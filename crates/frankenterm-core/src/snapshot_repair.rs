@@ -25,7 +25,7 @@
 //!   ($K \le 2,048$, envelope $\le 2$ MiB per chunk). Callers must chunk large objects into
 //!   bounded representations rather than attempting quadratic full-block Gaussian elimination
 //!   at the theoretical RFC 6330 maximum of 56,403 symbols.
-//! - **Comprehensive Memory Accounting**: Pre-charges checked memory budgets covering
+//! - **Decoder Working-Set Admission**: Pre-charges checked estimates covering
 //!   symbol payloads, intermediate symbols, dense inactivation matrices ($L \times L$ in GF(256)),
 //!   and equation structures BEFORE constructor initialization or matrix solving.
 //! - **Pre-Allocation Buffering Guards**: Enforces `max_symbols_buffered` ceiling using checked
@@ -39,15 +39,15 @@
 //!   [`RepairAdmissionController`], with periodic `cx.checkpoint()` cancellation gates.
 //!   Because RaptorQ systematic matrix inversion and inactivation elimination are
 //!   synchronous, compute-bound algorithms that cannot be preempted mid-matrix-solve,
-//!   latency is strictly bounded by construction through $K \le \text{MAX\_CHUNK\_SOURCE\_SYMBOLS}$
-//!   ($K \le 2,048$). This bounds geometry; solve latency requires measurement.
+//!   geometry is capped through $K \le \text{MAX\_CHUNK\_SOURCE\_SYMBOLS}$
+//!   ($K \le 2,048$). Solve latency requires measurement.
 //!   Hard interruption during solve is not claimed; instead, `cx.checkpoint()` is verified
 //!   immediately AFTER solve and digest verification before returning success, ensuring that
 //!   cancellation during solve fails closed.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -273,11 +273,7 @@ pub struct ExpectedRecoveryIdentity {
 impl ExpectedRecoveryIdentity {
     /// Create a new expected identity assertion tuple.
     #[must_use]
-    pub const fn new(
-        representation_id: [u8; 32],
-        object_id: [u8; 32],
-        generation: u64,
-    ) -> Self {
+    pub const fn new(representation_id: [u8; 32], object_id: [u8; 32], generation: u64) -> Self {
         Self {
             representation_id,
             object_id,
@@ -322,8 +318,9 @@ pub struct RepairStats {
 }
 
 /// Output of a successful repair decode operation.
-/// Holds the active budget permit so returned buffers do not outlive the permit
-/// for the returned repair buffer. Other caller-owned buffers have separate budgets.
+/// Returns a buffer alongside its admission reservation. Callers that separate
+/// these public fields must retain the permit until the buffer is released.
+/// Caller-owned inputs and allocator overhead are not a process-wide heap bound.
 #[derive(Debug)]
 pub struct RepairResult<'a> {
     /// Bit-for-bit recovered serialized encrypted envelope.
@@ -338,11 +335,11 @@ pub struct RepairResult<'a> {
 
 impl<'a> RepairResult<'a> {
     /// Consume the result, yielding the reconstructed envelope and the active budget permit.
+    /// The caller must retain the permit for the lifetime of the returned buffer.
     #[must_use]
     pub fn into_parts(self) -> (Vec<u8>, RepairPermit<'a>) {
         (self.reconstructed_envelope, self.permit)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +361,9 @@ pub enum RepairError {
     #[error("Authentication key is empty")]
     EmptyAuthenticationKey,
 
-    #[error("Source symbol count {k} exceeds per-object chunk limit {limit}; callers must chunk large recovery objects")]
+    #[error(
+        "Source symbol count {k} exceeds per-object chunk limit {limit}; callers must chunk large recovery objects"
+    )]
     ExceedsMaxSourceSymbols { k: usize, limit: usize },
 
     #[error("Multi-block SBN {sbn} unsupported: only single-block SBN=0 is supported")]
@@ -388,7 +387,9 @@ pub enum RepairError {
     #[error("Foreign generation: expected {expected}, got {got}")]
     ForeignGeneration { expected: u64, got: u64 },
 
-    #[error("Conflicting duplicate symbol detected: ESI {esi} received with divergent payload data")]
+    #[error(
+        "Conflicting duplicate symbol detected: ESI {esi} received with divergent payload data"
+    )]
     ConflictingDuplicateSymbol { esi: u32 },
 
     #[error("Insufficient equation rank: achieved {rank}/{columns}, deficit {deficit}")]
@@ -447,7 +448,11 @@ pub struct RepairAdmissionController {
 impl RepairAdmissionController {
     /// Create a new admission controller with explicit operational bounds.
     #[must_use]
-    pub fn new(max_concurrent: usize, max_memory_bytes: usize, max_symbols_buffered: usize) -> Self {
+    pub fn new(
+        max_concurrent: usize,
+        max_memory_bytes: usize,
+        max_symbols_buffered: usize,
+    ) -> Self {
         Self {
             max_concurrent,
             max_memory_bytes,
@@ -603,8 +608,9 @@ impl std::fmt::Debug for RepairPermit<'_> {
 // Memory Budget Estimation (Checked Arithmetic)
 // ---------------------------------------------------------------------------
 
-/// Estimate comprehensive memory consumption for decoder initialization,
-/// equation matrix storage, dense inactivation solve, and intermediate symbols.
+/// Estimate the decoder working set for initialization, equation matrix storage,
+/// dense inactivation solve, and intermediate symbols. This is an admission
+/// estimate for the pinned decoder, not an allocator-level heap measurement.
 ///
 /// Accounts for:
 /// 1. Total matrix rows: matrix_rows = received_symbol_count + S + H + (K' - K).
@@ -614,10 +620,10 @@ impl std::fmt::Debug for RepairPermit<'_> {
 ///    - dense submatrix clone / factor cache during elimination: matrix_rows * L in GF(256)
 ///    - rank basis vectors in coefficient_rank_profile: L * L in GF(256)
 ///    Charged as: 3 * (matrix_rows * L) + (L * L).
-/// 3. HDPC and dense equations having up to L terms (8-byte column index + 1-byte GF256 coeff = 9 bytes),
+/// 3. HDPC and dense equations having up to L aligned (usize, GF256) terms,
 ///    vector/struct allocation headers (~128 bytes), and RHS symbol buffers (symbol_size).
 ///    Solver clones equation and RHS rows while original equation list is held:
-///    Charged as: 2 * matrix_rows * (L * 9 + 128 + symbol_size).
+///    Charged as: 2 * matrix_rows * (L * size_of::<(usize, u8)>() + 128 + symbol_size).
 /// 4. Full decoder state symbol payload buffers:
 ///    - intermediate symbols (L * symbol_size)
 ///    - solved array in DecoderState (L * symbol_size)
@@ -645,11 +651,13 @@ fn calculate_decoder_memory_budget(
         .checked_mul(2)
         .and_then(|v| v.checked_add(k.checked_mul(2)?))
         .and_then(|v| v.checked_add(received_symbol_count))
-        .ok_or_else(|| RepairError::AdmissionExceeded("symbol buffer count overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("symbol buffer count overflow".to_string())
+        })?;
 
-    let symbol_payload_bytes = total_symbol_slots
-        .checked_mul(symbol_size)
-        .ok_or_else(|| RepairError::AdmissionExceeded("symbol payload bytes overflow".to_string()))?;
+    let symbol_payload_bytes = total_symbol_slots.checked_mul(symbol_size).ok_or_else(|| {
+        RepairError::AdmissionExceeded("symbol payload bytes overflow".to_string())
+    })?;
 
     // 2. Total matrix rows: received symbols + base constraints (S + H) + padding rows (K' - K)
     let padding_rows = k_prime.saturating_sub(k);
@@ -676,16 +684,18 @@ fn calculate_decoder_memory_budget(
         .checked_mul(l)
         .ok_or_else(|| RepairError::AdmissionExceeded("rank basis bytes overflow".to_string()))?;
 
-    let total_matrix_bytes = dense_matrix_bytes
-        .checked_add(basis_bytes)
-        .ok_or_else(|| RepairError::AdmissionExceeded("total dense matrix bytes overflow".to_string()))?;
+    let total_matrix_bytes = dense_matrix_bytes.checked_add(basis_bytes).ok_or_else(|| {
+        RepairError::AdmissionExceeded("total dense matrix bytes overflow".to_string())
+    })?;
 
     // 4. Equation structures and RHS
     // Account for tuple alignment, not just the sum of index and GF256 field widths.
     // Plus vector/struct allocation headers (~128 bytes) + RHS symbol payload (symbol_size).
     let term_bytes = l
         .checked_mul(std::mem::size_of::<(usize, u8)>())
-        .ok_or_else(|| RepairError::AdmissionExceeded("equation term bytes overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("equation term bytes overflow".to_string())
+        })?;
 
     const STRUCT_AND_VEC_HEADER_OVERHEAD: usize = 128;
     let single_equation_slot_bytes = term_bytes
@@ -703,14 +713,18 @@ fn calculate_decoder_memory_budget(
     let auxiliary_overhead = matrix_rows
         .checked_mul(64)
         .and_then(|v| v.checked_add(l.checked_mul(32)?))
-        .ok_or_else(|| RepairError::AdmissionExceeded("auxiliary state overhead overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("auxiliary state overhead overflow".to_string())
+        })?;
 
     // Sum all components safely
     let total_memory = symbol_payload_bytes
         .checked_add(total_matrix_bytes)
         .and_then(|v| v.checked_add(equation_bytes))
         .and_then(|v| v.checked_add(auxiliary_overhead))
-        .ok_or_else(|| RepairError::AdmissionExceeded("total decoder memory budget overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("total decoder memory budget overflow".to_string())
+        })?;
 
     Ok(total_memory)
 }
@@ -733,40 +747,46 @@ fn calculate_encoder_memory_budget(
     let total_symbol_slots = l
         .checked_add(k)
         .and_then(|v| v.checked_add(total_symbols))
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder symbol count overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("encoder symbol count overflow".to_string())
+        })?;
 
-    let symbol_payload_bytes = total_symbol_slots
-        .checked_mul(symbol_size)
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder symbol payload overflow".to_string()))?;
+    let symbol_payload_bytes = total_symbol_slots.checked_mul(symbol_size).ok_or_else(|| {
+        RepairError::AdmissionExceeded("encoder symbol payload overflow".to_string())
+    })?;
 
     // Constraint matrix solve: (S + H + K') rows * L columns in GF(256)
     let matrix_rows = s
         .checked_add(h)
         .and_then(|v| v.checked_add(k_prime))
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix rows overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("encoder matrix rows overflow".to_string())
+        })?;
 
-    let single_matrix_bytes = matrix_rows
-        .checked_mul(l)
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix bytes overflow".to_string()))?;
+    let single_matrix_bytes = matrix_rows.checked_mul(l).ok_or_else(|| {
+        RepairError::AdmissionExceeded("encoder matrix bytes overflow".to_string())
+    })?;
 
     // Solver clones the constraint matrix; charge 2x
-    let matrix_bytes = single_matrix_bytes
-        .checked_mul(2)
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder matrix clone bytes overflow".to_string()))?;
+    let matrix_bytes = single_matrix_bytes.checked_mul(2).ok_or_else(|| {
+        RepairError::AdmissionExceeded("encoder matrix clone bytes overflow".to_string())
+    })?;
 
     // Solver clones the RHS values: matrix_rows * symbol_size; charge 2x
     let single_rhs_bytes = matrix_rows
         .checked_mul(symbol_size)
         .ok_or_else(|| RepairError::AdmissionExceeded("encoder rhs bytes overflow".to_string()))?;
 
-    let rhs_bytes = single_rhs_bytes
-        .checked_mul(2)
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder rhs clone bytes overflow".to_string()))?;
+    let rhs_bytes = single_rhs_bytes.checked_mul(2).ok_or_else(|| {
+        RepairError::AdmissionExceeded("encoder rhs clone bytes overflow".to_string())
+    })?;
 
     let total_memory = symbol_payload_bytes
         .checked_add(matrix_bytes)
         .and_then(|v| v.checked_add(rhs_bytes))
-        .ok_or_else(|| RepairError::AdmissionExceeded("encoder total memory budget overflow".to_string()))?;
+        .ok_or_else(|| {
+            RepairError::AdmissionExceeded("encoder total memory budget overflow".to_string())
+        })?;
 
     Ok(total_memory)
 }
@@ -793,8 +813,10 @@ pub fn compute_manifest_mac(
         return Err(RepairError::EmptyAuthenticationKey);
     }
     let key_guard = Zeroizing::new(key.to_vec());
-    let mut mac = HmacSha256::new_from_slice(&key_guard)
-        .map_err(|e| RepairError::InvalidGeometry { reason: format!("HMAC key initialization failed: {e}") })?;
+    let mut mac =
+        HmacSha256::new_from_slice(&key_guard).map_err(|e| RepairError::InvalidGeometry {
+            reason: format!("HMAC key initialization failed: {e}"),
+        })?;
 
     mac.update(MANIFEST_MAC_DOMAIN);
     mac.update(representation_id);
@@ -853,8 +875,10 @@ pub fn compute_symbol_mac(
         return Err(RepairError::EmptyAuthenticationKey);
     }
     let key_guard = Zeroizing::new(key.to_vec());
-    let mut mac = HmacSha256::new_from_slice(&key_guard)
-        .map_err(|e| RepairError::InvalidGeometry { reason: format!("HMAC key initialization failed: {e}") })?;
+    let mut mac =
+        HmacSha256::new_from_slice(&key_guard).map_err(|e| RepairError::InvalidGeometry {
+            reason: format!("HMAC key initialization failed: {e}"),
+        })?;
 
     mac.update(SYMBOL_MAC_DOMAIN);
     mac.update(representation_id);
@@ -1049,9 +1073,9 @@ pub fn encode_repair_envelope(
             return Err(RepairError::Cancelled);
         }
         let esi = (k + i) as u32;
-        let payload = encoder
-            .try_repair_symbol(esi)
-            .map_err(|e| RepairError::DecoderError(format!("encoder repair symbol failed: {e:?}")))?;
+        let payload = encoder.try_repair_symbol(esi).map_err(|e| {
+            RepairError::DecoderError(format!("encoder repair symbol failed: {e:?}"))
+        })?;
 
         let tag = compute_symbol_mac(
             auth_key,
@@ -1215,7 +1239,10 @@ pub fn decode_repair_symbols<'a>(
         });
     }
 
-    let payload_len = manifest.payload_len as usize;
+    let payload_len =
+        usize::try_from(manifest.payload_len).map_err(|_| RepairError::InvalidGeometry {
+            reason: "payload_len does not fit the host address space".to_owned(),
+        })?;
     if payload_len == 0 || payload_len > MAX_CHUNK_ENVELOPE_BYTES {
         return Err(RepairError::InvalidGeometry {
             reason: format!("payload_len {payload_len} out of bounds"),
@@ -1236,9 +1263,7 @@ pub fn decode_repair_symbols<'a>(
     let total_symbols_manifest = manifest.total_symbols_generated as usize;
     if total_symbols_manifest < k {
         return Err(RepairError::InvalidGeometry {
-            reason: format!(
-                "manifest total_symbols_generated {total_symbols_manifest} < K {k}"
-            ),
+            reason: format!("manifest total_symbols_generated {total_symbols_manifest} < K {k}"),
         });
     }
 
@@ -1301,6 +1326,39 @@ pub fn decode_repair_symbols<'a>(
             });
         }
 
+        // Validate even duplicates: authentication does not make a source ESI
+        // valid as a repair ESI, or permit noncanonical source padding.
+        let esi = sym.esi as usize;
+        match sym.kind {
+            RepairSymbolKind::Source if esi >= k => {
+                return Err(RepairError::InvalidGeometry {
+                    reason: format!("source symbol ESI {} >= K {}", sym.esi, k),
+                });
+            }
+            RepairSymbolKind::Repair if esi < k => {
+                return Err(RepairError::InvalidGeometry {
+                    reason: format!("repair symbol ESI {} < K {}", sym.esi, k),
+                });
+            }
+            RepairSymbolKind::Repair if esi >= total_symbols_manifest => {
+                return Err(RepairError::InvalidGeometry {
+                    reason: format!(
+                        "repair symbol ESI {} >= total_symbols_generated {}",
+                        sym.esi, total_symbols_manifest
+                    ),
+                });
+            }
+            _ => {}
+        }
+        if sym.kind == RepairSymbolKind::Source && esi == k - 1 {
+            let final_bytes = payload_len - (k - 1) * symbol_size;
+            if sym.payload[final_bytes..].iter().any(|&byte| byte != 0) {
+                return Err(RepairError::InvalidGeometry {
+                    reason: "nonzero source padding".to_owned(),
+                });
+            }
+        }
+
         // Handle duplicates
         if seen_esis.contains(&sym.esi) {
             // Check for conflicting duplicate payload
@@ -1322,28 +1380,9 @@ pub fn decode_repair_symbols<'a>(
         seen_esis.insert(sym.esi);
         match sym.kind {
             RepairSymbolKind::Source => {
-                if sym.esi as usize >= k {
-                    return Err(RepairError::InvalidGeometry {
-                        reason: format!("source symbol ESI {} >= K {}", sym.esi, k),
-                    });
-                }
                 validated_source.push((sym.esi, sym.payload.clone()));
             }
             RepairSymbolKind::Repair => {
-                let esi = sym.esi as usize;
-                if esi < k {
-                    return Err(RepairError::InvalidGeometry {
-                        reason: format!("repair symbol ESI {} < K {}", sym.esi, k),
-                    });
-                }
-                if esi >= total_symbols_manifest {
-                    return Err(RepairError::InvalidGeometry {
-                        reason: format!(
-                            "repair symbol ESI {} >= total_symbols_generated {}",
-                            sym.esi, total_symbols_manifest
-                        ),
-                    });
-                }
                 validated_repair.push((sym.esi, sym.payload.clone()));
             }
         }
@@ -1374,11 +1413,13 @@ pub fn decode_repair_symbols<'a>(
             return Err(RepairError::Cancelled);
         }
 
-        // Shrink permit from temporary decode budget down to exact retained buffer length
-        // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
-        permit.shrink_to(reconstructed.capacity());
-
         let l = decoder.params().l;
+        // Free temporary allocations before releasing their reservation.
+        drop(validated_source);
+        drop(validated_repair);
+        drop(seen_esis);
+        drop(decoder);
+        permit.shrink_to(reconstructed.capacity());
         return Ok(RepairResult {
             reconstructed_envelope: reconstructed,
             representation_id: manifest.representation_id,
@@ -1399,24 +1440,44 @@ pub fn decode_repair_symbols<'a>(
     // General decoding path using RaptorQ InactivationDecoder
     // Populate with LDPC/HDPC constraint symbols
     let mut received_equations = decoder.constraint_symbols();
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
 
     // Add received source symbols
-    for (esi, data) in &validated_source {
+    for (index, (esi, data)) in validated_source.iter().enumerate() {
+        if index % 64 == 0 && cx.checkpoint().is_err() {
+            return Err(RepairError::Cancelled);
+        }
         received_equations.push(ReceivedSymbol::source(*esi, data.clone()));
     }
 
     // Add received repair symbols with derived repair equations
-    for (esi, data) in &validated_repair {
-        let (columns, coefficients) = decoder
-            .repair_equation(*esi)
-            .map_err(|e| RepairError::DecoderError(format!("repair equation failed for ESI {esi}: {e:?}")))?;
-        received_equations.push(ReceivedSymbol::repair(*esi, columns, coefficients, data.clone()));
+    for (index, (esi, data)) in validated_repair.iter().enumerate() {
+        if index % 64 == 0 && cx.checkpoint().is_err() {
+            return Err(RepairError::Cancelled);
+        }
+        let (columns, coefficients) = decoder.repair_equation(*esi).map_err(|e| {
+            RepairError::DecoderError(format!("repair equation failed for ESI {esi}: {e:?}"))
+        })?;
+        received_equations.push(ReceivedSymbol::repair(
+            *esi,
+            columns,
+            coefficients,
+            data.clone(),
+        ));
     }
 
     // Check rank status
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
     let rank_profile = decoder
         .rank_status(&received_equations)
         .map_err(|e| RepairError::DecoderError(format!("rank evaluation failed: {e:?}")))?;
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
 
     if rank_profile.deficit > 0 {
         return Err(RepairError::InsufficientRank {
@@ -1434,6 +1495,9 @@ pub fn decode_repair_symbols<'a>(
     let decode_result = decoder
         .decode(&received_equations)
         .map_err(|e| RepairError::DecoderError(format!("RaptorQ solve failed: {e:?}")))?;
+    if cx.checkpoint().is_err() {
+        return Err(RepairError::Cancelled);
+    }
 
     if decode_result.source.len() < k {
         return Err(RepairError::DecoderError(format!(
@@ -1441,6 +1505,16 @@ pub fn decode_repair_symbols<'a>(
             decode_result.source.len(),
             k
         )));
+    }
+    let final_bytes = payload_len - (k - 1) * symbol_size;
+    if decode_result.source[k - 1].len() != symbol_size
+        || decode_result.source[k - 1][final_bytes..]
+            .iter()
+            .any(|&byte| byte != 0)
+    {
+        return Err(RepairError::InvalidGeometry {
+            reason: "invalid decoded source padding".to_owned(),
+        });
     }
 
     // Assemble reconstructed envelope
@@ -1466,16 +1540,23 @@ pub fn decode_repair_symbols<'a>(
         return Err(RepairError::Cancelled);
     }
 
-    // Shrink permit from temporary solver scratchpad down to exact retained buffer length
-    // so returned buffers do not outlive the permit and aggregate bounds remain strictly true.
+    let source_symbols_used = validated_source.len();
+    let repair_symbols_used = validated_repair.len();
+    drop(decode_result);
+    drop(received_equations);
+    drop(validated_source);
+    drop(validated_repair);
+    drop(seen_esis);
+    drop(decoder);
+    // Release scratch reservations only after their buffers have been freed.
     permit.shrink_to(reconstructed.capacity());
 
     Ok(RepairResult {
         reconstructed_envelope: reconstructed,
         representation_id: manifest.representation_id,
         stats: RepairStats {
-            source_symbols_used: validated_source.len(),
-            repair_symbols_used: validated_repair.len(),
+            source_symbols_used,
+            repair_symbols_used,
             duplicates_discarded,
             rank_status: RankStatusDiagnostic {
                 rank: rank_profile.rank,
@@ -1603,8 +1684,15 @@ mod tests {
         .expect("encode failed");
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &bundle.symbols, &expected, key, &admission)
-            .expect("decode failed");
+        let result = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect("decode failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
         assert_eq!(result.representation_id, bundle.manifest.representation_id);
@@ -1641,8 +1729,9 @@ mod tests {
         }
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
-            .expect("decode repair failed");
+        let result =
+            decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
+                .expect("decode repair failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
         assert!(result.stats.repair_symbols_used > 0);
@@ -1680,8 +1769,9 @@ mod tests {
         }
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
-            .expect("decode repair 50% failed");
+        let result =
+            decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
+                .expect("decode repair 50% failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
         assert_eq!(result.stats.source_symbols_used, k - (k + 1) / 2);
@@ -1716,8 +1806,9 @@ mod tests {
             .collect();
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
-            .expect("burst loss repair failed");
+        let result =
+            decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
+                .expect("burst loss repair failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
     }
@@ -1752,8 +1843,9 @@ mod tests {
             .collect();
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
-            .expect("odd-sized decode failed");
+        let result =
+            decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
+                .expect("odd-sized decode failed");
 
         assert_eq!(result.reconstructed_envelope.len(), 1337);
         assert_eq!(result.reconstructed_envelope, payload);
@@ -1783,8 +1875,9 @@ mod tests {
         let received: Vec<_> = bundle.symbols.iter().take(3).cloned().collect();
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let err = decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
-            .expect_err("insufficient rank must fail");
+        let err =
+            decode_repair_symbols(&cx, &bundle.manifest, &received, &expected, key, &admission)
+                .expect_err("insufficient rank must fail");
 
         match err {
             RepairError::InsufficientRank {
@@ -1824,8 +1917,15 @@ mod tests {
         tampered_symbols[0].payload[10] ^= 0xFF;
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let err = decode_repair_symbols(&cx, &bundle.manifest, &tampered_symbols, &expected, key, &admission)
-            .expect_err("tampered symbol must fail");
+        let err = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &tampered_symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("tampered symbol must fail");
 
         match err {
             RepairError::SymbolAuthenticationFailed { esi, .. } => {
@@ -1859,9 +1959,15 @@ mod tests {
         tampered_manifest.manifest_mac[5] ^= 0xAA; // Corrupt MAC
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&tampered_manifest);
-        let err =
-            decode_repair_symbols(&cx, &tampered_manifest, &bundle.symbols, &expected, key, &admission)
-                .expect_err("tampered manifest must fail");
+        let err = decode_repair_symbols(
+            &cx,
+            &tampered_manifest,
+            &bundle.symbols,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("tampered manifest must fail");
 
         assert_eq!(err, RepairError::ManifestAuthenticationFailed);
     }
@@ -1949,9 +2055,15 @@ mod tests {
         symbols_with_dupes.push(bundle.symbols[0].clone());
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let result =
-            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_dupes, &expected, key, &admission)
-                .expect("benign duplicates should be discarded gracefully");
+        let result = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &symbols_with_dupes,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect("benign duplicates should be discarded gracefully");
 
         assert_eq!(result.reconstructed_envelope, payload);
         assert_eq!(result.stats.duplicates_discarded, 2);
@@ -1996,9 +2108,15 @@ mod tests {
         symbols_with_conflict.push(conflicting_sym);
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let err =
-            decode_repair_symbols(&cx, &bundle.manifest, &symbols_with_conflict, &expected, key, &admission)
-                .expect_err("conflicting duplicate must fail");
+        let err = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &symbols_with_conflict,
+            &expected,
+            key,
+            &admission,
+        )
+        .expect_err("conflicting duplicate must fail");
 
         match err {
             RepairError::ConflictingDuplicateSymbol { esi } => {
@@ -2006,6 +2124,100 @@ mod tests {
             }
             other => panic!("expected ConflictingDuplicateSymbol, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_authenticated_invalid_duplicate_kind_is_not_discarded() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let key = b"test-secret-key-32-bytes-long!!";
+        let bundle = encode_repair_envelope(
+            &cx,
+            &sample_envelope(1337),
+            sample_object_id(77),
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .unwrap();
+        let mut symbols = bundle.symbols.clone();
+        let mut invalid = symbols[0].clone();
+        invalid.kind = RepairSymbolKind::Repair;
+        invalid.tag = compute_symbol_mac(
+            key,
+            &bundle.manifest.representation_id,
+            &bundle.manifest.object_id,
+            bundle.manifest.generation,
+            bundle.manifest.sbn,
+            invalid.kind,
+            invalid.esi,
+            &invalid.payload,
+        )
+        .unwrap();
+        symbols.push(invalid);
+        let error = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &symbols,
+            &ExpectedRecoveryIdentity::from_manifest(&bundle.manifest),
+            key,
+            &admission,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RepairError::InvalidGeometry { reason } if reason.contains("< K")));
+        assert_eq!(admission.allocated_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn test_authenticated_nonzero_source_padding_is_rejected() {
+        let cx = test_cx();
+        let admission = RepairAdmissionController::default_production();
+        let key = b"test-secret-key-32-bytes-long!!";
+        let bundle = encode_repair_envelope(
+            &cx,
+            &sample_envelope(1337),
+            sample_object_id(78),
+            1,
+            key,
+            DEFAULT_SYMBOL_SIZE,
+            RepairProtectionClass::Standard,
+            &admission,
+        )
+        .unwrap();
+        let mut symbols = bundle.symbols.clone();
+        let last = symbols
+            .iter_mut()
+            .find(|symbol| {
+                symbol.kind == RepairSymbolKind::Source && symbol.esi == bundle.manifest.k - 1
+            })
+            .unwrap();
+        *last.payload.last_mut().unwrap() = 1;
+        last.tag = compute_symbol_mac(
+            key,
+            &bundle.manifest.representation_id,
+            &bundle.manifest.object_id,
+            bundle.manifest.generation,
+            bundle.manifest.sbn,
+            last.kind,
+            last.esi,
+            &last.payload,
+        )
+        .unwrap();
+        let error = decode_repair_symbols(
+            &cx,
+            &bundle.manifest,
+            &symbols,
+            &ExpectedRecoveryIdentity::from_manifest(&bundle.manifest),
+            key,
+            &admission,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, RepairError::InvalidGeometry { reason } if reason == "nonzero source padding")
+        );
+        assert_eq!(admission.allocated_memory_bytes(), 0);
     }
 
     #[test]
@@ -2238,7 +2450,9 @@ mod tests {
     fn test_admission_controller_concurrency_limit() {
         let admission = RepairAdmissionController::new(1, 1024 * 1024, 1000);
         let permit1 = admission.acquire(1024).expect("first permit succeeds");
-        let permit2_err = admission.acquire(1024).expect_err("second permit exceeds concurrency");
+        let permit2_err = admission
+            .acquire(1024)
+            .expect_err("second permit exceeds concurrency");
         match permit2_err {
             RepairError::AdmissionExceeded(msg) => assert!(msg.contains("concurrency limit")),
             other => panic!("expected AdmissionExceeded, got {other:?}"),
@@ -2307,7 +2521,9 @@ mod tests {
         let initial_ops = shared.active_operations();
 
         // Acquire a permit from shared controller
-        let permit = shared.acquire(1024).expect("permit from shared controller succeeds");
+        let permit = shared
+            .acquire(1024)
+            .expect("permit from shared controller succeeds");
         assert_eq!(shared.active_operations(), initial_ops + 1);
 
         drop(permit);
@@ -2323,7 +2539,9 @@ mod tests {
         let p2 = admission.acquire(1_000).expect("permit 2 succeeds");
 
         // Concurrency limit exceeded
-        let err_conc = admission.acquire(1_000).expect_err("permit 3 must exceed concurrency");
+        let err_conc = admission
+            .acquire(1_000)
+            .expect_err("permit 3 must exceed concurrency");
         match err_conc {
             RepairError::AdmissionExceeded(msg) => assert!(msg.contains("concurrency limit")),
             other => panic!("expected AdmissionExceeded, got {other:?}"),
@@ -2339,9 +2557,13 @@ mod tests {
         }
 
         // 3. Counter overflow protection with usize::MAX
-        let err_overflow = admission.acquire(usize::MAX).expect_err("overflow must be rejected");
+        let err_overflow = admission
+            .acquire(usize::MAX)
+            .expect_err("overflow must be rejected");
         match err_overflow {
-            RepairError::AdmissionExceeded(msg) => assert!(msg.contains("limit") || msg.contains("overflow")),
+            RepairError::AdmissionExceeded(msg) => {
+                assert!(msg.contains("limit") || msg.contains("overflow"))
+            }
             other => panic!("expected AdmissionExceeded, got {other:?}"),
         }
 
@@ -2390,15 +2612,8 @@ mod tests {
         };
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&manifest);
-        let err = decode_repair_symbols(
-            &cx,
-            &manifest,
-            &[],
-            &expected,
-            key,
-            &admission,
-        )
-        .expect_err("k mismatch must fail");
+        let err = decode_repair_symbols(&cx, &manifest, &[], &expected, key, &admission)
+            .expect_err("k mismatch must fail");
 
         match err {
             RepairError::InvalidGeometry { reason } => {
@@ -2448,15 +2663,8 @@ mod tests {
         };
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&manifest);
-        let err = decode_repair_symbols(
-            &cx,
-            &manifest,
-            &[],
-            &expected,
-            key,
-            &admission,
-        )
-        .expect_err("total_symbols < k must fail");
+        let err = decode_repair_symbols(&cx, &manifest, &[], &expected, key, &admission)
+            .expect_err("total_symbols < k must fail");
 
         match err {
             RepairError::InvalidGeometry { reason } => {
@@ -2513,15 +2721,9 @@ mod tests {
         symbols.push(bad_symbol);
 
         let expected = ExpectedRecoveryIdentity::from_manifest(&bundle.manifest);
-        let err = decode_repair_symbols(
-            &cx,
-            &bundle.manifest,
-            &symbols,
-            &expected,
-            key,
-            &admission,
-        )
-        .expect_err("out of bounds repair ESI must fail");
+        let err =
+            decode_repair_symbols(&cx, &bundle.manifest, &symbols, &expected, key, &admission)
+                .expect_err("out of bounds repair ESI must fail");
 
         match err {
             RepairError::InvalidGeometry { reason } => {
@@ -2626,7 +2828,9 @@ mod tests {
         assert_eq!(admission.active_operations(), 1);
 
         // Another acquisition exceeding remaining memory (60,000 - 3,500 = 56,500) fails
-        let err = admission.acquire(56_501).expect_err("must exceed remaining memory");
+        let err = admission
+            .acquire(56_501)
+            .expect_err("must exceed remaining memory");
         match err {
             RepairError::AdmissionExceeded(msg) => assert!(msg.contains("memory limit")),
             other => panic!("expected AdmissionExceeded, got {other:?}"),
@@ -2638,7 +2842,9 @@ mod tests {
         assert_eq!(admission.active_operations(), 0);
 
         // Now full 60,000 reservation succeeds
-        let _permit = admission.acquire(60_000).expect("full reservation succeeds after drop");
+        let _permit = admission
+            .acquire(60_000)
+            .expect("full reservation succeeds after drop");
     }
 
     #[test]

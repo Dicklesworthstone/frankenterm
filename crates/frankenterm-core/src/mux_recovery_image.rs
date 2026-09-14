@@ -260,6 +260,18 @@ pub enum MuxRecoveryImageError {
         ack: String,
     },
 
+    #[error(
+        "pane {pane_id} ACK stream watermark {ack} differs from its terminal checkpoint watermark {checkpoint}"
+    )]
+    ParserStreamWatermarkMismatch {
+        pane_id: usize,
+        ack: u64,
+        checkpoint: u64,
+    },
+
+    #[error("invalid captured topology: {0}")]
+    InvalidCapturedTopology(&'static str),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -566,13 +578,55 @@ pub struct RecoveryDomain {
     pub is_attached: bool,
 }
 
-/// Window placement and dimensions on host desktop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Exact configured window placement, without inventing desktop dimensions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryGuiPosition {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
+    pub x: RecoveryGuiDimension,
+    pub y: RecoveryGuiDimension,
+    pub origin: RecoveryGeometryOrigin,
+}
+
+/// Unit-tagged IEEE-754 f32 bits preserve the captured coordinate exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryGuiDimension {
+    Points(u32),
+    Pixels(u32),
+    Percent(u32),
+    Cells(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryGeometryOrigin {
+    ScreenCoordinateSystem,
+    MainScreen,
+    ActiveScreen,
+    Named(String),
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl From<&config::GuiPosition> for RecoveryGuiPosition {
+    fn from(position: &config::GuiPosition) -> Self {
+        fn dimension(value: config::Dimension) -> RecoveryGuiDimension {
+            match value {
+                config::Dimension::Points(value) => RecoveryGuiDimension::Points(value.to_bits()),
+                config::Dimension::Pixels(value) => RecoveryGuiDimension::Pixels(value.to_bits()),
+                config::Dimension::Percent(value) => RecoveryGuiDimension::Percent(value.to_bits()),
+                config::Dimension::Cells(value) => RecoveryGuiDimension::Cells(value.to_bits()),
+            }
+        }
+        Self {
+            x: dimension(position.x),
+            y: dimension(position.y),
+            origin: match &position.origin {
+                config::GeometryOrigin::ScreenCoordinateSystem => {
+                    RecoveryGeometryOrigin::ScreenCoordinateSystem
+                }
+                config::GeometryOrigin::MainScreen => RecoveryGeometryOrigin::MainScreen,
+                config::GeometryOrigin::ActiveScreen => RecoveryGeometryOrigin::ActiveScreen,
+                config::GeometryOrigin::Named(name) => RecoveryGeometryOrigin::Named(name.clone()),
+            },
+        }
+    }
 }
 
 /// Ordered window representation preserving exact user tab order.
@@ -1447,7 +1501,7 @@ impl MuxRecoveryImage {
 #[cfg(feature = "frankenterm-deps")]
 impl MuxRecoveryImage {
     /// Converts a coherent live [`mux::MuxCapturedTopology`] and per-pane [`mux::ModelParserCheckpointAck`]s
-    /// into an authenticated, validated [`MuxRecoveryImage`].
+    /// into a validated [`MuxRecoveryImage`]. The publisher authenticates its encrypted envelope.
     ///
     /// # Invariants Enforced:
     /// - Exact membership bijection: every pane in `captured.pane_bindings` must appear in
@@ -1550,6 +1604,13 @@ impl MuxRecoveryImage {
                     ack: ack_uuid,
                 });
             }
+            if ack.parser_stream_bytes != ack.terminal_checkpoint.parser_stream_bytes() {
+                return Err(MuxRecoveryImageError::ParserStreamWatermarkMismatch {
+                    pane_id: binding.pane_id,
+                    ack: ack.parser_stream_bytes,
+                    checkpoint: ack.terminal_checkpoint.parser_stream_bytes(),
+                });
+            }
             let chk_ref = checkpoint_object_refs
                 .get(&binding.pane_id)
                 .unwrap()
@@ -1609,14 +1670,26 @@ impl MuxRecoveryImage {
         // 6. Build windows and tabs
         let mut captured_tabs_by_id = HashMap::new();
         for tab in &captured.tabs {
-            captured_tabs_by_id.insert(tab.tab_id, tab);
+            if captured_tabs_by_id.insert(tab.tab_id, tab).is_some() {
+                return Err(MuxRecoveryImageError::DuplicateTabId(tab.tab_id));
+            }
         }
 
         let mut windows = Vec::with_capacity(captured.windows.len());
         for win in &captured.windows {
             let mut tabs = Vec::with_capacity(win.ordered_tab_ids.len());
             for &tab_id in &win.ordered_tab_ids {
-                if let Some(tab) = captured_tabs_by_id.get(&tab_id) {
+                {
+                    let tab = captured_tabs_by_id.remove(&tab_id).ok_or(
+                        MuxRecoveryImageError::InvalidCapturedTopology(
+                            "ordered tab is missing or repeated",
+                        ),
+                    )?;
+                    if tab.window_id != win.window_id {
+                        return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                            "tab window binding mismatch",
+                        ));
+                    }
                     let root_split = convert_mux_pane_node(&tab.split_tree, &pane_uuid_map)?;
                     let floating_panes = tab
                         .floating_panes
@@ -1655,14 +1728,16 @@ impl MuxRecoveryImage {
 
                     let active_pane_id = match tab.active_pane_id {
                         Some(id) => id,
+                        None if root_split.is_none()
+                            && floating_panes.is_empty()
+                            && tab.pane_stacks.is_empty() =>
+                        {
+                            0
+                        }
                         None => {
-                            if let Some(ref rs) = root_split {
-                                rs.leaves().first().map(|(id, _)| *id).unwrap_or(0)
-                            } else if let Some(fp) = floating_panes.first() {
-                                fp.pane_id
-                            } else {
-                                0
-                            }
+                            return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                                "nonempty tab has no active pane",
+                            ));
                         }
                     };
 
@@ -1695,9 +1770,19 @@ impl MuxRecoveryImage {
                 }
             }
 
-            let mut active_tab_index = win.active_tab_index.unwrap_or(0);
-            if !tabs.is_empty() && active_tab_index >= tabs.len() {
-                active_tab_index = 0;
+            let active_tab_index = match win.active_tab_index {
+                Some(index) if index < tabs.len() => index,
+                None if tabs.is_empty() && win.active_tab_id.is_none() => 0,
+                _ => {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "active tab index is missing or invalid",
+                    ));
+                }
+            };
+            if win.active_tab_id != tabs.get(active_tab_index).map(|tab| tab.tab_id) {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "active tab id and index disagree",
+                ));
             }
 
             windows.push(RecoveryWindow {
@@ -1705,18 +1790,25 @@ impl MuxRecoveryImage {
                 stable_window_id: format!("win-{}", win.window_id),
                 workspace: win.workspace.clone(),
                 order_revision: win.order_revision.get(),
-                gui_position: None,
+                gui_position: win.position.as_ref().map(RecoveryGuiPosition::from),
                 tabs,
                 active_tab_index,
             });
         }
+        if !captured_tabs_by_id.is_empty() {
+            return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                "captured tab is absent from window order",
+            ));
+        }
 
         // 7. Topology container
-        let focused_window_id = captured
-            .workspaces
-            .first()
-            .and_then(|w| w.active_window_id)
-            .or_else(|| captured.windows.first().map(|w| w.window_id));
+        let focused_window_id = captured.client_workspace.as_ref().and_then(|client| {
+            captured
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.name == client.active_workspace)
+                .and_then(|workspace| workspace.active_window_id)
+        });
 
         let client_workspace =
             captured
@@ -2050,10 +2142,9 @@ mod tests {
             workspace: "default".to_string(),
             order_revision: 1,
             gui_position: Some(RecoveryGuiPosition {
-                x: 100,
-                y: 100,
-                width: 800,
-                height: 600,
+                x: RecoveryGuiDimension::Pixels(100.0_f32.to_bits()),
+                y: RecoveryGuiDimension::Pixels(100.0_f32.to_bits()),
+                origin: RecoveryGeometryOrigin::ScreenCoordinateSystem,
             }),
             tabs: vec![tab],
             active_tab_index: 0,
@@ -2850,6 +2941,7 @@ mod converter_tests {
     fn make_test_checkpoint(
         rows: usize,
         cols: usize,
+        stream: &[u8],
     ) -> frankenterm_term::RecoveryTerminalCheckpointV2 {
         let size = TermTerminalSize {
             rows,
@@ -2865,7 +2957,7 @@ mod converter_tests {
             "converter-test",
             Box::new(Vec::<u8>::new()),
         );
-        term.advance_bytes(b"Converter test line\r\n");
+        term.advance_bytes(stream);
         term.capture_recovery_checkpoint(TerminalCheckpointLimits::default())
             .expect("capture test checkpoint")
     }
@@ -3071,8 +3163,8 @@ mod converter_tests {
             mux::ModelParserCheckpointAck {
                 registration_wire_identity: wire1,
                 durable_pane_id: uuid::Uuid::from_bytes(uuid1),
-                parser_stream_bytes: 1024,
-                terminal_checkpoint: make_test_checkpoint(24, 40),
+                parser_stream_bytes: 4,
+                terminal_checkpoint: make_test_checkpoint(24, 40, b"one\n"),
             },
         );
         checkpoint_acks.insert(
@@ -3080,8 +3172,8 @@ mod converter_tests {
             mux::ModelParserCheckpointAck {
                 registration_wire_identity: wire2,
                 durable_pane_id: uuid::Uuid::from_bytes(uuid2),
-                parser_stream_bytes: 2048,
-                terminal_checkpoint: make_test_checkpoint(24, 40),
+                parser_stream_bytes: 4,
+                terminal_checkpoint: make_test_checkpoint(24, 40, b"two\n"),
             },
         );
 
@@ -3166,8 +3258,8 @@ mod converter_tests {
             mux::ModelParserCheckpointAck {
                 registration_wire_identity: wire3,
                 durable_pane_id: uuid::Uuid::from_bytes(uuid3),
-                parser_stream_bytes: 3072,
-                terminal_checkpoint: make_test_checkpoint(24, 40),
+                parser_stream_bytes: 6,
+                terminal_checkpoint: make_test_checkpoint(24, 40, b"three\n"),
             },
         );
 
@@ -3247,7 +3339,7 @@ mod converter_tests {
                 registration_wire_identity: [9u8; 16],
                 durable_pane_id: uuid::Uuid::new_v4(),
                 parser_stream_bytes: 1024,
-                terminal_checkpoint: make_test_checkpoint(24, 80),
+                terminal_checkpoint: make_test_checkpoint(24, 80, b"extra\n"),
             },
         );
 
@@ -3318,7 +3410,9 @@ mod converter_tests {
     #[test]
     fn test_converter_preserves_zero_parser_stream_bytes_without_invented_receipts() {
         let (meta, captured, mut acks, refs) = make_test_fixture();
-        acks.get_mut(&101).unwrap().parser_stream_bytes = 0;
+        let ack = acks.get_mut(&101).unwrap();
+        ack.terminal_checkpoint = make_test_checkpoint(24, 40, b"");
+        ack.parser_stream_bytes = ack.terminal_checkpoint.parser_stream_bytes();
 
         let image =
             MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
@@ -3360,6 +3454,92 @@ mod converter_tests {
                 .checkpoint
                 .registration_wire_identity,
             wire_identity
+        );
+    }
+
+    #[test]
+    fn test_converter_rejects_ack_checkpoint_watermark_mismatch() {
+        let (meta, captured, mut acks, refs) = make_test_fixture();
+        acks.get_mut(&101).unwrap().parser_stream_bytes = 5;
+        let error =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            MuxRecoveryImageError::ParserStreamWatermarkMismatch {
+                pane_id: 101,
+                ack: 5,
+                checkpoint: 4
+            }
+        );
+    }
+
+    #[test]
+    fn test_converter_rejects_missing_ordered_tab_instead_of_dropping_it() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.windows[0].ordered_tab_ids.push(999);
+        let error =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            MuxRecoveryImageError::InvalidCapturedTopology("ordered tab is missing or repeated")
+        );
+    }
+
+    #[test]
+    fn test_converter_rejects_invalid_active_tab_instead_of_selecting_first() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.windows[0].active_tab_index = Some(99);
+        let error =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            MuxRecoveryImageError::InvalidCapturedTopology(
+                "active tab index is missing or invalid"
+            )
+        );
+    }
+
+    #[test]
+    fn test_converter_rejects_missing_active_pane_instead_of_selecting_first() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.tabs[0].active_pane_id = None;
+        let error =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            MuxRecoveryImageError::InvalidCapturedTopology("nonempty tab has no active pane")
+        );
+    }
+
+    #[test]
+    fn test_converter_preserves_position_units_origin_and_absent_focus() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.windows[0].position = Some(config::GuiPosition {
+            x: config::Dimension::Percent(0.25),
+            y: config::Dimension::Cells(-2.5),
+            origin: config::GeometryOrigin::Named("external-display".to_owned()),
+        });
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        assert_eq!(image.topology.focused_window_id, None);
+        assert_eq!(
+            image.topology.windows[0].gui_position,
+            Some(RecoveryGuiPosition {
+                x: RecoveryGuiDimension::Percent(0.25_f32.to_bits()),
+                y: RecoveryGuiDimension::Cells((-2.5_f32).to_bits()),
+                origin: RecoveryGeometryOrigin::Named("external-display".to_owned()),
+            })
+        );
+        let decoded =
+            MuxRecoveryImage::from_json_slice(&image.to_canonical_json().unwrap()).unwrap();
+        assert_eq!(
+            decoded.topology.windows[0].gui_position,
+            image.topology.windows[0].gui_position
         );
     }
 }

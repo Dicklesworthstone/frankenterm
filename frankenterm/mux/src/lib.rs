@@ -357,15 +357,9 @@ pub enum MuxTopologyCaptureError {
         source: WindowOrderSnapshotError,
     },
     #[error("tab capture failed for tab {tab_id}: {message}")]
-    TabCapture {
-        tab_id: TabId,
-        message: String,
-    },
+    TabCapture { tab_id: TabId, message: String },
     #[error("window count {count} exceeds configured limit {max}")]
-    TooManyWindows {
-        count: usize,
-        max: usize,
-    },
+    TooManyWindows { count: usize, max: usize },
     #[error("tab count {count} in window {window_id} exceeds limit {max}")]
     TooManyTabs {
         window_id: WindowId,
@@ -373,15 +367,9 @@ pub enum MuxTopologyCaptureError {
         max: usize,
     },
     #[error("pane count {count} exceeds configured limit {max}")]
-    TooManyPanes {
-        count: usize,
-        max: usize,
-    },
+    TooManyPanes { count: usize, max: usize },
     #[error("tree depth {depth} exceeds configured limit {max}")]
-    TreeDepthExceeded {
-        depth: usize,
-        max: usize,
-    },
+    TreeDepthExceeded { depth: usize, max: usize },
     #[error("pane registration missing for pane {0}")]
     MissingPaneRegistration(PaneId),
     #[error("domain {0} missing from mux registry")]
@@ -4847,13 +4835,10 @@ mod pane_registration_handle {
             if durable_pane_id.is_nil() {
                 return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
             }
-            let (request_id, completion) =
-                self.generation.live_parser_checkpoint.register_model_checkpoint(
-                    &pane,
-                    &self.generation,
-                    durable_pane_id,
-                    limits,
-                )?;
+            let (request_id, completion) = self
+                .generation
+                .live_parser_checkpoint
+                .register_model_checkpoint(&pane, &self.generation, durable_pane_id, limits)?;
             let result = match completion.recv_timeout(timeout) {
                 Ok(result) => result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -10133,7 +10118,9 @@ fn attempt_live_parser_checkpoint(
             return LiveParserAttemptOutcome::Completed;
         };
         if !request.expected_pane.ptr_eq(&Arc::downgrade(&pane))
-            || !request.expected_generation.ptr_eq(&Arc::downgrade(generation))
+            || !request
+                .expected_generation
+                .ptr_eq(&Arc::downgrade(generation))
         {
             control.complete_model_capture(
                 request.request_id,
@@ -18272,9 +18259,8 @@ impl Mux {
                         .map(|t| t.tab_id())
                         .collect();
                     let active_tab_id = frozen_order.active_tab.as_ref().map(|t| t.tab_id());
-                    let active_tab_index = active_tab_id.and_then(|id| {
-                        ordered_tab_ids.iter().position(|&tab_id| tab_id == id)
-                    });
+                    let active_tab_index = active_tab_id
+                        .and_then(|id| ordered_tab_ids.iter().position(|&tab_id| tab_id == id));
 
                     window_snapshots.push(MuxCapturedWindow {
                         window_id,
@@ -18302,12 +18288,12 @@ impl Mux {
             let mut captured_tabs = Vec::new();
             for (window_id, workspace, tabs) in window_tabs {
                 for tab in tabs.iter() {
-                    let captured_tab = tab
-                        .capture_tab_topology(window_id, &workspace)
-                        .map_err(|err| MuxTopologyCaptureError::TabCapture {
-                            tab_id: tab.tab_id(),
-                            message: err.to_string(),
-                        })?;
+                    let captured_tab =
+                        tab.capture_tab_topology(window_id, &workspace)
+                            .map_err(|err| MuxTopologyCaptureError::TabCapture {
+                                tab_id: tab.tab_id(),
+                                message: err.to_string(),
+                            })?;
                     captured_tabs.push(captured_tab);
                 }
             }
@@ -18321,13 +18307,21 @@ impl Mux {
             }
             // Only clone handles under registry locks. Pane and domain callbacks
             // may re-enter the mux; never invoke them through registry guards.
-            let panes_guard: HashMap<_, _> = self.panes.read().iter().map(|(&id, reg)| {
-                (id, CapturedRegistration {
-                    pane: Arc::clone(&reg.pane),
-                    generation: Arc::clone(&reg.generation),
-                    domain_id: reg.domain_id,
+            let panes_guard: HashMap<_, _> = self
+                .panes
+                .read()
+                .iter()
+                .map(|(&id, reg)| {
+                    (
+                        id,
+                        CapturedRegistration {
+                            pane: Arc::clone(&reg.pane),
+                            generation: Arc::clone(&reg.generation),
+                            domain_id: reg.domain_id,
+                        },
+                    )
                 })
-            }).collect();
+                .collect();
             let domains_guard = self.domains.read().clone();
 
             let mut pane_bindings = Vec::new();
@@ -18338,7 +18332,11 @@ impl Mux {
                     for (stack_index, &pane_id) in stack.pane_ids.iter().enumerate() {
                         stack_membership.insert(
                             pane_id,
-                            (stack.slot_index, stack_index, stack_index == stack.active_index),
+                            (
+                                stack.slot_index,
+                                stack_index,
+                                stack_index == stack.active_index,
+                            ),
                         );
                     }
                 }
@@ -18355,9 +18353,9 @@ impl Mux {
                         });
                     }
 
-                    let reg = panes_guard
-                        .get(&entry.pane_id)
-                        .ok_or(MuxTopologyCaptureError::MissingPaneRegistration(entry.pane_id))?;
+                    let reg = panes_guard.get(&entry.pane_id).ok_or(
+                        MuxTopologyCaptureError::MissingPaneRegistration(entry.pane_id),
+                    )?;
                     let domain = domains_guard
                         .get(&reg.domain_id)
                         .ok_or(MuxTopologyCaptureError::MissingDomain(reg.domain_id))?;
@@ -18471,10 +18469,7 @@ impl Mux {
                                 .map(|u| u.to_string()),
                             size,
                             alt_screen_active: reg.pane.is_alt_screen_active(),
-                            cursor_pos: (
-                                cursor.x,
-                                usize::try_from(cursor.y).unwrap_or(0),
-                            ),
+                            cursor_pos: (cursor.x, usize::try_from(cursor.y).unwrap_or(0)),
                             is_active_in_tab: false,
                             is_zoomed_in_tab: false,
                         });
@@ -18535,10 +18530,7 @@ impl Mux {
                             .map(|u| u.to_string()),
                         size,
                         alt_screen_active: reg.pane.is_alt_screen_active(),
-                        cursor_pos: (
-                            cursor.x,
-                            usize::try_from(cursor.y).unwrap_or(0),
-                        ),
+                        cursor_pos: (cursor.x, usize::try_from(cursor.y).unwrap_or(0)),
                         is_active_in_tab: tab.active_pane_id == Some(fp.pane_id),
                         is_zoomed_in_tab: tab.zoomed_pane_id == Some(fp.pane_id),
                     });
@@ -18548,7 +18540,8 @@ impl Mux {
             let registrations_current = {
                 let live = self.panes.read();
                 pane_bindings.iter().all(|binding| {
-                    live.get(&binding.pane_id).zip(panes_guard.get(&binding.pane_id))
+                    live.get(&binding.pane_id)
+                        .zip(panes_guard.get(&binding.pane_id))
                         .is_some_and(|(current, captured)| {
                             Arc::ptr_eq(&current.pane, &captured.pane)
                                 && Arc::ptr_eq(&current.generation, &captured.generation)
@@ -18575,7 +18568,9 @@ impl Mux {
             for client_id in client_ids {
                 if let Some((_, win_id, _, _)) = self.resolve_focused_pane(&client_id) {
                     if let Some(win) = window_snapshots.iter().find(|w| w.window_id == win_id) {
-                        client_focused_windows.entry(win.workspace.clone()).or_insert(win_id);
+                        client_focused_windows
+                            .entry(win.workspace.clone())
+                            .or_insert(win_id);
                     }
                 }
             }
@@ -18595,14 +18590,13 @@ impl Mux {
             workspaces.sort_by(|a, b| a.name.cmp(&b.name));
 
             // Client workspace binding (per-client identity)
-            let client_workspace = capture_identity
-                .and_then(|ident| {
-                    self.active_workspace_for_client_if_same(&ident)
-                        .map(|active| MuxCapturedClientWorkspaceBinding {
-                            client_id: format!("{}:{}:{}", ident.username, ident.hostname, ident.id),
-                            active_workspace: active,
-                        })
-                });
+            let client_workspace = capture_identity.and_then(|ident| {
+                self.active_workspace_for_client_if_same(&ident)
+                    .map(|active| MuxCapturedClientWorkspaceBinding {
+                        client_id: format!("{}:{}:{}", ident.username, ident.hostname, ident.id),
+                        active_workspace: active,
+                    })
+            });
 
             // Re-verify topology revision at the end of the cut
             let final_stamp = {
@@ -37317,7 +37311,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                LiveParserCheckpointError::StaleRegistration | LiveParserCheckpointError::ReaderDead
+                LiveParserCheckpointError::StaleRegistration
+                    | LiveParserCheckpointError::ReaderDead
             ),
             "unexpected error variant: {err:?}",
         );

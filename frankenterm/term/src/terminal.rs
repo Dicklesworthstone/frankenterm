@@ -1070,7 +1070,10 @@ impl Terminal {
     pub fn capture_staged(
         &self,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
-    ) -> Result<crate::terminalstate::checkpoint::StagedHotCheckpoint, RecoveryTerminalCheckpointError> {
+    ) -> Result<
+        crate::terminalstate::checkpoint::StagedHotCheckpoint,
+        RecoveryTerminalCheckpointError,
+    > {
         crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_staged(&self.state, limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
     }
@@ -1082,15 +1085,16 @@ impl Terminal {
         interval: crate::config::ScrollbackInterval,
         replacements: std::collections::BTreeMap<StableRowIndex, termwiz::surface::Line>,
     ) {
-        self.state.screen.screen.cold_row_fragments = Some(Arc::new(crate::screen::ColdRowFragments {
+        let screen = self.state.screen_mut();
+        screen.cold_row_fragments = Some(Arc::new(crate::screen::ColdRowFragments {
             sink,
             interval,
             rows: replacements,
-            aligned_frontier: self.state.screen.screen.phys_to_stable_row_index(0),
+            aligned_frontier: screen.phys_to_stable_row_index(0),
             aligned_source_start: 0,
-            cols: self.state.screen.screen.physical_cols,
-            dpi: self.state.screen.screen.dpi,
-            policy: self.state.screen.screen.resize_wrap_policy,
+            cols: screen.physical_cols,
+            dpi: screen.dpi,
+            policy: screen.resize_wrap_policy,
         }));
     }
 

@@ -670,7 +670,9 @@ impl ColdSeamReflow {
                 || count >= ScreenLineRead::MAX_ROWS
                 || previous.aligned_frontier != self.frontier
                 || !Arc::ptr_eq(&previous.sink, &self.sink)
-                || !self.interval.retains(&previous.interval, start..self.frontier)
+                || !self
+                    .interval
+                    .retains(&previous.interval, start..self.frontier)
             {
                 return None;
             }
@@ -4483,12 +4485,10 @@ impl Screen {
         self.preflight_resident_checkpoint_usage(limits, usage)?;
 
         if let Some(recovery) = self.recovery_scrollback {
-            let oldest_stable = StableRowIndex::try_from(resident_oldest).map_err(|_| {
-                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-            })?;
-            let resident_count = StableRowIndex::try_from(self.lines.len()).map_err(|_| {
-                ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-            })?;
+            let oldest_stable = StableRowIndex::try_from(resident_oldest)
+                .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
+            let resident_count = StableRowIndex::try_from(self.lines.len())
+                .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
             let resident_newest = oldest_stable
                 .checked_add(resident_count)
                 .ok_or(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
@@ -4496,10 +4496,8 @@ impl Screen {
             if boundary < oldest_stable || boundary > resident_newest {
                 return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
             }
-            let cold_prefix_line_count =
-                usize::try_from(boundary - oldest_stable).map_err(|_| {
-                    ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
-                })?;
+            let cold_prefix_line_count = usize::try_from(boundary - oldest_stable)
+                .map_err(|_| ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent)?;
             if !self.allow_scrollback
                 && (cold_prefix_line_count != 0 || recovery.expected_generation.is_some())
             {
@@ -4512,7 +4510,11 @@ impl Screen {
             keyboard_stack.extend(self.keyboard_stack.iter().cloned());
 
             return Ok(StagedScreenCheckpoint {
-                resident_lines: self.lines.iter().map(Line::semantic_checkpoint_clone).collect(),
+                resident_lines: self
+                    .lines
+                    .iter()
+                    .map(Line::semantic_checkpoint_clone)
+                    .collect(),
                 resident_oldest,
                 cold_snapshot_generation: recovery.expected_generation,
                 cold_prefix_line_count,
@@ -4528,17 +4530,16 @@ impl Screen {
 
         let cold_source = if self.allow_scrollback {
             if let Some(sink) = self.config.scrollback_spill_sink() {
-                let expected_newest_exclusive = StableRowIndex::try_from(resident_oldest)
-                    .map_err(|_| {
+                let expected_newest_exclusive =
+                    StableRowIndex::try_from(resident_oldest).map_err(|_| {
                         ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
                     })?;
                 let max_cold_bytes =
                     u64::try_from(limits.max_cold_scrollback_bytes).map_err(|_| {
-                        ScreenCheckpointCaptureError::ArithmeticOverflow(
-                            "cold_scrollback_bytes",
-                        )
+                        ScreenCheckpointCaptureError::ArithmeticOverflow("cold_scrollback_bytes")
                     })?;
-                let (before_interval, fragments) = if let Some(fragments) = &self.cold_row_fragments {
+                let (before_interval, fragments) = if let Some(fragments) = &self.cold_row_fragments
+                {
                     let crate::config::ScrollbackIntervalCapture::Ready(before) =
                         sink.try_capture_scrollback_interval()
                     else {
@@ -4583,7 +4584,11 @@ impl Screen {
         keyboard_stack.extend(self.keyboard_stack.iter().cloned());
 
         Ok(StagedScreenCheckpoint {
-            resident_lines: self.lines.iter().map(Line::semantic_checkpoint_clone).collect(),
+            resident_lines: self
+                .lines
+                .iter()
+                .map(Line::semantic_checkpoint_clone)
+                .collect(),
             resident_oldest,
             cold_snapshot_generation: None,
             cold_prefix_line_count: 0,
@@ -4643,9 +4648,7 @@ impl StagedScreenCheckpoint {
                             .max_retained_capture_bytes
                             .saturating_sub(usage.retained_capture_bytes)
                 {
-                    return Err(
-                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                    );
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
                 let oldest = match (snapshot.oldest_stable_row(), snapshot.rows().is_empty()) {
                     (None, true) => self.resident_oldest,
@@ -4661,9 +4664,7 @@ impl StagedScreenCheckpoint {
                 if oldest > self.resident_oldest
                     || self.resident_oldest.checked_sub(oldest) != Some(snapshot.rows().len())
                 {
-                    return Err(
-                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                    );
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
                 let generation = snapshot.generation();
                 let cold_prefix_line_count = snapshot.rows().len();
@@ -4671,14 +4672,10 @@ impl StagedScreenCheckpoint {
                 let crate::config::ScrollbackIntervalCapture::Ready(after) =
                     cold.sink.try_capture_scrollback_interval()
                 else {
-                    return Err(
-                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                    );
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 };
                 if !after.same_lineage(&cold.before_interval) {
-                    return Err(
-                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                    );
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
                 let oldest_stable = StableRowIndex::try_from(oldest).map_err(|_| {
                     ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent
@@ -4687,32 +4684,28 @@ impl StagedScreenCheckpoint {
                     && (!after.retains(
                         &cold.before_interval,
                         oldest_stable..cold.expected_newest_exclusive,
-                    ) || cold.before_interval
+                    ) || cold
+                        .before_interval
                         .rows()
                         .is_none_or(|rows| rows.start != oldest_stable)
-                        || after
-                            .rows()
-                            .is_none_or(|rows| rows.start != oldest_stable))
+                        || after.rows().is_none_or(|rows| rows.start != oldest_stable))
                 {
-                    return Err(
-                        ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                    );
+                    return Err(ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent);
                 }
 
                 let mut cold_lines = snapshot.into_rows();
                 for (index, line) in cold_lines.iter_mut().enumerate() {
-                    let stable_idx = match oldest_stable.checked_add(index as StableRowIndex) {
-                        Some(idx) => idx,
-                        None => {
-                            return Err(
+                    let stable_idx =
+                        match oldest_stable.checked_add(index as StableRowIndex) {
+                            Some(idx) => idx,
+                            None => return Err(
                                 ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent,
-                            )
-                        }
-                    };
-                    if let Some(replacement) =
-                        cold.fragments.as_ref().and_then(|fragments| {
-                            fragments.rows.get(&stable_idx)
-                        })
+                            ),
+                        };
+                    if let Some(replacement) = cold
+                        .fragments
+                        .as_ref()
+                        .and_then(|fragments| fragments.rows.get(&stable_idx))
                     {
                         inspect_checkpoint_line(replacement, limits, usage)?;
                         *line = replacement.semantic_checkpoint_clone();
@@ -4731,9 +4724,12 @@ impl StagedScreenCheckpoint {
                 )
             };
 
-        let total_lines = cold_lines.len().checked_add(self.resident_lines.len()).ok_or(
-            ScreenCheckpointCaptureError::ArithmeticOverflow("screen_lines"),
-        )?;
+        let total_lines = cold_lines
+            .len()
+            .checked_add(self.resident_lines.len())
+            .ok_or(ScreenCheckpointCaptureError::ArithmeticOverflow(
+                "screen_lines",
+            ))?;
         if usage.lines > limits.max_total_lines {
             return Err(ScreenCheckpointCaptureError::ResourceLimit {
                 resource: "screen_lines",
@@ -4762,7 +4758,6 @@ impl StagedScreenCheckpoint {
             saved_cursor: self.saved_cursor,
         })
     }
-
 }
 
 impl Screen {
@@ -9219,8 +9214,7 @@ pub(crate) mod tests {
                 let reference = reference.hydrate(|| false).unwrap();
                 assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
                 let (actual_fragments, actual_rows) = ready.replacement.as_ref().unwrap();
-                let (expected_fragments, expected_rows) =
-                    reference.replacement.as_ref().unwrap();
+                let (expected_fragments, expected_rows) = reference.replacement.as_ref().unwrap();
                 assert_eq!(actual_fragments.rows, expected_fragments.rows);
                 assert_eq!(actual_rows, expected_rows);
                 assert_eq!(ready.source, reference.source);
@@ -9235,7 +9229,10 @@ pub(crate) mod tests {
                         .iter()
                         .map(|line| line.as_str().into_owned())
                         .collect::<String>();
-                assert_eq!(actual.trim_end(), format!("{cold_text}{head_text}{tail_text}"));
+                assert_eq!(
+                    actual.trim_end(),
+                    format!("{cold_text}{head_text}{tail_text}")
+                );
             }
         }
     }

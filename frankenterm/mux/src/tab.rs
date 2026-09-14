@@ -5338,8 +5338,9 @@ impl Tab {
                                 .panes()
                                 .iter()
                                 .map(|pane| {
-                                    pane_ids.get(&pane_identity(pane)).copied()
-                                        .ok_or_else(|| anyhow::anyhow!("stack member missing from capture census"))
+                                    pane_ids.get(&pane_identity(pane)).copied().ok_or_else(|| {
+                                        anyhow::anyhow!("stack member missing from capture census")
+                                    })
                                 })
                                 .collect::<anyhow::Result<_>>()?;
                             if stack.active_index() >= stack_pane_ids.len() {
@@ -5386,10 +5387,12 @@ impl Tab {
                 check_pane_tree_depth(t, 1, 64)?;
             }
 
-            let active_pane_id =
-                active.as_ref().and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
-            let zoomed_pane_id =
-                zoomed.as_ref().and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+            let active_pane_id = active
+                .as_ref()
+                .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+            let zoomed_pane_id = zoomed
+                .as_ref()
+                .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
 
             let split_tree = match tree {
                 Some(tree) => pane_tree(

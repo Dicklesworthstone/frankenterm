@@ -635,11 +635,26 @@ impl EncryptedRecoveryObject {
     /// Framing:
     /// `MAGIC(8) || FORMAT_VERSION(4) || HEADER_JSON_LEN(4) || HEADER_JSON(N) || CIPHERTEXT_LEN(8) || CIPHERTEXT(M)`
     ///
-    /// The entire byte slice returned by this method is what `%570` (`snapshot_repair.rs`) ingests
+    /// The entire byte slice returned by this method is what `snapshot_repair` ingests
     /// to generate systematic RaptorQ repair symbols.
     pub fn to_bytes(&self) -> Result<Vec<u8>, RepresentationError> {
-        let header_json = serde_json::to_vec(&self.header)
-            .map_err(|e| RepresentationError::SerializationError { reason: e.to_string() })?;
+        if self.ciphertext.len() > MAX_ENVELOPE_BYTES.saturating_sub(24) {
+            return Err(RepresentationError::EnvelopeTooLarge {
+                size: self.ciphertext.len().saturating_add(24),
+                limit: MAX_ENVELOPE_BYTES,
+            });
+        }
+        let header_json = serde_json::to_vec(&self.header).map_err(|e| {
+            RepresentationError::SerializationError {
+                reason: e.to_string(),
+            }
+        })?;
+        if header_json.len() > MAX_HEADER_JSON_BYTES {
+            return Err(RepresentationError::HeaderTooLarge {
+                size: header_json.len(),
+                limit: MAX_HEADER_JSON_BYTES,
+            });
+        }
         let header_len = u32::try_from(header_json.len()).map_err(|_| {
             RepresentationError::SerializationError {
                 reason: "header JSON exceeds u32::MAX".into(),
@@ -651,8 +666,26 @@ impl EncryptedRecoveryObject {
             }
         })?;
 
-        let mut bytes =
-            Vec::with_capacity(8 + 4 + 4 + header_json.len() + 8 + self.ciphertext.len());
+        let total_len = self
+            .ciphertext
+            .len()
+            .checked_add(header_json.len())
+            .and_then(|len| len.checked_add(24))
+            .filter(|len| *len <= MAX_ENVELOPE_BYTES)
+            .ok_or(RepresentationError::EnvelopeTooLarge {
+                size: self
+                    .ciphertext
+                    .len()
+                    .saturating_add(header_json.len())
+                    .saturating_add(24),
+                limit: MAX_ENVELOPE_BYTES,
+            })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| RepresentationError::AllocationFailed {
+                operation: "serialize encrypted recovery envelope",
+            })?;
         bytes.extend_from_slice(&self.header.magic);
         bytes.extend_from_slice(&self.header.format_version.to_be_bytes());
         bytes.extend_from_slice(&header_len.to_be_bytes());
@@ -696,8 +729,7 @@ impl EncryptedRecoveryObject {
                 version: format_version,
             });
         }
-        let header_len =
-            u32::from_be_bytes([slice[12], slice[13], slice[14], slice[15]]) as usize;
+        let header_len = u32::from_be_bytes([slice[12], slice[13], slice[14], slice[15]]) as usize;
         if header_len > MAX_HEADER_JSON_BYTES {
             return Err(RepresentationError::HeaderTooLarge {
                 size: header_len,
@@ -711,14 +743,17 @@ impl EncryptedRecoveryObject {
             });
         }
         let header_bytes = &slice[16..header_end];
-        let header: RecoveryObjectHeader = serde_json::from_slice(header_bytes)
-            .map_err(|e| RepresentationError::MalformedRepresentation {
+        let header: RecoveryObjectHeader = serde_json::from_slice(header_bytes).map_err(|e| {
+            RepresentationError::MalformedRepresentation {
                 reason: format!("header JSON deserialization failed: {e}"),
-            })?;
+            }
+        })?;
 
         // Reject non-canonical envelope JSON to guarantee representation identity uniqueness
-        let canonical_header_json = serde_json::to_vec(&header)
-            .map_err(|e| RepresentationError::SerializationError { reason: e.to_string() })?;
+        let canonical_header_json =
+            serde_json::to_vec(&header).map_err(|e| RepresentationError::SerializationError {
+                reason: e.to_string(),
+            })?;
         if header_bytes != canonical_header_json.as_slice() {
             return Err(RepresentationError::MalformedRepresentation {
                 reason: "non-canonical header JSON encoding in recovery object envelope".into(),
@@ -937,8 +972,10 @@ fn compress_bounded(
     limit: usize,
 ) -> Result<Zeroizing<Vec<u8>>, RepresentationError> {
     let writer = BoundedWriter::new(limit);
-    let mut encoder = zstd::Encoder::new(writer, level)
-        .map_err(|e| RepresentationError::CompressionFailed { reason: e.to_string() })?;
+    let mut encoder =
+        zstd::Encoder::new(writer, level).map_err(|e| RepresentationError::CompressionFailed {
+            reason: e.to_string(),
+        })?;
 
     if let Err(e) = encoder.write_all(plaintext) {
         if encoder.get_ref().exceeded {
@@ -947,7 +984,9 @@ fn compress_bounded(
                 limit,
             });
         }
-        return Err(RepresentationError::CompressionFailed { reason: e.to_string() });
+        return Err(RepresentationError::CompressionFailed {
+            reason: e.to_string(),
+        });
     }
 
     // Keep ownership of the writer when final frame emission fails: otherwise a
@@ -961,7 +1000,9 @@ fn compress_bounded(
                     limit,
                 }
             } else {
-                RepresentationError::CompressionFailed { reason: error.to_string() }
+                RepresentationError::CompressionFailed {
+                    reason: error.to_string(),
+                }
             });
         }
     };
@@ -1044,21 +1085,30 @@ pub fn encode_recovery_object(
     let mut rng = SysRng;
     rng.try_fill_bytes(&mut nonce)
         .map_err(|e| RepresentationError::EntropyUnavailable {
-            reason: format!("failed to obtain {} bytes of entropy for nonce: {e}", NONCE_BYTES),
+            reason: format!(
+                "failed to obtain {} bytes of entropy for nonce: {e}",
+                NONCE_BYTES
+            ),
         })?;
 
     // 5. Compute AAD and encrypt via XChaCha20-Poly1305
     let aad = context.compute_canonical_aad();
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
-        .map_err(|e| RepresentationError::KeyError { reason: e.to_string() })?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes()).map_err(|e| {
+        RepresentationError::KeyError {
+            reason: e.to_string(),
+        }
+    })?;
     let xnonce = XNonce::from(nonce);
     let payload = Payload {
         msg: &compressed,
         aad: &aad,
     };
-    let ciphertext = cipher
-        .encrypt(&xnonce, payload)
-        .map_err(|e| RepresentationError::EncryptionFailed { reason: e.to_string() })?;
+    let ciphertext =
+        cipher
+            .encrypt(&xnonce, payload)
+            .map_err(|e| RepresentationError::EncryptionFailed {
+                reason: e.to_string(),
+            })?;
 
     let ciphertext_digest: [u8; 32] = Sha256::digest(&ciphertext).into();
 
@@ -1147,8 +1197,7 @@ pub fn decode_recovery_object(
         return Err(RepresentationError::MalformedRepresentation {
             reason: format!(
                 "inner context representation_version ({}) does not match header format_version ({})",
-                object.header.context.representation_version,
-                object.header.format_version
+                object.header.context.representation_version, object.header.format_version
             ),
         });
     }
@@ -1221,16 +1270,22 @@ pub fn decode_recovery_object(
 
     // 6. Decrypt via XChaCha20-Poly1305 with authenticated AAD
     let aad = object.header.context.compute_canonical_aad();
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
-        .map_err(|e| RepresentationError::KeyError { reason: e.to_string() })?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes()).map_err(|e| {
+        RepresentationError::KeyError {
+            reason: e.to_string(),
+        }
+    })?;
     let xnonce = XNonce::from(object.header.nonce);
     let payload = Payload {
         msg: &object.ciphertext,
         aad: &aad,
     };
-    let compressed_bytes = cipher
-        .decrypt(&xnonce, payload)
-        .map_err(|e| RepresentationError::DecryptionFailed { reason: e.to_string() })?;
+    let compressed_bytes =
+        cipher
+            .decrypt(&xnonce, payload)
+            .map_err(|e| RepresentationError::DecryptionFailed {
+                reason: e.to_string(),
+            })?;
     let compressed: Zeroizing<Vec<u8>> = Zeroizing::new(compressed_bytes);
 
     // 7. Verify compressed bytes digest
@@ -1253,10 +1308,12 @@ pub fn decode_recovery_object(
     }
 
     // 8. Bounded decompression guards (mandatory exact byte ceilings enforce strict limits)
-    let expected_uncompressed = usize::try_from(object.header.context.uncompressed_bytes)
-        .map_err(|_| RepresentationError::UncompressedLimitExceeded {
-            size: usize::MAX,
-            limit: config.max_uncompressed_bytes,
+    let expected_uncompressed =
+        usize::try_from(object.header.context.uncompressed_bytes).map_err(|_| {
+            RepresentationError::UncompressedLimitExceeded {
+                size: usize::MAX,
+                limit: config.max_uncompressed_bytes,
+            }
         })?;
 
     if expected_uncompressed > config.max_uncompressed_bytes {
@@ -1283,14 +1340,21 @@ pub fn decode_recovery_object(
     // allocates an ordinary Vec internally and can drop partial plaintext on an
     // error before the caller has a chance to wrap it.
     let mut decompressed = Zeroizing::new(Vec::new());
-    decompressed.try_reserve_exact(expected_uncompressed).map_err(|_| {
-        RepresentationError::AllocationFailed { operation: "decompression" }
-    })?;
+    decompressed
+        .try_reserve_exact(expected_uncompressed)
+        .map_err(|_| RepresentationError::AllocationFailed {
+            operation: "decompression",
+        })?;
     decompressed.resize(expected_uncompressed, 0);
-    let mut decoder = zstd::bulk::Decompressor::new()
-        .map_err(|e| RepresentationError::DecompressionFailed { reason: e.to_string() })?;
-    let decoded_len = decoder.decompress_to_buffer(&compressed, decompressed.as_mut_slice())
-        .map_err(|e| RepresentationError::DecompressionFailed { reason: e.to_string() })?;
+    let mut decoder =
+        zstd::bulk::Decompressor::new().map_err(|e| RepresentationError::DecompressionFailed {
+            reason: e.to_string(),
+        })?;
+    let decoded_len = decoder
+        .decompress_to_buffer(&compressed, decompressed.as_mut_slice())
+        .map_err(|e| RepresentationError::DecompressionFailed {
+            reason: e.to_string(),
+        })?;
     decompressed.truncate(decoded_len);
 
     if decompressed.len() != expected_uncompressed {
@@ -1359,7 +1423,11 @@ mod tests {
             object_id,
             RecoveryObjectKind::WholeMuxImage,
             generation,
-            if generation > 0 { Some(generation - 1) } else { None },
+            if generation > 0 {
+                Some(generation - 1)
+            } else {
+                None
+            },
             1747371642000,
         )
     }
@@ -1376,11 +1444,30 @@ mod tests {
             object_id,
             RecoveryObjectKind::ScrollbackSegment,
             generation,
-            if generation > 0 { Some(generation - 1) } else { None },
+            if generation > 0 {
+                Some(generation - 1)
+            } else {
+                None
+            },
             1747371642000,
             chunk_index,
             chunk_count,
         )
+    }
+
+    #[test]
+    fn serialized_envelope_limit_includes_header_and_framing() {
+        let key = RecoveryKey::from_bytes([7; KEY_BYTES]).unwrap();
+        let mut object =
+            encode_recovery_object(b"small", sample_metadata(1, 1), &key, None).unwrap();
+        object.ciphertext.resize(MAX_ENVELOPE_BYTES - 24, 0);
+        assert!(matches!(
+            object.to_bytes(),
+            Err(RepresentationError::EnvelopeTooLarge {
+                limit: MAX_ENVELOPE_BYTES,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1396,7 +1483,10 @@ mod tests {
         assert_eq!(encrypted.header.magic, RECOVERY_OBJECT_MAGIC);
         assert_eq!(encrypted.header.format_version, RECOVERY_FORMAT_VERSION);
         assert_eq!(encrypted.header.context.object_id, metadata.object_id);
-        assert_eq!(encrypted.header.context.uncompressed_bytes, payload.len() as u64);
+        assert_eq!(
+            encrypted.header.context.uncompressed_bytes,
+            payload.len() as u64
+        );
 
         let decoded = decode_recovery_object(&encrypted, &expected, &key, None)
             .expect("decoding must succeed");
@@ -1413,12 +1503,12 @@ mod tests {
         let metadata = sample_metadata(7, 1);
         let expected = ExpectedContext::from_metadata(&metadata);
 
-        let encrypted = encode_recovery_object(payload, metadata, &key, None)
-            .expect("encoding must succeed");
+        let encrypted =
+            encode_recovery_object(payload, metadata, &key, None).expect("encoding must succeed");
 
         let wire_bytes = encrypted.to_bytes().expect("serialization must succeed");
-        let parsed = EncryptedRecoveryObject::from_bytes(&wire_bytes)
-            .expect("deserialization must succeed");
+        let parsed =
+            EncryptedRecoveryObject::from_bytes(&wire_bytes).expect("deserialization must succeed");
 
         assert_eq!(parsed.header, encrypted.header);
         assert_eq!(parsed.ciphertext, encrypted.ciphertext);
@@ -1493,8 +1583,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err =
-            encode_recovery_object(&noise, metadata, &key, Some(&strict_config)).unwrap_err();
+        let err = encode_recovery_object(&noise, metadata, &key, Some(&strict_config)).unwrap_err();
         assert!(matches!(
             err,
             RepresentationError::CompressedLimitExceeded { limit: 50, .. }
@@ -1550,8 +1639,8 @@ mod tests {
             header: huge_obj.header.clone(),
             ciphertext: vec![0u8; 64 + AEAD_TAG_BYTES + 1],
         };
-        let err2 = decode_recovery_object(&over_budget_obj, &expected, &key, Some(&config))
-            .unwrap_err();
+        let err2 =
+            decode_recovery_object(&over_budget_obj, &expected, &key, Some(&config)).unwrap_err();
         assert!(matches!(
             err2,
             RepresentationError::CiphertextTooLarge { .. }
@@ -1572,8 +1661,9 @@ mod tests {
         let mut over_compressed_meta_obj = huge_obj.clone();
         over_compressed_meta_obj.ciphertext = vec![0u8; 32];
         over_compressed_meta_obj.header.context.compressed_bytes = 200;
-        let err4 = decode_recovery_object(&over_compressed_meta_obj, &expected, &key, Some(&config))
-            .unwrap_err();
+        let err4 =
+            decode_recovery_object(&over_compressed_meta_obj, &expected, &key, Some(&config))
+                .unwrap_err();
         assert!(matches!(
             err4,
             RepresentationError::CompressedLimitExceeded { limit: 64, .. }
@@ -1604,13 +1694,9 @@ mod tests {
         expected_some_zero.predecessor_generation = Some(0);
 
         // Because AAD encodes discriminant 0 for None vs 1 for Some, Poly1305 MUST reject!
-        let err_sub = decode_recovery_object(
-            &tampered_none_to_some,
-            &expected_some_zero,
-            &key,
-            None,
-        )
-        .unwrap_err();
+        let err_sub =
+            decode_recovery_object(&tampered_none_to_some, &expected_some_zero, &key, None)
+                .unwrap_err();
         assert!(
             matches!(err_sub, RepresentationError::DecryptionFailed { .. }),
             "expected DecryptionFailed on None -> Some(0) tag substitution, got: {:?}",
@@ -1631,13 +1717,9 @@ mod tests {
         let mut expected_none_sub = expected_some.clone();
         expected_none_sub.predecessor_generation = None;
 
-        let err_sub_b = decode_recovery_object(
-            &tampered_some_to_none,
-            &expected_none_sub,
-            &key,
-            None,
-        )
-        .unwrap_err();
+        let err_sub_b =
+            decode_recovery_object(&tampered_some_to_none, &expected_none_sub, &key, None)
+                .unwrap_err();
         assert!(
             matches!(err_sub_b, RepresentationError::DecryptionFailed { .. }),
             "expected DecryptionFailed on Some(0) -> None tag substitution, got: {:?}",
@@ -1687,7 +1769,10 @@ mod tests {
             chunk_count: 0,
         };
         let err_exp1 = decode_recovery_object(&valid_enc, &bad_exp1, &key, None).unwrap_err();
-        assert!(matches!(err_exp1, RepresentationError::InvalidMetadata { .. }));
+        assert!(matches!(
+            err_exp1,
+            RepresentationError::InvalidMetadata { .. }
+        ));
 
         let bad_exp2 = ExpectedContext {
             object_id: [0u8; 32],
@@ -1698,7 +1783,10 @@ mod tests {
             chunk_count: 1,
         };
         let err_exp2 = decode_recovery_object(&valid_enc, &bad_exp2, &key, None).unwrap_err();
-        assert!(matches!(err_exp2, RepresentationError::InvalidMetadata { .. }));
+        assert!(matches!(
+            err_exp2,
+            RepresentationError::InvalidMetadata { .. }
+        ));
     }
 
     #[test]
@@ -1719,7 +1807,7 @@ mod tests {
         // Insert an extra space into the header JSON to create non-canonical formatting
         let header_bytes = &canonical_wire[16..16 + header_len];
         let header_str = std::str::from_utf8(header_bytes).unwrap();
-        // {"magic": -> {"magic": 
+        // {"magic": -> {"magic":
         let non_canonical_str = header_str.replace("{\"magic\":", "{\"magic\": ");
         assert_ne!(header_str, non_canonical_str);
 
@@ -1758,13 +1846,19 @@ mod tests {
         let mut bad_ver = enc.clone();
         bad_ver.header.format_version = 999;
         let err2 = decode_recovery_object(&bad_ver, &expected, &key, None).unwrap_err();
-        assert!(matches!(err2, RepresentationError::UnsupportedVersion { version: 999 }));
+        assert!(matches!(
+            err2,
+            RepresentationError::UnsupportedVersion { version: 999 }
+        ));
 
         // 3. Inner context representation_version mismatch with header
         let mut bad_context_ver = enc.clone();
         bad_context_ver.header.context.representation_version = 999;
         let err3 = decode_recovery_object(&bad_context_ver, &expected, &key, None).unwrap_err();
-        assert!(matches!(err3, RepresentationError::MalformedRepresentation { .. }));
+        assert!(matches!(
+            err3,
+            RepresentationError::MalformedRepresentation { .. }
+        ));
     }
 
     #[test]
@@ -1787,14 +1881,16 @@ mod tests {
             obj0.canonical_filename().unwrap(),
             obj1.canonical_filename().unwrap()
         );
-        assert!(obj0
-            .canonical_filename()
-            .unwrap()
-            .contains("chunk0000-of-0002"));
-        assert!(obj1
-            .canonical_filename()
-            .unwrap()
-            .contains("chunk0001-of-0002"));
+        assert!(
+            obj0.canonical_filename()
+                .unwrap()
+                .contains("chunk0000-of-0002")
+        );
+        assert!(
+            obj1.canonical_filename()
+                .unwrap()
+                .contains("chunk0001-of-0002")
+        );
     }
 
     #[test]
@@ -1932,8 +2028,8 @@ mod tests {
         let mut tampered_expected = ExpectedContext::from_metadata(&metadata);
         tampered_expected.generation = 999;
 
-        let err4 = decode_recovery_object(&tampered_header, &tampered_expected, &key, None)
-            .unwrap_err();
+        let err4 =
+            decode_recovery_object(&tampered_header, &tampered_expected, &key, None).unwrap_err();
         assert!(matches!(err4, RepresentationError::DecryptionFailed { .. }));
     }
 
@@ -2045,8 +2141,8 @@ mod tests {
                 .expect("encode must succeed");
             assert_eq!(enc.header.context.object_kind, kind);
 
-            let decoded = decode_recovery_object(&enc, &expected, &key, None)
-                .expect("decode must succeed");
+            let decoded =
+                decode_recovery_object(&enc, &expected, &key, None).expect("decode must succeed");
             assert_eq!(decoded.plaintext(), payload.as_slice());
         }
     }

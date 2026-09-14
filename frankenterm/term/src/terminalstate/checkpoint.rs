@@ -2030,7 +2030,6 @@ impl CheckpointReplayConfigV2 {
     ) -> Result<bool, TerminalCheckpointError> {
         PendingReplayConfigV2::capture(config, limits)?.matches_checkpoint(self, tables)
     }
-
 }
 
 struct ReplayTerminalConfiguration {
@@ -4172,7 +4171,7 @@ impl TerminalCheckpointV2 {
 
     /// Cursor position as `(row, col)`.
     #[must_use]
-    pub fn cursor_position(&self) -> (VisibleRowIndex, usize) {
+    pub fn cursor_position(&self) -> (VisibleRowIndex, u64) {
         (self.cursor.y, self.cursor.x)
     }
 
@@ -4230,10 +4229,11 @@ impl ValidatedTerminalCheckpointV2 {
         &self,
     ) -> Result<Arc<dyn TerminalConfiguration>, TerminalCheckpointError> {
         let maps = decode_custom_cell_width_maps(&self.checkpoint.custom_cell_width_maps)?;
-        Ok(Arc::new(self.checkpoint.replay_config.to_replay_configuration(
-            self.limits,
-            &maps,
-        )?))
+        Ok(Arc::new(
+            self.checkpoint
+                .replay_config
+                .to_replay_configuration(self.limits, &maps)?,
+        ))
     }
 
     /// Reference to the underlying validated `TerminalCheckpointV2`.
@@ -5698,9 +5698,9 @@ mod tests {
                     crate::config::ScrollbackIntervalIdentity::default(),
                 ),
                 rows: std::sync::Mutex::new(Vec::new()),
-                generation: std::sync::Mutex::new(crate::config::ScrollbackSnapshotGeneration::new(
-                    [1; 16], 1,
-                )),
+                generation: std::sync::Mutex::new(
+                    crate::config::ScrollbackSnapshotGeneration::new([1; 16], 1),
+                ),
             }
         }
 
@@ -5709,8 +5709,7 @@ mod tests {
         }
 
         fn advance_identity(&self) {
-            *self.identity.lock().unwrap() =
-                crate::config::ScrollbackIntervalIdentity::default();
+            *self.identity.lock().unwrap() = crate::config::ScrollbackIntervalIdentity::default();
         }
     }
 
@@ -5762,7 +5761,8 @@ mod tests {
             &self,
             expected_newest_exclusive: StableRowIndex,
             _limits: crate::config::ScrollbackSnapshotLimits,
-        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError> {
+        ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+        {
             let rows = self.rows.lock().unwrap();
             let filtered: Vec<Line> = rows
                 .iter()
@@ -5772,7 +5772,9 @@ mod tests {
             let oldest = if filtered.is_empty() {
                 None
             } else {
-                filtered.first().and_then(|_| rows.first().map(|(idx, _)| *idx))
+                filtered
+                    .first()
+                    .and_then(|_| rows.first().map(|(idx, _)| *idx))
             };
             let gen = *self.generation.lock().unwrap();
             let count = filtered.len();
@@ -5792,7 +5794,8 @@ mod tests {
             _expected_generation: Option<crate::config::ScrollbackSnapshotGeneration>,
             _prefix: crate::config::ScrollbackPrefix<'_>,
             _max_retained_rows: usize,
-        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError> {
+        ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+        {
             Err(crate::config::ScrollbackSpillError::StorageUnavailable)
         }
     }

@@ -73,6 +73,196 @@ pub struct WholeMuxPanePublication<'a> {
     pub ack: &'a mux::ModelParserCheckpointAck,
 }
 
+/// Failures of the bounded model-only mux capture coordinator.
+#[cfg(feature = "frankenterm-deps")]
+#[derive(Debug, thiserror::Error)]
+pub enum WholeMuxCaptureError {
+    #[error("another snapshot owns this publication authority")]
+    Busy,
+    #[error("publication authority requires reconciliation")]
+    ReconciliationRequired,
+    #[error("capture timeout must be nonzero and at most thirty seconds")]
+    InvalidTimeout,
+    #[error("publication authority path is not representable")]
+    InvalidAuthorityPath,
+    #[error("model capture exhausted its total time budget")]
+    CaptureDeadline,
+    #[error("model capture exceeds the retained checkpoint byte limit")]
+    CaptureByteLimit,
+    #[error("mux topology or pane registration changed during model capture")]
+    StaleCapture,
+    #[error("capture capability context stopped")]
+    Context(#[from] SnapshotError),
+    #[error("coherent mux topology capture failed")]
+    Topology(#[from] mux::MuxTopologyCaptureError),
+    #[error("pane {pane_id} model capture failed")]
+    Pane {
+        pane_id: usize,
+        #[source]
+        source: mux::LiveParserCheckpointError,
+    },
+    #[error("encrypted model publication failed")]
+    Publication(#[source] anyhow::Error),
+}
+
+/// Capture actual mux/parser state and publish an encrypted offline model image.
+///
+/// Run on an owned blocking worker, never a mux or readiness thread. There is
+/// one attempt, at most 1,024 panes, a total deadline, and at most 100ms between
+/// caller cancellation checks while waiting for a parser ACK. PTY durability
+/// and guardian replay suffixes are not asserted by this model-only operation.
+/// All periodic/manual callers must share this store authority and this entry
+/// point. The store additionally serializes the final root CAS across processes.
+#[cfg(feature = "frankenterm-deps")]
+#[allow(clippy::too_many_lines)]
+pub fn capture_and_publish_whole_mux_model(
+    cx: &crate::cx::Cx,
+    mux: &mux::Mux,
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    key: Arc<crate::snapshot_representation::RecoveryKey>,
+    expected: &WholeMuxPublicationIdentity,
+    capture_timeout: Duration,
+) -> Result<crate::snapshot_publication::GenerationPublicationReceipt, WholeMuxCaptureError> {
+    snapshot_cx_checkpoint(cx)?;
+    if capture_timeout.is_zero() || capture_timeout > Duration::from_secs(30) {
+        return Err(WholeMuxCaptureError::InvalidTimeout);
+    }
+    let path = store
+        .root_path()
+        .to_str()
+        .ok_or(WholeMuxCaptureError::InvalidAuthorityPath)?;
+    // Reuse the existing canonical-path + filesystem-object identity registry.
+    // This names the pinned store directory; no SQLite connection is opened.
+    let authority = shared_snapshot_authority_state(path);
+    if authority.reconciliation_is_required() {
+        return Err(WholeMuxCaptureError::ReconciliationRequired);
+    }
+    if authority
+        .in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(WholeMuxCaptureError::Busy);
+    }
+    let attempt = SnapshotAuthorityAttemptGuard {
+        authority,
+        operation: SnapshotAuthorityOperation::CheckpointCommit,
+        handoff_state: Arc::new(AtomicU8::new(AUTHORITY_HANDOFF_PENDING)),
+        settled: false,
+    };
+    if attempt.authority.reconciliation_is_required() {
+        return Err(WholeMuxCaptureError::ReconciliationRequired);
+    }
+    let deadline = Instant::now()
+        .checked_add(capture_timeout)
+        .ok_or(WholeMuxCaptureError::InvalidTimeout)?;
+    let config = mux::MuxTopologyCaptureConfig {
+        max_attempts: 1,
+        max_panes: 1024,
+        ..Default::default()
+    };
+    let captured = mux.capture_topology_coherent(config)?;
+    if hex::encode(captured.session_incarnation.as_bytes()) != expected.mux_incarnation_id {
+        return Err(WholeMuxCaptureError::StaleCapture);
+    }
+    let mut acks = Vec::with_capacity(captured.pane_bindings.len());
+    let mut total_bytes = 0usize;
+    for pane in &captured.pane_bindings {
+        snapshot_cx_checkpoint(cx)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(WholeMuxCaptureError::CaptureDeadline)?;
+        let result = mux.capture_pane_model_checkpoint(
+            pane.pane_id,
+            frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            remaining.min(Duration::from_millis(100)),
+        );
+        snapshot_cx_checkpoint(cx)?;
+        let ack = result.map_err(|source| match source {
+            mux::LiveParserCheckpointError::StaleRegistration => WholeMuxCaptureError::StaleCapture,
+            mux::LiveParserCheckpointError::CheckpointBusy => WholeMuxCaptureError::Busy,
+            source => WholeMuxCaptureError::Pane {
+                pane_id: pane.pane_id,
+                source,
+            },
+        })?;
+        if ack.registration_wire_identity != pane.registration_wire_identity
+            || ack.durable_pane_id.to_string() != pane.pane_uuid
+        {
+            return Err(WholeMuxCaptureError::StaleCapture);
+        }
+        total_bytes = total_bytes
+            .checked_add(ack.terminal_checkpoint.canonical_payload().len())
+            .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+            .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
+        acks.push(ack);
+    }
+    snapshot_cx_checkpoint(cx)?;
+    if Instant::now() >= deadline {
+        return Err(WholeMuxCaptureError::CaptureDeadline);
+    }
+    let rechecked = mux.capture_topology_coherent(config)?;
+    if captured.session_incarnation != rechecked.session_incarnation
+        || captured.topology_revision != rechecked.topology_revision
+        || captured.windows != rechecked.windows
+        || captured.tabs != rechecked.tabs
+        || captured.pane_bindings != rechecked.pane_bindings
+        || captured.workspaces != rechecked.workspaces
+        || captured.client_workspace != rechecked.client_workspace
+        || captured.default_workspace != rechecked.default_workspace
+    {
+        return Err(WholeMuxCaptureError::StaleCapture);
+    }
+    snapshot_cx_checkpoint(cx)?;
+    // Capture identity is caller-owned; storage names additionally include the
+    // observed cut time so a failed encryption attempt is not blindly replayed.
+    let names: Vec<_> = captured
+        .pane_bindings
+        .iter()
+        .map(|pane| {
+            format!(
+                "model-{}-{}-{}",
+                expected.generation, captured.captured_at_epoch_ms, pane.pane_id
+            )
+        })
+        .collect();
+    let inputs: Vec<_> = captured
+        .pane_bindings
+        .iter()
+        .zip(&acks)
+        .zip(&names)
+        .map(|((pane, ack), name)| WholeMuxPanePublication {
+            pane_id: pane.pane_id,
+            object_id: name,
+            ack,
+        })
+        .collect();
+    attempt
+        .handoff_state
+        .store(AUTHORITY_HANDOFF_STARTED, Ordering::Release);
+    let result = publish_whole_mux_recovery(cx, store, &captured, &inputs, key, expected);
+    match result {
+        Ok(receipt) => {
+            attempt.settle();
+            Ok(receipt)
+        }
+        Err(error) => {
+            if error
+                .downcast_ref::<crate::snapshot_publication::PublicationError>()
+                .is_some()
+            {
+                // A filesystem error may follow root rename. Do not turn an
+                // unknown durable outcome into permission for another writer.
+                attempt.latch_and_settle();
+            } else {
+                attempt.settle();
+            }
+            Err(WholeMuxCaptureError::Publication(error))
+        }
+    }
+}
+
 /// Publish a complete encrypted model-only recovery generation.
 ///
 /// This synchronous, bounded operation belongs on the caller's blocking worker.
@@ -12360,6 +12550,90 @@ mod tests {
     use super::*;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
+
+    #[test]
+    #[cfg(feature = "frankenterm-deps")]
+    fn model_mux_capture_serializes_and_releases_prepublication_authority() {
+        let mux = mux::Mux::new(None);
+        let topology = mux.capture_topology_coherent(Default::default()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::snapshot_publication::SnapshotPublicationStore::open(
+            directory.path(),
+            Default::default(),
+        )
+        .unwrap();
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([21; 32]).unwrap());
+        let mut expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "empty-model-test".into(),
+            mux_incarnation_id: hex::encode(topology.session_incarnation.as_bytes()),
+            root_object_id: [22; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+        };
+        let authority = shared_snapshot_authority_state(store.root_path().to_str().unwrap());
+        authority.in_progress.store(true, Ordering::Release);
+        let held = SnapshotAuthorityReadGuard {
+            authority: Arc::clone(&authority),
+        };
+        let cx = crate::cx::Cx::for_testing();
+        assert!(matches!(
+            capture_and_publish_whole_mux_model(
+                &cx,
+                &mux,
+                &store,
+                Arc::clone(&key),
+                &expected,
+                Duration::from_secs(1),
+            ),
+            Err(WholeMuxCaptureError::Busy)
+        ));
+        drop(held);
+        let cancelled = crate::cx::Cx::for_testing();
+        cancelled.cancel_with(CancelKind::User, Some("model capture test"));
+        assert!(matches!(
+            capture_and_publish_whole_mux_model(
+                &cancelled,
+                &mux,
+                &store,
+                Arc::clone(&key),
+                &expected,
+                Duration::from_secs(1),
+            ),
+            Err(WholeMuxCaptureError::Context(SnapshotError::Cancelled))
+        ));
+        expected.mux_incarnation_id = "wrong-incarnation".into();
+        assert!(matches!(
+            capture_and_publish_whole_mux_model(
+                &cx,
+                &mux,
+                &store,
+                Arc::clone(&key),
+                &expected,
+                Duration::from_secs(1),
+            ),
+            Err(WholeMuxCaptureError::StaleCapture)
+        ));
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        assert!(!authority.reconciliation_is_required());
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        expected.mux_incarnation_id = hex::encode(topology.session_incarnation.as_bytes());
+        let receipt = capture_and_publish_whole_mux_model(
+            &cx,
+            &mux,
+            &store,
+            key,
+            &expected,
+            Duration::from_secs(1),
+        )
+        .expect("empty real mux can publish after rejected preflight attempts");
+        assert_eq!(receipt.generation, 1);
+        assert!(!authority.in_progress.load(Ordering::Acquire));
+        assert!(!authority.reconciliation_is_required());
+    }
 
     #[test]
     #[cfg(feature = "frankenterm-deps")]

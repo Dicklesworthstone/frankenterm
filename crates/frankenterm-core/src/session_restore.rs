@@ -44,40 +44,52 @@ use crate::snapshot_engine::{
 use crate::wezterm::WeztermHandle;
 use sha2::{Digest, Sha256};
 
+use crate::cx::Cx;
 use crate::mux_recovery_image::{
-    CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, PaneCheckpointBinding,
-    ParserCaptureIdentity, RecoveryDomain, RecoveryFloatingPane, RecoveryImageHeader,
-    RecoveryObjectRef, RecoveryPane, RecoverySplitNode, RecoveryTab, RecoveryTopology,
-    RecoveryWindow, SplitDirection as MuxSplitDirection, SplitDirectionAndSize, TerminalSize,
-    MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION,
+    CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, RecoveryImageHeader,
+    RecoveryPane, RecoveryTopology,
+};
+#[cfg(test)]
+use crate::mux_recovery_image::{
+    MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION, PaneCheckpointBinding,
+    ParserCaptureIdentity, RecoveryDomain, RecoveryFloatingPane, RecoveryObjectRef,
+    RecoverySplitNode, RecoveryTab, RecoveryWindow, SplitDirection as MuxSplitDirection,
+    SplitDirectionAndSize, TerminalSize,
+};
+#[cfg(test)]
+use crate::snapshot_publication::{
+    GenerationRootPublishRequest, PredecessorBinding, RecoveryObjectPayload, RootSlot,
+    TornRootDiagnostic, sha256_hex,
 };
 use crate::snapshot_publication::{
-    sha256_hex, GenerationRootPublishRequest, PredecessorBinding, PublicationError,
-    RecoveryObjectPayload, RootSlot, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
-    TornRootDiagnostic, VerifiedRootSelection,
+    PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
+    VerifiedRootSelection,
 };
+#[cfg(test)]
+use crate::snapshot_repair::RepairProtectionClass;
 use crate::snapshot_repair::{
     AuthenticatedRepairSymbol, EncodedRepairBundle, ExpectedRecoveryIdentity,
-    RepairAdmissionController, RepairError, RepairManifest, RepairProtectionClass, RepairPermit,
+    RepairAdmissionController, RepairError, RepairPermit,
 };
-use crate::cx::Cx;
 use crate::snapshot_representation::{
-    decode_recovery_object, EncryptedRecoveryObject, ExpectedContext, ObjectMetadata, RecoveryKey,
-    RecoveryObjectKind, RepresentationConfig, RepresentationError, RECOVERY_OBJECT_MAGIC,
+    EncryptedRecoveryObject, ExpectedContext, RECOVERY_OBJECT_MAGIC, RecoveryKey,
+    RecoveryObjectKind, RepresentationConfig, RepresentationError, decode_recovery_object,
 };
-use zeroize::Zeroizing;
-#[cfg(feature = "frankenterm-deps")]
-use frankenterm_term::color::{ColorPalette, Palette256, SrgbaTuple};
+#[cfg(test)]
+use crate::snapshot_representation::ObjectMetadata;
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use frankenterm_term::TerminalSize as TermSize;
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use frankenterm_term::color::ColorPalette;
 #[cfg(feature = "frankenterm-deps")]
 use frankenterm_term::config::TerminalConfiguration;
 #[cfg(feature = "frankenterm-deps")]
-use frankenterm_term::terminal::{InertTerminal, Terminal};
+use frankenterm_term::terminal::InertTerminal;
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use frankenterm_term::terminal::Terminal;
 #[cfg(feature = "frankenterm-deps")]
-use frankenterm_term::terminalstate::checkpoint::{
-    TerminalCheckpointLimits, TerminalCheckpointV2, ValidatedTerminalCheckpointV2,
-};
-#[cfg(feature = "frankenterm-deps")]
-use frankenterm_term::TerminalSize as TermSize;
+use frankenterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
+use zeroize::Zeroizing;
 
 // =============================================================================
 // Error type
@@ -6469,20 +6481,27 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
 /// Error during whole-mux recovery root verification, planning, or reconstruction.
 #[derive(Debug, thiserror::Error)]
 pub enum WholeMuxRecoveryError {
+    #[error("whole-mux recovery was cancelled")]
+    Cancelled,
+
     #[error("image decoding or schema validation failed: {0}")]
     Image(#[from] MuxRecoveryImageError),
 
     #[error("missing referenced checkpoint object '{0}' in publication store")]
     MissingCheckpointObject(String),
 
-    #[error("tampered checkpoint object payload for {object_id}: expected digest {expected}, computed {computed}")]
+    #[error(
+        "tampered checkpoint object payload for {object_id}: expected digest {expected}, computed {computed}"
+    )]
     CheckpointDigestMismatch {
         object_id: String,
         expected: String,
         computed: String,
     },
 
-    #[error("checkpoint payload size mismatch for {object_id}: expected {expected} bytes, observed {actual} bytes")]
+    #[error(
+        "checkpoint payload size mismatch for {object_id}: expected {expected} bytes, observed {actual} bytes"
+    )]
     CheckpointSizeMismatch {
         object_id: String,
         expected: u64,
@@ -6490,21 +6509,15 @@ pub enum WholeMuxRecoveryError {
     },
 
     #[error("unverified terminal checkpoint state for pane {pane_id}: {reason}")]
-    UnverifiedTerminalState {
-        pane_id: u64,
-        reason: String,
-    },
+    UnverifiedTerminalState { pane_id: u64, reason: String },
 
-    #[error("fake guardian authority rejected for pane {pane_id}: model capture cannot claim guardian replication")]
-    FakeGuardianAuthority {
-        pane_id: u64,
-    },
+    #[error(
+        "fake guardian authority rejected for pane {pane_id}: model capture cannot claim guardian replication"
+    )]
+    FakeGuardianAuthority { pane_id: u64 },
 
     #[error("unproved guardian authority rejected for pane {pane_id}: {reason}")]
-    UnprovedGuardianAuthority {
-        pane_id: u64,
-        reason: String,
-    },
+    UnprovedGuardianAuthority { pane_id: u64, reason: String },
 
     #[error("publication store error: {0}")]
     Publication(#[from] PublicationError),
@@ -6535,10 +6548,10 @@ pub enum WholeMuxRecoveryError {
         source: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointError,
     },
 
-    #[error("restore refused: destination namespace '{namespace}' is currently active live session")]
-    LiveDestinationRefused {
-        namespace: String,
-    },
+    #[error(
+        "restore refused: destination namespace '{namespace}' is currently active live session"
+    )]
+    LiveDestinationRefused { namespace: String },
 
     #[error("topology validation failed: {0}")]
     TopologyValidation(String),
@@ -6627,8 +6640,11 @@ impl ValidatedPayloadMap {
 
 impl std::fmt::Debug for ValidatedPayloadMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let summary: BTreeMap<&str, usize> =
-            self.inner.iter().map(|(k, v)| (k.as_str(), v.len())).collect();
+        let summary: BTreeMap<&str, usize> = self
+            .inner
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.len()))
+            .collect();
         f.debug_map().entries(summary).finish()
     }
 }
@@ -6770,7 +6786,7 @@ pub struct WholeMuxRecoveryVerifier {
     trusted_identity: WholeMuxTrustedIdentityConfig,
     repair_key: Option<Zeroizing<Vec<u8>>>,
     repair_bundles: HashMap<[u8; 32], EncodedRepairBundle>,
-    admission: Arc<RepairAdmissionController>,
+    admission: Option<Arc<RepairAdmissionController>>,
 }
 
 impl std::fmt::Debug for WholeMuxRecoveryVerifier {
@@ -6809,13 +6825,13 @@ impl WholeMuxRecoveryVerifier {
             trusted_identity,
             repair_key: None,
             repair_bundles: HashMap::new(),
-            admission: Arc::new(RepairAdmissionController::default_production()),
+            admission: None,
         }
     }
 
     #[must_use]
     pub fn with_admission(mut self, admission: Arc<RepairAdmissionController>) -> Self {
-        self.admission = admission;
+        self.admission = Some(admission);
         self
     }
 
@@ -6834,27 +6850,36 @@ impl WholeMuxRecoveryVerifier {
         let representation_id = bundle.manifest.representation_id;
         let is_replacement = self.repair_bundles.contains_key(&representation_id);
         if !is_replacement && self.repair_bundles.len() >= self.limits.max_panes.saturating_add(1) {
-            return Err(WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(
-                "retained repair bundle count exceeds recovery limit".to_string(),
-            )));
+            return Err(WholeMuxRecoveryError::Repair(
+                RepairError::AdmissionExceeded(
+                    "retained repair bundle count exceeds recovery limit".to_string(),
+                ),
+            ));
         }
         let retained_bytes = |bundle: &EncodedRepairBundle| -> Option<usize> {
-            let headers = bundle.symbols.capacity().checked_mul(
-                std::mem::size_of::<AuthenticatedRepairSymbol>(),
-            )?;
+            let headers = bundle
+                .symbols
+                .capacity()
+                .checked_mul(std::mem::size_of::<AuthenticatedRepairSymbol>())?;
             bundle.symbols.iter().try_fold(headers, |total, symbol| {
                 total.checked_add(symbol.payload.capacity())
             })
         };
-        let total = self.repair_bundles.iter()
+        let total = self
+            .repair_bundles
+            .iter()
             .filter(|(id, _)| **id != representation_id)
             .map(|(_, existing)| existing)
             .chain(std::iter::once(&bundle))
-            .try_fold(0usize, |total, item| total.checked_add(retained_bytes(item)?));
+            .try_fold(0usize, |total, item| {
+                total.checked_add(retained_bytes(item)?)
+            });
         if total.is_none_or(|bytes| bytes > self.limits.max_total_checkpoint_bytes) {
-            return Err(WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(
-                "retained repair symbols exceed recovery byte budget".to_string(),
-            )));
+            return Err(WholeMuxRecoveryError::Repair(
+                RepairError::AdmissionExceeded(
+                    "retained repair symbols exceed recovery byte budget".to_string(),
+                ),
+            ));
         }
         self.repair_bundles
             .insert(bundle.manifest.representation_id, bundle);
@@ -6878,9 +6903,7 @@ impl WholeMuxRecoveryVerifier {
         expected_object_id: [u8; 32],
         expected_generation: u64,
     ) -> Result<Option<(Zeroizing<Vec<u8>>, RepairPermit<'_>)>, WholeMuxRecoveryError> {
-        let bundle = self
-            .repair_bundles
-            .get(expected_representation_id);
+        let bundle = self.repair_bundles.get(expected_representation_id);
         let Some(bundle) = bundle else {
             return Ok(None);
         };
@@ -6899,7 +6922,9 @@ impl WholeMuxRecoveryVerifier {
             &bundle.symbols,
             &expected,
             repair_key.as_slice(),
-            &self.admission,
+            self.admission
+                .as_deref()
+                .unwrap_or_else(crate::snapshot_repair::shared_admission_controller),
         )
         .map_err(WholeMuxRecoveryError::Repair)?;
 
@@ -6920,12 +6945,18 @@ impl WholeMuxRecoveryVerifier {
         }
 
         let mut repair_permit = None;
-        let wire_bytes: Zeroizing<Vec<u8>> = if candidate.manifest_bytes.starts_with(&RECOVERY_OBJECT_MAGIC) {
+        let wire_bytes: Zeroizing<Vec<u8>> = if candidate
+            .manifest_bytes
+            .starts_with(&RECOVERY_OBJECT_MAGIC)
+        {
             Zeroizing::new(candidate.manifest_bytes.clone())
         } else {
-            if let Some((reconstructed, permit)) =
-                self.attempt_raptorq_repair(cx, &expected_rep_id, self.trusted_identity.expected_root_object_id, candidate.generation)?
-            {
+            if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
+                cx,
+                &expected_rep_id,
+                self.trusted_identity.expected_root_object_id,
+                candidate.generation,
+            )? {
                 repair_permit = Some(permit);
                 reconstructed
             } else {
@@ -6939,9 +6970,12 @@ impl WholeMuxRecoveryVerifier {
         let enc_obj = match EncryptedRecoveryObject::from_bytes(wire_bytes.as_slice()) {
             Ok(obj) => obj,
             Err(parse_err) => {
-                if let Some((reconstructed, permit)) =
-                    self.attempt_raptorq_repair(cx, &expected_rep_id, self.trusted_identity.expected_root_object_id, candidate.generation)?
-                {
+                if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
+                    cx,
+                    &expected_rep_id,
+                    self.trusted_identity.expected_root_object_id,
+                    candidate.generation,
+                )? {
                     repair_permit = Some(permit);
                     EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
                         .map_err(WholeMuxRecoveryError::Representation)?
@@ -6958,13 +6992,13 @@ impl WholeMuxRecoveryVerifier {
             candidate.predecessor_generation,
         );
 
-        let decoded = decode_recovery_object(
-            &enc_obj,
-            &expected_context,
-            &self.recovery_key,
-            None,
-        )
-        .map_err(WholeMuxRecoveryError::Representation)?;
+        let config = RepresentationConfig {
+            max_uncompressed_bytes: self.limits.max_image_bytes,
+            max_compressed_bytes: self.limits.max_image_bytes,
+            ..RepresentationConfig::default()
+        };
+        let decoded = decode_recovery_object(&enc_obj, &expected_context, &self.recovery_key, Some(&config))
+            .map_err(WholeMuxRecoveryError::Representation)?;
 
         drop(wire_bytes);
         drop(enc_obj);
@@ -6977,6 +7011,7 @@ impl WholeMuxRecoveryVerifier {
         payload_bytes: &[u8],
         pane: &RecoveryPane,
         image_generation: u64,
+        remaining_plaintext_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>, WholeMuxRecoveryError> {
         if !payload_bytes.starts_with(&RECOVERY_OBJECT_MAGIC) {
             return Err(WholeMuxRecoveryError::AeadRequired(format!(
@@ -6998,13 +7033,13 @@ impl WholeMuxRecoveryVerifier {
             None,
         );
 
-        let decoded = decode_recovery_object(
-            &enc_obj,
-            &expected_context,
-            &self.recovery_key,
-            None,
-        )
-        .map_err(WholeMuxRecoveryError::Representation)?;
+        let config = RepresentationConfig {
+            max_uncompressed_bytes: self.limits.max_per_pane_checkpoint_bytes.min(remaining_plaintext_bytes),
+            max_compressed_bytes: self.limits.max_per_pane_checkpoint_bytes,
+            ..RepresentationConfig::default()
+        };
+        let decoded = decode_recovery_object(&enc_obj, &expected_context, &self.recovery_key, Some(&config))
+            .map_err(WholeMuxRecoveryError::Representation)?;
 
         Ok(decoded.into_plaintext())
     }
@@ -7015,6 +7050,7 @@ impl WholeMuxRecoveryVerifier {
         candidate: &RootSlotCandidate,
         store: &SnapshotPublicationStore,
     ) -> Result<ValidatedWholeMuxRecovery, WholeMuxRecoveryError> {
+        cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
         if candidate.manifest_bytes.len() > self.limits.max_image_bytes {
             return Err(WholeMuxRecoveryError::TopologyValidation(format!(
                 "root manifest payload exceeds limit ({} > {})",
@@ -7070,6 +7106,7 @@ impl WholeMuxRecoveryVerifier {
         let mut total_bytes: usize = 0;
 
         for pane in &image.panes {
+            cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
             let obj_ref = &pane.checkpoint.checkpoint_ref;
 
             // Enforce authority policy:
@@ -7105,9 +7142,12 @@ impl WholeMuxRecoveryVerifier {
                 Ok(bytes) => {
                     let computed: [u8; 32] = Sha256::digest(&bytes).into();
                     if computed != obj_ref.payload_digest {
-                        if let Some((repaired, permit)) =
-                            self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, expected_object_id, image_generation)?
-                        {
+                        if let Some((repaired, permit)) = self.attempt_raptorq_repair(
+                            cx,
+                            &obj_ref.payload_digest,
+                            expected_object_id,
+                            image_generation,
+                        )? {
                             repair_permit = Some(permit);
                             repaired
                         } else {
@@ -7118,9 +7158,12 @@ impl WholeMuxRecoveryVerifier {
                     }
                 }
                 Err(_) => {
-                    if let Some((repaired, permit)) =
-                        self.attempt_raptorq_repair(cx, &obj_ref.payload_digest, expected_object_id, image_generation)?
-                    {
+                    if let Some((repaired, permit)) = self.attempt_raptorq_repair(
+                        cx,
+                        &obj_ref.payload_digest,
+                        expected_object_id,
+                        image_generation,
+                    )? {
                         repair_permit = Some(permit);
                         repaired
                     } else {
@@ -7151,10 +7194,15 @@ impl WholeMuxRecoveryVerifier {
 
             // Decode and decrypt AEAD checkpoint payload with ExpectedContext
             // (semantic ID from authenticated image ref, generation from image generation)
-            let decoded_json =
-                self.decode_and_verify_checkpoint_payload(payload.as_slice(), pane, image_generation)?;
+            let decoded_json = self.decode_and_verify_checkpoint_payload(
+                payload.as_slice(),
+                pane,
+                image_generation,
+                self.limits.max_total_checkpoint_bytes.saturating_sub(total_bytes),
+            )?;
             drop(payload);
             drop(repair_permit);
+            cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
 
             // Verify canonical terminal checkpoint decoding if dependencies are active
             #[cfg(feature = "frankenterm-deps")]
@@ -7162,9 +7210,9 @@ impl WholeMuxRecoveryVerifier {
                 let term_limits = TerminalCheckpointLimits::default();
                 TerminalCheckpointV2::decode_canonical_json(decoded_json.as_slice(), term_limits)
                     .map_err(|source| WholeMuxRecoveryError::TerminalCheckpointDecode {
-                        pane_id: pane.pane_id as u64,
-                        source,
-                    })?;
+                    pane_id: pane.pane_id as u64,
+                    source,
+                })?;
             }
 
             total_bytes = total_bytes.saturating_add(decoded_json.len());
@@ -7178,6 +7226,7 @@ impl WholeMuxRecoveryVerifier {
             checkpoint_payloads.insert(obj_ref.object_id.clone(), decoded_json);
         }
 
+        cx.checkpoint().map_err(|_| WholeMuxRecoveryError::Cancelled)?;
         Ok(ValidatedWholeMuxRecovery::new(
             image,
             candidate.generation,
@@ -7197,181 +7246,6 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
     ) -> Result<Self::Verified, Self::Error> {
         let cx = crate::cx::for_request();
         self.verify_root_with_cx(&cx, candidate, store)
-    }
-}
-
-/// Offline configuration for inert terminal reconstruction.
-///
-/// Probes and mirrors the checkpoint's authentic replay configuration (palette,
-/// scrollback size, kitty keyboard, etc.) to ensure that `matches_stable` validation
-/// succeeds without losing non-default state during crash recovery.
-#[cfg(feature = "frankenterm-deps")]
-#[derive(Debug, Clone)]
-pub struct InertRecoveryConfiguration {
-    pub palette: ColorPalette,
-    pub scrollback_size: usize,
-    pub enable_kitty_keyboard: bool,
-    pub max_user_vars: usize,
-    pub max_unicode_version_stack_depth: usize,
-    pub max_accumulating_title_len: usize,
-    pub normalize_output_to_unicode_nfc: bool,
-}
-
-#[cfg(feature = "frankenterm-deps")]
-impl Default for InertRecoveryConfiguration {
-    fn default() -> Self {
-        Self {
-            palette: ColorPalette::default(),
-            scrollback_size: 3500,
-            enable_kitty_keyboard: false,
-            max_user_vars: 128,
-            max_unicode_version_stack_depth: 16,
-            max_accumulating_title_len: 1024,
-            normalize_output_to_unicode_nfc: false,
-        }
-    }
-}
-
-#[cfg(feature = "frankenterm-deps")]
-#[derive(Deserialize)]
-struct TerminalCheckpointProbe {
-    replay_config: Option<ReplayConfigProbe>,
-}
-
-#[cfg(feature = "frankenterm-deps")]
-#[derive(Deserialize)]
-struct ReplayConfigProbe {
-    #[serde(default)]
-    scrollback_size: Option<u64>,
-    #[serde(default)]
-    color_palette: Option<ColorPaletteProbe>,
-    #[serde(default)]
-    enable_kitty_keyboard: Option<bool>,
-    #[serde(default)]
-    max_user_vars: Option<u64>,
-    #[serde(default)]
-    max_unicode_version_stack_depth: Option<u64>,
-    #[serde(default)]
-    max_accumulating_title_len: Option<u64>,
-    #[serde(default)]
-    normalize_output_to_unicode_nfc: Option<bool>,
-}
-
-#[cfg(feature = "frankenterm-deps")]
-#[derive(Deserialize)]
-struct ColorPaletteProbe {
-    #[serde(default)]
-    colors: Vec<SrgbaProbe>,
-    foreground: SrgbaProbe,
-    background: SrgbaProbe,
-    cursor_fg: SrgbaProbe,
-    cursor_bg: SrgbaProbe,
-    cursor_border: SrgbaProbe,
-    selection_fg: SrgbaProbe,
-    selection_bg: SrgbaProbe,
-    scrollbar_thumb: SrgbaProbe,
-    split: SrgbaProbe,
-}
-
-#[cfg(feature = "frankenterm-deps")]
-#[derive(Clone, Copy, Deserialize)]
-struct SrgbaProbe {
-    red_bits: u32,
-    green_bits: u32,
-    blue_bits: u32,
-    alpha_bits: u32,
-}
-
-#[cfg(feature = "frankenterm-deps")]
-impl SrgbaProbe {
-    fn into_srgba(self) -> SrgbaTuple {
-        SrgbaTuple(
-            f32::from_bits(self.red_bits),
-            f32::from_bits(self.green_bits),
-            f32::from_bits(self.blue_bits),
-            f32::from_bits(self.alpha_bits),
-        )
-    }
-}
-
-#[cfg(feature = "frankenterm-deps")]
-impl ColorPaletteProbe {
-    fn into_color_palette(self) -> Option<ColorPalette> {
-        if self.colors.len() != 256 {
-            return None;
-        }
-        let mut palette256 = [SrgbaTuple(0.0, 0.0, 0.0, 1.0); 256];
-        for (i, c) in self.colors.into_iter().enumerate() {
-            palette256[i] = c.into_srgba();
-        }
-        Some(ColorPalette {
-            colors: Palette256(palette256),
-            foreground: self.foreground.into_srgba(),
-            background: self.background.into_srgba(),
-            cursor_fg: self.cursor_fg.into_srgba(),
-            cursor_bg: self.cursor_bg.into_srgba(),
-            cursor_border: self.cursor_border.into_srgba(),
-            selection_fg: self.selection_fg.into_srgba(),
-            selection_bg: self.selection_bg.into_srgba(),
-            scrollbar_thumb: self.scrollbar_thumb.into_srgba(),
-            split: self.split.into_srgba(),
-        })
-    }
-}
-
-#[cfg(feature = "frankenterm-deps")]
-impl InertRecoveryConfiguration {
-    pub fn probe_from_checkpoint_json(payload: &[u8]) -> Option<Self> {
-        let probe: TerminalCheckpointProbe = serde_json::from_slice(payload).ok()?;
-        let replay = probe.replay_config?;
-        let palette = replay
-            .color_palette
-            .and_then(|p| p.into_color_palette())
-            .unwrap_or_default();
-        Some(Self {
-            palette,
-            scrollback_size: replay.scrollback_size.unwrap_or(3500) as usize,
-            enable_kitty_keyboard: replay.enable_kitty_keyboard.unwrap_or(false),
-            max_user_vars: replay.max_user_vars.unwrap_or(128) as usize,
-            max_unicode_version_stack_depth: replay
-                .max_unicode_version_stack_depth
-                .unwrap_or(16) as usize,
-            max_accumulating_title_len: replay.max_accumulating_title_len.unwrap_or(1024) as usize,
-            normalize_output_to_unicode_nfc: replay
-                .normalize_output_to_unicode_nfc
-                .unwrap_or(false),
-        })
-    }
-}
-
-#[cfg(feature = "frankenterm-deps")]
-impl TerminalConfiguration for InertRecoveryConfiguration {
-    fn color_palette(&self) -> ColorPalette {
-        self.palette.clone()
-    }
-
-    fn scrollback_size(&self) -> usize {
-        self.scrollback_size
-    }
-
-    fn enable_kitty_keyboard(&self) -> bool {
-        self.enable_kitty_keyboard
-    }
-
-    fn max_user_vars(&self) -> usize {
-        self.max_user_vars
-    }
-
-    fn max_unicode_version_stack_depth(&self) -> usize {
-        self.max_unicode_version_stack_depth
-    }
-
-    fn max_accumulating_title_len(&self) -> usize {
-        self.max_accumulating_title_len
-    }
-
-    fn normalize_output_to_unicode_nfc(&self) -> bool {
-        self.normalize_output_to_unicode_nfc
     }
 }
 
@@ -7479,12 +7353,12 @@ pub fn reconstruct_whole_mux_image_inert_with_config(
         // 3. Resolve configuration matching checkpoint replay config
         let live_config: Arc<dyn TerminalConfiguration> = match intended_live_config {
             Some(ref cfg) => Arc::clone(cfg),
-            None => validated_checkpoint.replay_configuration().map_err(|source| {
-                WholeMuxRecoveryError::InertTerminalRestore {
+            None => validated_checkpoint
+                .replay_configuration()
+                .map_err(|source| WholeMuxRecoveryError::InertTerminalRestore {
                     pane_id: pane.pane_id as u64,
                     source,
-                }
-            })?,
+                })?,
         };
 
         // 4. Rebuild off-topology inert terminal (no writer thread, callbacks, or spill capability)
@@ -13265,6 +13139,57 @@ mod tests {
         (canonical_bytes, digest)
     }
 
+    fn whole_mux_test_key() -> Arc<RecoveryKey> {
+        Arc::new(RecoveryKey::from_bytes([0x51; 32]).expect("test recovery key"))
+    }
+
+    fn whole_mux_test_verifier() -> WholeMuxRecoveryVerifier {
+        WholeMuxRecoveryVerifier::new_production(
+            whole_mux_test_key(),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        )
+    }
+
+    fn encrypted_test_payload(
+        plaintext: &[u8],
+        object_id: [u8; 32],
+        kind: RecoveryObjectKind,
+        generation: u64,
+        predecessor: Option<u64>,
+    ) -> Vec<u8> {
+        crate::snapshot_representation::encode_recovery_object(
+            plaintext,
+            ObjectMetadata::single(object_id, kind, generation, predecessor, 1700000000000),
+            &whole_mux_test_key(),
+            None,
+        )
+        .expect("encrypt test recovery object")
+        .to_bytes()
+        .expect("serialize encrypted test recovery object")
+    }
+
+    fn encrypted_test_checkpoint(plaintext: &[u8], object_id: &str) -> (Vec<u8>, [u8; 32]) {
+        let bytes = encrypted_test_payload(
+            plaintext,
+            semantic_object_id_from_str(object_id),
+            RecoveryObjectKind::TerminalCheckpoint,
+            1,
+            None,
+        );
+        let digest = Sha256::digest(&bytes).into();
+        (bytes, digest)
+    }
+
+    fn encrypted_test_image(image: &MuxRecoveryImage) -> Vec<u8> {
+        encrypted_test_payload(
+            &serde_json::to_vec(image).expect("serialize test image"),
+            [0x72; 32],
+            RecoveryObjectKind::WholeMuxImage,
+            image.header.generation,
+            (image.header.generation > 1).then(|| image.header.generation - 1),
+        )
+    }
+
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_roundtrip_offline_layout() {
@@ -13272,13 +13197,15 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload1, digest1) =
+        let (payload1, _) =
             create_test_terminal_checkpoint_payload(b"pane 1 terminal content\r\n", 24, 80);
-        let (payload2, digest2) =
+        let (payload2, _) =
             create_test_terminal_checkpoint_payload(b"pane 2 terminal content\r\n", 30, 100);
 
         let obj1_id = "obj-pane-100".to_string();
         let obj2_id = "obj-pane-101".to_string();
+        let (payload1, digest1) = encrypted_test_checkpoint(&payload1, &obj1_id);
+        let (payload2, digest2) = encrypted_test_checkpoint(&payload2, &obj2_id);
 
         store
             .publish_object(&RecoveryObjectPayload {
@@ -13335,11 +13262,11 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-100".to_string(),
-                    registration_generation: 1,
+                    registration_generation: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 512,
-                        segment_id: 1,
-                        parser_seqno: 1,
+                        segment_id: None,
+                        parser_seqno: Some(1),
                     },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj1_id,
@@ -13349,7 +13276,7 @@ mod tests {
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
-                        parser_seqno: 1,
+                        parser_seqno: Some(1),
                     },
                 },
             },
@@ -13365,11 +13292,11 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-101".to_string(),
-                    registration_generation: 1,
+                    registration_generation: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 1024,
-                        segment_id: 1,
-                        parser_seqno: 2,
+                        segment_id: None,
+                        parser_seqno: Some(2),
                     },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj2_id,
@@ -13379,7 +13306,7 @@ mod tests {
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
-                        parser_seqno: 2,
+                        parser_seqno: Some(2),
                     },
                 },
             },
@@ -13421,6 +13348,7 @@ mod tests {
                         }),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 100,
                 }],
@@ -13438,7 +13366,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -13451,7 +13379,7 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("root verification must succeed");
@@ -13497,13 +13425,11 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload, digest) = create_test_terminal_checkpoint_payload(
-            b"echo line 1\r\necho line 2\r\n",
-            25,
-            80,
-        );
+        let (plaintext, _) =
+            create_test_terminal_checkpoint_payload(b"echo line 1\r\necho line 2\r\n", 25, 80);
 
         let obj_id = "obj-single-pane".to_string();
+        let (payload, digest) = encrypted_test_checkpoint(&plaintext, &obj_id);
         store
             .publish_object(&RecoveryObjectPayload {
                 object_id: obj_id.clone(),
@@ -13544,11 +13470,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-42".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
@@ -13558,7 +13484,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -13588,6 +13514,7 @@ mod tests {
                         pane_uuid: "uuid-pane-42".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 42,
                 }],
@@ -13605,7 +13532,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -13618,8 +13545,10 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
-        let validated = verifier.verify_root(&candidate, &store).expect("verify root");
+        let verifier = whole_mux_test_verifier();
+        let validated = verifier
+            .verify_root(&candidate, &store)
+            .expect("verify root");
 
         let active_sessions = HashSet::new();
         let reconstructed = reconstruct_whole_mux_image_inert(
@@ -13646,7 +13575,7 @@ mod tests {
             .to_vec();
 
         assert_eq!(
-            recaptured, payload,
+            recaptured, plaintext,
             "recaptured canonical terminal checkpoint must match original bytes"
         );
     }
@@ -13658,9 +13587,9 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload, digest) =
-            create_test_terminal_checkpoint_payload(b"gen 1 content\r\n", 24, 80);
+        let (payload, _) = create_test_terminal_checkpoint_payload(b"gen 1 content\r\n", 24, 80);
         let obj_id = "obj-gen-1".to_string();
+        let (payload, digest) = encrypted_test_checkpoint(&payload, &obj_id);
         store
             .publish_object(&RecoveryObjectPayload {
                 object_id: obj_id.clone(),
@@ -13701,11 +13630,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
@@ -13715,7 +13644,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -13745,6 +13674,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -13762,9 +13692,9 @@ mod tests {
         };
         image1.image_digest = image1.compute_digest().expect("digest");
 
-        let image1_bytes = image1.to_canonical_json().expect("image 1 bytes");
+        let image1_bytes = encrypted_test_image(&image1);
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
 
         // Publish generation 1 to store
         store
@@ -13804,11 +13734,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 2,
+                registration_generation: [2; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 200,
-                    segment_id: 1,
-                    parser_seqno: 2,
+                    segment_id: None,
+                    parser_seqno: Some(2),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: "obj-missing-gen-2".to_string(),
@@ -13818,7 +13748,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000001000,
-                    parser_seqno: 2,
+                    parser_seqno: Some(2),
                 },
             },
         }];
@@ -13848,6 +13778,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -13865,7 +13796,7 @@ mod tests {
         };
         image2.image_digest = image2.compute_digest().expect("digest");
 
-        let image2_bytes = image2.to_canonical_json().expect("image 2 bytes");
+        let image2_bytes = encrypted_test_image(&image2);
 
         // Verify that publish_generation_root fails closed because obj-missing-gen-2 is missing
         let publish_result = store.publish_generation_root(
@@ -13928,7 +13859,7 @@ mod tests {
             image_digest: [0u8; 32],
         };
 
-        let raw_json = serde_json::to_vec(&image).expect("serde json");
+        let raw_json = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -13941,7 +13872,7 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let result = verifier.verify_root(&candidate, &store);
         assert!(matches!(
             result,
@@ -13974,7 +13905,7 @@ mod tests {
             image_digest: [0u8; 32],
         };
 
-        let raw_json2 = serde_json::to_vec(&image2).expect("serde json");
+        let raw_json2 = encrypted_test_image(&image2);
         let candidate2 = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -14034,11 +13965,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: "obj-never-published".to_string(),
@@ -14048,7 +13979,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -14078,6 +14009,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -14095,7 +14027,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -14108,7 +14040,7 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let result = verifier.verify_root(&candidate, &store);
         match result {
             Err(WholeMuxRecoveryError::MissingCheckpointObject(id)) => {
@@ -14172,11 +14104,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id.clone(),
@@ -14186,7 +14118,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -14216,6 +14148,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -14233,7 +14166,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -14246,7 +14179,7 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let result = verifier.verify_root(&candidate, &store);
         match result {
             Err(WholeMuxRecoveryError::CheckpointDigestMismatch { object_id, .. }) => {
@@ -14343,7 +14276,7 @@ mod tests {
             dpi: 96,
         };
 
-        // Fake guardian authority: claims Guardian but has 0 watermark
+        // A claimed guardian authority is unproved regardless of its watermark.
         let panes = vec![RecoveryPane {
             pane_id: 99,
             pane_uuid: "uuid-pane-99".to_string(),
@@ -14356,11 +14289,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-99".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
-                    watermark_bytes: 0, // invalid: 0 watermark for guardian
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    watermark_bytes: 0,
+                    segment_id: Some(1),
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: "obj-fake-guardian".to_string(),
@@ -14401,6 +14334,7 @@ mod tests {
                         pane_uuid: "uuid-pane-99".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 99,
                 }],
@@ -14418,7 +14352,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -14431,13 +14365,13 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let result = verifier.verify_root(&candidate, &store);
         match result {
-            Err(WholeMuxRecoveryError::FakeGuardianAuthority { pane_id }) => {
+            Err(WholeMuxRecoveryError::UnprovedGuardianAuthority { pane_id, .. }) => {
                 assert_eq!(pane_id, 99);
             }
-            other => panic!("expected FakeGuardianAuthority error, got {other:?}"),
+            other => panic!("expected UnprovedGuardianAuthority error, got {other:?}"),
         }
     }
 
@@ -14448,13 +14382,15 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload1, digest1) =
+        let (payload1, _) =
             create_test_terminal_checkpoint_payload(b"domain alpha pane\r\n", 24, 80);
-        let (payload2, digest2) =
+        let (payload2, _) =
             create_test_terminal_checkpoint_payload(b"domain beta pane\r\n", 32, 120);
 
         let obj1_id = "obj-alpha-pane".to_string();
         let obj2_id = "obj-beta-pane".to_string();
+        let (payload1, digest1) = encrypted_test_checkpoint(&payload1, &obj1_id);
+        let (payload2, digest2) = encrypted_test_checkpoint(&payload2, &obj2_id);
 
         store
             .publish_object(&RecoveryObjectPayload {
@@ -14511,11 +14447,11 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-10".to_string(),
-                    registration_generation: 1,
+                    registration_generation: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 256,
-                        segment_id: 1,
-                        parser_seqno: 1,
+                        segment_id: None,
+                        parser_seqno: Some(1),
                     },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj1_id,
@@ -14525,7 +14461,7 @@ mod tests {
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
-                        parser_seqno: 1,
+                        parser_seqno: Some(1),
                     },
                 },
             },
@@ -14541,11 +14477,11 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-20".to_string(),
-                    registration_generation: 1,
+                    registration_generation: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 512,
-                        segment_id: 2,
-                        parser_seqno: 2,
+                        segment_id: None,
+                        parser_seqno: Some(2),
                     },
                     checkpoint_ref: RecoveryObjectRef {
                         object_id: obj2_id,
@@ -14555,7 +14491,7 @@ mod tests {
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
-                        parser_seqno: 2,
+                        parser_seqno: Some(2),
                     },
                 },
             },
@@ -14594,6 +14530,7 @@ mod tests {
                             pane_uuid: "uuid-pane-10".to_string(),
                         }),
                         floating_panes: vec![],
+                        pane_stacks: vec![],
                         floating_focus: None,
                         active_pane_id: 10,
                     }],
@@ -14618,6 +14555,7 @@ mod tests {
                             pane_uuid: "uuid-pane-20".to_string(),
                         }),
                         floating_panes: vec![],
+                        pane_stacks: vec![],
                         floating_focus: None,
                         active_pane_id: 20,
                     }],
@@ -14636,7 +14574,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json image");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -14649,7 +14587,7 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
+        let verifier = whole_mux_test_verifier();
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("root verification must succeed");
@@ -14667,11 +14605,17 @@ mod tests {
 
         let p_alpha = &reconstructed.pane_terminals[&10];
         assert_eq!(p_alpha.tab_id, 88, "pane 10 must belong to tab 88");
-        assert_eq!(p_alpha.domain_id, 42, "pane 10 must belong to domain 42 (domain-alpha)");
+        assert_eq!(
+            p_alpha.domain_id, 42,
+            "pane 10 must belong to domain 42 (domain-alpha)"
+        );
 
         let p_beta = &reconstructed.pane_terminals[&20];
         assert_eq!(p_beta.tab_id, 99, "pane 20 must belong to tab 99");
-        assert_eq!(p_beta.domain_id, 77, "pane 20 must belong to domain 77 (domain-beta)");
+        assert_eq!(
+            p_beta.domain_id, 77,
+            "pane 20 must belong to domain 77 (domain-beta)"
+        );
     }
 
     #[test]
@@ -14684,14 +14628,14 @@ mod tests {
             .expect("open publication store");
 
         let raw_key = [0x5au8; 32];
-        let recovery_key = Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
+        let recovery_key =
+            Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
 
         let (checkpoint_plain, _plain_digest) =
             create_test_terminal_checkpoint_payload(b"encrypted pane content\r\n", 24, 80);
 
         let obj_id_str = "obj-enc-pane-1".to_string();
-        let mut obj_id_bytes = [0u8; 32];
-        obj_id_bytes[..obj_id_str.len().min(32)].copy_from_slice(&obj_id_str.as_bytes()[..obj_id_str.len().min(32)]);
+        let obj_id_bytes = semantic_object_id_from_str(&obj_id_str);
 
         let enc_checkpoint_obj = encode_recovery_object(
             &checkpoint_plain,
@@ -14752,11 +14696,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id_str.clone(),
@@ -14766,7 +14710,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -14796,6 +14740,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -14847,7 +14792,12 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&recovery_key));
+        let verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&recovery_key),
+            WholeMuxTrustedIdentityConfig::new(root_obj_id)
+                .with_session_id("sess-enc-test")
+                .with_mux_incarnation_id("inc-enc-test"),
+        );
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("verify AEAD encrypted root and checkpoints");
@@ -14888,15 +14838,15 @@ mod tests {
             .expect("open publication store");
 
         let raw_key = [0x77u8; 32];
-        let recovery_key = Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
+        let recovery_key =
+            Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
         let repair_key = b"repair-key-32-bytes-long-secret!".to_vec();
 
         let (checkpoint_plain, _digest) =
             create_test_terminal_checkpoint_payload(b"repair test terminal\r\n", 24, 80);
 
         let obj_id_str = "obj-repair-pane".to_string();
-        let mut obj_id_bytes = [0u8; 32];
-        obj_id_bytes[..obj_id_str.len().min(32)].copy_from_slice(&obj_id_str.as_bytes()[..obj_id_str.len().min(32)]);
+        let obj_id_bytes = semantic_object_id_from_str(&obj_id_str);
 
         let enc_checkpoint_obj = encode_recovery_object(
             &checkpoint_plain,
@@ -14955,11 +14905,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id_str,
@@ -14969,7 +14919,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -14999,6 +14949,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -15069,9 +15020,14 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let mut verifier = WholeMuxRecoveryVerifier::new_production(recovery_key)
-            .with_repair_key(repair_key);
-        verifier.register_repair_bundle(bundle).expect("bounded repair bundle");
+        let mut verifier = WholeMuxRecoveryVerifier::new_production(
+            recovery_key,
+            WholeMuxTrustedIdentityConfig::new(root_obj_id),
+        )
+        .with_repair_key(repair_key);
+        verifier
+            .register_repair_bundle(bundle)
+            .expect("bounded repair bundle");
 
         let validated = verifier
             .verify_root(&damaged_candidate, &store)
@@ -15090,7 +15046,8 @@ mod tests {
             .expect("open publication store");
 
         let raw_key = [0x88u8; 32];
-        let recovery_key = Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
+        let recovery_key =
+            Arc::new(RecoveryKey::from_bytes(raw_key).expect("construct recovery key"));
 
         let dummy_payload = b"{\"dummy\":true}";
         let mut root_obj_id = [0u8; 32];
@@ -15126,7 +15083,10 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::new_production(recovery_key);
+        let verifier = WholeMuxRecoveryVerifier::new_production(
+            recovery_key,
+            WholeMuxTrustedIdentityConfig::new(root_obj_id),
+        );
         let result = verifier.verify_root(&candidate, &store);
 
         assert!(matches!(
@@ -15191,9 +15151,9 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload, digest) =
-            create_test_terminal_checkpoint_payload(b"unplaced pane\r\n", 24, 80);
+        let (payload, _) = create_test_terminal_checkpoint_payload(b"unplaced pane\r\n", 24, 80);
         let obj_id = "obj-unplaced".to_string();
+        let (payload, digest) = encrypted_test_checkpoint(&payload, &obj_id);
         store
             .publish_object(&RecoveryObjectPayload {
                 object_id: obj_id.clone(),
@@ -15234,11 +15194,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-999".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
@@ -15248,7 +15208,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -15275,6 +15235,7 @@ mod tests {
                     zoomed_pane_id: None,
                     root_split: None, // Empty tab: pane 999 is unplaced!
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 0,
                 }],
@@ -15292,7 +15253,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -15305,19 +15266,14 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
-        let validated = verifier.verify_root(&candidate, &store).expect("root verify");
-
-        let active_sessions = HashSet::new();
-        let err = reconstruct_whole_mux_image_inert(
-            &validated,
-            TerminalCheckpointLimits::default(),
-            None,
-            &active_sessions,
-        )
-        .expect_err("reconstruction must fail for unplaced pane");
-
-        assert!(matches!(err, WholeMuxRecoveryError::TopologyValidation(_)));
+        let verifier = whole_mux_test_verifier();
+        let err = verifier
+            .verify_root(&candidate, &store)
+            .expect_err("verification must reject an unplaced pane before reconstruction");
+        assert!(matches!(
+            err,
+            WholeMuxRecoveryError::Image(MuxRecoveryImageError::OrphanCatalogPane(999))
+        ));
     }
 
     #[test]
@@ -15327,9 +15283,10 @@ mod tests {
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
-        let (payload, digest) =
+        let (payload, _) =
             create_test_terminal_checkpoint_payload(b"unknown domain pane\r\n", 24, 80);
         let obj_id = "obj-unknown-domain".to_string();
+        let (payload, digest) = encrypted_test_checkpoint(&payload, &obj_id);
         store
             .publish_object(&RecoveryObjectPayload {
                 object_id: obj_id.clone(),
@@ -15370,11 +15327,11 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: 1,
+                registration_generation: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
-                    segment_id: 1,
-                    parser_seqno: 1,
+                    segment_id: None,
+                    parser_seqno: Some(1),
                 },
                 checkpoint_ref: RecoveryObjectRef {
                     object_id: obj_id,
@@ -15384,7 +15341,7 @@ mod tests {
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
-                    parser_seqno: 1,
+                    parser_seqno: Some(1),
                 },
             },
         }];
@@ -15414,6 +15371,7 @@ mod tests {
                         pane_uuid: "uuid-pane-1".to_string(),
                     }),
                     floating_panes: vec![],
+                    pane_stacks: vec![],
                     floating_focus: None,
                     active_pane_id: 1,
                 }],
@@ -15431,7 +15389,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let image_bytes = image.to_canonical_json().expect("canonical json");
+        let image_bytes = encrypted_test_image(&image);
         let candidate = RootSlotCandidate {
             slot: RootSlot::SlotA,
             generation: 1,
@@ -15444,18 +15402,13 @@ mod tests {
             created_at_ms: 1700000000000,
         };
 
-        let verifier = WholeMuxRecoveryVerifier::default();
-        let validated = verifier.verify_root(&candidate, &store).expect("root verify");
-
-        let active_sessions = HashSet::new();
-        let err = reconstruct_whole_mux_image_inert(
-            &validated,
-            TerminalCheckpointLimits::default(),
-            None,
-            &active_sessions,
-        )
-        .expect_err("reconstruction must fail for domain not in topology domains");
-
-        assert!(matches!(err, WholeMuxRecoveryError::TopologyValidation(_)));
+        let verifier = whole_mux_test_verifier();
+        let err = verifier
+            .verify_root(&candidate, &store)
+            .expect_err("verification must reject an unknown domain before reconstruction");
+        assert!(matches!(
+            err,
+            WholeMuxRecoveryError::Image(MuxRecoveryImageError::MissingDomain(_))
+        ));
     }
 }

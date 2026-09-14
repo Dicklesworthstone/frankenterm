@@ -368,7 +368,9 @@ pub enum LegacyTerminalCaptureError {
     StaleColdGeneration,
     #[error("terminal checkpoint error: {0}")]
     Terminal(#[from] RecoveryTerminalCheckpointError),
-    #[error("cannot use legacy model capture on guardian-owned pane: false guardian authority rejected")]
+    #[error(
+        "cannot use legacy model capture on guardian-owned pane: false guardian authority rejected"
+    )]
     FalseGuardianAuthority,
 }
 
@@ -2845,9 +2847,9 @@ impl LocalPane {
                 terminal.perform_actions(std::mem::take(pending_actions));
             }
             terminal.capture_staged(limits).map_err(|e| match e {
-                RecoveryTerminalCheckpointError::Checkpoint(TerminalCheckpointError::StaleColdGeneration) => {
-                    LegacyTerminalCaptureError::StaleColdGeneration
-                }
+                RecoveryTerminalCheckpointError::Checkpoint(
+                    TerminalCheckpointError::StaleColdGeneration,
+                ) => LegacyTerminalCaptureError::StaleColdGeneration,
                 other => LegacyTerminalCaptureError::Terminal(other),
             })?
         }; // Terminal mutex is released immediately here!
@@ -8498,7 +8500,8 @@ mod disruptor_ring_keep_gate {
 
     impl std::fmt::Debug for MuxCheckpointTestSink {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("MuxCheckpointTestSink").finish_non_exhaustive()
+            f.debug_struct("MuxCheckpointTestSink")
+                .finish_non_exhaustive()
         }
     }
 
@@ -8559,7 +8562,9 @@ mod disruptor_ring_keep_gate {
             self.rows.lock().unwrap().len() * 80
         }
 
-        fn try_capture_scrollback_interval(&self) -> frankenterm_term::config::ScrollbackIntervalCapture {
+        fn try_capture_scrollback_interval(
+            &self,
+        ) -> frankenterm_term::config::ScrollbackIntervalCapture {
             let rows = self.rows.lock().unwrap();
             let range = if rows.is_empty() {
                 None
@@ -8575,11 +8580,17 @@ mod disruptor_ring_keep_gate {
             &self,
             expected_newest_exclusive: StableRowIndex,
             _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
-        ) -> Result<frankenterm_term::config::ScrollbackSnapshot, frankenterm_term::config::ScrollbackSpillError> {
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
             if let Some(probe) = self.snapshot_probe.lock().unwrap().as_ref() {
                 probe();
             }
-            if self.mutate_on_snapshot.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .mutate_on_snapshot
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 self.advance_identity();
             }
             let rows = self.rows.lock().unwrap();
@@ -8591,7 +8602,9 @@ mod disruptor_ring_keep_gate {
             let oldest = if filtered.is_empty() {
                 None
             } else {
-                filtered.first().and_then(|_| rows.first().map(|(idx, _)| *idx))
+                filtered
+                    .first()
+                    .and_then(|_| rows.first().map(|(idx, _)| *idx))
             };
             let gen = *self.generation.lock().unwrap();
             let count = filtered.len();
@@ -8611,7 +8624,10 @@ mod disruptor_ring_keep_gate {
             _expected_generation: Option<frankenterm_term::config::ScrollbackSnapshotGeneration>,
             _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
             _max_retained_rows: usize,
-        ) -> Result<frankenterm_term::config::ScrollbackReplaceCommit, frankenterm_term::config::ScrollbackSpillError> {
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
             Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
         }
     }
@@ -8638,7 +8654,9 @@ mod disruptor_ring_keep_gate {
             }
         }
 
-        fn scrollback_spill_sink(&self) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+        fn scrollback_spill_sink(
+            &self,
+        ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
             Some(Arc::clone(&self.sink) as Arc<dyn frankenterm_term::config::ScrollbackSpillSink>)
         }
     }
@@ -8689,7 +8707,8 @@ mod disruptor_ring_keep_gate {
         terminal.advance_bytes(b"\x1b[?2004h");
         terminal.advance_bytes(b"\x1b[6;11H");
 
-        terminal.advance_bytes("\x1b[?1049h\x1b[4;32mAlternate \u{26A1} HighVolt\x1b[0m".as_bytes());
+        terminal
+            .advance_bytes("\x1b[?1049h\x1b[4;32mAlternate \u{26A1} HighVolt\x1b[0m".as_bytes());
 
         let pane = make_legacy_test_pane(777, terminal);
 
@@ -8709,11 +8728,9 @@ mod disruptor_ring_keep_gate {
         assert_eq!(recovery.cols(), 80);
         assert!(!recovery.canonical_payload().is_empty());
 
-        let validated = TerminalCheckpointV2::decode_canonical_json(
-            recovery.canonical_payload(),
-            limits,
-        )
-        .expect("canonical payload must decode and validate");
+        let validated =
+            TerminalCheckpointV2::decode_canonical_json(recovery.canonical_payload(), limits)
+                .expect("canonical payload must decode and validate");
 
         let checkpoint = validated.checkpoint();
 
@@ -8758,10 +8775,7 @@ mod disruptor_ring_keep_gate {
 
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
-        let mut pending = vec![
-            Action::Print('h'),
-            Action::Print('i'),
-        ];
+        let mut pending = vec![Action::Print('h'), Action::Print('i')];
         let mut parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
@@ -8809,12 +8823,8 @@ mod disruptor_ring_keep_gate {
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
 
-        let result = pane.capture_legacy_terminal_checkpoint(
-            authority,
-            &mut pending,
-            ground,
-            limits,
-        );
+        let result =
+            pane.capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits);
 
         match result {
             Err(LegacyTerminalCaptureError::FalseGuardianAuthority) => {}
@@ -8854,12 +8864,8 @@ mod disruptor_ring_keep_gate {
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
 
-        let result = pane.capture_legacy_terminal_checkpoint(
-            authority,
-            &mut pending,
-            ground,
-            limits,
-        );
+        let result =
+            pane.capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits);
 
         match result {
             Err(LegacyTerminalCaptureError::StaleColdGeneration) => {}
@@ -8909,12 +8915,8 @@ mod disruptor_ring_keep_gate {
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
 
-        let result = pane.capture_legacy_terminal_checkpoint(
-            authority,
-            &mut pending,
-            ground,
-            limits,
-        );
+        let result =
+            pane.capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits);
 
         assert!(result.is_ok(), "capture must succeed: {:?}", result.err());
         assert!(
@@ -8952,7 +8954,8 @@ mod disruptor_ring_keep_gate {
         };
 
         // Install cold row fragments representing a reflowed split row
-        let reflowed_line = Line::from_text("reflowed replacement cold row 0", &blank_attr, 1, None);
+        let reflowed_line =
+            Line::from_text("reflowed replacement cold row 0", &blank_attr, 1, None);
         let mut replacements = std::collections::BTreeMap::new();
         replacements.insert(0, reflowed_line);
 
@@ -8976,11 +8979,9 @@ mod disruptor_ring_keep_gate {
             .capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits)
             .expect("capture with cold reflow fragments must succeed");
 
-        let validated = TerminalCheckpointV2::decode_canonical_json(
-            recovery.canonical_payload(),
-            limits,
-        )
-        .expect("canonical payload must decode and validate");
+        let validated =
+            TerminalCheckpointV2::decode_canonical_json(recovery.canonical_payload(), limits)
+                .expect("canonical payload must decode and validate");
 
         let checkpoint = validated.checkpoint();
 
