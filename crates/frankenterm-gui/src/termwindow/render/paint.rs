@@ -40,6 +40,9 @@ impl crate::TermWindow {
     where
         P: FnOnce(&mut Self) -> Result<(), RenderAttemptFailure>,
     {
+        if let Some(ticket) = self.fallback_invalidation_for_paint.take() {
+            ticket.begin_font_read();
+        }
         self.num_frames += 1;
         // Per ft-d6nrd / ft-96uy6: tick the per-frame budget allocator
         // at the top of paint, then reconcile any carry-over cosmetic

@@ -176,9 +176,10 @@ impl Drop for PendingMuxTitleRefresh {
     }
 }
 
-/// One queued fallback invalidation for this window. Resolver jobs have already
-/// published their handles before acquiring this ticket; a single cache clear
-/// can expose all of those pending changes. Keep the ticket through Window::notify.
+/// One fallback invalidation awaiting a font read in this window. Resolver jobs
+/// publish their handles before acquiring this ticket. Retain it through the
+/// notification handler until painting begins so completions before that read
+/// share one cache invalidation.
 pub struct PendingFallbackInvalidation(Option<Arc<AtomicBool>>);
 
 impl PendingFallbackInvalidation {
@@ -189,10 +190,10 @@ impl PendingFallbackInvalidation {
             .map(|_| Self(Some(Arc::clone(pending))))
     }
 
-    fn begin_invalidation(mut self) {
-        // Release before clearing caches. A resolver completing after that
-        // boundary must be able to request another invalidation, even if this
-        // frame has already consumed its font's pending handles.
+    fn begin_font_read(mut self) {
+        // Release immediately before painting can consume pending font handles.
+        // A later resolver completion must be able to queue another invalidation,
+        // even if this paint fails or has already read that font's handles.
         if let Some(pending) = self.0.take() {
             pending.store(false, Ordering::Release);
         }
@@ -1128,6 +1129,7 @@ pub struct TermWindow {
     quad_generation: usize,
     shape_generation: usize,
     fallback_invalidation_pending: Arc<AtomicBool>,
+    fallback_invalidation_for_paint: Option<PendingFallbackInvalidation>,
     /// Per-pane render-side dirty-line bitmap (ft-tfzhy / ft-mpc9b.1.2).
     ///
     /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` to retain
@@ -3400,6 +3402,7 @@ impl TermWindow {
             quad_generation: 0,
             shape_generation: 0,
             fallback_invalidation_pending: Arc::new(AtomicBool::new(false)),
+            fallback_invalidation_for_paint: None,
             dirty_lines: HashMap::new(),
             damage_generation: DamageGeneration::default(),
             render_recovery_state: RenderRecoveryState::default(),
@@ -3978,11 +3981,14 @@ impl TermWindow {
                 self.invalidate_shape_cache_notification(cause, window);
             }
             TermWindowNotif::FallbackFontsReady(ticket) => {
-                ticket.begin_invalidation();
                 self.invalidate_shape_cache_notification(
                     RenderInvalidationCause::FallbackFont,
                     window,
                 );
+                // Acquisition failures must retain this ticket along with the
+                // pending damage. The next paint releases it before shaping;
+                // teardown or rejected delivery releases it through Drop.
+                self.fallback_invalidation_for_paint = Some(ticket);
             }
             TermWindowNotif::PerformAssignment {
                 pane_id,
@@ -5345,8 +5351,11 @@ impl TermWindow {
 
         if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
             self.load_os_parameters();
-            self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
+            let scale_applied = self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
             self.apply_dimensions(&dimensions, None, &window);
+            if scale_applied {
+                self.warm_scale_change_glyphs();
+            }
             window.config_did_change(&config);
             window.invalidate();
         }
@@ -8799,7 +8808,7 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fallback_completion_burst_coalesces_until_the_window_handler() {
+    fn fallback_completion_burst_coalesces_through_handler_until_font_read() {
         let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let other_window = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut notifications = vec![];
@@ -8815,19 +8824,25 @@ mod tests {
             panic!("unexpected notification");
         };
         assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
-        ticket.begin_invalidation();
+        let mut awaiting_paint = Some(ticket);
+        // The handler has already invalidated. Further completions, including
+        // while a surface acquisition is unavailable, still share that damage.
+        for _ in 0..64 {
+            assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
+        }
+        awaiting_paint.take().unwrap().begin_font_read();
         assert!(super::PendingFallbackInvalidation::acquire(&pending).is_some());
     }
 
     #[test]
-    fn fallback_completion_after_invalidation_queues_a_successor() {
+    fn fallback_completion_after_font_read_begins_queues_a_successor() {
         let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first = super::PendingFallbackInvalidation::acquire(&pending).unwrap();
-        first.begin_invalidation();
+        first.begin_font_read();
         let late = super::PendingFallbackInvalidation::acquire(&pending)
-            .expect("a fallback published after the invalidation boundary needs another repaint");
+            .expect("a fallback published after the font-read boundary needs another repaint");
         assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
-        late.begin_invalidation();
+        late.begin_font_read();
         assert!(super::PendingFallbackInvalidation::acquire(&pending).is_some());
     }
 
@@ -8842,8 +8857,17 @@ mod tests {
         drop(abandoned);
         assert!(super::PendingFallbackInvalidation::acquire(&old).is_some());
         assert!(super::PendingFallbackInvalidation::acquire(&replacement).is_none());
-        current.begin_invalidation();
+        current.begin_font_read();
         assert!(super::PendingFallbackInvalidation::acquire(&replacement).is_some());
+    }
+
+    #[test]
+    fn fallback_completion_window_teardown_releases_unpainted_ticket() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let awaiting_paint = Some(super::PendingFallbackInvalidation::acquire(&pending).unwrap());
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_none());
+        drop(awaiting_paint);
+        assert!(super::PendingFallbackInvalidation::acquire(&pending).is_some());
     }
 
     #[test]

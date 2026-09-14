@@ -422,7 +422,9 @@ impl super::TermWindow {
         }
     }
 
-    pub fn apply_scale_change(&mut self, dimensions: &Dimensions, font_scale: f64) {
+    /// Returns whether the new metrics were installed. Optional glyph warmup
+    /// follows dimension admission so it can overlap the native reflow worker.
+    pub fn apply_scale_change(&mut self, dimensions: &Dimensions, font_scale: f64) -> bool {
         let config = &self.config;
         let font_size = config.font_size * font_scale;
         let theoretical_height = font_size * dimensions.dpi as f64 / 72.0;
@@ -435,11 +437,11 @@ impl super::TermWindow {
                 font_scale,
                 theoretical_height
             );
-            return;
+            return false;
         }
 
         let (prior_font, prior_dpi) = self.fonts.change_scaling(font_scale, dimensions.dpi);
-        match RenderMetrics::new(&self.fonts) {
+        let scale_applied = match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;
                 // Invalidate the shape cache: shaped runs cache per-glyph
@@ -466,16 +468,6 @@ impl super::TermWindow {
                     RenderInvalidationCause::FontMetrics
                 };
                 self.invalidate_render_caches(cause);
-                // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
-                // the NEW CellMetricKey so the first paint after a scale change
-                // finds them already in the atlas instead of synchronously
-                // rasterizing mid-paint. Routes through the same `cached_glyph`
-                // path the paint uses (keyed by the same BorrowedGlyphKey,
-                // including `metric: CellMetricKey`), so the cached glyphs are
-                // byte-identical to lazy rasterization — only WHEN they
-                // rasterize changes. Bounded by SCALE_CHANGE_GLYPH_WARMUP_BUDGET;
-                // fail-safe (logs + returns stats if the font cannot resolve);
-                // no-op when render_state is absent (headless / pre-init).
                 if let Some(render_state) = self.render_state.as_ref() {
                     let mut glyph_cache = render_state.glyph_cache.borrow_mut();
                     // ft-b4vw9: drop now-unreachable old-CellMetricKey glyphs/
@@ -485,11 +477,8 @@ impl super::TermWindow {
                     // the new scale, so rendering is unchanged.
                     let _evicted =
                         glyph_cache.evict_stale_cell_metrics((&self.render_metrics).into());
-                    let _warm = glyph_cache.warm_up_default_glyphs(
-                        &self.render_metrics,
-                        SCALE_CHANGE_GLYPH_WARMUP_BUDGET,
-                    );
                 }
+                true
             }
             Err(err) => {
                 log::error!(
@@ -500,8 +489,9 @@ impl super::TermWindow {
                 );
                 // Restore prior scaling factors
                 self.fonts.change_scaling(prior_font, prior_dpi);
+                false
             }
-        }
+        };
 
         // ft-c9arc: drop the wholesale `recreate_texture_atlas(None)`
         // call (ghostty pattern). The atlas is now versioned —
@@ -518,6 +508,19 @@ impl super::TermWindow {
         // ft-mpc9b.7's RQ-S10 atlas-stability bench enforces it.
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
+        scale_applied
+    }
+
+    /// Run the same optional raster work after `apply_dimensions`, allowing
+    /// admitted reflow to overlap it in this GUI turn before the next paint.
+    /// Metrics, shaping generations and stale glyph eviction are already updated.
+    /// Unwarmed glyphs continue through the identical lazy rasterization path.
+    pub(super) fn warm_scale_change_glyphs(&mut self) {
+        if let Some(render_state) = self.render_state.as_ref() {
+            let mut glyph_cache = render_state.glyph_cache.borrow_mut();
+            let _warm = glyph_cache
+                .warm_up_default_glyphs(&self.render_metrics, SCALE_CHANGE_GLYPH_WARMUP_BUDGET);
+        }
     }
 
     pub fn apply_dimensions(
@@ -822,9 +825,7 @@ impl super::TermWindow {
 
         let cell_dims = self.current_cell_dimensions();
 
-        if scale_changed {
-            self.apply_scale_change(&dimensions, font_scale);
-        }
+        let scale_applied = scale_changed && self.apply_scale_change(&dimensions, font_scale);
 
         let scale_changed_cells = if font_scale_changed || simple_dpi_change {
             Some(cell_dims)
@@ -837,6 +838,9 @@ impl super::TermWindow {
             scale_changed_cells
         );
         self.apply_dimensions(&dimensions, scale_changed_cells, window);
+        if scale_applied {
+            self.warm_scale_change_glyphs();
+        }
     }
 
     /// Used for applying font size changes only; this takes into account
@@ -861,9 +865,12 @@ impl super::TermWindow {
         } else {
             let dimensions = self.dimensions;
             // Compute new font metrics
-            self.apply_scale_change(&dimensions, font_scale);
+            let scale_applied = self.apply_scale_change(&dimensions, font_scale);
             // Now revise the pty size to fit the window
             self.apply_dimensions(&dimensions, None, window);
+            if scale_applied {
+                self.warm_scale_change_glyphs();
+            }
         }
         self.schedule_background_reload();
     }
@@ -934,7 +941,7 @@ impl super::TermWindow {
             dpi: self.dimensions.dpi,
         };
 
-        self.apply_scale_change(&dimensions, 1.0);
+        let scale_applied = self.apply_scale_change(&dimensions, 1.0);
         self.apply_dimensions(
             &dimensions,
             Some(RowsAndCols {
@@ -943,6 +950,9 @@ impl super::TermWindow {
             }),
             window,
         );
+        if scale_applied {
+            self.warm_scale_change_glyphs();
+        }
         Ok(())
     }
 
