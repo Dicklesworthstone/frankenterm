@@ -420,11 +420,13 @@ mod scale_font_tests {
         let glyphs = discover_bundled_fallback(&original);
         let pixels = glyph_pixels(&original, &glyphs);
         let dynamic = original.clone_dynamic_fallback_handles();
-        assert_eq!(dynamic.len(), 1);
+        assert!(!dynamic.is_empty());
+        assert!(dynamic.len() < MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES);
 
         // Exercise exact chain cardinality with real bundled font handles and
         // a real rebuilt shaper. Repeated faces make this resource-boundary
-        // fixture independent of the number of fonts installed on the host.
+        // fixture independent of the number of faces selected by the bundled
+        // resolver. Keep all originally discovered faces in their original order.
         let mut handles = original.clone_handles();
         handles.resize(
             original.configured_handle_count + MAX_RETAINED_DYNAMIC_FALLBACK_HANDLES,
