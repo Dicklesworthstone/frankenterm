@@ -887,7 +887,7 @@ mod tests {
     fn live_native_selection_text(term: &wezterm_term::Terminal, selection: &Selection) -> String {
         let lines: Vec<_> = term
             .screen()
-            .all_lines()
+            .lines_in_phys_range(0..term.screen().scrollback_rows())
             .into_iter()
             .enumerate()
             .map(|(row, line)| mux::pane::LogicalLine {

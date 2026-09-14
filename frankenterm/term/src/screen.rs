@@ -8990,7 +8990,7 @@ pub(crate) mod tests {
             captured.layout = Some(Arc::clone(&layout));
             let ready = captured
                 .hydrate_with_payload_limit(exact, || false)
-                .unwrap_or_else(|error| panic!("row={row} exact={exact}: {error:#}"));
+                .unwrap_or_else(|error| panic!("row={} exact={}: {:#}", row, exact, error));
             assert_eq!(ready.payload_bytes(), exact);
             assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), vec![output]);
             assert!(screen.validates_line_read(&ready));
@@ -10303,7 +10303,8 @@ pub(crate) mod tests {
         let fast_reads = sink.batch_reads.load(Ordering::Relaxed);
         assert!(
             fast_reads < 32,
-            "only requested groups should decode: {fast_reads}"
+            "only requested groups should decode: {}",
+            fast_reads
         );
         assert!(screen.validates_line_read(&fast));
         let mut payload_only = screen.capture_line_read(0..1).unwrap();
