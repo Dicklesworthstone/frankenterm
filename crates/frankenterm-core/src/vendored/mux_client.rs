@@ -6031,9 +6031,9 @@ mod tests {
             covered, required,
             "cover the live codec notification registry"
         );
-        for notification in notifications {
-            for during_codec in [false, true] {
-                exercise_handshake_notifications(vec![notification.clone()], during_codec);
+        for during_codec in [false, true] {
+            for notification in handshake_notifications() {
+                exercise_handshake_notifications(vec![notification], during_codec);
             }
         }
     }
@@ -6045,10 +6045,9 @@ mod tests {
             choices in prop::collection::vec(0usize..handshake_notifications().len(), 1..16),
             during_codec in any::<bool>(),
         ) {
-            let notifications = handshake_notifications();
             exercise_handshake_notifications(
                 choices.into_iter().enumerate().map(|(position, index)| {
-                    let mut notification = notifications[index].clone();
+                    let mut notification = handshake_notifications().swap_remove(index);
                     if let Pdu::GetPaneRenderChangesResponse(payload) = &mut notification {
                         payload.seqno = position + 1;
                         payload.title = format!("handshake-{position}");
@@ -6126,9 +6125,15 @@ mod tests {
             .collect();
         assert_eq!(covered, required);
         for notification in notifications {
+            let mut frame = Vec::new();
+            notification
+                .encode(&mut frame, 0)
+                .expect("encode gated fixture");
             for during_codec in [false, true] {
                 exercise_forbidden_handshake_notification(
-                    notification.clone(),
+                    Pdu::decode(frame.as_slice())
+                        .expect("decode gated fixture")
+                        .pdu,
                     during_codec,
                     false,
                 );
