@@ -482,6 +482,7 @@ pub mod mission_objective_plan;
 pub mod mission_twin_replay;
 pub mod mission_twin_snapshot;
 pub mod mux_client;
+pub mod mux_recovery_image;
 pub mod namespace_isolation;
 pub mod network_calculus_bound;
 // `NetworkObserver` delegates child lifecycle and bounded capture to the
@@ -713,6 +714,8 @@ pub mod smart_selection_patterns;
 pub mod snap_back_fuzz;
 pub mod snapshot_divergence;
 pub mod snapshot_engine;
+pub mod snapshot_publication;
+pub mod snapshot_representation;
 pub mod soak_confidence_gate;
 pub mod sparse_table;
 pub mod sparse_texture_atlas;
