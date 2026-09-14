@@ -537,7 +537,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use tempfile::tempdir;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
