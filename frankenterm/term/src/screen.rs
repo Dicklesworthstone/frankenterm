@@ -33,6 +33,7 @@ std::thread_local! {
     static REFLOW_CACHED_RESERVED_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_RETAINED_SOURCE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_RETAINED_REPLAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COLD_GEOMETRY_COUNT_REUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn logical_len_exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
@@ -236,6 +237,22 @@ impl std::fmt::Display for ColdReadGeometryUnavailable {
 
 #[cfg(feature = "use_serde")]
 impl std::error::Error for ColdReadGeometryUnavailable {}
+
+/// A transient metadata lock conflict, rather than missing or invalid source
+/// authority. Only an off-thread owner may wait and retry this refusal.
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+pub struct ColdReadMetadataBusy;
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for ColdReadMetadataBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cold history metadata is busy")
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for ColdReadMetadataBusy {}
 
 #[cfg(feature = "use_serde")]
 pub struct ScreenLineRead {
@@ -774,6 +791,86 @@ impl ColdSeamReflow {
     }
 }
 
+/// One exact previous paragraph, scoped to one width/policy and one captured
+/// read. Equal compact widths avoid rehashing every width as a usize and
+/// locking/cloning the process-wide wrap-plan cache for repeated geometry.
+/// Text and attributes are deliberately absent; all join certificates, trim
+/// boundaries and physical lengths participate in LineWrapGeometry equality.
+#[cfg(feature = "use_serde")]
+struct ColdGeometryRowCounts {
+    previous: Option<(LineWrapGeometry, usize)>,
+    cols: usize,
+    cost_model: MonospaceKpCostModel,
+    plans: usize,
+    reuses: usize,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdGeometryRowCounts {
+    fn new(cols: usize, cost_model: MonospaceKpCostModel) -> Self {
+        Self {
+            previous: None,
+            cols,
+            cost_model,
+            plans: 0,
+            reuses: 0,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.previous
+            .as_ref()
+            .map_or(0, |(g, _)| g.retained_bytes())
+    }
+
+    /// Charge the optional previous paragraph beside the next allocation's
+    /// peak. Evict before allocation when necessary; reuse must never turn an
+    /// otherwise admitted baseline operation into a budget refusal.
+    fn reserve(&mut self, budget: usize, peak: Option<usize>) -> usize {
+        if peak
+            .and_then(|bytes| bytes.checked_add(self.retained_bytes()))
+            .is_none_or(|bytes| bytes > budget)
+        {
+            self.previous = None;
+        }
+        budget.saturating_sub(self.retained_bytes())
+    }
+
+    fn count(
+        &mut self,
+        logical: LineWrapGeometry,
+        scratch: &mut LineWrapWidthPrefixScratch,
+        budget: usize,
+    ) -> Option<usize> {
+        let planning_budget = budget.checked_sub(logical.retained_bytes())?;
+        // Keep the baseline planner admission even on a reuse. The previous
+        // paragraph is retired before any planning allocation, and the newly
+        // completed paragraph moves into its place without another clone.
+        if logical.planning_bytes_upper_bound(self.cols, self.cost_model, scratch)?
+            > planning_budget
+        {
+            return None;
+        }
+        let reused = self
+            .previous
+            .as_ref()
+            .filter(|(before, _)| *before == logical)
+            .map(|(_, count)| *count);
+        self.previous = None;
+        let count = if let Some(count) = reused {
+            self.reuses += 1;
+            #[cfg(test)]
+            COLD_GEOMETRY_COUNT_REUSES.with(|n| n.set(n.get() + 1));
+            count
+        } else {
+            self.plans += 1;
+            logical.row_count(self.cols, self.cost_model, scratch)
+        };
+        self.previous = Some((logical, count));
+        Some(count)
+    }
+}
+
 #[cfg(feature = "use_serde")]
 impl ScreenLineRead {
     pub const MAX_ROWS: usize = 16_384;
@@ -837,6 +934,8 @@ impl ScreenLineRead {
         let mut visual_rows: StableRowIndex = 0;
         let mut cell_visits = 0usize;
         let mut scratch = LineWrapWidthPrefixScratch::default();
+        let mut counts =
+            ColdGeometryRowCounts::new(self.witness.cols, self.wrap_policy.kp_cost_model);
         for (offset, captured) in snapshot.rows.iter().enumerate() {
             anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
             let scratch_bytes = scratch
@@ -851,6 +950,20 @@ impl ScreenLineRead {
                 .fragments
                 .as_ref()
                 .and_then(|fragments| fragments.rows.get(&row));
+            // Append may retain both the old and replacement width buffers.
+            // This conservative peak is only for optional-cache eviction; the
+            // original capture/append admission below remains authoritative.
+            let peak = if replacement.is_some() {
+                None // replacement capture has its own temporary text budget
+            } else if let Some(logical) = &group {
+                logical
+                    .retained_bytes()
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(captured.geometry.retained_bytes()))
+            } else {
+                Some(captured.geometry.retained_bytes())
+            };
+            let geometry_budget = counts.reserve(geometry_budget, peak);
             let replacement_geometry;
             let (geometry, wrapped) = if let Some(line) = replacement {
                 let available = geometry_budget
@@ -906,18 +1019,10 @@ impl ScreenLineRead {
                 } else {
                     0
                 };
-                let Some(planning_budget) = group_budget
-                    .checked_sub(logical.retained_bytes())
-                    .and_then(|bytes| bytes.checked_sub(transient_bytes))
-                else {
+                let Some(planning_budget) = group_budget.checked_sub(transient_bytes) else {
                     return Ok(None);
                 };
-                let Some(count) = logical.row_count_with_budget(
-                    self.witness.cols,
-                    self.wrap_policy.kp_cost_model,
-                    &mut scratch,
-                    planning_budget,
-                ) else {
+                let Some(count) = counts.count(logical, &mut scratch, planning_budget) else {
                     return Ok(None);
                 };
                 count
@@ -951,6 +1056,10 @@ impl ScreenLineRead {
                 .ok_or_else(|| anyhow::anyhow!("cold geometry coordinate overflow"))?;
         }
         anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+        debug!(
+            "cold_geometry_counts plans={} reuses={}",
+            counts.plans, counts.reuses
+        );
         Ok(Some((
             Arc::new(ColdVisualLayout {
                 kind: ColdVisualLayoutKind::Canonical,
@@ -3232,9 +3341,12 @@ impl Screen {
         let Some(sink) = self.config.scrollback_spill_sink() else {
             return Ok(None);
         };
-        let ScrollbackIntervalCapture::Ready(interval) = sink.try_capture_scrollback_interval()
-        else {
-            anyhow::bail!("cold seam metadata busy or unavailable");
+        let interval = match sink.try_capture_scrollback_interval() {
+            ScrollbackIntervalCapture::Ready(interval) => interval,
+            ScrollbackIntervalCapture::Busy => anyhow::bail!(ColdReadMetadataBusy),
+            ScrollbackIntervalCapture::Unavailable => {
+                anyhow::bail!("cold seam metadata unavailable");
+            }
         };
         let frontier = self.phys_to_stable_row_index(0);
         let Some(rows) = interval.rows() else {
@@ -3311,7 +3423,7 @@ impl Screen {
         &mut self,
         prepared: &mut ColdSeamReflow,
         seqno: SequenceNo,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         use crate::config::ScrollbackIntervalCapture;
         if seqno == SequenceNo::MAX
             || prepared.replacement.is_none()
@@ -3325,28 +3437,30 @@ impl Screen {
                 .zip(&prepared.resident)
                 .all(|(now, before)| now.is_same_reflow_source(before))
         {
-            return false;
+            return Ok(false);
         }
         let Some(sink) = self.config.scrollback_spill_sink() else {
-            return false;
+            return Ok(false);
         };
         if !Arc::ptr_eq(&sink, &prepared.sink) {
-            return false;
+            return Ok(false);
         }
-        let ScrollbackIntervalCapture::Ready(now) = sink.try_capture_scrollback_interval() else {
-            return false;
+        let now = match sink.try_capture_scrollback_interval() {
+            ScrollbackIntervalCapture::Ready(now) => now,
+            ScrollbackIntervalCapture::Busy => anyhow::bail!(ColdReadMetadataBusy),
+            ScrollbackIntervalCapture::Unavailable => return Ok(false),
         };
         let Some(source) = prepared.source.as_ref() else {
-            return false;
+            return Ok(false);
         };
         if !now.retains(&prepared.interval, source.clone()) {
-            return false;
+            return Ok(false);
         }
         let Some((replacement, rows)) = prepared.replacement.as_mut() else {
-            return false;
+            return Ok(false);
         };
         if !Self::fragments_match_interval(replacement, &sink, &now) {
-            return false;
+            return Ok(false);
         }
         for (live, replacement) in self.lines.iter_mut().zip(rows) {
             replacement.update_last_change_seqno(seqno);
@@ -3357,7 +3471,7 @@ impl Screen {
         prepared.retired_layout = self.cold_visual_layout.take();
         self.invalidate_coordinate_witnesses();
         self.cold_visual_seqno = seqno;
-        true
+        Ok(true)
     }
     /// Capture a bounded request without invoking any blocking sink method.
     #[cfg(feature = "use_serde")]
@@ -3398,14 +3512,17 @@ impl Screen {
                             // a requested cold row onto resident row zero.
                             anyhow::ensure!(rows.end >= hot_top, "cold read discontinuity");
                             oldest = rows.start.min(hot_top);
-                            if let Some(layout) = self.current_cold_visual_layout() {
+                            if let Some(layout) = self.cold_visual_layout_for_interval(&interval) {
                                 oldest = layout.visual.start;
                             }
                         }
                         cold = Some((sink, interval));
                     }
                     _ if requested.start >= hot_top && requested.end <= newest => {}
-                    _ => anyhow::bail!("cold read metadata busy or unavailable"),
+                    ScrollbackIntervalCapture::Busy => anyhow::bail!(ColdReadMetadataBusy),
+                    ScrollbackIntervalCapture::Unavailable => {
+                        anyhow::bail!("cold read metadata unavailable");
+                    }
                 }
             }
         }
@@ -3443,7 +3560,8 @@ impl Screen {
                 self.capture_stored_physical_layout(sink, interval, hot_top, budget)
             });
             stored.or_else(|| {
-                self.current_cold_visual_layout()
+                cold.as_ref()
+                    .and_then(|(_, interval)| self.cold_visual_layout_for_interval(interval))
                     .filter(|layout| resident_first <= layout.visual.end)
                     .and_then(|_| self.cold_visual_layout.as_ref().map(Arc::clone))
             })
@@ -3540,7 +3658,7 @@ impl Screen {
         let retained = interval.rows()?;
         if self.cold_row_fragments.is_some()
             || self
-                .current_cold_visual_layout()
+                .cold_visual_layout_for_interval(interval)
                 .is_some_and(|layout| !layout.stored_physical())
             || !Arc::ptr_eq(sink, &stored.sink)
             || !self.matches_coordinate_witness(&stored.witness)
@@ -3878,6 +3996,36 @@ impl Screen {
 
     #[cfg(feature = "use_serde")]
     fn current_cold_visual_layout(&self) -> Option<&ColdVisualLayout> {
+        // Avoid invoking a sink at all when the local coordinates are stale.
+        self.cold_visual_layout_at_current_coordinates()?;
+        let sink = self.config.scrollback_spill_sink()?;
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            return None;
+        };
+        self.cold_visual_layout_for_interval(&interval)
+    }
+
+    /// A capture already owns one coherent interval. Re-probing its sink here
+    /// could turn temporary contention into a false cache miss and payload
+    /// reindex. Publication still revalidates against the live source.
+    #[cfg(feature = "use_serde")]
+    fn cold_visual_layout_for_interval(
+        &self,
+        interval: &crate::config::ScrollbackInterval,
+    ) -> Option<&ColdVisualLayout> {
+        self.cold_visual_layout_at_current_coordinates()
+            .filter(|layout| {
+                interval
+                    .rows()
+                    .is_some_and(|rows| rows.start == layout.source.start)
+                    && interval.retains(&layout.interval, layout.source.clone())
+            })
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn cold_visual_layout_at_current_coordinates(&self) -> Option<&ColdVisualLayout> {
         let layout = self.cold_visual_layout.as_deref()?;
         let frontier = self.phys_to_stable_row_index(0);
         if !self.matches_coordinate_witness(&layout.witness)
@@ -3890,18 +4038,7 @@ impl Screen {
         {
             return None;
         }
-        let sink = self.config.scrollback_spill_sink()?;
-        match sink.try_capture_scrollback_interval() {
-            crate::config::ScrollbackIntervalCapture::Ready(now)
-                if now
-                    .rows()
-                    .is_some_and(|rows| rows.start == layout.source.start)
-                    && now.retains(&layout.interval, layout.source.clone()) =>
-            {
-                Some(layout)
-            }
-            _ => None,
-        }
+        Some(layout)
     }
 
     /// Capture without consulting configuration/sink callbacks or scanning
@@ -6179,12 +6316,12 @@ impl Screen {
         &mut self,
         physical_cols: usize,
         physical_rows: usize,
-        cursor_x: usize,
-        cursor_y: PhysRowIndex,
+        cursor: (usize, PhysRowIndex),
         seqno: SequenceNo,
         verified: Option<VerifiedPreparedResize>,
         selection_anchors: &mut SelectionAnchorRegistry,
     ) -> (usize, PhysRowIndex) {
+        let (cursor_x, cursor_y) = cursor;
         self.invalidate_coordinate_witnesses();
         let started = Instant::now();
         let old_cols = self.physical_cols;
@@ -6744,8 +6881,7 @@ impl Screen {
                     self.rewrap_lines(
                         physical_cols,
                         physical_rows,
-                        cursor.x,
-                        cursor_phys,
+                        (cursor.x, cursor_phys),
                         seqno,
                         verified_wraps,
                         &mut selection_anchors,
@@ -8593,6 +8729,45 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn cold_seam_metadata_busy_retains_exact_prepared_transaction() {
+        let (mut terminal, sink) = cold_seam_test_terminal();
+        let mut plan = terminal
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(plan.is_ready());
+        let before = terminal.screen().lines.clone();
+        sink.force_busy_probe.store(true, Ordering::Release);
+        let capture = terminal.screen().capture_cold_seam_reflow();
+        assert!(capture.err().unwrap().is::<ColdReadMetadataBusy>());
+        let installation = terminal
+            .screen_mut()
+            .install_cold_seam_reflow(&mut plan, 20);
+        assert!(installation.unwrap_err().is::<ColdReadMetadataBusy>());
+        assert_eq!(terminal.screen().lines, before);
+        assert!(
+            plan.is_ready(),
+            "busy metadata does not consume the prepared cells"
+        );
+        sink.force_busy_probe.store(false, Ordering::Release);
+        assert!(terminal
+            .screen_mut()
+            .install_cold_seam_reflow(&mut plan, 20)
+            .unwrap());
+        assert!(
+            !terminal
+                .screen_mut()
+                .install_cold_seam_reflow(&mut plan, 21)
+                .unwrap(),
+            "a consumed or stale transaction remains a definitive rejection"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn cold_seam_transaction_preserves_keys_and_moves_real_cells_atomically() {
         let sink = Arc::new(TestColdScrollbackSink::default());
         let mut cold = Line::from_text("abcd", &CellAttributes::blank(), 1, None);
@@ -8628,7 +8803,7 @@ pub(crate) mod tests {
             .hydrate(|| false)
             .unwrap();
         screen.lines[0].update_last_change_seqno(2);
-        assert!(!screen.install_cold_seam_reflow(&mut stale, 3));
+        assert!(!screen.install_cold_seam_reflow(&mut stale, 3).unwrap());
         screen.lines[0].update_last_change_seqno(1);
         let mut plan = screen
             .capture_cold_seam_reflow()
@@ -8637,7 +8812,7 @@ pub(crate) mod tests {
             .hydrate(|| false)
             .unwrap();
         assert!(plan.is_ready());
-        assert!(screen.install_cold_seam_reflow(&mut plan, 2));
+        assert!(screen.install_cold_seam_reflow(&mut plan, 2).unwrap());
         assert_eq!(screen.lines[0].as_str(), "def");
         assert_eq!(screen.lines[1].as_str(), "gh");
         assert_eq!(screen.stable_row_index_offset, 1);
@@ -8673,7 +8848,7 @@ pub(crate) mod tests {
             ["abc", "def", "gh"]
         );
         assert!(
-            !screen.install_cold_seam_reflow(&mut plan, 4),
+            !screen.install_cold_seam_reflow(&mut plan, 4).unwrap(),
             "old authority cannot publish twice"
         );
     }
@@ -8768,7 +8943,7 @@ pub(crate) mod tests {
             .unwrap()
             .hydrate(|| false)
             .unwrap();
-        assert!(screen.install_cold_seam_reflow(&mut plan, 2));
+        assert!(screen.install_cold_seam_reflow(&mut plan, 2).unwrap());
         assert_eq!(screen.lines[0].as_str(), "gh");
         sink.rows.lock().unwrap().remove(&0);
         let mut after_trim = screen
@@ -8777,7 +8952,7 @@ pub(crate) mod tests {
             .expect("partial trim must not reuse old alignment")
             .hydrate(|| false)
             .unwrap();
-        assert!(screen.install_cold_seam_reflow(&mut after_trim, 3));
+        assert!(screen.install_cold_seam_reflow(&mut after_trim, 3).unwrap());
         assert_eq!(screen.lines[0].as_str(), "h");
         assert_eq!(screen.stable_row_index_offset, 2);
         assert_eq!(sink.load_scrollback_line(1).unwrap().as_str(), "efg");
@@ -9101,6 +9276,8 @@ pub(crate) mod tests {
         inner: TestColdScrollbackSink,
         max_batch_rows: usize,
         requests: Mutex<Vec<Range<StableRowIndex>>>,
+        metadata_probes: AtomicU64,
+        metadata_probe_budget: AtomicU64,
         cancel_on_read: AtomicBool,
         cancelled: AtomicBool,
         overfill: AtomicBool,
@@ -9109,6 +9286,18 @@ pub(crate) mod tests {
     #[cfg(feature = "use_serde")]
     impl ScrollbackSpillSink for ColdPrefetchTestSink {
         fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+            self.metadata_probes.fetch_add(1, Ordering::Relaxed);
+            if self
+                .metadata_probe_budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| match left {
+                    u64::MAX => Some(left),
+                    0 => None,
+                    _ => Some(left - 1),
+                })
+                .is_err()
+            {
+                return crate::config::ScrollbackIntervalCapture::Busy;
+            }
             self.inner.try_capture_scrollback_interval()
         }
         fn store_scrollback_line(&self, row: StableRowIndex, line: &Line, limit: usize) -> bool {
@@ -9175,6 +9364,8 @@ pub(crate) mod tests {
             inner: TestColdScrollbackSink::default(),
             max_batch_rows,
             requests: Mutex::new(Vec::new()),
+            metadata_probes: AtomicU64::new(0),
+            metadata_probe_budget: AtomicU64::new(u64::MAX),
             cancel_on_read: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             overfill: AtomicBool::new(false),
@@ -9415,6 +9606,69 @@ pub(crate) mod tests {
             .unwrap()
             .hydrate_with_payload_limit(expected_bytes - 1, || false)
             .is_err());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn owned_line_read_reuses_single_ready_interval_despite_later_busy_metadata() {
+        let (screen, sink) = cold_prefetch_fixture(32);
+        let canonical = screen.cold_visual_layout.as_ref().unwrap();
+        assert!(!canonical.stored_physical());
+        assert!(screen.cold_geometry_index.is_none());
+        assert!(screen.stored_physical_layout.is_none());
+        sink.requests.lock().unwrap().clear();
+        sink.metadata_probe_budget.store(0, Ordering::Relaxed);
+        assert!(screen
+            .capture_line_read(17..18)
+            .err()
+            .unwrap()
+            .is::<ColdReadMetadataBusy>());
+        assert!(sink.requests.lock().unwrap().is_empty());
+
+        let mut last_read = None;
+        for (requested, row) in [
+            (17..18, 17),
+            (StableRowIndex::MIN..StableRowIndex::MIN + 1, 0),
+        ] {
+            sink.metadata_probes.store(0, Ordering::Relaxed);
+            sink.metadata_probe_budget.store(1, Ordering::Relaxed);
+            let captured = screen.capture_line_read(requested).unwrap();
+            assert_eq!(
+                sink.metadata_probes.load(Ordering::Relaxed),
+                1,
+                "one coherent capture must not re-probe and lose its canonical cache"
+            );
+            assert!(Arc::ptr_eq(captured.layout.as_ref().unwrap(), canonical));
+            assert_eq!(captured.first_row(), row);
+            sink.requests.lock().unwrap().clear();
+            let read = captured.hydrate(|| false).unwrap();
+            assert_eq!(
+                *sink.requests.lock().unwrap(),
+                [row..row + 1],
+                "Busy after capture must not trigger a 65-group payload reindex"
+            );
+            assert_eq!(
+                read.lines().next().unwrap().as_str(),
+                format!("{row:02}界e\u{301}")
+            );
+            assert!(
+                !screen.validates_line_read(&read),
+                "publication still needs fresh metadata authority"
+            );
+            sink.metadata_probe_budget
+                .store(u64::MAX, Ordering::Relaxed);
+            assert!(screen.validates_line_read(&read));
+            last_read = Some(read);
+        }
+        assert!(sink.store_scrollback_line(
+            0,
+            &Line::from_text("new source", &CellAttributes::blank(), 3, None),
+            65
+        ));
+        assert!(
+            !screen.validates_line_read(&last_read.unwrap()),
+            "same-key destructive source replacement cannot reuse the earlier captured authority"
+        );
     }
 
     #[cfg(feature = "use_serde")]
@@ -10192,6 +10446,112 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn cold_geometry_count_reuse_preserves_trim_width_and_policy_distinctions() {
+        let mut styled = CellAttributes::blank();
+        styled.set_italic(true);
+        let mut fallback = MonospaceKpCostModel::terminal_default();
+        fallback.max_dp_states = 0;
+        for model in [MonospaceKpCostModel::terminal_default(), fallback] {
+            for cols in [0, 1, 3, 5, 12] {
+                let mut counts = ColdGeometryRowCounts::new(cols, model);
+                let mut scratch = LineWrapWidthPrefixScratch::default();
+                let first = LineWrapGeometry::capture(
+                    &Line::from_text("abcdefgh    ", &CellAttributes::blank(), 1, None),
+                    usize::MAX,
+                )
+                .unwrap();
+                let same = LineWrapGeometry::capture(
+                    &Line::from_text("different   ", &styled, 2, None),
+                    usize::MAX,
+                )
+                .unwrap();
+                // Equal column counts alone do not authorize reuse: the last
+                // non-space token is part of the exact key.
+                assert_ne!(first, same);
+                let mut prior = None;
+                for text in [
+                    "abcdefgh    ",
+                    "12345678    ",
+                    "different   ",
+                    "界界界界    ",
+                    "界界界界    ",
+                    "e\u{301}",
+                    "a",
+                    "",
+                    " ",
+                    "abcdefghzzzz",
+                ] {
+                    let line = Line::from_text(text, &styled, 3, None);
+                    let geometry = LineWrapGeometry::capture(&line, usize::MAX).unwrap();
+                    let expected =
+                        geometry.row_count(cols, model, &mut LineWrapWidthPrefixScratch::default());
+                    let reuse_expected = prior.as_ref() == Some(&geometry);
+                    prior = Some(geometry.clone());
+                    let before = (counts.plans, counts.reuses);
+                    assert_eq!(
+                        counts.count(geometry, &mut scratch, usize::MAX),
+                        Some(expected)
+                    );
+                    assert_eq!(counts.reuses - before.1, usize::from(reuse_expected));
+                    assert_eq!(counts.plans - before.0, usize::from(!reuse_expected));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_geometry_count_reuse_evicts_before_pressure_and_keeps_planner_admission() {
+        let geometry = LineWrapGeometry::capture(
+            &Line::from_text("abcdefghijkl  ", &CellAttributes::blank(), 1, None),
+            usize::MAX,
+        )
+        .unwrap();
+        let cols = 3;
+        let model = MonospaceKpCostModel::terminal_default();
+        let mut counts = ColdGeometryRowCounts::new(cols, model);
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let expected = counts
+            .count(geometry.clone(), &mut scratch, usize::MAX)
+            .unwrap();
+        let retained = geometry.retained_bytes();
+        assert_eq!(counts.retained_bytes(), retained);
+        assert_eq!(counts.reserve(2 * retained, Some(retained)), retained);
+        assert_eq!(counts.retained_bytes(), retained);
+        let baseline = retained
+            + geometry
+                .planning_bytes_upper_bound(cols, model, &scratch)
+                .unwrap();
+        assert_eq!(
+            counts.count(geometry.clone(), &mut scratch, baseline - 1),
+            None
+        );
+        assert_eq!(counts.reuses, 0, "a hit cannot bypass baseline admission");
+        assert_eq!(
+            counts.count(geometry.clone(), &mut scratch, baseline),
+            Some(expected)
+        );
+        assert_eq!(counts.reuses, 1);
+
+        // The next geometry fits without the optional entry. Drop the old
+        // allocation first, then admit the same operation at its exact limit.
+        assert_eq!(counts.reserve(retained, Some(retained)), retained);
+        assert_eq!(counts.retained_bytes(), 0);
+        assert_eq!(
+            counts.count(geometry.clone(), &mut scratch, baseline),
+            Some(expected)
+        );
+        assert_eq!(counts.plans, 2);
+        assert_eq!(counts.reserve(usize::MAX, None), usize::MAX);
+        assert_eq!(
+            counts.retained_bytes(),
+            0,
+            "overflow evicts before baseline validation"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn admitted_geometry_native_parser_corpus_avoids_history_reads() {
         const PARAGRAPHS: usize = 10_000;
         let sink = Arc::new(TestColdScrollbackSink::default());
@@ -10245,11 +10605,16 @@ pub(crate) mod tests {
         assert!(plan.layout.is_none());
         assert!(plan.geometry.as_ref().unwrap().rows.len() >= PARAGRAPHS * 3);
         sink.batch_reads.store(0, Ordering::Relaxed);
+        COLD_GEOMETRY_COUNT_REUSES.with(|n| n.set(0));
         let (geometry, _) = plan
             .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
             .unwrap()
             .expect("the actual 30k physical rows must fit the geometry budget");
         assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        assert!(
+            COLD_GEOMETRY_COUNT_REUSES.with(|n| n.get()) >= PARAGRAPHS - 1,
+            "distinct numbered text must reuse its identical packed geometry"
+        );
         let (reference, _) = plan
             .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
             .unwrap();

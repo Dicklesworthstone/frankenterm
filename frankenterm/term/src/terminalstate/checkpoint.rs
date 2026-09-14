@@ -4893,7 +4893,8 @@ mod tests {
         let seqno = live.current_seqno();
         assert!(live
             .screen_mut()
-            .install_cold_seam_reflow(&mut prepared, seqno));
+            .install_cold_seam_reflow(&mut prepared, seqno)
+            .unwrap());
         let captured = TerminalCheckpointV2::capture_with_limits(&live, limits).unwrap();
         let text = |screen: &CheckpointScreen| {
             screen
@@ -4967,7 +4968,8 @@ mod tests {
         let seqno = live.current_seqno();
         assert!(live
             .screen_mut()
-            .install_cold_seam_reflow(&mut prepared, seqno));
+            .install_cold_seam_reflow(&mut prepared, seqno)
+            .unwrap());
         let canonical = TerminalCheckpointV2::capture_with_limits(&live, limits)
             .unwrap()
             .to_canonical_json(limits)

@@ -141,6 +141,11 @@ fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
             .is_some()
     }) {
         "geometry_unavailable"
+    } else if error
+        .downcast_ref::<wezterm_term::screen::ColdReadMetadataBusy>()
+        .is_some()
+    {
+        "metadata_busy"
     } else {
         "other"
     }
@@ -9698,6 +9703,13 @@ mod tests {
                 wezterm_term::screen::ColdReadGeometryUnavailable
             )),
             "geometry_unavailable"
+        );
+        assert_eq!(
+            line_read_failure_reason(
+                &anyhow::Error::new(wezterm_term::screen::ColdReadMetadataBusy)
+                    .context("private storage path")
+            ),
+            "metadata_busy"
         );
         assert_eq!(
             line_read_failure_reason(&anyhow!("private terminal text")),
