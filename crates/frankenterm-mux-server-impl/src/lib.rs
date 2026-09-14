@@ -396,6 +396,8 @@ mod deferred_scrollback {
 
     const MAX_PENDING_ROWS: usize = 256;
     const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_CACHED_ROWS: usize = 32;
+    const MAX_CACHED_BYTES: usize = 256 * 1024;
 
     struct PendingRow {
         stable_row: StableRowIndex,
@@ -409,6 +411,11 @@ mod deferred_scrollback {
         publication_uncertain: bool,
         pending: VecDeque<PendingRow>,
         pending_bytes: usize,
+        // An acknowledged suffix, transferred from pending without cloning or
+        // serializing cells. First reflow can read its cold/hot boundary here.
+        // Uses the same cell/text charge as pending, not a total heap estimate.
+        cached: VecDeque<PendingRow>,
+        cached_bytes: usize,
         durable_bytes: usize,
         oldest: Option<StableRowIndex>,
         newest_exclusive: Option<StableRowIndex>,
@@ -418,6 +425,45 @@ mod deferred_scrollback {
         backing: Arc<dyn ScrollbackSpillSink>,
         operation: Mutex<()>,
         state: Mutex<State>,
+    }
+
+    impl State {
+        fn prune_cached(&mut self) {
+            while self.cached.front().is_some_and(|row| {
+                self.oldest.is_none_or(|oldest| row.stable_row < oldest)
+                    || self.cached.len() > MAX_CACHED_ROWS
+                    || self.cached_bytes > MAX_CACHED_BYTES
+            }) {
+                if let Some(row) = self.cached.pop_front() {
+                    self.cached_bytes -= row.charged_bytes;
+                }
+            }
+        }
+
+        fn cache_acknowledged(&mut self, row: PendingRow) {
+            // A skipped row breaks the contiguous suffix. Mutable image
+            // handles cannot stand in for the serialized backing-store image.
+            if row.charged_bytes > MAX_CACHED_BYTES || row.line.has_image_attachments() {
+                self.cached.clear();
+                self.cached_bytes = 0;
+                return;
+            }
+            while self.cached.len() >= MAX_CACHED_ROWS
+                || row.charged_bytes > MAX_CACHED_BYTES.saturating_sub(self.cached_bytes)
+            {
+                if let Some(oldest) = self.cached.pop_front() {
+                    self.cached_bytes -= oldest.charged_bytes;
+                }
+            }
+            if self.cached.try_reserve(1).is_err() {
+                self.cached.clear();
+                self.cached_bytes = 0;
+                return;
+            }
+            self.cached_bytes += row.charged_bytes;
+            self.cached.push_back(row);
+            self.prune_cached();
+        }
     }
 
     impl std::fmt::Debug for DeferredScrollbackSpillSink {
@@ -455,6 +501,8 @@ mod deferred_scrollback {
                 publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
+                cached: VecDeque::new(),
+                cached_bytes: 0,
                 durable_bytes: backing.retained_scrollback_bytes(),
                 oldest,
                 newest_exclusive,
@@ -518,6 +566,7 @@ mod deferred_scrollback {
                         .pop_front()
                         .ok_or(ScrollbackSpillError::SnapshotRowMissing)?;
                     state.pending_bytes -= row.charged_bytes;
+                    state.cache_acknowledged(row);
                 }
                 state.durable_bytes = durable_bytes;
                 metrics::counter!("mux.scrollback.deferred_rows_durable")
@@ -622,6 +671,7 @@ mod deferred_scrollback {
             state.pending_bytes += charge;
             state.oldest = Some(oldest);
             state.newest_exclusive = Some(next);
+            state.prune_cached();
             metrics::counter!("mux.scrollback.deferred_rows_admitted").increment(1);
             let interval = match state.interval_identity.capture(Some(oldest..next)) {
                 ScrollbackIntervalCapture::Ready(interval) => Some(interval),
@@ -656,12 +706,12 @@ mod deferred_scrollback {
             if rows.start >= rows.end || self.operation.is_poisoned() {
                 return Vec::new();
             }
-            // Capture an immutable pending suffix and its append-only lineage.
+            // Capture the immutable cached/pending suffix and its lineage.
             // Taking operation here would wait for the entire durable flush,
             // even when the requested durable prefix is already available.
             // The backing read serializes its own IO; validate the lineage
             // afterwards so clear, replacement and retention cannot mix rows.
-            let (end, pending, interval) = {
+            let (end, pending, interval, cached_range) = {
                 let Ok(state) = self.state.lock() else {
                     return Vec::new();
                 };
@@ -678,12 +728,16 @@ mod deferred_scrollback {
                 };
                 let end = rows.end.min(newest).min(rows.start.saturating_add(32));
                 let pending = state
-                    .pending
+                    .cached
                     .iter()
+                    .chain(state.pending.iter())
                     .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
                     .map(|row| (row.stable_row, Arc::clone(&row.line)))
                     .collect::<Vec<_>>();
-                (end, pending, interval)
+                let cached_range = state.cached.front().zip(state.cached.back()).map(
+                    |(first, last)| first.stable_row..last.stable_row.saturating_add(1),
+                );
+                (end, pending, interval, cached_range)
             };
             let durable_end = pending.first().map_or(end, |(row, _)| *row);
             let mut result = if durable_end > rows.start {
@@ -717,6 +771,17 @@ mod deferred_scrollback {
                     rows.start..rows.start + result.len() as StableRowIndex,
                 )
             {
+                if let Some(cached) = cached_range {
+                    let returned_end = rows.start + result.len() as StableRowIndex;
+                    let served = cached
+                        .end
+                        .min(returned_end)
+                        .saturating_sub(cached.start.max(rows.start));
+                    if served > 0 {
+                        metrics::counter!("mux.scrollback.deferred_cached_rows_served")
+                            .increment(served as u64);
+                    }
+                }
                 result
             } else {
                 Vec::new()
@@ -812,6 +877,8 @@ mod deferred_scrollback {
                 publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
+                cached: VecDeque::new(),
+                cached_bytes: 0,
                 durable_bytes: self.backing.retained_scrollback_bytes(),
                 oldest: receipt.oldest_stable_row(),
                 newest_exclusive: Some(receipt.newest_stable_row_exclusive()),
@@ -848,6 +915,8 @@ mod deferred_scrollback {
                 publication_uncertain: false,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
+                cached: VecDeque::new(),
+                cached_bytes: 0,
                 durable_bytes: 0,
                 oldest: None,
                 newest_exclusive: None,
@@ -958,6 +1027,71 @@ mod deferred_scrollback {
         );
         assert!(deferred.load_scrollback_lines(0..2).is_empty());
         assert!(deferred.load_scrollback_lines(1..2).is_empty());
+    }
+
+    #[test]
+    fn deferred_cached_suffix_obeys_row_byte_and_retention_limits() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, _backing, deferred) = super::tests::deferred_test_sink();
+        let line = Line::from_text("café 中文 🙂", &CellAttributes::blank(), 0, None);
+        for row in 0..64 {
+            assert!(deferred.store_scrollback_line(row, &line, 128));
+        }
+        let original = Arc::clone(&deferred.state.lock().unwrap().pending.back().unwrap().line);
+        deferred.flush_scrollback().unwrap();
+        {
+            let state = deferred.state.lock().unwrap();
+            assert_eq!(state.cached.len(), MAX_CACHED_ROWS);
+            assert_eq!(state.cached.front().unwrap().stable_row, 32);
+            assert!(Arc::ptr_eq(&state.cached.back().unwrap().line, &original));
+            assert!(state.cached_bytes <= MAX_CACHED_BYTES);
+        }
+        assert!(deferred.store_scrollback_line(64, &line, 2));
+        assert!(deferred.load_scrollback_line(62).is_none());
+        assert_eq!(deferred.state.lock().unwrap().cached.len(), 1);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(deferred.state.lock().unwrap().cached.len(), 2);
+
+        // A row too large for this optional cache still persists normally.
+        // It must break the suffix rather than leave a hole in cached reads.
+        let large = Line::from_text(
+            &"x".repeat(MAX_CACHED_BYTES / std::mem::size_of::<wezterm_term::Cell>() + 1),
+            &CellAttributes::blank(),
+            0,
+            None,
+        );
+        assert!(DeferredScrollbackSpillSink::row_charge(&large).unwrap() > MAX_CACHED_BYTES);
+        assert!(deferred.store_scrollback_line(65, &large, 128));
+        deferred.flush_scrollback().unwrap();
+        assert!(deferred.state.lock().unwrap().cached.is_empty());
+        assert_eq!(deferred.load_scrollback_line(65), Some(large));
+        assert!(deferred.store_scrollback_line(66, &line, 128));
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(deferred.state.lock().unwrap().cached.len(), 1);
+        deferred.clear_scrollback().unwrap();
+        assert!(deferred.state.lock().unwrap().cached.is_empty());
+        assert_eq!(deferred.state.lock().unwrap().cached_bytes, 0);
+        assert!(deferred.load_scrollback_line(66).is_none());
+
+        let medium = Line::from_text(
+            &"x".repeat(MAX_CACHED_BYTES / (3 * std::mem::size_of::<wezterm_term::Cell>())),
+            &CellAttributes::blank(),
+            0,
+            None,
+        );
+        for row in 0..5 {
+            assert!(deferred.store_scrollback_line(row, &medium, 128));
+        }
+        deferred.flush_scrollback().unwrap();
+        let state = deferred.state.lock().unwrap();
+        assert!(!state.cached.is_empty());
+        assert!(state.cached.len() < 5, "byte limit applies before row limit");
+        assert!(state.cached_bytes <= MAX_CACHED_BYTES);
+        assert_eq!(
+            state.cached_bytes,
+            state.cached.iter().map(|row| row.charged_bytes).sum::<usize>()
+        );
     }
 }
 
@@ -9729,6 +9863,57 @@ mod tests {
         assert!(backing.load_scrollback_lines(40..41).is_empty());
         deferred.clear_scrollback().unwrap();
         assert!(deferred.load_scrollback_lines(0..40).is_empty());
+    }
+
+    #[test]
+    fn deferred_scrollback_acknowledged_tail_reads_bypass_locked_backing_storage() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let mut expected = Vec::new();
+        for row in 0..64 {
+            let line = Line::from_text(
+                &format!("row {row}: café 中文 e\u{301} 🙂  "),
+                &CellAttributes::blank(),
+                row as usize,
+                None,
+            );
+            assert!(deferred.store_scrollback_line(row, &line, 128));
+            expected.push(line);
+        }
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 64);
+        // A fresh adapter has the same durable rows but no warm suffix. This
+        // is the causal control for the pre-cache path, using real encrypted IO.
+        let uncached =
+            deferred_scrollback::DeferredScrollbackSpillSink::new(backing.clone()).unwrap();
+        let pending = Line::from_text("pending tail", &CellAttributes::blank(), 64, None);
+        assert!(deferred.store_scrollback_line(64, &pending, 128));
+        expected.push(pending);
+        let lease = acquire_live_scrollback_filesystem_mutation_lease(
+            backing.manifest_path.parent().unwrap(),
+            false,
+        )
+        .unwrap();
+        let (warm_tx, warm_rx) = std::sync::mpsc::sync_channel(1);
+        let reading = Arc::clone(&deferred);
+        let warm = std::thread::spawn(move || {
+            warm_tx.send(reading.load_scrollback_lines(62..65)).unwrap();
+        });
+        let warmed = warm_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let (cold_tx, cold_rx) = std::sync::mpsc::sync_channel(1);
+        let cold = std::thread::spawn(move || {
+            cold_tx.send(uncached.load_scrollback_lines(62..64)).unwrap();
+        });
+        let blocked = cold_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err();
+        drop(lease);
+        warm.join().unwrap();
+        cold.join().unwrap();
+        assert_eq!(warmed.unwrap(), expected[62..65]);
+        assert!(blocked, "uncached control must wait for the backing lease");
+        assert_eq!(cold_rx.recv().unwrap(), expected[62..64]);
+        assert_eq!(backing.retained_scrollback_rows(), 64, "read cannot flush");
+        assert_eq!(deferred.load_scrollback_lines(30..34), expected[30..34]);
     }
 
     #[test]
