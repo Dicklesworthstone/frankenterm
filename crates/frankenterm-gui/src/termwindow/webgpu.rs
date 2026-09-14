@@ -1186,6 +1186,18 @@ fn select_composite_alpha_mode(
 }
 
 impl WebGpuState {
+    /// Read the Metal host clock in nanoseconds, not a GPU completion time.
+    /// wgpu-hal 30's Metal PresentationTimer scales mach_absolute_time by
+    /// mach_timebase_info. SCK displayTime uses the same Mach tick origin;
+    /// its observer must apply that timebase before comparing these values.
+    pub(crate) fn native_submission_mach_ns(&self) -> Option<u128> {
+        if !cfg!(target_os = "macos") || self.adapter_info.backend != wgpu::Backend::Metal {
+            return None;
+        }
+        let timestamp = self.adapter.get_presentation_timestamp();
+        (!timestamp.is_invalid() && timestamp.0 > 0).then_some(timestamp.0)
+    }
+
     pub async fn new(
         window: &Window,
         dimensions: Dimensions,

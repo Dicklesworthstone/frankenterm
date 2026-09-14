@@ -22,6 +22,7 @@ pub enum AllowImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaintOutcome {
     pub(crate) damage_generation: DamageGeneration,
+    submission_mach_ns: Option<u128>,
     post_present: PostPresentWork,
 }
 
@@ -168,7 +169,22 @@ impl crate::TermWindow {
             .and_then(|()| {
                 log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
                 let damage_generation = self.damage_generation();
-                present(self).map(|()| damage_generation)
+                present(self).map(|()| {
+                    // Sample immediately after successful backend acceptance,
+                    // before bookkeeping or log delivery can delay observation.
+                    // The optional diagnostic never substitutes for SCK pixels.
+                    let submission_mach_ns = if log::log_enabled!(
+                        target: "frankenterm_gui::native_present_profile",
+                        log::Level::Debug
+                    ) {
+                        self.webgpu
+                            .as_ref()
+                            .and_then(|state| state.native_submission_mach_ns())
+                    } else {
+                        None
+                    };
+                    (damage_generation, submission_mach_ns)
+                })
             });
 
         // Scheduling the next animation frame is cosmetic: reduce-motion
@@ -195,8 +211,9 @@ impl crate::TermWindow {
         metrics::histogram!("gui.paint.impl").record(self.last_frame_duration);
         metrics::histogram!("gui.paint.impl.rate").record(1.);
 
-        present_result.map(|damage_generation| PaintOutcome {
+        present_result.map(|(damage_generation, submission_mach_ns)| PaintOutcome {
             damage_generation,
+            submission_mach_ns,
             post_present: PostPresentWork {
                 animation_due,
                 should_schedule_animation,
@@ -214,16 +231,18 @@ impl crate::TermWindow {
             if let Some(frame) = state.selection_frame.presented() {
                 // This record is emitted only after backend acceptance and uses
                 // the complete frame actually staged for drawing. It is not a
-                // GPU completion or scanout timestamp. An external observer can
-                // timestamp receipt on its capture clock to bound submission.
+                // GPU completion or scanout timestamp. The Metal host clock was
+                // sampled after acceptance; zero means no supported source clock
+                // and must not authorize a compositor timing claim.
                 log::debug!(
                     target: "frankenterm_gui::native_present_profile",
-                    "native_present_complete pane_id={} damage={} source_sequence={} viewport={} geometry={:?}",
+                    "native_present_complete pane_id={} damage={} source_sequence={} viewport={} geometry={:?} submission_mach_ns={}",
                     pane_id,
                     outcome.damage_generation.value,
                     frame.source_sequence,
                     frame.viewport,
                     frame.geometry,
+                    outcome.submission_mach_ns.unwrap_or_default(),
                 );
             }
         }
