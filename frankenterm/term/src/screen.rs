@@ -695,10 +695,20 @@ impl ScreenLineRead {
                 anyhow::ensure!(!cancelled(), "cold index cancelled");
                 let before_bytes = charge.used;
                 charge.serialize_line(&original)?;
-                let mut line = cold_row_with_fragment(self.fragments.as_deref(), row, original);
-                if self.fragments.is_some() {
-                    charge.serialize_line(&line)?;
-                }
+                let mut line = match self
+                    .fragments
+                    .as_ref()
+                    .and_then(|fragments| fragments.rows.get(&row))
+                {
+                    Some(replacement) => {
+                        // Both decoded source and replacement consume work.
+                        // An unrelated seam fragment does not create another
+                        // representation of this row to serialize or charge.
+                        charge.serialize_line(replacement)?;
+                        replacement.clone()
+                    }
+                    None => original,
+                };
                 source_bytes = source_bytes
                     .checked_add(charge.used - before_bytes)
                     .ok_or_else(|| anyhow::anyhow!("cold index source byte overflow"))?;
@@ -7991,6 +8001,134 @@ pub(crate) mod tests {
         assert_eq!(first, 0);
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].as_str(), "disk");
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn streamed_cold_fragment_fixture(
+        originals: &[Line],
+        replacements: BTreeMap<StableRowIndex, Line>,
+        cols: usize,
+    ) -> (Screen, Arc<TestColdScrollbackSink>) {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        for (row, line) in originals.iter().enumerate() {
+            assert!(sink.store_scrollback_line(row as StableRowIndex, line, originals.len()));
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            cols,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = originals.len();
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            panic!("fixture interval must be ready");
+        };
+        screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
+            sink: sink.clone(),
+            interval,
+            rows: replacements,
+            aligned_frontier: originals.len() as StableRowIndex,
+            aligned_source_start: 0,
+            cols,
+            dpi: 96,
+            policy: screen.resize_wrap_policy,
+        }));
+        (screen, sink)
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn streamed_cold_index_unchanged_rows_have_one_exact_charge_with_fragments() {
+        use std::cell::Cell as Counter;
+
+        let originals = [
+            Line::from_text(&"x".repeat(128), &CellAttributes::blank(), 1, None),
+            Line::from_text("abc", &CellAttributes::blank(), 1, None),
+        ];
+        let replacement = Line::from_text("xy", &CellAttributes::blank(), 1, None);
+        let (screen, sink) =
+            streamed_cold_fragment_fixture(&originals, [(1, replacement.clone())].into(), 256);
+        // The first closed group sets the exact peak source budget. The next
+        // group must still pay for its real replacement and retained metadata.
+        let exact = serde_json::to_vec(&originals[0]).unwrap().len();
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let (layout, metadata_bytes) = plan.streamed_cold_layout(exact, &|| false).unwrap();
+        assert_eq!(layout.groups, vec![(0..1, 0..1), (1..2, 1..2)]);
+        assert!(
+            serde_json::to_vec(&originals[1]).unwrap().len()
+                + serde_json::to_vec(&replacement).unwrap().len()
+                + metadata_bytes
+                < exact
+        );
+        assert!(!plan.index_budget_exhausted.load(Ordering::Acquire));
+
+        // Cancel between the unchanged group and the actual fragment, after
+        // real decoding/accounting work. No index is published or poisoned.
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let checks = Counter::new(0);
+        let cancelled = plan
+            .streamed_cold_layout(exact, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 3
+            })
+            .unwrap_err();
+        assert!(cancelled.to_string().contains("cold index cancelled"));
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 1);
+        assert!(screen.cold_visual_layout.is_none());
+        assert!(!plan.index_budget_exhausted.load(Ordering::Acquire));
+
+        let refused = plan.streamed_cold_layout(exact - 1, &|| false).unwrap_err();
+        assert!(refused.downcast_ref::<ColdReadPayloadLimit>().is_some());
+        assert_eq!(sink.load_scrollback_line(0).unwrap(), originals[0]);
+        assert_eq!(sink.load_scrollback_line(1).unwrap(), originals[1]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn streamed_cold_index_actual_fragment_charges_original_and_replacement() {
+        let mut original =
+            Line::from_text(&"original ".repeat(8), &CellAttributes::blank(), 1, None);
+        original.set_last_cell_was_wrapped(true, 1);
+        let originals = [
+            original,
+            Line::from_text("end", &CellAttributes::blank(), 1, None),
+        ];
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(termwiz::hyperlink::Hyperlink::new(format!(
+            "https://example.invalid/{}",
+            "a".repeat(8_192)
+        )))));
+        let mut replacement = Line::from_text("xy", &attrs, 1, None);
+        replacement.set_last_cell_was_wrapped(true, 1);
+        let (screen, sink) =
+            streamed_cold_fragment_fixture(&originals, [(0, replacement.clone())].into(), 8);
+        let original_bytes = serde_json::to_vec(&originals[0]).unwrap().len();
+        let tail_bytes = serde_json::to_vec(&originals[1]).unwrap().len();
+        let replacement_bytes = serde_json::to_vec(&replacement).unwrap().len();
+        assert!(replacement_bytes > 8_192, "attributes consume the budget");
+        let exact = original_bytes + replacement_bytes + tail_bytes;
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let (layout, metadata_bytes) = plan.streamed_cold_layout(exact, &|| false).unwrap();
+        assert!(metadata_bytes < exact);
+        // The replacement's five-cell joined group fits one row; wrapping the
+        // original source instead would produce multiple rows at this width.
+        assert_eq!(layout.groups, vec![(0..2, 1..2)]);
+        for limit in [
+            exact - 1,
+            replacement_bytes + tail_bytes,
+            original_bytes + tail_bytes,
+        ] {
+            let refused = plan.streamed_cold_layout(limit, &|| false).unwrap_err();
+            assert!(refused.downcast_ref::<ColdReadPayloadLimit>().is_some());
+        }
+        assert!(screen.cold_visual_layout.is_none());
+        assert_eq!(sink.load_scrollback_line(0).unwrap(), originals[0]);
+        assert_eq!(sink.load_scrollback_line(1).unwrap(), originals[1]);
     }
 
     #[cfg(feature = "use_serde")]
