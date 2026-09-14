@@ -179,7 +179,7 @@ impl fmt::Display for AtomicComponentMarkerField {
 }
 
 /// Fail-closed errors for marker construction, parsing, and sealing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AtomicComponentIdentityError {
     /// A build ID was not a non-zero value encoded as exactly 64 lowercase
     /// hexadecimal characters.
@@ -201,6 +201,8 @@ pub enum AtomicComponentIdentityError {
     UnsealedDevelopmentBuild,
     /// A Cargo build-script input was not valid Unicode.
     EnvironmentNotUnicode(&'static str),
+    /// A sealed build supplied an override not bound by its source identity.
+    UnboundCargoProfileOverride(String),
 }
 
 impl fmt::Display for AtomicComponentIdentityError {
@@ -229,6 +231,10 @@ impl fmt::Display for AtomicComponentIdentityError {
             Self::EnvironmentNotUnicode(variable) => {
                 write!(formatter, "{variable} must be valid UTF-8")
             }
+            Self::UnboundCargoProfileOverride(variable) => write!(
+                formatter,
+                "sealed FrankenTerm build forbids profile override {variable}; change committed Cargo.toml instead"
+            ),
         }
     }
 }
@@ -441,7 +447,9 @@ pub fn parse_sealed_atomic_component_marker_details(
 /// `FT_ATOMIC_BUILD_IDENTITY` may be absent for ordinary development builds;
 /// when it is present it must be a canonical sealed identity. Supplying the
 /// literal `unsealed` is rejected so release automation cannot disguise an
-/// explicit value as the implicit development state.
+/// explicit value as the implicit development state. Sealed builds reject
+/// Cargo profile environment overrides because those settings are not bound
+/// by the committed source identity.
 pub fn emit_cargo_atomic_component_marker(
     role: AtomicComponentRole,
 ) -> Result<String, AtomicComponentIdentityError> {
@@ -456,6 +464,20 @@ pub fn emit_cargo_atomic_component_marker(
             ));
         }
     };
+    if matches!(build_identity, AtomicBuildIdentity::Sealed(_)) {
+        for (variable, _) in std::env::vars_os() {
+            let variable = variable.to_string_lossy();
+            if variable.to_ascii_uppercase().starts_with("CARGO_PROFILE_") {
+                let error = AtomicComponentIdentityError::UnboundCargoProfileOverride(
+                    variable.into_owned(),
+                );
+                // Cargo reports build-script Result errors with Debug, so
+                // also print the actionable remedy without the input value.
+                eprintln!("{error}");
+                return Err(error);
+            }
+        }
+    }
     let target = read_build_environment("TARGET", "unknown")?;
     let version = read_build_environment("CARGO_PKG_VERSION", "unknown")?;
     let profile = match std::env::var("FT_ATOMIC_BUILD_PROFILE") {
@@ -519,6 +541,120 @@ mod tests {
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
         0x1e, 0x1f,
     ];
+
+    // Invoke the production emitter in a separate process: mutating the
+    // environment inside a parallel Rust test process is unsafe.
+    #[test]
+    fn cargo_profile_override_child() {
+        let Ok(role) = std::env::var("FT_IDENTITY_PROFILE_TEST_ROLE") else {
+            return;
+        };
+        let role = AtomicComponentRole::from_str(&role).unwrap();
+        if let Err(error) = emit_cargo_atomic_component_marker(role) {
+            eprintln!("{error}");
+            std::process::exit(23);
+        }
+    }
+
+    fn profile_override_child(
+        role: AtomicComponentRole,
+        sealed: bool,
+        variables: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::cargo_profile_override_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("FT_IDENTITY_PROFILE_TEST_ROLE", role.as_str())
+            .env("TARGET", "aarch64-apple-darwin")
+            .env("CARGO_PKG_VERSION", "0.15.1")
+            .env("FT_ATOMIC_BUILD_PROFILE", "release-interactive");
+        if sealed {
+            command.env("FT_ATOMIC_BUILD_IDENTITY", SEALED_HEX);
+        }
+        for (name, value) in variables {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    }
+
+    #[test]
+    fn sealed_emitter_rejects_profile_overrides_before_any_role_marker() {
+        for role in [
+            AtomicComponentRole::Ft,
+            AtomicComponentRole::FrankenTermGui,
+            AtomicComponentRole::FrankenTermMuxServer,
+            AtomicComponentRole::FrankenTermPtyGuardian,
+        ] {
+            for (name, value) in [
+                ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "private-override-value"),
+                (
+                    "cargo_profile_release_interactive_panic",
+                    "private-abort-value",
+                ),
+                ("Cargo_Profile_Dev_Codegen_Units", ""),
+            ] {
+                let output = profile_override_child(role, true, &[(name, value)]);
+                assert_eq!(output.status.code(), Some(23), "{role}: {output:?}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(!stdout.contains(ATOMIC_COMPONENT_MARKER_PREFIX));
+                assert!(stderr.contains(name), "{stderr}");
+                assert!(stderr.contains("change committed Cargo.toml"), "{stderr}");
+                if !value.is_empty() {
+                    assert!(!stdout.contains(value), "{stdout}");
+                    assert!(!stderr.contains(value), "{stderr}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emitter_preserves_unsealed_overrides_and_sealed_non_profile_inputs() {
+        let allowed = [
+            ("CARGO_PROFILE", "near-prefix"),
+            ("CARGO_PROFILES_RELEASE_OPT_LEVEL", "near-prefix"),
+            ("NOT_CARGO_PROFILE_RELEASE_OPT_LEVEL", "near-prefix"),
+            ("CARGO_BUILD_JOBS", "2"),
+            ("OPT_LEVEL", "3"),
+        ];
+        for role in [
+            AtomicComponentRole::Ft,
+            AtomicComponentRole::FrankenTermGui,
+            AtomicComponentRole::FrankenTermMuxServer,
+            AtomicComponentRole::FrankenTermPtyGuardian,
+        ] {
+            let sealed = profile_override_child(role, true, &allowed);
+            assert!(sealed.status.success(), "{sealed:?}");
+            let marker = atomic_component_marker(
+                AtomicBuildIdentity::Sealed(
+                    SealedAtomicBuildIdentity::from_lower_hex(SEALED_HEX).unwrap(),
+                ),
+                role,
+                "aarch64-apple-darwin",
+                "release-interactive",
+                "0.15.1",
+            )
+            .unwrap();
+            assert!(String::from_utf8(sealed.stdout).unwrap().contains(&marker));
+
+            let unsealed = profile_override_child(
+                role,
+                false,
+                &[("CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL", "3")],
+            );
+            assert!(unsealed.status.success(), "{unsealed:?}");
+            assert!(
+                String::from_utf8(unsealed.stdout)
+                    .unwrap()
+                    .contains(&format!("{ATOMIC_COMPONENT_MARKER_PREFIX}unsealed:{role}:"))
+            );
+        }
+    }
 
     #[test]
     fn sealed_identity_decodes_exactly_thirty_two_bytes() {
