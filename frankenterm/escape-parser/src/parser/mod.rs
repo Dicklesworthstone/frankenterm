@@ -1092,12 +1092,17 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         &mut self,
         _params: &[i64],
         intermediates: &[u8],
-        _ignored_extra_intermediates: bool,
+        ignored_extra_intermediates: bool,
         control: u8,
     ) {
-        // It doesn't appear to be possible for params.len() > 1 due to the way
-        // that the state machine in vte functions.  As such, it also seems to
-        // be impossible for ignored_extra_intermediates to be true too.
+        // Esc represents at most one intermediate. Dropping extra bytes would
+        // turn an unsupported sequence into a different command: ESC SP SP X
+        // would become SOS and swallow subsequent printable text on replay.
+        // Overflow also invalidates the sequence even if the retained prefix
+        // happens to fit the representation.
+        if ignored_extra_intermediates || intermediates.len() > 1 {
+            return;
+        }
         (self.callback)(Action::Esc(Esc::parse(
             if intermediates.len() == 1 {
                 Some(intermediates[0])
@@ -1840,6 +1845,44 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "\x1b%H");
+    }
+
+    #[test]
+    fn unsupported_esc_intermediates_preserve_following_text() {
+        for input in [
+            b"\x1b  Xhello\x1b[1m!".as_slice(),
+            b"\x1b                                Xhello\x1b[1m!".as_slice(),
+        ] {
+            // Exercise every boundary, including inside the escape prefix.
+            for split in 0..=input.len() {
+                let mut p = Parser::new();
+                p.set_print_batching(false);
+                let mut actions = p.parse_as_vec(&input[..split]);
+                actions.extend(p.parse_as_vec(&input[split..]));
+                let mut expected = Parser::new();
+                expected.set_print_batching(false);
+                assert_eq!(actions, expected.parse_as_vec(b"hello\x1b[1m!"));
+                let encoded = encode(&actions);
+                let mut replay = Parser::new();
+                replay.set_print_batching(false);
+                assert_eq!(actions, replay.parse_as_vec(encoded.as_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn overflowed_esc_dispatch_rejects_even_a_short_retained_prefix() {
+        let p = Parser::new();
+        let mut actions = Vec::new();
+        let mut callback = |action| actions.push(action);
+        let mut state = p.state.borrow_mut();
+        let mut performer = Performer {
+            callback: &mut callback,
+            state: &mut state,
+        };
+        performer.esc_dispatch(&[], &[], true, b'X');
+        performer.esc_dispatch(&[], b"%", true, b'H');
+        assert!(actions.is_empty());
     }
 
     #[test]
