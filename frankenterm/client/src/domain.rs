@@ -3439,15 +3439,14 @@ impl ClientDomain {
                     )?;
                 }
 
-                // Codec 46 does not carry authoritative window order. Keep
-                // the exact local placement of an already attached mirror:
+                // Neither ordinary listing dialect carries authoritative UI
+                // order. Floating-pane authority does not grant authority to
+                // relocate tabs. Keep an already attached mirror's placement:
                 // a user may have reordered it or moved it to another GUI
                 // window since the remote-window mapping was recorded.
                 // Reattaching through that old mapping both discards user
                 // intent and fails the mux's exclusive-parent invariant.
-                if !floating_snapshot_authoritative
-                    && mux.window_containing_tab(tab.tab_id()).is_some()
-                {
+                if mux.window_containing_tab(tab.tab_id()).is_some() {
                     continue;
                 }
 
@@ -5833,17 +5832,30 @@ mod tests {
 
     #[test]
     fn legacy_topology_resync_preserves_user_tab_order_and_window_moves() {
+        assert_topology_resync_preserves_user_tab_order_and_window_moves(false);
+    }
+
+    #[test]
+    fn current_topology_resync_preserves_user_tab_order_and_window_moves() {
+        assert_topology_resync_preserves_user_tab_order_and_window_moves(true);
+    }
+
+    fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(91_021);
         let _domain = register_test_client_domain(&mux, &inner);
         let listing = || {
-            let mut listing = sample_remote_tab_listing();
+            let mut listing = if current {
+                sample_remote_tab_listing_with_float()
+            } else {
+                sample_remote_tab_listing()
+            };
             let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
                 panic!("sample listing must have one leaf");
             };
-            for (tab_id, pane_id) in [(52, 62), (53, 63)] {
+            for (tab_id, pane_id) in [(52, 72), (53, 73)] {
                 let mut entry = template.clone();
                 entry.tab_id = tab_id;
                 entry.pane_id = pane_id;
@@ -5852,8 +5864,15 @@ mod tests {
             }
             listing
         };
-        let apply = || {
-            let panes = listing();
+        let apply = |panes: ListPanesResponse| {
+            if current {
+                return ClientDomain::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    RpcTopologySnapshot::Current(panes),
+                    None,
+                );
+            }
             ClientDomain::process_pane_snapshot(
                 &mux,
                 Arc::clone(&inner),
@@ -5864,7 +5883,7 @@ mod tests {
                 None,
             )
         };
-        apply().expect("initial legacy attachment");
+        apply(listing()).expect("initial attachment");
         let original = inner.remote_to_local_window(41).expect("local window");
         let first = mux
             .get_tab(inner.remote_to_local_tab_id(51).expect("tab mapping"))
@@ -5893,7 +5912,7 @@ mod tests {
         // The server still lists 51,52,53 under its original remote window.
         // Repeating a resync must neither reinsert 51 nor reset the local order.
         for _ in 0..2 {
-            apply().expect("legacy resync after a local window move must succeed");
+            apply(listing()).expect("resync after a local window move must succeed");
             assert_eq!(mux.iter_windows().len(), 2);
             for expected in &before {
                 let current = mux
@@ -5926,6 +5945,24 @@ mod tests {
                     .get_pane(pane.pane_id())
                     .is_some_and(|live| Arc::ptr_eq(&live, pane)));
             }
+        }
+        if current {
+            // Preserving a local window placement must not skip current
+            // floating-pane reconciliation, including exact stale retirement.
+            let floating_id = inner
+                .remote_to_local_pane_id(&mux, 62)
+                .expect("floating pane survived moved-tab resync");
+            let floating = first.iter_floating_panes();
+            assert_eq!(floating.len(), 1);
+            assert_eq!(floating[0].pane_id, floating_id);
+            assert_eq!((floating[0].left, floating[0].top), (4, 3));
+            let mut without_float = listing();
+            without_float.floating_panes.clear();
+            apply(without_float).expect("retire floating pane in a user-moved tab");
+            assert!(first.iter_floating_panes().is_empty());
+            assert!(mux.get_pane(floating_id).is_none());
+            assert_eq!(remote_tab_order(&mux, &inner, original), vec![53, 52]);
+            assert_eq!(remote_tab_order(&mux, &inner, *destination), vec![51]);
         }
         drop(destination);
     }
