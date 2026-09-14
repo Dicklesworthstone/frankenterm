@@ -1285,11 +1285,14 @@ impl core::clone::Clone for TeenyString {
         if Self::is_marker_bit_set(self.0) {
             Self(self.0)
         } else {
-            // Heap-backed cells can carry an explicit width that differs from
-            // the host's current Unicode tables.  Recomputing here silently
-            // changed terminal geometry when a Line/Cell was cloned (including
-            // for persistence).  Preserve the authoritative stored width.
-            Self::from_str(self.str(), Some(self.width()), None)
+            // Copy authoritative geometry verbatim: Unicode tables may differ,
+            // and explicit constructor normalization would turn a legitimate
+            // computed zero width into one.
+            let heap = Box::new(TeenyStringHeap {
+                bytes: Zeroizing::new(self.as_bytes().to_vec()),
+                width: self.width(),
+            });
+            Self(Box::into_raw(heap) as u64)
         }
     }
 }
@@ -2357,6 +2360,55 @@ mod test {
         assert_ne!(s.0, c.0, "heap-backed clones must own distinct buffers");
         drop(s);
         assert_eq!(c.str(), "a long string that goes on heap");
+    }
+
+    #[test]
+    fn teeny_string_clone_preserves_zero_and_explicit_heap_widths() {
+        for (text, explicit, expected_width) in [
+            ("\u{301}\u{301}\u{301}\u{301}", None, 0),
+            ("abcdefgh", Some(1), 1),
+            ("abcdefgh", Some(2), 2),
+        ] {
+            let source = TeenyString::from_str(text, explicit, None);
+            assert!(!TeenyString::is_marker_bit_set(source.0));
+            assert_eq!(source.width(), expected_width);
+            if expected_width == 0 {
+                let normalized = TeenyString::from_str(source.str(), Some(source.width()), None);
+                assert_eq!(
+                    normalized.width(),
+                    1,
+                    "constructor policy is not clone semantics"
+                );
+            }
+            let cloned = source.clone();
+            assert!(cloned == source);
+            assert_ne!(
+                cloned.0, source.0,
+                "heap clones must own independent storage"
+            );
+            drop(source);
+            assert_eq!(cloned.str(), text);
+            assert_eq!(cloned.width(), expected_width);
+            assert!(cloned.clone() == cloned);
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn zero_width_cell_clone_and_json_roundtrip_preserve_geometry() {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        let source = Cell::new_grapheme("\u{301}\u{301}\u{301}\u{301}", attrs, None);
+        assert_eq!(source.width(), 0);
+        let cloned = source.clone();
+        assert_eq!(cloned, source);
+        let wire = serde_json::to_value(&cloned).unwrap();
+        assert_eq!(wire, serde_json::to_value(&source).unwrap());
+        let restored: Cell = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored, source);
+        assert_eq!(restored, cloned);
+        assert_eq!(restored.width(), 0);
+        assert!(restored.attrs().italic());
     }
 
     #[test]

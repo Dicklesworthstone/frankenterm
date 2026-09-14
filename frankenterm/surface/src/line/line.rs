@@ -5266,6 +5266,7 @@ mod tests {
             &mut scratch,
         );
         assert!(layout.image_free);
+        assert_eq!(layout.tokens[layout.token_range.start].width(), 0);
         assert_deferred_metadata_scan_contract(&layout, true);
         let retained = layout.retain_width_prefix();
         assert!(!retained.width_prefix.as_ref().unwrap().all_widths_positive);
