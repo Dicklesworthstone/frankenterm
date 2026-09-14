@@ -49,23 +49,68 @@ for command in curl git ln python3 shasum; do
         exit 2
     fi
 done
-if [[ -n "${DSR_RELEASE_GIT_SHA:-}" && "$(pwd -P)" != "$(cd "$PROJECT_ROOT" && pwd -P)" ]]; then
-    # Keep browser lock data and verifier bytes in the source archive DSR built.
-    # The canonical repository supplies immutable Git objects, not live assets.
+if [[ -n "${DSR_SOURCE_REPOSITORY:-}" && -z "${DSR_RELEASE_GIT_SHA:-}" ]]; then
+    echo "Error: DSR_SOURCE_REPOSITORY requires DSR_RELEASE_GIT_SHA" >&2
+    exit 2
+fi
+if [[ -n "${DSR_RELEASE_GIT_SHA:-}" && ( -n "${DSR_SOURCE_REPOSITORY:-}" \
+    || "$(pwd -P)" != "$(cd "$PROJECT_ROOT" && pwd -P)" ) ]]; then
+    # DSR_SOURCE_REPOSITORY is Git-object authority, never an asset directory.
+    # It permits this script to run from the immutable archive itself. Keep
+    # the canonical-script caller's repository default for existing callers.
     DSR_SOURCE_ROOT="$(pwd -P)"
     if [[ -z "${CARGO_TARGET_DIR:-}" || ! -d "$CARGO_TARGET_DIR" || -e "$DSR_SOURCE_ROOT/.git" \
         || "$DSR_SOURCE_ROOT" != "$(cd "$CARGO_TARGET_DIR/.." && pwd -P)/source" ]]; then
         echo "Error: DSR assembly requires its source archive and sibling Cargo target directory" >&2
         exit 2
     fi
-    bash "$MANIFEST_TOOL" verify-source --root "$DSR_SOURCE_ROOT" \
-        --repository "$PROJECT_ROOT" --source-revision "$DSR_RELEASE_GIT_SHA"
+    # Bootstrap the verifier from the requested commit, not unverified archive
+    # bytes or the repository's possibly newer working tree. Bound Git output
+    # by its immutable blob size before loading executable verifier bytes.
+    python3 - "${DSR_SOURCE_REPOSITORY:-$PROJECT_ROOT}" "$DSR_RELEASE_GIT_SHA" "$DSR_SOURCE_ROOT" <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+repository, revision, root = sys.argv[1:]
+if not re.fullmatch(r"[0-9a-f]{40}", revision):
+    raise SystemExit("invalid DSR source revision")
+environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+command = ["git", "--no-replace-objects", "-C", repository]
+try:
+    def git(*arguments):
+        return subprocess.check_output(command + list(arguments), env=environment, timeout=30)
+
+    if git("rev-parse", "--verify", revision + "^{commit}").decode().strip() != revision:
+        raise SystemExit("DSR source revision does not name the requested commit")
+    blob = git("rev-parse", "--verify", revision + ":scripts/atomic-component-manifest.sh").decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", blob) or git("cat-file", "-t", blob) != b"blob\n":
+        raise SystemExit("DSR source verifier is not an immutable Git blob")
+    size = int(git("cat-file", "-s", blob))
+    if not 0 < size <= 1024 * 1024:
+        raise SystemExit("DSR source verifier exceeds the byte limit")
+    verifier = git("cat-file", "blob", blob)
+    if len(verifier) != size:
+        raise SystemExit("DSR source verifier size changed")
+    subprocess.run(
+        ["bash", "-s", "--", "verify-source", "--root", root,
+         "--repository", repository, "--source-revision", revision],
+        input=verifier, env=environment, check=True,
+    )
+except (OSError, ValueError, subprocess.SubprocessError) as error:
+    raise SystemExit(f"DSR immutable source verification failed: {error}") from error
+PY
     PROJECT_ROOT="$DSR_SOURCE_ROOT"
     LOCK_FILE="$PROJECT_ROOT/docs/release/browser-runtime-lock.v1.json"
     MANIFEST_TOOL="$PROJECT_ROOT/scripts/atomic-component-manifest.sh"
     SOURCE_REVISION="$DSR_RELEASE_GIT_SHA"
 else
     SOURCE_REVISION=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
+    if [[ -n "${DSR_RELEASE_GIT_SHA:-}" && "$SOURCE_REVISION" != "$DSR_RELEASE_GIT_SHA" ]]; then
+        echo "Error: checkout source differs from DSR_RELEASE_GIT_SHA" >&2
+        exit 2
+    fi
     UNTRACKED_SOURCE=$(git -C "$PROJECT_ROOT" ls-files --others --exclude-standard)
     if ! git -C "$PROJECT_ROOT" diff --quiet -- \
         || ! git -C "$PROJECT_ROOT" diff --cached --quiet -- \

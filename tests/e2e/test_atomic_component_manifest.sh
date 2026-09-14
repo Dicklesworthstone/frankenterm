@@ -865,5 +865,144 @@ for source_case in changed mode extra symlink directory; do
     verify_source_fixture "$SOURCE_BAD"
 done
 
+# Exercise the actual packaging entrypoints from a Gitless DSR archive. The
+# fixture deliberately has no browser lock or browser component: successful
+# source admission must emit the real verifier receipt, then reach that next
+# packaging guard. This proves source admission, not a native app build.
+DSR_CASE="$TEST_ROOT/dsr-source-entrypoints"
+DSR_ARCHIVE="$DSR_CASE/source"
+DSR_TARGET="$DSR_CASE/.cargo-target-darwin-arm64"
+DSR_OBJECTS="$TEST_ROOT/dsr-source-objects.git"
+DSR_WRONG_OBJECTS="$TEST_ROOT/dsr-wrong-objects.git"
+mkdir -p "$DSR_ARCHIVE/scripts" "$DSR_TARGET"
+git init --bare -q "$DSR_OBJECTS"
+git init --bare -q "$DSR_WRONG_OBJECTS"
+for dsr_script in atomic-component-manifest.sh assemble-browser-runtime.sh create-macos-bundle.sh; do
+  cp -p "$REPO_ROOT/scripts/$dsr_script" "$DSR_ARCHIVE/scripts/$dsr_script"
+done
+printf 'version = "0.13.0"\n' > "$DSR_ARCHIVE/Cargo.toml"
+DSR_SCRIPT_TREE=$(
+  for dsr_script in assemble-browser-runtime.sh atomic-component-manifest.sh create-macos-bundle.sh; do
+    dsr_blob=$(git --git-dir="$DSR_OBJECTS" hash-object -w "$DSR_ARCHIVE/scripts/$dsr_script")
+    printf '100755 blob %s\t%s\n' "$dsr_blob" "$dsr_script"
+  done | git --git-dir="$DSR_OBJECTS" mktree
+)
+DSR_CARGO_BLOB=$(git --git-dir="$DSR_OBJECTS" hash-object -w "$DSR_ARCHIVE/Cargo.toml")
+DSR_TREE=$(printf '100644 blob %s\tCargo.toml\n040000 tree %s\tscripts\n' \
+  "$DSR_CARGO_BLOB" "$DSR_SCRIPT_TREE" | git --git-dir="$DSR_OBJECTS" mktree)
+DSR_COMMIT=$(printf 'DSR source entrypoint fixture\n' | git --git-dir="$DSR_OBJECTS" \
+  -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$DSR_TREE")
+DSR_NEW_CARGO_BLOB=$(printf 'version = "0.14.0"\n' | git --git-dir="$DSR_OBJECTS" hash-object -w --stdin)
+DSR_NEW_TREE=$(printf '100644 blob %s\tCargo.toml\n040000 tree %s\tscripts\n' \
+  "$DSR_NEW_CARGO_BLOB" "$DSR_SCRIPT_TREE" | git --git-dir="$DSR_OBJECTS" mktree)
+DSR_NEW_COMMIT=$(printf 'Later canonical repository commit\n' | git --git-dir="$DSR_OBJECTS" \
+  -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$DSR_NEW_TREE" -p "$DSR_COMMIT")
+git --git-dir="$DSR_OBJECTS" update-ref refs/heads/main "$DSR_NEW_COMMIT"
+git --git-dir="$DSR_OBJECTS" symbolic-ref HEAD refs/heads/main
+test "$(git --git-dir="$DSR_OBJECTS" rev-parse HEAD)" != "$DSR_COMMIT"
+
+# Preserve the existing canonical-script call form, and prove it also reads
+# verifier bytes from Git rather than a changed canonical working-tree file.
+DSR_CANONICAL_CALLER="$TEST_ROOT/dsr-canonical-caller"
+cp -Rp "$DSR_ARCHIVE" "$DSR_CANONICAL_CALLER"
+printf 'gitdir: %s\n' "$DSR_OBJECTS" > "$DSR_CANONICAL_CALLER/.git"
+printf '#!/usr/bin/env bash\nprintf "UNVERIFIED_CANONICAL_TOOL_EXECUTED\\n" >&2\nexit 0\n' \
+  > "$DSR_CANONICAL_CALLER/scripts/atomic-component-manifest.sh"
+
+run_dsr_source_entrypoint() {
+  local script="$1" archive="$2" target_dir="$3" repository="$4" revision="$5" output="$6"
+  (
+    cd "$archive"
+    export DSR_SOURCE_REPOSITORY="$repository" DSR_RELEASE_GIT_SHA="$revision"
+    export CARGO_TARGET_DIR="$target_dir"
+    # The wrong-repository case must not be rescued by ambient Git authority.
+    export GIT_DIR="$DSR_OBJECTS" GIT_WORK_TREE="$DSR_CANONICAL_CALLER"
+    case "$script" in
+      */assemble-browser-runtime.sh)
+        bash "$script" --target "$TARGET" --output "$output/runtime" \
+          --manifest "$output/manifest.json" --cache "$output/cache"
+        ;;
+      */create-macos-bundle.sh)
+        bash "$script" --skip-build --target "$TARGET" --output "$output"
+        ;;
+      *) echo "unknown fixture entrypoint: $script" >&2; return 1 ;;
+    esac
+  )
+}
+
+for dsr_script in assemble-browser-runtime.sh create-macos-bundle.sh; do
+  case "$dsr_script" in
+    assemble-browser-runtime.sh) dsr_next_guard='browser lock or atomic manifest tool is unavailable' ;;
+    create-macos-bundle.sh) dsr_next_guard='an exact browser runtime root and detached component manifest are required' ;;
+  esac
+  for dsr_caller in snapshot canonical; do
+    dsr_log="$TEST_ROOT/dsr-$dsr_script-$dsr_caller"
+    dsr_output="$dsr_log-output"
+    dsr_entrypoint="$DSR_ARCHIVE/scripts/$dsr_script"
+    dsr_repository="$DSR_OBJECTS"
+    if [[ "$dsr_caller" == canonical ]]; then
+      dsr_entrypoint="$DSR_CANONICAL_CALLER/scripts/$dsr_script"
+      dsr_repository=""
+    fi
+    if run_dsr_source_entrypoint "$dsr_entrypoint" "$DSR_ARCHIVE" "$DSR_TARGET" \
+      "$dsr_repository" "$DSR_COMMIT" "$dsr_output" > "$dsr_log.stdout" 2> "$dsr_log.stderr"; then
+      echo "expected the missing fixture browser input guard after source admission" >&2
+      exit 1
+    fi
+    # Bundle status messages use stdout after the verifier's first-line JSON.
+    head -n 1 "$dsr_log.stdout" | jq -e --arg revision "$DSR_COMMIT" \
+      --arg root "$(cd "$DSR_ARCHIVE" && pwd -P)" '
+      .ok and .operation == "verify-source" and .source_revision == $revision
+      and .root == $root and .file_count == 4 and .offline
+    ' >/dev/null
+    grep -Fq "$dsr_next_guard" "$dsr_log.stdout" "$dsr_log.stderr"
+    if grep -Fq UNVERIFIED_CANONICAL_TOOL_EXECUTED "$dsr_log.stderr"; then
+      echo "canonical working-tree verifier was executed" >&2
+      exit 1
+    fi
+    test ! -e "$dsr_output"
+  done
+
+  for dsr_negative in wrong-sha wrong-repository changed-source forged-verifier missing-sha; do
+    dsr_bad_case="$TEST_ROOT/dsr-$dsr_script-$dsr_negative"
+    mkdir "$dsr_bad_case"
+    cp -Rp "$DSR_ARCHIVE" "$dsr_bad_case/source"
+    mkdir "$dsr_bad_case/.cargo-target-darwin-arm64"
+    dsr_revision="$DSR_COMMIT"
+    dsr_repository="$DSR_OBJECTS"
+    dsr_expected_error=source_content_mismatch
+    case "$dsr_negative" in
+      wrong-sha) dsr_revision="$DSR_NEW_COMMIT" ;;
+      wrong-repository)
+        dsr_repository="$DSR_WRONG_OBJECTS"
+        dsr_expected_error='DSR immutable source verification failed'
+        ;;
+      changed-source) printf '# changed after snapshot\n' >> "$dsr_bad_case/source/Cargo.toml" ;;
+      forged-verifier)
+        printf '#!/usr/bin/env bash\nprintf "UNVERIFIED_SNAPSHOT_TOOL_EXECUTED\\n" >&2\nexit 0\n' \
+          > "$dsr_bad_case/source/scripts/atomic-component-manifest.sh"
+        ;;
+      missing-sha)
+        dsr_revision=""
+        dsr_expected_error='DSR_SOURCE_REPOSITORY requires DSR_RELEASE_GIT_SHA'
+        ;;
+    esac
+    if run_dsr_source_entrypoint "$dsr_bad_case/source/scripts/$dsr_script" \
+      "$dsr_bad_case/source" "$dsr_bad_case/.cargo-target-darwin-arm64" \
+      "$dsr_repository" "$dsr_revision" "$dsr_bad_case/output" \
+      > "$dsr_bad_case/stdout" 2> "$dsr_bad_case/stderr"; then
+      echo "invalid DSR source was admitted: $dsr_script $dsr_negative" >&2
+      exit 1
+    fi
+    grep -Fq "$dsr_expected_error" "$dsr_bad_case/stderr"
+    if [[ -s "$dsr_bad_case/stdout" ]] \
+      || grep -Fq UNVERIFIED_SNAPSHOT_TOOL_EXECUTED "$dsr_bad_case/stderr"; then
+      echo "invalid DSR source produced an admission receipt or executed unverified code" >&2
+      exit 1
+    fi
+    test ! -e "$dsr_bad_case/output"
+  done
+done
+
 printf 'FT_ATOMIC_COMPONENT_MANIFEST_MATRIX_SUCCESS root=%s build_id=%s manifest_id=%s\n' \
   "$TEST_ROOT" "$BUILD_A" "$(jq -r .manifest_id "$CLEAN/manifest.json")"
