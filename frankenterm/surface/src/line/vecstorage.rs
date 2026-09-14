@@ -271,11 +271,14 @@ impl VecStorage {
         })
     }
 
-    pub(crate) fn reusable_wrap_tokens(&self) -> Option<Arc<[Cell]>> {
+    pub(crate) fn reusable_wrap_tokens(&self) -> Option<(Arc<[Cell]>, core::ops::Range<usize>)> {
         #[cfg(feature = "std")]
         if let Some(row) = &self.cells.deferred {
-            if row.range == (0..row.tokens.len()) && row.tail.is_none() {
-                return Some(Arc::clone(&row.tokens));
+            // The row may be a trimmed prefix or an interior logical range.
+            // Its backing allocation is reusable whenever visible iteration
+            // reads the original tokens without a synthetic wrapped tail.
+            if row.tail.is_none() {
+                return Some((Arc::clone(&row.tokens), row.range.clone()));
             }
         }
         None
@@ -498,6 +501,20 @@ mod tests {
         s.chars()
             .map(|c| Cell::new(c, CellAttributes::default()))
             .collect()
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn reusable_token_ranges_refuse_synthetic_wrapped_tails() {
+        let tokens: Arc<[Cell]> = make_cells("prefix body suffix").into();
+        let plain = VecStorage::from_token_range(Arc::clone(&tokens), 7..11, false);
+        let (reused, range) = plain.reusable_wrap_tokens().unwrap();
+        assert!(Arc::ptr_eq(&tokens, &reused));
+        assert_eq!(range, 7..11);
+        assert!(plain.is_deferred_unmaterialized());
+        let wrapped = VecStorage::from_token_range(tokens, 7..11, true);
+        assert!(wrapped.reusable_wrap_tokens().is_none());
+        assert!(wrapped.is_deferred_unmaterialized());
     }
 
     #[cfg(feature = "std")]

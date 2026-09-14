@@ -543,11 +543,24 @@ impl Line {
                 CellStorage::V(storage) => storage.reusable_wrap_tokens(),
                 CellStorage::C(_) => None,
             };
-            let tokens: Arc<[Cell]> = reusable
-                .filter(|tokens| tokens.len() == cells.len())
-                .unwrap_or_else(|| cells.into_iter().map(|cell| cell.as_cell()).collect());
+            let (tokens, token_range) =
+                match reusable.filter(|(_, range)| range.len() >= cells.len()) {
+                    Some((tokens, range)) => {
+                        // Trimming trailing spaces narrows the source view; it
+                        // must not copy every retained cell at each new width.
+                        let end = range.start + cells.len();
+                        (tokens, range.start..end)
+                    }
+                    None => {
+                        let tokens: Arc<[Cell]> =
+                            cells.into_iter().map(|cell| cell.as_cell()).collect();
+                        let end = tokens.len();
+                        (tokens, 0..end)
+                    }
+                };
             plan_wrap_tokens(
                 tokens,
+                token_range,
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
                 geometry_hash,
                 width,
@@ -559,6 +572,7 @@ impl Line {
             width_prefix_scratch.clear();
             LineWrapLayout {
                 tokens: Arc::from([]),
+                token_range: 0..0,
                 width_prefix: None,
                 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
                 geometry_hash: [0; 16],
@@ -2129,6 +2143,9 @@ pub struct LineWrapReport {
 #[derive(Debug, Clone)]
 pub struct LineWrapLayout {
     tokens: Arc<[Cell]>,
+    // Break offsets and width prefixes are relative to this active range.
+    // The allocation can also retain excluded trailing spaces or other rows.
+    token_range: Range<usize>,
     width_prefix: Option<Arc<LineWrapWidthPrefixScratch>>,
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
     geometry_hash: [u8; 16],
@@ -2147,9 +2164,9 @@ impl LineWrapLayout {
     pub fn retain_width_prefix(mut self) -> Self {
         if self.blank.is_none() && self.width_prefix.is_none() {
             let mut prefix = LineWrapWidthPrefixScratch {
-                widths: Vec::with_capacity(self.tokens.len().saturating_add(1)),
+                widths: Vec::with_capacity(self.token_range.len().saturating_add(1)),
             };
-            prefix.rebuild(&self.tokens);
+            prefix.rebuild(&self.tokens[self.token_range.clone()]);
             self.width_prefix = Some(Arc::new(prefix));
         }
         self
@@ -2169,6 +2186,7 @@ impl LineWrapLayout {
         }
         plan_wrap_tokens(
             Arc::clone(&self.tokens),
+            self.token_range.clone(),
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             self.geometry_hash,
             width,
@@ -2211,8 +2229,8 @@ impl LineWrapLayout {
             };
             let stop = self.break_offsets[row];
             lines.push(materialize_wrap_line(
-                &self.tokens[start..stop],
-                stop < self.tokens.len(),
+                &self.tokens[self.token_range.start + start..self.token_range.start + stop],
+                stop < self.token_range.len(),
                 seqno,
                 self.width_prefix.as_ref().map_or(stop - start, |prefix| {
                     prefix.width_between(start, stop).max(stop - start)
@@ -2250,8 +2268,8 @@ impl LineWrapLayout {
                         Line {
                             cells: CellStorage::V(VecStorage::from_token_range(
                                 Arc::clone(&self.tokens),
-                                start..stop,
-                                stop < self.tokens.len(),
+                                self.token_range.start + start..self.token_range.start + stop,
+                                stop < self.token_range.len(),
                             )),
                             zones: Vec::new(),
                             seqno,
@@ -2282,6 +2300,7 @@ impl LineWrapLayout {
 
 fn plan_wrap_tokens(
     tokens: Arc<[Cell]>,
+    token_range: Range<usize>,
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))] geometry_hash: [u8; 16],
     width: usize,
     cost_model: MonospaceKpCostModel,
@@ -2298,6 +2317,7 @@ fn plan_wrap_tokens(
     if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
         return LineWrapLayout {
             tokens,
+            token_range,
             width_prefix,
             geometry_hash,
             break_offsets: cached.break_offsets,
@@ -2305,24 +2325,26 @@ fn plan_wrap_tokens(
             scorecard: cached.scorecard,
         };
     }
+    let active_tokens = &tokens[token_range.clone()];
     let prefix = match width_prefix.as_deref() {
         Some(prefix) => prefix,
         None => {
-            scratch.rebuild(&tokens);
+            scratch.rebuild(active_tokens);
             &*scratch
         }
     };
-    let plan = bounded_monospace_wrap_plan_with_width_prefix(&tokens, width, cost_model, prefix);
+    let plan =
+        bounded_monospace_wrap_plan_with_width_prefix(active_tokens, width, cost_model, prefix);
     let selected = evaluate_break_offsets_with_width_prefix(
-        &tokens,
+        active_tokens,
         &plan.break_offsets,
         width,
         cost_model,
         prefix,
     );
-    let greedy_offsets = greedy_break_offsets_from_width_prefix(&tokens, width, prefix);
+    let greedy_offsets = greedy_break_offsets_from_width_prefix(active_tokens, width, prefix);
     let greedy = evaluate_break_offsets_with_width_prefix(
-        &tokens,
+        active_tokens,
         &greedy_offsets,
         width,
         cost_model,
@@ -2349,6 +2371,7 @@ fn plan_wrap_tokens(
     );
     LineWrapLayout {
         tokens,
+        token_range,
         width_prefix,
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         geometry_hash,
@@ -4705,8 +4728,11 @@ mod tests {
                     MonospaceKpCostModel::terminal_default(),
                     &mut LineWrapWidthPrefixScratch::default(),
                 );
-                let expected =
-                    materialize_wrap_lines_from_tokens(&layout.tokens, &layout.break_offsets, 9);
+                let expected = materialize_wrap_lines_from_tokens(
+                    &layout.tokens[layout.token_range.clone()],
+                    &layout.break_offsets,
+                    9,
+                );
                 assert_eq!(layout.row_count(), expected.len());
                 assert_eq!(layout.scorecard().line_count, expected.len());
                 // The plan owns the original text even after its source changes.
@@ -4770,6 +4796,119 @@ mod tests {
             assert_eq!(
                 layout.materialize_rows(0..layout.row_count(), 9),
                 fresh.lines
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn trimmed_logical_ranges_reuse_tokens_without_retained_width_plans() {
+        for text in [
+            "ascii ffi -> long logical content   ",
+            "界面 e\u{301} 🚀 ffi אבג trailing text   ",
+        ] {
+            let source = Line::from_text(text, &CellAttributes::default(), 4, None);
+            // Include unrelated wide cells on both sides. All planner offsets
+            // must refer to the active logical slice, not the allocation.
+            let mut cells = vec![Cell::new('前', CellAttributes::default())];
+            cells.extend(source.visible_cells().map(|cell| cell.as_cell()));
+            let source_end = cells.len();
+            cells.push(Cell::new('後', CellAttributes::default()));
+            let tokens: Arc<[Cell]> = cells.into();
+            let mut shared = source.clone();
+            shared.cells = CellStorage::V(VecStorage::from_token_range(
+                Arc::clone(&tokens),
+                1..source_end,
+                false,
+            ));
+            for width in [0, 1, 3, 7, 17, 31, 5] {
+                // Deliberately reconstruct the plan each time. Replan alone
+                // hides the copying bug for sources outside the token budget.
+                let layout = shared.clone().plan_wrap_with_width_prefix_scratch(
+                    width,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                assert!(Arc::ptr_eq(&tokens, &layout.tokens));
+                assert_eq!(layout.token_range, 1..source_end - 3);
+                assert!(layout.width_prefix.is_none());
+                let expected = source.clone().wrap_with_report(
+                    width,
+                    9,
+                    MonospaceKpCostModel::terminal_default(),
+                );
+                assert_eq!(layout.scorecard(), expected.scorecard);
+                assert_eq!(layout.materialize_rows(0..usize::MAX, 9), expected.lines);
+                let deferred = layout.deferred_rows(0..usize::MAX, 9);
+                for (row, expected) in deferred.iter().zip(&expected.lines) {
+                    assert_eq!(row.len(), expected.len());
+                    assert_eq!(row.compute_shape_hash(), expected.compute_shape_hash());
+                    assert_eq!(
+                        row.last_cell_was_wrapped(),
+                        expected.last_cell_was_wrapped()
+                    );
+                    let CellStorage::V(storage) = &row.cells else {
+                        panic!("not vector storage");
+                    };
+                    if std::env::var_os("FT_DISABLE_DEFERRED_REFLOW_CELLS").is_none() {
+                        assert!(storage.is_deferred_unmaterialized());
+                    }
+                }
+                assert_eq!(deferred, expected.lines);
+                let retained = layout.retain_width_prefix();
+                let expected_prefix = source
+                    .clone()
+                    .plan_wrap_with_width_prefix_scratch(
+                        width,
+                        MonospaceKpCostModel::terminal_default(),
+                        &mut LineWrapWidthPrefixScratch::default(),
+                    )
+                    .retain_width_prefix();
+                assert_eq!(retained.width_prefix, expected_prefix.width_prefix);
+                let next_width = width + 2;
+                let replanned = retained.replan(
+                    next_width,
+                    MonospaceKpCostModel::terminal_default(),
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                let next_expected = source.clone().wrap_with_report(
+                    next_width,
+                    9,
+                    MonospaceKpCostModel::terminal_default(),
+                );
+                assert!(Arc::ptr_eq(&tokens, &replanned.tokens));
+                assert_eq!(replanned.scorecard(), next_expected.scorecard);
+                assert_eq!(
+                    replanned.materialize_rows(0..usize::MAX, 9),
+                    next_expected.lines,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn all_whitespace_shared_range_preserves_passthrough_metadata() {
+        let tokens: Arc<[Cell]> = cells_from_text("前   後").into();
+        let mut source = Line::new(41);
+        source.cells = CellStorage::V(VecStorage::from_token_range(tokens, 1..4, false));
+        source.bits = LineBits::DOUBLE_WIDTH | LineBits::BIDI_ENABLED;
+        for width in [0, 1, 2, 8] {
+            let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+                width,
+                MonospaceKpCostModel::terminal_default(),
+                &mut LineWrapWidthPrefixScratch::default(),
+            );
+            assert_eq!(layout.row_count(), 1);
+            assert!(layout.tokens.is_empty());
+            assert_eq!(layout.token_range, 0..0);
+            assert_eq!(
+                layout.materialize_rows(0..usize::MAX, 99),
+                vec![source.clone()]
+            );
+            assert_eq!(
+                layout.deferred_rows(0..usize::MAX, 99),
+                vec![source.clone()]
             );
         }
     }
@@ -4940,7 +5079,7 @@ mod tests {
                     panic!("not vector storage");
                 };
                 assert!(storage.is_deferred_unmaterialized());
-                let tokens = storage.reusable_wrap_tokens().unwrap();
+                let (tokens, _) = storage.reusable_wrap_tokens().unwrap();
                 let mut eager: Option<Line> = None;
                 for mut row in physical.clone() {
                     if row.last_cell_was_wrapped() {

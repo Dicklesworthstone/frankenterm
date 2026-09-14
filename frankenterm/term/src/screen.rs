@@ -10294,8 +10294,9 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
         );
         let _ = screen.logical_wraps_for_resize(4, 2, true, &|| false);
-        let (_, _, _, wrap_cache_hit, _) =
-            screen.logical_wraps_for_resize(4, 2, true, &|| false).unwrap();
+        let (_, _, _, wrap_cache_hit, _) = screen
+            .logical_wraps_for_resize(4, 2, true, &|| false)
+            .unwrap();
         assert!(wrap_cache_hit, "exercise an actual cached wrap");
         screen.last_viewport_first_reflow_us = u64::MAX;
         screen.resize(test_size(4, 4, 96), test_cursor(0, 3, 1), 2, false);
@@ -10820,6 +10821,40 @@ pub(crate) mod tests {
                 assert_eq!(text, expected);
             });
             assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn reflow_trimmed_shared_tokens_preserve_trailing_virtual_cursor_column() {
+        let source = Line::from_text("ab界e\u{301}🚀z   ", &CellAttributes::default(), 1, None);
+        let compact = Line::try_compact_logical_rows(core::iter::once(&source), 1).unwrap();
+        let mut screen = test_screen(1, 64, 96);
+        screen.lines = VecDeque::from([compact.clone()]);
+        // Cover the cursor on text and past the final retained nonblank cell.
+        for logical_x in [2, source.len() + 2] {
+            screen.lines = VecDeque::from([compact.clone()]);
+            screen.physical_cols = 64;
+            screen.rewrap_cache = Some(Arc::new(LogicalLineWrapCache::with_token_budget(
+                Some(screen.compute_layout_signature()),
+                vec![compact.clone()],
+                0,
+            )));
+            let mut cursor = (logical_x, 0);
+            for cols in [3, 8, 1, 12, 5, 3] {
+                cursor = screen.rewrap_lines(cols, 1, cursor.0, cursor.1, 2, None);
+                screen.physical_cols = cols;
+                assert_eq!(
+                    screen.logical_cursor_from_physical(cursor.0, cursor.1),
+                    Some((0, logical_x)),
+                );
+                assert!(screen
+                    .rewrap_cache
+                    .as_ref()
+                    .unwrap()
+                    .logical_lines
+                    .iter()
+                    .all(|line| line.wrap_source.is_none()));
+            }
         }
     }
 
@@ -11740,14 +11775,18 @@ pub(crate) mod tests {
         for (seqno, cols) in [(2, 8), (3, 5), (4, 8)] {
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
         }
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, true, &|| false).unwrap();
+        let (_, _, _, cached, _) = screen
+            .logical_wraps_for_resize(5, 5, true, &|| false)
+            .unwrap();
         assert!(cached, "exercise a previously cached target width");
         assert!(screen.last_resize_wrap_scorecard.is_none());
 
         // Installing the same policy must keep useful whole-line wraps.
         let unchanged = Arc::clone(&screen.config);
         screen.set_config(&unchanged);
-        let (_, _, _, cached, _) = screen.logical_wraps_for_resize(5, 5, true, &|| false).unwrap();
+        let (_, _, _, cached, _) = screen
+            .logical_wraps_for_resize(5, 5, true, &|| false)
+            .unwrap();
         assert!(cached, "unchanged policy should retain cached wraps");
 
         let scored: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
