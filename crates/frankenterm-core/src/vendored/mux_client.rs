@@ -5823,11 +5823,96 @@ mod tests {
         });
     }
 
+    fn handshake_notifications() -> Vec<Pdu> {
+        let mut surface = test_render_change(7, 2, "handshake");
+        surface.dimensions.scrollback_rows = 24;
+        surface.dirty_lines.clear();
+        vec![
+            Pdu::SetClipboard(codec::SetClipboard {
+                pane_id: 7,
+                clipboard: Some("handshake".into()),
+                selection: frankenterm_term::ClipboardSelection::Clipboard,
+            }),
+            Pdu::GetPaneRenderChangesResponse(test_render_change(7, 1, "handshake")),
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 8 }),
+            Pdu::SetPalette(codec::SetPalette {
+                pane_id: 7,
+                palette: Arc::new(Default::default()),
+            }),
+            Pdu::NotifyAlert(codec::NotifyAlert {
+                pane_id: 7,
+                alert: frankenterm_term::Alert::Bell,
+            }),
+            Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                window_id: 1,
+                workspace: "handshake".into(),
+            }),
+            Pdu::PaneFocused(codec::PaneFocused { pane_id: 7 }),
+            Pdu::TabResized(codec::TabResized { tab_id: 0 }),
+            Pdu::TabAddedToWindow(codec::TabAddedToWindow {
+                tab_id: 0,
+                window_id: 1,
+            }),
+            Pdu::TabTitleChanged(codec::TabTitleChanged {
+                tab_id: 0,
+                title: "handshake".into(),
+            }),
+            Pdu::WindowTitleChanged(codec::WindowTitleChanged {
+                window_id: 1,
+                title: "handshake".into(),
+            }),
+            Pdu::RenameWorkspace(codec::RenameWorkspace {
+                old_workspace: "old".into(),
+                new_workspace: "handshake".into(),
+            }),
+            Pdu::RenderApplicationUpdateV1(codec::RenderApplicationUpdateV1 {
+                identity: codec::RenderApplicationIdentity {
+                    protocol_version: 1,
+                    token: codec::RenderApplicationToken {
+                        connection_generation: 1,
+                        coordinator_instance: 1,
+                        scheduler_sequence: 1,
+                        attempt: 1,
+                        ledger_instance: 1,
+                        render_generation: 1,
+                        ledger_obligation: 1,
+                    },
+                    pane_id: 7,
+                    base_state: Some(codec::RenderStateIdentity {
+                        render_generation: 1,
+                        state_sequence: 1,
+                    }),
+                    resulting_state: codec::RenderStateIdentity {
+                        render_generation: 1,
+                        state_sequence: 2,
+                    },
+                    kind: codec::RenderApplicationKind::Delta,
+                },
+                retry_budget: codec::RenderApplicationRetryBudget {
+                    attempt_ordinal: 1,
+                    max_attempts: 1,
+                    remaining_millis: 250,
+                },
+                surface,
+                semantic_zones: codec::RenderComponentUpdate::Unchanged,
+                palette: codec::RenderComponentUpdate::Unchanged,
+                alerts: Vec::new(),
+            }),
+        ]
+    }
+
     /// A pane spawning during the handshake makes the mux broadcast a unilateral
     /// `TabResized` (serial 0) before it answers `SetClientId`. That is not a
     /// reply and must not poison the connection as a phase violation.
     #[test]
     fn unilateral_notification_during_registration_does_not_poison_connection() {
+        exercise_handshake_notifications(
+            vec![Pdu::TabResized(codec::TabResized { tab_id: 0 })],
+            false,
+        );
+    }
+
+    fn exercise_handshake_notifications(notifications: Vec<Pdu>, during_codec: bool) {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("mux-unilateral.sock");
@@ -5835,7 +5920,14 @@ mod tests {
                 .await
                 .expect("bind listener");
 
-            task::spawn(async move {
+            let expected_render: Vec<_> = notifications
+                .iter()
+                .filter_map(|pdu| match pdu {
+                    Pdu::GetPaneRenderChangesResponse(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .collect();
+            let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut read_buf = StreamingPduBuffer::new();
                 let mut responses: HashMap<u64, Pdu> = HashMap::new();
@@ -5849,6 +5941,17 @@ mod tests {
                     }
                     read_buf.extend_from_slice(&temp[..read]);
                     while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        if (during_codec && matches!(decoded.pdu, Pdu::GetCodecVersion(_)))
+                            || (!during_codec && matches!(decoded.pdu, Pdu::SetClientId(_)))
+                        {
+                            let mut out = Vec::new();
+                            for notification in &notifications {
+                                notification
+                                    .encode(&mut out, 0)
+                                    .expect("encode notification");
+                            }
+                            stream.write_all(&out).await.expect("write notifications");
+                        }
                         let response = match decoded.pdu {
                             Pdu::GetCodecVersion(_) => {
                                 let payload = GetCodecVersionResponse {
@@ -5860,18 +5963,7 @@ mod tests {
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
-                            Pdu::SetClientId(_) => {
-                                // The broadcast lands before the registration reply.
-                                let mut out = Vec::new();
-                                Pdu::TabResized(codec::TabResized { tab_id: 0 })
-                                    .encode(&mut out, 0)
-                                    .expect("encode unilateral notification");
-                                stream
-                                    .write_all(&out)
-                                    .await
-                                    .expect("write unilateral notification");
-                                Pdu::UnitResponse(UnitResponse {})
-                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                             Pdu::ListPanes(_) => {
                                 let payload = ListPanesResponse {
                                     tabs: Vec::new(),
@@ -5898,12 +5990,74 @@ mod tests {
             let mut client = DirectMuxClient::connect(config)
                 .await
                 .expect("connect must survive a unilateral notification during registration");
+            assert!(matches!(
+                client.protocol_state,
+                DirectMuxProtocolState::Ready(_)
+            ));
+            for expected in expected_render {
+                let retained = client
+                    .take_pending_render_change(expected.pane_id as u64)
+                    .expect("valid retained notification")
+                    .expect("handshake render notification must be retained");
+                assert_eq!(retained, expected);
+            }
+            assert!(client.pending_render_changes.is_empty());
             let panes = client
                 .list_panes()
                 .await
                 .expect("list panes after registration");
             assert_eq!(panes.tabs, [] as [mux::tab::PaneNode; 0]);
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .expect("server observes client close")
+                .expect("server task");
         });
+    }
+
+    #[test]
+    fn every_ungated_unilateral_notification_survives_both_handshake_phases() {
+        let notifications = handshake_notifications();
+        let covered: HashSet<_> = notifications.iter().map(Pdu::pdu_name).collect();
+        let required: HashSet<_> = Pdu::all_wire_specs()
+            .iter()
+            .filter(|spec| {
+                spec.authorizes(PduProducer::Server, PduWireRole::Unilateral)
+                    && matches!(spec.capability, PduCapabilityUse::None)
+            })
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            covered, required,
+            "cover the live codec notification registry"
+        );
+        for notification in notifications {
+            for during_codec in [false, true] {
+                exercise_handshake_notifications(vec![notification.clone()], during_codec);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+        #[test]
+        fn prop_unilateral_notification_order_during_handshake(
+            choices in prop::collection::vec(0usize..handshake_notifications().len(), 1..16),
+            during_codec in any::<bool>(),
+        ) {
+            let notifications = handshake_notifications();
+            exercise_handshake_notifications(
+                choices.into_iter().enumerate().map(|(position, index)| {
+                    let mut notification = notifications[index].clone();
+                    if let Pdu::GetPaneRenderChangesResponse(payload) = &mut notification {
+                        payload.seqno = position + 1;
+                        payload.title = format!("handshake-{position}");
+                    }
+                    notification
+                }).collect(),
+                during_codec,
+            );
+        }
     }
 
     /// Planted negative for the phase gate (ft-xxfwy.34): a reply that is
@@ -5912,6 +6066,81 @@ mod tests {
     /// unilateral notifications (serial 0) are tolerated during registration.
     #[test]
     fn correlated_wrong_pdu_during_registration_is_still_a_phase_violation() {
+        exercise_forbidden_handshake_notification(
+            Pdu::TabResized(codec::TabResized { tab_id: 0 }),
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn correlated_wrong_pdu_during_codec_is_still_a_phase_violation() {
+        exercise_forbidden_handshake_notification(
+            Pdu::TabResized(codec::TabResized { tab_id: 0 }),
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn capability_gated_unilateral_notifications_are_forbidden_during_handshake() {
+        let legacy = handshake_notifications()
+            .into_iter()
+            .find_map(|pdu| match pdu {
+                Pdu::RenderApplicationUpdateV1(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("legacy render fixture");
+        let mut identity = legacy.identity;
+        identity.protocol_version = codec::RENDER_APPLICATION_PROTOCOL_VERSION;
+        let update = codec::RenderApplicationUpdate {
+            identity,
+            retry_budget: legacy.retry_budget,
+            surface: legacy.surface,
+            semantic_zones: legacy.semantic_zones,
+            palette: legacy.palette,
+            alerts: legacy.alerts,
+            connection_identity: codec::RenderConnectionIdentity::new(
+                codec::TopologyStreamId::from_bytes([0x35; 16]),
+                mux::MuxSessionIncarnation::from_bytes([0x57; 16]),
+            ),
+        };
+        update.validate().expect("valid gated render fixture");
+        let notifications = vec![
+            Pdu::TopologyEvent(codec::TopologyEvent {
+                stream_id: codec::TopologyStreamId::from_bytes([0x62; 16]),
+                revision: mux::TopologyRevision::new(7),
+                event: codec::TopologyEventKind::Empty,
+            }),
+            Pdu::RenderApplicationUpdate(update),
+            ordered_window_event(),
+        ];
+        let covered: HashSet<_> = notifications.iter().map(Pdu::pdu_name).collect();
+        let required: HashSet<_> = Pdu::all_wire_specs()
+            .iter()
+            .filter(|spec| {
+                spec.authorizes(PduProducer::Server, PduWireRole::Unilateral)
+                    && matches!(spec.capability, PduCapabilityUse::Requires(_))
+            })
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(covered, required);
+        for notification in notifications {
+            for during_codec in [false, true] {
+                exercise_forbidden_handshake_notification(
+                    notification.clone(),
+                    during_codec,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn exercise_forbidden_handshake_notification(
+        forbidden: Pdu,
+        during_codec: bool,
+        correlated: bool,
+    ) {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("mux-wrong-pdu.sock");
@@ -5919,7 +6148,7 @@ mod tests {
                 .await
                 .expect("bind listener");
 
-            task::spawn(async move {
+            let server = task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut read_buf = StreamingPduBuffer::new();
                 loop {
@@ -5930,6 +6159,15 @@ mod tests {
                     };
                     read_buf.extend_from_slice(&temp[..read]);
                     while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        if (during_codec && matches!(decoded.pdu, Pdu::GetCodecVersion(_)))
+                            || (!during_codec && matches!(decoded.pdu, Pdu::SetClientId(_)))
+                        {
+                            let serial = if correlated { decoded.serial } else { 0 };
+                            write_response_pdu(&mut stream, &forbidden, serial)
+                                .await
+                                .expect("write forbidden notification");
+                            return;
+                        }
                         let response = match decoded.pdu {
                             Pdu::GetCodecVersion(_) => {
                                 Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
@@ -5940,9 +6178,6 @@ mod tests {
                                     min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
-                            // Wrong type on the registration request's own
-                            // serial: not a broadcast, so not tolerated.
-                            Pdu::SetClientId(_) => Pdu::TabResized(codec::TabResized { tab_id: 0 }),
                             _ => continue,
                         };
                         let mut out = Vec::new();
@@ -5959,20 +6194,37 @@ mod tests {
             let config = direct_mux_client_config(socket_path);
             let error = match DirectMuxClient::connect(config).await {
                 Ok(_) => {
-                    panic!("a correlated wrong-type reply during registration must not connect")
+                    panic!("a forbidden handshake notification must not connect")
                 }
                 Err(error) => error,
             };
-            assert!(
-                matches!(
-                    error,
-                    DirectMuxError::InboundPduInvalidForPhase {
-                        pdu: "TabResized",
-                        ..
-                    }
-                ),
-                "expected InboundPduInvalidForPhase for TabResized, got {error:?}"
-            );
+            if correlated {
+                let expected_phase = if during_codec {
+                    "awaiting_codec"
+                } else {
+                    "awaiting_registration"
+                };
+                assert!(
+                    matches!(
+                        error,
+                        DirectMuxError::InboundPduInvalidForPhase {
+                            pdu: "TabResized",
+                            phase,
+                            ..
+                        } if phase == expected_phase
+                    ),
+                    "expected correlated phase violation, got {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, DirectMuxError::InboundCapabilityNotNegotiated { .. }),
+                    "expected capability violation, got {error:?}"
+                );
+            }
+            timeout(Duration::from_secs(5), server)
+                .await
+                .expect("server completes")
+                .expect("server task");
         });
     }
 
