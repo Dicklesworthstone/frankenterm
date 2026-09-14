@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 35,
-        "other": 23,
+        "other": 24,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 20
       },
-      "fork_side_commit_count": 108,
+      "fork_side_commit_count": 109,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-13T18:22:58-04:00",
-        "sha": "6e1ad67aa80e7647b7d11a6aed3a4cc373a2e71a",
-        "subject": "perf(term): construct compact logical ranges on reflow workers"
+        "committed_at": "2026-09-13T20:03:38-04:00",
+        "sha": "9a5e8ef9103981b8d92af63005caa412d3c151ef",
+        "subject": "perf(term): share compact history snapshots and prepared row indexes"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -897,19 +897,19 @@
         "docs": 1,
         "feat": 53,
         "fix": 93,
-        "other": 39,
+        "other": 42,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 264,
+      "fork_side_commit_count": 267,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-13T18:22:58-04:00",
-        "sha": "6e1ad67aa80e7647b7d11a6aed3a4cc373a2e71a",
-        "subject": "perf(term): construct compact logical ranges on reflow workers"
+        "committed_at": "2026-09-13T20:37:07-04:00",
+        "sha": "191843bf7703a81e247dfa53882af1293e24b4a1",
+        "subject": "perf(term): prepare cursor mapping off the resize commit path"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2531,
-  "generated_at": "2026-09-13T22:36:55.430634Z",
+  "fork_side_commit_total": 2535,
+  "generated_at": "2026-09-14T00:45:53.315541Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
