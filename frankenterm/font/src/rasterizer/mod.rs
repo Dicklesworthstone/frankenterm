@@ -6,6 +6,7 @@ use image::{ImageBuffer, Rgba};
 
 /// The amount, as a number in [0,1], to horizontally skew a glyph when rendering synthetic
 /// italics
+#[cfg(not(windows))]
 pub(crate) const FAKE_ITALIC_SKEW: f64 = 0.2;
 
 #[cfg(not(windows))]

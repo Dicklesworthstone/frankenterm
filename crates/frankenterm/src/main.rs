@@ -6711,6 +6711,7 @@ enum AtomicPathTransitionOperation {
     Exchange,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AtomicPathTransitionOperation {
     const fn as_str(self) -> &'static str {
         match self {
@@ -6720,6 +6721,7 @@ impl AtomicPathTransitionOperation {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_atomic_path_transition_name(value: &str, label: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !value.is_empty() && value.len() <= 255,
@@ -6737,6 +6739,7 @@ fn validate_atomic_path_transition_name(value: &str, label: &str) -> anyhow::Res
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_atomic_path_transition_transaction_id(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         value.len() == 32
@@ -6748,6 +6751,7 @@ fn validate_atomic_path_transition_transaction_id(value: &str) -> anyhow::Result
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_atomic_path_content_id(value: &str, label: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         value == "missing"
@@ -6763,11 +6767,13 @@ fn validate_atomic_path_content_id(value: &str, label: &str) -> anyhow::Result<(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum AtomicPathTransitionOutcome {
     Applied,
     AlreadyApplied,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AtomicPathTransitionOutcome {
     const fn as_str(self) -> &'static str {
         match self {
@@ -7846,19 +7852,6 @@ fn run_atomic_path_transition(
         operation,
         fs::File::sync_all,
     )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn run_atomic_path_transition(
-    _parent: &Path,
-    _stage_name: &str,
-    _target_name: &str,
-    _transaction_id: &str,
-    _stage_content_id: &str,
-    _target_content_id: &str,
-    _operation: AtomicPathTransitionOperation,
-) -> anyhow::Result<AtomicPathTransitionOutcome> {
-    anyhow::bail!("safe atomic installer path transitions are unsupported on this platform")
 }
 
 #[derive(Subcommand)]
@@ -16900,7 +16893,9 @@ struct AgentConfigApplyError {
 #[derive(Debug)]
 struct AgentConfigPublicationError {
     message: String,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     outcome: AgentConfigTransactionOutcome,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     effect_parent_synced: bool,
 }
 
@@ -18251,9 +18246,12 @@ fn collect_agent_config_transaction_receipts_after_failure(
 
 struct StagedAgentConfig {
     file: cap_std::fs::File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     leaf: PathBuf,
     path: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     identity: AgentConfigObjectIdentity,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     security: AgentConfigSecuritySnapshot,
 }
 
@@ -18333,18 +18331,23 @@ fn create_agent_config_candidate(
         }
         let initial_security = capture_agent_config_security(parent, &path, &leaf, &file, opened)?;
         validate_fresh_agent_config_security(initial_security, source_security, &path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let security = source_security.unwrap_or(initial_security);
         parent.revalidate()?;
         Ok(StagedAgentConfig {
             file,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             leaf,
             path,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             identity: opened.identity,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             security,
         })
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_named_agent_config(
     parent: &AgentConfigParentDirectory,
     path: &Path,
@@ -19095,8 +19098,6 @@ fn publish_agent_config_candidate(
             "Atomic agent config publication for '{}' is unsupported on this platform.",
             target_path.display()
         ),
-        outcome: AgentConfigTransactionOutcome::NoEffect,
-        effect_parent_synced: false,
     })
 }
 
@@ -48619,6 +48620,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     // current config, workspace database, logging, font setup, or mux client.
     // Dispatch it before all of those surfaces so an explicit compatible
     // client + socket pair is the only live-mux authority involved.
+    #[cfg(unix)]
     if let Some(Commands::Session {
         command:
             SessionCommands::CompatibleClientDump {
@@ -48654,6 +48656,17 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
         )
         .await?;
         return Ok(());
+    }
+    #[cfg(not(unix))]
+    if matches!(
+        command.as_ref(),
+        Some(Commands::Session {
+            command: SessionCommands::CompatibleClientDump { .. },
+        })
+    ) {
+        anyhow::bail!(
+            "compatible-client dump requires Unix descriptor and socket identity support"
+        );
     }
 
     // Offline dump verification is also an incident-recovery surface. Keep it
@@ -68259,6 +68272,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             "immutable remote generation publication requires Linux GNU renameat2 NOREPLACE/EXCHANGE"
                         );
                     }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     SetupCommands::AtomicPathTransition {
                         parent,
                         stage_name,
@@ -68284,6 +68298,12 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             stage_name,
                             target_name,
                             outcome.as_str()
+                        );
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    SetupCommands::AtomicPathTransition { .. } => {
+                        anyhow::bail!(
+                            "safe atomic installer path transitions are unsupported on this platform"
                         );
                     }
                     SetupCommands::AtomicPathContentId { parent, name } => {
@@ -82109,11 +82129,15 @@ const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_TIMEOUT: Duration = Duration::from_secs(1
 const COMPATIBLE_CLIENT_DUMP_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(7_200);
 const COMPATIBLE_CLIENT_DUMP_MIN_BATCH_OUTPUT_BYTES: usize = 16 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_BATCH_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(any(unix, test))]
 const COMPATIBLE_CLIENT_DUMP_MAX_STATE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(unix)]
 const COMPATIBLE_CLIENT_DUMP_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_METADATA_STRING_BYTES: usize = 16 * 1024;
 const COMPATIBLE_CLIENT_DUMP_MAX_CLIENT_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
 const COMPATIBLE_CLIENT_DUMP_MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 4_096;
+#[cfg(unix)]
 const COMPATIBLE_CLIENT_DUMP_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const COMPATIBLE_CLIENT_DUMP_CAPTURE_TRANSPORT: &str = "pinned_v0_13_robot_double_census_v1";
 const COMPATIBLE_CLIENT_DUMP_BACKEND_CONSTRAINT: &str =
@@ -82203,6 +82227,7 @@ struct VerifiedCompatibleClientDumpContract {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
 struct CompatibleClientDumpRequest {
     client: PathBuf,
     expected_client_sha256: String,
@@ -82217,6 +82242,7 @@ struct CompatibleClientDumpRequest {
 }
 
 #[derive(Debug)]
+#[cfg(unix)]
 struct CompatibleClientDumpReceipt {
     path: PathBuf,
     schema: String,
@@ -82252,12 +82278,14 @@ struct PublishedMuxDumpReceipt {
     projection_count: usize,
     domain_pane_counts: BTreeMap<String, usize>,
     error_count: usize,
+    #[cfg(unix)]
     content_bytes: usize,
     payload_sha256: String,
     artifact_sha256: String,
     artifact_bytes: u64,
     durability: &'static str,
     recovered_existing: bool,
+    #[cfg(unix)]
     compatible_client: Option<VerifiedCompatibleClientDumpContract>,
 }
 
@@ -82321,6 +82349,7 @@ struct PinnedCompatibleMuxSocket {
     path_sha256: String,
 }
 
+#[cfg(unix)]
 struct CompatibleClientEnvironment {
     root: PathBuf,
     empty_path: PathBuf,
@@ -82333,6 +82362,7 @@ struct CompatibleClientEnvironment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct CompatibleClientVersionIdentity {
     version: String,
     git_hash: String,
@@ -82340,6 +82370,7 @@ struct CompatibleClientVersionIdentity {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(unix, test))]
 struct CompatibleClientRobotEnvelope<T> {
     ok: bool,
     data: Option<T>,
@@ -82354,6 +82385,7 @@ struct CompatibleClientRobotEnvelope<T> {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(unix, test))]
 struct CompatibleClientPaneState {
     pane_id: u64,
     pane_uuid: Option<String>,
@@ -82368,6 +82400,7 @@ struct CompatibleClientPaneState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct CompatibleClientContentTargetState {
     pane_id: u64,
     pane_uuid: Option<String>,
@@ -82386,18 +82419,21 @@ struct CompatibleClientPaneProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct CompatibleClientAliasAwareCensus {
     content_targets: BTreeMap<u64, CompatibleClientContentTargetState>,
     projections: Vec<CompatibleClientPaneProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct CompatibleClientRawPaneTopology {
     content_targets: Vec<CompatibleClientRawContentTargetTopology>,
     projections: Vec<CompatibleClientPaneProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(unix, test))]
 struct CompatibleClientRawContentTargetTopology {
     pane_id: u64,
     pane_uuid: Option<String>,
@@ -82405,17 +82441,20 @@ struct CompatibleClientRawContentTargetTopology {
 }
 
 #[derive(Serialize)]
+#[cfg(unix)]
 struct CompatibleClientConfig<'a> {
     vendored: CompatibleClientVendoredConfig<'a>,
 }
 
 #[derive(Serialize)]
+#[cfg(unix)]
 struct CompatibleClientVendoredConfig<'a> {
     mux_socket_path: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(unix, test))]
 struct CompatibleClientBatchTextData {
     pane_ids: Vec<u64>,
     tail_lines: usize,
@@ -82425,6 +82464,7 @@ struct CompatibleClientBatchTextData {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg(any(unix, test))]
 enum CompatibleClientPaneTextResult {
     Ok {
         text: String,
@@ -82441,6 +82481,7 @@ enum CompatibleClientPaneTextResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(unix, test))]
 struct CompatibleClientTruncationInfo {
     original_bytes: usize,
     returned_bytes: usize,
@@ -82449,12 +82490,14 @@ struct CompatibleClientTruncationInfo {
 }
 
 #[derive(Debug)]
+#[cfg(unix)]
 struct CompatibleClientCommandReceipt {
     stdout: Vec<u8>,
     stderr_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(unix)]
 enum CompatibleClientCommandKind<'a> {
     Version,
     State,
@@ -82464,6 +82507,7 @@ enum CompatibleClientCommandKind<'a> {
     },
 }
 
+#[cfg(unix)]
 struct CompatibleClientCapture {
     payload: serde_json::Value,
     recovery_environment_path: PathBuf,
@@ -82480,6 +82524,7 @@ struct CompatibleClientCapture {
 }
 
 #[derive(Debug, Default)]
+#[cfg(unix)]
 struct CompatibleClientSubprocessAccounting {
     commands: usize,
     stderr_warning_commands: usize,
@@ -83133,6 +83178,7 @@ async fn run_compatible_client_subprocess(
     run_result
 }
 
+#[cfg(any(unix, test))]
 fn parse_compatible_client_version(
     bytes: &[u8],
 ) -> anyhow::Result<CompatibleClientVersionIdentity> {
@@ -83149,6 +83195,7 @@ fn parse_compatible_client_version(
     })
 }
 
+#[cfg(any(unix, test))]
 fn parse_compatible_client_robot_envelope<T>(
     bytes: &[u8],
     limits: JsonStructureLimits,
@@ -83188,6 +83235,7 @@ where
         .ok_or_else(|| anyhow::anyhow!("compatible-client robot success receipt omitted its data"))
 }
 
+#[cfg(any(unix, test))]
 fn compatible_client_state_json_limits(max_panes: usize) -> JsonStructureLimits {
     JsonStructureLimits {
         // The exact v0.13 row has nine map entries when ignore_reason is
@@ -83202,6 +83250,7 @@ fn compatible_client_state_json_limits(max_panes: usize) -> JsonStructureLimits 
     }
 }
 
+#[cfg(unix)]
 fn compatible_client_batch_json_limits(
     batch_size: usize,
     stdout_limit: usize,
@@ -83215,6 +83264,7 @@ fn compatible_client_batch_json_limits(
     }
 }
 
+#[cfg(any(unix, test))]
 fn validate_compatible_client_state(
     mut panes: Vec<CompatibleClientPaneState>,
     max_panes: usize,
@@ -83292,6 +83342,7 @@ fn validate_compatible_client_state(
     })
 }
 
+#[cfg(any(unix, test))]
 fn compatible_client_raw_topology(
     census: &CompatibleClientAliasAwareCensus,
 ) -> CompatibleClientRawPaneTopology {
@@ -83360,6 +83411,7 @@ fn hash_compatible_client_projected_pane_topology(
     Ok(fingerprint)
 }
 
+#[cfg(unix)]
 fn compatible_client_projected_topology_fingerprint(
     census: &CompatibleClientAliasAwareCensus,
     redactor: &frankenterm_core::redactor::Redactor,
@@ -83492,6 +83544,7 @@ fn compatible_client_projected_topology_fingerprint_from_v2_records(
     })
 }
 
+#[cfg(unix)]
 fn account_compatible_client_subprocess(
     accounting: &mut CompatibleClientSubprocessAccounting,
     receipt: &CompatibleClientCommandReceipt,
@@ -83513,6 +83566,7 @@ fn account_compatible_client_subprocess(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn consume_compatible_client_batch(
     data: CompatibleClientBatchTextData,
     expected_pane_ids: &[u64],
@@ -84015,12 +84069,14 @@ fn publish_mux_dump_payload(
         projection_count,
         domain_pane_counts: verification.domain_pane_counts,
         error_count,
+        #[cfg(unix)]
         content_bytes: verification.content_bytes,
         payload_sha256,
         artifact_sha256: verification.artifact_sha256,
         artifact_bytes: verification.artifact_bytes,
         durability: artifact_receipt.durability,
         recovered_existing: artifact_receipt.recovered_existing,
+        #[cfg(unix)]
         compatible_client: verification.compatible_client,
     })
 }
@@ -84182,6 +84238,7 @@ fn reconcile_existing_compatible_client_dump(
     }))
 }
 
+#[cfg(unix)]
 fn emit_compatible_client_dump_receipt(
     receipt: &CompatibleClientDumpReceipt,
     output_format: SnapshotSessionOutputFormat,
@@ -84379,15 +84436,6 @@ async fn run_compatible_client_dump_command(
             retained_environment_path.display()
         )
     })
-}
-
-#[cfg(not(unix))]
-async fn run_compatible_client_dump_command(
-    _cx: &frankenterm_core::cx::Cx,
-    _request: CompatibleClientDumpRequest,
-    _format: &str,
-) -> anyhow::Result<()> {
-    anyhow::bail!("compatible-client dump requires Unix descriptor and socket identity support")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84893,19 +84941,13 @@ fn path_contains_parent_component(path: &Path) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+#[cfg(unix)]
 fn create_private_child_directory(parent: &cap_std::fs::Dir, name: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use cap_std::fs::DirBuilderExt as _;
+    use cap_std::fs::DirBuilderExt as _;
 
-        let mut builder = cap_std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        parent.create_dir_with(name, &builder)
-    }
-    #[cfg(not(unix))]
-    {
-        parent.create_dir(name)
-    }
+    let mut builder = cap_std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    parent.create_dir_with(name, &builder)
 }
 
 fn sync_capability_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
@@ -84920,6 +84962,7 @@ fn sync_capability_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()
     }
 }
 
+#[cfg(unix)]
 fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt as _;
 
@@ -84980,6 +85023,7 @@ fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir
     parent.open_dir_nofollow(Path::new(leaf))
 }
 
+#[cfg(unix)]
 fn artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf, PathBuf)> {
     if path_contains_parent_component(path) {
         anyhow::bail!(
@@ -85071,6 +85115,7 @@ fn revalidate_artifact_parent_directory(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sha256_reader(mut reader: impl Read) -> std::io::Result<(u64, String)> {
     use sha2::{Digest, Sha256};
 

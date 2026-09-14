@@ -22,9 +22,11 @@ extern "C" {
     fn hb_ft_font_set_load_flags(font: *mut hb_font_t, load_flags: i32);
 }
 
+#[cfg(not(windows))]
 pub const IS_PNG: hb_tag_t = hb_tag(b'p', b'n', b'g', b' ');
 #[allow(unused)]
 pub const IS_SVG: hb_tag_t = hb_tag(b's', b'v', b'g', b' ');
+#[cfg(not(windows))]
 pub const IS_BGRA: hb_tag_t = hb_tag(b'B', b'G', b'R', b'A');
 
 pub fn language_from_string(s: &str) -> Result<hb_language_t, Error> {
@@ -72,11 +74,13 @@ impl Clone for Blob {
 }
 
 impl Blob {
+    #[cfg(not(windows))]
     pub fn with_reference(blob: *mut hb_blob_t) -> Self {
         unsafe { hb_blob_reference(blob) };
         Self { blob }
     }
 
+    #[cfg(not(windows))]
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
             let mut len = 0;
@@ -312,12 +316,14 @@ impl Font {
         }
     }
 
+    #[cfg(not(windows))]
     pub fn set_synthetic_slant(&mut self, slant: f32) {
         unsafe {
             hb_font_set_synthetic_slant(self.font, slant);
         }
     }
 
+    #[cfg(not(windows))]
     pub fn set_synthetic_bold(&mut self, x_embolden: f32, y_embolden: f32, in_place: bool) {
         unsafe {
             hb_font_set_synthetic_bold(
@@ -1162,14 +1168,17 @@ impl DrawFuncs {
     }
 }
 
+#[cfg(not(windows))]
 pub struct TagString([u8; 4]);
 
+#[cfg(not(windows))]
 impl std::convert::AsRef<str> for TagString {
     fn as_ref(&self) -> &str {
         std::str::from_utf8(&self.0).expect("tag to be valid ascii")
     }
 }
 
+#[cfg(not(windows))]
 impl std::ops::Deref for TagString {
     type Target = str;
     fn deref(&self) -> &str {
@@ -1177,6 +1186,7 @@ impl std::ops::Deref for TagString {
     }
 }
 
+#[cfg(not(windows))]
 impl std::fmt::Display for TagString {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.as_ref().fmt(fmt)
@@ -1187,10 +1197,12 @@ pub const fn hb_tag(c1: u8, c2: u8, c3: u8, c4: u8) -> hb_tag_t {
     ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
 }
 
+#[cfg(not(windows))]
 pub fn hb_color(b: u8, g: u8, r: u8, a: u8) -> hb_tag_t {
     hb_tag(b, g, r, a)
 }
 
+#[cfg(not(windows))]
 pub fn hb_tag_to_string(tag: hb_tag_t) -> TagString {
     let mut buf = [0u8; 4];
 
