@@ -2994,7 +2994,8 @@ impl LocalPane {
         let retry = Arc::clone(&self.cold_viewport_retry);
         let capture_registration = registration.clone();
         let capture_retry = Arc::clone(&retry);
-        let worker = permit.start(Arc::clone(&cancelled), move |result, permit| {
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = permit.start(move || worker_cancelled.load(Ordering::Acquire), move |result, permit| {
             let mut plans = match result {
                 Ok(plans) => plans,
                 Err(error) => {

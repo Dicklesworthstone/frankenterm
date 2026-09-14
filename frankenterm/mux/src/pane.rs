@@ -86,7 +86,7 @@ impl LineReadPermit {
 
     pub fn start<F>(
         self,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        cancelled: impl Fn() -> bool + Send + 'static,
         complete: F,
     ) -> std::io::Result<LineReadWorker>
     where
@@ -102,7 +102,7 @@ impl LineReadPermit {
 
     fn start_with_spawn<F>(
         self,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        cancelled: impl Fn() -> bool + Send + 'static,
         complete: F,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     ) -> std::io::Result<LineReadWorker>
@@ -129,10 +129,7 @@ impl LineReadPermit {
                 frankenterm_sigpipe::catch_recoverable(
                     frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
                     std::panic::AssertUnwindSafe(|| {
-                        anyhow::ensure!(
-                            !cancelled.load(std::sync::atomic::Ordering::Acquire),
-                            "cold read cancelled"
-                        );
+                        anyhow::ensure!(!cancelled(), "cold read cancelled");
                         let rows = plans.iter().try_fold(0usize, |sum, plan| {
                             sum.checked_add(plan.requested_row_count())
                         });
@@ -147,7 +144,7 @@ impl LineReadPermit {
                         for plan in plans {
                             let ready = plan.hydrate_with_payload_limit(
                                 frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES - bytes,
-                                || cancelled.load(std::sync::atomic::Ordering::Acquire),
+                                &cancelled,
                             )?;
                             bytes = bytes.checked_add(ready.payload_bytes()).filter(|n|
                             *n <= frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES)
@@ -1198,7 +1195,7 @@ mod test {
         let completion_invoked = Arc::clone(&invoked);
         let worker = acquire_line_read_test_permit()
             .start(
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                || true,
                 move |_, _| {
                     completion_invoked.store(true, std::sync::atomic::Ordering::Release);
                     drop(guard);
@@ -1217,7 +1214,7 @@ mod test {
         let (sender, receiver) = std::sync::mpsc::channel();
         let guard = CompletionDrop(sender);
         let failed = acquire_line_read_test_permit().start_with_spawn(
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || false,
             move |_, _| {
                 drop(guard);
                 panic!("failed start cannot complete");
@@ -1247,7 +1244,7 @@ mod test {
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = acquire_line_read_test_permit()
             .start(
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                || true,
                 move |result, permit| {
                     let _ = sender.send((result.is_err(), std::thread::current().id()));
                     drop(permit);

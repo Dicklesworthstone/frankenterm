@@ -90,6 +90,20 @@ const PRODUCTION_TRACE_BYTE_CEILING: u64 = 32 * 1024 * 1024;
 const PRODUCTION_TRACE_SAMPLE_DENOMINATOR: u64 = 1_024;
 
 struct CancelLineReadOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+/// A detached storage worker must stop when its exact connection retires,
+/// even while the request future is still waiting for that worker's reply.
+#[derive(Clone)]
+struct SessionLineReadCancellation {
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    incarnation: Arc<SessionIncarnation>,
+}
+
+impl SessionLineReadCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire) || self.incarnation.is_retired()
+    }
+}
 type RetiredLineReply = (
     Vec<wezterm_term::screen::ScreenLineRead>,
     Option<codec::SerializedLines>,
@@ -117,14 +131,17 @@ impl Drop for CancelLineReadOnDrop {
 fn complete_owned_line_read(
     result: anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>,
     permit: mux::pane::LineReadPermit,
+    cancelled: impl Fn() -> bool,
     complete: impl FnOnce(anyhow::Result<OwnedLineReply>),
 ) {
     let (retirement, retired) = std::sync::mpsc::sync_channel(1);
     let mut retained_cells = Vec::new();
     let result = result.and_then(|plans| {
+        anyhow::ensure!(!cancelled(), "cold read cancelled");
         let mut rows = Vec::new();
         for plan in &plans {
             for (index, source) in plan.lines().enumerate() {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
                 let stable = stable_row_offset(plan.first_row(), index)
                     .ok_or_else(|| anyhow!("line read range overflow"))?;
                 let mut line = source.clone();
@@ -132,6 +149,7 @@ fn complete_owned_line_read(
                 rows.push((stable, line));
             }
         }
+        anyhow::ensure!(!cancelled(), "cold read cancelled");
         let payload = codec::SerializedLines::from(rows);
         let counts = payload.validate_structure()?;
         anyhow::ensure!(
@@ -148,10 +166,12 @@ fn complete_owned_line_read(
         retained_cells = payload
             .lines()
             .map(|(_, line)| {
+                anyhow::ensure!(!cancelled(), "cold read cancelled");
                 line.try_clone_for_snapshot(&mut bytes_left, &mut work_left)
                     .ok_or_else(|| anyhow!("line reply retirement budget"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(!cancelled(), "cold read cancelled");
         Ok(OwnedLineReply {
             plans,
             payload: Some(payload),
@@ -8403,19 +8423,31 @@ impl SessionHandler {
                         };
                         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let _cancel = CancelLineReadOnDrop(Arc::clone(&cancelled));
+                        let cancellation = SessionLineReadCancellation {
+                            abandoned: Arc::clone(&cancelled),
+                            incarnation: Arc::clone(&authority.incarnation),
+                        };
+                        let hydration_cancellation = cancellation.clone();
                         let (tx, rx) = frankenterm_core::runtime_async::oneshot::channel();
-                        let worker =
-                            match permit.start(Arc::clone(&cancelled), move |result, permit| {
-                                complete_owned_line_read(result, permit, |result| {
-                                    let _ = tx.send(result);
-                                });
-                            }) {
-                                Ok(worker) => worker,
-                                Err(error) => {
-                                    send_response(Err(error.into()));
-                                    return;
-                                }
-                            };
+                        let worker = match permit.start(
+                            move || hydration_cancellation.is_cancelled(),
+                            move |result, permit| {
+                                complete_owned_line_read(
+                                    result,
+                                    permit,
+                                    || cancellation.is_cancelled(),
+                                    |result| {
+                                        let _ = tx.send(result);
+                                    },
+                                );
+                            },
+                        ) {
+                            Ok(worker) => worker,
+                            Err(error) => {
+                                send_response(Err(error.into()));
+                                return;
+                            }
+                        };
                         // Keep captured prefixes outside both pane authority
                         // and panic recovery. Every exit hands them to the
                         // already-running worker, including a later-range error.
@@ -9282,6 +9314,145 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
+    fn line_read_test_permit() -> mux::pane::LineReadPermit {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(permit) = mux::pane::LineReadPermit::try_acquire() {
+                return permit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "line read test admission timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn line_read_test_plan() -> wezterm_term::screen::ScreenLineRead {
+        #[derive(Debug)]
+        struct Config;
+        impl wezterm_term::TerminalConfiguration for Config {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                wezterm_term::color::ColorPalette::default()
+            }
+        }
+        let mut term = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 16,
+                pixel_width: 160,
+                pixel_height: 80,
+                dpi: 96,
+            },
+            Arc::new(Config),
+            "line-read-cancellation",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        term.advance_bytes("first 界\r\nsecond\r\nthird\r\nlast".as_bytes());
+        term.screen().capture_line_read(0..4).unwrap()
+    }
+
+    #[test]
+    fn session_retirement_cancels_detached_line_read_before_request_drop() {
+        for (retire, abandon) in [(false, false), (true, false), (false, true)] {
+            let token = SessionLineReadCancellation {
+                abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                incarnation: Arc::new(SessionIncarnation::new()),
+            };
+            // Keep the request's drop guard alive throughout the worker. The
+            // retired-session case must not rely on dropping the waiting RPC.
+            let request = CancelLineReadOnDrop(Arc::clone(&token.abandoned));
+            let worker_token = token.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let caller = std::thread::current().id();
+            let worker = line_read_test_permit()
+                .start(
+                    move || worker_token.is_cancelled(),
+                    move |result, permit| {
+                        let result = result.map(|plans| {
+                            plans[0]
+                                .lines()
+                                .map(|line| line.as_str().into_owned())
+                                .collect::<Vec<_>>()
+                        });
+                        drop(permit);
+                        let _ = sender.send((result, std::thread::current().id()));
+                    },
+                )
+                .unwrap();
+            // A different connection retiring cannot cancel this read.
+            SessionIncarnation::new().retire();
+            if retire {
+                token.incarnation.retire();
+            }
+            if abandon {
+                token.abandoned.store(true, Ordering::Release);
+            }
+            worker.submit(vec![line_read_test_plan()]);
+            let (result, worker_thread) = receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_ne!(worker_thread, caller);
+            if retire || abandon {
+                assert_eq!(result.unwrap_err().to_string(), "cold read cancelled");
+            } else {
+                assert!(result.unwrap()[0].starts_with("first 界"));
+            }
+            assert_eq!(token.abandoned.load(Ordering::Acquire), abandon);
+            drop(request);
+        }
+    }
+
+    #[test]
+    fn session_retirement_stops_reply_encoding_after_hydration() {
+        for retire_on_check in [None, Some(1), Some(3)] {
+            let token = SessionLineReadCancellation {
+                abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                incarnation: Arc::new(SessionIncarnation::new()),
+            };
+            let plan = line_read_test_plan().hydrate(|| false).unwrap();
+            let checks = Cell::new(0);
+            let mut outcome = None;
+            complete_owned_line_read(
+                Ok(vec![plan]),
+                line_read_test_permit(),
+                || {
+                    checks.set(checks.get() + 1);
+                    if retire_on_check == Some(checks.get()) {
+                        token.incarnation.retire();
+                    }
+                    token.is_cancelled()
+                },
+                |result| {
+                    outcome = Some(result.map(|reply| {
+                        let text = reply
+                            .payload
+                            .as_ref()
+                            .unwrap()
+                            .lines()
+                            .map(|(_, line)| line.as_str().into_owned())
+                            .collect::<Vec<_>>();
+                        drop(reply);
+                        text
+                    }));
+                },
+            );
+            if let Some(stop) = retire_on_check {
+                assert_eq!(
+                    outcome.unwrap().unwrap_err().to_string(),
+                    "cold read cancelled"
+                );
+                assert_eq!(checks.get(), stop);
+            } else {
+                let text = outcome.unwrap().unwrap();
+                assert_eq!(text.len(), 4);
+                assert!(text[0].starts_with("first 界"));
+            }
+            assert!(!token.abandoned.load(Ordering::Acquire));
+        }
+    }
+
     #[test]
     fn line_read_reply_returns_rejected_payload_to_worker_queue() {
         let (retirement, retired) = std::sync::mpsc::sync_channel(1);
