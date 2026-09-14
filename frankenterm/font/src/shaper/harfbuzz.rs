@@ -400,12 +400,12 @@ impl HarfbuzzShaper {
             ..Default::default()
         };
 
-        cluster_resolver.build(hb_infos, s, &range);
+        cluster_resolver.build(hb_infos, s, &range, !no_more_fallbacks);
         log::debug!("cluster_resolver: {cluster_resolver:#?}");
 
         let info_iter = hb_infos.iter().zip(positions.iter()).peekable();
         for (info, pos) in info_iter {
-            let cluster_info = match cluster_resolver.get_mut(info.cluster as usize) {
+            let cluster_info = match cluster_resolver.get(info.cluster as usize) {
                 Some(i) => i,
                 None => panic!(
                     "expected cluster info.cluster {} to be in cluster_resolver",
@@ -429,20 +429,22 @@ impl HarfbuzzShaper {
             };
             log::debug!("hb info.cluster {} -> {info:?}", info.cluster);
 
-            if info.codepoint == 0 && !no_more_fallbacks {
-                cluster_info.incomplete = true;
-            }
-
             if let Some(ref mut cluster) = info_clusters.last_mut() {
-                // Don't fragment runs of unresolved codepoints; they could be a sequence
-                // that shapes together in a fallback font.
-                if info.codepoint == 0 && !no_more_fallbacks {
+                // Keep every glyph in an incomplete cluster in the fallback
+                // run, including available combining marks. Considering only
+                // codepoint==0 can emit a coalesced cluster again when its
+                // mark follows with the original, now interior, cluster offset.
+                if cluster_info.incomplete {
                     let prior = cluster.last_mut().unwrap();
                     // This logic essentially merges `info` into `prior` by
                     // extending the length of prior by `info`.
                     // We can only do that if they are contiguous.
                     // Take care, as the shaper may have re-ordered things!
-                    if prior.codepoint == 0 || prior.cluster == info.cluster {
+                    if cluster_resolver
+                        .get(prior.cluster)
+                        .expect("assigned above")
+                        .incomplete
+                    {
                         if prior.cluster + prior.len == info.cluster {
                             // Coalesce with prior
                             prior.len += info.len;
@@ -454,9 +456,11 @@ impl HarfbuzzShaper {
                             std::mem::swap(&mut info, prior);
                             prior.len += info.len;
                             continue;
-                        } else if info.cluster + info.len == prior.cluster + prior.len {
-                            // Overlaps and coincide with the end of prior; this one folds away.
-                            // This can happen with NFD rather than NFC text.
+                        } else if info.cluster >= prior.cluster
+                            && info.cluster + info.len <= prior.cluster + prior.len
+                        {
+                            // This glyph is already covered by the fallback
+                            // run, including marks at either end in LTR/RTL.
                             // <https://github.com/wezterm/wezterm/issues/2032>
                             continue;
                         }
@@ -795,11 +799,18 @@ struct ClusterResolver<'a> {
 }
 
 impl<'a> ClusterResolver<'a> {
-    pub fn build(&mut self, hb_infos: &[harfbuzz::hb_glyph_info_t], s: &str, range: &Range<usize>) {
+    pub fn build(
+        &mut self,
+        hb_infos: &[harfbuzz::hb_glyph_info_t],
+        s: &str,
+        range: &Range<usize>,
+        allow_fallback: bool,
+    ) {
         #[derive(PartialOrd, Ord, Eq, PartialEq, Copy, Clone)]
         struct Item {
             cell_idx: Option<usize>,
             start: usize,
+            incomplete: bool,
         }
 
         let mut map = HashMap::new();
@@ -821,7 +832,14 @@ impl<'a> ClusterResolver<'a> {
                 None => None,
             };
 
-            map.entry(start).or_insert_with(|| Item { start, cell_idx });
+            let item = map.entry(start).or_insert_with(|| Item {
+                start,
+                cell_idx,
+                incomplete: false,
+            });
+            // Determine whole-cluster fallback ownership before visiting its
+            // glyphs: a mark may precede or follow its missing base glyph.
+            item.incomplete |= allow_fallback && info.codepoint == 0;
         }
 
         let mut cluster_starts: Vec<Item> = map.into_values().collect();
@@ -832,7 +850,10 @@ impl<'a> ClusterResolver<'a> {
         // falsely remove valid cluster locations in the case where
         // we have no presentation_width information.
         cluster_starts.dedup_by(|a, b| match (a.cell_idx, b.cell_idx) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a_cell), Some(b_cell)) if a_cell == b_cell => {
+                b.incomplete |= a.incomplete;
+                true
+            }
             _ => false,
         });
 
@@ -849,19 +870,8 @@ impl<'a> ClusterResolver<'a> {
                 start,
                 byte_len,
                 cell_width,
-                incomplete: false,
+                incomplete: item.incomplete,
             });
-        }
-    }
-
-    pub fn get_mut(&mut self, start: usize) -> Option<&mut ClusterInfo> {
-        match self.presentation_width {
-            Some(pw) => {
-                let cell_idx = pw.byte_to_cell_idx(start);
-                let actual_start = self.start_by_cell_idx.get(&cell_idx)?;
-                self.map.get_mut(actual_start)
-            }
-            None => self.map.get_mut(&start),
         }
     }
 
@@ -1068,7 +1078,81 @@ mod test {
                             .iter()
                             .map(|glyph| usize::from(glyph.num_cells))
                             .sum::<usize>(),
-                        unicode_column_width(&text[range.clone()], None)
+                        unicode_column_width(&text[range.clone()], None),
+                        "direction={direction:?} range={range:?} presentation_width={presentation_width:?} glyphs={actual_glyphs:#?}"
+                    );
+                    assert_eq!(
+                        actual_glyphs
+                            .iter()
+                            .filter(|glyph| glyph.cluster as usize == start)
+                            .map(|glyph| usize::from(glyph.num_cells))
+                            .sum::<usize>(),
+                        1,
+                        "the original Ѡ cluster must consume exactly one cell"
+                    );
+                    assert_eq!(
+                        actual_glyphs
+                            .iter()
+                            .filter(|glyph| (start + 'Ѡ'.len_utf8()..end)
+                                .contains(&(glyph.cluster as usize)))
+                            .map(|glyph| usize::from(glyph.num_cells))
+                            .sum::<usize>(),
+                        2,
+                        "the original 一 plus combining mark must consume exactly two cells"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_missing_clusters_with_marks_consume_each_cell_once() {
+        use termwiz::cell::CellAttributes;
+        use termwiz::surface::{Line, SEQ_ZERO};
+
+        let handles = fallback_test_handles(1);
+        let config = config::configuration();
+        for text in [
+            "Ѡ一\u{301}",
+            "Ѡ\u{301}一",
+            "Ѡ\u{301}一\u{302}",
+            "一\u{301}Ѡ",
+            "一\u{301}Ѡ\u{302}",
+        ] {
+            let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None);
+            let clusters = line.cluster(None);
+            assert_eq!(clusters.len(), 1);
+            let width = PresentationWidth::with_cluster(&clusters[0]);
+            for direction in [Direction::LeftToRight, Direction::RightToLeft] {
+                for presentation_width in [None, Some(&width)] {
+                    let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+                    let mut missing = Vec::new();
+                    let glyphs = shaper
+                        .shape(
+                            text,
+                            10.,
+                            72,
+                            &mut missing,
+                            None,
+                            direction,
+                            None,
+                            presentation_width,
+                        )
+                        .unwrap();
+                    assert!(glyphs.iter().any(|glyph| glyph.glyph_pos == 0));
+                    assert!(
+                        glyphs.iter().any(|glyph| glyph.glyph_pos != 0),
+                        "the mark must actually be available"
+                    );
+                    assert_eq!(
+                        missing,
+                        text.chars().collect::<Vec<_>>(),
+                        "each missing run must be requested once"
+                    );
+                    assert_eq!(
+                        glyphs.iter().map(|glyph| usize::from(glyph.num_cells)).sum::<usize>(),
+                        3,
+                        "text={text:?} direction={direction:?} presentation_width={presentation_width:?} glyphs={glyphs:#?}"
                     );
                 }
             }
