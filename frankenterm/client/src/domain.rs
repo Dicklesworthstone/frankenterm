@@ -3439,6 +3439,18 @@ impl ClientDomain {
                     )?;
                 }
 
+                // Codec 46 does not carry authoritative window order. Keep
+                // the exact local placement of an already attached mirror:
+                // a user may have reordered it or moved it to another GUI
+                // window since the remote-window mapping was recorded.
+                // Reattaching through that old mapping both discards user
+                // intent and fails the mux's exclusive-parent invariant.
+                if !floating_snapshot_authoritative
+                    && mux.window_containing_tab(tab.tab_id()).is_some()
+                {
+                    continue;
+                }
+
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let needs_attach = mux
                         .get_window(local_window_id)
@@ -5817,6 +5829,105 @@ mod tests {
         assert!(mux.get_pane(local_float_id).is_none());
         assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
         assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn legacy_topology_resync_preserves_user_tab_order_and_window_moves() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_021);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let listing = || {
+            let mut listing = sample_remote_tab_listing();
+            let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+                panic!("sample listing must have one leaf");
+            };
+            for (tab_id, pane_id) in [(52, 62), (53, 63)] {
+                let mut entry = template.clone();
+                entry.tab_id = tab_id;
+                entry.pane_id = pane_id;
+                listing.tabs.push(PaneNode::Leaf(entry));
+                listing.tab_titles.push(format!("remote tab {tab_id}"));
+            }
+            listing
+        };
+        let apply = || {
+            let panes = listing();
+            ClientDomain::process_pane_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                panes.tabs,
+                panes.tab_titles,
+                panes.window_titles,
+                None,
+                None,
+            )
+        };
+        apply().expect("initial legacy attachment");
+        let original = inner.remote_to_local_window(41).expect("local window");
+        let first = mux
+            .get_tab(inner.remote_to_local_tab_id(51).expect("tab mapping"))
+            .expect("first tab");
+        let last = mux
+            .get_tab(inner.remote_to_local_tab_id(53).expect("tab mapping"))
+            .expect("last tab");
+        let panes_before = mux.iter_panes();
+        mux.move_tab_between_windows(last.tab_id(), original, Some(0))
+            .expect("user reorders tabs");
+        let destination = mux.new_empty_window(Some("ops".to_string()), None);
+        mux.move_tab_between_windows(first.tab_id(), *destination, Some(0))
+            .expect("user moves one tab to another native window");
+        let before = [original, *destination].map(|id| {
+            mux.window_order_snapshot(id)
+                .expect("valid order")
+                .expect("live window")
+        });
+        assert_eq!(remote_tab_order(&mux, &inner, original), vec![53, 52]);
+        assert_eq!(remote_tab_order(&mux, &inner, *destination), vec![51]);
+        assert!(
+            mux.add_tab_to_window(&first, original).is_err(),
+            "the old resync operation attempts a forbidden second parent"
+        );
+
+        // The server still lists 51,52,53 under its original remote window.
+        // Repeating a resync must neither reinsert 51 nor reset the local order.
+        for _ in 0..2 {
+            apply().expect("legacy resync after a local window move must succeed");
+            assert_eq!(mux.iter_windows().len(), 2);
+            for expected in &before {
+                let current = mux
+                    .window_order_snapshot(expected.window_id())
+                    .expect("valid restored order")
+                    .expect("same window");
+                assert_eq!(current.order_revision(), expected.order_revision());
+                assert_eq!(
+                    current
+                        .ordered_tabs()
+                        .iter()
+                        .map(Arc::as_ptr)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .ordered_tabs()
+                        .iter()
+                        .map(Arc::as_ptr)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(current.active_tab_id(), expected.active_tab_id());
+                for tab in current.ordered_tabs() {
+                    assert_eq!(
+                        mux.window_containing_tab(tab.tab_id()),
+                        Some(expected.window_id())
+                    );
+                }
+            }
+            for pane in &panes_before {
+                assert!(mux
+                    .get_pane(pane.pane_id())
+                    .is_some_and(|live| Arc::ptr_eq(&live, pane)));
+            }
+        }
+        drop(destination);
     }
 
     #[test]
