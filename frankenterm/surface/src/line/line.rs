@@ -43,6 +43,8 @@ const MAX_MATERIALIZED_LINE_LEN: usize = u16::MAX as usize;
 #[cfg(all(test, feature = "std"))]
 std::thread_local! {
     static REFLOW_CONTENT_SHAPE_HASH_SCANS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static WRAP_PHYSICAL_ROWS_CREATED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static WRAP_PLANNER_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 fn normalize_cell_width(width: usize) -> usize {
@@ -2175,6 +2177,356 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+/// Width-only snapshot of one physical row or a certified logical-row join.
+/// No text, attributes, cells, images or output rows are retained. Capture is
+/// fallible under the caller's byte budget; a refused join must use the ordinary
+/// text-bearing path. In particular, clustered append can change grapheme
+/// boundaries and normalize widths, so concatenating arbitrary width arrays is
+/// not equivalent to `Line::append_line`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineWrapGeometry {
+    widths: Vec<u8>,
+    physical_len: usize,
+    trimmed_tokens: usize,
+    join_safe: bool,
+    head_basic: bool,
+    tail_basic: bool,
+    head_after_basic: bool,
+    tail_before_basic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineWrapGeometryJoinError {
+    UncertifiedSource,
+    UncertifiedBoundary,
+    LengthOverflow,
+    ByteBudget,
+    Allocation,
+}
+
+impl LineWrapGeometry {
+    /// Capture exact visible widths and the last non-space token. `max_bytes`
+    /// bounds retained metadata and temporary boundary-certificate text work.
+    /// Standalone counts remain exact even when `supports_join()` is false.
+    pub fn capture(line: &Line, max_bytes: usize) -> Option<Self> {
+        let available = max_bytes.checked_sub(core::mem::size_of::<Self>())?;
+        // Visible tokens cannot outnumber columns in canonical physical rows.
+        // Reserve once, before certificate scratch exists, so a growing width
+        // allocation cannot double the admitted working-memory footprint.
+        if line.len() > available {
+            return None;
+        }
+        let mut result = Self {
+            widths: Vec::new(),
+            physical_len: line.len(),
+            trimmed_tokens: 0,
+            join_safe: line.len() <= u32::MAX as usize,
+            head_basic: false,
+            tail_basic: false,
+            head_after_basic: false,
+            tail_before_basic: false,
+        };
+        result.widths.try_reserve_exact(line.len()).ok()?;
+        if result.widths.capacity() > available {
+            return None;
+        }
+        let boundary_budget = max_bytes.checked_sub(result.retained_bytes())?;
+        let mut previous: Option<&str> = None;
+        let mut previous_basic = false;
+        let mut columns = 0usize;
+        let mut text_work = 0usize;
+        let mut boundary = zeroize::Zeroizing::new(String::new());
+        for cell in line.visible_cells() {
+            let width = cell.width();
+            // Current cells use widths 0..=2. Refuse a future extended width
+            // rather than silently truncating it in this compact encoding.
+            if width > u8::MAX as usize || result.widths.len() == result.widths.capacity() {
+                return None;
+            }
+            result.widths.push(width as u8);
+            // Preserve the source borrow beyond this temporary CellRef so the
+            // next token can certify its boundary against the previous one.
+            let text = match cell {
+                CellRef::CellRef { cell, .. } => cell.str(),
+                CellRef::ClusterRef { text, .. } => text,
+            };
+            if text != " " {
+                result.trimmed_tokens = result.widths.len();
+            }
+            result.join_safe &= cell.cell_index() == columns && (1..=2).contains(&width);
+            columns = columns.checked_add(width.max(1))?;
+            text_work = text_work.checked_add(text.len())?;
+            if text_work > max_bytes {
+                return None;
+            }
+            // Durable scrollback normalizes storage through cells and its
+            // text serializer. A width override must not authorize geometry
+            // for a later default-width decoded representation.
+            let ascii = text.len() == 1 && matches!(text.as_bytes()[0], b' '..=b'~');
+            let mut chars = text.chars();
+            let basic = chars.next().is_some_and(geometry_basic_starter) && chars.next().is_none();
+            result.join_safe &= if ascii {
+                width == 1
+            } else {
+                frankenterm_cell::grapheme_column_width(text, None) == width
+            };
+            if !basic {
+                let mut graphemes = Graphemes::new(text);
+                result.join_safe &= graphemes.next() == Some(text) && graphemes.next().is_none();
+            }
+            if let Some(previous) = previous {
+                if !(previous_basic && basic) {
+                    result.join_safe &= geometry_boundary_is_separate(
+                        previous,
+                        text,
+                        &mut boundary,
+                        boundary_budget,
+                    )?;
+                }
+            } else {
+                result.head_basic = text.chars().next().is_some_and(geometry_basic_starter);
+                result.head_after_basic = basic
+                    || geometry_boundary_is_separate("a", text, &mut boundary, boundary_budget)?;
+            }
+            previous = Some(text);
+            previous_basic = basic;
+        }
+        result.join_safe &= columns == line.len();
+        if let Some(last) = previous {
+            result.tail_basic = previous_basic;
+            result.tail_before_basic = previous_basic
+                || geometry_boundary_is_separate(last, "a", &mut boundary, boundary_budget)?;
+        }
+        Some(result)
+    }
+
+    /// True when this row's widths, segmentation and physical length survive
+    /// both vector and clustered storage and default-width text round trips.
+    /// Appending still requires a certified boundary between the two rows.
+    pub fn supports_join(&self) -> bool {
+        self.join_safe
+    }
+
+    pub fn physical_len(&self) -> usize {
+        self.physical_len
+    }
+
+    /// Owned allocation plus the inline representation; an external Arc header
+    /// and collection slots must be charged separately by their owner.
+    pub fn retained_bytes(&self) -> usize {
+        core::mem::size_of::<Self>().saturating_add(self.widths.capacity())
+    }
+
+    /// Conservative upper bound for live planner allocations, including the
+    /// caller's retained scratch. DP can retain a break-offset vector at every
+    /// endpoint; a bound on width bytes alone is not a bound on planning memory.
+    pub fn planning_bytes_upper_bound(
+        &self,
+        cols: usize,
+        cost_model: MonospaceKpCostModel,
+        scratch: &LineWrapWidthPrefixScratch,
+    ) -> Option<usize> {
+        let n = self.trimmed_tokens;
+        if self.physical_len <= cols || n == 0 {
+            return scratch.capacity().checked_mul(core::mem::size_of::<u128>());
+        }
+        let prefix = scratch
+            .capacity()
+            .checked_mul(2)?
+            .max(n.checked_add(1)?)
+            .max(4)
+            .checked_add(scratch.capacity())?;
+        // Vec push growth rounds up geometrically. Twice n (at least eight)
+        // bounds each offset vector, including a cloned candidate's next push.
+        let offsets = n.checked_add(1)?.checked_mul(2)?.max(8);
+        let dp = cols != 0 && !cost_model.should_fallback(n);
+        let offset_vectors = if dp { n.checked_add(8)? } else { 8 };
+        let mut bytes = prefix
+            .checked_mul(core::mem::size_of::<u128>())?
+            .checked_add(
+                offset_vectors
+                    .checked_mul(offsets)?
+                    .checked_mul(core::mem::size_of::<usize>())?,
+            )?;
+        if dp {
+            bytes = bytes.checked_add(
+                n.checked_add(1)?
+                    .checked_mul(core::mem::size_of::<Option<MonospaceBreakCandidate>>())?,
+            )?;
+        }
+        Some(bytes)
+    }
+
+    /// Budgeted form for cold-read workers. Refusal leaves scratch untouched
+    /// and lets the caller preserve its existing bounded fallback contract.
+    pub fn row_count_with_budget(
+        &self,
+        cols: usize,
+        cost_model: MonospaceKpCostModel,
+        scratch: &mut LineWrapWidthPrefixScratch,
+        max_bytes: usize,
+    ) -> Option<usize> {
+        if self.planning_bytes_upper_bound(cols, cost_model, scratch)? > max_bytes {
+            return None;
+        }
+        Some(self.row_count(cols, cost_model, scratch))
+    }
+
+    /// Join without retaining source text. A false return leaves the logical
+    /// geometry unchanged (a successful reserve may increase its capacity).
+    pub fn append(&mut self, other: &Self, max_bytes: usize) -> bool {
+        self.try_append(other, max_bytes).is_ok()
+    }
+
+    /// Fallible join with a finite refusal reason for fallback diagnostics.
+    pub fn try_append(
+        &mut self,
+        other: &Self,
+        max_bytes: usize,
+    ) -> Result<(), LineWrapGeometryJoinError> {
+        if !self.join_safe || !other.join_safe {
+            return Err(LineWrapGeometryJoinError::UncertifiedSource);
+        }
+        if !self.widths.is_empty()
+            && !other.widths.is_empty()
+            && !(self.tail_basic && other.head_after_basic
+                || other.head_basic && self.tail_before_basic)
+        {
+            return Err(LineWrapGeometryJoinError::UncertifiedBoundary);
+        }
+        let Some(physical_len) = self.physical_len.checked_add(other.physical_len) else {
+            return Err(LineWrapGeometryJoinError::LengthOverflow);
+        };
+        // ClusteredLine's physical length saturates at u32::MAX. Do not
+        // certify a join whose vector and clustered lengths could disagree.
+        if physical_len > u32::MAX as usize {
+            return Err(LineWrapGeometryJoinError::LengthOverflow);
+        }
+        let Some(len) = self.widths.len().checked_add(other.widths.len()) else {
+            return Err(LineWrapGeometryJoinError::LengthOverflow);
+        };
+        let Some(available) = max_bytes.checked_sub(core::mem::size_of::<Self>()) else {
+            return Err(LineWrapGeometryJoinError::ByteBudget);
+        };
+        if len > available || self.widths.capacity() > available {
+            return Err(LineWrapGeometryJoinError::ByteBudget);
+        }
+        if len > self.widths.capacity()
+            && self
+                .widths
+                .capacity()
+                .checked_add(len)
+                .is_none_or(|peak| peak > available)
+        {
+            return Err(LineWrapGeometryJoinError::ByteBudget);
+        }
+        if self.widths.try_reserve_exact(other.widths.len()).is_err() {
+            return Err(LineWrapGeometryJoinError::Allocation);
+        }
+        if self.widths.capacity() > available {
+            return Err(LineWrapGeometryJoinError::ByteBudget);
+        }
+        if other.trimmed_tokens > 0 {
+            self.trimmed_tokens = self.widths.len() + other.trimmed_tokens;
+        }
+        if self.widths.is_empty() {
+            self.head_basic = other.head_basic;
+            self.head_after_basic = other.head_after_basic;
+        }
+        if !other.widths.is_empty() {
+            self.tail_basic = other.tail_basic;
+            self.tail_before_basic = other.tail_before_basic;
+        }
+        self.widths.extend_from_slice(&other.widths);
+        self.physical_len = physical_len;
+        Ok(())
+    }
+
+    /// Count the rows produced by Screen's short-line bypass followed by the
+    /// exact production planner. An aligned empty cold seam is handled by the
+    /// caller. No cells or physical output rows are created, even on cache miss.
+    pub fn row_count(
+        &self,
+        cols: usize,
+        cost_model: MonospaceKpCostModel,
+        scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> usize {
+        if self.physical_len <= cols || self.trimmed_tokens == 0 {
+            return 1;
+        }
+        let widths = &self.widths[..self.trimmed_tokens];
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        let cache_key = {
+            let mut hasher = SipHasher::new();
+            widths.len().hash(&mut hasher);
+            for &width in widths {
+                usize::from(width).hash(&mut hasher);
+            }
+            MemoizedWrapPointCacheKey {
+                geometry_hash: hasher.finish128().as_bytes(),
+                width: cols,
+                cost_model,
+            }
+        };
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
+            return cached.scorecard.line_count;
+        }
+        scratch.rebuild_widths(widths.iter().map(|&width| usize::from(width)));
+        let (plan, scorecard) = wrap_plan_and_scorecard(widths.len(), cols, cost_model, scratch);
+        #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+        memoized_wrap_point_cache_insert(
+            cache_key,
+            MemoizedWrapPointCacheEntry {
+                break_offsets: plan.break_offsets,
+                scorecard,
+            },
+        );
+        #[cfg(not(all(feature = "std", not(ft_disable_memoized_wrap_points))))]
+        let _ = plan;
+        scorecard.line_count
+    }
+}
+
+// These are ordinary starters in Unicode grapheme segmentation: no prepend,
+// continuation, RI, Hangul, Indic linker or emoji-ZWJ context. The conservative
+// set includes the CJK seam in the native profiling corpus. Other boundaries
+// require a basic starter on the opposite side or the text-bearing fallback.
+fn geometry_basic_starter(ch: char) -> bool {
+    matches!(ch, ' '..='~' | '\u{4e00}'..='\u{9fff}')
+}
+
+fn geometry_boundary_is_separate(
+    left: &str,
+    right: &str,
+    scratch: &mut zeroize::Zeroizing<String>,
+    max_bytes: usize,
+) -> Option<bool> {
+    use zeroize::Zeroize;
+    let len = left.len().checked_add(right.len())?;
+    if len > max_bytes {
+        return None;
+    }
+    scratch.zeroize();
+    if len > scratch.capacity() {
+        // Drop the wiped previous allocation before reserving its replacement;
+        // the capture budget covers one boundary buffer, not two at once.
+        *scratch = zeroize::Zeroizing::new(String::new());
+        scratch.try_reserve_exact(len).ok()?;
+    }
+    if scratch.capacity() > max_bytes {
+        return None;
+    }
+    scratch.push_str(left);
+    scratch.push_str(right);
+    let mut graphemes = Graphemes::new(scratch);
+    Some(
+        graphemes.next() == Some(left)
+            && graphemes.next() == Some(right)
+            && graphemes.next().is_none(),
+    )
+}
+
 /// Owned logical cells plus width-dependent break metadata. No output `Line`
 /// or wide-cell padding is allocated until a row is requested. As with `Line`,
 /// attached image handles are not deep-frozen by this representation.
@@ -2351,6 +2703,8 @@ impl LineWrapLayout {
                 }
                 return (rows.start..end)
                     .map(|row| {
+                        #[cfg(test)]
+                        WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.set(count.get() + 1));
                         let start = if row == 0 {
                             0
                         } else {
@@ -2452,34 +2806,7 @@ fn plan_wrap_tokens(
             &*scratch
         }
     };
-    let plan =
-        bounded_monospace_wrap_plan_with_width_prefix(active_tokens, width, cost_model, prefix);
-    let selected = evaluate_break_offsets_with_width_prefix(
-        active_tokens,
-        &plan.break_offsets,
-        width,
-        cost_model,
-        prefix,
-    );
-    let greedy_offsets = greedy_break_offsets_from_width_prefix(active_tokens, width, prefix);
-    let greedy = evaluate_break_offsets_with_width_prefix(
-        active_tokens,
-        &greedy_offsets,
-        width,
-        cost_model,
-        prefix,
-    );
-    let scorecard = LineWrapScorecard {
-        mode: plan.mode,
-        greedy_total_cost: greedy.total_cost,
-        selected_total_cost: selected.total_cost,
-        badness_delta: saturating_diff_i64(selected.total_cost, greedy.total_cost),
-        greedy_forced_breaks: greedy.forced_breaks,
-        selected_forced_breaks: selected.forced_breaks,
-        line_count: selected.line_count,
-        estimated_states: plan.estimated_states,
-        evaluated_states: plan.evaluated_states,
-    };
+    let (plan, scorecard) = wrap_plan_and_scorecard(active_tokens.len(), width, cost_model, prefix);
     #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
     memoized_wrap_point_cache_insert(
         cache_key,
@@ -2502,6 +2829,45 @@ fn plan_wrap_tokens(
         blank: None,
         scorecard,
     }
+}
+
+fn wrap_plan_and_scorecard(
+    token_count: usize,
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+    prefix: &LineWrapWidthPrefixScratch,
+) -> (MonospaceWrapPlan, LineWrapScorecard) {
+    #[cfg(all(test, feature = "std"))]
+    WRAP_PLANNER_CALLS.with(|count| count.set(count.get() + 1));
+    let plan =
+        bounded_monospace_wrap_plan_with_width_prefix(token_count, width, cost_model, prefix);
+    let selected = evaluate_break_offsets_with_width_prefix(
+        token_count,
+        &plan.break_offsets,
+        width,
+        cost_model,
+        prefix,
+    );
+    let greedy_offsets = greedy_break_offsets_from_width_prefix(token_count, width, prefix);
+    let greedy = evaluate_break_offsets_with_width_prefix(
+        token_count,
+        &greedy_offsets,
+        width,
+        cost_model,
+        prefix,
+    );
+    let scorecard = LineWrapScorecard {
+        mode: plan.mode,
+        greedy_total_cost: greedy.total_cost,
+        selected_total_cost: selected.total_cost,
+        badness_delta: saturating_diff_i64(selected.total_cost, greedy.total_cost),
+        greedy_forced_breaks: greedy.forced_breaks,
+        selected_forced_breaks: selected.forced_breaks,
+        line_count: selected.line_count,
+        estimated_states: plan.estimated_states,
+        evaluated_states: plan.evaluated_states,
+    };
+    (plan, scorecard)
 }
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
@@ -2690,8 +3056,12 @@ impl LineWrapWidthPrefixScratch {
     }
 
     fn rebuild(&mut self, tokens: &[Cell]) {
+        self.rebuild_widths(tokens.iter().map(Cell::width));
+    }
+
+    fn rebuild_widths(&mut self, widths: impl ExactSizeIterator<Item = usize>) {
         self.widths.clear();
-        self.widths.reserve(tokens.len().saturating_add(1));
+        self.widths.reserve(widths.len().saturating_add(1));
         self.widths.push(0);
         #[cfg(feature = "std")]
         {
@@ -2699,8 +3069,7 @@ impl LineWrapWidthPrefixScratch {
         }
 
         let mut total = 0u128;
-        for token in tokens {
-            let width = token.width();
+        for width in widths {
             #[cfg(feature = "std")]
             {
                 self.all_widths_positive &= width > 0;
@@ -2777,19 +3146,19 @@ fn compute_wrap_geometry_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16]
 fn greedy_break_offsets_from_tokens(tokens: &[Cell], width: usize) -> Vec<usize> {
     let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
     width_prefix_scratch.rebuild(tokens);
-    greedy_break_offsets_from_width_prefix(tokens, width, &width_prefix_scratch)
+    greedy_break_offsets_from_width_prefix(tokens.len(), width, &width_prefix_scratch)
 }
 
 #[inline]
 fn greedy_break_offsets_from_width_prefix(
-    tokens: &[Cell],
+    token_count: usize,
     width: usize,
     width_prefix: &LineWrapWidthPrefixScratch,
 ) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut current_width = 0usize;
 
-    for idx in 0..tokens.len() {
+    for idx in 0..token_count {
         let token_width = width_prefix.width_between(idx, idx + 1);
         let need_new_line = current_width > 0 && current_width.saturating_add(token_width) > width;
         if need_new_line {
@@ -2799,13 +3168,13 @@ fn greedy_break_offsets_from_width_prefix(
         current_width = current_width.saturating_add(token_width);
     }
 
-    offsets.push(tokens.len());
+    offsets.push(token_count);
     offsets
 }
 
 #[inline]
 fn fallback_wrap_plan(
-    tokens: &[Cell],
+    token_count: usize,
     width: usize,
     estimated_states: usize,
     evaluated_states: usize,
@@ -2813,7 +3182,7 @@ fn fallback_wrap_plan(
 ) -> MonospaceWrapPlan {
     MonospaceWrapPlan {
         mode: MonospaceWrapMode::Fallback,
-        break_offsets: greedy_break_offsets_from_width_prefix(tokens, width, width_prefix),
+        break_offsets: greedy_break_offsets_from_width_prefix(token_count, width, width_prefix),
         estimated_states,
         evaluated_states,
     }
@@ -2829,16 +3198,16 @@ pub(crate) fn bounded_monospace_wrap_plan(
 ) -> MonospaceWrapPlan {
     let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
     width_prefix_scratch.rebuild(tokens);
-    bounded_monospace_wrap_plan_with_width_prefix(tokens, width, model, &width_prefix_scratch)
+    bounded_monospace_wrap_plan_with_width_prefix(tokens.len(), width, model, &width_prefix_scratch)
 }
 
 fn bounded_monospace_wrap_plan_with_width_prefix(
-    tokens: &[Cell],
+    token_count: usize,
     width: usize,
     model: MonospaceKpCostModel,
     width_prefix: &LineWrapWidthPrefixScratch,
 ) -> MonospaceWrapPlan {
-    if tokens.is_empty() {
+    if token_count == 0 {
         return MonospaceWrapPlan {
             mode: MonospaceWrapMode::Dp,
             break_offsets: vec![],
@@ -2847,10 +3216,9 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
         };
     }
 
-    let token_count = tokens.len();
     let estimated_states = model.estimated_dp_states(token_count);
     if width == 0 || model.should_fallback(token_count) {
-        return fallback_wrap_plan(tokens, width, estimated_states, 0, width_prefix);
+        return fallback_wrap_plan(token_count, width, estimated_states, 0, width_prefix);
     }
 
     let mut evaluated_states = 0usize;
@@ -2866,9 +3234,9 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
     // wider than lookahead_limit tokens. Keep greedy as a complete feasible
     // incumbent: searching fewer edges must never make the selected layout
     // worse. The normal candidate comparator retains all tie-break rules.
-    let greedy_breaks = greedy_break_offsets_from_width_prefix(tokens, width, width_prefix);
+    let greedy_breaks = greedy_break_offsets_from_width_prefix(token_count, width, width_prefix);
     best[token_count] = Some(evaluate_break_offsets_with_width_prefix(
-        tokens,
+        token_count,
         &greedy_breaks,
         width,
         model,
@@ -2893,7 +3261,7 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
             evaluated_states = evaluated_states.saturating_add(1);
             if evaluated_states > model.max_dp_states {
                 return fallback_wrap_plan(
-                    tokens,
+                    token_count,
                     width,
                     estimated_states,
                     evaluated_states,
@@ -2952,7 +3320,7 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
             evaluated_states,
         },
         None => fallback_wrap_plan(
-            tokens,
+            token_count,
             width,
             estimated_states,
             evaluated_states,
@@ -2963,7 +3331,7 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
 
 #[inline]
 fn evaluate_break_offsets_with_width_prefix(
-    tokens: &[Cell],
+    token_count: usize,
     break_offsets: &[usize],
     width: usize,
     model: MonospaceKpCostModel,
@@ -2977,13 +3345,13 @@ fn evaluate_break_offsets_with_width_prefix(
     let mut start = 0usize;
 
     for &raw_end in break_offsets {
-        let end = raw_end.min(tokens.len());
+        let end = raw_end.min(token_count);
         if end <= start {
             continue;
         }
 
         let line_width = width_prefix.width_between(start, end);
-        let is_last_line = end == tokens.len();
+        let is_last_line = end == token_count;
 
         let (line_cost, forced_inc) = if line_width > width {
             if end == start + 1 {
@@ -3010,10 +3378,10 @@ fn evaluate_break_offsets_with_width_prefix(
         start = end;
     }
 
-    if start < tokens.len() {
-        let line_width = width_prefix.width_between(start, tokens.len());
+    if start < token_count {
+        let line_width = width_prefix.width_between(start, token_count);
         let (line_cost, forced_inc) = if line_width > width {
-            if tokens.len() == start + 1 {
+            if token_count == start + 1 {
                 let overflow_cols = line_width.saturating_sub(width) as u64;
                 (
                     model
@@ -3033,7 +3401,7 @@ fn evaluate_break_offsets_with_width_prefix(
         forced_breaks = forced_breaks.saturating_add(forced_inc);
         max_line_badness = max_line_badness.max(line_cost);
         line_count = line_count.saturating_add(1);
-        normalized_breaks.push(tokens.len());
+        normalized_breaks.push(token_count);
     }
 
     MonospaceBreakCandidate {
@@ -3090,6 +3458,8 @@ fn materialize_wrap_line(
     seqno: SequenceNo,
     cell_capacity: usize,
 ) -> Line {
+    #[cfg(all(test, feature = "std"))]
+    WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.set(count.get() + 1));
     // Retained geometry supplies the row's display width without another
     // Unicode scan. Eager wrapping reserves at least one slot per token.
     let mut cells = Vec::with_capacity(cell_capacity);
@@ -3122,6 +3492,294 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    fn geometry_screen_rows(source: Line, cols: usize, model: MonospaceKpCostModel) -> Vec<Line> {
+        if source.len() <= cols {
+            return vec![source];
+        }
+        let layout = source.plan_wrap_with_width_prefix_scratch(
+            cols,
+            model,
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        layout.deferred_rows(0..layout.row_count(), 19)
+    }
+
+    #[test]
+    fn width_only_geometry_preserves_short_blank_trim_and_zero_width_counts() {
+        let zero = Cell::new_grapheme(
+            "\u{301}\u{302}\u{303}\u{304}",
+            CellAttributes::blank(),
+            None,
+        );
+        assert_eq!(zero.width(), 0);
+        let sources = vec![
+            Line::new(1),
+            Line::from_text("          ", &CellAttributes::blank(), 1, None),
+            Line::from_text("a界e\u{301}🚀b     ", &CellAttributes::blank(), 1, None),
+            Line::from_text("   a    b  ", &CellAttributes::blank(), 1, None),
+            Line::from_cells(
+                vec![zero.clone(), Cell::new('a', CellAttributes::blank()), zero],
+                1,
+            ),
+            // An overhanging wide token makes physical length differ from the
+            // width sum. Short-line bypass must still use physical length.
+            Line::from_cells(vec![Cell::new('界', CellAttributes::blank())], 1),
+        ];
+        for source in sources {
+            let geometry = LineWrapGeometry::capture(&source, 4096).unwrap();
+            assert_eq!(geometry.physical_len(), source.len());
+            assert!(geometry.retained_bytes() <= 4096);
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            for max_dp_states in [0, 8192] {
+                for lookahead_limit in [1, 64] {
+                    let model = MonospaceKpCostModel {
+                        max_dp_states,
+                        lookahead_limit,
+                        ..MonospaceKpCostModel::terminal_default()
+                    };
+                    for cols in [0, 1, 2, 3, 5, 12, 100] {
+                        // Poison caller scratch before both cached and uncached
+                        // counts; stale prefixes must not become source data.
+                        scratch.rebuild(&cells_from_text("界界abcdef"));
+                        let expected = geometry_screen_rows(source.clone(), cols, model).len();
+                        #[cfg(feature = "std")]
+                        let created = WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.get());
+                        assert_eq!(geometry.row_count(cols, model, &mut scratch), expected);
+                        assert_eq!(geometry.row_count(cols, model, &mut scratch), expected);
+                        #[cfg(feature = "std")]
+                        assert_eq!(
+                            WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.get()),
+                            created
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn width_only_geometry_certifies_native_unicode_physical_joins() {
+        let text = format!(
+            "00000 {}",
+            "Text reflow: ASCII ligatures ffi =>, 界面, e\u{301}, 🚀. ".repeat(9)
+        );
+        let source = Line::from_text(&text, &CellAttributes::blank(), 1, None);
+        // Reproduce the parser's physical-row packing, not optimized wrap
+        // output: the native corpus is admitted at 173 columns.
+        let mut physical = Vec::new();
+        let mut cells = Vec::new();
+        for cell in source.visible_cells() {
+            if cells.len() + cell.width() > 173 {
+                physical.push(Line::from_cells(core::mem::take(&mut cells), 1));
+            }
+            cells.push(cell.as_cell());
+            for _ in 1..cell.width() {
+                cells.push(Cell::blank());
+            }
+        }
+        physical.push(Line::from_cells(cells, 1));
+        assert_eq!(physical.len(), 3);
+        assert_eq!(physical[1].visible_cells().last().unwrap().str(), "界");
+        assert_eq!(physical[2].visible_cells().next().unwrap().str(), "面");
+        for storage_mask in 0..8 {
+            let mut rows = physical.clone();
+            for (idx, row) in rows.iter_mut().enumerate() {
+                if storage_mask & (1 << idx) != 0 {
+                    row.compress_for_scrollback();
+                }
+                row.set_last_cell_was_wrapped(false, 1);
+            }
+            let mut logical = rows[0].clone();
+            let mut geometry = LineWrapGeometry::capture(&rows[0], 4096).unwrap();
+            assert!(geometry.supports_join());
+            for row in &rows[1..] {
+                let next = LineWrapGeometry::capture(row, 4096).unwrap();
+                assert!(next.supports_join());
+                assert_eq!(geometry.try_append(&next, 4096), Ok(()));
+                logical.append_line(row.clone(), 1);
+            }
+            assert_eq!(geometry.physical_len(), logical.len());
+            for cols in [0, 1, 2, 85, 100, 123, 173, 512] {
+                let model = MonospaceKpCostModel::terminal_default();
+                let expected = geometry_screen_rows(logical.clone(), cols, model).len();
+                assert_eq!(
+                    geometry.row_count(cols, model, &mut LineWrapWidthPrefixScratch::default()),
+                    expected
+                );
+            }
+            #[cfg(feature = "use_serde")]
+            {
+                // The durable sink serializes an explicitly materialized row;
+                // pending rows can still be clustered. Both must certify the
+                // same physical geometry before the snapshot is admitted.
+                let mut materialized = logical.clone();
+                let _ = materialized.cells_mut();
+                let decoded: Line =
+                    serde_json::from_value(serde_json::to_value(&materialized).unwrap()).unwrap();
+                let restored = LineWrapGeometry::capture(&decoded, 4096).unwrap();
+                assert_eq!(geometry.widths, restored.widths);
+                assert_eq!(geometry.trimmed_tokens, restored.trimmed_tokens);
+                assert_eq!(geometry.physical_len, restored.physical_len);
+                assert!(restored.supports_join());
+            }
+        }
+    }
+
+    #[test]
+    fn width_only_geometry_refuses_text_sensitive_or_storage_dependent_joins() {
+        let left = Line::from_text("👩\u{200d}", &CellAttributes::blank(), 1, None);
+        let right = Line::from_text("👩", &CellAttributes::blank(), 1, None);
+        let mut geometry = LineWrapGeometry::capture(&left, 4096).unwrap();
+        let original = geometry.clone();
+        let next = LineWrapGeometry::capture(&right, 4096).unwrap();
+        assert_eq!(
+            geometry.try_append(&next, 4096),
+            Err(LineWrapGeometryJoinError::UncertifiedBoundary)
+        );
+        assert_eq!(geometry, original);
+        let mut vector = left.clone();
+        let _ = vector.cells_mut();
+        vector.append_line(right.clone(), 1);
+        let mut clustered = left;
+        clustered.compress_for_scrollback();
+        clustered.append_line(right, 1);
+        let model = MonospaceKpCostModel {
+            max_dp_states: 0,
+            ..MonospaceKpCostModel::terminal_default()
+        };
+        assert_ne!(
+            geometry_screen_rows(vector, 2, model).len(),
+            geometry_screen_rows(clustered, 2, model).len()
+        );
+
+        for source in [
+            Line::from_cells(
+                vec![Cell::new_grapheme(
+                    "\u{301}\u{302}\u{303}\u{304}",
+                    CellAttributes::blank(),
+                    None,
+                )],
+                1,
+            ),
+            Line::from_cells(vec![Cell::new('界', CellAttributes::blank())], 1),
+            Line::from_cells(
+                vec![
+                    Cell::new_grapheme_with_width("a", 2, CellAttributes::blank()),
+                    Cell::blank(),
+                ],
+                1,
+            ),
+            Line::from_cells(
+                vec![
+                    Cell::new_grapheme("ab", CellAttributes::blank(), None),
+                    Cell::blank(),
+                ],
+                1,
+            ),
+        ] {
+            let unsafe_join = LineWrapGeometry::capture(&source, 4096).unwrap();
+            assert!(!unsafe_join.supports_join());
+            assert_eq!(
+                geometry.try_append(&unsafe_join, 4096),
+                Err(LineWrapGeometryJoinError::UncertifiedSource)
+            );
+            assert_eq!(geometry, original);
+        }
+    }
+
+    #[test]
+    fn width_only_geometry_enforces_capture_join_and_planning_budgets() {
+        let accented = Line::from_text("e\u{301}", &CellAttributes::blank(), 1, None);
+        let metadata_only = core::mem::size_of::<LineWrapGeometry>() + accented.len();
+        assert!(LineWrapGeometry::capture(&accented, metadata_only).is_none());
+        assert!(LineWrapGeometry::capture(&accented, metadata_only + "ae\u{301}".len()).is_some());
+        let source = Line::from_text("abcdef   ", &CellAttributes::blank(), 1, None);
+        assert!(
+            LineWrapGeometry::capture(&source, core::mem::size_of::<LineWrapGeometry>()).is_none()
+        );
+        let mut geometry = LineWrapGeometry::capture(&source, 4096).unwrap();
+        let other = geometry.clone();
+        let original = geometry.clone();
+        let too_small = core::mem::size_of::<LineWrapGeometry>() + 2 * geometry.widths.len() - 1;
+        assert_eq!(
+            geometry.try_append(&other, too_small),
+            Err(LineWrapGeometryJoinError::ByteBudget)
+        );
+        assert_eq!(geometry, original);
+        assert!(geometry.append(&other, 4096));
+        let model = MonospaceKpCostModel::terminal_default();
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        scratch.rebuild(&cells_from_text("界abc"));
+        let unchanged = scratch.clone();
+        let bound = geometry
+            .planning_bytes_upper_bound(3, model, &scratch)
+            .unwrap();
+        assert!(bound > geometry.retained_bytes());
+        assert_eq!(
+            geometry.row_count_with_budget(3, model, &mut scratch, bound - 1),
+            None
+        );
+        assert_eq!(scratch, unchanged);
+        assert!(geometry
+            .row_count_with_budget(3, model, &mut scratch, bound)
+            .is_some());
+        assert_eq!(
+            geometry.row_count_with_budget(100, model, &mut scratch, 0),
+            None,
+            "retained scratch remains charged even for a short line"
+        );
+        assert_eq!(
+            geometry.row_count_with_budget(
+                100,
+                model,
+                &mut LineWrapWidthPrefixScratch::default(),
+                0
+            ),
+            Some(1)
+        );
+        let mut huge = geometry;
+        huge.trimmed_tokens = usize::MAX;
+        huge.physical_len = usize::MAX;
+        assert_eq!(huge.planning_bytes_upper_bound(1, model, &scratch), None);
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn width_only_geometry_reuses_plans_without_materializing_rows() {
+        let _guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut source = Line::from_text("a界b🚀cde界f ghi  ", &CellAttributes::blank(), 1, None);
+        let geometry = LineWrapGeometry::capture(&source, 4096).unwrap();
+        let model = MonospaceKpCostModel {
+            badness_scale: 37,
+            max_dp_states: 0,
+            ..MonospaceKpCostModel::terminal_default()
+        };
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let created = WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.get());
+        let expected = geometry.row_count(3, model, &mut scratch);
+        let plans = WRAP_PLANNER_CALLS.with(|count| count.get());
+        // A later source mutation cannot alter an admitted width snapshot.
+        source.resize(1, 4);
+        scratch.rebuild(&cells_from_text("abcdefghijklmnop"));
+        let poisoned = scratch.clone();
+        assert_eq!(geometry.row_count(3, model, &mut scratch), expected);
+        assert_eq!(
+            scratch, poisoned,
+            "memoized count must not rebuild prefixes"
+        );
+        assert_eq!(WRAP_PLANNER_CALLS.with(|count| count.get()), plans);
+        assert_eq!(
+            WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.get()),
+            created
+        );
+        // The counter is attached to real row constructors, not this API.
+        let control = Line::from_text("a界b🚀cde界f ghi  ", &CellAttributes::blank(), 1, None);
+        assert_eq!(geometry_screen_rows(control, 3, model).len(), expected);
+        assert!(WRAP_PHYSICAL_ROWS_CREATED.with(|count| count.get()) > created);
+    }
 
     #[cfg(feature = "std")]
     #[test]
@@ -4393,14 +5051,14 @@ mod tests {
                 for width in [0, 1, 2, 8, 63, 64, 65, 120, 128] {
                     let plan = bounded_monospace_wrap_plan(&tokens, width, model);
                     let selected = evaluate_break_offsets_with_width_prefix(
-                        &tokens,
+                        tokens.len(),
                         &plan.break_offsets,
                         width,
                         model,
                         &widths,
                     );
                     let greedy = evaluate_break_offsets_with_width_prefix(
-                        &tokens,
+                        tokens.len(),
                         &greedy_break_offsets_from_tokens(&tokens, width),
                         width,
                         model,

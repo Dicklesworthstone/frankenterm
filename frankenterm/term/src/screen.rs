@@ -6,6 +6,8 @@ use crate::config::{
     ScrollbackActivationError, ScrollbackPrefix, ScrollbackSnapshotFidelity,
     ScrollbackSnapshotLimits,
 };
+#[cfg(feature = "use_serde")]
+use frankenterm_surface::line::LineWrapGeometry;
 use frankenterm_surface::line::{
     LineWrapLayout, LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
     MonospaceKpCostModel, MonospaceWrapMode,
@@ -219,6 +221,103 @@ pub struct ScreenLineRead {
     index_budget_exhausted: Arc<std::sync::atomic::AtomicBool>,
     attempted_index: bool,
     fragments: Option<Arc<ColdRowFragments>>,
+    geometry: Option<ColdGeometrySnapshot>,
+}
+
+/// Width information belongs to immutable admitted source rows, independently
+/// of the current viewport coordinates. Payload remains in the spill sink.
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone)]
+struct ColdGeometryRow {
+    geometry: Arc<LineWrapGeometry>,
+    wrapped: bool,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone)]
+struct ColdGeometryIndex {
+    sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+    interval: crate::config::ScrollbackInterval,
+    source: Range<StableRowIndex>,
+    rows: VecDeque<ColdGeometryRow>,
+    geometry_bytes: usize,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+struct ColdGeometrySnapshot {
+    source: Range<StableRowIndex>,
+    rows: Vec<ColdGeometryRow>,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdGeometryIndex {
+    fn append(&mut self, row: StableRowIndex, line: &Line) -> Option<()> {
+        let retained = self.interval.rows()?;
+        let end = row.checked_add(1)?;
+        if row != self.source.end || retained.end != end || retained.start > row {
+            return None;
+        }
+        while self.source.start < retained.start && !self.rows.is_empty() {
+            let removed = self.rows.pop_front()?;
+            self.geometry_bytes = self.geometry_bytes.checked_sub(
+                removed.geometry.retained_bytes() + 2 * std::mem::size_of::<usize>(),
+            )?;
+            self.source.start += 1;
+        }
+        if self.rows.len() >= ScreenLineRead::MAX_INDEX_SOURCE_ROWS {
+            return None;
+        }
+        let capacity = if self.rows.len() == self.rows.capacity() {
+            self.rows
+                .capacity()
+                .max(32)
+                .checked_mul(2)?
+                .min(ScreenLineRead::MAX_INDEX_SOURCE_ROWS)
+        } else {
+            self.rows.capacity()
+        };
+        let peak_capacity = if capacity > self.rows.capacity() {
+            capacity.checked_add(self.rows.capacity())?
+        } else {
+            capacity
+        };
+        let overhead = peak_capacity
+            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(2 * std::mem::size_of::<usize>())?;
+        let available = ScreenLineRead::MAX_INDEX_METADATA_BYTES
+            .checked_sub(overhead)?
+            .checked_sub(self.geometry_bytes)?;
+        let geometry = LineWrapGeometry::capture(line, available)?;
+        // Pending rows can still use clustered storage; durable rows have
+        // passed through cell serialization. Admission must certify the same
+        // widths in either representation, even for a one-row logical group.
+        if !geometry.supports_join() {
+            return None;
+        }
+        let bytes = geometry
+            .retained_bytes()
+            .checked_add(2 * std::mem::size_of::<usize>())?;
+        if bytes > available {
+            return None;
+        }
+        if capacity > self.rows.capacity() {
+            self.rows
+                .try_reserve_exact(capacity - self.rows.len())
+                .ok()?;
+            if self.rows.capacity() > capacity {
+                return None;
+            }
+        }
+        self.geometry_bytes = self.geometry_bytes.checked_add(bytes)?;
+        self.rows.push_back(ColdGeometryRow {
+            geometry: Arc::new(geometry),
+            wrapped: line.last_cell_was_wrapped(),
+        });
+        self.source.end = end;
+        Some(())
+    }
 }
 
 /// Visual coordinates never replace authenticated backing-store row keys.
@@ -406,6 +505,22 @@ struct ColdReadCharge {
 
 #[cfg(feature = "use_serde")]
 impl ColdReadCharge {
+    fn line_with_fragment(
+        &mut self,
+        fragments: Option<&ColdRowFragments>,
+        row: StableRowIndex,
+        original: Line,
+    ) -> anyhow::Result<Line> {
+        self.serialize_line(&original)?;
+        match fragments.and_then(|fragments| fragments.rows.get(&row)) {
+            Some(replacement) => {
+                self.serialize_line(replacement)?;
+                Ok(replacement.clone())
+            }
+            None => Ok(original),
+        }
+    }
+
     fn serialize_line(&mut self, line: &Line) -> anyhow::Result<()> {
         serde_json::to_writer(self, line).map_err(|error| {
             // This writer performs no IO: its only IO error is its byte cap.
@@ -483,9 +598,7 @@ impl ColdSeamReflow {
             let original = batch
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("cold seam source unavailable"))?;
-            serde_json::to_writer(&mut charge, &original)?;
-            let line = cold_row_with_fragment(self.previous.as_deref(), key, original);
-            serde_json::to_writer(&mut charge, &line)?;
+            let line = charge.line_with_fragment(self.previous.as_deref(), key, original)?;
             if !line.last_cell_was_wrapped() {
                 if rows.is_empty() {
                     return Ok(self);
@@ -630,6 +743,188 @@ impl ScreenLineRead {
     const MAX_INDEX_SOURCE_BYTES: usize = 512 * 1024 * 1024;
     const MAX_INDEX_CELL_VISITS: usize = 64 * 1024 * 1024;
 
+    /// Plan coordinates from admitted widths without opening historical text.
+    /// An uncertified join or exhausted metadata budget keeps the payload
+    /// planner available; it never publishes a partial geometry index.
+    fn geometry_cold_layout(
+        &self,
+        limit: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> anyhow::Result<Option<(Arc<ColdVisualLayout>, usize)>> {
+        let Some(snapshot) = &self.geometry else {
+            return Ok(None);
+        };
+        let Some((_, interval)) = &self.cold else {
+            return Ok(None);
+        };
+        let header_bytes =
+            std::mem::size_of::<ColdVisualLayout>() + 2 * std::mem::size_of::<usize>();
+        let entry_bytes = std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
+        let Some(maximum_bytes) = snapshot
+            .rows
+            .len()
+            .checked_mul(entry_bytes)
+            .and_then(|bytes| bytes.checked_add(header_bytes))
+        else {
+            return Ok(None);
+        };
+        if maximum_bytes >= limit.min(Self::MAX_INDEX_METADATA_BYTES) {
+            return Ok(None);
+        }
+        let mut groups = Vec::new();
+        if groups.try_reserve_exact(snapshot.rows.len()).is_err() {
+            return Ok(None);
+        }
+        let metadata_bytes = header_bytes + groups.capacity() * entry_bytes;
+        if metadata_bytes >= limit.min(Self::MAX_INDEX_METADATA_BYTES) {
+            return Ok(None);
+        }
+        let Some(group_budget) = limit.checked_sub(metadata_bytes) else {
+            return Ok(None);
+        };
+        let aligned_seam = self.fragments.as_ref().is_some_and(|fragments| {
+            fragments.alignment_retained(interval)
+                && fragments.aligned_at(
+                    self.hot_top,
+                    self.witness.cols,
+                    self.witness.dpi,
+                    self.wrap_policy,
+                )
+        });
+        let mut group: Option<LineWrapGeometry> = None;
+        let mut group_start = snapshot.source.start;
+        let mut source_end = self.hot_top;
+        let mut visual_rows: StableRowIndex = 0;
+        let mut cell_visits = 0usize;
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        for (offset, captured) in snapshot.rows.iter().enumerate() {
+            anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+            let scratch_bytes = scratch
+                .capacity()
+                .checked_mul(std::mem::size_of::<u128>())
+                .ok_or_else(|| anyhow::anyhow!("cold geometry scratch overflow"))?;
+            let Some(geometry_budget) = group_budget.checked_sub(scratch_bytes) else {
+                return Ok(None);
+            };
+            let row = snapshot.source.start + StableRowIndex::try_from(offset)?;
+            let replacement = self
+                .fragments
+                .as_ref()
+                .and_then(|fragments| fragments.rows.get(&row));
+            let replacement_geometry;
+            let (geometry, wrapped) = if let Some(line) = replacement {
+                let available = geometry_budget
+                    .saturating_sub(group.as_ref().map_or(0, LineWrapGeometry::retained_bytes));
+                let Some(rebuilt) = LineWrapGeometry::capture(line, available) else {
+                    return Ok(None);
+                };
+                if !rebuilt.supports_join() {
+                    return Ok(None);
+                }
+                replacement_geometry = rebuilt;
+                (&replacement_geometry, line.last_cell_was_wrapped())
+            } else {
+                (captured.geometry.as_ref(), captured.wrapped)
+            };
+            cell_visits = match cell_visits.checked_add(geometry.physical_len().max(1)) {
+                Some(visits) if visits <= Self::MAX_INDEX_CELL_VISITS => visits,
+                _ => return Ok(None),
+            };
+            if let Some(logical) = &mut group {
+                let available = geometry_budget.saturating_sub(if replacement.is_some() {
+                    geometry.retained_bytes()
+                } else {
+                    0
+                });
+                if !logical.append(geometry, available) {
+                    return Ok(None);
+                }
+            } else {
+                let required = geometry
+                    .retained_bytes()
+                    .checked_mul(if replacement.is_some() { 2 } else { 1 });
+                if required.is_none_or(|bytes| bytes > geometry_budget) {
+                    return Ok(None);
+                }
+                group = Some(geometry.clone());
+            }
+            let end = row
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("cold geometry source overflow"))?;
+            if end.saturating_sub(group_start) as usize > Self::MAX_ROWS {
+                return Ok(None);
+            }
+            if wrapped && !(end == self.hot_top && aligned_seam) {
+                continue;
+            }
+            let logical = group.take().expect("current row created its logical group");
+            let count = if end == self.hot_top && aligned_seam && logical.physical_len() == 0 {
+                0
+            } else {
+                let transient_bytes = if replacement.is_some() {
+                    geometry.retained_bytes()
+                } else {
+                    0
+                };
+                let Some(planning_budget) = group_budget
+                    .checked_sub(logical.retained_bytes())
+                    .and_then(|bytes| bytes.checked_sub(transient_bytes))
+                else {
+                    return Ok(None);
+                };
+                let Some(count) = logical.row_count_with_budget(
+                    self.witness.cols,
+                    self.wrap_policy.kp_cost_model,
+                    &mut scratch,
+                    planning_budget,
+                ) else {
+                    return Ok(None);
+                };
+                count
+            };
+            if count > Self::MAX_ROWS {
+                return Ok(None);
+            }
+            let next_visual = visual_rows
+                .checked_add(StableRowIndex::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("cold geometry visual overflow"))?;
+            groups.push((group_start..end, visual_rows..next_visual));
+            visual_rows = next_visual;
+            group_start = end;
+        }
+        if group.is_some() {
+            source_end = group_start;
+            anyhow::ensure!(self.end <= source_end, ColdReadGeometryUnavailable);
+        }
+        let visual_first = source_end
+            .checked_sub(visual_rows)
+            .ok_or_else(|| anyhow::anyhow!("cold geometry origin overflow"))?;
+        for (_, visual) in &mut groups {
+            anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+            visual.start = visual
+                .start
+                .checked_add(visual_first)
+                .ok_or_else(|| anyhow::anyhow!("cold geometry coordinate overflow"))?;
+            visual.end = visual
+                .end
+                .checked_add(visual_first)
+                .ok_or_else(|| anyhow::anyhow!("cold geometry coordinate overflow"))?;
+        }
+        anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+        Ok(Some((
+            Arc::new(ColdVisualLayout {
+                kind: ColdVisualLayoutKind::Canonical,
+                source: snapshot.source.start..source_end,
+                visual: visual_first..source_end,
+                resident_frontier: self.hot_top,
+                groups,
+                witness: self.witness.clone(),
+                interval: interval.clone(),
+            }),
+            metadata_bytes,
+        )))
+    }
+
     /// Scan a large prefix without retaining its decoded rows. A completed
     /// logical group is wrapped, reduced to coordinate metadata, and retired
     /// before the next group. Viewport cells are hydrated separately after
@@ -694,21 +989,8 @@ impl ScreenLineRead {
             for original in batch {
                 anyhow::ensure!(!cancelled(), "cold index cancelled");
                 let before_bytes = charge.used;
-                charge.serialize_line(&original)?;
-                let mut line = match self
-                    .fragments
-                    .as_ref()
-                    .and_then(|fragments| fragments.rows.get(&row))
-                {
-                    Some(replacement) => {
-                        // Both decoded source and replacement consume work.
-                        // An unrelated seam fragment does not create another
-                        // representation of this row to serialize or charge.
-                        charge.serialize_line(replacement)?;
-                        replacement.clone()
-                    }
-                    None => original,
-                };
+                let mut line =
+                    charge.line_with_fragment(self.fragments.as_deref(), row, original)?;
                 source_bytes = source_bytes
                     .checked_add(charge.used - before_bytes)
                     .ok_or_else(|| anyhow::anyhow!("cold index source byte overflow"))?;
@@ -911,17 +1193,46 @@ impl ScreenLineRead {
         if self.layout.is_none()
             && self.attempted_index
             && self.first < self.resident_first
-            && self
-                .cold
-                .as_ref()
-                .and_then(|(_, interval)| interval.rows())
-                .is_some_and(|rows| {
-                    self.hot_top.saturating_sub(rows.start) as usize > Self::MAX_ROWS
-                })
+            && (self.geometry.is_some()
+                || self
+                    .cold
+                    .as_ref()
+                    .and_then(|(_, interval)| interval.rows())
+                    .is_some_and(|rows| {
+                        self.hot_top.saturating_sub(rows.start) as usize > Self::MAX_ROWS
+                    }))
         {
-            let (layout, metadata_bytes) = self.streamed_cold_layout(limit, &cancelled)?;
+            let (layout, metadata_bytes) = match self.geometry_cold_layout(limit, &cancelled)? {
+                Some(layout) => {
+                    metrics::counter!("term.cold_geometry_layout", "outcome" => "ready")
+                        .increment(1);
+                    layout
+                }
+                None => {
+                    metrics::counter!("term.cold_geometry_layout", "outcome" => "unavailable")
+                        .increment(1);
+                    self.streamed_cold_layout(limit, &cancelled)?
+                }
+            };
+            let requested_rows = self.end.saturating_sub(self.first);
             self.first = self.first.max(layout.visual.start);
-            self.end = self.end.max(self.first);
+            if self.resident.is_empty() {
+                // The first request can predate knowledge of the new visual
+                // origin. Preserve its row count inside indexed cold history;
+                // no terminal access or uncaptured resident rows are needed.
+                self.end = self
+                    .first
+                    .checked_add(requested_rows)
+                    .ok_or_else(|| anyhow::anyhow!("cold read range overflow"))?
+                    .min(layout.visual.end);
+                self.resident_first = self.end;
+                anyhow::ensure!(self.first <= self.end, ColdReadGeometryUnavailable);
+            } else {
+                // A mixed capture already owns an exact resident endpoint.
+                // Extending it would invent rows outside that snapshot.
+                self.end = self.end.max(self.first);
+            }
+            self.geometry = None;
             self.layout = Some(layout);
             let mut ready = self.hydrate_with_payload_limit(limit - metadata_bytes, cancelled)?;
             ready.payload_bytes += metadata_bytes;
@@ -994,11 +1305,7 @@ impl ScreenLineRead {
                         range.start += 1;
                         continue;
                     }
-                    charge.serialize_line(&line)?;
-                    let line = cold_row_with_fragment(fragments, range.start, line);
-                    if fragments.is_some() {
-                        charge.serialize_line(&line)?;
-                    }
+                    let line = charge.line_with_fragment(fragments, range.start, line)?;
                     result.push(line);
                     range.start += 1;
                 }
@@ -1206,11 +1513,7 @@ impl ScreenLineRead {
             );
             for line in batch {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
-                charge.serialize_line(&line)?;
-                let line = cold_row_with_fragment(self.fragments.as_deref(), row, line);
-                if self.fragments.is_some() {
-                    charge.serialize_line(&line)?;
-                }
+                let line = charge.line_with_fragment(self.fragments.as_deref(), row, line)?;
                 self.hydrated.push(line);
                 row += 1;
             }
@@ -1482,6 +1785,8 @@ pub struct Screen {
     cold_visual_layout: Option<Arc<ColdVisualLayout>>,
     #[cfg(feature = "use_serde")]
     stored_physical_layout: Option<StoredPhysicalLayout>,
+    #[cfg(feature = "use_serde")]
+    cold_geometry_index: Option<ColdGeometryIndex>,
     #[cfg(feature = "use_serde")]
     cold_row_fragments: Option<Arc<ColdRowFragments>>,
     #[cfg(feature = "use_serde")]
@@ -3102,6 +3407,13 @@ impl Screen {
         } else {
             None
         };
+        let geometry = if first < resident_first && layout.is_none() {
+            cold.as_ref().and_then(|(sink, interval)| {
+                self.capture_cold_geometry(sink, interval, hot_top, budget)
+            })
+        } else {
+            None
+        };
         Ok(ScreenLineRead {
             witness: self.capture_coordinate_witness(),
             layout_seqno: self.cold_visual_seqno,
@@ -3124,6 +3436,53 @@ impl Screen {
                 .cold_index_budget_exhausted
                 .load(std::sync::atomic::Ordering::Acquire),
             fragments: self.cold_row_fragments.clone(),
+            geometry,
+        })
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn capture_cold_geometry(
+        &self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        frontier: StableRowIndex,
+        budget: &mut LineReadCaptureBudget,
+    ) -> Option<ColdGeometrySnapshot> {
+        let index = self.cold_geometry_index.as_ref()?;
+        let retained = interval.rows()?;
+        if !Arc::ptr_eq(sink, &index.sink)
+            || index.source.start > retained.start
+            || index.source.end != frontier
+            || !interval.retains(&index.interval, retained.start..frontier)
+        {
+            return None;
+        }
+        let skip = usize::try_from(retained.start.checked_sub(index.source.start)?).ok()?;
+        let count = index.rows.len().checked_sub(skip)?;
+        if count == 0 || count > budget.work_left {
+            return None;
+        }
+        let bytes = count
+            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+            .checked_add(std::mem::size_of::<ColdGeometrySnapshot>())?;
+        if bytes > budget.bytes_left {
+            return None;
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count).ok()?;
+        let actual_bytes = rows
+            .capacity()
+            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+            .checked_add(std::mem::size_of::<ColdGeometrySnapshot>())?;
+        if actual_bytes > budget.bytes_left {
+            return None;
+        }
+        rows.extend(index.rows.iter().skip(skip).cloned());
+        budget.work_left -= count;
+        budget.bytes_left -= actual_bytes;
+        Some(ColdGeometrySnapshot {
+            source: retained.start..frontier,
+            rows,
         })
     }
 
@@ -3215,6 +3574,15 @@ impl Screen {
             return false;
         }
         if read.first < read.resident_first || read.layout.is_some() {
+            if read.layout.as_ref().is_some_and(|layout| {
+                !layout.stored_physical()
+                    && layout.resident_frontier != self.phys_to_stable_row_index(0)
+            }) {
+                // Canonical visual rows are anchored to the complete cold
+                // frontier. New source rows can have a different wrapped row
+                // count and shift even a closed prefix's visual origin.
+                return false;
+            }
             if read.layout.as_ref().is_some_and(|layout| {
                 matches!(
                     layout.kind,
@@ -3471,6 +3839,7 @@ impl Screen {
         let frontier = self.phys_to_stable_row_index(0);
         if !self.matches_coordinate_witness(&layout.witness)
             || layout.resident_frontier > frontier
+            || (!layout.stored_physical() && layout.resident_frontier != frontier)
             || (matches!(
                 layout.kind,
                 ColdVisualLayoutKind::StoredPhysical { open_tail: true }
@@ -3893,6 +4262,8 @@ impl Screen {
             #[cfg(feature = "use_serde")]
             stored_physical_layout: None,
             #[cfg(feature = "use_serde")]
+            cold_geometry_index: None,
+            #[cfg(feature = "use_serde")]
             cold_row_fragments: None,
             #[cfg(feature = "use_serde")]
             cold_visual_seqno: 0,
@@ -4262,10 +4633,17 @@ impl Screen {
                 crate::config::ScrollbackLineAdmission::Admitted {
                     interval: Some(interval),
                 } => {
+                    self.record_cold_geometry_row(
+                        Arc::clone(&sink),
+                        interval.clone(),
+                        stable_row,
+                        line,
+                    );
                     self.record_stored_physical_row(sink, interval, stable_row, line);
                 }
                 crate::config::ScrollbackLineAdmission::Admitted { interval: None } => {
                     self.stored_physical_layout = None;
+                    self.cold_geometry_index = None;
                 }
             }
         }
@@ -4275,6 +4653,35 @@ impl Screen {
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
         self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
         true
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn record_cold_geometry_row(
+        &mut self,
+        sink: Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: crate::config::ScrollbackInterval,
+        row: StableRowIndex,
+        line: &Line,
+    ) {
+        let extends = self.cold_geometry_index.as_ref().is_some_and(|index| {
+            Arc::ptr_eq(&sink, &index.sink)
+                && interval.same_lineage(&index.interval)
+                && index.source.end == row
+        });
+        if !extends {
+            self.cold_geometry_index = Some(ColdGeometryIndex {
+                sink,
+                interval: interval.clone(),
+                source: row..row,
+                rows: VecDeque::new(),
+                geometry_bytes: 0,
+            });
+        }
+        let index = self.cold_geometry_index.as_mut().unwrap();
+        index.interval = interval;
+        if index.append(row, line).is_none() {
+            self.cold_geometry_index = None;
+        }
     }
 
     #[cfg(feature = "use_serde")]
@@ -9315,6 +9722,243 @@ pub(crate) mod tests {
         screen.install_line_read_layout(&ready, 2);
         assert_eq!(screen.lines_in_stable_range(requested).1, expected);
         assert!(screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_changed_width_matches_stream_without_prefix_reads() {
+        let (mut screen, sink) = stored_physical_fixture(20_001, 30_000);
+        let cursor = test_cursor(0, 0, 1);
+        screen.resize(test_size(4, 11, 96), cursor, 2, false);
+        assert!(screen.stored_physical_layout.is_none());
+        assert!(screen.cold_geometry_index.is_some());
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let plan = screen.capture_line_read(0..1).unwrap();
+        assert!(plan.layout.is_none());
+        assert!(plan.geometry.is_some());
+        let (geometry, _) = plan
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .expect("the Unicode fixture has certified joins");
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let (reference, _) = plan
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(geometry.source, reference.source);
+        assert_eq!(geometry.visual, reference.visual);
+        assert_eq!(geometry.groups, reference.groups);
+        assert!(sink.batch_reads.load(Ordering::Relaxed) >= 10_001);
+
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let fast = plan.hydrate(|| false).unwrap();
+        let fast_reads = sink.batch_reads.load(Ordering::Relaxed);
+        assert!(
+            fast_reads < 32,
+            "only requested groups should decode: {fast_reads}"
+        );
+        assert!(screen.validates_line_read(&fast));
+        let mut payload_only = screen.capture_line_read(0..1).unwrap();
+        payload_only.geometry = None;
+        let reference = payload_only.hydrate(|| false).unwrap();
+        assert_eq!(fast.first_row(), reference.first_row());
+        assert_eq!(
+            fast.lines().cloned().collect::<Vec<_>>(),
+            reference.lines().cloned().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_clips_retention_and_replans_after_geometry_aba() {
+        let (mut screen, sink) = stored_physical_fixture(9, 5);
+        let cursor = test_cursor(0, 0, 1);
+        let cursor = screen.resize(test_size(4, 11, 96), cursor, 2, false);
+        screen.resize(test_size(4, 20, 96), cursor, 3, false);
+        let captured = screen.capture_line_read(4..5).unwrap();
+        assert_eq!(captured.geometry.as_ref().unwrap().source, 4..9);
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let (layout, _) = captured
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let (reference, _) = captured
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(layout.groups, reference.groups);
+        assert_eq!(layout.source.start, 4);
+        assert_eq!(layout.groups.first().unwrap().0.start, 4);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_rejects_uncertain_source_and_bounds_capture() {
+        let (mut screen, sink) = stored_physical_fixture(6, 32);
+        screen.invalidate_coordinate_witnesses();
+        let mut budget = LineReadCaptureBudget {
+            bytes_left: 1,
+            work_left: 65_536,
+        };
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            panic!("fixture interval ready");
+        };
+        let trait_sink: Arc<dyn ScrollbackSpillSink> = sink.clone();
+        assert!(screen
+            .capture_cold_geometry(&trait_sink, &interval, 6, &mut budget)
+            .is_none());
+        assert_eq!(budget.bytes_left, 1);
+        assert_eq!(budget.work_left, 65_536);
+        let mut budget = LineReadCaptureBudget {
+            bytes_left: ScreenLineRead::MAX_PAYLOAD_BYTES,
+            work_left: 5,
+        };
+        assert!(screen
+            .capture_cold_geometry(&trait_sink, &interval, 6, &mut budget)
+            .is_none());
+        let other: Arc<dyn ScrollbackSpillSink> = Arc::new(TestColdScrollbackSink::default());
+        assert!(screen
+            .capture_cold_geometry(&other, &interval, 6, &mut LineReadCaptureBudget::default())
+            .is_none());
+
+        let captured = screen.capture_line_read(0..1).unwrap();
+        assert!(captured.geometry.is_some());
+        let checks = std::cell::Cell::new(0);
+        assert!(captured
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 3
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(!captured.index_budget_exhausted.load(Ordering::Acquire));
+        assert!(captured
+            .geometry_cold_layout(1, &|| false)
+            .unwrap()
+            .is_none());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+
+        let before = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&before));
+        sink.omit_admission_receipt.store(true, Ordering::Relaxed);
+        let line = Line::from_text("unwitnessed", &CellAttributes::blank(), 3, None);
+        assert!(screen.record_scrollback_spill(6, &line, 3));
+        screen.advance_stable_row_index_offset(1);
+        assert!(screen.cold_geometry_index.is_none());
+        assert!(!screen.validates_line_read(&before));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn canonical_geometry_frontier_advance_rejects_old_visual_origin() {
+        for cold_rows in [6, 8] {
+            let (mut screen, _) = stored_physical_fixture(cold_rows, 32);
+            screen.physical_cols = 200;
+            screen.invalidate_coordinate_witnesses();
+            let old = screen
+                .capture_line_read(4..5)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(old.layout.as_ref().unwrap().source, 0..6);
+            assert_eq!(old.layout.as_ref().unwrap().visual, 4..6);
+            assert!(screen.validates_line_read(&old));
+            screen.install_line_read_layout(&old, 2);
+            if cold_rows == 6 {
+                let mut head = Line::from_text("new", &CellAttributes::blank(), 3, None);
+                head.set_last_cell_was_wrapped(true, 3);
+                assert!(screen.record_scrollback_spill(6, &head, 3));
+                screen.advance_stable_row_index_offset(1);
+                let tail = Line::from_text("tail", &CellAttributes::blank(), 3, None);
+                assert!(screen.record_scrollback_spill(7, &tail, 3));
+                screen.advance_stable_row_index_offset(1);
+            } else {
+                let tail = screen.lines[0].clone();
+                assert!(screen.record_scrollback_spill(8, &tail, 3));
+                screen.advance_stable_row_index_offset(1);
+            }
+            assert!(!screen.validates_line_read(&old));
+            assert!(screen.current_cold_visual_layout().is_none());
+            let first = if cold_rows == 6 { 5 } else { 6 };
+            let current = screen
+                .capture_line_read(first..first + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(current.layout.as_ref().unwrap().visual.start, first);
+            assert!(screen.validates_line_read(&current));
+            screen.install_line_read_layout(&current, 4);
+            assert!(!screen.validates_line_read(&old));
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn canonical_geometry_positive_origin_preserves_owned_requested_rows() {
+        let (mut screen, _) = stored_physical_fixture(6, 32);
+        screen.physical_cols = 200;
+        screen.invalidate_coordinate_witnesses();
+        for (request, expected) in [(0..1, 4..5), (0..3, 4..6), (0..7, 4..7)] {
+            let ready = screen
+                .capture_line_read(request)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(ready.first_row(), expected.start);
+            assert_eq!(ready.row_count(), (expected.end - expected.start) as usize);
+            assert_eq!(ready.end, expected.end);
+            assert!(
+                ready.geometry.is_none(),
+                "worker retires source snapshot after indexing"
+            );
+            assert!(screen.validates_line_read(&ready));
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_replaces_only_fragment_rows_and_preserves_open_seam() {
+        let (mut screen, sink) = stored_physical_fixture(8, 32);
+        screen.physical_cols = 11;
+        screen.invalidate_coordinate_witnesses();
+        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
+            sink.try_capture_scrollback_interval()
+        else {
+            panic!("fixture interval ready");
+        };
+        let replacement = Line::from_text("new fragment", &CellAttributes::blank(), 3, None);
+        screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
+            sink: sink.clone(),
+            interval,
+            rows: [(7, replacement)].into(),
+            aligned_frontier: 8,
+            aligned_source_start: 0,
+            cols: 11,
+            dpi: 96,
+            policy: screen.resize_wrap_policy,
+        }));
+        let captured = screen.capture_line_read(4..5).unwrap();
+        let (layout, _) = captured
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let (reference, _) = captured
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(layout.source, reference.source);
+        assert_eq!(layout.visual, reference.visual);
+        assert_eq!(layout.groups, reference.groups);
+        let ready = captured.hydrate(|| false).unwrap();
+        assert!(screen.validates_line_read(&ready));
+        screen.cold_row_fragments = None;
+        assert!(!screen.validates_line_read(&ready));
     }
 
     #[cfg(feature = "use_serde")]
