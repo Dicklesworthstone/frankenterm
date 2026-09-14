@@ -6063,6 +6063,23 @@ pub mod process {
     /// that probe and these signals, so its PID cannot be reused; on Windows,
     /// `Child::kill` retains the process handle identity. The helper makes no
     /// safety claim for arbitrary numeric process identifiers.
+    #[cfg(unix)]
+    fn terminate_child_process(child: &mut std::process::Child, deadline: Instant) -> (bool, bool) {
+        // Termination must still work when descriptor/process pressure prevents
+        // spawning a signal helper. This safe syscall needs neither an extra
+        // process nor the helper's stdio descriptors and scheduling budget.
+        // The unreaped owned leader pins the group identity for this call.
+        let group = rustix::process::Pid::from_child(child);
+        let process_tree_signalled = Instant::now() < deadline
+            && !group.is_init()
+            && rustix::process::kill_process_group(group, rustix::process::Signal::KILL).is_ok();
+        let _ = child.kill();
+        // No signal helper was created. Group failure still remains explicit,
+        // even if the direct owned-leader fallback succeeds.
+        (true, process_tree_signalled)
+    }
+
+    #[cfg(not(unix))]
     fn terminate_child_process(child: &mut std::process::Child, deadline: Instant) -> (bool, bool) {
         let group_result = send_signal_to_process_group_until(child.id(), "KILL", deadline);
         let signal_helper_settled = group_result.as_ref().err().is_none_or(|error| {
@@ -6414,6 +6431,101 @@ pub mod process {
             assert!(reaped_branch.contains("return (true, true, false);"));
             assert!(!reaped_branch.contains("return (true, true, true);"));
             assert!(!implementation.contains("return (true, true, true);"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn owned_group_termination_survives_descriptor_exhaustion() {
+            use std::os::unix::process::ExitStatusExt;
+
+            const SELECTOR: &str = "runtime_async::process::output_capture_unit_tests::owned_group_termination_survives_descriptor_exhaustion";
+            if std::env::var_os("FT_RUNTIME_GROUP_SIGNAL_FD_CHILD").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+            {
+                let output = Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "ulimit -n 96 || exit 95; exec \"$1\" --exact \"$2\" --nocapture",
+                        "owned-group-descriptor-test",
+                    ])
+                    .arg(std::env::current_exe().expect("current test executable"))
+                    .arg(SELECTOR)
+                    .env("FT_RUNTIME_GROUP_SIGNAL_FD_CHILD", "1")
+                    .stdout_limit(64 * 1024)
+                    .stderr_limit(64 * 1024)
+                    .output_blocking(Duration::from_secs(10))
+                    .expect("isolated descriptor test must settle");
+                assert!(
+                    output.status.success(),
+                    "owned descriptor test failed: stdout={}; stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).expect("test output is UTF-8");
+                assert!(stdout.contains(&format!("test {SELECTOR} ... ok")));
+                assert!(stdout.contains("1 passed; 0 failed; 0 ignored"));
+                return;
+            }
+
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "exec sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_process_group(&mut command).expect("owned group configuration");
+            let mut child = command.spawn().expect("owned group leader");
+
+            let mut descriptors = Vec::new();
+            // Bound the attempt count even if the child marker is inherited
+            // without the shell's descriptor-limit setup.
+            let exhaustion = (0..=96).find_map(|_| match std::fs::File::open("/dev/null") {
+                Ok(descriptor) => {
+                    descriptors.push(descriptor);
+                    None
+                }
+                Err(error) => Some(error),
+            });
+            // The former external-helper path cannot even open its stdio at
+            // this point. Keep this control side-effect free (signal zero).
+            let helper = std::process::Command::new(unix_kill_command())
+                .args(["-s", "0", &std::process::id().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let terminated = terminate_output_child_if_running(
+                &mut child,
+                false,
+                process_deadline_after(PROCESS_TERMINATION_SETTLE_TIMEOUT),
+            );
+            drop(descriptors);
+            let reaped = reap_signal_helper_until(
+                &mut child,
+                process_deadline_after(Duration::from_secs(1)),
+            );
+            // Retire even an unexpectedly spawned control before assertions.
+            let helper_error = match helper {
+                Ok(mut helper) => {
+                    let _ = helper.kill();
+                    let _ = reap_signal_helper_until(
+                        &mut helper,
+                        process_deadline_after(Duration::from_secs(1)),
+                    );
+                    None
+                }
+                Err(error) => error.raw_os_error(),
+            };
+            assert_eq!(
+                exhaustion.as_ref().and_then(std::io::Error::raw_os_error),
+                Some(libc::EMFILE)
+            );
+            assert_eq!(helper_error, Some(libc::EMFILE));
+            assert_eq!(terminated, (false, true, true));
+            let SignalHelperReapOutcome::Reaped(status) = reaped else {
+                panic!("owned leader must be reaped after direct group termination");
+            };
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
         }
 
         #[test]
@@ -14609,7 +14721,7 @@ mod tests {
     #[test]
     fn unix_signal_helper_can_probe_an_exact_process_group() {
         let mut command = std::process::Command::new("sh");
-        command.args(["-c", "sleep 10"]);
+        command.args(["-c", "exec sleep 10"]);
         process::configure_process_group(&mut command)
             .expect("test child must own a distinct process group");
         let mut child = command.spawn().expect("spawn process-group probe child");
