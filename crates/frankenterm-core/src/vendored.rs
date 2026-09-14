@@ -17,8 +17,8 @@ mod mux_client;
 pub use mux_client::subscribe_pane_output_with_inherited_cx;
 #[cfg(all(feature = "vendored", unix))]
 pub use mux_client::{
-    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, PaneDelta, PaneOutputSubscription,
-    SubscriptionConfig, subscribe_pane_output,
+    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, MuxTextReadResult, PaneDelta,
+    PaneOutputSubscription, SubscriptionConfig, subscribe_pane_output,
 };
 
 #[cfg(all(feature = "vendored", unix))]

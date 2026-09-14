@@ -732,7 +732,21 @@ impl MuxPool {
         &self,
         cx: &Cx,
         op_name: &'static str,
+        op: Op,
+    ) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
+        self.execute_with_recovery_outcome_with_cx(cx, op_name, op, |_| true)
+            .await
+    }
+
+    async fn execute_with_recovery_outcome_with_cx<T, Op>(
+        &self,
+        cx: &Cx,
+        op_name: &'static str,
         mut op: Op,
+        outcome_succeeded: fn(&T) -> bool,
     ) -> Result<T, MuxPoolError>
     where
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
@@ -804,7 +818,7 @@ impl MuxPool {
                     // cancellation observed during cleanup cannot publish a
                     // now-stale repeatable-read result.
                     Self::checkpoint_cx(cx)?;
-                    if attempt > 1 {
+                    if attempt > 1 && outcome_succeeded(&value) {
                         saturating_atomic_increment(&self.recovery_successes);
                     }
                     return Ok(value);
@@ -946,15 +960,21 @@ impl MuxPool {
         max_output_bytes: usize,
     ) -> Result<MuxTextReadResult, MuxPoolError> {
         let op_cx = cx.clone();
-        self.execute_with_recovery_with_cx(cx, "get_text", move |client| {
-            let op_cx = op_cx.clone();
-            Box::pin(async move {
-                client
-                    .get_text_with_cx(&op_cx, pane_id, max_output_bytes)
-                    .await
-            })
-        })
-        .await
+        self.execute_with_recovery_outcome_with_cx(
+            cx,
+            "get_text",
+            move |client| {
+                let op_cx = op_cx.clone();
+                Box::pin(async move {
+                    client
+                        .get_text_transaction_with_cx(&op_cx, pane_id, max_output_bytes)
+                        .await
+                })
+            },
+            |outcome| matches!(outcome, Ok(MuxTextReadResult::Text(_))),
+        )
+        .await?
+        .map_err(|error| MuxPoolError::Mux(DirectMuxError::RemoteRejection(error)))
     }
 
     /// Poll for pane render changes via a pooled connection.

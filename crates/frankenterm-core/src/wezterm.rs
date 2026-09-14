@@ -1650,7 +1650,7 @@ impl WeztermClient {
                     "mux pool get_text_with_cx does not support escapes; falling back to CLI"
                 );
             } else if self.mux_circuit_guard() {
-                use crate::vendored::mux_client::MuxTextReadResult;
+                use crate::vendored::MuxTextReadResult;
                 let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
                     crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
                     0,
