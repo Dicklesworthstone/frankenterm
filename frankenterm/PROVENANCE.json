@@ -897,19 +897,19 @@
         "docs": 1,
         "feat": 53,
         "fix": 94,
-        "other": 44,
+        "other": 45,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 47
       },
-      "fork_side_commit_count": 270,
+      "fork_side_commit_count": 271,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "other",
-        "committed_at": "2026-09-14T01:35:54-04:00",
-        "sha": "3106b936b65d6b0ae195f33355c4b826024ad589",
-        "subject": "perf(surface): retain shared token ranges during reflow"
+        "committed_at": "2026-09-14T02:02:41-04:00",
+        "sha": "de4dc54f90c111f20716491360320099cb5f3272",
+        "subject": "perf(reflow): use bounded available worker capacity by default"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2542,
-  "generated_at": "2026-09-14T05:38:21.369412Z",
+  "fork_side_commit_total": 2543,
+  "generated_at": "2026-09-14T06:06:54.161741Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
