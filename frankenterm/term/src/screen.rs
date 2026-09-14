@@ -1944,8 +1944,23 @@ impl ScreenLineRead {
                     interval: interval.clone(),
                 })
             });
+            let requested_rows = self.end.saturating_sub(self.first);
             self.first = self.first.max(visual_first);
-            self.end = self.end.max(self.first);
+            if cold_source.is_some() && self.resident.is_empty() {
+                // Match streamed/geometry indexing: an oldest-row request
+                // predates the new visual origin. Preserve its count within
+                // the indexed cold prefix instead of clamping it to empty.
+                self.end = self
+                    .first
+                    .checked_add(requested_rows)
+                    .ok_or_else(|| anyhow::anyhow!("cold read range overflow"))?
+                    .min(index_source_end);
+                self.resident_first = self.end;
+                anyhow::ensure!(self.first <= self.end, ColdReadGeometryUnavailable);
+            } else {
+                // Mixed captures must keep their exact resident endpoint.
+                self.end = self.end.max(self.first);
+            }
             let skip = (self.first - visual_first) as usize;
             for line in &mut output {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
@@ -10861,12 +10876,69 @@ pub(crate) mod tests {
         assert!(fallback.source.complete);
         assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
         assert!(screen.validates_line_read(&fallback.source));
+        assert!(
+            expected.first_row() > 0,
+            "reflow must move the oldest visual row"
+        );
+        assert_eq!(expected.row_count(), 1);
+        assert_eq!(fallback.source.row_count(), 1);
         assert_eq!(fallback.source.first_row(), expected.first_row());
+        assert_eq!(fallback.source.end, expected.end);
         assert_eq!(
             fallback.source.lines().cloned().collect::<Vec<_>>(),
             expected.lines().cloned().collect::<Vec<_>>()
         );
         assert!(screen.install_prepared_cold_layout(&mut fallback, 3));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_small_prefix_payload_fallback_preserves_clamped_request_count() {
+        for cols in [11, 40] {
+            for requested in [0..1, 0..5, 0..10] {
+                let (mut screen, sink) = stored_physical_fixture(9, 32);
+                screen.resize(test_size(4, cols, 96), test_cursor(0, 0, 1), 2, false);
+                let expected = screen
+                    .capture_line_read(requested.clone())
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                let mut capture = screen.capture_line_read(requested.clone()).unwrap();
+                assert!(capture.geometry.is_some());
+                assert!(capture.layout.is_none());
+                let resident = capture.resident.clone();
+                let endpoint = capture.end;
+                capture.geometry = None;
+                sink.batch_reads.store(0, Ordering::Relaxed);
+                let fallback = capture.hydrate(|| false).unwrap();
+                assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
+                assert!(screen.validates_line_read(&fallback));
+                assert!(fallback.row_count() > 0);
+                assert_eq!(fallback.first_row(), expected.first_row());
+                assert_eq!(fallback.end, expected.end);
+                assert_eq!(fallback.resident, resident);
+                if !resident.is_empty() {
+                    assert_eq!(fallback.end, endpoint, "resident endpoint must not move");
+                } else {
+                    assert_eq!(fallback.resident_first, fallback.end);
+                    let available =
+                        fallback.layout.as_ref().unwrap().visual.end - fallback.first_row();
+                    assert_eq!(
+                        fallback.row_count(),
+                        (requested.end - requested.start).min(available) as usize
+                    );
+                }
+                assert_eq!(
+                    fallback.lines().cloned().collect::<Vec<_>>(),
+                    expected.lines().cloned().collect::<Vec<_>>()
+                );
+                let fallback_layout = fallback.layout.as_ref().unwrap();
+                let expected_layout = expected.layout.as_ref().unwrap();
+                assert_eq!(fallback_layout.source, expected_layout.source);
+                assert_eq!(fallback_layout.visual, expected_layout.visual);
+                assert_eq!(fallback_layout.groups, expected_layout.groups);
+            }
+        }
     }
 
     #[cfg(feature = "use_serde")]
