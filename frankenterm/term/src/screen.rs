@@ -652,21 +652,59 @@ impl ColdSeamReflow {
             limit: ScreenLineRead::MAX_PAYLOAD_BYTES,
             index_failure: None,
         };
+        // A completed seam already owns every replacement row and its exact
+        // logical-group boundary. If that complete source is still retained at
+        // the same frontier, rereading the immutable spill rows only to replace
+        // them again performs unnecessary storage/decode work on every resize.
+        // A changed frontier, lineage, or incomplete fragment set uses the
+        // ordinary storage path. Publication still revalidates the live source
+        // interval, coordinate witness, resident rows and fragment identity.
+        let fragment_start = self.previous.as_ref().and_then(|previous| {
+            let start = previous.aligned_source_start;
+            let count = self.frontier.checked_sub(start)?;
+            let count = usize::try_from(count).ok()?;
+            if count == 0
+                || count >= ScreenLineRead::MAX_ROWS
+                || previous.aligned_frontier != self.frontier
+                || !Arc::ptr_eq(&previous.sink, &self.sink)
+                || !self.interval.retains(&previous.interval, start..self.frontier)
+            {
+                return None;
+            }
+            let complete = previous.rows.range(start..self.frontier).try_fold(
+                0usize,
+                |offset, (&key, line)| {
+                    (key == start + offset as StableRowIndex && line.last_cell_was_wrapped())
+                        .then_some(offset + 1)
+                },
+            );
+            (complete == Some(count)).then_some(start)
+        });
         let mut rows = VecDeque::new();
         let mut first = self.frontier;
-        while first > retained.start {
+        while first > fragment_start.unwrap_or(retained.start) {
             anyhow::ensure!(!cancelled(), "cold seam cancelled");
             anyhow::ensure!(
                 rows.len() + self.resident.len() < ScreenLineRead::MAX_ROWS,
                 "cold seam row limit"
             );
             let key = first - 1;
-            let mut batch = self.sink.load_scrollback_lines(key..first);
-            anyhow::ensure!(batch.len() == 1, "cold seam source unavailable");
-            let original = batch
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("cold seam source unavailable"))?;
-            let line = charge.line_with_fragment(self.previous.as_deref(), key, original)?;
+            let line = if fragment_start.is_some() {
+                let fragment = self
+                    .previous
+                    .as_ref()
+                    .and_then(|previous| previous.rows.get(&key))
+                    .ok_or_else(|| anyhow::anyhow!("cold seam fragment unavailable"))?;
+                charge.serialize_line(fragment)?;
+                fragment.clone()
+            } else {
+                let mut batch = self.sink.load_scrollback_lines(key..first);
+                anyhow::ensure!(batch.len() == 1, "cold seam source unavailable");
+                let original = batch
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("cold seam source unavailable"))?;
+                charge.line_with_fragment(self.previous.as_deref(), key, original)?
+            };
             if !line.last_cell_was_wrapped() {
                 if rows.is_empty() {
                     return Ok(self);
@@ -8960,6 +8998,142 @@ pub(crate) mod tests {
             !screen.install_cold_seam_reflow(&mut plan, 4).unwrap(),
             "old authority cannot publish twice"
         );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_reuses_retained_fragments_across_width_changes_without_payload_reads() {
+        for (cold_text, head_text, tail_text) in [("abcd", "efg", "h"), ("界ab", "cde", "f")] {
+            let sink = Arc::new(TestColdScrollbackSink::default());
+            let mut cold = Line::from_text(cold_text, &CellAttributes::blank(), 1, None);
+            cold.set_last_cell_was_wrapped(true, 1);
+            assert!(sink.store_scrollback_line(0, &cold, 32));
+            let mut screen = test_screen_with_config(
+                2,
+                3,
+                96,
+                TestTermConfig {
+                    cold_sink: Some(sink.clone()),
+                    ..TestTermConfig::default()
+                },
+            );
+            screen.stable_row_index_offset = 1;
+            let mut head = Line::from_text(head_text, &CellAttributes::blank(), 1, None);
+            head.set_last_cell_was_wrapped(true, 1);
+            screen.lines = [
+                head,
+                Line::from_text(tail_text, &CellAttributes::blank(), 1, None),
+                Line::new(1),
+                Line::new(1),
+            ]
+            .into();
+            let mut initial = screen
+                .capture_cold_seam_reflow()
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.install_cold_seam_reflow(&mut initial, 2).unwrap());
+            let mut cursor = test_cursor(0, 1, 2);
+            for (index, cols) in [2, 3, 2, 3].into_iter().enumerate() {
+                let seqno = 3 + index * 2;
+                cursor = screen.resize(test_size(2, cols, 96), cursor, seqno, false);
+                let capture = screen.capture_cold_seam_reflow().unwrap().unwrap();
+                let before = screen.lines.clone();
+                sink.batch_reads.store(0, Ordering::Relaxed);
+                sink.single_reads.store(0, Ordering::Relaxed);
+                let mut ready = capture.hydrate(|| false).unwrap();
+                assert!(ready.is_ready());
+                assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0, "cols={cols}");
+                assert_eq!(sink.single_reads.load(Ordering::Relaxed), 0);
+                assert_eq!(screen.lines, before, "preparation cannot publish");
+
+                // Force the established storage path without changing the
+                // retained replacement rows: only invalidate its optional
+                // boundary certificate in this independent preparation.
+                let mut reference = screen.capture_cold_seam_reflow().unwrap().unwrap();
+                let mut fragments = reference.previous.as_deref().unwrap().clone();
+                fragments.aligned_frontier += 1;
+                reference.previous = Some(Arc::new(fragments));
+                let reference = reference.hydrate(|| false).unwrap();
+                assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
+                let (actual_fragments, actual_rows) = ready.replacement.as_ref().unwrap();
+                let (expected_fragments, expected_rows) =
+                    reference.replacement.as_ref().unwrap();
+                assert_eq!(actual_fragments.rows, expected_fragments.rows);
+                assert_eq!(actual_rows, expected_rows);
+                assert_eq!(ready.source, reference.source);
+                assert!(screen
+                    .install_cold_seam_reflow(&mut ready, seqno + 1)
+                    .unwrap());
+                assert_eq!(screen.phys_to_stable_row_index(0), 1);
+                let fragments = screen.cold_row_fragments.as_ref().unwrap();
+                let actual = fragments.rows[&0].as_str().into_owned()
+                    + &screen
+                        .lines
+                        .iter()
+                        .map(|line| line.as_str().into_owned())
+                        .collect::<String>();
+                assert_eq!(actual.trim_end(), format!("{cold_text}{head_text}{tail_text}"));
+            }
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_fragment_reuse_rejects_cancelled_and_replaced_sources() {
+        for replace_before_capture in [false, true] {
+            let (mut terminal, sink) = cold_seam_test_terminal();
+            let mut initial = terminal
+                .screen()
+                .capture_cold_seam_reflow()
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(terminal
+                .screen_mut()
+                .install_cold_seam_reflow(&mut initial, 20)
+                .unwrap());
+            terminal.resize(test_size(2, 2, 96));
+            let before = terminal.screen().lines.clone();
+            let cancelled = terminal
+                .screen()
+                .capture_cold_seam_reflow()
+                .unwrap()
+                .unwrap();
+            sink.batch_reads.store(0, Ordering::Relaxed);
+            assert!(cancelled.hydrate(|| true).is_err());
+            assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+            let mut prepared = if replace_before_capture {
+                None
+            } else {
+                Some(
+                    terminal
+                        .screen()
+                        .capture_cold_seam_reflow()
+                        .unwrap()
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap(),
+                )
+            };
+            let key = *sink.rows.lock().unwrap().first_key_value().unwrap().0;
+            assert!(sink.store_scrollback_line(
+                key,
+                &Line::from_text("new", &CellAttributes::blank(), 21, None),
+                32,
+            ));
+            if let Some(prepared) = prepared.as_mut() {
+                assert!(!terminal
+                    .screen_mut()
+                    .install_cold_seam_reflow(prepared, 22)
+                    .unwrap());
+            } else {
+                assert!(terminal.screen().capture_cold_seam_reflow().is_err());
+            }
+            assert_eq!(terminal.screen().lines, before);
+        }
     }
 
     #[cfg(feature = "use_serde")]
