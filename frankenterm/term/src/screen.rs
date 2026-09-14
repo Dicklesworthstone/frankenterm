@@ -25,6 +25,7 @@ use termwiz::input::KeyboardEncoding;
 std::thread_local! {
     static REFLOW_SOURCE_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_FULL_LAYOUT_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_CURSOR_PREFIX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_ROW_PREFIX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_CACHED_RESERVED_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1909,6 +1910,7 @@ pub struct ScreenReflowPreparation {
     snapshot: Screen,
     source_lines: VecDeque<Line>,
     source_cursor: CursorPosition,
+    source_logical_cursor: Option<(usize, usize)>,
     source_dpi: u32,
     target: TerminalSize,
     ready: bool,
@@ -1929,6 +1931,13 @@ impl ScreenReflowPreparation {
             return false;
         }
         self.source_lines = self.snapshot.lines.clone();
+        // Pruning only removes rows after the cursor. Compute its logical
+        // prefix on the immutable worker source before that pruning, then
+        // reuse it only under the same exact-source authority as the wraps.
+        self.source_logical_cursor = self.snapshot.logical_cursor_from_physical(
+            self.source_cursor.x,
+            self.snapshot.phys_row(self.source_cursor.y),
+        );
         self.snapshot
             .prune_resize_trailing_blanks(self.source_cursor);
         if self.target.dpi != self.snapshot.dpi {
@@ -1983,6 +1992,7 @@ struct VerifiedPreparedResize {
     wrapped: CachedResizeLines,
     logical_count: usize,
     cache_entries: usize,
+    logical_cursor: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -4467,6 +4477,8 @@ impl Screen {
         cursor_x: usize,
         cursor_y: PhysRowIndex,
     ) -> Option<(usize, usize)> {
+        #[cfg(test)]
+        REFLOW_CURSOR_PREFIX_SCANS.with(|count| count.set(count.get() + 1));
         let mut logical_idx = 0usize;
         let mut prefix_len = 0usize;
 
@@ -4494,12 +4506,11 @@ impl Screen {
     ) {
         let (passed, reason) = if cursor_y >= self.lines.len() {
             (false, "cursor_phys_out_of_bounds")
-        } else if self
-            .logical_cursor_from_physical(cursor_x, cursor_y)
-            .is_none()
-        {
-            (false, "logical_mapping_missing")
         } else {
+            // Every in-range physical row belongs to exactly one logical
+            // range, including the final unterminated soft-wrapped range.
+            // Computing the entire prefix merely to test existence cannot
+            // detect another failure beyond the bounds check above.
             let stable_row = self.phys_to_stable_row_index(cursor_y);
             if self.stable_row_to_phys(stable_row) != Some(cursor_y) {
                 (false, "stable_row_roundtrip_mismatch")
@@ -5111,7 +5122,10 @@ impl Screen {
         let profile_start =
             log::log_enabled!(target: "frankenterm_term::screen::reflow_profile", log::Level::Debug)
                 .then(Instant::now);
-        let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
+        let logical_cursor = verified.as_ref().map_or_else(
+            || self.logical_cursor_from_physical(cursor_x, cursor_y),
+            |prepared| prepared.logical_cursor,
+        );
         let cursor_elapsed = profile_start.map(|start| start.elapsed());
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
             if let Some(mut verified) = verified {
@@ -5228,10 +5242,9 @@ impl Screen {
         // division then shifts the cursor onto another grapheme or a spacer.
         // A trailing virtual column remains on the last row of its record.
         if let Some((logical_idx, mut remaining)) = logical_cursor {
-            if let (Some(&start), Some(&end)) = (
-                row_prefix.get(logical_idx),
-                row_prefix.get(logical_idx + 1),
-            ) {
+            if let (Some(&start), Some(&end)) =
+                (row_prefix.get(logical_idx), row_prefix.get(logical_idx + 1))
+            {
                 for row in start..end {
                     let row_len = self.lines[row].len();
                     if remaining < row_len || row + 1 == end {
@@ -5395,6 +5408,7 @@ impl Screen {
             snapshot,
             source_lines: VecDeque::new(),
             source_cursor: cursor,
+            source_logical_cursor: None,
             source_dpi: self.dpi,
             target: size,
             ready: false,
@@ -5547,6 +5561,7 @@ impl Screen {
                         wrapped,
                         logical_count: cache.logical_lines.len(),
                         cache_entries: cache.wrapped_by_key.len(),
+                        logical_cursor: prepared.source_logical_cursor,
                     });
             }
             // The preparation owns only new counters, never a stale copy of
@@ -9152,7 +9167,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_reflow_matches_synchronous_geometry_and_cursor() {
-        for conpty in [false, true] {
+        for (conpty, initial_cursor_y) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
             let mut screen = test_screen(4, 8, 96);
             let attrs = CellAttributes::blank();
             screen.lines = VecDeque::from(vec![
@@ -9161,7 +9176,9 @@ pub(crate) mod tests {
                 Line::from_text("abcdefghijklmno", &attrs, 1, None),
                 Line::new(1),
             ]);
-            let mut cursor = test_cursor(0, 3, 1);
+            // Cover both the original last-row cursor and a cursor above a
+            // trailing blank, exercising worker/live pruning parity.
+            let mut cursor = test_cursor(0, initial_cursor_y, 1);
             for (index, (rows, cols, dpi)) in [
                 (3, 3, 96),
                 (6, 11, 144),
@@ -9225,8 +9242,12 @@ pub(crate) mod tests {
                 physical_cols: size.cols,
                 dpi: size.dpi,
             };
-            let prepared_target =
-                &prepared.snapshot.rewrap_cache.as_ref().unwrap().wrapped_by_key[&key];
+            let prepared_target = &prepared
+                .snapshot
+                .rewrap_cache
+                .as_ref()
+                .unwrap()
+                .wrapped_by_key[&key];
             let prepared_prefix = Arc::clone(
                 prepared_target
                     .row_prefix
@@ -9257,18 +9278,31 @@ pub(crate) mod tests {
             REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
             REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.set(0));
             REFLOW_ROW_PREFIX_BUILDS.with(|count| count.set(0));
+            REFLOW_CURSOR_PREFIX_SCANS.with(|count| count.set(0));
             let actual_cursor =
                 screen.resize_with_prepared_reflow(size, cursor, 2, false, Some(&mut prepared));
             let scans = REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get());
             let full_scans = REFLOW_FULL_LAYOUT_SIGNATURE_SCANS.with(|count| count.get());
             let prefix_builds = REFLOW_ROW_PREFIX_BUILDS.with(|count| count.get());
+            let cursor_scans = REFLOW_CURSOR_PREFIX_SCANS.with(|count| count.get());
             assert_eq!(prepared.was_applied(), !stale);
             if stale {
                 assert!(scans > 0, "stale work must use the source-hashing fallback");
-                assert!(prefix_builds > 0, "stale rows require a fresh target prefix");
+                assert!(
+                    prefix_builds > 0,
+                    "stale rows require a fresh target prefix"
+                );
+                assert!(
+                    cursor_scans > 0,
+                    "stale source requires live cursor mapping"
+                );
             } else {
                 assert_eq!(scans, 0, "validated commit must not hash the source again");
                 assert_eq!(full_scans, 0, "target hashing must also stay on the worker");
+                assert_eq!(
+                    cursor_scans, 0,
+                    "accepted commit must reuse worker cursor mapping"
+                );
                 assert_eq!(
                     prefix_builds, 0,
                     "commit must not rebuild the prepared prefix"
@@ -9299,7 +9333,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_reflow_rejects_changed_source_and_policy() {
-        for mutation in 0..7 {
+        for mutation in 0..8 {
             let mut screen = test_screen(3, 8, 96);
             let attrs = CellAttributes::blank();
             screen.lines = VecDeque::from(vec![
@@ -9334,6 +9368,9 @@ pub(crate) mod tests {
                 }
                 6 => {
                     screen.dpi = 144;
+                }
+                7 => {
+                    screen.lines[0].set_cell(0, Cell::new('界', attrs.clone()), 1);
                 }
                 _ => unreachable!(),
             }
@@ -9865,12 +9902,9 @@ pub(crate) mod tests {
         let mut screen = test_screen(4, 8, 96);
         screen.lines = VecDeque::with_capacity(64);
         for _ in 0..48 {
-            screen.lines.push_back(Line::from_text(
-                "abcde",
-                &CellAttributes::blank(),
-                1,
-                None,
-            ));
+            screen
+                .lines
+                .push_back(Line::from_text("abcde", &CellAttributes::blank(), 1, None));
         }
         let cursor = test_cursor(0, 3, 1);
         let size = test_size(4, 4, 96);
@@ -9908,16 +9942,15 @@ pub(crate) mod tests {
         let mut screen = test_screen(4, 8, 96);
         screen.lines = VecDeque::with_capacity(24);
         for _ in 0..4 {
-            screen.lines.push_back(Line::from_text(
-                "text",
-                &CellAttributes::blank(),
-                1,
-                None,
-            ));
+            screen
+                .lines
+                .push_back(Line::from_text("text", &CellAttributes::blank(), 1, None));
         }
         let requested = 5 + screen.hot_scrollback_size();
         assert!(requested > screen.lines.capacity());
-        assert!(screen.lines.len() + requested - screen.lines.capacity() <= screen.lines.capacity());
+        assert!(
+            screen.lines.len() + requested - screen.lines.capacity() <= screen.lines.capacity()
+        );
         screen.resize(test_size(5, 8, 96), test_cursor(0, 3, 1), 2, false);
         assert!(screen.lines.capacity() >= requested);
         assert_eq!(screen.lines.len(), 5);
