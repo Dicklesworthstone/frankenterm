@@ -16802,7 +16802,7 @@ mod tests {
                     if poll == UPDATES + 2 {
                         return (
                             Vec::new(),
-                            Some(Pdu::LivenessResponse(LivenessResponse {
+                            Some(Pdu::LivenessResponse(codec::LivenessResponse {
                                 pane_id: 9,
                                 is_alive: false,
                             })),
