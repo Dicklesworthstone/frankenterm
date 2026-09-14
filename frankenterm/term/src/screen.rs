@@ -281,6 +281,17 @@ pub struct ScreenLineRead {
     geometry: Option<ColdGeometrySnapshot>,
 }
 
+/// Worker-owned coordinate preparation, never a receipt for readable text.
+/// Admitted geometry can establish the complete cold mapping without loading
+/// the arbitrary row used to capture its source. Displaced metadata remains
+/// here until the worker releases the terminal and registration guards.
+#[cfg(feature = "use_serde")]
+pub struct PreparedColdLayout {
+    source: ScreenLineRead,
+    retired_layout: Option<Arc<ColdVisualLayout>>,
+    installed: bool,
+}
+
 /// Width information belongs to immutable admitted source rows, independently
 /// of the current viewport coordinates. Payload remains in the spill sink.
 #[cfg(feature = "use_serde")]
@@ -1330,6 +1341,48 @@ impl ScreenLineRead {
     /// and remain subject to the source store's own admission limits.
     pub fn hydrate(self, cancelled: impl Fn() -> bool) -> anyhow::Result<Self> {
         self.hydrate_with_payload_limit(Self::MAX_PAYLOAD_BYTES, cancelled)
+    }
+
+    /// Prepare only layout authority when admitted widths are sufficient.
+    /// The existing bounded payload path remains the fallback for unavailable
+    /// geometry. This does not make an unhydrated ScreenLineRead publishable.
+    pub fn prepare_cold_layout(
+        mut self,
+        cancelled: impl Fn() -> bool,
+    ) -> anyhow::Result<PreparedColdLayout> {
+        anyhow::ensure!(!self.complete, "line read already hydrated");
+        anyhow::ensure!(!cancelled(), "cold layout preparation cancelled");
+        if self.layout.is_none()
+            && self.attempted_index
+            && self.first < self.resident_first
+            && self.geometry.is_some()
+        {
+            if let Some((layout, metadata_bytes)) =
+                self.geometry_cold_layout(Self::MAX_PAYLOAD_BYTES, &cancelled)?
+            {
+                debug!(
+                    "cold_geometry_layout outcome=ready groups={} metadata_bytes={} purpose=layout_only",
+                    layout.groups.len(),
+                    metadata_bytes
+                );
+                // Coordinates depend on the complete indexed source, even
+                // though the capture requested only one otherwise unused row.
+                self.cold_context = Some(layout.source.clone());
+                self.layout = Some(layout);
+                self.geometry = None;
+                self.payload_bytes = metadata_bytes;
+                return Ok(PreparedColdLayout {
+                    source: self,
+                    retired_layout: None,
+                    installed: false,
+                });
+            }
+        }
+        Ok(PreparedColdLayout {
+            source: self.hydrate(cancelled)?,
+            retired_layout: None,
+            installed: false,
+        })
     }
 
     pub fn hydrate_with_payload_limit(
@@ -3726,11 +3779,16 @@ impl Screen {
     /// Call under the terminal lock, in the same critical section as publication.
     #[cfg(feature = "use_serde")]
     pub fn validates_line_read(&self, read: &ScreenLineRead) -> bool {
+        read.complete
+            && read.row_count() == read.end.saturating_sub(read.first) as usize
+            && self.validates_line_read_source(read)
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn validates_line_read_source(&self, read: &ScreenLineRead) -> bool {
         use crate::config::ScrollbackIntervalCapture;
-        if !read.complete
-            || !self.matches_coordinate_witness(&read.witness)
+        if !self.matches_coordinate_witness(&read.witness)
             || !self.same_cold_fragments(&read.fragments)
-            || read.row_count() != read.end.saturating_sub(read.first) as usize
         {
             return false;
         }
@@ -3852,6 +3910,32 @@ impl Screen {
         })
     }
 
+    #[cfg(feature = "use_serde")]
+    pub fn validates_prepared_cold_layout(&self, prepared: &PreparedColdLayout) -> bool {
+        !prepared.installed && self.validates_line_read_source(&prepared.source)
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn prepared_cold_layout_changes_layout(&self, prepared: &PreparedColdLayout) -> bool {
+        self.line_read_changes_layout(&prepared.source)
+    }
+
+    /// Validate and install under the caller's pane/resize authority. A single
+    /// receipt cannot publish twice or retire its displaced layout under lock.
+    #[cfg(feature = "use_serde")]
+    pub fn install_prepared_cold_layout(
+        &mut self,
+        prepared: &mut PreparedColdLayout,
+        seqno: SequenceNo,
+    ) -> bool {
+        if seqno == SequenceNo::MAX || !self.validates_prepared_cold_layout(prepared) {
+            return false;
+        }
+        prepared.retired_layout = self.replace_line_read_layout(&prepared.source, seqno);
+        prepared.installed = true;
+        true
+    }
+
     /// Reconcile asynchronous retention/replacement with the terminal's wire
     /// sequence. The caller increments its sequence before publishing a pair.
     /// Busy is not an unchanged authority and must defer the observation.
@@ -3893,17 +3977,27 @@ impl Screen {
 
     #[cfg(feature = "use_serde")]
     pub fn install_line_read_layout(&mut self, read: &ScreenLineRead, seqno: SequenceNo) {
+        drop(self.replace_line_read_layout(read, seqno));
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn replace_line_read_layout(
+        &mut self,
+        read: &ScreenLineRead,
+        seqno: SequenceNo,
+    ) -> Option<Arc<ColdVisualLayout>> {
         if let Some(layout) = &read.layout {
             if self.current_cold_visual_layout().is_some_and(|current| {
                 std::ptr::eq(layout.as_ref(), current) || current.extends(layout)
             }) {
-                return;
+                return None;
             }
             if self.line_read_changes_layout(read) {
                 self.cold_visual_seqno = seqno;
             }
-            self.cold_visual_layout = Some(Arc::clone(layout));
+            return self.cold_visual_layout.replace(Arc::clone(layout));
         }
+        None
     }
 
     #[cfg(feature = "use_serde")]
@@ -10636,6 +10730,179 @@ pub(crate) mod tests {
             fast.lines().cloned().collect::<Vec<_>>(),
             reference_read.lines().cloned().collect::<Vec<_>>()
         );
+
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        sink.single_reads.store(0, Ordering::Relaxed);
+        let before_rows = terminal.screen().lines.clone();
+        let before_cursor = terminal.cursor_pos();
+        let mut prepared = terminal
+            .screen()
+            .capture_line_read(0..1)
+            .unwrap()
+            .prepare_cold_layout(|| false)
+            .unwrap();
+        assert!(!prepared.source.complete, "metadata is not a text receipt");
+        assert!(!terminal.screen().validates_line_read(&prepared.source));
+        assert!(terminal.screen().validates_prepared_cold_layout(&prepared));
+        let actual_layout = prepared.source.layout.as_ref().unwrap();
+        let reference_layout = reference_read.layout.as_ref().unwrap();
+        assert_eq!(actual_layout.source, reference_layout.source);
+        assert_eq!(actual_layout.visual, reference_layout.visual);
+        assert_eq!(actual_layout.groups, reference_layout.groups);
+        let seqno = terminal.current_seqno().checked_add(1).unwrap();
+        assert!(terminal
+            .screen_mut()
+            .install_prepared_cold_layout(&mut prepared, seqno));
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.single_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(terminal.screen().lines, before_rows);
+        assert_eq!(terminal.cursor_pos(), before_cursor);
+        assert!(!terminal.screen().validates_prepared_cold_layout(&prepared));
+        assert!(!terminal
+            .screen_mut()
+            .install_prepared_cold_layout(&mut prepared, seqno));
+        let published = terminal
+            .screen()
+            .capture_line_read(reference_read.first_row()..reference_read.end)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(terminal.screen().validates_line_read(&published));
+        assert_eq!(
+            published.lines().cloned().collect::<Vec<_>>(),
+            reference_read.lines().cloned().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn prepared_cold_layout_rejects_stale_source_without_publication() {
+        for mutation in 0..7 {
+            let (mut screen, sink) = stored_physical_fixture(9, 32);
+            let cursor = screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+            let mut prepared = screen
+                .capture_line_read(0..1)
+                .unwrap()
+                .prepare_cold_layout(|| false)
+                .unwrap();
+            assert!(!prepared.source.complete);
+            assert!(screen.validates_prepared_cold_layout(&prepared));
+            match mutation {
+                0 => sink.force_busy_probe.store(true, Ordering::Relaxed),
+                1 => *sink.interval_identity.lock().unwrap() = Default::default(),
+                2 => {
+                    sink.rows.lock().unwrap().pop_first();
+                }
+                3 => {
+                    let line = Line::from_text("new source", &CellAttributes::blank(), 3, None);
+                    assert!(screen.record_scrollback_spill(9, &line, 3));
+                    screen.advance_stable_row_index_offset(1);
+                }
+                4 => {
+                    screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
+                        sink: sink.clone(),
+                        interval: prepared.source.cold.as_ref().unwrap().1.clone(),
+                        rows: BTreeMap::new(),
+                        aligned_frontier: 9,
+                        aligned_source_start: 0,
+                        cols: 11,
+                        dpi: 96,
+                        policy: screen.resize_wrap_policy,
+                    }));
+                }
+                5 => {
+                    let cursor = screen.resize(test_size(4, 20, 96), cursor, 3, false);
+                    screen.resize(test_size(4, 11, 96), cursor, 4, false);
+                }
+                6 => screen.set_config(&Arc::clone(&screen.config)),
+                _ => unreachable!(),
+            }
+            let before_seqno = screen.cold_visual_seqno;
+            let before_layout = screen.cold_visual_layout.clone();
+            assert!(!screen.validates_prepared_cold_layout(&prepared));
+            assert!(!screen.install_prepared_cold_layout(&mut prepared, 5));
+            assert!(!prepared.installed);
+            assert_eq!(screen.cold_visual_seqno, before_seqno);
+            assert!(match (&before_layout, &screen.cold_visual_layout) {
+                (None, None) => true,
+                (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                _ => false,
+            });
+            if mutation == 0 {
+                sink.force_busy_probe.store(false, Ordering::Relaxed);
+                assert!(screen.validates_prepared_cold_layout(&prepared));
+                assert!(screen.install_prepared_cold_layout(&mut prepared, 5));
+            }
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn prepared_cold_layout_cancellation_and_payload_fallback_remain_exact() {
+        let (mut screen, sink) = stored_physical_fixture(9, 32);
+        screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        assert!(screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .prepare_cold_layout(|| true)
+            .is_err());
+        assert!(screen.cold_visual_layout.is_none());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.single_reads.load(Ordering::Relaxed), 0);
+        let expected = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let mut capture = screen.capture_line_read(0..1).unwrap();
+        capture.geometry = None;
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let mut fallback = capture.prepare_cold_layout(|| false).unwrap();
+        assert!(fallback.source.complete);
+        assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
+        assert!(screen.validates_line_read(&fallback.source));
+        assert_eq!(fallback.source.first_row(), expected.first_row());
+        assert_eq!(
+            fallback.source.lines().cloned().collect::<Vec<_>>(),
+            expected.lines().cloned().collect::<Vec<_>>()
+        );
+        assert!(screen.install_prepared_cold_layout(&mut fallback, 3));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn prepared_cold_layout_retains_displaced_metadata_until_worker_drop() {
+        let (mut screen, _) = stored_physical_fixture(9, 32);
+        let cursor = screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        let mut first = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .prepare_cold_layout(|| false)
+            .unwrap();
+        assert!(screen.install_prepared_cold_layout(&mut first, 3));
+        drop(first);
+        let retired = Arc::downgrade(screen.cold_visual_layout.as_ref().unwrap());
+        screen.resize(test_size(4, 7, 96), cursor, 4, false);
+        let mut next = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .prepare_cold_layout(|| false)
+            .unwrap();
+        assert!(screen.install_prepared_cold_layout(&mut next, 5));
+        assert!(Arc::ptr_eq(
+            next.retired_layout.as_ref().unwrap(),
+            &retired.upgrade().unwrap()
+        ));
+        assert!(!screen.install_prepared_cold_layout(&mut next, 6));
+        assert!(
+            retired.upgrade().is_some(),
+            "receipt retains replaced allocation"
+        );
+        drop(next);
+        assert!(
+            retired.upgrade().is_none(),
+            "worker retirement releases allocation"
+        );
     }
 
     #[cfg(feature = "use_serde")]
@@ -11300,6 +11567,7 @@ pub(crate) mod tests {
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
         interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,
+        single_reads: AtomicU64,
         force_busy_probe: AtomicBool,
         refuse_admission: AtomicBool,
         omit_admission_receipt: AtomicBool,
@@ -11389,6 +11657,7 @@ pub(crate) mod tests {
         }
 
         fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.single_reads.fetch_add(1, Ordering::Relaxed);
             self.rows
                 .lock()
                 .expect("test sink mutex")

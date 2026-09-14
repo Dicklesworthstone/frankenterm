@@ -3799,7 +3799,7 @@ impl LocalPane {
                 .flatten() else {
                     return Ok(false);
                 };
-                let read = plan.hydrate(&cancelled)?;
+                let mut prepared = plan.prepare_cold_layout(&cancelled)?;
                 let committed = retry_cold_resize_step("index_commit", &cancelled, || {
                     registration
                         .try_with_current(|_| {
@@ -3808,22 +3808,28 @@ impl LocalPane {
                             };
                             let (decision, _) =
                                 with_resize_commit_barrier(resize_queue, token, || {
-                                    if !term.screen().validates_line_read(&read)
+                                    if !term.screen().validates_prepared_cold_layout(&prepared)
                                         || term.current_seqno() == SequenceNo::MAX
                                     {
                                         return Ok(false);
                                     }
-                                    let changes_layout =
-                                        term.screen().line_read_changes_layout(&read);
+                                    let changes_layout = term
+                                        .screen()
+                                        .prepared_cold_layout_changes_layout(&prepared);
                                     let seqno = if changes_layout {
                                         next_cold_resize_sequence(term.current_seqno())?
                                     } else {
                                         term.current_seqno()
                                     };
+                                    if !term
+                                        .screen_mut()
+                                        .install_prepared_cold_layout(&mut prepared, seqno)
+                                    {
+                                        return Ok(false);
+                                    }
                                     if changes_layout {
                                         term.increment_seqno();
                                     }
-                                    term.screen_mut().install_line_read_layout(&read, seqno);
                                     Self::publish_resize_source(
                                         pane_id,
                                         line_layout_observation,
@@ -3841,7 +3847,7 @@ impl LocalPane {
                         })
                         .unwrap_or(Ok(None))
                 })? == Some(true);
-                // `read` and any replaced decoded buffers retire here on this
+                // The preparation and displaced layout retire here on this
                 // worker, after both locks and before the global permit.
                 Ok(committed)
             }),
@@ -4628,6 +4634,8 @@ mod tests {
         )>,
         busy: AtomicBool,
         busy_observations: AtomicUsize,
+        witness_admission: AtomicBool,
+        payload_reads: AtomicUsize,
         read_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, Receiver<()>)>>,
     }
 
@@ -4652,17 +4660,39 @@ mod tests {
         }
 
         fn store_scrollback_line(&self, row: StableRowIndex, line: &Line, limit: usize) -> bool {
+            self.store_scrollback_line_with_receipt(row, line, limit)
+                .accepted()
+        }
+
+        fn store_scrollback_line_with_receipt(
+            &self,
+            row: StableRowIndex,
+            line: &Line,
+            limit: usize,
+        ) -> frankenterm_term::config::ScrollbackLineAdmission {
+            use frankenterm_term::config::{ScrollbackIntervalCapture, ScrollbackLineAdmission};
             let mut rows = self.rows.lock();
             if limit == 0 || rows.1.len() >= limit {
-                return false;
+                return ScrollbackLineAdmission::Refused;
             }
             if rows.1.insert(row, line.clone()).is_some() {
                 rows.0 = Default::default();
             }
-            true
+            let interval = if self.witness_admission.load(Ordering::Relaxed) {
+                let first = *rows.1.first_key_value().unwrap().0;
+                let end = rows.1.last_key_value().unwrap().0.checked_add(1);
+                match end.map(|end| rows.0.capture(Some(first..end))) {
+                    Some(ScrollbackIntervalCapture::Ready(interval)) => Some(interval),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            ScrollbackLineAdmission::Admitted { interval }
         }
 
         fn load_scrollback_line(&self, row: StableRowIndex) -> Option<Line> {
+            self.payload_reads.fetch_add(1, Ordering::Relaxed);
             let gate = self.read_gate.lock().take();
             if let Some((entered, release)) = gate {
                 entered.send(()).unwrap();
@@ -4743,7 +4773,9 @@ mod tests {
         }
     }
 
-    fn cold_resize_fixture() -> (
+    fn cold_resize_fixture(
+        witness_admission: bool,
+    ) -> (
         Arc<LocalPane>,
         Arc<crate::Mux>,
         PaneRegistrationHandle,
@@ -4751,6 +4783,8 @@ mod tests {
         ResizeCancellationToken,
     ) {
         let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission
+            .store(witness_admission, Ordering::Relaxed);
         let mut term = Terminal::new(
             term_size(4, 2),
             Arc::new(ColdResizeTestConfig(sink.clone())),
@@ -4828,8 +4862,92 @@ mod tests {
     }
 
     #[test]
+    fn cold_resize_geometry_publication_skips_payload_and_preserves_fallback() {
+        for witnessed in [true, false] {
+            let (pane, _mux, registration, sink, token) = cold_resize_fixture(witnessed);
+            // The seam legitimately needs its crossing paragraph. Settle it
+            // first so the counter isolates the production index phase.
+            let seam = {
+                let term = pane.terminal.lock();
+                term.screen().capture_cold_seam_reflow().unwrap().unwrap()
+            };
+            let mut seam = seam.hydrate(|| false).unwrap();
+            {
+                let mut term = pane.terminal.lock();
+                let seqno = next_cold_resize_sequence(term.current_seqno()).unwrap();
+                assert!(term
+                    .screen_mut()
+                    .install_cold_seam_reflow(&mut seam, seqno)
+                    .unwrap());
+                term.increment_seqno();
+                assert!(LocalPane::publish_resize_source(
+                    pane.pane_id(),
+                    &pane.line_layout_observation,
+                    &mut term,
+                    token,
+                    token.seq,
+                    "cold_seam",
+                ));
+            }
+            drop(seam);
+            let before = pane
+                .try_capture_render_frame(None, 0, 0, &[], false)
+                .unwrap();
+            sink.payload_reads.store(0, Ordering::Relaxed);
+            let target = Arc::clone(&pane);
+            let (done_tx, done_rx) = sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                LocalPane::prepare_cold_layout_after_resize(
+                    target.pane_id(),
+                    &target.terminal,
+                    &target.line_layout_observation,
+                    &target.resize_queue,
+                    token,
+                    registration,
+                );
+                done_tx.send(()).unwrap();
+            });
+            let settled = done_rx.recv_timeout(Duration::from_secs(5));
+            if settled.is_err() {
+                pane.resize_queue.lock().next_seq += 1;
+            }
+            worker.join().unwrap();
+            settled.unwrap();
+            let reads = sink.payload_reads.load(Ordering::Relaxed);
+            if witnessed {
+                assert_eq!(reads, 0, "admitted index must not hydrate an unused row");
+            } else {
+                assert!(
+                    reads > 0,
+                    "unwitnessed admission must retain the real payload fallback"
+                );
+            }
+            let after = pane
+                .try_capture_render_frame(
+                    None,
+                    before.source_sequence,
+                    before.source_sequence,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            assert!(after.source_sequence > before.source_sequence);
+            assert!(after.layout_floor > before.layout_floor);
+            assert_eq!(after.first, before.first);
+            assert_eq!(after.lines, before.lines);
+            assert_eq!(after.cursor, before.cursor);
+            assert!(
+                after.dirty.is_empty(),
+                "cold indexing does not damage the resident viewport"
+            );
+            assert_eq!(cold_resize_read_all(&pane).unwrap(), "abcdefgh\none\n\n");
+            assert!(sink.payload_reads.load(Ordering::Relaxed) > 0);
+        }
+    }
+
+    #[test]
     fn cold_resize_metadata_contention_settles_without_another_resize() {
-        let (pane, _mux, registration, sink, token) = cold_resize_fixture();
+        let (pane, _mux, registration, sink, token) = cold_resize_fixture(false);
         assert!(cold_resize_read_all(&pane)
             .unwrap_err()
             .is::<frankenterm_term::screen::ColdReadGeometryUnavailable>());
@@ -4874,7 +4992,7 @@ mod tests {
 
     #[test]
     fn cold_resize_recaptures_changed_resident_source_before_commit() {
-        let (pane, _mux, registration, sink, token) = cold_resize_fixture();
+        let (pane, _mux, registration, sink, token) = cold_resize_fixture(false);
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
         *sink.read_gate.lock() = Some((entered_tx, release_rx));
@@ -4925,7 +5043,7 @@ mod tests {
     #[test]
     fn cold_resize_busy_wait_cancels_for_supersession_or_retirement() {
         for retire in [false, true] {
-            let (pane, _mux, registration, sink, token) = cold_resize_fixture();
+            let (pane, _mux, registration, sink, token) = cold_resize_fixture(false);
             sink.busy.store(true, Ordering::Release);
             let target = Arc::clone(&pane);
             let worker_registration = registration.clone();
