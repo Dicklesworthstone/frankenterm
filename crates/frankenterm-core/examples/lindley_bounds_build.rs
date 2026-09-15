@@ -601,7 +601,7 @@ mod live_measurement {
                     let write_ack_ns = elapsed(epoch)?;
                     let marker = format!("FT LINDLEY END {sequence:08}");
                     let capture_deadline = Instant::now() + Duration::from_secs(5);
-                    let (snapshot, transient_read_rejections, poll) =
+                    let (snapshot, transient_read_rejections, poll_diagnostics) =
                         poll_frame(cx, &marker, capture_deadline, || {
                             client.get_text_with_cx(cx, pane_id, false)
                         })
@@ -627,7 +627,7 @@ mod live_measurement {
                         segment.content,
                         transient_read_rejections,
                         write_ack_ns,
-                        poll,
+                        poll_diagnostics,
                     ));
                 }
                 let results = futures::future::join_all(pending.iter().map(
