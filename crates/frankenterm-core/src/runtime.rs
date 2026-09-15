@@ -18477,6 +18477,14 @@ mod tests {
     }
 
     async fn wait_for_snapshot_checkpoint(db_path: &str, checkpoint_type: &str) {
+        wait_for_snapshot_checkpoint_with_diagnostics(db_path, checkpoint_type, String::new).await;
+    }
+
+    async fn wait_for_snapshot_checkpoint_with_diagnostics(
+        db_path: &str,
+        checkpoint_type: &str,
+        diagnostics: impl Fn() -> String,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let exists: bool = rusqlite::Connection::open(db_path)
@@ -18493,7 +18501,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "no {checkpoint_type} checkpoint before deadline"
+                "no {checkpoint_type} checkpoint before deadline; {}",
+                diagnostics()
             );
             sleep(Duration::from_millis(20)).await;
         }
@@ -18532,7 +18541,22 @@ mod tests {
             );
             // Ten-second deadline is much shorter than the default 30-minute
             // fallback. This asserts durable publication, not just queue ingress.
-            wait_for_snapshot_checkpoint(&db_path, "event").await;
+            wait_for_snapshot_checkpoint_with_diagnostics(&db_path, "event", || {
+                format!(
+                    "telemetry={:?}; scheduler_finished={:?}; bridge_finished={:?}; subscribers={}",
+                    handle
+                        .snapshot_engine
+                        .as_ref()
+                        .map(|engine| engine.telemetry().snapshot()),
+                    handle.snapshot.as_ref().map(|task| task.is_finished()),
+                    handle
+                        .snapshot_triggers
+                        .as_ref()
+                        .map(|task| task.is_finished()),
+                    bus.subscriber_count(),
+                )
+            })
+            .await;
             assert_eq!(snapshot_settlement_counts(&db_path), (1, 0, 0));
             let summary = handle.shutdown_with_summary().await;
             assert!(summary.is_clean(), "{:?}", summary.warnings);
