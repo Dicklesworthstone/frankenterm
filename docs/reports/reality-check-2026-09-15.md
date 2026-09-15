@@ -142,3 +142,9 @@ journey, followed by an explicitly authorized canary on an existing host.
   proof must cover the corrected source as well.
 - The campaign's six-hour checkpoint above remains the measured work window;
   the elapsed pause afterward is not claimed as continuous swarm supervision.
+- Native RC18 comparison 4 matched all 18 action frames and preserved 10,000
+  ordered records, but its observed compositor upper bounds ranged from
+  59.461 to 310.563 ms, with seven actions above the 100 ms ceiling. The
+  retained receipt is `/tmp/ft-native-profile-rch-0912/rc18-primary-comparison4-receipts.json`.
+  These are scaled-capture matches, not native-resolution text-quality proof;
+  live dragging was excluded and clean-host performance remains unqualified.
