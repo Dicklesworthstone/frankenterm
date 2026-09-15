@@ -1265,6 +1265,8 @@ pub type DomainBindingFuture =
 pub type DomainBindingResolver = fn(ClientEndpointFingerprint) -> DomainBindingFuture;
 
 static DOMAIN_BINDING_RESOLVER: OnceLock<DomainBindingResolver> = OnceLock::new();
+const LAYOUT_BINDING_RESOLUTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 /// Install the GUI's asynchronous durable store without making this crate
 /// depend on the GUI. Headless callers may omit it and have no layout binding.
@@ -2535,6 +2537,44 @@ impl ClientDomain {
             "durable domain binding changed while its registration remained live"
         );
         *binding = Some(resolved);
+        Ok(())
+    }
+
+    async fn prepare_layout_binding_for_attach(
+        &self,
+        mux: &Arc<Mux>,
+        resolver: Option<DomainBindingResolver>,
+        deadline: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
+        if let Some(resolver) = resolver {
+            let result = match futures::future::select(
+                Box::pin(self.resolve_layout_binding_with(resolver)),
+                Box::pin(deadline),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _deadline)) => result,
+                futures::future::Either::Right(((), pending_resolution)) => {
+                    // Drop the exact waiter before ordinary transport admission;
+                    // a late storage receipt must not publish onto this domain.
+                    drop(pending_resolution);
+                    Err(anyhow!("durable domain layout binding deadline elapsed"))
+                }
+            };
+            if let Err(error) = result {
+                metrics::counter!("mux.client.layout_binding_unavailable.total").increment(1);
+                log::warn!("durable domain layout binding unavailable: {error:#}");
+            }
+        }
+        ensure!(
+            !self.retired.load(Ordering::Acquire)
+                && mux.get_domain(self.local_domain_id).is_some_and(|current| {
+                    current
+                        .downcast_ref::<Self>()
+                        .is_some_and(|current| std::ptr::eq(current, self))
+                }),
+            "client domain retired while awaiting durable layout binding"
+        );
         Ok(())
     }
 
@@ -4546,27 +4586,16 @@ impl Domain for ClientDomain {
                 let ui = ui.clone();
                 let mux = Arc::clone(mux);
                 async move {
+                    // Optional persistence has its own short budget. A stalled
+                    // store must not consume the transport/version/topology
+                    // bootstrap timeout or prevent ordinary attachment.
+                    self.prepare_layout_binding_for_attach(
+                        &mux,
+                        DOMAIN_BINDING_RESOLVER.get().copied(),
+                        promise::spawn::sleep(LAYOUT_BINDING_RESOLUTION_TIMEOUT),
+                    )
+                    .await?;
                     let result = with_mux_rpc_bootstrap_timeout(async {
-                        if let Some(resolver) = DOMAIN_BINDING_RESOLVER.get() {
-                            // Await only the storage worker, before creating a
-                            // transport. A failed write cannot grant durable
-                            // layout authority, but ordinary attachment remains
-                            // available without ordered capabilities.
-                            if let Err(error) = self.resolve_layout_binding_with(*resolver).await {
-                                metrics::counter!("mux.client.layout_binding_unavailable.total")
-                                    .increment(1);
-                                log::warn!("durable domain layout binding unavailable: {error:#}");
-                            }
-                        }
-                        ensure!(
-                            !self.retired.load(Ordering::Acquire)
-                                && mux.get_domain(domain_id).is_some_and(|current| {
-                                    current
-                                        .downcast_ref::<Self>()
-                                        .is_some_and(|current| std::ptr::eq(current, self))
-                                }),
-                            "client domain retired while awaiting durable layout binding"
-                        );
                         let mut cloned_ui = ui.clone();
                         let mux_owner = Arc::downgrade(&mux);
                         let client = spawn_into_new_thread(move || match &config {
@@ -4910,6 +4939,82 @@ mod tests {
             assert_eq!(domain.durable_layout_binding(), None);
             assert!(domain.resolve_layout_binding_with(ready).await.is_err());
         });
+    }
+
+    #[test]
+    fn pending_layout_binding_deadline_admits_transport_without_granting_durable_authority() {
+        fn pending(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(std::future::pending())
+        }
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x44; 16])) })
+        }
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain = Arc::new(
+            ClientDomain::new(
+                ClientDomainConfig::Unix(UnixDomain {
+                    name: "binding-deadline".into(),
+                    ..UnixDomain::default()
+                }),
+                &mux,
+            )
+            .expect("create exact domain"),
+        );
+        let registration: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registration)
+            .expect("register exact domain");
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let (expire, expiry) = futures::channel::oneshot::channel();
+        let transport_admitted = AtomicBool::new(false);
+        let mut preparation = Box::pin(async {
+            domain
+                .prepare_layout_binding_for_attach(&mux, Some(pending), async {
+                    expiry.await.expect("controlled storage deadline");
+                })
+                .await?;
+            transport_admitted.store(true, Ordering::Release);
+            anyhow::Result::<()>::Ok(())
+        });
+        assert!(preparation.as_mut().poll(&mut context).is_pending());
+        assert!(!transport_admitted.load(Ordering::Acquire));
+        expire.send(()).expect("expire optional storage only");
+        assert!(matches!(
+            preparation.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(preparation);
+        assert!(transport_admitted.load(Ordering::Acquire));
+        assert_eq!(domain.durable_layout_binding(), None);
+
+        // Always falling back would pass the pending case. A real receipt wins
+        // before its deadline and establishes a durable identity.
+        asupersync_block_on(domain.prepare_layout_binding_for_attach(
+            &mux,
+            Some(ready),
+            std::future::pending(),
+        ))
+        .expect("ready store permits normal admission");
+        assert_eq!(
+            domain
+                .durable_layout_binding()
+                .expect("durable receipt")
+                .binding_id
+                .as_bytes(),
+            [0x44; 16]
+        );
+        domain.retired.store(true, Ordering::Release);
+        assert!(
+            asupersync_block_on(domain.prepare_layout_binding_for_attach(
+                &mux,
+                Some(pending),
+                std::future::ready(()),
+            ))
+            .is_err(),
+            "fallback must not revive a retired registration"
+        );
     }
 
     #[test]
