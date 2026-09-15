@@ -6780,6 +6780,9 @@ impl WholeMuxTrustedIdentityConfig {
     }
 }
 
+/// Repaired plaintext and the admission charge retained for its lifetime.
+type AdmittedRepairEnvelope<'a> = (Zeroizing<Vec<u8>>, RepairPermit<'a>);
+
 /// Verifier implementing `RootVerifier` for whole-mux recovery roots.
 ///
 /// Enforces complete object-graph closure, mandatory AEAD authenticated envelopes,
@@ -6919,7 +6922,7 @@ impl WholeMuxRecoveryVerifier {
         expected_object_id: [u8; 32],
         expected_generation: u64,
         max_envelope_bytes: usize,
-    ) -> Result<Option<(Zeroizing<Vec<u8>>, RepairPermit<'_>)>, WholeMuxRecoveryError> {
+    ) -> Result<Option<AdmittedRepairEnvelope<'_>>, WholeMuxRecoveryError> {
         cx.checkpoint()
             .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
         let expected = ExpectedRecoveryIdentity::new(
@@ -7376,11 +7379,11 @@ pub struct ReconstructedWholeMuxSession {
 /// for every pane in the recovery image, guaranteeing real terminal state reconstruction
 /// (modes, alternate screen, scrollback, cursor positions, pen attributes) without live PTY takeover.
 #[cfg(feature = "frankenterm-deps")]
-pub fn reconstruct_whole_mux_image_inert(
+pub fn reconstruct_whole_mux_image_inert<S: std::hash::BuildHasher>(
     validated: &ValidatedWholeMuxRecovery,
     terminal_limits: TerminalCheckpointLimits,
     destination_namespace: Option<&str>,
-    active_live_sessions: &HashSet<String>,
+    active_live_sessions: &HashSet<String, S>,
 ) -> Result<ReconstructedWholeMuxSession, WholeMuxRecoveryError> {
     reconstruct_whole_mux_image_inert_with_config(
         validated,
@@ -7396,12 +7399,12 @@ pub fn reconstruct_whole_mux_image_inert(
 /// is `None`, the complete validated replay configuration is reconstructed by
 /// the terminal checkpoint implementation.
 #[cfg(feature = "frankenterm-deps")]
-pub fn reconstruct_whole_mux_image_inert_with_config(
+pub fn reconstruct_whole_mux_image_inert_with_config<S: std::hash::BuildHasher>(
     validated: &ValidatedWholeMuxRecovery,
     terminal_limits: TerminalCheckpointLimits,
     intended_live_config: Option<Arc<dyn TerminalConfiguration>>,
     destination_namespace: Option<&str>,
-    active_live_sessions: &HashSet<String>,
+    active_live_sessions: &HashSet<String, S>,
 ) -> Result<ReconstructedWholeMuxSession, WholeMuxRecoveryError> {
     // 1. Live target safety gate: refuse if destination namespace is active
     if let Some(dest) = destination_namespace {
@@ -7502,10 +7505,10 @@ pub fn reconstruct_whole_mux_image_inert_with_config(
 }
 
 /// Non-terminal layout-only validation of a verified whole-mux recovery image.
-pub fn validate_whole_mux_image_layout_only(
+pub fn validate_whole_mux_image_layout_only<S: std::hash::BuildHasher>(
     validated: &ValidatedWholeMuxRecovery,
     destination_namespace: Option<&str>,
-    active_live_sessions: &HashSet<String>,
+    active_live_sessions: &HashSet<String, S>,
 ) -> Result<(), WholeMuxRecoveryError> {
     if let Some(dest) = destination_namespace {
         if active_live_sessions.contains(dest) {
@@ -7562,7 +7565,7 @@ pub fn select_verified_recovery_roots_with_cx(
         .admission
         .as_deref()
         .unwrap_or_else(|| shared_admission_controller());
-    let mut verified = Vec::with_capacity(2);
+    let mut accepted_roots = Vec::with_capacity(2);
     for slot in [RootSlot::SlotA, RootSlot::SlotB] {
         let ordinary = candidates.iter().find(|candidate| candidate.slot == slot);
         let discovery = discoveries.iter().find(|discovery| discovery.slot == slot);
@@ -7662,7 +7665,7 @@ pub fn select_verified_recovery_roots_with_cx(
                 .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
             match result {
                 Ok(graph) => {
-                    verified.push((generation, graph));
+                    accepted_roots.push((generation, graph));
                     break;
                 }
                 Err(
@@ -7674,11 +7677,11 @@ pub fn select_verified_recovery_roots_with_cx(
                 ) => {
                     return Err(WholeMuxRecoveryError::Cancelled);
                 }
-                Err(error @ WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(_)))
-                | Err(
-                    error @ WholeMuxRecoveryError::Publication(PublicationError::Repair(
+                Err(
+                    error @ (WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(_))
+                    | WholeMuxRecoveryError::Publication(PublicationError::Repair(
                         RepairError::AdmissionExceeded(_),
-                    )),
+                    ))),
                 ) => return Err(error),
                 Err(_) => {
                     if diagnostics.len() < store.limits().max_error_records {
@@ -7697,17 +7700,17 @@ pub fn select_verified_recovery_roots_with_cx(
             }
         }
     }
-    verified.sort_by(|a, b| b.0.cmp(&a.0));
-    if verified.len() == 2 && verified[0].0 == verified[1].0 {
+    accepted_roots.sort_by_key(|root| std::cmp::Reverse(root.0));
+    if accepted_roots.len() == 2 && accepted_roots[0].0 == accepted_roots[1].0 {
         return Err(PublicationError::AmbiguousGeneration {
-            generation: verified[0].0,
+            generation: accepted_roots[0].0,
         }
         .into());
     }
-    let mut verified = verified.into_iter();
+    let mut accepted_roots = accepted_roots.into_iter();
     Ok(VerifiedRootSelection {
-        current: verified.next().map(|(_, graph)| graph),
-        previous: verified.next().map(|(_, graph)| graph),
+        current: accepted_roots.next().map(|(_, graph)| graph),
+        previous: accepted_roots.next().map(|(_, graph)| graph),
         torn_or_rejected: diagnostics,
     })
 }

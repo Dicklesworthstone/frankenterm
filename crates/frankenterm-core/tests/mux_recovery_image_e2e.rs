@@ -647,7 +647,7 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
         .with_session_id(expected["session"].as_str().unwrap())
         .with_mux_incarnation_id(expected["incarnation"].as_str().unwrap()),
     );
-    let verified = select_verified_recovery_roots_with_cx(
+    let checked_root = select_verified_recovery_roots_with_cx(
         &frankenterm_core::cx::for_request(),
         &store,
         &verifier,
@@ -655,10 +655,10 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
     .unwrap()
     .current
     .unwrap();
-    assert_eq!(verified.generation(), expected_generation);
-    assert_eq!(verified.pane_count(), 8);
+    assert_eq!(checked_root.generation(), expected_generation);
+    assert_eq!(checked_root.pane_count(), 8);
     let reconstructed = reconstruct_whole_mux_image_inert(
-        &verified,
+        &checked_root,
         TerminalCheckpointLimits::default(),
         Some("fresh-process-offline"),
         &HashSet::new(),

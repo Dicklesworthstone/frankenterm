@@ -972,7 +972,7 @@ pub struct RepairPermit<'a> {
     released: bool,
 }
 
-impl<'a> RepairPermit<'a> {
+impl RepairPermit<'_> {
     /// Adjust the allocated bytes down to the retained buffer size.
     /// Releases the difference back to the admission controller while retaining
     /// the charge for the surviving buffer.
@@ -1039,6 +1039,7 @@ impl std::fmt::Debug for RepairPermit<'_> {
 ///    - flat dense matrix A in inactivate_and_solve: matrix_rows * L in GF(256)
 ///    - dense submatrix clone / factor cache during elimination: matrix_rows * L in GF(256)
 ///    - rank basis vectors in coefficient_rank_profile: L * L in GF(256)
+///
 ///    Charged as: 3 * (matrix_rows * L) + (L * L).
 /// 3. HDPC and dense equations having up to L aligned (usize, GF256) terms,
 ///    vector/struct allocation headers (~128 bytes), and RHS symbol buffers (symbol_size).
@@ -1050,6 +1051,7 @@ impl std::fmt::Debug for RepairPermit<'_> {
 ///    - source symbols (K * symbol_size)
 ///    - output reconstructed envelope (K * symbol_size)
 ///    - received symbol data (received_symbol_count * symbol_size)
+///
 ///    Charged as: (2L + 2K + received_symbol_count) * symbol_size.
 /// 5. Full state auxiliary vector overhead:
 ///    - column_states (L * 1)

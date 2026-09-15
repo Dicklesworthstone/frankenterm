@@ -18979,7 +18979,25 @@ mod tests {
             .with_wezterm_handle(Arc::new(mock))
             .with_snapshot_config(SnapshotConfig::default());
             let handle = runtime.start().await.unwrap();
-            wait_for_snapshot_checkpoint(&db_path, "startup").await;
+            wait_for_snapshot_checkpoint_with_diagnostics(&db_path, "startup", || {
+                format!(
+                    "telemetry={:?}; scheduler_finished={:?}; scheduler_status={:?}; bridge_finished={:?}",
+                    handle
+                        .snapshot_engine
+                        .as_ref()
+                        .map(|engine| engine.telemetry().snapshot()),
+                    handle.snapshot.as_ref().map(|task| task.is_finished()),
+                    handle
+                        .snapshot_scheduler_status
+                        .as_ref()
+                        .map(|status| status.load(Ordering::Acquire)),
+                    handle
+                        .snapshot_triggers
+                        .as_ref()
+                        .map(|task| task.is_finished()),
+                )
+            })
+            .await;
             sleep(Duration::from_millis(30)).await;
             let started = Instant::now();
             let summary = handle.shutdown_with_timeout(Duration::from_secs(2)).await;

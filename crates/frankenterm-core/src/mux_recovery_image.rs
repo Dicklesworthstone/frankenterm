@@ -322,7 +322,7 @@ impl<'a> Sha256Sink<'a> {
     }
 }
 
-impl<'a> Write for Sha256Sink<'a> {
+impl Write for Sha256Sink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
         Ok(buf.len())
@@ -368,14 +368,11 @@ impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.written.saturating_add(buf.len()) > self.limit {
             self.exceeded = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "output byte limit exceeded: attempted {} bytes with limit {}",
-                    self.written.saturating_add(buf.len()),
-                    self.limit
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "output byte limit exceeded: attempted {} bytes with limit {}",
+                self.written.saturating_add(buf.len()),
+                self.limit
+            )));
         }
         let n = self.inner.write(buf)?;
         self.written += n;

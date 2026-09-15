@@ -1064,7 +1064,7 @@ impl SnapshotPublicationStore {
         }
 
         let objects_dir = Self::ensure_private_child_dir(&root_dir, OBJECTS_DIR_NAME, &root_path)?;
-        let roots_dir = Self::ensure_private_child_dir(&root_dir, ROOTS_DIR_NAME, &root_path)?;
+        let root_slots_dir = Self::ensure_private_child_dir(&root_dir, ROOTS_DIR_NAME, &root_path)?;
         let generations_dir =
             Self::ensure_private_child_dir(&root_dir, GENERATIONS_DIR_NAME, &root_path)?;
 
@@ -1072,7 +1072,7 @@ impl SnapshotPublicationStore {
             root_path,
             root_dir,
             objects_dir,
-            roots_dir,
+            roots_dir: root_slots_dir,
             generations_dir,
             limits,
         })
@@ -1926,8 +1926,8 @@ impl SnapshotPublicationStore {
 
         for candidate in &candidates {
             match verifier.verify_root(candidate, self) {
-                Ok(verified) => {
-                    verified_entries.push((candidate.generation, candidate.slot, verified));
+                Ok(checked_root) => {
+                    verified_entries.push((candidate.generation, candidate.slot, checked_root));
                 }
                 Err(_) => {
                     diagnostics.push(TornRootDiagnostic {
@@ -1940,7 +1940,7 @@ impl SnapshotPublicationStore {
         }
 
         // Sort descending by generation
-        verified_entries.sort_by(|a, b| b.0.cmp(&a.0));
+        verified_entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         if verified_entries.len() == 2 && verified_entries[0].0 == verified_entries[1].0 {
             return Err(PublicationError::AmbiguousGeneration {
@@ -2113,7 +2113,7 @@ impl SnapshotPublicationStore {
                 verified_candidates.push(candidate);
             }
         }
-        verified_candidates.sort_by(|a, b| b.generation.cmp(&a.generation));
+        verified_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.generation));
         if verified_candidates.len() == 2
             && verified_candidates[0].generation == verified_candidates[1].generation
         {
@@ -2171,19 +2171,15 @@ impl SnapshotPublicationStore {
                             .join(ROOTS_DIR_NAME)
                             .join(candidate.slot.filename()),
                     });
-                } else {
-                    return Err(PublicationError::GenerationConflict {
-                        generation: request.generation,
-                        expected: format!(
-                            "publisher={}, hash={manifest_sha256}",
-                            request.publisher_id
-                        ),
-                        existing: format!(
-                            "publisher={}, hash={}",
-                            candidate.publisher_id, candidate.manifest_sha256
-                        ),
-                    });
                 }
+                return Err(PublicationError::GenerationConflict {
+                    generation: request.generation,
+                    expected: format!("publisher={}, hash={manifest_sha256}", request.publisher_id),
+                    existing: format!(
+                        "publisher={}, hash={}",
+                        candidate.publisher_id, candidate.manifest_sha256
+                    ),
+                });
             }
         }
 
@@ -2533,7 +2529,7 @@ impl SnapshotPublicationStore {
                 }),
             }
         }
-        discoveries.sort_by(|a, b| b.generation.cmp(&a.generation));
+        discoveries.sort_by_key(|discovery| std::cmp::Reverse(discovery.generation));
         if discoveries.len() == 2 && discoveries[0].generation == discoveries[1].generation {
             return Err(PublicationError::AmbiguousGeneration {
                 generation: discoveries[0].generation,
@@ -2660,7 +2656,7 @@ impl SnapshotPublicationStore {
             .map_err(|error| PublicationError::io(&stage_path, error))?;
         stage
             .write_all(&bytes)
-            .and_then(|_| stage.sync_all())
+            .and_then(|()| stage.sync_all())
             .map_err(|error| PublicationError::io(&stage_path, error))?;
         stage
             .seek(SeekFrom::Start(0))

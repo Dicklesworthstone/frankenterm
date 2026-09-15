@@ -809,11 +809,11 @@ impl RepresentationContext {
     pub fn chunk_coordinate_id(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(RECOVERY_CHUNK_COORDINATE_ID_DOMAIN);
-        hasher.update(&self.representation_version.to_be_bytes());
-        hasher.update(&self.object_id);
-        hasher.update(&self.generation.to_be_bytes());
-        hasher.update(&self.chunk_index.to_be_bytes());
-        hasher.update(&self.chunk_count.to_be_bytes());
+        hasher.update(self.representation_version.to_be_bytes());
+        hasher.update(self.object_id);
+        hasher.update(self.generation.to_be_bytes());
+        hasher.update(self.chunk_index.to_be_bytes());
+        hasher.update(self.chunk_count.to_be_bytes());
         let digest = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
@@ -948,7 +948,7 @@ impl EncryptedRecoveryObject {
             .checked_add(header_json.len())
             .and_then(|len| len.checked_add(24))
             .filter(|len| *len <= MAX_ENVELOPE_BYTES)
-            .ok_or(RepresentationError::EnvelopeTooLarge {
+            .ok_or_else(|| RepresentationError::EnvelopeTooLarge {
                 size: self
                     .ciphertext
                     .len()

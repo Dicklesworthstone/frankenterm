@@ -567,17 +567,17 @@ pub fn publish_whole_mux_recovery(
                   store: &crate::snapshot_publication::SnapshotPublicationStore|
      -> Result<_, VerifyPublicationError> {
         snapshot_cx_checkpoint(cx)?;
-        let verified = verifier.verify_root_with_cx(cx, candidate, store)?;
+        let checked_root = verifier.verify_root_with_cx(cx, candidate, store)?;
         if expected
             .predecessor
             .as_ref()
             .is_some_and(|p| p.expected_generation == candidate.generation)
-            && Some(verified.image().image_digest) != expected.predecessor_image_digest
+            && Some(checked_root.image().image_digest) != expected.predecessor_image_digest
         {
             return Err(VerifyPublicationError::Predecessor);
         }
         snapshot_cx_checkpoint(cx)?;
-        Ok(verified)
+        Ok(checked_root)
     };
     Ok(store.publish_repair_protected_generation_root(
         cx,
