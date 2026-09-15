@@ -19,8 +19,8 @@ use frankenterm_core::snapshot_engine::{
     WholeMuxPanePublication, WholeMuxPublicationIdentity, publish_whole_mux_recovery,
 };
 use frankenterm_core::snapshot_publication::{
-    GenerationPublicationReceipt, PredecessorBinding, RootSlotCandidate, SnapshotPublicationStore,
-    repair_descriptor_object_id, sha256_hex,
+    GenerationPublicationReceipt, PredecessorBinding, PublicationError, RootSlotCandidate,
+    SnapshotPublicationStore, repair_descriptor_object_id, sha256_hex,
 };
 use frankenterm_core::snapshot_repair::{
     ExpectedRecoveryIdentity, RepairAdmissionController, RepairError, RepairObjectDescriptor,
@@ -660,12 +660,39 @@ fn test_mux_recovery_e2e_production_verifier_rejects_missing_object() {
     fixture.publish(&cx, &store, None);
     let mut image = fixture.current(&cx, &store).image().clone();
     image.panes[3].checkpoint.checkpoint_ref.object_id = "absent-object".into();
+    let absent_digest = [0xa9; 32];
+    assert!(matches!(
+        store.read_object(&repair_descriptor_object_id(&absent_digest)),
+        Err(PublicationError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
+    ));
+    image.panes[3].checkpoint.checkpoint_ref.payload_digest = absent_digest;
     image.image_digest = image.compute_digest().unwrap();
     let candidate = encrypted_candidate(&image, &fixture.key);
     assert!(
         matches!(fixture.verifier().verify_root_with_cx(&cx, &candidate, &store),
         Err(WholeMuxRecoveryError::MissingCheckpointObject(id)) if id == "absent-object")
     );
+    assert_eq!(fixture.current(&cx, &store).generation(), 1);
+}
+
+#[test]
+fn test_mux_recovery_e2e_production_verifier_rejects_spoofed_object_locator() {
+    let fixture = Fixture::new();
+    let cx = frankenterm_core::cx::for_request();
+    let (_directory, store) = store();
+    fixture.publish(&cx, &store, None);
+    let mut image = fixture.current(&cx, &store).image().clone();
+    let original_id = image.panes[3].checkpoint.checkpoint_ref.object_id.clone();
+    image.panes[3].checkpoint.checkpoint_ref.object_id = "spoofed-object".into();
+    image.image_digest = image.compute_digest().unwrap();
+    let candidate = encrypted_candidate(&image, &fixture.key);
+    assert!(matches!(
+        fixture.verifier().verify_root_with_cx(&cx, &candidate, &store),
+        Err(WholeMuxRecoveryError::Publication(PublicationError::Repair(
+            RepairError::ForeignObjectId { expected, got }
+        ))) if expected == frankenterm_core::session_restore::semantic_object_id_from_str("spoofed-object")
+            && got == frankenterm_core::session_restore::semantic_object_id_from_str(&original_id)
+    ));
     assert_eq!(fixture.current(&cx, &store).generation(), 1);
 }
 
