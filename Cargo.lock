@@ -3900,6 +3900,7 @@ dependencies = [
  "tracing-subscriber",
  "tru",
  "url",
+ "uuid",
  "x509-parser",
  "xattr",
  "zeroize",
