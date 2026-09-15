@@ -691,6 +691,7 @@ fn assert_fresh_process_recovery(
         RecoveryWrapContext, RecoveryWrappingKey, wrap_recovery_key,
     };
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let artifacts = private_test_directory();
     let directory = artifacts.path().canonicalize().unwrap();
