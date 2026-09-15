@@ -12685,26 +12685,28 @@ mod tests {
             GuardianCheckpointStageKindV1::Chunk,
             GuardianCheckpointStageKindV1::Query,
         ] {
-            let stage = match kind {
-                GuardianCheckpointStageKindV1::Begin => {
-                    GuardianCheckpointStageRequestV1::begin(scope, upload, descriptor, 1_024)
-                }
-                GuardianCheckpointStageKindV1::Chunk => GuardianCheckpointStageRequestV1::chunk(
-                    scope,
-                    upload,
-                    descriptor,
-                    1_024,
-                    0,
-                    zeroizing_vec_from_slice(&terminal.canonical_payload()[..1_024]),
-                ),
-                GuardianCheckpointStageKindV1::Query => {
-                    GuardianCheckpointStageRequestV1::query(scope, upload, descriptor, 1_024)
-                }
-                _ => unreachable!(),
-            }
-            .unwrap();
             for authority in [&owner, &reconnect, &other_mux, &other_build] {
-                let envelope = request(
+                let stage = match kind {
+                    GuardianCheckpointStageKindV1::Begin => {
+                        GuardianCheckpointStageRequestV1::begin(scope, upload, descriptor, 1_024)
+                    }
+                    GuardianCheckpointStageKindV1::Chunk => {
+                        GuardianCheckpointStageRequestV1::chunk(
+                            scope,
+                            upload,
+                            descriptor,
+                            1_024,
+                            0,
+                            zeroizing_vec_from_slice(&terminal.canonical_payload()[..1_024]),
+                        )
+                    }
+                    GuardianCheckpointStageKindV1::Query => {
+                        GuardianCheckpointStageRequestV1::query(scope, upload, descriptor, 1_024)
+                    }
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                let envelope = request_zeroizing(
                     GuardianOperation::CheckpointStage,
                     id(1),
                     authority.mux_incarnation,
@@ -12713,7 +12715,7 @@ mod tests {
                     0,
                     0,
                     Some(effect),
-                    &stage.encode().unwrap(),
+                    stage.into_zeroizing_payload().unwrap(),
                 );
                 let request = authenticate(&envelope);
                 let admitted =

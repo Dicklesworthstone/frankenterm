@@ -6161,6 +6161,10 @@ mod tests {
                         "into_zeroizing_payload"
                     )
                     | (Some("GuardianProtocolState"), "preflight_checkpoint_stage")
+                    | (
+                        Some("GuardianProtocolState"),
+                        "preflight_genesis_checkpoint_stage"
+                    )
                     | (Some("GuardianProtocolState"), "preflight_checkpoint_seal")
             ) {
                 let mut exact = function.clone();
@@ -6583,6 +6587,12 @@ mod tests {
                 "GuardianProtocolState",
                 "pub",
                 false,
+                "fn preflight_genesis_checkpoint_stage(&self, request: &AuthenticatedGuardianRequest, connection: &GuardianAuthenticatedMuxConnectionAuthorityV1, live_guardian: &GuardianLiveBuildAuthorityV1) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianProtocolState",
+                "pub",
+                false,
                 "fn preflight_checkpoint_stage(&self, request: &AuthenticatedGuardianRequest) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError>",
             ),
             expected_authority_method(
@@ -6867,6 +6877,59 @@ mod tests {
             expected_protocol_ownership_method(
                 "GuardianProtocolState",
                 r#"
+                    pub fn preflight_genesis_checkpoint_stage(
+                        &self,
+                        request: &AuthenticatedGuardianRequest,
+                        connection: &GuardianAuthenticatedMuxConnectionAuthorityV1,
+                        live_guardian: &GuardianLiveBuildAuthorityV1,
+                    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+                        validate_request_envelope(request)?;
+                        if request.header.guardian_incarnation != self.incarnation {
+                            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+                        }
+                        if request.header.operation != GuardianOperation::CheckpointStage {
+                            return Err(GuardianProtocolError::InvalidOperationScope {
+                                operation: request.header.operation,
+                            });
+                        }
+                        if connection.guardian_incarnation != self.incarnation
+                            || connection.mux_incarnation != request.header.mux_incarnation
+                            || live_guardian.guardian_incarnation != self.incarnation
+                        {
+                            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+                        }
+                        let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+                        let GuardianCheckpointScopeV1::Genesis { spawn_effect_id } = stage.scope() else {
+                            return Err(GuardianProtocolError::InvalidGenesisReservation);
+                        };
+                        if !matches!(
+                            stage.kind(),
+                            GuardianCheckpointStageKindV1::Begin
+                                | GuardianCheckpointStageKindV1::Chunk
+                                | GuardianCheckpointStageKindV1::Query
+                        ) {
+                            return Err(GuardianProtocolError::GenesisAuthorityUnavailable);
+                        }
+                        let owner = GuardianHelloBuildIdentityV1 {
+                            build_identity: AtomicBuildIdentity::Sealed(connection.mux_build_identity),
+                        };
+                        let expected_upload_id = owner.genesis_upload_id(
+                            self.incarnation,
+                            connection.mux_incarnation,
+                            spawn_effect_id,
+                            stage.descriptor(),
+                            stage.chunk_bytes(),
+                        )?;
+                        if stage.upload_id() != expected_upload_id {
+                            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+                        }
+                        Ok(stage)
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianProtocolState",
+                r#"
                     pub fn preflight_checkpoint_stage(
                         &self,
                         request: &AuthenticatedGuardianRequest,
@@ -7064,6 +7127,7 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
             "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_checkpoint_stage:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_genesis_checkpoint_stage:pub:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -7095,6 +7159,8 @@ mod tests {
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::ack",
             "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
             "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_checkpoint_stage",
+            "GuardianCheckpointStageRequestV1@GuardianProtocolState::preflight_genesis_checkpoint_stage",
+            "GuardianCheckpointStageRequestV1@GuardianHelloBuildIdentityV1::genesis_upload_id",
             // Genesis decodes only after validating both authenticated
             // envelopes and their connection/build authority, then checks the
             // Begin scope, geometry and one-shot reservation identity.
