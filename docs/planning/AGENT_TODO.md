@@ -255,6 +255,34 @@ just code presence. Existing remote sessions remain outside the disposable test.
   deferred producer runtime proof and Lindley calibration/holdout, then sign,
   publish, verify canary/upgrade, and activate the qualified Mac application.
 
+### 23:37 UTC release repair batch
+
+- [x] Correct all five diagnosed cohort failures; strict sealed RCH 57395 at
+  `097696a9b` passed 2,464 active tests: guardian 225, redactor 123, surface 430,
+  terminal 510, mux 1,176. The Genesis staging success marker was present;
+  one separately proven broker test remains explicitly ignored.
+- [x] Execute all 21 audited GUI regressions through RCH 57392 on hz3.
+- [x] Fix the static generator gate's swallowed nonzero status in `c42cd7ae6`;
+  causal shell proof preserves failure exit 37 and successful optional behavior.
+- [x] Clarify existing retained-manifest post-build qualification in `2c90bf05c`;
+  actual producer success, complete canonical identities, trusted manifest digest,
+  exact DSR source/build bindings, and strict verification remain mandatory.
+- [x] Start all six DSR quality checks. Run `20260915T192517-4572` began on
+  `2c90bf05c`; subsequent real defect fixes make this run diagnostic, not final
+  unchanged-source release qualification.
+- [x] Retain nine-regression RCH 57350 failure: four watcher tests passed, one
+  symlink-alias event timed out; Cargo did not execute the four core tests.
+- [x] Execute those four named crash tests from the retained RCH-built remote
+  binary: four passed. This runtime receipt does not replace final RCH quality.
+- [x] Diagnose actual inotify alias naming; fix parent-only event normalization
+  and add missing-leaf/sibling controls in `3a5c13390`, preserving timeouts.
+- [x] Fix two Rust 2018 assertion-format warnings in `7865a302a`.
+- [ ] Finish six focused watcher tests, strict RCH 57397 on `3a5c13390`.
+- [ ] Complete final metadata/freeze, exact RC23 tag and full parallel DSR build;
+  the qualified Linux lock serializes both ts1 builds. Existing sessions stay live.
+- [ ] Requalify the final source through all six DSR checks and actual producer,
+  native UI, signing, release, canary, and upgrade acceptance above.
+
 This operator-requested TODO retires as an active checklist when its remaining
 work is completed or explicitly handed off with qualified evidence.
 

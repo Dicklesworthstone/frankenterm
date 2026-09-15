@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 43,
-        "fix": 46,
+        "fix": 47,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 137,
+      "fork_side_commit_count": 138,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-15T17:55:46-04:00",
-        "sha": "a736fcd95a9ac8d38059acb8ec4c097240bea92a",
-        "subject": "fix(gui): preserve window size during font zoom by default"
+        "committed_at": "2026-09-15T19:33:53-04:00",
+        "sha": "3a5c133902cf7ec71bc9e285db2aab15ea354620",
+        "subject": "fix(config): match native events through parent path aliases"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -901,15 +901,15 @@
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 57
+        "test": 58
       },
-      "fork_side_commit_count": 307,
+      "fork_side_commit_count": 308,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-15T19:08:10-04:00",
-        "sha": "61c2d77bacd14807d8f87e232ce0677ce874fcb8",
-        "subject": "test(term): import checked cursor conversion for Rust 2018"
+        "committed_at": "2026-09-15T19:34:31-04:00",
+        "sha": "7865a302a01bff379df0fc1da12c36fc66c6001a",
+        "subject": "test(term): format Rust 2018 assertion diagnostics explicitly"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2651,
-  "generated_at": "2026-09-15T23:15:56.799146Z",
+  "fork_side_commit_total": 2653,
+  "generated_at": "2026-09-15T23:37:27.576527Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
