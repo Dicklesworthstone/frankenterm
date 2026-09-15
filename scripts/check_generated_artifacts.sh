@@ -15,8 +15,15 @@ run_generator() {
     local script="$1"
     if [[ -f "$script" ]]; then
         echo "[INFO] Running generator: $script"
-        (cd "$PROJECT_ROOT" && CI=1 bash "$script")
-        return 0
+        if (cd "$PROJECT_ROOT" && CI=1 bash "$script"); then
+            return 0
+        else
+            local status=$?
+            # Callers use this function as an if condition, which disables
+            # errexit. A failed generator must terminate the gate explicitly.
+            echo "[ERROR] Generator failed (exit $status): $script" >&2
+            exit "$status"
+        fi
     fi
 
     echo "[INFO] Skipping generator (not found): $script"
