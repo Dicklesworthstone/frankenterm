@@ -2225,7 +2225,7 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
-/// Width-only snapshot of one physical row or a certified logical-row join.
+/// Width and ordinary-space snapshot of a physical row or certified logical join.
 /// No text, attributes, cells, images or output rows are retained. Capture is
 /// fallible under the caller's byte budget; a refused join must use the ordinary
 /// text-bearing path. In particular, clustered append can change grapheme
@@ -2288,10 +2288,12 @@ impl LineWrapGeometry {
             let width = cell.width();
             // Current cells use widths 0..=2. Refuse a future extended width
             // rather than silently truncating it in this compact encoding.
-            if width > u8::MAX as usize || result.widths.len() == result.widths.capacity() {
+            if width > 2 || result.widths.len() == result.widths.capacity() {
                 return None;
             }
-            result.widths.push(width as u8);
+            result
+                .widths
+                .push(width as u8 | if cell.str() == " " { 0x80 } else { 0 });
             // Preserve the source borrow beyond this temporary CellRef so the
             // next token can certify its boundary against the previous one.
             let text = match cell {
@@ -2381,7 +2383,7 @@ impl LineWrapGeometry {
         let prefix = scratch
             .capacity()
             .checked_mul(2)?
-            .max(n.checked_add(1)?)
+            .max(n.checked_add(1)?.checked_mul(3)?)
             .max(4)
             .checked_add(scratch.capacity())?;
         // Vec push growth rounds up geometrically. Twice n (at least eight)
@@ -2508,7 +2510,8 @@ impl LineWrapGeometry {
             let mut hasher = SipHasher::new();
             widths.len().hash(&mut hasher);
             for &width in widths {
-                usize::from(width).hash(&mut hasher);
+                usize::from(width & 0x7f).hash(&mut hasher);
+                (width & 0x80 != 0).hash(&mut hasher);
             }
             MemoizedWrapPointCacheKey {
                 geometry_hash: hasher.finish128().as_bytes(),
@@ -2520,7 +2523,11 @@ impl LineWrapGeometry {
         if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
             return cached.scorecard.line_count;
         }
-        scratch.rebuild_widths(widths.iter().map(|&width| usize::from(width)));
+        scratch.rebuild_metadata(
+            widths
+                .iter()
+                .map(|&width| (usize::from(width & 0x7f), width & 0x80 != 0)),
+        );
         let (plan, scorecard) = wrap_plan_and_scorecard(widths.len(), cols, cost_model, scratch);
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
         memoized_wrap_point_cache_insert(
@@ -2648,6 +2655,9 @@ impl LineWrapLayout {
         if self.blank.is_none() && self.width_prefix.is_none() {
             let mut prefix = LineWrapWidthPrefixScratch {
                 widths: Vec::with_capacity(self.token_range.len().saturating_add(1)),
+                spaces: Vec::with_capacity(self.token_range.len()),
+                word_widths: Vec::with_capacity(self.token_range.len()),
+                has_spaces: false,
                 #[cfg(feature = "std")]
                 all_widths_positive: false,
             };
@@ -3086,6 +3096,9 @@ fn memoized_wrap_point_cache_key_hits_for_test(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LineWrapWidthPrefixScratch {
     widths: Vec<u128>,
+    spaces: Vec<bool>,
+    word_widths: Vec<u128>,
+    has_spaces: bool,
     #[cfg(feature = "std")]
     all_widths_positive: bool,
 }
@@ -3093,6 +3106,9 @@ pub struct LineWrapWidthPrefixScratch {
 impl LineWrapWidthPrefixScratch {
     pub fn clear(&mut self) {
         self.widths.clear();
+        self.spaces.clear();
+        self.word_widths.clear();
+        self.has_spaces = false;
         #[cfg(feature = "std")]
         {
             self.all_widths_positive = false;
@@ -3100,15 +3116,28 @@ impl LineWrapWidthPrefixScratch {
     }
 
     pub fn capacity(&self) -> usize {
-        self.widths.capacity()
+        // Existing callers charge capacity in u128 units. Round up the space
+        // metadata so that retained and peak-working budgets cover every Vec.
+        self.widths
+            .capacity()
+            .saturating_add(self.word_widths.capacity())
+            .saturating_add(
+                self.spaces
+                    .capacity()
+                    .div_ceil(core::mem::size_of::<u128>()),
+            )
     }
 
     fn rebuild(&mut self, tokens: &[Cell]) {
-        self.rebuild_widths(tokens.iter().map(Cell::width));
+        self.rebuild_metadata(tokens.iter().map(|cell| (cell.width(), cell.str() == " ")));
     }
 
-    fn rebuild_widths(&mut self, widths: impl ExactSizeIterator<Item = usize>) {
+    fn rebuild_metadata(&mut self, widths: impl ExactSizeIterator<Item = (usize, bool)>) {
         self.widths.clear();
+        self.spaces.clear();
+        self.word_widths.clear();
+        self.has_spaces = false;
+        self.spaces.reserve(widths.len());
         self.widths.reserve(widths.len().saturating_add(1));
         self.widths.push(0);
         #[cfg(feature = "std")]
@@ -3117,7 +3146,9 @@ impl LineWrapWidthPrefixScratch {
         }
 
         let mut total = 0u128;
-        for width in widths {
+        for (width, space) in widths {
+            self.spaces.push(space);
+            self.has_spaces |= space;
             #[cfg(feature = "std")]
             {
                 self.all_widths_positive &= width > 0;
@@ -3125,6 +3156,36 @@ impl LineWrapWidthPrefixScratch {
             total = total.saturating_add(width as u128);
             self.widths.push(total);
         }
+        if self.has_spaces {
+            self.word_widths.resize(self.spaces.len(), 0);
+            let mut start = 0;
+            while start < self.spaces.len() {
+                if self.spaces[start] {
+                    start += 1;
+                    continue;
+                }
+                let end = (start..self.spaces.len())
+                    .find(|&i| self.spaces[i])
+                    .unwrap_or(self.spaces.len());
+                let width = self.widths[end].saturating_sub(self.widths[start]);
+                self.word_widths[start..end].fill(width);
+                start = end;
+            }
+        }
+    }
+
+    fn word_boundary(&self, offset: usize) -> bool {
+        offset == 0 || offset == self.spaces.len() || self.spaces[offset - 1] || self.spaces[offset]
+    }
+
+    fn allowed_word_break(&self, start: usize, end: usize, width: usize) -> bool {
+        if self.word_boundary(end) || !self.has_spaces {
+            return true;
+        }
+        // Emergency splitting is permitted only inside a word wider than a
+        // complete row. Spaces remain original cells, never collapsed/glue.
+        self.word_widths[end] > width as u128
+            || end == start + 1 && self.width_between(start, end) > width
     }
 
     #[cfg(feature = "std")]
@@ -3173,7 +3234,7 @@ fn compute_wrap_geometry_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16]
     if use_content_key {
         bits.bits().hash(&mut hasher);
     } else {
-        // The planner, scorer and tie-breaker use only the ordered widths,
+        // The planner, scorer and tie-breaker use ordered widths and spaces,
         // token count, target width and cost model. Cache only their offsets
         // and scorecard; materialization always reads the caller's current
         // cells, including colors, links and mutable image attachments.
@@ -3185,6 +3246,7 @@ fn compute_wrap_geometry_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16]
             cell.compute_shape_hash(&mut hasher);
         }
         cell.width().hash(&mut hasher);
+        (cell.str() == " ").hash(&mut hasher);
     }
     hasher.finish128().as_bytes()
 }
@@ -3203,6 +3265,35 @@ fn greedy_break_offsets_from_width_prefix(
     width: usize,
     width_prefix: &LineWrapWidthPrefixScratch,
 ) -> Vec<usize> {
+    if width_prefix.has_spaces {
+        let mut offsets = Vec::new();
+        let mut start = 0;
+        while start < token_count {
+            let mut end = start;
+            let mut last_boundary = None;
+            while end < token_count {
+                let next = end + 1;
+                if end > start && width_prefix.width_between(start, next) > width {
+                    break;
+                }
+                end = next;
+                if width_prefix.word_boundary(end) {
+                    last_boundary = Some(end);
+                }
+                if width_prefix.width_between(start, end) > width {
+                    break;
+                }
+            }
+            let stop = if end == token_count {
+                end
+            } else {
+                last_boundary.unwrap_or(end)
+            };
+            offsets.push(stop);
+            start = stop;
+        }
+        return offsets;
+    }
     let mut offsets = Vec::new();
     let mut current_width = 0usize;
 
@@ -3316,6 +3407,12 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
                     width_prefix,
                 );
             }
+            if line_width > width && end > start + 1 {
+                break;
+            }
+            if !width_prefix.allowed_word_break(start, end, width) {
+                continue;
+            }
 
             let is_last_line = end == token_count;
             let (line_cost, forced_break_inc) = if line_width > width {
@@ -3332,7 +3429,14 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
                 }
             } else {
                 let slack = width.saturating_sub(line_width) as i64;
-                (model.line_badness(slack, width, is_last_line), 0usize)
+                let forced =
+                    usize::from(width_prefix.has_spaces && !width_prefix.word_boundary(end));
+                (
+                    model
+                        .line_badness(slack, width, is_last_line)
+                        .saturating_add(model.forced_break_penalty.saturating_mul(forced as u64)),
+                    forced,
+                )
             };
 
             let mut break_offsets = prefix.break_offsets.clone();
@@ -3415,7 +3519,15 @@ fn evaluate_break_offsets_with_width_prefix(
             }
         } else {
             let slack = width.saturating_sub(line_width) as i64;
-            (model.line_badness(slack, width, is_last_line), 0usize)
+            let forced = usize::from(width_prefix.has_spaces && !width_prefix.word_boundary(end));
+            let cost = if width_prefix.allowed_word_break(start, end, width) {
+                model
+                    .line_badness(slack, width, is_last_line)
+                    .saturating_add(model.forced_break_penalty.saturating_mul(forced as u64))
+            } else {
+                KP_BADNESS_INF
+            };
+            (cost, forced)
         };
 
         total_cost = total_cost.saturating_add(line_cost);
@@ -3540,6 +3652,193 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn prose_wrap_has_exact_source_preserving_rows_in_dp_and_fallback() {
+        let cases: &[(&str, usize, &[&str], &[usize])] = &[
+            (
+                "alpha beta gamma",
+                8,
+                &["alpha ", "beta ", "gamma"],
+                &[6, 11, 16],
+            ),
+            ("x aa\u{a0}bb", 5, &["x ", "aa\u{a0}bb"], &[2, 7]),
+            ("  ab  cd", 4, &["  ab", "  cd"], &[4, 8]),
+            ("ab  cd ef", 5, &["ab  ", "cd ef"], &[4, 9]),
+            (
+                "e\u{301}é 界界 ok",
+                5,
+                &["e\u{301}é ", "界界 ", "ok"],
+                &[3, 6, 8],
+            ),
+            // A terminal preserves the separator as a real cell. With both
+            // words filling a row, keeping those words intact requires a
+            // separator row; silently eliding it would corrupt source offsets.
+            ("hello world", 5, &["hello", " ", "world"], &[5, 6, 11]),
+            // Entirely blank lines retain the existing passthrough contract.
+            ("       ", 3, &["       "], &[]),
+        ];
+        for &(text, width, expected_rows, expected_offsets) in cases {
+            for fallback in [false, true] {
+                let mut model = MonospaceKpCostModel::terminal_default();
+                if fallback {
+                    model.max_dp_states = 0;
+                }
+                let source = Line::from_text(text, &CellAttributes::default(), 7, None);
+                let mut scratch = LineWrapWidthPrefixScratch::default();
+                let geometry = LineWrapGeometry::capture(&source, 1 << 20).unwrap();
+                let layout = source.plan_wrap_with_width_prefix_scratch(width, model, &mut scratch);
+                assert_eq!(layout.break_offsets, expected_offsets, "source {text:?}");
+                let rows: Vec<String> = layout
+                    .materialize_rows(0..layout.row_count(), 7)
+                    .iter()
+                    .map(|row| row.as_str().into_owned())
+                    .collect();
+                assert_eq!(rows, expected_rows, "source {text:?}");
+                assert_eq!(rows.concat(), text, "every separator and grapheme survives");
+                assert_eq!(
+                    geometry.row_count(width, model, &mut scratch),
+                    expected_rows.len()
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn prose_wrap_retained_prefix_replans_and_cold_join_keeps_boundaries() {
+        for fallback in [false, true] {
+            let mut model = MonospaceKpCostModel::terminal_default();
+            if fallback {
+                model.max_dp_states = 0;
+            }
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            let source = Line::from_text("alpha beta gamma", &CellAttributes::default(), 7, None);
+            let retained = source
+                .plan_wrap_with_width_prefix_scratch(8, model, &mut scratch)
+                .retain_width_prefix();
+            let prefix = retained.width_prefix.as_ref().unwrap();
+            let mut joined = LineWrapGeometry::capture(
+                &Line::from_text("alpha beta ", &CellAttributes::default(), 7, None),
+                1 << 20,
+            )
+            .unwrap();
+            joined
+                .try_append(
+                    &LineWrapGeometry::capture(
+                        &Line::from_text("gamma", &CellAttributes::default(), 7, None),
+                        1 << 20,
+                    )
+                    .unwrap(),
+                    1 << 20,
+                )
+                .unwrap();
+            for (width, expected) in [(8, vec![6, 11, 16]), (11, vec![11, 16])] {
+                scratch.rebuild(&cells_from_text("xxxxxxxxxxxxxxxx"));
+                let layout = retained.replan(width, model, &mut scratch);
+                assert!(Arc::ptr_eq(prefix, layout.width_prefix.as_ref().unwrap()));
+                assert_eq!(layout.break_offsets, expected);
+                assert_eq!(joined.row_count(width, model, &mut scratch), expected.len());
+                assert_eq!(
+                    layout
+                        .materialize_rows(0..layout.row_count(), 7)
+                        .iter()
+                        .map(|row| row.as_str().into_owned())
+                        .collect::<String>(),
+                    "alpha beta gamma"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prose_wrap_preserves_words_cells_and_cold_geometry_in_dp_and_fallback() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_italic(true);
+        for text in [
+            "alpha beta gamma",
+            "e\u{301}clair 界界 hello",
+            "ab abcdefghijkl xy",
+        ] {
+            let source = Line::from_text(text, &attrs, 7, None);
+            let expected: Vec<String> = source
+                .visible_cells()
+                .map(|cell| cell.str().to_owned())
+                .collect();
+            for cols in [4, 8] {
+                for fallback in [false, true] {
+                    let mut model = MonospaceKpCostModel::terminal_default();
+                    if fallback {
+                        model.max_dp_states = 0;
+                    }
+                    let mut scratch = LineWrapWidthPrefixScratch::default();
+                    let layout = source.clone().plan_wrap_with_width_prefix_scratch(
+                        cols,
+                        model,
+                        &mut scratch,
+                    );
+                    // A memoized hit intentionally leaves scratch untouched.
+                    scratch.rebuild(
+                        &source
+                            .visible_cells()
+                            .map(|cell| cell.as_cell())
+                            .collect::<Vec<_>>(),
+                    );
+                    let mut start = 0;
+                    for &end in &layout.break_offsets {
+                        assert!(scratch.allowed_word_break(start, end, cols));
+                        start = end;
+                    }
+                    let rows = layout.materialize_rows(0..layout.row_count(), 7);
+                    let actual: Vec<String> = rows
+                        .iter()
+                        .flat_map(|row| row.visible_cells().map(|cell| cell.str().to_owned()))
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert!(rows
+                        .iter()
+                        .all(|row| row.visible_cells().all(|cell| cell.attrs().italic())));
+                    let geometry = LineWrapGeometry::capture(&source, 1 << 20).unwrap();
+                    assert_eq!(geometry.row_count(cols, model, &mut scratch), rows.len());
+                    assert_eq!(
+                        layout.scorecard.mode,
+                        if fallback {
+                            MonospaceWrapMode::Fallback
+                        } else {
+                            MonospaceWrapMode::Dp
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn prose_wrap_cache_distinguishes_equal_width_different_word_boundaries() {
+        let _guard = memoized_wrap_point_cache_test_lock().lock().unwrap();
+        memoized_wrap_point_cache_clear_for_test();
+        let model = MonospaceKpCostModel::terminal_default();
+        let first = Line::from_text("abcde fghij", &CellAttributes::default(), 1, None);
+        let second = Line::from_text("ab cdefghij", &CellAttributes::default(), 1, None);
+        let mut scratch = LineWrapWidthPrefixScratch::default();
+        let first = first.plan_wrap_with_width_prefix_scratch(8, model, &mut scratch);
+        let second = second.plan_wrap_with_width_prefix_scratch(8, model, &mut scratch);
+        assert_ne!(first.geometry_hash, second.geometry_hash);
+        assert_ne!(first.break_offsets, second.break_offsets);
+        assert_eq!(first.break_offsets, vec![6, 11]);
+        assert_eq!(second.break_offsets, vec![3, 11]);
+        let left = Line::from_text("abcde ", &CellAttributes::default(), 1, None);
+        let right = Line::from_text("fghij", &CellAttributes::default(), 1, None);
+        let mut joined = LineWrapGeometry::capture(&left, 1 << 20).unwrap();
+        joined
+            .try_append(
+                &LineWrapGeometry::capture(&right, 1 << 20).unwrap(),
+                1 << 20,
+            )
+            .unwrap();
+        assert_eq!(joined.row_count(8, model, &mut scratch), first.row_count());
+    }
 
     #[test]
     fn semantic_snapshot_ignores_compression_and_scan_cache_but_detects_cells() {
@@ -4785,7 +5084,7 @@ mod tests {
         let reused = current.clone().wrap_with_report(width, 7, model);
         assert!(
             memoized_wrap_point_cache_key_hits_for_test(&current, width, model) > hits_before,
-            "equal cell widths must reuse geometry across different text and attributes"
+            "equal widths and space boundaries must reuse geometry across text and attributes"
         );
         memoized_wrap_point_cache_clear_for_test();
         let fresh = current.wrap_with_report(width, 7, model);

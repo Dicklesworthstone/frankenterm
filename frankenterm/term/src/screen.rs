@@ -1264,10 +1264,6 @@ impl ScreenLineRead {
                 let logical = logical
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("cold index empty group"))?;
-                if logical.len().div_ceil(self.witness.cols.max(1)) > Self::MAX_ROWS {
-                    exhausted();
-                    anyhow::bail!("cold index group output row limit");
-                }
                 let seqno = logical.current_seqno();
                 let wrapped = Screen::wrap_cold_logical_line(
                     logical,
@@ -1275,11 +1271,12 @@ impl ScreenLineRead {
                     seqno,
                     self.wrap_policy,
                     row == self.hot_top && aligned_seam,
-                );
-                if wrapped.len() > Self::MAX_ROWS {
+                    Self::MAX_ROWS,
+                )
+                .ok_or_else(|| {
                     exhausted();
-                    anyhow::bail!("cold index group output row limit");
-                }
+                    anyhow::anyhow!("cold index group output row limit")
+                })?;
                 let next_visual = visual_rows
                     .checked_add(StableRowIndex::try_from(wrapped.len())?)
                     .ok_or_else(|| anyhow::anyhow!("cold index visual coordinate overflow"))?;
@@ -1710,7 +1707,9 @@ impl ScreenLineRead {
                                 self.wrap_policy,
                             )
                         }),
-                );
+                    (visual.end - visual.start) as usize,
+                )
+                .ok_or_else(|| anyhow::anyhow!("cold visual index source changed"))?;
                 anyhow::ensure!(
                     wrapped.len() == (visual.end - visual.start) as usize,
                     "cold visual index source changed"
@@ -1945,12 +1944,6 @@ impl ScreenLineRead {
                 }
                 let seqno = logical.current_seqno();
                 logical.set_last_cell_was_wrapped(false, seqno);
-                if cold_source.is_none() {
-                    anyhow::ensure!(
-                        logical.len().div_ceil(self.witness.cols.max(1)) <= end - start,
-                        ColdReadGeometryUnavailable
-                    );
-                }
                 expanded_cells = expanded_cells
                     .checked_add(logical.len())
                     .ok_or_else(|| anyhow::anyhow!("cold reflow expanded cell overflow"))?;
@@ -1968,7 +1961,21 @@ impl ScreenLineRead {
                     seqno,
                     self.wrap_policy,
                     aligned_seam && end == cold_len,
-                );
+                    if cold_source.is_some() {
+                        Self::MAX_ROWS.saturating_sub(output.len())
+                    } else {
+                        end - start
+                    },
+                )
+                .ok_or_else(|| {
+                    if cold_source.is_some() {
+                        self.index_budget_exhausted
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        anyhow::anyhow!("cold visual index output row limit")
+                    } else {
+                        anyhow::anyhow!(ColdReadGeometryUnavailable)
+                    }
+                })?;
                 if cold_source.is_none() {
                     anyhow::ensure!(wrapped.len() == end - start, ColdReadGeometryUnavailable);
                 }
@@ -3040,14 +3047,26 @@ impl LogicalLineWrapCache {
                     .len()
                     .checked_mul(
                         std::mem::size_of::<Cell>()
-                            + std::mem::size_of::<usize>()
-                            + std::mem::size_of::<u128>(),
+                            + 2 * std::mem::size_of::<u128>()
+                            + std::mem::size_of::<bool>(),
                     )
+                    // Retained plans own source cells, cumulative widths,
+                    // word widths, space flags and a growable break vector.
+                    .and_then(|bytes| {
+                        line.len()
+                            .checked_mul(2)?
+                            .max(8)
+                            .checked_mul(std::mem::size_of::<usize>())?
+                            .checked_add(bytes)
+                    })
                     .and_then(|bytes| {
                         bytes.checked_add(
-                            std::mem::size_of::<LineWrapLayout>()
+                            std::mem::size_of::<std::sync::OnceLock<LineWrapLayout>>()
                                 + std::mem::size_of::<LineWrapWidthPrefixScratch>()
-                                + std::mem::size_of::<u128>(),
+                                + std::mem::size_of::<u128>()
+                                // Arc headers for source cells, prefix and
+                                // the lazily initialized retained layout.
+                                + 6 * std::mem::size_of::<usize>(),
                         )
                     });
                 let wrap_source = bytes.filter(|bytes| *bytes <= remaining).map(|bytes| {
@@ -5624,23 +5643,36 @@ impl Screen {
         seqno: SequenceNo,
         policy: ResizeWrapPolicy,
         aligned_seam: bool,
-    ) -> Vec<Line> {
+        max_rows: usize,
+    ) -> Option<Vec<Line>> {
         if aligned_seam && logical.len() == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
-        let (mut rows, _) = Self::wrap_single_logical_line_for_resize(
-            logical,
-            cols,
-            seqno,
-            policy,
-            &mut LineWrapWidthPrefixScratch::default(),
-        );
+        let mut rows = if logical.len() <= cols {
+            if max_rows == 0 {
+                return None;
+            }
+            vec![logical]
+        } else {
+            let layout = logical.plan_wrap_with_width_prefix_scratch(
+                cols,
+                policy.kp_cost_model,
+                &mut LineWrapWidthPrefixScratch::default(),
+            );
+            // Natural word boundaries can leave spare columns. Only the actual
+            // plan bounds output rows; ceil(cell_count / cols) cannot do so.
+            // Refuse before allocating the deferred physical-row collection.
+            if layout.row_count() > max_rows {
+                return None;
+            }
+            layout.deferred_rows(0..layout.row_count(), seqno)
+        };
         if aligned_seam {
             if let Some(last) = rows.last_mut() {
                 last.set_last_cell_was_wrapped(true, seqno);
             }
         }
-        rows
+        Some(rows)
     }
 
     fn clear_rewrap_line_cache(&mut self) {
@@ -8282,7 +8314,7 @@ impl Screen {
                     break;
                 };
                 let seqno = logical.current_seqno();
-                let wrapped = Self::wrap_cold_logical_line(
+                let Some(wrapped) = Self::wrap_cold_logical_line(
                     logical,
                     self.physical_cols,
                     seqno,
@@ -8295,7 +8327,10 @@ impl Screen {
                             self.resize_wrap_policy,
                         )
                     }),
-                );
+                    (visual.end - visual.start) as usize,
+                ) else {
+                    break;
+                };
                 if wrapped.len() != (visual.end - visual.start) as usize {
                     break;
                 }
@@ -10831,6 +10866,45 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_wrap_rows_enforces_plan_limit_and_preserves_seam() {
+        let line = Line::from_text("abcdefghijkl", &CellAttributes::blank(), 7, None);
+        let policy = ResizeWrapPolicy::default();
+        assert!(Screen::wrap_cold_logical_line(line.clone(), 4, 7, policy, false, 2).is_none());
+        let rows = Screen::wrap_cold_logical_line(line, 4, 7, policy, true, 3)
+            .expect("exact row budget is admitted");
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(Line::last_cell_was_wrapped));
+        assert_eq!(
+            rows.iter().map(Line::as_str).collect::<String>(),
+            "abcdefghijkl"
+        );
+        assert!(Screen::wrap_cold_logical_line(Line::new(7), 4, 7, policy, false, 0).is_none());
+        assert!(
+            Screen::wrap_cold_logical_line(Line::new(7), 4, 7, policy, true, 0)
+                .expect("empty aligned seam requires no output rows")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_wrap_rows_counts_natural_breaks_before_output_admission() {
+        let line = Line::from_text("one one one one", &CellAttributes::blank(), 7, None);
+        assert_eq!(line.len().div_ceil(6), 3);
+        let policy = ResizeWrapPolicy::default();
+        assert!(Screen::wrap_cold_logical_line(line.clone(), 6, 7, policy, false, 3).is_none());
+        let rows = Screen::wrap_cold_logical_line(line, 6, 7, policy, false, 4)
+            .expect("actual four-row word layout fits its budget");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().map(Line::as_str).collect::<String>(),
+            "one one one one"
+        );
+        assert!(!rows.last().unwrap().last_cell_was_wrapped());
+    }
+
+    #[cfg(feature = "use_serde")]
     fn stored_physical_fixture(
         cold_rows: usize,
         retention: usize,
@@ -12852,16 +12926,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retained_wrap_budget_prefers_recent_lines_without_changing_row_order() {
-        let first = Line::from_text("first", &CellAttributes::blank(), 1, None);
-        let last = Line::from_text("last!", &CellAttributes::blank(), 1, None);
-        let one_line_budget = first.len()
+    fn retained_wrap_budget_charges_word_metadata_before_admission() {
+        let line = Line::from_text("alpha beta gamma", &CellAttributes::blank(), 1, None);
+        let width_only_budget = line.len()
             * (std::mem::size_of::<Cell>()
                 + std::mem::size_of::<usize>()
                 + std::mem::size_of::<u128>())
             + std::mem::size_of::<LineWrapLayout>()
             + std::mem::size_of::<LineWrapWidthPrefixScratch>()
             + std::mem::size_of::<u128>();
+        let cache =
+            LogicalLineWrapCache::with_token_budget(None, vec![line.clone()], width_only_budget);
+        assert!(cache.logical_lines[0].wrap_source.is_none());
+        assert_eq!(cache.logical_lines[0].line, line);
+        let (actual, _) = Screen::wrap_logical_line_source_for_resize(
+            &cache.logical_lines[0],
+            &VecDeque::new(),
+            8,
+            2,
+            ResizeWrapPolicy::default(),
+            &mut LineWrapWidthPrefixScratch::default(),
+        );
+        let RewrapScratch::Lines(actual) = actual else {
+            panic!("uncached wrapping must remain available under retention pressure")
+        };
+        assert_eq!(actual, line.wrap(8, 2));
+    }
+
+    #[test]
+    fn retained_wrap_budget_prefers_recent_lines_without_changing_row_order() {
+        let first = Line::from_text("first", &CellAttributes::blank(), 1, None);
+        let last = Line::from_text("last!", &CellAttributes::blank(), 1, None);
+        let one_line_budget = first.len()
+            * (std::mem::size_of::<Cell>()
+                + 2 * std::mem::size_of::<u128>()
+                + std::mem::size_of::<bool>())
+            + (2 * first.len()).max(8) * std::mem::size_of::<usize>()
+            + std::mem::size_of::<std::sync::OnceLock<LineWrapLayout>>()
+            + std::mem::size_of::<LineWrapWidthPrefixScratch>()
+            + std::mem::size_of::<u128>()
+            + 6 * std::mem::size_of::<usize>();
         let cache = LogicalLineWrapCache::with_token_budget(
             None,
             vec![first.clone(), last.clone()],
