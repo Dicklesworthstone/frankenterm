@@ -130,6 +130,10 @@ async fn spawn_window() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await?;
+    #[cfg(target_os = "macos")]
+    let initialization = win;
+    #[cfg(target_os = "macos")]
+    let win = initialization.window().clone();
 
     eprintln!("before show");
     win.show();
@@ -137,6 +141,8 @@ async fn spawn_window() -> Result<(), Box<dyn std::error::Error>> {
 
     state.borrow_mut().gl.replace(gl);
     win.invalidate();
+    #[cfg(target_os = "macos")]
+    initialization.publish();
     Ok(())
 }
 

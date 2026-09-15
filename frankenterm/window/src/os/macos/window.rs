@@ -496,6 +496,33 @@ pub struct Window {
 unsafe impl Send for Window {}
 unsafe impl Sync for Window {}
 
+/// Own an unpublished native allocation on its creating thread. Retaining the
+/// exact allocation here avoids reacquiring it through a replaceable Connection
+/// after initialization yields or dispatches callbacks.
+pub struct WindowInitialization {
+    window: Window,
+    inner: Option<Rc<RefCell<WindowInner>>>,
+}
+
+impl WindowInitialization {
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    pub fn publish(mut self) -> Window {
+        self.inner.take();
+        self.window.clone()
+    }
+}
+
+impl Drop for WindowInitialization {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            inner.borrow_mut().close();
+        }
+    }
+}
+
 fn set_window_position(window: *mut Object, coords: ScreenPoint) {
     unsafe {
         let cartesian = screen_point_to_cartesian(coords);
@@ -512,25 +539,6 @@ fn set_window_position(window: *mut Object, coords: ScreenPoint) {
 }
 
 impl Window {
-    /// Retain the exact unpublished native view for initialization rollback.
-    ///
-    /// The returned closure is owner-thread-only (`Rc`), and closes directly
-    /// after the initialization future releases its borrows. It neither needs
-    /// another scheduler admission nor resolves a numeric id on a replacement
-    /// Connection when a failed/cancelled GUI initialization is unwound.
-    pub fn initialization_rollback(&self) -> anyhow::Result<impl FnOnce()> {
-        let conn = Connection::get()
-            .ok_or_else(|| anyhow!("native window initialization lost its connection"))?;
-        let inner = conn
-            .window_by_id(self.id)
-            .ok_or_else(|| anyhow!("native window initialization lost its window"))?;
-        anyhow::ensure!(
-            *inner.borrow().window == self.ns_window,
-            "native window initialization has a different exact owner"
-        );
-        Ok(move || inner.borrow_mut().close())
-    }
-
     pub async fn new_window<F>(
         _class_name: &str,
         name: &str,
@@ -538,7 +546,7 @@ impl Window {
         config: Option<&ConfigHandle>,
         _font_config: Rc<FontConfiguration>,
         event_handler: F,
-    ) -> anyhow::Result<Window>
+    ) -> anyhow::Result<WindowInitialization>
     where
         F: 'static + FnMut(WindowEvent, &Window),
     {
@@ -746,6 +754,10 @@ impl Window {
             conn.windows
                 .borrow_mut()
                 .insert(window_id, Rc::clone(&window_inner));
+            let initialization = WindowInitialization {
+                window: window_handle.clone(),
+                inner: Some(window_inner),
+            };
 
             inner
                 .borrow_mut()
@@ -767,7 +779,7 @@ impl Window {
                 live_resizing: false,
             });
 
-            Ok(window_handle)
+            Ok(initialization)
         }
     }
 }

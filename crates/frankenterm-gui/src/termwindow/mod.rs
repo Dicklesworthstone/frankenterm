@@ -3550,7 +3550,7 @@ impl TermWindow {
         };
         log::trace!("{:?}", geometry);
 
-        let window = Window::new_window(
+        let created_window = Window::new_window(
             &get_window_class(),
             "FrankenTerm",
             geometry,
@@ -3565,8 +3565,11 @@ impl TermWindow {
         )
         .await?;
         #[cfg(target_os = "macos")]
-        let pending_native =
-            crate::frontend::PendingNativeWindow::new(window.initialization_rollback()?);
+        let pending_native = created_window;
+        #[cfg(target_os = "macos")]
+        let window = pending_native.window().clone();
+        #[cfg(not(target_os = "macos"))]
+        let window = created_window;
         #[cfg(not(target_os = "macos"))]
         let pending_native = crate::frontend::PendingNativeWindow::new({
             let window = window.clone();

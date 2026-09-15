@@ -27,10 +27,12 @@ const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
 /// Close only the newly allocated native view if initialization does not hand
 /// it to the frontend. The cleanup captures the exact platform window handle.
+#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) struct PendingNativeWindow<F: FnOnce()> {
     close: Option<F>,
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl<F: FnOnce()> PendingNativeWindow<F> {
     pub(crate) fn new(close: F) -> Self {
         Self { close: Some(close) }
@@ -41,6 +43,7 @@ impl<F: FnOnce()> PendingNativeWindow<F> {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl<F: FnOnce()> Drop for PendingNativeWindow<F> {
     fn drop(&mut self) {
         if let Some(close) = self.close.take() {
