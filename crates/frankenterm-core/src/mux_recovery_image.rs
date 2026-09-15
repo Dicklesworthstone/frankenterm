@@ -2804,7 +2804,7 @@ mod tests {
         let mut image = make_valid_test_image();
         image.panes[0].checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 1,
-            lease_verifier: "".to_string(),
+            lease_verifier: String::new(),
             catalog_generation: 1,
         };
         image.image_digest = image.compute_digest().unwrap();

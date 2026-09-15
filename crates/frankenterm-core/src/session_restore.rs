@@ -13491,6 +13491,8 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_roundtrip_offline_layout() {
+        type ProjectionMutation = (TerminalProjectionField, fn(&mut RecoveryPane));
+
         let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
@@ -13685,30 +13687,30 @@ mod tests {
         // These roots are correctly encrypted and rehashed. The independent
         // terminal object is unchanged: projection disagreement must be rejected
         // during verification, before any inert terminal can be constructed.
-        let projection_mutations: &[(TerminalProjectionField, fn(&mut RecoveryPane))] = &[
+        let projection_mutations: &[ProjectionMutation] = &[
             (TerminalProjectionField::SchemaVersion, |p| {
-                p.checkpoint.checkpoint_ref.schema_version = 1
+                p.checkpoint.checkpoint_ref.schema_version = 1;
             }),
             (TerminalProjectionField::Geometry, |p| p.size.rows += 1),
             (TerminalProjectionField::Geometry, |p| p.size.cols += 1),
             (TerminalProjectionField::Geometry, |p| {
-                p.size.pixel_width += 1
+                p.size.pixel_width += 1;
             }),
             (TerminalProjectionField::Geometry, |p| {
-                p.size.pixel_height += 1
+                p.size.pixel_height += 1;
             }),
             (TerminalProjectionField::Geometry, |p| p.size.dpi += 1),
             (TerminalProjectionField::Title, |p| {
-                p.title.push_str(" changed")
+                p.title.push_str(" changed");
             }),
             (TerminalProjectionField::CurrentDirectory, |p| {
-                p.cwd = Some("file:///other".into())
+                p.cwd = Some("file:///other".into());
             }),
             (TerminalProjectionField::Cursor, |p| {
-                p.cursor_position.0 += 1
+                p.cursor_position.0 += 1;
             }),
             (TerminalProjectionField::AlternateScreen, |p| {
-                p.alt_screen_active = !p.alt_screen_active
+                p.alt_screen_active = !p.alt_screen_active;
             }),
         ];
         for (expected, mutate) in projection_mutations {
@@ -15382,7 +15384,7 @@ mod tests {
 
         // Mutate/damage the candidate manifest bytes (corrupt 4 bytes in the body)
         let mut damaged_manifest_bytes = enc_root_bytes.clone();
-        for b in damaged_manifest_bytes[30..34].iter_mut() {
+        for b in &mut damaged_manifest_bytes[30..34] {
             *b ^= 0xAA;
         }
 

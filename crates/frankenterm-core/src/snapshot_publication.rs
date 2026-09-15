@@ -3872,8 +3872,8 @@ mod tests {
         // Snapshot bytes of both slots
         let slot_a_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_A_NAME);
         let slot_b_path = temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME);
-        let slot_a_bytes_before = std::fs::read(&slot_a_path).unwrap();
-        let slot_b_bytes_before = std::fs::read(&slot_b_path).unwrap();
+        let fallback_root_before = std::fs::read(&slot_a_path).unwrap();
+        let current_root_before = std::fs::read(&slot_b_path).unwrap();
 
         // 3. Propose Gen 3 targeting inactive Slot A, but with a verifier that rejects it!
         struct RejectingVerifier;
@@ -3912,14 +3912,14 @@ mod tests {
         assert!(matches!(err, PublicationError::VerificationRejected { .. }));
 
         // Prove: neither Slot A nor Slot B was modified! Both roots remain intact!
-        let slot_a_bytes_after = std::fs::read(&slot_a_path).unwrap();
-        let slot_b_bytes_after = std::fs::read(&slot_b_path).unwrap();
+        let fallback_root_after = std::fs::read(&slot_a_path).unwrap();
+        let current_root_after = std::fs::read(&slot_b_path).unwrap();
         assert_eq!(
-            slot_a_bytes_before, slot_a_bytes_after,
+            fallback_root_before, fallback_root_after,
             "Slot A (valid fallback Gen 1) must not be clobbered by bad candidate"
         );
         assert_eq!(
-            slot_b_bytes_before, slot_b_bytes_after,
+            current_root_before, current_root_after,
             "Slot B (active Gen 2) must remain intact"
         );
 

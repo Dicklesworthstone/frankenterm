@@ -2336,7 +2336,7 @@ mod tests {
                 .expect("decode repair 50% failed");
 
         assert_eq!(result.reconstructed_envelope, payload);
-        assert_eq!(result.stats.source_symbols_used, k - (k + 1) / 2);
+        assert_eq!(result.stats.source_symbols_used, k - k.div_ceil(2));
     }
 
     #[test]
@@ -3136,7 +3136,7 @@ mod tests {
             .expect_err("overflow must be rejected");
         match err_overflow {
             RepairError::AdmissionExceeded(msg) => {
-                assert!(msg.contains("limit") || msg.contains("overflow"))
+                assert!(msg.contains("limit") || msg.contains("overflow"));
             }
             other => panic!("expected AdmissionExceeded, got {other:?}"),
         }
