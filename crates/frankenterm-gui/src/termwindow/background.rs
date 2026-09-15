@@ -84,6 +84,8 @@ const GRADIENT_NOISE_SEED: u64 = 0x6674_2d67_7261_6469;
 // color table independently of the decoded-image budget (at most 256 KiB).
 const MAX_GRADIENT_AXIS_SAMPLES: usize = 65_536;
 const MIN_PARALLEL_GRADIENT_PIXELS: usize = 128 * 1_024;
+// Keep row seed storage independent of image aspect ratio and pixel budget.
+const MAX_PARALLEL_GRADIENT_ROWS: usize = 16_384;
 #[cfg(test)]
 const FIRST_F64_INTEGER_WITHOUT_UNIT_PRECISION: f64 = 9_007_199_254_740_992.0;
 const BACKGROUND_IMAGE_VALIDATION_LIMITS: ImageDataValidationLimits = ImageDataValidationLimits {
@@ -211,6 +213,11 @@ fn checked_background_pixel_bytes(width: u32, height: u32) -> anyhow::Result<usi
     anyhow::ensure!(
         width > 0 && height > 0,
         "background dimensions must be non-zero"
+    );
+    anyhow::ensure!(
+        width <= BACKGROUND_IMAGE_VALIDATION_LIMITS.max_width
+            && height <= BACKGROUND_IMAGE_VALIDATION_LIMITS.max_height,
+        "background dimensions exceed decoded image limits"
     );
     let pixel_bytes = usize::try_from(u128::from(width) * u128::from(height) * 4)
         .context("background dimensions exceed addressable memory")?;
@@ -597,13 +604,17 @@ fn rasterize_gradient_pixels(
     };
 
     if width * height >= MIN_PARALLEL_GRADIENT_PIXELS
+        && height <= MAX_PARALLEL_GRADIENT_ROWS
         && let Some(pool) = pool
         && pool.current_num_threads() > 1
     {
         let mut seeds = Vec::new();
         if seeds.try_reserve_exact(height).is_ok() {
             let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
-            for _ in 0..height {
+            for row in 0..height {
+                if row.is_multiple_of(4_096) && is_cancelled() {
+                    anyhow::bail!("background gradient load was superseded");
+                }
                 seeds.push(row_seeds.fork());
             }
             let rows_per_group = height.div_ceil(pool.current_num_threads());
@@ -2083,6 +2094,10 @@ mod tests {
         assert!(checked_background_pixel_bytes(1, 0).is_err());
         assert_eq!(checked_background_pixel_bytes(1, 1).unwrap(), 4);
         assert!(checked_background_pixel_bytes(16_384, 16_384).is_err());
+        assert_eq!(checked_background_pixel_bytes(1, 16_384).unwrap(), 65_536);
+        assert!(checked_background_pixel_bytes(1, 16_385).is_err());
+        assert!(checked_background_pixel_bytes(16_385, 1).is_err());
+        assert!(checked_background_pixel_bytes(1, 67_108_864).is_err());
     }
 
     #[test]
@@ -2335,6 +2350,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual.into_raw(), expected);
+    }
+
+    #[test]
+    fn parallel_gradient_rows_bound_seed_storage_for_tall_narrow_images() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let config = test_gradient(GradientOrientation::Vertical, None);
+        let gradient = config.build().unwrap();
+        // Exercise the row helper independently of the earlier dimension
+        // admission: only 512 KiB of pixels, but too many row seeds. This
+        // must stay serial even with enough total pixels and a ready pool.
+        let mut image = image::RgbaImage::new(1, MIN_PARALLEL_GRADIENT_PIXELS as u32);
+        let rows = std::sync::atomic::AtomicUsize::new(0);
+        rasterize_gradient_pixels(
+            &mut image,
+            &config,
+            gradient.as_ref(),
+            &|| false,
+            Some(&pool),
+            |_, _, _, _| {
+                assert!(pool.current_thread_index().is_none());
+                rows.fetch_add(1, Ordering::Relaxed);
+                image::Rgba([0, 0, 0, 255])
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.load(Ordering::Relaxed), MIN_PARALLEL_GRADIENT_PIXELS);
+
+        let gradient = test_gradient(GradientOrientation::Vertical, None);
+        let result = CachedGradient::compute(&gradient, 1, 67_108_864, &|| false);
+        assert!(matches!(result, Err(error) if error.to_string().contains("dimensions")));
+    }
+
+    #[test]
+    fn parallel_gradient_seed_preparation_observes_supersession() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let config = test_gradient(GradientOrientation::Vertical, None);
+        let gradient = config.build().unwrap();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let mut image = image::RgbaImage::new(16, 8_192);
+        let result = rasterize_gradient_pixels(
+            &mut image,
+            &config,
+            gradient.as_ref(),
+            &|| checks.fetch_add(1, Ordering::Relaxed) + 1 >= 2,
+            Some(&pool),
+            |_, _, _, _| panic!("superseded seed preparation must not reach pixel generation"),
+        );
+        assert!(matches!(result, Err(error) if error.to_string().contains("superseded")));
+        assert_eq!(checks.load(Ordering::Relaxed), 2);
     }
 
     #[test]
