@@ -1057,11 +1057,10 @@ pub struct Config {
     #[dynamic(default = "default_enq_answerback")]
     pub enq_answerback: String,
 
+    /// Font zoom preserves the native window size and reflows its terminal
+    /// grid by default. Opt in to resizing the window to preserve rows/cols.
     #[dynamic(default)]
-    pub adjust_window_size_when_changing_font_size: Option<bool>,
-
-    #[dynamic(default = "default_tiling_desktop_environments")]
-    pub tiling_desktop_environments: Vec<String>,
+    pub adjust_window_size_when_changing_font_size: bool,
 
     #[dynamic(default)]
     pub use_resize_increments: bool,
@@ -2619,21 +2618,6 @@ fn default_max_fps() -> u64 {
     60
 }
 
-fn default_tiling_desktop_environments() -> Vec<String> {
-    [
-        "X11 LG3D",
-        "X11 Qtile",
-        "X11 awesome",
-        "X11 bspwm",
-        "X11 dwm",
-        "X11 i3",
-        "X11 xmonad",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
 fn default_stateless_process_list() -> Vec<String> {
     // FrankenTerm panes often host long-running agent work behind ordinary
     // shells, so the safe default is to prompt before closing any live pane.
@@ -3730,6 +3714,26 @@ mod tests {
     fn config_default_click_interval_ms_is_five_hundred() {
         let config = Config::default();
         assert_eq!(config.click_interval_ms, 500);
+    }
+
+    #[test]
+    fn font_zoom_defaults_to_reflow_without_resizing_the_window() {
+        assert!(!Config::default().adjust_window_size_when_changing_font_size);
+    }
+
+    #[test]
+    fn font_zoom_window_resize_requires_explicit_opt_in() {
+        for enabled in [false, true] {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(
+                Value::String("adjust_window_size_when_changing_font_size".into()),
+                Value::Bool(enabled),
+            );
+            let config =
+                Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                    .expect("explicit font zoom window-size policy should parse");
+            assert_eq!(config.adjust_window_size_when_changing_font_size, enabled);
+        }
     }
 
     #[test]

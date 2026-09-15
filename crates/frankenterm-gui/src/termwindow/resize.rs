@@ -877,26 +877,15 @@ impl super::TermWindow {
     /// the `adjust_window_size_when_changing_font_size` configuration and
     /// revises the scaling/resize change accordingly
     pub fn adjust_font_scale(&mut self, font_scale: f64, window: &Window) {
-        let adjust_window_size_when_changing_font_size =
-            match self.config.adjust_window_size_when_changing_font_size {
-                Some(value) => value,
-                None => {
-                    let is_tiling = self
-                        .config
-                        .tiling_desktop_environments
-                        .iter()
-                        .any(|item| item.as_str() == self.connection_name.as_str());
-                    !is_tiling
-                }
-            };
-
-        if self.window_state.can_resize() && adjust_window_size_when_changing_font_size {
+        if self.window_state.can_resize() && self.config.adjust_window_size_when_changing_font_size
+        {
             self.scaling_changed(self.dimensions, font_scale, window);
         } else {
             let dimensions = self.dimensions;
             // Compute new font metrics
             let scale_applied = self.apply_scale_change(&dimensions, font_scale);
-            // Now revise the pty size to fit the window
+            // Font zoom keeps the native window fixed by default. Passing no
+            // preserved grid recalculates rows/cols and schedules pane reflow.
             self.profile_native_scale_stage("scale_dimensions", |this| {
                 this.apply_dimensions(&dimensions, None, window);
             });
