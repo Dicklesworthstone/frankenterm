@@ -49,3 +49,114 @@
 ## 6) Hand off
 - [x] Documented contributions in `AGENT_TODO.md`
 - [ ] Ready for `VioletStream` or `BoldRiver` to resume once build lock clears
+
+## 2026-09-15 — StormyWillow: connect guardian recovery to ordinary startup
+
+Requested by the operator: retain granular implementation and verification tasks.
+This section tracks the current recovery work; earlier sections are historical.
+Completion requires working production behavior and retained verification, not
+just code presence. Existing remote sessions remain outside the disposable test.
+
+- [x] Recheck governing-document drift after the complete AGENTS/README intake.
+- [x] Register with Agent Mail and coordinate ownership with RubyFortress.
+- [x] Read the guardian proxy and checkpoint-input Bead contracts.
+- [x] Find ordinary standalone startup and the unused `GuardianProxyLeasePlan`.
+- [x] Identify initial-checkpoint mismatch: Genesis has spawn-effect identity,
+  while the proxy currently accepts only pane-bound Record checkpoints.
+- [ ] Trace authenticated Genesis publication, adoption, and spawn admission.
+- [ ] Trace existing domain command preparation and unpublished-pane rollback.
+- [ ] Claim the smallest implementation Bead that advances the production path.
+- [ ] Reserve exact implementation paths and resolve any peer overlap.
+- [ ] Connect the required production seam without weakening lease, checkpoint,
+  or durable spawn authority.
+- [ ] Add a positive test exercising the real newly connected path.
+- [ ] Add causal negative tests for identity mismatch and interrupted handoff.
+- [ ] Verify lease retirement does not terminate the guardian-owned child.
+- [ ] Exercise a disposable PTY through mux detach/restart/reattachment.
+- [ ] Verify exact text/parser state, output continuity, input, and child identity.
+- [ ] Obtain strict-RCH targeted test receipts on the exact implementation.
+- [ ] Run required workspace check, Clippy, and exact-source formatting proof
+  through admitted remote workers; retain any blockers without counting them as passes.
+- [ ] Review the diff and update this list and Beads with implemented/proven limits.
+- [ ] Commit only owned paths, export Beads, and push main plus its required mirror.
+- [ ] Reassess the next positive-capability gap after the first integration lands.
+
+### Concrete dependency findings and parallel fixes
+
+- [x] Trace Genesis through runtime, catalog and broker: neither catalog
+  admission nor broker Spawn has a production caller. The runtime does not
+  retain authenticated Spawn + Genesis Begin or own a broker client.
+- [x] Independently confirm that switching the ordinary startup selector would
+  bypass missing authority transfers. `br` refused the `.8.12.3` claim because
+  `.8.12.1` and `.8.12.2` remain dependencies; no dependency was overridden.
+- [ ] Implement a broker-backed reserved Spawn transaction, including durable
+  recovery-capability retention before acknowledgment; this precedes the domain
+  hookup above and requires a coherent wire/runtime change.
+- [ ] Replace the broker acceptance fixture's synthetic admission checksum with
+  real Genesis publication, then prove exactly one disposable child.
+- [x] Delegate ready `ft-dmm4l` to SandyCanyon: config dependency filtering.
+- [ ] Review watcher code and actual filesystem-event regressions.
+- [ ] Obtain strict-RCH watcher proof and update its Bead truthfully.
+- [x] Claim ready `ft-u6zfw`; diagnose retained-but-stale crash-window reporting,
+  five separate reads per snapshot, and poison fallback erasing real evidence.
+- [x] Implement reporting-time window evaluation and one observation per snapshot.
+- [x] Preserve detector observations and future updates after mutex poisoning.
+- [x] Saturate the consecutive counter instead of panicking/wrapping at its limit.
+- [x] Add causal quiet-window expiry, overflow, and poisoned-lock regressions.
+- [ ] Complete independent review and strict-RCH crash-diagnostic regression proof.
+- [ ] Retain the distinction between observed pane replacements and actual
+  watcher-process crash history; the latter is not implemented by this patch.
+
+### 20:08 UTC implementation checkpoint
+
+- [x] DSR21 fence released at 20:01:41; resume exact owned edits.
+- [x] Fix independent review's empty/expired zero-threshold edge and add a
+  fourth crash regression. Final independent source review found no remaining
+  defect in this diff; it is not execution proof.
+- [x] Commit runtime/crash changes as `d895ed512` using a private Git index.
+- [x] Record scope and verification blocker in `ft-u6zfw` comment 9395 and mark
+  it blocked, not closed. Pane replacements are not watcher-process crashes.
+- [x] Finish watcher review corrections and commit its exact file as `d8a259a6e`.
+  Five real filesystem-watcher tests are authored. Root reviewed the complete
+  diff; formatting and diff checks passed. Tests are not executed.
+- [x] Record watcher proof blocker in `ft-dmm4l` comment 9396 and mark blocked.
+- [ ] Re-run the disk admission gate before any Cargo/RCH proof. Latest check:
+  exit 2, critical, 45,758,001,152 of 1,995,218,165,760 bytes free (2.293%).
+- [ ] Serialize proof after RubyFortress's existing vmi job 57273 ends.
+
+This operator-requested TODO retires as an active checklist when its remaining
+work is completed or explicitly handed off with qualified evidence.
+
+Bounded work audit (the two fixes and this checklist): FrankenTerm runs and
+observes terminal fleets. Classification: two USER implementation drafts, one
+PROCESS checklist, zero ENABLER/UNKNOWN items; neither fix is deployed. The
+watcher behavior is the most direct prospective demo, but it cannot honestly
+be demonstrated from unexecuted tests. Omitting the checklist would not change
+runtime behavior. No speculative enabler was added. The larger guardian
+recovery gap remains open because actual authority transfers are missing;
+these smaller real defects were actionable meanwhile. No agent closed work,
+and no follow-up was created to manufacture completion. Verdict: DRIFTING if
+this becomes another documentation-only block; finish code and obtain proof
+before expanding reports.
+
+Honesty inventory for this batch: 1–6 no test weakening, synthetic production
+path, golden rewrite, gate bypass, release trick, or zero-test pass claimed
+(checked the complete owned diffs and command results). 7–12 no invented run,
+fixture-as-live claim, hidden verification blocker, stderr suppression,
+false closure, or rewritten acceptance (checked comments, TODO and replies).
+13–18 no agent closes, gaming-only assignment, unreviewed accepted diff,
+refusal farming, agreement-as-execution claim, or post-selected benchmark
+denominator (checked assignments and review messages; tests remain unrun).
+19: the delayed source-freeze notice caused edits during the peer's DSR run,
+forcing cancellation; this was disclosed in AM3103 and the handoff, and edits
+stopped until explicit release. Check both latest mail and fallback before a
+future freeze; require acknowledged coordination. 20: strongest current
+evidence is inspectable source plus causal test code, not a runtime result.
+CASS query for crash_loop_diagnostics returned stale/misaligned line references;
+it supplies no additional historical proof. Disposition: unfinished and
+unqualified, with the coordination collision disclosed; no done declaration.
+
+Current source handoff: `d895ed512` (health, four tests) and `d8a259a6e`
+(watcher, five tests). Nine authored regressions, zero executed in this batch.
+All remaining compilation, execution, native, and recovery-integration tasks
+above stay open. No existing session or installed application was changed.
