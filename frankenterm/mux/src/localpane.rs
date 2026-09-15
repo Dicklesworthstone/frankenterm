@@ -3867,11 +3867,10 @@ impl LocalPane {
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
         line_layout_observation: &LineLayoutObservation,
-        resize_queue: &Mutex<ResizeQueueState>,
+        resize_queue: &Arc<Mutex<ResizeQueueState>>,
         token: ResizeCancellationToken,
         registration: PaneRegistrationHandle,
     ) {
-        let mut seam_committed = false;
         let cancelled = || {
             resize_queue.lock().superseded_by(token).is_some()
                 || registration.try_with_current(|_| ()).is_none()
@@ -3943,7 +3942,6 @@ impl LocalPane {
                             .unwrap_or(Ok(None))
                     })?;
                     if installed == Some(true) {
-                        seam_committed = true;
                         Ok(Some(()))
                     } else {
                         // The token may still be newest while output/pruning
@@ -4032,12 +4030,23 @@ impl LocalPane {
                 Ok(committed)
             }),
         );
-        if seam_committed || matches!(&result, Ok(Ok(true))) {
+        // The primary terminal resize has already committed. A missing cold
+        // tier or unavailable history must not suppress its visible-frame
+        // wakeup and leave the GUI waiting for the repaint retry timer.
+        // This is only a hint: frame capture still validates the exact source.
+        if !cancelled() {
+            let resize_queue = Arc::clone(resize_queue);
             schedule_local_pane_main_thread(
                 promise::spawn::MainThreadServiceClass::Interactive,
                 LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
-                "cold_resize_layout_ready",
+                "resize_layout_settled",
                 || async move {
+                    // Supersession may occur after enqueueing this callback.
+                    // Release the queue lock before registration/subscribers.
+                    let current = resize_queue.lock().superseded_by(token).is_none();
+                    if !current {
+                        return;
+                    }
                     let _ = registration.try_with_current(|pane| pane.notify_lines_ready());
                 },
             );
@@ -4813,6 +4822,7 @@ mod tests {
             BTreeMap<StableRowIndex, Line>,
         )>,
         busy: AtomicBool,
+        unavailable: AtomicBool,
         busy_observations: AtomicUsize,
         witness_admission: AtomicBool,
         payload_reads: AtomicUsize,
@@ -4824,6 +4834,9 @@ mod tests {
             &self,
         ) -> frankenterm_term::config::ScrollbackIntervalCapture {
             use frankenterm_term::config::ScrollbackIntervalCapture;
+            if self.unavailable.load(Ordering::Acquire) {
+                return ScrollbackIntervalCapture::Unavailable;
+            }
             if self.busy.load(Ordering::Acquire) {
                 self.busy_observations.fetch_add(1, Ordering::Release);
                 return ScrollbackIntervalCapture::Busy;
@@ -5039,6 +5052,112 @@ mod tests {
             }
         }
         Ok(text)
+    }
+
+    #[test]
+    fn native_resize_completion_notifies_without_cold_layout_and_fences_stale_work() {
+        const CHILD: &str = "FT_RESIZE_COMPLETION_NOTIFY_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // The actual main-thread scheduler is process-global. Isolate its
+            // installation so this causal notification test cannot reroute
+            // another concurrently running mux test's callbacks.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "localpane::tests::native_resize_completion_notifies_without_cold_layout_and_fences_stale_work",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "notification subprocess failed: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "notification subprocess exceeded watchdog: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let executor = promise::spawn::SimpleExecutor::new();
+        for case in [
+            "no_cold",
+            "unavailable",
+            "superseded",
+            "retired",
+            "late_superseded",
+            "late_retired",
+        ] {
+            let (pane, mux, registration, sink, token) = cold_resize_fixture(false);
+            if case == "no_cold" {
+                let mut term = guardian_lifetime_test_terminal();
+                term.resize(term_size(3, 2));
+                *pane.terminal.lock() = term;
+            } else {
+                sink.unavailable.store(true, Ordering::Release);
+            }
+            let notifications = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&notifications);
+            mux.subscribe(move |notification| {
+                if matches!(notification, crate::MuxNotification::PaneOutput(719)) {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            })
+            .unwrap();
+            let supersede = || {
+                pane.resize_queue
+                    .lock()
+                    .enqueue(term_size(5, 2), pty_size(5, 2), Instant::now());
+            };
+            if case == "superseded" {
+                supersede();
+            } else if case == "retired" {
+                registration.retire_if_current();
+            }
+            LocalPane::prepare_cold_layout_after_resize(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                &pane.resize_queue,
+                token,
+                registration.clone(),
+            );
+            if case == "late_superseded" {
+                supersede();
+            } else if case == "late_retired" {
+                registration.retire_if_current();
+            }
+            let mut dispatched = 0;
+            while executor.try_tick().unwrap() {
+                dispatched += 1;
+                assert!(dispatched <= 32, "resize wakeup must have bounded fanout");
+            }
+            assert_eq!(
+                notifications.load(Ordering::Relaxed),
+                usize::from(matches!(case, "no_cold" | "unavailable")),
+                "{case}: primary completion must wake exactly its current pane",
+            );
+        }
     }
 
     #[test]
