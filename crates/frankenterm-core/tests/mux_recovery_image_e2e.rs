@@ -551,9 +551,10 @@ fn test_mux_recovery_e2e_reconstructs_hidden_stack_member() {
 fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     #[cfg(unix)]
     if let Some(directory) = std::env::var_os("FT_RECOVERY_CHILD_ARTIFACTS") {
-        assert_eq!(
-            std::env::var("FT_RECOVERY_CHILD_PHASE").unwrap(),
-            "repair-generation-2"
+        let phase = std::env::var("FT_RECOVERY_CHILD_PHASE").unwrap();
+        assert!(
+            phase == "repair-generation-2" || phase == "fallback-generation-1",
+            "unexpected recovery child phase {phase}"
         );
         verify_recovery_in_fresh_child(std::path::Path::new(&directory));
         println!("\nFT_FRESH_PROCESS_RECOVERY_COMPLETE_V1");
@@ -598,13 +599,15 @@ fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     assert_eq!(recovered.generation(), 2);
     assert_exact_checkpoint_payloads(&fixture, &recovered);
     #[cfg(unix)]
-    assert_fresh_process_recovery(&fixture, &store);
+    assert_fresh_process_recovery(&fixture, &store, "repair-generation-2", 2);
     // Destroy all authenticated symbols in one required chunk. Recovery must
     // now fail for generation 2 and preserve the complete predecessor.
     std::fs::write(&records_path, vec![0; records.len()]).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 1);
     assert!(first.path.exists());
     assert!(second.path.exists());
+    #[cfg(unix)]
+    assert_fresh_process_recovery(&fixture, &store, "fallback-generation-1", 1);
     // Restore the exact bytes to prove corruption, rather than an invalid gen2,
     // caused selection to fall back.
     std::fs::write(&second.path, &original).unwrap();
@@ -617,6 +620,10 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
     use frankenterm_core::snapshot_representation::ExpectedRecoveryWrapContext;
     let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("expected.json")).unwrap()).unwrap();
+    let phase = std::env::var("FT_RECOVERY_CHILD_PHASE").unwrap();
+    assert_eq!(expected["phase"].as_str().unwrap(), phase);
+    let expected_generation: u64 =
+        serde_json::from_value(expected["expected_generation"].clone()).unwrap();
     let context = ExpectedRecoveryWrapContext {
         namespace_id: serde_json::from_value(expected["namespace"].clone()).unwrap(),
         policy_id: serde_json::from_value(expected["policy"].clone()).unwrap(),
@@ -648,7 +655,7 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
     .unwrap()
     .current
     .unwrap();
-    assert_eq!(verified.generation(), 2);
+    assert_eq!(verified.generation(), expected_generation);
     assert_eq!(verified.pane_count(), 8);
     let reconstructed = reconstruct_whole_mux_image_inert(
         &verified,
@@ -674,7 +681,12 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn assert_fresh_process_recovery(fixture: &Fixture, store: &SnapshotPublicationStore) {
+fn assert_fresh_process_recovery(
+    fixture: &Fixture,
+    store: &SnapshotPublicationStore,
+    phase: &str,
+    expected_generation: u64,
+) {
     use frankenterm_core::snapshot_representation::{
         RecoveryWrapContext, RecoveryWrappingKey, wrap_recovery_key,
     };
@@ -707,6 +719,8 @@ fn assert_fresh_process_recovery(fixture: &Fixture, store: &SnapshotPublicationS
             "key_id": fixture.key.key_id(), "authority_id": authority.authority_id(),
             "store": store.root_path().canonicalize().unwrap(), "root_id": ROOT_ID,
             "session": SESSION, "incarnation": hex::encode(INCARNATION),
+            "expected_generation": expected_generation,
+            "phase": phase,
         }))
         .unwrap(),
     );
@@ -740,7 +754,7 @@ fn assert_fresh_process_recovery(fixture: &Fixture, store: &SnapshotPublicationS
                 "--test-threads=1",
             ])
             .env("FT_RECOVERY_CHILD_ARTIFACTS", &directory)
-            .env("FT_RECOVERY_CHILD_PHASE", "repair-generation-2")
+            .env("FT_RECOVERY_CHILD_PHASE", phase)
             .stdout(output_file("child.stdout"))
             .stderr(output_file("child.stderr"))
             .spawn()
