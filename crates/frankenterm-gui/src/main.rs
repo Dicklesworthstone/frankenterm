@@ -5315,7 +5315,7 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
                     None,
                     Some(&presentation_width),
                 )
-                .unwrap();
+                .context("shaping font diagnostic text")?;
 
             // We must grab the handles after shaping, so that we get the
             // revised list that includes system fallbacks!

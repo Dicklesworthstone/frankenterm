@@ -17,13 +17,52 @@ use promise::spawn::{
 };
 use promise::{Future, Promise};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 
 const MAX_RECONCILE_WAITERS: usize = 4_096;
 const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+
+/// Owns only a pending native view, never the sessions behind that view.
+/// Cancellation and errors release exactly this attempt's registration.
+struct PendingWindowCreation {
+    pending: Rc<RefCell<HashMap<MuxWindowId, Rc<()>>>>,
+    window_id: MuxWindowId,
+    identity: Rc<()>,
+}
+
+impl PendingWindowCreation {
+    fn try_begin(
+        pending: &Rc<RefCell<HashMap<MuxWindowId, Rc<()>>>>,
+        window_id: MuxWindowId,
+    ) -> Option<Self> {
+        let mut entries = pending.borrow_mut();
+        if entries.contains_key(&window_id) {
+            return None;
+        }
+        let identity = Rc::new(());
+        entries.insert(window_id, Rc::clone(&identity));
+        Some(Self {
+            pending: Rc::clone(pending),
+            window_id,
+            identity,
+        })
+    }
+}
+
+impl Drop for PendingWindowCreation {
+    fn drop(&mut self) {
+        let mut entries = self.pending.borrow_mut();
+        if entries
+            .get(&self.window_id)
+            .is_some_and(|current| Rc::ptr_eq(current, &self.identity))
+        {
+            entries.remove(&self.window_id);
+        }
+    }
+}
 
 fn schedule_frontend_main_thread<MAKE, FUT>(
     service_class: MainThreadServiceClass,
@@ -62,7 +101,7 @@ fn schedule_frontend_main_thread<MAKE, FUT>(
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
     switching_workspaces: RefCell<bool>,
-    spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
+    spawned_mux_window: Rc<RefCell<HashMap<MuxWindowId, Rc<()>>>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
     osc22_cursor_shapes: RefCell<Osc22PerPaneCursorMap>,
     client_id: Arc<ClientId>,
@@ -92,7 +131,7 @@ impl GuiFrontEnd {
         let front_end = Rc::new(GuiFrontEnd {
             connection,
             switching_workspaces: RefCell::new(false),
-            spawned_mux_window: RefCell::new(HashSet::new()),
+            spawned_mux_window: Rc::new(RefCell::new(HashMap::new())),
             known_windows: RefCell::new(BTreeMap::new()),
             osc22_cursor_shapes: RefCell::new(Osc22PerPaneCursorMap::new()),
             client_id: client_id.clone(),
@@ -672,24 +711,28 @@ impl GuiFrontEnd {
                     let Some(fe) = try_front_end() else {
                         return;
                     };
-                    if fe.has_mux_window(mux_window_id)
-                        || fe.spawned_mux_window.borrow().contains(&mux_window_id)
-                    {
+                    if fe.has_mux_window(mux_window_id) {
                         continue;
                     }
-                    fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
+                    let Some(_pending_creation) =
+                        PendingWindowCreation::try_begin(&fe.spawned_mux_window, mux_window_id)
+                    else {
+                        continue;
+                    };
                     log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
                     if let Err(err) =
                         TermWindow::new_window(mux_window_id, workspace.clone(), saved_window_state)
                             .await
                     {
-                        log::error!("Failed to create window: {:#}", err);
-                        if let Some(mux) = Mux::try_get() {
-                            mux.kill_window(mux_window_id);
-                        }
-                        if let Some(fe) = try_front_end() {
-                            fe.spawned_mux_window.borrow_mut().remove(&mux_window_id);
-                        }
+                        // Native allocation/render initialization can fail while
+                        // the mux window still owns live sessions. A failed view
+                        // must not close those sessions; release the creation
+                        // marker so a later reconciliation can retry the view.
+                        metrics::counter!("gui.window_creation_failed.total").increment(1);
+                        log::error!(
+                            "Failed to create native window for mux window {mux_window_id}; \
+                             preserving its sessions for retry: {err:#}"
+                        );
                     }
                 }
                 if let Some(fe) = try_front_end() {
@@ -902,6 +945,65 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn pending_native_window_creation_releases_failed_and_cancelled_attempts() {
+        use super::PendingWindowCreation;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll};
+
+        let pending = Rc::new(RefCell::new(HashMap::new()));
+        let cancelled = PendingWindowCreation::try_begin(&pending, 7).unwrap();
+        let other = PendingWindowCreation::try_begin(&pending, 8).unwrap();
+        assert!(PendingWindowCreation::try_begin(&pending, 7).is_none());
+        let mut creation = Box::pin(async move {
+            let _attempt = cancelled;
+            std::future::pending::<()>().await;
+        });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(creation.as_mut().poll(&mut cx), Poll::Pending);
+        drop(creation);
+        assert!(!pending.borrow().contains_key(&7));
+        assert!(pending.borrow().contains_key(&8));
+
+        let retry = PendingWindowCreation::try_begin(&pending, 7).unwrap();
+        let mut failed_creation = Box::pin(async move {
+            let _attempt = retry;
+            Err::<(), _>(anyhow::anyhow!("native renderer initialization failed"))
+        });
+        assert!(matches!(
+            failed_creation.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert!(!pending.borrow().contains_key(&7));
+        let success = PendingWindowCreation::try_begin(&pending, 7).unwrap();
+        drop(success);
+        drop(other);
+        assert!(pending.borrow().is_empty());
+    }
+
+    #[test]
+    fn pending_native_window_creation_cannot_release_a_replacement_attempt() {
+        use super::PendingWindowCreation;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let pending = Rc::new(RefCell::new(HashMap::new()));
+        let old = PendingWindowCreation::try_begin(&pending, 7).unwrap();
+        // Workspace reconciliation can retire the old view while its native
+        // initialization is still awaiting completion.
+        pending.borrow_mut().remove(&7);
+        let current = PendingWindowCreation::try_begin(&pending, 7).unwrap();
+        drop(old);
+        assert!(PendingWindowCreation::try_begin(&pending, 7).is_none());
+        drop(current);
+        assert!(PendingWindowCreation::try_begin(&pending, 7).is_some());
+    }
 
     #[test]
     fn background_frontend_dispatch_constructs_and_polls_local_future_on_owner() {
