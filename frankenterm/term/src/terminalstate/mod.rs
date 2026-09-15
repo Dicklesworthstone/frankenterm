@@ -885,9 +885,12 @@ impl TerminalState {
         prepared_config: PreparedRecoveryConfiguration,
         prepared_writer: PreparedTerminalWriter,
     ) -> Result<(), crate::config::ScrollbackActivationError> {
-        self.increment_seqno();
         self.screen
             .activate_recovered_scrollback(&prepared_config.config)?;
+        // Refused activation retains the exact retryable canonical model,
+        // including its semantic generation. Advance only after the fallible
+        // scrollback transaction commits, before installing the live config.
+        self.increment_seqno();
         self.screen
             .install_prepared_config(&prepared_config.config, prepared_config.resize_wrap_policy);
         self.kitty_img.image_budget_bytes = prepared_config.kitty_image_budget_bytes;
