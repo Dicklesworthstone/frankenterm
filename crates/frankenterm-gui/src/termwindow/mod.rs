@@ -4591,7 +4591,23 @@ impl TermWindow {
             return tab_overlay.pane_id() == pane_id;
         }
 
-        tab.contains_pane(pane_id)
+        let pane_state = self.pane_state.borrow();
+        if tab.is_pane_visible(pane_id) {
+            // Per-pane overlays replace tiled panes only; floating panes are
+            // rendered directly by get_pos_panes_for_tab.
+            return tab.has_floating_pane(pane_id)
+                || pane_state
+                    .get(&pane_id)
+                    .is_none_or(|state| state.overlay.is_none());
+        }
+        pane_state.iter().any(|(&underlying_id, state)| {
+            state
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+                && tab.is_pane_visible(underlying_id)
+                && !tab.has_floating_pane(underlying_id)
+        })
     }
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) -> anyhow::Result<()> {

@@ -5744,6 +5744,21 @@ impl Tab {
         self.inner.lock().contains_pane(pane)
     }
 
+    /// Whether this pane contributes to the current tab image, before GUI
+    /// overlays. Hidden stack members, zoomed-away tiled panes, and hidden
+    /// floating panes remain owned by the tab but do not cause paint damage.
+    pub fn is_pane_visible(&self, pane: PaneId) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .floating_panes
+            .iter()
+            .any(|floating| floating.visible && floating.pane_id == pane)
+            || match &inner.zoomed {
+                Some(zoomed) => zoomed.pane_id() == pane,
+                None => inner.contains_tiled_pane(pane),
+            }
+    }
+
     pub fn iter_panes(&self) -> Vec<PositionedPane> {
         self.inner.lock().iter_panes()
     }
@@ -11094,7 +11109,7 @@ impl TabInner {
         callbacks
     }
 
-    fn contains_pane(&self, pane: PaneId) -> bool {
+    fn contains_tiled_pane(&self, pane: PaneId) -> bool {
         fn contains(tree: &Tree, pane: PaneId) -> bool {
             match tree {
                 Tree::Empty => false,
@@ -11102,11 +11117,14 @@ impl TabInner {
                 Tree::Leaf(p) => p.pane_id() == pane,
             }
         }
-        let in_tree = match &self.pane {
+        match &self.pane {
             Some(root) => contains(root, pane),
             None => false,
-        };
-        in_tree
+        }
+    }
+
+    fn contains_pane(&self, pane: PaneId) -> bool {
+        self.contains_tiled_pane(pane)
             || self.pane_stacks.values().any(|stack| {
                 stack
                     .panes()
@@ -16500,6 +16518,93 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    #[test]
+    fn pane_visibility_matches_rendered_stack_zoom_and_floating_membership() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        assert!(!tab.is_pane_visible(1));
+        let first = FakePane::new(1, size);
+        let second = FakePane::new(2, size);
+        let hidden = FakePane::new(3, size);
+        tab.assign_pane(&first);
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                target_is_second: true,
+                top_level: false,
+                size: SplitSize::Percent(50),
+            },
+            Arc::clone(&second),
+        )
+        .unwrap();
+        tab.inner.lock().pane_stacks.insert(
+            1,
+            PaneStack::new(vec![Arc::clone(&second), Arc::clone(&hidden)]),
+        );
+        tab.add_floating_pane(
+            FakePane::new(4, size),
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 10,
+            },
+        )
+        .unwrap();
+
+        let assert_rendered_membership = || {
+            let mut rendered: Vec<_> = tab
+                .iter_panes()
+                .into_iter()
+                .map(|positioned| positioned.pane.pane_id())
+                .collect();
+            rendered.extend(
+                tab.iter_floating_panes()
+                    .into_iter()
+                    .filter(|positioned| positioned.visible)
+                    .map(|positioned| positioned.pane_id),
+            );
+            for id in 0..=5 {
+                assert_eq!(
+                    tab.is_pane_visible(id),
+                    rendered.contains(&id),
+                    "pane {}",
+                    id
+                );
+            }
+            for id in 1..=4 {
+                assert!(tab.contains_pane(id), "pane {} remains owned", id);
+            }
+        };
+        assert_rendered_membership();
+        assert!(!tab.is_pane_visible(3));
+
+        tab.set_active_idx(0);
+        tab.set_zoomed(true);
+        assert_rendered_membership();
+        assert!(tab.is_pane_visible(1));
+        assert!(!tab.is_pane_visible(2));
+        assert!(tab.is_pane_visible(4));
+
+        assert!(tab.set_floating_pane_visible(4, false));
+        assert_rendered_membership();
+        assert!(!tab.is_pane_visible(4));
+
+        tab.set_zoomed(false);
+        assert_eq!(tab.select_stack_pane(1, 1), Some(3));
+        assert_rendered_membership();
+        assert!(!tab.is_pane_visible(2));
+        assert!(tab.is_pane_visible(3));
     }
 
     #[test]
