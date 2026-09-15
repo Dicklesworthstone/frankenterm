@@ -3179,6 +3179,17 @@ impl LineWrapWidthPrefixScratch {
     }
 
     fn allowed_word_break(&self, start: usize, end: usize, width: usize) -> bool {
+        // A separator that fits stays with its preceding word. Otherwise an
+        // equal-cost DP tie can move it to the start of the next row, adding
+        // indentation that was absent from the source. When the word fills
+        // the row, preserve the separator on the following row instead.
+        if end < self.spaces.len()
+            && !self.spaces[end - 1]
+            && self.spaces[end]
+            && self.width_between(start, end + 1) <= width
+        {
+            return false;
+        }
         if self.word_boundary(end) || !self.has_spaces {
             return true;
         }
