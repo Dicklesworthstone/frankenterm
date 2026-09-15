@@ -91,3 +91,30 @@ previously closed beads. No recovery bead was closed by this campaign on the
 strength of component tests alone. The next useful milestone is a verified
 ordinary-startup guardian path and a disposable real crash/reattachment
 journey, followed by an explicitly authorized canary on an existing host.
+
+## Follow-up qualification at 04:53 UTC
+
+- Formatting job `30016197441357127` passed the exact `a761bf1a3` contract:
+  one named test, one pass, zero filtered, and the source-bound success marker.
+- Broader core job `30016197441357133` on that source passed 1,127 of 1,128
+  tests. Both earlier shutdown cases passed, but the event-bridge test observed
+  startup persistence without an event checkpoint inside ten seconds, before
+  shutdown began. Its separate 14-test recovery integration target passed.
+  The worker exited 101; subsequent RCH stuck-detector cancellation of the
+  lingering wrapper is separately retained. This is not an overall pass.
+- `ec3cefcc3` adds test-only trigger/capture counters and task status to that
+  timeout, with unchanged deadlines. Job `30016197441357160` is investigating
+  the broader selection with those diagnostics; no behavioral fix is claimed.
+- Workspace check `30016197441357126` and GUI test job `30016197441357147`
+  both failed to compile the newly included journal-binding library test.
+  `91e96f2b3` supplies its missing `CompatRuntime` import. Full workspace Clippy
+  job `30016197441357168` is running on that corrected revision.
+- Independent review accepted the native callback-registration and allocation-
+  owner fixes (`b8e3a26f2`, `7e532d1f7`). RC19 DSR run `9c0b3470` failed before
+  Cargo because the build host lacked the tagged Git object; the object was
+  subsequently transferred without changing its checkout. No native compile,
+  installation, or release success follows from that attempt.
+- UBS static scanning remains nonzero. Review of its displayed findings found
+  fixture panics, bounded operations, binary headers mistaken for HTTP headers,
+  and integer task/reactor tokens mistaken for credentials. Its sampled output
+  does not clear the undisplayed aggregate findings or establish a clean gate.
