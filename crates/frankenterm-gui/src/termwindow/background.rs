@@ -621,6 +621,7 @@ fn rasterize_gradient_pixels(
     let width = image.width() as usize;
     let height = image.height() as usize;
     let row_bytes = width * 4;
+    let pixels: &mut [u8] = image.as_mut();
     let render_row = |gradient: &dyn colorgrad::Gradient,
                       y: usize,
                       row: &mut [u8],
@@ -651,8 +652,7 @@ fn rasterize_gradient_pixels(
             }
             let rows_per_group = height.div_ceil(pool.current_num_threads());
             if let Some(result) = run_gradient_without_coordinator_reentry(pool, || {
-                image
-                    .as_mut()
+                pixels
                     .par_chunks_mut(row_bytes * rows_per_group)
                     .zip(seeds.par_chunks(rows_per_group))
                     .enumerate()
@@ -687,7 +687,7 @@ fn rasterize_gradient_pixels(
     }
 
     let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
-    for (y, row) in image.as_mut().chunks_exact_mut(row_bytes).enumerate() {
+    for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
         render_row(serial_gradient, y, row, row_seeds.fork())?;
     }
     Ok(())
