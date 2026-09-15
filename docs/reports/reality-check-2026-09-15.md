@@ -118,3 +118,27 @@ journey, followed by an explicitly authorized canary on an existing host.
   fixture panics, bounded operations, binary headers mistaken for HTTP headers,
   and integer task/reactor tokens mistaken for credentials. Its sampled output
   does not clear the undisplayed aggregate findings or establish a clean gate.
+
+## Follow-up qualification at 17:12 UTC
+
+- Core job `30016197441357160` ended with 1,127 passes and one failure. The
+  idle-bridge test did not observe a startup checkpoint within ten seconds;
+  it had not reached shutdown. The event-bridge case passed. This does not
+  establish a causal fix for either intermittent failure.
+- GUI/window job `30016197441357169` passed its actual 3 library, 7 binary,
+  and 1 window tests on `91e96f2b3`. This is Linux component evidence, not
+  macOS compilation, native timing, or installed-app acceptance.
+- Workspace Clippy job `30016197441357168` failed with 27 diagnostics. The
+  fixes are in `747c75cbd13dd3e1089cbdcd821a23000aef426f`: explicit hasher
+  parameters, simpler bindings/patterns, equivalent sorting/error construction,
+  and repaired documentation formatting. Startup diagnostics retain the same
+  deadline. No lint suppressions or relaxed recovery assertions were added.
+- That commit's message overstates the generation-conflict change: the old
+  `else` already returned the error; removing it preserves behavior. The report
+  also remains on disk and in HEAD despite the unrelated stale normal index.
+- Strict RCH jobs `30016197441357178` (workspace Clippy) and
+  `30016197441357179` (focused runtime snapshot tests) were admitted on hz4
+  against that exact source. They are pending, not passes. Final formatting
+  proof must cover the corrected source as well.
+- The campaign's six-hour checkpoint above remains the measured work window;
+  the elapsed pause afterward is not claimed as continuous swarm supervision.
