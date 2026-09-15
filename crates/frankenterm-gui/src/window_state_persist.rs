@@ -7186,6 +7186,8 @@ fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
 /// attempted independently and retain distinct finite diagnostics; per-window
 /// lookups then remain silent and allocation-bounded.
 pub fn initialize() -> Result<(), PersistenceFailure> {
+    frankenterm_client::domain::install_domain_binding_resolver(resolve_client_domain_binding)
+        .map_err(|_| PersistenceFailure::invalid("conflicting client domain binding resolver"))?;
     ensure_legacy_window_state_migrated()?;
     let writer_failure = global_writer().err();
     let snapshot_failure =
@@ -7206,6 +7208,27 @@ pub fn initialize() -> Result<(), PersistenceFailure> {
             Err(snapshot_failure)
         }
     }
+}
+
+fn resolve_client_domain_binding(
+    fingerprint: frankenterm_client::domain::ClientEndpointFingerprint,
+) -> frankenterm_client::domain::DomainBindingFuture {
+    Box::pin(async move {
+        let writer = global_writer()?;
+        resolve_client_domain_binding_with(writer, fingerprint).await
+    })
+}
+
+async fn resolve_client_domain_binding_with(
+    writer: &PersistenceWriter,
+    fingerprint: frankenterm_client::domain::ClientEndpointFingerprint,
+) -> anyhow::Result<codec::DomainBindingId> {
+    let receiver = writer.ensure_domain_binding(PrivacySafeTargetFingerprint::from_bytes(
+        fingerprint.as_bytes(),
+    ))?;
+    // Receipt publication follows the storage worker's fsync, not enqueue.
+    let binding = receiver.recv_async().await??;
+    Ok(codec::DomainBindingId::from_bytes(binding.as_bytes()))
 }
 
 /// Queue the maximize/fullscreen subset of `window_state` for `workspace`.
@@ -7290,6 +7313,89 @@ mod tests {
     const CROSS_PROCESS_STATE_PATH_ENV: &str = "FT_TEST_WINDOW_STATE_PATH";
     const CROSS_PROCESS_WORKSPACE_ENV: &str = "FT_TEST_WINDOW_STATE_WORKSPACE";
     const CROSS_PROCESS_MARKER_ENV: &str = "FT_TEST_WINDOW_STATE_MARKER";
+
+    #[test]
+    fn client_domain_binding_bridge_is_durable_across_reopen_and_endpoint_rotation() {
+        use frankenterm_client::domain::ClientDomainConfig;
+        let fixture = tempfile::tempdir().expect("binding bridge fixture");
+        let path = fixture.path().join("window-state.json");
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("binding bridge runtime");
+        runtime.block_on(async {
+            let mut config = config::SshDomain {
+                name: "private-label-sentinel".into(),
+                remote_address: "private-endpoint-sentinel:22".into(),
+                ..config::SshDomain::default()
+            };
+            config
+                .ssh_option
+                .insert("ProxyCommand".into(), "private-command-sentinel".into());
+            let fingerprint = ClientDomainConfig::Ssh(config.clone()).endpoint_fingerprint();
+            let writer = PersistenceWriter::open(&path).expect("first store process");
+            let first = resolve_client_domain_binding_with(&writer, fingerprint)
+                .await
+                .expect("durable first binding receipt");
+            assert_ne!(first.as_bytes(), [0; 16]);
+            let snapshot = load_snapshot_at(&path).expect("read disk after receipt");
+            assert_eq!(
+                snapshot
+                    .binding_for(PrivacySafeTargetFingerprint::from_bytes(
+                        fingerprint.as_bytes()
+                    ))
+                    .expect("receipt must already be durable")
+                    .as_bytes(),
+                first.as_bytes()
+            );
+            drop(writer);
+
+            let reopened = PersistenceWriter::open(&path).expect("reopened store process");
+            config.name = "renamed-label".into();
+            config.connect_automatically = true;
+            let renamed = ClientDomainConfig::Ssh(config.clone()).endpoint_fingerprint();
+            assert_eq!(renamed, fingerprint);
+            assert_eq!(
+                resolve_client_domain_binding_with(&reopened, renamed)
+                    .await
+                    .expect("recover exact durable binding"),
+                first
+            );
+            config.remote_address = "different-private-endpoint:22".into();
+            let replacement = ClientDomainConfig::Ssh(config).endpoint_fingerprint();
+            let second = resolve_client_domain_binding_with(&reopened, replacement)
+                .await
+                .expect("new endpoint gets separate namespace");
+            assert_ne!(second, first);
+            let snapshot = load_snapshot_at(&path).expect("both identities remain durable");
+            assert_eq!(snapshot.domain_bindings.len(), 2);
+            assert_eq!(
+                snapshot
+                    .binding_for(PrivacySafeTargetFingerprint::from_bytes(
+                        fingerprint.as_bytes()
+                    ))
+                    .expect("old endpoint remains available to saved placeholders")
+                    .as_bytes(),
+                first.as_bytes()
+            );
+            for slot in [&path, &shadow_file_name(&path)] {
+                if slot.exists() {
+                    let bytes = std::fs::read(slot).expect("read retained journal slot");
+                    let text = String::from_utf8(bytes).expect("journal JSON");
+                    for private in [
+                        "private-label-sentinel",
+                        "private-endpoint-sentinel",
+                        "private-command-sentinel",
+                        "different-private-endpoint",
+                    ] {
+                        assert!(
+                            !text.contains(private),
+                            "journal must contain only opaque binding identity"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     #[cfg(unix)]
     #[test]

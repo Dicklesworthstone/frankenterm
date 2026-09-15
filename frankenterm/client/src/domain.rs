@@ -27,13 +27,15 @@ use promise::spawn::spawn_into_new_thread;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use wezterm_term::TerminalSize;
 
 thread_local! {
@@ -1247,6 +1249,114 @@ impl ClientInner {
     }
 }
 
+/// Stable client-side endpoint identity. Only this digest is persisted; it is
+/// not authentication evidence for the mux session reached by a transport.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ClientEndpointFingerprint([u8; 32]);
+
+impl ClientEndpointFingerprint {
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+pub type DomainBindingFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<codec::DomainBindingId>> + Send>>;
+pub type DomainBindingResolver = fn(ClientEndpointFingerprint) -> DomainBindingFuture;
+
+static DOMAIN_BINDING_RESOLVER: OnceLock<DomainBindingResolver> = OnceLock::new();
+
+/// Install the GUI's asynchronous durable store without making this crate
+/// depend on the GUI. Headless callers may omit it and have no layout binding.
+pub fn install_domain_binding_resolver(resolver: DomainBindingResolver) -> anyhow::Result<()> {
+    match DOMAIN_BINDING_RESOLVER.set(resolver) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if DOMAIN_BINDING_RESOLVER
+                .get()
+                .is_some_and(|current| std::ptr::fn_addr_eq(*current, resolver)) =>
+        {
+            Ok(())
+        }
+        Err(_) => bail!("a different durable domain binding resolver is already installed"),
+    }
+}
+
+/// A durable client namespace only. Ordered topology still requires the exact
+/// live transport, authenticated server session and committed snapshot fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableClientBinding {
+    pub fingerprint: ClientEndpointFingerprint,
+    pub binding_id: codec::DomainBindingId,
+}
+
+struct EndpointHasher(openssl::sha::Sha256);
+
+impl EndpointHasher {
+    fn new(transport: &[u8]) -> Self {
+        let mut this = Self(openssl::sha::Sha256::new());
+        this.bytes(b"frankenterm-client-endpoint-v1");
+        this.bytes(transport);
+        this
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.number(value.len() as u64);
+        self.0.update(value);
+    }
+
+    fn number(&mut self, value: u64) {
+        self.0.update(&value.to_le_bytes());
+    }
+
+    fn flag(&mut self, value: bool) {
+        self.0.update(&[u8::from(value)]);
+    }
+
+    fn optional<T>(&mut self, value: &Option<T>, write: impl FnOnce(&mut Self, &T)) {
+        self.flag(value.is_some());
+        if let Some(value) = value {
+            write(self, value);
+        }
+    }
+
+    fn strings(&mut self, values: &[String]) {
+        self.number(values.len() as u64);
+        for value in values {
+            self.bytes(value.as_bytes());
+        }
+    }
+
+    fn path(&mut self, value: &std::path::Path) {
+        // Never canonicalize/read a path or lossy-convert an OS string. These
+        // encodings are stable on the client platform across app restarts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            self.bytes(b"unix-path-bytes");
+            self.bytes(value.as_os_str().as_bytes());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            self.bytes(b"windows-path-utf16le");
+            self.number(value.as_os_str().encode_wide().count() as u64);
+            for unit in value.as_os_str().encode_wide() {
+                self.0.update(&unit.to_le_bytes());
+            }
+        }
+    }
+
+    fn duration(&mut self, value: std::time::Duration) {
+        self.number(value.as_secs());
+        self.number(u64::from(value.subsec_nanos()));
+    }
+
+    fn finish(self) -> ClientEndpointFingerprint {
+        ClientEndpointFingerprint(self.0.finish())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientDomainConfig {
     Unix(UnixDomain),
@@ -1255,6 +1365,136 @@ pub enum ClientDomainConfig {
 }
 
 impl ClientDomainConfig {
+    /// Versioned, length-prefixed endpoint/trust/session-policy digest. Display
+    /// names and live UI policy do not change the durable namespace, except
+    /// where TLS uses the name to select its credential-cache directory. Exhaustive
+    /// destructuring forces new transport fields to receive an explicit choice.
+    pub fn endpoint_fingerprint(&self) -> ClientEndpointFingerprint {
+        match self {
+            Self::Unix(unix) => {
+                let UnixDomain {
+                    name: _,
+                    socket_path: _,
+                    connect_automatically: _,
+                    no_serve_automatically,
+                    serve_command,
+                    proxy_command,
+                    skip_permissions_check,
+                    read_timeout,
+                    write_timeout,
+                    local_echo_threshold_ms: _,
+                    overlay_lag_indicator: _,
+                } = unix;
+                let mut hash = EndpointHasher::new(b"unix");
+                hash.path(&unix.socket_path());
+                hash.flag(*no_serve_automatically);
+                hash.optional(serve_command, |hash, value| hash.strings(value));
+                hash.optional(proxy_command, |hash, value| hash.strings(value));
+                hash.flag(*skip_permissions_check);
+                hash.duration(*read_timeout);
+                hash.duration(*write_timeout);
+                hash.finish()
+            }
+            Self::Tls(tls) => {
+                let TlsDomainClient {
+                    name,
+                    bootstrap_via_ssh,
+                    remote_address,
+                    pem_private_key,
+                    pem_cert,
+                    pem_ca,
+                    pem_root_certs,
+                    accept_invalid_hostnames,
+                    expected_cn,
+                    connect_automatically: _,
+                    read_timeout,
+                    write_timeout,
+                    local_echo_threshold_ms: _,
+                    remote_wezterm_path,
+                    overlay_lag_indicator: _,
+                } = tls;
+                let mut hash = EndpointHasher::new(b"tls");
+                hash.bytes(remote_address.as_bytes());
+                // Reconnectable::tls_creds_path selects stored credentials by
+                // this name. It is consequently more than a display label.
+                hash.bytes(name.as_bytes());
+                hash.optional(bootstrap_via_ssh, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                for path in [pem_private_key, pem_cert, pem_ca] {
+                    hash.optional(path, |hash, value| hash.path(value));
+                }
+                hash.number(pem_root_certs.len() as u64);
+                for path in pem_root_certs {
+                    hash.path(path);
+                }
+                hash.flag(*accept_invalid_hostnames);
+                hash.optional(expected_cn, |hash, value| hash.bytes(value.as_bytes()));
+                hash.duration(*read_timeout);
+                hash.duration(*write_timeout);
+                hash.optional(remote_wezterm_path, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.finish()
+            }
+            Self::Ssh(ssh) => {
+                let SshDomain {
+                    name: _,
+                    remote_address,
+                    no_agent_auth,
+                    username,
+                    connect_automatically: _,
+                    timeout,
+                    local_echo_threshold_ms: _,
+                    overlay_lag_indicator: _,
+                    remote_wezterm_path,
+                    override_proxy_command,
+                    ssh_backend,
+                    multiplexing,
+                    ssh_option,
+                    ssh_config_file,
+                    default_prog,
+                    assume_shell,
+                } = ssh;
+                let mut hash = EndpointHasher::new(b"ssh");
+                hash.bytes(remote_address.as_bytes());
+                hash.flag(*no_agent_auth);
+                hash.optional(username, |hash, value| hash.bytes(value.as_bytes()));
+                hash.duration(*timeout);
+                hash.optional(remote_wezterm_path, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.optional(override_proxy_command, |hash, value| {
+                    hash.bytes(value.as_bytes())
+                });
+                hash.optional(ssh_backend, |hash, value| {
+                    hash.number(match value {
+                        config::SshBackend::Ssh2 => 0,
+                        config::SshBackend::LibSsh => 1,
+                    })
+                });
+                hash.number(match multiplexing {
+                    config::SshMultiplexing::WezTerm => 0,
+                    config::SshMultiplexing::None => 1,
+                });
+                let mut options: Vec<_> = ssh_option.iter().collect();
+                options.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                hash.number(options.len() as u64);
+                for (key, value) in options {
+                    hash.bytes(key.as_bytes());
+                    hash.bytes(value.as_bytes());
+                }
+                hash.optional(ssh_config_file, |hash, value| hash.bytes(value.as_bytes()));
+                hash.optional(default_prog, |hash, value| hash.strings(value));
+                hash.number(match assume_shell {
+                    config::Shell::Unknown => 0,
+                    config::Shell::Posix => 1,
+                });
+                hash.finish()
+            }
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             ClientDomainConfig::Unix(unix) => &unix.name,
@@ -1468,6 +1708,7 @@ impl ClientInner {
 pub struct ClientDomain {
     config: ClientDomainConfig,
     policy: parking_lot::RwLock<ClientDomainPolicy>,
+    durable_binding: Mutex<Option<DurableClientBinding>>,
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     background_attachment_ui: Mutex<Option<ConnectionUI>>,
@@ -2131,6 +2372,7 @@ impl ClientDomain {
         Ok(Self {
             config,
             policy: parking_lot::RwLock::new(policy),
+            durable_binding: Mutex::new(None),
             label,
             inner: Mutex::new(None),
             background_attachment_ui: Mutex::new(None),
@@ -2254,6 +2496,46 @@ impl ClientDomain {
 
     pub fn connect_automatically(&self) -> bool {
         self.policy.read().connect_automatically
+    }
+
+    /// Durable namespace for this exact configured domain. This does not grant
+    /// any transport readiness or ordered-topology publication authority.
+    pub fn durable_layout_binding(&self) -> Option<DurableClientBinding> {
+        let binding = *lock_or_recover(&self.durable_binding, "durable_domain_binding");
+        (!self.retired.load(Ordering::Acquire))
+            .then_some(binding)
+            .flatten()
+    }
+
+    async fn resolve_layout_binding_with(
+        &self,
+        resolver: DomainBindingResolver,
+    ) -> anyhow::Result<()> {
+        ensure!(!self.retired.load(Ordering::Acquire), "domain is retired");
+        if self.durable_layout_binding().is_some() {
+            return Ok(());
+        }
+        let fingerprint = self.config.endpoint_fingerprint();
+        let binding_id = resolver(fingerprint).await?;
+        ensure!(
+            binding_id.as_bytes() != [0; 16],
+            "durable domain binding is reserved"
+        );
+        let mut binding = lock_or_recover(&self.durable_binding, "durable_domain_binding");
+        ensure!(
+            !self.retired.load(Ordering::Acquire),
+            "domain retired while resolving layout binding"
+        );
+        let resolved = DurableClientBinding {
+            fingerprint,
+            binding_id,
+        };
+        ensure!(
+            binding.is_none_or(|current| current == resolved),
+            "durable domain binding changed while its registration remained live"
+        );
+        *binding = Some(resolved);
+        Ok(())
     }
 
     pub fn reconcile_configuration(&self, expected: &ClientDomainConfig) -> bool {
@@ -4265,6 +4547,26 @@ impl Domain for ClientDomain {
                 let mux = Arc::clone(mux);
                 async move {
                     let result = with_mux_rpc_bootstrap_timeout(async {
+                        if let Some(resolver) = DOMAIN_BINDING_RESOLVER.get() {
+                            // Await only the storage worker, before creating a
+                            // transport. A failed write cannot grant durable
+                            // layout authority, but ordinary attachment remains
+                            // available without ordered capabilities.
+                            if let Err(error) = self.resolve_layout_binding_with(*resolver).await {
+                                metrics::counter!("mux.client.layout_binding_unavailable.total")
+                                    .increment(1);
+                                log::warn!("durable domain layout binding unavailable: {error:#}");
+                            }
+                        }
+                        ensure!(
+                            !self.retired.load(Ordering::Acquire)
+                                && mux.get_domain(domain_id).is_some_and(|current| {
+                                    current
+                                        .downcast_ref::<Self>()
+                                        .is_some_and(|current| std::ptr::eq(current, self))
+                                }),
+                            "client domain retired while awaiting durable layout binding"
+                        );
                         let mut cloned_ui = ui.clone();
                         let mux_owner = Arc::downgrade(&mux);
                         let client = spawn_into_new_thread(move || match &config {
@@ -4374,6 +4676,243 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_fingerprint_v1_encoding_is_stable_across_process_and_compiler_restarts() {
+        let config = ClientDomainConfig::Ssh(SshDomain {
+            remote_address: "host:22".into(),
+            timeout: std::time::Duration::new(7, 9),
+            remote_wezterm_path: Some("/usr/bin/ft".into()),
+            ssh_backend: Some(config::SshBackend::LibSsh),
+            assume_shell: config::Shell::Posix,
+            ..SshDomain::default()
+        });
+        // Independently encoded little-endian lengths/integers and SHA-256.
+        // Rust's Hash/Debug/serde representations are not disk identity formats.
+        assert_eq!(
+            config.endpoint_fingerprint().as_bytes(),
+            [
+                0x78, 0xac, 0x1b, 0xd5, 0x1e, 0xef, 0x7a, 0x71, 0x9e, 0x57, 0xdc, 0xab, 0x97, 0xed,
+                0x61, 0x70, 0xc3, 0xa0, 0xa7, 0x19, 0xd8, 0xa5, 0x61, 0x67, 0x5d, 0xab, 0xbd, 0x20,
+                0xfd, 0x39, 0x3c, 0xc1,
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_fingerprint_preserves_ssh_identity_across_label_policy_and_map_order() {
+        let mut first = SshDomain {
+            name: "work".to_string(),
+            remote_address: "user@host:22".to_string(),
+            ..SshDomain::default()
+        };
+        first
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-a".into());
+        first
+            .ssh_option
+            .insert("StrictHostKeyChecking".into(), "yes".into());
+        let expected = ClientDomainConfig::Ssh(first.clone()).endpoint_fingerprint();
+        let mut renamed = first.clone();
+        renamed.name = "renamed work".to_string();
+        renamed.connect_automatically = true;
+        renamed.local_echo_threshold_ms = Some(10);
+        renamed.overlay_lag_indicator = true;
+        renamed.ssh_option.clear();
+        renamed
+            .ssh_option
+            .insert("StrictHostKeyChecking".into(), "yes".into());
+        renamed
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-a".into());
+        assert_eq!(
+            ClientDomainConfig::Ssh(renamed).endpoint_fingerprint(),
+            expected
+        );
+
+        for changed in [
+            SshDomain {
+                remote_address: "user@other:22".into(),
+                ..first.clone()
+            },
+            SshDomain {
+                username: Some("other-user".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                no_agent_auth: true,
+                ..first.clone()
+            },
+            SshDomain {
+                override_proxy_command: Some("different proxy".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                ssh_backend: Some(config::SshBackend::Ssh2),
+                ..first.clone()
+            },
+            SshDomain {
+                ssh_config_file: Some("/private/other-config".into()),
+                ..first.clone()
+            },
+            SshDomain {
+                default_prog: Some(vec!["different".into()]),
+                ..first.clone()
+            },
+        ] {
+            assert_ne!(
+                ClientDomainConfig::Ssh(changed).endpoint_fingerprint(),
+                expected
+            );
+        }
+        first
+            .ssh_option
+            .insert("IdentityFile".into(), "/private/key-b".into());
+        assert_ne!(
+            ClientDomainConfig::Ssh(first).endpoint_fingerprint(),
+            expected
+        );
+        assert!(!format!("{expected:?}").contains("private"));
+    }
+
+    #[test]
+    fn endpoint_fingerprint_frames_fields_and_preserves_exact_os_paths_and_timeouts() {
+        let base = UnixDomain {
+            socket_path: Some("/tmp/binding.sock".into()),
+            proxy_command: Some(vec!["a".into(), "bc".into()]),
+            read_timeout: std::time::Duration::new(1 << 54, 1),
+            ..UnixDomain::default()
+        };
+        let expected = ClientDomainConfig::Unix(base.clone()).endpoint_fingerprint();
+        let mut changed = base.clone();
+        changed.proxy_command = Some(vec!["ab".into(), "c".into()]);
+        assert_ne!(
+            ClientDomainConfig::Unix(changed).endpoint_fingerprint(),
+            expected
+        );
+        let mut changed = base;
+        changed.read_timeout = std::time::Duration::new(1 << 54, 2);
+        assert_ne!(
+            ClientDomainConfig::Unix(changed).endpoint_fingerprint(),
+            expected
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let path_a = std::ffi::OsString::from_vec(b"/tmp/\xff".to_vec());
+            let path_b = std::ffi::OsString::from_vec(b"/tmp/\xfe".to_vec());
+            assert_eq!(path_a.to_string_lossy(), path_b.to_string_lossy());
+            let a = ClientDomainConfig::Unix(UnixDomain {
+                socket_path: Some(path_a.into()),
+                ..UnixDomain::default()
+            });
+            let b = ClientDomainConfig::Unix(UnixDomain {
+                socket_path: Some(path_b.into()),
+                ..UnixDomain::default()
+            });
+            assert_ne!(a.endpoint_fingerprint(), b.endpoint_fingerprint());
+        }
+        let tls = TlsDomainClient {
+            remote_address: "host:1234".into(),
+            ..TlsDomainClient::default()
+        };
+        let expected = ClientDomainConfig::Tls(tls.clone()).endpoint_fingerprint();
+        let mut changed = tls.clone();
+        changed.accept_invalid_hostnames = true;
+        assert_ne!(
+            ClientDomainConfig::Tls(changed).endpoint_fingerprint(),
+            expected
+        );
+        let mut changed = tls;
+        changed.name = "another-credential-cache".into();
+        assert_ne!(
+            ClientDomainConfig::Tls(changed).endpoint_fingerprint(),
+            expected
+        );
+    }
+
+    #[test]
+    fn durable_layout_binding_requires_receipt_and_cancellation_or_retirement_cannot_publish() {
+        fn ready(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0x42; 16])) })
+        }
+        fn reserved(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(async { Ok(codec::DomainBindingId::from_bytes([0; 16])) })
+        }
+        fn pending(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            Box::pin(std::future::pending())
+        }
+        fn delayed(_: ClientEndpointFingerprint) -> DomainBindingFuture {
+            let mut polled = false;
+            Box::pin(std::future::poll_fn(move |context| {
+                if std::mem::replace(&mut polled, true) {
+                    std::task::Poll::Ready(Ok(codec::DomainBindingId::from_bytes([0x43; 16])))
+                } else {
+                    context.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create domain");
+        let mut waiting = Box::pin(domain.resolve_layout_binding_with(pending));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(domain.durable_layout_binding(), None);
+        drop(waiting);
+        assert_eq!(domain.durable_layout_binding(), None);
+        let retiring = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create concurrently retired domain");
+        let mut late_receipt = Box::pin(retiring.resolve_layout_binding_with(delayed));
+        assert!(late_receipt.as_mut().poll(&mut context).is_pending());
+        retiring.retired.store(true, Ordering::Release);
+        assert!(matches!(
+            late_receipt.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(retiring.durable_layout_binding(), None);
+        let concurrent = ClientDomain::new(ClientDomainConfig::Unix(UnixDomain::default()), &mux)
+            .expect("create concurrent receipt domain");
+        let mut conflicting = Box::pin(concurrent.resolve_layout_binding_with(delayed));
+        assert!(conflicting.as_mut().poll(&mut context).is_pending());
+        asupersync_block_on(concurrent.resolve_layout_binding_with(ready))
+            .expect("first committed receipt wins");
+        assert!(matches!(
+            conflicting.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(
+            concurrent
+                .durable_layout_binding()
+                .expect("preserve winner")
+                .binding_id
+                .as_bytes(),
+            [0x42; 16]
+        );
+        asupersync_block_on(async {
+            assert!(domain.resolve_layout_binding_with(reserved).await.is_err());
+            assert_eq!(domain.durable_layout_binding(), None);
+            domain
+                .resolve_layout_binding_with(ready)
+                .await
+                .expect("durable receipt");
+            let committed = domain.durable_layout_binding().expect("binding available");
+            assert_eq!(committed.binding_id.as_bytes(), [0x42; 16]);
+            domain
+                .resolve_layout_binding_with(reserved)
+                .await
+                .expect("reuse committed binding");
+            assert_eq!(domain.durable_layout_binding(), Some(committed));
+            domain.retired.store(true, Ordering::Release);
+            assert_eq!(domain.durable_layout_binding(), None);
+            assert!(domain.resolve_layout_binding_with(ready).await.is_err());
+        });
+    }
+
+    #[test]
     fn initial_attachment_claim_is_single_flight_before_transport_creation() {
         let config = ClientDomainConfig::Unix(UnixDomain {
             name: "single-flight-attach-test".to_string(),
@@ -4382,6 +4921,7 @@ mod tests {
         let domain = ClientDomain {
             label: config.label(),
             policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
             config,
             inner: Mutex::new(None),
             background_attachment_ui: Mutex::new(None),
@@ -4432,6 +4972,7 @@ mod tests {
             label: config.label(),
             config: config.clone(),
             policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
             inner: Mutex::new(None),
             background_attachment_ui: Mutex::new(None),
             initial_attachment_pending: AtomicBool::new(false),
@@ -4861,6 +5402,7 @@ mod tests {
         let domain = Arc::new(ClientDomain {
             label: config.label(),
             policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+            durable_binding: Mutex::new(None),
             config,
             inner: Mutex::new(Some(Arc::clone(inner))),
             background_attachment_ui: Mutex::new(None),
@@ -4895,6 +5437,7 @@ mod tests {
             let domain = Arc::new(ClientDomain {
                 label: config.label(),
                 policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(&config)),
+                durable_binding: Mutex::new(None),
                 config,
                 inner: Mutex::new(Some(Arc::clone(&inner))),
                 background_attachment_ui: Mutex::new(None),
@@ -4958,6 +5501,7 @@ mod tests {
                 policy: parking_lot::RwLock::new(ClientDomainPolicy::from_config(
                     &successor_config,
                 )),
+                durable_binding: Mutex::new(None),
                 config: successor_config,
                 inner: Mutex::new(Some(successor_inner)),
                 background_attachment_ui: Mutex::new(None),
