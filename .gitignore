@@ -303,3 +303,12 @@ ubs_*.txt
 /pat
 /output.txt
 claude-upgrade-progress.json
+# rustfmt staging copies written by Codex format passes.
+.codex-format-stage/
+
+# === agent ephemeral residue 2026-09-15 ===
+# rustc ICE dumps from local/RCH builds.
+rustc-ice-*.txt
+# Per-host gate wrappers at the repo root.
+/.gate_*.sh
+/.verify_*.sh
