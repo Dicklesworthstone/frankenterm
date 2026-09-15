@@ -6008,6 +6008,95 @@ mod tests {
     }
 
     #[test]
+    fn native_owned_read_publication_keeps_compatible_cold_prefix_without_sequence_churn() {
+        let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission.store(true, Ordering::Relaxed);
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "cold-prefix-publication-test",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\n");
+        let pane = LocalPane::new(
+            720,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x80; 16],
+            "cold-prefix-publication-test".to_string(),
+        );
+        let (first, prior_end) = {
+            let rows = sink.rows.lock();
+            (
+                *rows.1.first_key_value().expect("output spilled history").0,
+                *rows.1.last_key_value().unwrap().0 + 1,
+            )
+        };
+        let prior = pane
+            .capture_line_read(first..first + 1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(
+            prior.lines().next().unwrap().as_str().trim_end_matches(' '),
+            "first"
+        );
+        assert!(pane.publish_line_reads(std::slice::from_ref(&prior), &mut || {}));
+        pane.get_line_layout().unwrap();
+
+        pane.terminal
+            .lock()
+            .advance_bytes(b"sixth\r\nseventh\r\neighth\r\n");
+        assert!(*sink.rows.lock().1.last_key_value().unwrap().0 >= prior_end);
+        let successor = pane
+            .capture_line_read(prior_end..prior_end + 1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(pane.publish_line_reads(std::slice::from_ref(&successor), &mut || {}));
+        assert!(pane.terminal.lock().screen().validates_line_read(&prior));
+        let (floor, dimensions) = pane.get_line_layout().unwrap();
+        let sequence = pane.get_current_seqno();
+        let mut publications = 0;
+        assert!(
+            pane.publish_line_reads_at_layout(
+                std::slice::from_ref(&prior),
+                sequence,
+                dimensions,
+                &mut || publications += 1,
+            ),
+            "retained prefix must publish without restarting a same-layout read"
+        );
+        assert_eq!(publications, 1);
+        assert_eq!(pane.get_current_seqno(), sequence);
+        assert_eq!(pane.get_line_layout().unwrap().0, floor);
+
+        // Geometric compatibility is not source authority. Replacing a row
+        // at the same coordinate must reject the captured bytes independently.
+        {
+            let mut rows = sink.rows.lock();
+            rows.0 = Default::default();
+            rows.1.insert(
+                first,
+                Line::from_text("changed", &termwiz::cell::CellAttributes::blank(), 99, None),
+            );
+        }
+        assert!(
+            !pane.publish_line_reads(std::slice::from_ref(&prior), &mut || {
+                panic!("replaced cold source was published")
+            })
+        );
+    }
+
+    #[test]
     fn native_owned_read_publication_is_nonblocking_and_rejects_mutation() {
         let pane = LocalPane::new(
             700,
