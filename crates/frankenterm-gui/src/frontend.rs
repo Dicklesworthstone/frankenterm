@@ -39,11 +39,11 @@ impl PendingWindowCreation {
         window_id: MuxWindowId,
     ) -> Option<Self> {
         let mut entries = pending.borrow_mut();
-        if entries.contains_key(&window_id) {
+        let std::collections::hash_map::Entry::Vacant(entry) = entries.entry(window_id) else {
             return None;
-        }
+        };
         let identity = Rc::new(());
-        entries.insert(window_id, Rc::clone(&identity));
+        entry.insert(Rc::clone(&identity));
         Some(Self {
             pending: Rc::clone(pending),
             window_id,
@@ -61,6 +61,84 @@ impl Drop for PendingWindowCreation {
         {
             entries.remove(&self.window_id);
         }
+    }
+}
+
+/// Releases the reconciliation gate even if its detached task is never polled
+/// or is cancelled while native window creation is awaiting completion.
+struct PendingWorkspaceReconcile {
+    identity: Rc<()>,
+    current: Rc<RefCell<Option<Rc<()>>>>,
+    gate: Rc<Cell<WorkspaceReconcileGate>>,
+    waiters: Rc<RefCell<WorkspaceReconcileWaiters>>,
+}
+
+impl PendingWorkspaceReconcile {
+    fn new(
+        current: &Rc<RefCell<Option<Rc<()>>>>,
+        gate: &Rc<Cell<WorkspaceReconcileGate>>,
+        waiters: &Rc<RefCell<WorkspaceReconcileWaiters>>,
+    ) -> Self {
+        let identity = Rc::new(());
+        *current.borrow_mut() = Some(Rc::clone(&identity));
+        Self {
+            identity,
+            current: Rc::clone(current),
+            gate: Rc::clone(gate),
+            waiters: Rc::clone(waiters),
+        }
+    }
+
+    fn release_identity(&self) -> bool {
+        let mut current = self.current.borrow_mut();
+        if current
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, &self.identity))
+        {
+            current.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(self, failure: Option<&'static str>) -> Option<bool> {
+        if !self.release_identity() {
+            return None;
+        }
+        let mut gate = self.gate.get();
+        let run_again = gate.finish_pass();
+        self.gate.set(gate);
+        let completed = self.waiters.borrow_mut().finish_active_pass(run_again);
+        for mut promise in completed {
+            match failure {
+                Some(reason) => {
+                    promise.err(Error::msg(reason));
+                }
+                None => {
+                    promise.ok(());
+                }
+            }
+        }
+        Some(run_again)
+    }
+}
+
+impl Drop for PendingWorkspaceReconcile {
+    fn drop(&mut self) {
+        if !self.release_identity() {
+            return;
+        }
+        let mut gate = self.gate.get();
+        gate.cancel_pass();
+        self.gate.set(gate);
+        let cancelled = self.waiters.borrow_mut().cancel_all();
+        // Wake callers only after every shared borrow is released. A caller
+        // can immediately retry, creating a new independently owned pass.
+        for mut promise in cancelled {
+            promise.err(Error::msg("workspace reconciliation was cancelled"));
+        }
+        metrics::counter!("gui.workspace_reconcile_cancelled.total").increment(1);
     }
 }
 
@@ -106,8 +184,9 @@ pub struct GuiFrontEnd {
     osc22_cursor_shapes: RefCell<Osc22PerPaneCursorMap>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
-    workspace_reconcile_gate: Cell<WorkspaceReconcileGate>,
-    workspace_reconcile_waiters: RefCell<WorkspaceReconcileWaiters>,
+    workspace_reconcile_gate: Rc<Cell<WorkspaceReconcileGate>>,
+    workspace_reconcile_waiters: Rc<RefCell<WorkspaceReconcileWaiters>>,
+    workspace_reconcile_pass: Rc<RefCell<Option<Rc<()>>>>,
     osc52_dispatch_identity: Arc<()>,
 }
 
@@ -136,8 +215,11 @@ impl GuiFrontEnd {
             osc22_cursor_shapes: RefCell::new(Osc22PerPaneCursorMap::new()),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
-            workspace_reconcile_gate: Cell::new(WorkspaceReconcileGate::default()),
-            workspace_reconcile_waiters: RefCell::new(WorkspaceReconcileWaiters::default()),
+            workspace_reconcile_gate: Rc::new(Cell::new(WorkspaceReconcileGate::default())),
+            workspace_reconcile_waiters: Rc::new(
+                RefCell::new(WorkspaceReconcileWaiters::default()),
+            ),
+            workspace_reconcile_pass: Rc::new(RefCell::new(None)),
             osc52_dispatch_identity: Arc::new(()),
         });
 
@@ -620,9 +702,14 @@ impl GuiFrontEnd {
     }
 
     fn run_workspace_reconcile_pass(&self) {
+        let pass = PendingWorkspaceReconcile::new(
+            &self.workspace_reconcile_pass,
+            &self.workspace_reconcile_gate,
+            &self.workspace_reconcile_waiters,
+        );
         let Some(mux) = Mux::try_get() else {
             log::warn!("cannot reconcile workspace: mux singleton is not available");
-            self.finish_workspace_reconcile_pass();
+            self.finish_workspace_reconcile_pass(pass, Some("mux is unavailable"));
             return;
         };
         let workspace = mux.active_workspace_for_client(&self.client_id);
@@ -632,7 +719,7 @@ impl GuiFrontEnd {
             // be running in other workspaces, so let's pick one
             // and activate it
             if self.is_switching_workspace() {
-                self.finish_workspace_reconcile_pass();
+                self.finish_workspace_reconcile_pass(pass, None);
                 return;
             }
             for workspace in mux.iter_workspaces() {
@@ -697,8 +784,10 @@ impl GuiFrontEnd {
         ) {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
             rejected => {
-                *self.switching_workspaces.borrow_mut() = false;
-                self.finish_workspace_reconcile_pass();
+                self.finish_workspace_reconcile_pass(
+                    pass,
+                    Some("workspace reconciliation scheduling was rejected"),
+                );
                 log::error!(
                     "GUI main-thread scheduler rejected workspace reconciliation suffix; released the exact pass gate for retry: {rejected:?}"
                 );
@@ -707,10 +796,14 @@ impl GuiFrontEnd {
         };
         reservation
             .spawn_local(async move {
+                let mut failure = None;
                 while let Some(mux_window_id) = mux_windows.next() {
                     let Some(fe) = try_front_end() else {
                         return;
                     };
+                    if !Rc::ptr_eq(&fe.workspace_reconcile_pass, &pass.current) {
+                        return;
+                    }
                     if fe.has_mux_window(mux_window_id) {
                         continue;
                     }
@@ -724,6 +817,7 @@ impl GuiFrontEnd {
                         TermWindow::new_window(mux_window_id, workspace.clone(), saved_window_state)
                             .await
                     {
+                        failure = Some("native window creation failed");
                         // Native allocation/render initialization can fail while
                         // the mux window still owns live sessions. A failed view
                         // must not close those sessions; release the creation
@@ -736,25 +830,21 @@ impl GuiFrontEnd {
                     }
                 }
                 if let Some(fe) = try_front_end() {
-                    *fe.switching_workspaces.borrow_mut() = false;
-                    fe.finish_workspace_reconcile_pass();
+                    fe.finish_workspace_reconcile_pass(pass, failure);
                 }
             })
             .detach();
     }
 
-    fn finish_workspace_reconcile_pass(&self) {
-        let mut gate = self.workspace_reconcile_gate.get();
-        let run_again = gate.finish_pass();
-        self.workspace_reconcile_gate.set(gate);
-        let completed = self
-            .workspace_reconcile_waiters
-            .borrow_mut()
-            .finish_active_pass(run_again);
-        for mut promise in completed {
-            promise.ok(());
+    fn finish_workspace_reconcile_pass(
+        &self,
+        pass: PendingWorkspaceReconcile,
+        failure: Option<&'static str>,
+    ) {
+        if !Rc::ptr_eq(&self.workspace_reconcile_pass, &pass.current) {
+            return;
         }
-        if run_again {
+        if pass.finish(failure) == Some(true) {
             self.run_workspace_reconcile_pass();
         }
     }
@@ -945,6 +1035,117 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn pending_workspace_reconcile_cancellation_releases_gate_and_all_waiters() {
+        use super::PendingWorkspaceReconcile;
+        use frankenterm_gui::workspace_reconcile::{
+            WorkspaceReconcileGate, WorkspaceReconcileWaiters,
+        };
+        use promise::Promise;
+        use std::cell::{Cell, RefCell};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context, Poll};
+
+        let current = Rc::new(RefCell::new(None));
+        let gate = Rc::new(Cell::new(WorkspaceReconcileGate::default()));
+        let waiters = Rc::new(RefCell::new(WorkspaceReconcileWaiters::default()));
+        let mut first = Promise::new();
+        let mut first_result = first.get_future().unwrap();
+        let mut next = Promise::new();
+        let mut next_result = next.get_future().unwrap();
+        let mut requested = gate.get();
+        assert!(requested.request_pass());
+        waiters.borrow_mut().push(true, first);
+        assert!(!requested.request_pass());
+        waiters.borrow_mut().push(false, next);
+        gate.set(requested);
+        let pass = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        let mut task = Box::pin(async move {
+            let _pass = pass;
+            std::future::pending::<()>().await;
+        });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(task.as_mut().poll(&mut cx), Poll::Pending);
+        drop(task);
+        for result in [&mut first_result, &mut next_result] {
+            assert!(matches!(
+                Pin::new(result).poll(&mut cx),
+                Poll::Ready(Err(_))
+            ));
+        }
+        assert_eq!(waiters.borrow().waiter_count(), 0);
+        assert!(current.borrow().is_none());
+
+        let mut requested = gate.get();
+        assert!(
+            requested.request_pass(),
+            "cancelled pass must not wedge retry"
+        );
+        gate.set(requested);
+        let mut retry = Promise::new();
+        let mut retry_result = retry.get_future().unwrap();
+        waiters.borrow_mut().push(true, retry);
+        let retry_pass = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        assert_eq!(retry_pass.finish(None), Some(false));
+        assert!(matches!(
+            Pin::new(&mut retry_result).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(gate.get(), WorkspaceReconcileGate::default());
+
+        let mut requested = gate.get();
+        assert!(requested.request_pass());
+        gate.set(requested);
+        let mut failure = Promise::new();
+        let mut failure_result = failure.get_future().unwrap();
+        waiters.borrow_mut().push(true, failure);
+        let failed_pass = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        assert_eq!(
+            failed_pass.finish(Some("native window creation failed")),
+            Some(false)
+        );
+        assert!(matches!(
+            Pin::new(&mut failure_result).poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(gate.get(), WorkspaceReconcileGate::default());
+    }
+
+    #[test]
+    fn pending_workspace_reconcile_stale_drop_cannot_cancel_the_successor() {
+        use super::PendingWorkspaceReconcile;
+        use frankenterm_gui::workspace_reconcile::{
+            WorkspaceReconcileGate, WorkspaceReconcileWaiters,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let current = Rc::new(RefCell::new(None));
+        let gate = Rc::new(Cell::new(WorkspaceReconcileGate::default()));
+        let waiters = Rc::new(RefCell::new(WorkspaceReconcileWaiters::default()));
+        let mut requested = gate.get();
+        assert!(requested.request_pass());
+        gate.set(requested);
+        let old = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        let successor = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        drop(old);
+        assert!(current.borrow().is_some());
+        assert_eq!(gate.get(), requested);
+        assert_eq!(successor.finish(None), Some(false));
+        assert_eq!(gate.get(), WorkspaceReconcileGate::default());
+
+        let mut requested = gate.get();
+        assert!(requested.request_pass());
+        gate.set(requested);
+        let never_polled = PendingWorkspaceReconcile::new(&current, &gate, &waiters);
+        drop(async move { never_polled.finish(None) });
+        assert_eq!(gate.get(), WorkspaceReconcileGate::default());
+        assert!(current.borrow().is_none());
+    }
 
     #[test]
     fn pending_native_window_creation_releases_failed_and_cancelled_attempts() {

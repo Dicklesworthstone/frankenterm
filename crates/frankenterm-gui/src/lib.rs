@@ -134,6 +134,10 @@ pub mod workspace_reconcile {
                 false
             }
         }
+
+        pub fn cancel_pass(&mut self) {
+            *self = Self::default();
+        }
     }
 
     #[derive(Default)]
@@ -166,6 +170,11 @@ pub mod workspace_reconcile {
                 debug_assert!(self.next_pass.is_empty());
             }
             completed
+        }
+
+        pub fn cancel_all(&mut self) -> impl Iterator<Item = Promise<()>> + use<> {
+            let pending = std::mem::take(self);
+            pending.active_pass.into_iter().chain(pending.next_pass)
         }
     }
 
