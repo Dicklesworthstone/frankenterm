@@ -18,8 +18,9 @@ use mux::tab::{
 };
 use mux::window::WindowId;
 use mux::{
-    CurrentPane, DomainOperationGuard, MoveCommitReceipt, Mux, MuxNotification, MuxWindowBuilder,
-    PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
+    CurrentPane, DomainOperationGuard, MoveCommitReceipt, Mux, MuxNotification,
+    MuxSessionIncarnation, MuxWindowBuilder, PaneOperationGuard, PaneRegistrationHandle,
+    SplitCommitReceipt,
 };
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
@@ -179,6 +180,33 @@ where
     }
 }
 
+/// Identity available for the lifetime of a local client attachment, rather
+/// than only one transport connection. Legacy peers cannot prove continuity;
+/// their best-effort mappings must never silently acquire current authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientTopologySession {
+    Current(MuxSessionIncarnation),
+    Legacy46,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum ClientTopologySessionError {
+    #[error("remote topology carries a reserved mux session identity")]
+    ReservedIdentity,
+    #[error("remote mux session identity changed; a fresh domain attachment is required")]
+    Changed,
+    #[error("remote topology dialect changed without proof of session continuity; a fresh domain attachment is required")]
+    DialectChanged,
+}
+
+#[derive(Default)]
+enum ClientTopologySessionState {
+    #[default]
+    Unbound,
+    Bound(ClientTopologySession),
+    Revoked(ClientTopologySessionError),
+}
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -192,6 +220,7 @@ pub struct ClientInner {
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
+    topology_session: Mutex<ClientTopologySessionState>,
     detached: AtomicBool,
 }
 
@@ -1322,8 +1351,39 @@ impl ClientInner {
             focused_remote_pane_id: Mutex::new(None),
             reliable_input_queue: ReliableInputQueue::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
+            topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             detached: AtomicBool::new(false),
         }
+    }
+
+    fn pin_topology_session(
+        &self,
+        incoming: ClientTopologySession,
+    ) -> Result<(), ClientTopologySessionError> {
+        if matches!(incoming, ClientTopologySession::Current(id) if id.as_bytes() == [0; 16]) {
+            return Err(ClientTopologySessionError::ReservedIdentity);
+        }
+        let mut pinned = lock_or_recover(&self.topology_session, "topology_session");
+        let error = match *pinned {
+            ClientTopologySessionState::Unbound => {
+                // Retain this identity even if subsequent application fails:
+                // a partially applied snapshot still owns its numeric ids.
+                *pinned = ClientTopologySessionState::Bound(incoming);
+                return Ok(());
+            }
+            ClientTopologySessionState::Bound(current) if current == incoming => return Ok(()),
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(_))
+                if matches!(incoming, ClientTopologySession::Current(_)) =>
+            {
+                ClientTopologySessionError::Changed
+            }
+            ClientTopologySessionState::Bound(_) => ClientTopologySessionError::DialectChanged,
+            ClientTopologySessionState::Revoked(error) => return Err(error),
+        };
+        *pinned = ClientTopologySessionState::Revoked(error);
+        self.client.revoke_domain_reconnect();
+        metrics::counter!("mux.client.topology_session_revoked.total").increment(1);
+        Err(error)
     }
 
     pub(crate) fn begin_remote_metadata_application(
@@ -3049,7 +3109,11 @@ impl ClientDomain {
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         match snapshot {
-            RpcTopologySnapshot::Current(panes) => {
+            RpcTopologySnapshot::Current {
+                session_incarnation,
+                panes,
+            } => {
+                inner.pin_topology_session(ClientTopologySession::Current(session_incarnation))?;
                 panes
                     .validate_floating_panes()
                     .context("validating bounded floating-pane snapshot")?;
@@ -3070,6 +3134,7 @@ impl ClientDomain {
                 )
             }
             RpcTopologySnapshot::Legacy46(panes) => {
+                inner.pin_topology_session(ClientTopologySession::Legacy46)?;
                 let (tabs, tab_titles, window_titles) = panes.into_parts();
                 Self::process_pane_snapshot(
                     mux,
@@ -5928,6 +5993,163 @@ mod tests {
         assert_topology_resync_preserves_user_tab_order_and_window_moves(true);
     }
 
+    #[test]
+    fn current_topology_rejects_reused_ids_from_another_session_before_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_022);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let original_session = MuxSessionIncarnation::from_bytes([0xa1; 16]);
+        let replacement_session = MuxSessionIncarnation::from_bytes([0xa2; 16]);
+        let listing = || {
+            let mut panes = sample_remote_tab_listing();
+            let PaneNode::Leaf(mut second) = panes.tabs[0].clone() else {
+                panic!("sample must contain one leaf");
+            };
+            second.tab_id = 52;
+            second.pane_id = 62;
+            panes.tabs.push(PaneNode::Leaf(second));
+            panes.tab_titles.push("second tab".to_string());
+            panes
+        };
+        let apply = |session_incarnation, panes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation,
+                    panes,
+                },
+                None,
+            )
+        };
+        apply(original_session, listing()).expect("initial session attaches");
+        let window_id = inner.remote_to_local_window(41).unwrap();
+        let second_id = inner.remote_to_local_tab_id(52).unwrap();
+        mux.move_tab_between_windows(second_id, window_id, Some(0))
+            .expect("user reorders the two live tabs");
+        apply(original_session, listing()).expect("same-session resync preserves user order");
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+        let before = mux.window_order_snapshot(window_id).unwrap().unwrap();
+        let topology = mux.topology_snapshot_authority().unwrap();
+        let panes_before = mux.iter_panes();
+        let titles_before: Vec<_> = before
+            .ordered_tabs()
+            .iter()
+            .map(|tab| tab.get_title())
+            .collect();
+
+        // The replacement uses exactly the same numeric ids but different
+        // metadata. Neither it nor a delayed old-session response may mutate
+        // this attachment after the identity mismatch revokes it.
+        for session in [replacement_session, original_session] {
+            let mut reused = listing();
+            reused
+                .tab_titles
+                .fill("replacement must not overwrite old tab".to_string());
+            reused
+                .window_titles
+                .insert(41, "replacement window".to_string());
+            let error = apply(session, reused).expect_err("different session must not alias ids");
+            assert_eq!(
+                error.downcast_ref::<ClientTopologySessionError>(),
+                Some(&ClientTopologySessionError::Changed)
+            );
+            assert_eq!(mux.topology_snapshot_authority().unwrap(), topology);
+            assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+            assert_eq!(mux.iter_windows().len(), 1);
+            assert_eq!(mux.iter_panes().len(), panes_before.len());
+            let after = mux.window_order_snapshot(window_id).unwrap().unwrap();
+            assert_eq!(after.order_revision(), before.order_revision());
+            assert_eq!(after.active_tab_id(), before.active_tab_id());
+            for ((prior, current), title) in before
+                .ordered_tabs()
+                .iter()
+                .zip(after.ordered_tabs())
+                .zip(&titles_before)
+            {
+                assert!(Arc::ptr_eq(prior, current));
+                assert_eq!(&current.get_title(), title);
+                assert_eq!(mux.window_containing_tab(current.tab_id()), Some(window_id));
+            }
+            for pane in &panes_before {
+                assert!(Arc::ptr_eq(&mux.get_pane(pane.pane_id()).unwrap(), pane));
+            }
+        }
+
+        // A fresh attachment has its own identity namespace and can attach
+        // the new session without inheriting or destroying the old objects.
+        let fresh = test_client_inner(91_023);
+        let _fresh_domain = register_test_client_domain(&mux, &fresh);
+        ClientDomain::process_topology_snapshot(
+            &mux,
+            Arc::clone(&fresh),
+            RpcTopologySnapshot::Current {
+                session_incarnation: replacement_session,
+                panes: listing(),
+            },
+            None,
+        )
+        .expect("fresh attachment accepts the replacement session");
+        assert_ne!(fresh.remote_to_local_tab_id(52), Some(second_id));
+        assert_eq!(remote_tab_order(&mux, &inner, window_id), vec![52, 51]);
+        assert_eq!(mux.iter_panes().len(), panes_before.len() * 2);
+    }
+
+    #[test]
+    fn current_topology_reserved_session_does_not_pin_or_mutate_initial_attachment() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_024);
+        let _domain = register_test_client_domain(&mux, &inner);
+        let apply = |bytes| {
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation: MuxSessionIncarnation::from_bytes(bytes),
+                    panes: sample_remote_tab_listing(),
+                },
+                None,
+            )
+        };
+        let error = apply([0; 16]).expect_err("zero session is never authority");
+        assert_eq!(
+            error.downcast_ref::<ClientTopologySessionError>(),
+            Some(&ClientTopologySessionError::ReservedIdentity)
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert_eq!(inner.remote_to_local_tab_id(51), None);
+        apply([0xa3; 16]).expect("valid first session still attaches after invalid input");
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn topology_session_dialect_change_cannot_promote_legacy_numeric_ids() {
+        let current = ClientTopologySession::Current(MuxSessionIncarnation::from_bytes([0xa4; 16]));
+        for (first, next) in [
+            (ClientTopologySession::Legacy46, current),
+            (current, ClientTopologySession::Legacy46),
+        ] {
+            let inner = test_client_inner(91_025);
+            inner.pin_topology_session(first).expect("initial dialect");
+            inner
+                .pin_topology_session(first)
+                .expect("same dialect retains continuity");
+            assert_eq!(
+                inner.pin_topology_session(next),
+                Err(ClientTopologySessionError::DialectChanged)
+            );
+            assert_eq!(
+                inner.pin_topology_session(first),
+                Err(ClientTopologySessionError::DialectChanged)
+            );
+        }
+    }
+
     fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
@@ -5957,7 +6179,10 @@ mod tests {
                 return ClientDomain::process_topology_snapshot(
                     &mux,
                     Arc::clone(&inner),
-                    RpcTopologySnapshot::Current(panes),
+                    RpcTopologySnapshot::Current {
+                        session_incarnation: MuxSessionIncarnation::from_bytes([0x91; 16]),
+                        panes,
+                    },
                     None,
                 );
             }

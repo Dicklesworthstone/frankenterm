@@ -2639,7 +2639,10 @@ enum PendingRpcReply {
 /// Topology payload delivered to the domain under the exact snapshot
 /// authority available from its peer.
 pub(crate) enum RpcTopologySnapshot {
-    Current(ListPanesResponse),
+    Current {
+        session_incarnation: MuxSessionIncarnation,
+        panes: ListPanesResponse,
+    },
     Legacy46(Legacy46ListPanesResponse),
 }
 
@@ -3567,7 +3570,10 @@ impl RpcGenerationScope {
         request_guard.disarm();
         let applied = self
             .commit_sync(consumer, || {
-                apply(RpcTopologySnapshot::Current(snapshot.panes))
+                apply(RpcTopologySnapshot::Current {
+                    session_incarnation: authority.session_incarnation,
+                    panes: snapshot.panes,
+                })
             })
             .map_err(anyhow::Error::new)?;
         match applied {
@@ -12706,7 +12712,7 @@ mod tests {
                             );
                             Ok("legacy46-snapshot-committed")
                         }
-                        RpcTopologySnapshot::Current(_) => {
+                        RpcTopologySnapshot::Current { .. } => {
                             bail!("exact codec-46 socket selected the current topology schema")
                         }
                     }
