@@ -124,22 +124,60 @@ just code presence. Existing remote sessions remain outside the disposable test.
   both passed `sbh check --need 20G`. Local APFS pressure does not establish
   that remote verification is blocked. Route returned artifacts and temporary
   files to `/Volumes/USB_NVME/ft-release-20260915`.
-- [ ] Serialize proof after RubyFortress's existing vmi job 57273 ends.
+- [x] Serialize proof after RubyFortress's existing vmi job 57273 ends.
+  Its retained daemon receipt reports remote exit 1; it is not a pass.
 - [x] Run DSR doctor, host health, and repository configuration inspection.
 - [x] Prepare a validated private DSR configuration retaining all six checks,
   with external artifact destinations and one Cargo compile job.
 - [x] Diagnose static preflight: 25 passed, four failed, eight Cargo checks
   skipped. Unix import was already function-gated; explicit import gating
   passes the bounded scanner (`78a2b54b6`).
-- [ ] Refresh the three README source counts and vendored provenance metadata.
-- [ ] Re-run generated-artifact cleanliness with a private index at final HEAD.
-- [ ] Agree the RC22 source freeze with all writers before native DSR starts.
+- [x] Refresh the three README source counts and vendored provenance metadata.
+- [x] Re-run generated-artifact cleanliness with a private index at RC22.
+- [x] Obtain root/team RC22 freeze acknowledgments before native DSR starts.
+  An unidentified outside writer merged `.gitignore` changes at 21:33 UTC;
+  RC22's immutable native build continues for diagnosis, but cannot qualify
+  under DSR's checkout identity gate. No index/tag/source rollback is allowed.
 - [ ] Execute the nine health/watcher regressions and GUI gradient regressions.
 - [ ] Complete the full DSR quality checks with retained remote receipts.
 - [ ] Prove native selection, resize/reflow, and fixed-window font changes.
 - [ ] Build and verify DSR release artifacts, then publish the verified release.
 - [ ] Verify the release, matching-version canary, and upgrade asset discovery.
 - [ ] Activate the verified Mac application without losing existing sessions.
+
+### 21:49 UTC active execution
+
+- [x] Move native build storage to a dedicated healthy NFSv3 volume; actual
+  mkdir/write/read/flock/symlink/fsync checks passed. Preserve the stalled old
+  volume and all existing sessions.
+- [ ] Retain terminal result of strict RCH job 30016197441357350 on
+  `6fe88a178cd2b869498974e10e0d6f9ee2ddcc95`; nine requested regressions,
+  compilation active, zero test results so far.
+- [ ] Retain diagnostic RC22 native run
+  `4915fc03-4f16-42c4-abfc-a2ab1695dc5b`, including compile errors or usable
+  output; do not publish it as a qualified build.
+- [x] Independently review bounded gradient seed allocation and nested Rayon
+  coordinator repair. Their regression tests still require execution.
+- [x] Release checkout freeze by AM3214 after its qualification was lost;
+  resume separately reserved fixes while preserving the immutable archive.
+- [ ] Qualify RubyFortress's cold-layout Busy race repair through strict RCH
+  and native frozen-history read convergence. Independent source review passed.
+- [ ] Add measured write/read/retry/storage-submission phases to the Lindley
+  producer without changing its workload, model, or acceptance thresholds.
+- [ ] Replace the guardian broker's synthetic admission fixture with actual
+  Genesis publication and exactly-once child admission where authority permits.
+- [x] Re-run operating-envelope fixture and strict Doctor inventory checks;
+  both pass. These static checks do not replace runtime qualification.
+- [ ] Qualify operating-envelope, redaction, and Doctor producer suites on the
+  final source, then refresh their artifacts and manifest slots.
+- [ ] Run fresh Lindley calibration and independent holdout after diagnosis
+  and any justified fix. Preserve the failed prior experiment.
+- [x] Locate the existing September 5 operator-enrolled Ed25519 authority;
+  no replacement key is needed and private key contents were not exposed.
+- [ ] Bind the signed bundle to independently verified final DSR source,
+  version, profile, target family, and operator policy.
+- [ ] Establish a new final candidate freeze after fixes and producer
+  qualification; complete DSR quality, native acceptance, and release above.
 
 This operator-requested TODO retires as an active checklist when its remaining
 work is completed or explicitly handed off with qualified evidence.
