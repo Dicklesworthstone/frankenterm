@@ -14,6 +14,7 @@ use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
 use k9::assert_equal as assert_eq;
+use std::convert::TryFrom;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
