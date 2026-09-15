@@ -665,7 +665,11 @@ fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
             .unwrap()
             .to_canonical_json(TerminalCheckpointLimits::default())
             .unwrap();
-        assert_eq!(restored, oracle, "fresh process exact pane {id}");
+        assert_eq!(
+            restored.as_slice(),
+            oracle.as_slice(),
+            "fresh process exact pane {id}"
+        );
     }
 }
 
