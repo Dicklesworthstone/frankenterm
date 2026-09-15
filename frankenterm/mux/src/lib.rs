@@ -37587,6 +37587,7 @@ mod tests {
 
         let client_id = Arc::new(ClientId::new());
         mux.register_client(Arc::clone(&client_id));
+        mux.replace_identity(Some(Arc::clone(&client_id)));
         assert!(mux.record_focus_for_client(&client_id, 501));
 
         let config = MuxTopologyCaptureConfig::default();
