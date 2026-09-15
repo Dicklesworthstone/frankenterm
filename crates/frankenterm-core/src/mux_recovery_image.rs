@@ -181,6 +181,28 @@ pub enum MuxRecoveryImageError {
     #[error("tab {tab_id} zoomed pane id {pane_id} not found in tab panes")]
     InvalidZoomedPaneId { tab_id: usize, pane_id: usize },
 
+    #[error("tab {tab_id} has duplicate pane stack slot {slot_index}")]
+    DuplicateStackSlot { tab_id: usize, slot_index: usize },
+
+    #[error(
+        "tab {tab_id} pane stack slot {slot_index} is out of bounds for split tree (leaf count {leaf_count})"
+    )]
+    StackSlotOutOfBounds {
+        tab_id: usize,
+        slot_index: usize,
+        leaf_count: usize,
+    },
+
+    #[error(
+        "tab {tab_id} pane stack slot {slot_index} active member {found_pane_id} does not match split tree leaf {expected_pane_id}"
+    )]
+    StackActiveMemberMismatch {
+        tab_id: usize,
+        slot_index: usize,
+        expected_pane_id: usize,
+        found_pane_id: usize,
+    },
+
     #[error("focused window id {0} not found in window catalog")]
     InvalidFocusedWindowId(usize),
 
@@ -1307,7 +1329,14 @@ impl MuxRecoveryImage {
                     floating_pane_ids.insert(fp.pane_id);
                 }
 
-                // Validate pane stacks
+                // Validate pane stacks: slot_index must map 1-to-1 to split tree leaves in in-order traversal
+                let tree_leaves = tab
+                    .root_split
+                    .as_ref()
+                    .map(|rs| rs.leaves())
+                    .unwrap_or_default();
+                let mut seen_stack_slots = HashSet::new();
+
                 for stack in &tab.pane_stacks {
                     if stack.pane_ids.is_empty() {
                         return Err(MuxRecoveryImageError::MalformedSplit(
@@ -1319,12 +1348,33 @@ impl MuxRecoveryImage {
                             "pane stack active index out of bounds",
                         ));
                     }
-                    let active_id = stack.pane_ids[stack.active_index];
-                    if !tab_panes.contains(&active_id) {
-                        return Err(MuxRecoveryImageError::MalformedSplit(
-                            "pane stack active pane must be present in tab split tree",
-                        ));
+                    if !seen_stack_slots.insert(stack.slot_index) {
+                        return Err(MuxRecoveryImageError::DuplicateStackSlot {
+                            tab_id: tab.tab_id,
+                            slot_index: stack.slot_index,
+                        });
                     }
+
+                    // Slot index must correspond to an actual tree leaf in the tab's split tree
+                    let (expected_leaf_pane_id, _) = tree_leaves
+                        .get(stack.slot_index)
+                        .copied()
+                        .ok_or(MuxRecoveryImageError::StackSlotOutOfBounds {
+                            tab_id: tab.tab_id,
+                            slot_index: stack.slot_index,
+                            leaf_count: tree_leaves.len(),
+                        })?;
+
+                    let active_id = stack.pane_ids[stack.active_index];
+                    if active_id != expected_leaf_pane_id {
+                        return Err(MuxRecoveryImageError::StackActiveMemberMismatch {
+                            tab_id: tab.tab_id,
+                            slot_index: stack.slot_index,
+                            expected_pane_id: expected_leaf_pane_id,
+                            found_pane_id: active_id,
+                        });
+                    }
+
                     for (idx, &pane_id) in stack.pane_ids.iter().enumerate() {
                         if idx == stack.active_index {
                             continue; // Active pane is already counted in tab_panes and global_placed_pane_ids
@@ -2319,7 +2369,7 @@ mod tests {
     #[test]
     fn test_negative_pane_stack_missing_active_in_tree() {
         let mut image = make_valid_test_image();
-        // Pane stack active pane is 99, which is not in split tree
+        // Pane stack active pane is 99, which is not in split tree (expected leaf at slot 0 is pane 1)
         image.topology.windows[0].tabs[0]
             .pane_stacks
             .push(RecoveryPaneStack {
@@ -2330,7 +2380,160 @@ mod tests {
         image.image_digest = image.compute_digest().unwrap();
 
         let err = image.validate().unwrap_err();
-        assert!(matches!(err, MuxRecoveryImageError::MalformedSplit(_)));
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::StackActiveMemberMismatch {
+                tab_id: 10,
+                slot_index: 0,
+                expected_pane_id: 1,
+                found_pane_id: 99,
+            }
+        );
+    }
+
+    #[test]
+    fn test_negative_pane_stack_wrong_slot_active_member() {
+        let mut image = make_valid_test_image();
+        // Split tree has leaf 0 = pane 1, leaf 1 = pane 2.
+        // Add pane 4 as hidden stack member, but associate stack with slot 1 (leaf 2)
+        // while specifying pane 1 as active member.
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 1,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        image.image_digest = image.compute_digest().unwrap();
+
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::StackActiveMemberMismatch {
+                tab_id: 10,
+                slot_index: 1,
+                expected_pane_id: 2,
+                found_pane_id: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_negative_pane_stack_slot_out_of_bounds() {
+        let mut image = make_valid_test_image();
+        // Split tree has 2 leaves (indices 0 and 1). Slot 5 is out of bounds.
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 5,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        image.image_digest = image.compute_digest().unwrap();
+
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::StackSlotOutOfBounds {
+                tab_id: 10,
+                slot_index: 5,
+                leaf_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_negative_pane_stack_duplicate_slot() {
+        let mut image = make_valid_test_image();
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        let pane5 = make_test_pane(5, "uuid-pane-5", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.panes.push(pane5);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 5],
+                active_index: 0,
+            });
+        image.image_digest = image.compute_digest().unwrap();
+
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::DuplicateStackSlot {
+                tab_id: 10,
+                slot_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_negative_pane_stack_floating_pane_as_active_member() {
+        let mut image = make_valid_test_image();
+        // Pane 3 is a floating pane, not a tiled split leaf
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![3, 4],
+                active_index: 0,
+            });
+        image.image_digest = image.compute_digest().unwrap();
+
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::StackActiveMemberMismatch {
+                tab_id: 10,
+                slot_index: 0,
+                expected_pane_id: 1,
+                found_pane_id: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_positive_multi_slot_pane_stacks() {
+        let mut image = make_valid_test_image();
+        // Slot 0 has leaf 1, stacked with hidden pane 4
+        // Slot 1 has leaf 2, stacked with hidden pane 5
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        let pane5 = make_test_pane(5, "uuid-pane-5", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.panes.push(pane5);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 1,
+                pane_ids: vec![2, 5],
+                active_index: 0,
+            });
+        image.image_digest = image.compute_digest().unwrap();
+
+        assert!(image.validate().is_ok());
+        let all_ids = image.topology.windows[0].tabs[0].all_pane_ids();
+        assert_eq!(all_ids, vec![1, 2, 4, 5, 3]);
     }
 
     #[test]
