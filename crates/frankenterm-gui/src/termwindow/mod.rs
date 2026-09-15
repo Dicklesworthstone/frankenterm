@@ -4145,14 +4145,14 @@ impl TermWindow {
                             TermWindowNotif::InvalidateShapeCache(RenderInvalidationCause::Palette),
                             window,
                         )?;
-                        self.mux_pane_output_event(pane_id);
+                        self.mux_pane_output_event(pane_id)?;
                     }
                     MuxNotification::Alert {
                         alert: Alert::ImageAltText { .. },
                         pane_id,
                     } => {
                         self.record_render_invalidation(RenderInvalidationCause::Image);
-                        self.mux_pane_output_event(pane_id);
+                        self.mux_pane_output_event(pane_id)?;
                     }
                     MuxNotification::Alert {
                         alert: Alert::Bell,
