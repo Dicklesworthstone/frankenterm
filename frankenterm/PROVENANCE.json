@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 52,
-        "fix": 79,
+        "fix": 85,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 27
       },
-      "fork_side_commit_count": 209,
+      "fork_side_commit_count": 215,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T05:42:11-04:00",
-        "sha": "319d1b294d5e981cf24a3a40cfc5552d9e75046d",
-        "subject": "fix(mux): correlate render observations with their current source"
+        "committed_at": "2026-09-14T23:26:27-04:00",
+        "sha": "653d85a5676e51155047e6c37e33a0c087b42861",
+        "subject": "fix(client): bound optional layout binding before transport bootstrap"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 43,
-        "fix": 44,
+        "fix": 45,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 135,
+      "fork_side_commit_count": 136,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-12T17:31:39-04:00",
-        "sha": "73fb08e34c9c9dc56c3e9131ef2f127eba672895",
-        "subject": "fix(gui): follow wgpu/quad/glyph-cache APIs after the selection floor"
+        "committed_at": "2026-09-15T16:09:24-04:00",
+        "sha": "d8a259a6e90c3e477fbc38b162bc951b74dc5ad4",
+        "subject": "fix(config): reload only for watched configuration dependencies"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -447,19 +447,19 @@
         "cosmetic": 8,
         "docs": 1,
         "feat": 2,
-        "fix": 22,
+        "fix": 23,
         "other": 6,
         "refactor": 1,
         "rename": 1,
         "test": 2
       },
-      "fork_side_commit_count": 44,
+      "fork_side_commit_count": 45,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T09:38:29-04:00",
-        "sha": "b4a71c897cbdb3559cc64db5a06c5a83eeac474f",
-        "subject": "fix(font): shape incomplete combining clusters exactly once"
+        "committed_at": "2026-09-14T18:23:42-04:00",
+        "sha": "86a9350cb06e6568faf58b715f134d6042b0c111",
+        "subject": "fix(font): trim native glyph names at the C terminator"
       },
       "name": "frankenterm-font",
       "path": "frankenterm/font",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
-        "feat": 188,
-        "fix": 212,
-        "other": 38,
+        "feat": 189,
+        "fix": 221,
+        "other": 43,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 77
+        "test": 83
       },
-      "fork_side_commit_count": 583,
+      "fork_side_commit_count": 604,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-14T11:53:31-04:00",
-        "sha": "99ad44cf1b80a56eb77a239238828617cac0915e",
-        "subject": "feat(term): prepare cold layout from admitted geometry without hydrating a dummy row"
+        "classification": "fix",
+        "committed_at": "2026-09-15T15:08:34-04:00",
+        "sha": "921917dff7186a4bc617c000998bd4658c69050b",
+        "subject": "fix(mux): wake the GUI after primary resize completion"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 36,
+        "fix": 37,
         "other": 29,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 21
       },
-      "fork_side_commit_count": 116,
+      "fork_side_commit_count": 117,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-14T05:38:41-04:00",
-        "sha": "7eadc70a17ce9795221bb713f02be53ac0a2578d",
-        "subject": "test(term): qualify cold geometry through the actual Unicode parser"
+        "classification": "fix",
+        "committed_at": "2026-09-14T21:09:53-04:00",
+        "sha": "6d0a416af62e2404358b26ad9a5368813b97dee1",
+        "subject": "fix(mux): fence actual semantic row mutations during rendering"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -895,21 +895,21 @@
         "cleanup": 3,
         "cosmetic": 15,
         "docs": 2,
-        "feat": 54,
-        "fix": 101,
-        "other": 50,
+        "feat": 55,
+        "fix": 105,
+        "other": 54,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 54
+        "test": 55
       },
-      "fork_side_commit_count": 292,
+      "fork_side_commit_count": 302,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-14T17:16:15-04:00",
-        "sha": "ec6f3d3801f7ff8a2afdf82d4b43625ffccb9d58",
-        "subject": "perf(term): expose opt-in cold seam and geometry stage timings"
+        "classification": "fix",
+        "committed_at": "2026-09-14T23:20:16-04:00",
+        "sha": "f5f68e9f6f1714105e2ac64395c0d7f7168a5a83",
+        "subject": "fix(term): preserve checkpoint generation when activation fails"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 89,
-        "other": 13,
+        "fix": 93,
+        "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 142,
+      "fork_side_commit_count": 147,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T15:33:29-04:00",
-        "sha": "7ee596a0cf9aa34b2b8ddd6ebe9f084c6b956a7e",
-        "subject": "fix(window): compile X11 active-connection check without the wayland feature"
+        "classification": "other",
+        "committed_at": "2026-09-15T15:21:31-04:00",
+        "sha": "2569bda9aa1987fa7fd0b66f14fd5dfbefc97d14",
+        "subject": "perf(window): measure native font menu dispatch latency"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2593,
-  "generated_at": "2026-09-14T21:28:03.295100Z",
+  "fork_side_commit_total": 2638,
+  "generated_at": "2026-09-15T20:48:15.565323Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
