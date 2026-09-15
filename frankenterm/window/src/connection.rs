@@ -83,6 +83,43 @@ pub(crate) fn remove_exact_window_registration<T>(
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct MacWindowGeometry {
+    pub width_points: f64,
+    pub height_points: f64,
+    pub position_pixels: Option<crate::ScreenPoint>,
+}
+
+/// AppKit sizes use points, but set_window_position accepts screen pixels and
+/// performs its own coordinate conversion. Font DPI is not a backing scale:
+/// changing text density must not change this pixel-to-point relationship.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn macos_window_geometry(
+    geometry: ResolvedGeometry,
+    screen: &crate::screen::ScreenInfo,
+) -> Fallible<MacWindowGeometry> {
+    anyhow::ensure!(
+        screen.scale.is_finite() && screen.scale > 0.0,
+        "invalid native display backing scale"
+    );
+    let width_points = geometry.width as f64 / screen.scale;
+    let height_points = geometry.height as f64 / screen.scale;
+    anyhow::ensure!(
+        width_points.is_finite() && height_points.is_finite(),
+        "native window dimensions exceed the backing scale range"
+    );
+    let position_pixels = geometry
+        .x
+        .zip(geometry.y)
+        .map(|(x, y)| crate::ScreenPoint::new(x as isize, y as isize));
+    Ok(MacWindowGeometry {
+        width_points,
+        height_points,
+        position_pixels,
+    })
+}
+
 pub fn shutdown() {
     CONN.with(|m| drop(m.borrow_mut().take()));
 }
@@ -393,6 +430,76 @@ mod tests {
             active,
             by_name,
             virtual_rect: euclid::rect(-1200, 0, 3120, 1100),
+        }
+    }
+
+    #[test]
+    fn macos_geometry_uses_backing_scale_not_font_dpi_and_preserves_position_pixels() {
+        for dpi in [72.0, 96.0, 144.0, 288.0] {
+            let mut display = screen_info("retina", 0, 0, 3200, 1800);
+            display.scale = 2.0;
+            display.effective_dpi = Some(dpi);
+            let conn = GeometryConnection {
+                screens: Some(Screens {
+                    main: display.clone(),
+                    active: display.clone(),
+                    by_name: HashMap::new(),
+                    virtual_rect: display.rect,
+                }),
+                dpi,
+            };
+            let resolved = conn.resolve_geometry(RequestedWindowGeometry {
+                width: Dimension::Pixels(1601.0),
+                height: Dimension::Pixels(801.0),
+                x: Some(Dimension::Pixels(-800.0)),
+                y: Some(Dimension::Pixels(240.0)),
+                origin: GeometryOrigin::ScreenCoordinateSystem,
+            });
+            let native = super::macos_window_geometry(resolved, &display).unwrap();
+            assert_eq!(native.width_points, 800.5, "font DPI {dpi}");
+            assert_eq!(native.height_points, 400.5, "font DPI {dpi}");
+            assert_eq!(
+                native.position_pixels,
+                Some(crate::ScreenPoint::new(-800, 240)),
+                "screen position must be converted exactly once by the native setter"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_geometry_preserves_fractional_backing_scale_and_unspecified_position() {
+        let mut display = screen_info("scaled", 0, 0, 3200, 1800);
+        display.scale = 1.25;
+        let native = super::macos_window_geometry(
+            crate::ResolvedGeometry {
+                width: 1600,
+                height: 800,
+                x: Some(500),
+                y: None,
+            },
+            &display,
+        )
+        .unwrap();
+        assert_eq!(native.width_points, 1280.0);
+        assert_eq!(native.height_points, 640.0);
+        assert_eq!(native.position_pixels, None);
+    }
+
+    #[test]
+    fn macos_geometry_rejects_invalid_or_overflowing_backing_scale_before_allocation() {
+        let mut display = screen_info("invalid", 0, 0, 3200, 1800);
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::from_bits(1)] {
+            display.scale = scale;
+            let result = super::macos_window_geometry(
+                crate::ResolvedGeometry {
+                    width: 1600,
+                    height: 800,
+                    x: None,
+                    y: None,
+                },
+                &display,
+            );
+            assert!(result.is_err(), "invalid backing scale {:?}", scale);
         }
     }
 

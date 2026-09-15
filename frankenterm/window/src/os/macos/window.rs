@@ -6,14 +6,14 @@
 use super::keycodes::*;
 use super::{nsstring, nsstring_to_str};
 use crate::clipboard::Clipboard as ClipboardContext;
-use crate::connection::ConnectionOps;
+use crate::connection::{macos_window_geometry, ConnectionOps, MacWindowGeometry};
 use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
     Clipboard, Connection, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
     MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
-    RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint, Size, ULength,
-    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    RequestedWindowGeometry, ResizeIncrement, ScreenPoint, Size, ULength, WindowDecorations,
+    WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -558,23 +558,11 @@ impl Window {
         let conn = Connection::get().ok_or_else(|| {
             anyhow!("new_window must be called after Connection::init has succeeded")
         })?;
-        let ResolvedGeometry {
-            width,
-            height,
-            x,
-            y,
-        } = conn.resolve_geometry(geometry);
-
-        let scale_factor = (conn.default_dpi() / crate::DEFAULT_DPI) as usize;
-        let width = width / scale_factor;
-        let height = height / scale_factor;
-        let x = x.map(|x| x / scale_factor as i32);
-        let y = y.map(|y| y / scale_factor as i32);
-
-        let initial_pos = match (x, y) {
-            (Some(x), Some(y)) => Some(ScreenPoint::new(x as isize, y as isize)),
-            _ => None,
-        };
+        let MacWindowGeometry {
+            width_points,
+            height_points,
+            position_pixels: initial_pos,
+        } = macos_window_geometry(conn.resolve_geometry(geometry), &conn.screens()?.active)?;
 
         unsafe {
             let style_mask = decoration_to_mask(
@@ -583,7 +571,7 @@ impl Window {
             );
             let rect = NSRect::new(
                 NSPoint::new(0., 0.),
-                NSSize::new(width as f64, height as f64),
+                NSSize::new(width_points, height_points),
             );
 
             let window_id = conn.next_window_id()?;
