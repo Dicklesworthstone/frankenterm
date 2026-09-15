@@ -8,8 +8,10 @@ file is the focused closer for `BR-RC-ATTESTATION-CLOSURE`
 
 ## When to run
 
-- **Before** tagging `vX.Y.0`. If the bundle is incomplete,
-  fix the gap before tagging. DSR is the exclusive release orchestrator;
+- **Before publication** of `vX.Y.0`. Complete source-derived evidence before
+  tagging; measurements of the built candidate follow the post-build procedure
+  below. An immutable candidate tag does not authorize publication.
+  DSR is the exclusive release orchestrator;
   a successful development-bundle check is not release qualification.
 - **After** the DSR release path lands the signed bundle —
   re-verify offline as a third party would.
@@ -63,6 +65,41 @@ an artifact but forgets the manifest slot can recreate the `ft-e87u6` NO_BEAD
 gap. If you skip this checklist, the `ft-e87u6.5`
 `attestation_manifest_completeness` regression test will fail CI.
 
+## Post-build release evidence
+
+Artifacts measured from a DSR-built candidate are generated after its source
+tag is frozen. Retain them under `artifacts/releases/<version>/` with a complete
+manifest selected through `FT_ATTESTATION_MANIFEST`. Preserve every canonical
+slot's category, producer identity, proof categories, and required-category
+membership. A deferred slot may acquire a release artifact only after its
+producer's actual executions and validators satisfy the declared contract.
+Before approving the retained manifest digest, independently compare it with
+the frozen source manifest: required categories, proof taxonomy, and the complete
+slot identity set must match. Only qualified producer artifact paths/receipts
+and removal of their resolved deferral metadata may differ. The assembler reads
+required categories from the selected manifest, so its success alone cannot
+prove this equality or authorize a shortened manifest.
+Missing, skipped, failed, or deferred evidence cannot qualify that slot. Run
+the complete DSR quality lane with this manifest, including strict-required
+and strict-deferred bundle verification; an earlier incomplete run is not a pass.
+
+The independently approved release policy must pin the retained manifest digest
+and the exact DSR-confirmed source commit/tree, profile, and targets. Verify
+measured executable hashes against the DSR receipts. A supplied source
+environment variable, a valid signature, or artifact hashes alone do not prove
+producer success. Retain the named execution results, causal negative checks,
+measurement acceptance results, and independent review with the release bundle.
+Preserve each producer's scope limits, including unproven target-class capacity.
+
+This qualifies the exact release, not an unfinished repository-wide producer
+campaign. Keep a producer bead active while its canonical manifest slot remains
+deferred; closing it in that state violates the manifest completeness contract.
+Record release-specific qualification and retained paths on the bead, using
+`br --no-auto-flush` during the source freeze. Source-maintained artifact and
+canonical manifest changes still use the same-commit closing convention above.
+Generating release evidence must not move the source tag, change tracked source,
+or substitute weaker tests to avoid recompilation.
+
 ## Pre-flight: every category has a producing bead
 
 The canonical required-category list lives in
@@ -115,9 +152,11 @@ records the retained fixture/proof-calendar counts, and that target-class
 capacity remains blocked when the resource-cockpit target-class artifact is
 `skipped_not_proven`.
 
-If any bead is **not closed**, the release MUST NOT proceed —
-the attestation bundle would either be partial (rejected by
-the build script) or claim coverage that doesn't exist.
+For source-maintained slots, an unclosed producing bead blocks release. For
+post-build slots, the complete retained release manifest and the independently
+verified producer results above establish qualification for that exact release;
+an open canonical-wiring bead does not substitute for or invalidate those
+results. In both cases, incomplete producer evidence MUST block publication.
 
 ## Build: assemble the bundle
 
