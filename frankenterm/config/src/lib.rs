@@ -1005,11 +1005,25 @@ impl ConfigWatchDependencies {
         );
         event.paths.iter().any(|path| {
             let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
-            self.paths.iter().any(|(dependency, directory)| {
-                dependency == &absolute
-                    || (*directory && absolute.starts_with(dependency))
-                    || (can_replace_ancestor && dependency.starts_with(&absolute))
-            })
+            // Inode-based backends may report a sibling through another watched
+            // parent alias (for example links/../config.lua). Resolve only the
+            // parent: the leaf may have disappeared or be a retargeted symlink.
+            let normalized =
+                absolute
+                    .parent()
+                    .zip(absolute.file_name())
+                    .and_then(|(parent, name)| {
+                        parent.canonicalize().ok().map(|parent| parent.join(name))
+                    });
+            std::iter::once(&absolute)
+                .chain(normalized.iter())
+                .any(|path| {
+                    self.paths.iter().any(|(dependency, directory)| {
+                        dependency == path
+                            || (*directory && path.starts_with(dependency))
+                            || (can_replace_ancestor && dependency.starts_with(path))
+                    })
+                })
         })
     }
 }
@@ -1546,10 +1560,18 @@ mod tests {
             *self.dependencies.lock().unwrap() = dependencies;
         }
 
+        #[track_caller]
         fn changed(&self) -> usize {
+            self.changed_after("relevant native event")
+        }
+
+        #[track_caller]
+        fn changed_after(&self, phase: &str) -> usize {
             self.generations
                 .recv_timeout(Duration::from_secs(5))
-                .expect("relevant native event must advance config generation")
+                .unwrap_or_else(|error| {
+                    panic!("{} must advance config generation: {}", phase, error)
+                })
         }
 
         fn quiet(&self) {
@@ -1631,27 +1653,64 @@ mod tests {
         let mut watcher = RealConfigWatcher::new(vec![config.clone()]);
         watcher.quiet();
         std::fs::write(&first, "return {font_size=11}").unwrap();
-        watcher.changed();
+        watcher.changed_after("initial symlink target write");
         watcher.quiet();
         let replacement = root.join("new-link");
         symlink(&second, &replacement).unwrap();
         std::fs::rename(&replacement, &intermediate).unwrap();
-        watcher.changed();
+        watcher.changed_after("intermediate symlink retarget");
         watcher.refresh(vec![config.clone()]);
         watcher.quiet();
         std::fs::write(&first, "old target must no longer reload").unwrap();
         watcher.quiet();
         std::fs::write(&second, "return {font_size=12}").unwrap();
-        watcher.changed();
+        watcher.changed_after("new symlink target write");
         watcher.quiet();
         let new_target = targets.join("replacement.lua");
         std::fs::write(&new_target, "return {font_size=13}").unwrap();
         std::fs::rename(&new_target, &second).unwrap();
-        watcher.changed();
+        watcher.changed_after("new symlink target atomic save");
         watcher.quiet();
         symlink(&first, &replacement).unwrap();
         std::fs::rename(&replacement, &config).unwrap();
-        watcher.changed();
+        watcher.changed_after("top-level symlink retarget through parent alias");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_watcher_matches_event_parent_alias_without_resolving_leaf() {
+        use notify::event::{ModifyKind, RemoveKind, RenameMode};
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("links")).unwrap();
+        let target = root.join("target.lua");
+        std::fs::write(&target, "return {}").unwrap();
+        let config = root.join("config.lua");
+        symlink(&target, &config).unwrap();
+        let dependencies = ConfigWatchDependencies::from_paths(vec![config.clone()]);
+        let alias = root.join("links/../config.lua");
+        let rename = |path| {
+            Ok(
+                notify::Event::new(notify::EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                    .add_path(path),
+            )
+        };
+        assert!(dependencies.relevant(&rename(alias.clone())));
+        assert!(!dependencies.relevant(&rename(root.join("links/../unrelated.lua"))));
+
+        // A removed leaf cannot be canonicalized, but its parent still can.
+        std::fs::rename(&config, root.join("saved-config.lua")).unwrap();
+        assert!(!config.exists());
+        assert!(
+            dependencies.relevant(&Ok(notify::Event::new(notify::EventKind::Remove(
+                RemoveKind::File,
+            ))
+            .add_path(alias)))
+        );
+        assert!(dependencies.relevant(&rename(config)));
+        assert!(!dependencies.relevant(&rename(root.join("links/../saved-config.lua"))));
     }
 
     #[cfg(feature = "lua")]
