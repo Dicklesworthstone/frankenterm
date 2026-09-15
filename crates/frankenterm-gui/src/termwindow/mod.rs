@@ -3564,6 +3564,10 @@ impl TermWindow {
             },
         )
         .await?;
+        #[cfg(target_os = "macos")]
+        let pending_native =
+            crate::frontend::PendingNativeWindow::new(window.initialization_rollback()?);
+        #[cfg(not(target_os = "macos"))]
         let pending_native = crate::frontend::PendingNativeWindow::new({
             let window = window.clone();
             move || window.close()

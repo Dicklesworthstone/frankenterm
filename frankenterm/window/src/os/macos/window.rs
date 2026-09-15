@@ -512,6 +512,25 @@ fn set_window_position(window: *mut Object, coords: ScreenPoint) {
 }
 
 impl Window {
+    /// Retain the exact unpublished native view for initialization rollback.
+    ///
+    /// The returned closure is owner-thread-only (`Rc`), and closes directly
+    /// after the initialization future releases its borrows. It neither needs
+    /// another scheduler admission nor resolves a numeric id on a replacement
+    /// Connection when a failed/cancelled GUI initialization is unwound.
+    pub fn initialization_rollback(&self) -> anyhow::Result<impl FnOnce()> {
+        let conn = Connection::get()
+            .ok_or_else(|| anyhow!("native window initialization lost its connection"))?;
+        let inner = conn
+            .window_by_id(self.id)
+            .ok_or_else(|| anyhow!("native window initialization lost its window"))?;
+        anyhow::ensure!(
+            *inner.borrow().window == self.ns_window,
+            "native window initialization has a different exact owner"
+        );
+        Ok(move || inner.borrow_mut().close())
+    }
+
     pub async fn new_window<F>(
         _class_name: &str,
         name: &str,
