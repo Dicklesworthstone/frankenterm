@@ -2928,6 +2928,9 @@ impl Default for RenderRecoveryMode {
 #[derive(Debug, Default)]
 struct RenderRecoveryState {
     mode: RenderRecoveryMode,
+    /// A dependency notification may release one pending-frame attempt early.
+    /// Repeated output must not turn contention into an unbounded paint loop.
+    native_ready_retry_used: bool,
     /// Monotonic negative evidence for the current no-success incident.
     /// Failure-stage changes and external surface signals must not reset it;
     /// only a presented frame or complete renderer reinitialization may do so.
@@ -3082,6 +3085,25 @@ impl RenderRecoveryState {
         }
     }
 
+    fn mark_native_frame_ready(&mut self) -> bool {
+        if self.native_ready_retry_used
+            || !matches!(
+                self.mode,
+                RenderRecoveryMode::Cooldown {
+                    stage: RenderFailureStage::NativeFramePending,
+                    ..
+                }
+            )
+        {
+            return false;
+        }
+        self.native_ready_retry_used = true;
+        self.mode = RenderRecoveryMode::RetryReady {
+            stage: RenderFailureStage::NativeFramePending,
+        };
+        true
+    }
+
     fn park(&mut self, stage: RenderFailureStage) {
         self.mode = RenderRecoveryMode::Parked { stage };
     }
@@ -3093,6 +3115,7 @@ impl RenderRecoveryState {
     fn record_success(&mut self) {
         self.mode = RenderRecoveryMode::Healthy;
         self.failed_attempts_since_success = 0;
+        self.native_ready_retry_used = false;
     }
 
     fn record_reinitialized(&mut self) {
@@ -4207,7 +4230,7 @@ impl TermWindow {
                         }
                     }
                     MuxNotification::PaneOutput(pane_id) => {
-                        self.mux_pane_output_event(pane_id);
+                        self.mux_pane_output_event(pane_id)?;
                     }
                     MuxNotification::SynchronizedOutput { pane_id, event } => {
                         self.mux_synchronized_output_event(pane_id, event);
@@ -4571,14 +4594,31 @@ impl TermWindow {
         tab.contains_pane(pane_id)
     }
 
-    fn mux_pane_output_event(&mut self, pane_id: PaneId) {
+    fn mux_pane_output_event(&mut self, pane_id: PaneId) -> anyhow::Result<()> {
         self.record_idle_event(idle_detector::IdleEvent::PtyData);
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
         if self.is_pane_visible(pane_id) {
-            if let Some(ref win) = self.window {
-                win.invalidate();
+            if let Some(win) = self.window.clone() {
+                if self.resizes_pending == 0
+                    && self.webgpu.is_some()
+                    && self.render_recovery_state.mark_native_frame_ready()
+                {
+                    // A resize/cold-read worker can publish a coherent frame
+                    // before the pending-frame timer expires. Paint once on
+                    // this main-thread notification instead of adding both
+                    // the retry delay and the native repaint throttle. The
+                    // ordinary paint path still acquires and validates the
+                    // exact frame lease, and failure retains its bounded retry.
+                    self.render_wake_state.cancel();
+                    metrics::counter!("gui.render.retry", "action" => "native_frame_ready")
+                        .increment(1);
+                    self.paint_if_admitted(&win)?;
+                } else {
+                    win.invalidate();
+                }
             }
         }
+        Ok(())
     }
 
     fn mux_synchronized_output_event(&mut self, pane_id: PaneId, event: SynchronizedOutputEvent) {
