@@ -11671,19 +11671,18 @@ mod tests {
             Err(GuardianCheckpointStageStoreError::Conflict)
         ));
         assert_no_ack()?;
-        let wrong_generation = GuardianCheckpointStageRequestV1::ack(
-            GuardianCheckpointScopeV1::Pane {
-                pane_id: pane,
-                generation: 2,
-            },
-            begin.upload_id(),
-            begin.descriptor(),
-            begin.chunk_bytes(),
-            completion,
-        )?;
         assert!(matches!(
-            store.apply_ack_from_committed_catalog(wrong_generation, mux),
-            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+            GuardianCheckpointStageRequestV1::ack(
+                GuardianCheckpointScopeV1::Pane {
+                    pane_id: pane,
+                    generation: 2,
+                },
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion,
+            ),
+            Err(GuardianProtocolError::InvalidOperationPayload)
         ));
         assert_no_ack()?;
         // A second real durable output receipt produces a valid, distinct
@@ -11695,6 +11694,30 @@ mod tests {
             alternate_terminal.parser_stream_bytes(),
             alternate_receipt.cumulative_plaintext_bytes()
         );
+        // A structurally valid generation-2 descriptor must reach the store's
+        // independent generation fence, rather than fail during construction.
+        let later_generation = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane,
+            2,
+            begin.upload_id(),
+            &alternate_terminal,
+            alternate_receipt,
+            begin.chunk_bytes(),
+            None,
+        )?;
+        let wrong_generation = GuardianCheckpointStageRequestV1::ack(
+            later_generation.scope(),
+            later_generation.upload_id(),
+            later_generation.descriptor(),
+            later_generation.chunk_bytes(),
+            completion,
+        )?;
+        assert!(matches!(
+            store.apply_ack_from_committed_catalog(wrong_generation, mux),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+        assert_no_ack()?;
         let alternate = checkpoint_catalog_test_record_stage_request(
             GuardianCheckpointStageKindV1::Begin,
             pane,
