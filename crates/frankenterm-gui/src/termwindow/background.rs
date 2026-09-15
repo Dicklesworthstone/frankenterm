@@ -1443,7 +1443,19 @@ impl BackgroundLoadCoordinator {
                     &request.render_metrics,
                     &|| request.cancellation.load(Ordering::Acquire),
                 );
-                metrics::histogram!("gui.background.load_duration").record(started.elapsed());
+                let elapsed = started.elapsed();
+                metrics::histogram!("gui.background.load_duration").record(elapsed);
+                // Background completion can produce a later correct frame
+                // even when text reflow and GPU submission were already fast.
+                // This is worker elapsed time, not a compositor timestamp.
+                log::debug!(
+                    target: "frankenterm_gui::native_present_stages",
+                    "background_load_complete width={} height={} worker_duration_us={} cancelled={}",
+                    request.dimensions.pixel_width,
+                    request.dimensions.pixel_height,
+                    elapsed.as_micros(),
+                    request.cancellation.load(Ordering::Acquire),
+                );
 
                 if !request.cancellation.load(Ordering::Acquire) {
                     let coordinator = self.clone();

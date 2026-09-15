@@ -1759,7 +1759,12 @@ impl WebGpuState {
     /// here because legacy resize notifications have no error return channel;
     /// the acquisition path below repeats the operation with typed handling.
     pub fn resize(&self, dims: Dimensions) {
-        if let Err(err) = self.configure_surface(dims, false) {
+        // Resize normally configures eagerly, before prepare_surface runs.
+        // Timing only prepare_surface would hide this driver work behind a
+        // later no-op and misattribute it to input dispatch or text reflow.
+        if let Err(err) =
+            self.profile_native_stage("resize_configure", || self.configure_surface(dims, false))
+        {
             log::warn!("failed to resize webgpu surface: {err:#}");
         }
     }
