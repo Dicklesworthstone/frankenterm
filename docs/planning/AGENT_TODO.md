@@ -179,6 +179,45 @@ just code presence. Existing remote sessions remain outside the disposable test.
 - [ ] Establish a new final candidate freeze after fixes and producer
   qualification; complete DSR quality, native acceptance, and release above.
 
+### 22:32 UTC implementation and execution checkpoint
+
+- [x] Commit word-aware wrapping and exact cold-output admission as `87118af0e`;
+  retained-memory accounting includes word metadata and break-vector capacity.
+- [x] Commit fixed-window font zoom by default as `a736fcd95`.
+- [x] Execute its two named default/explicit-opt-in tests: strict RCH job
+  `30016197441357381`, worker vmi1152480, source `4b9ff4f503e475796b41c0fff35bb6fced473ed8`,
+  two passed, remote exit zero. Native default behavior remains unproven.
+- [x] Execute the Busy-storage layout regression: strict RCH job
+  `30016197441357375`, source `03f6b676bea475dda4e628600fb8238054fc8225`,
+  one named test passed on vmi1152480.
+- [x] Fix the separate older-closed-prefix layout churn in `4c58b7148` and
+  add the real LocalPane publication regression in `87f193a78`.
+- [ ] Finish the full surface, terminal and mux library suites, strict RCH
+  job `30016197441357384`, source `87f193a783181d248288bdf6f3ae5fe6e2ff9ae9`.
+- [ ] Finish the high-memory hz3 workspace/all-targets check, strict RCH
+  job `30016197441357385`, at that same source. Temporary routing was restored.
+- [ ] Finish the still-active nine crash/watcher regressions, job 57350.
+- [x] Retain RC22's terminal native compiler failure; repair ambiguous gradient
+  pixel-buffer typing in `cf9d9270b`. RC22 produced no qualified application.
+- [x] Commit measured Lindley phases in `6984c999d` without changing workload
+  or acceptance thresholds; execute its causal tests and fresh measurements next.
+- [x] Commit a real sealed Genesis catalog-to-broker acceptance test in
+  `4b9ff4f50`; its explicitly ignored, compiled-identity execution remains pending.
+- [ ] Wire authenticated Genesis staging through the real guardian client,
+  transport and durable output worker; reject cross-connection authority.
+- [ ] Implement durable broker-capability custody and broker-backed runtime
+  activation before enabling ordinary guardian Spawn or remote upgrades.
+- [x] Back up Dock settings and correct only the FrankenTerm tile from RC1 to
+  `/Applications/FrankenTerm.app`; verify after Dock reload. GUI PID 17757 stayed
+  running. This fixes the launcher path, not the installed RC15 application.
+- [x] Enable Windows NFS without reboot and qualify dedicated exact-client
+  storage: flush, rename, writable reopen and independent-process locking pass.
+- [ ] Integrate the per-SSH mapped-drive mount into private DSR Windows builds;
+  direct UNC paths cannot provide the required locking.
+- [ ] Complete the four deferred attestation producers, strict DSR quality,
+  native default and frozen-harness acceptance, four-target release, signature
+  verification, canary, upgrade verification, and safe Mac activation above.
+
 This operator-requested TODO retires as an active checklist when its remaining
 work is completed or explicitly handed off with qualified evidence.
 
