@@ -303,3 +303,5 @@ ubs_*.txt
 /pat
 /output.txt
 claude-upgrade-progress.json
+# rustfmt staging copies written by Codex format passes.
+.codex-format-stage/
