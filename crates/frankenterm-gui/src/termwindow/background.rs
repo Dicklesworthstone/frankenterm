@@ -11,6 +11,7 @@ use config::{
     BackgroundSource, BackgroundVerticalAlignment, ConfigHandle, DimensionContext, Gradient,
     GradientOrientation,
 };
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,31 @@ lazy_static::lazy_static! {
             .build()
             .map_err(|error| error.to_string())
     };
+    static ref GRADIENT_WORK_POOL: Result<rayon::ThreadPool, String> = {
+        // Parallelize only pixel generation, not whole image decodes. The
+        // existing coordinator still bounds simultaneously retained images.
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let workers = match std::env::var_os("FT_PROFILE_GRADIENT_WORKERS") {
+            None => (available / 4).clamp(1, 4),
+            Some(value) if value == "1" => 1,
+            Some(value) if value == "2" => 2,
+            Some(value) if value == "4" => 4,
+            Some(_) => {
+                log::warn!("FT_PROFILE_GRADIENT_WORKERS must be 1, 2 or 4; using the default");
+                (available / 4).clamp(1, 4)
+            }
+        };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("background-gradient-{index}"))
+            .build()
+            .map_err(|error| {
+                log::warn!("gradient worker pool unavailable; using serial pixels: {error}");
+                error.to_string()
+            })
+    };
 }
 
 const MAX_BACKGROUND_DECODED_BYTES: usize = MAX_TRUSTED_LOCAL_IMAGE_DECODED_BYTES;
@@ -54,6 +80,10 @@ const MAX_ACTIVE_BACKGROUND_DECODED_BYTES: usize = MAX_BACKGROUND_CACHE_BYTES;
 const BACKGROUND_IO_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_BACKGROUND_TILES_PER_LAYER: usize = 16_384;
 const GRADIENT_NOISE_SEED: u64 = 0x6674_2d67_7261_6469;
+// Axis-aligned dithering visits integer positions. Bound its optional exact
+// color table independently of the decoded-image budget (at most 256 KiB).
+const MAX_GRADIENT_AXIS_SAMPLES: usize = 65_536;
+const MIN_PARALLEL_GRADIENT_PIXELS: usize = 128 * 1_024;
 #[cfg(test)]
 const FIRST_F64_INTEGER_WITHOUT_UNIT_PRECISION: f64 = 9_007_199_254_740_992.0;
 const BACKGROUND_IMAGE_VALIDATION_LIMITS: ImageDataValidationLimits = ImageDataValidationLimits {
@@ -541,6 +571,83 @@ fn gradient_noise(rng: &mut fastrand::Rng, noise_amount: usize) -> f64 {
     }
 }
 
+fn rasterize_gradient_pixels(
+    image: &mut image::RgbaImage,
+    config: &Gradient,
+    serial_gradient: &dyn colorgrad::Gradient,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+    pool: Option<&rayon::ThreadPool>,
+    pixel: impl Fn(&dyn colorgrad::Gradient, u32, u32, &mut fastrand::Rng) -> image::Rgba<u8> + Sync,
+) -> anyhow::Result<()> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let row_bytes = width * 4;
+    let render_row = |gradient: &dyn colorgrad::Gradient,
+                      y: usize,
+                      row: &mut [u8],
+                      mut rng: fastrand::Rng|
+     -> anyhow::Result<()> {
+        for (x, output) in row.chunks_exact_mut(4).enumerate() {
+            if (x == 0 || (y * width + x).is_multiple_of(4_096)) && is_cancelled() {
+                anyhow::bail!("background gradient load was superseded");
+            }
+            output.copy_from_slice(&pixel(gradient, x as u32, y as u32, &mut rng).0);
+        }
+        Ok(())
+    };
+
+    if width * height >= MIN_PARALLEL_GRADIENT_PIXELS
+        && let Some(pool) = pool
+        && pool.current_num_threads() > 1
+    {
+        let mut seeds = Vec::new();
+        if seeds.try_reserve_exact(height).is_ok() {
+            let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
+            for _ in 0..height {
+                seeds.push(row_seeds.fork());
+            }
+            let rows_per_group = height.div_ceil(pool.current_num_threads());
+            return pool.install(|| {
+                image
+                    .as_mut()
+                    .par_chunks_mut(row_bytes * rows_per_group)
+                    .zip(seeds.par_chunks(rows_per_group))
+                    .enumerate()
+                    // colorgrad erases Send/Sync on its boxed trait. Build
+                    // each bounded row group's gradient on its executing
+                    // thread; never assert cross-thread safety for that box.
+                    .try_for_each_init(
+                        || config.build(),
+                        |gradient, (group, (rows, seeds))| {
+                            let gradient = gradient.as_ref().map_err(|error| {
+                                anyhow::anyhow!("building gradient row group: {error:#}")
+                            })?;
+                            for (offset, (row, rng)) in rows
+                                .chunks_exact_mut(row_bytes)
+                                .zip(seeds.iter())
+                                .enumerate()
+                            {
+                                render_row(
+                                    gradient.as_ref(),
+                                    group * rows_per_group + offset,
+                                    row,
+                                    rng.clone(),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )
+            });
+        }
+    }
+
+    let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
+    for (y, row) in image.as_mut().chunks_exact_mut(row_bytes).enumerate() {
+        render_row(serial_gradient, y, row, row_seeds.fork())?;
+    }
+    Ok(())
+}
+
 fn background_sources_match(left: &BackgroundSource, right: &BackgroundSource) -> bool {
     match (left, right) {
         (BackgroundSource::Gradient(left), BackgroundSource::Gradient(right)) => left == right,
@@ -577,7 +684,7 @@ impl CachedGradient {
         g: &Gradient,
         width: u32,
         height: u32,
-        is_cancelled: &dyn Fn() -> bool,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
     ) -> anyhow::Result<Arc<ImageData>> {
         anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
         let pixel_bytes = checked_background_pixel_bytes(width, height)
@@ -593,6 +700,11 @@ impl CachedGradient {
         pixels.resize(pixel_bytes, 0);
         let mut imgbuf = image::RgbaImage::from_raw(width, height, pixels)
             .context("constructing bounded background gradient image")?;
+        let pool = if pixel_bytes / 4 >= MIN_PARALLEL_GRADIENT_PIXELS {
+            GRADIENT_WORK_POOL.as_ref().ok()
+        } else {
+            None
+        };
         let fw = width as f64;
         let fh = height as f64;
 
@@ -611,12 +723,6 @@ impl CachedGradient {
             "background gradient domain must be finite and increasing"
         );
 
-        // Keep the dither fixed in image coordinates across independent loads.
-        // Only row forks advance this seed stream: changing a row's width or
-        // consuming an extra bounded-range sample cannot shift later rows.
-        let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
-        let mut rng = row_seeds.clone();
-
         // We add some randomness to the position that we use to
         // index into the color gradient, so that we can avoid
         // visible color banding.  The default 64 was selected
@@ -630,62 +736,97 @@ impl CachedGradient {
             }
         });
 
-        match g.orientation {
-            GradientOrientation::Horizontal => {
-                for (index, (x, _, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
+        // Horizontal/vertical pixels repeatedly sample the same small set of
+        // integer coordinates. Each coordinate and subtraction below is exact
+        // in f64 under this table bound, so the original remap/interpolation
+        // computes identical colors. Keep the RNG in the pixel loop: its row
+        // forks and bounded-range draws remain the dither authority.
+        let axis_size = match g.orientation {
+            GradientOrientation::Horizontal => Some(width),
+            GradientOrientation::Vertical => Some(height),
+            _ => None,
+        };
+        let noise_offset = noise_amount.saturating_sub(1);
+        let mut axis_samples = Vec::new();
+        if let Some(axis_size) = axis_size {
+            let sample_count = usize::try_from(axis_size)
+                .ok()
+                .and_then(|size| size.checked_add(noise_offset))
+                .filter(|&count| count <= MAX_GRADIENT_AXIS_SAMPLES && count <= pixel_bytes / 8);
+            if let Some(sample_count) = sample_count
+                && axis_samples.try_reserve_exact(sample_count).is_ok()
+            {
+                for index in 0..sample_count {
                     if index.is_multiple_of(4_096) && is_cancelled() {
                         anyhow::bail!("background gradient load was superseded");
                     }
-                    if x == 0 {
-                        rng = row_seeds.fork();
-                    }
-                    *pixel = to_pixel(grad.at(remap(
-                        x as f64 + gradient_noise(&mut rng, noise_amount),
+                    axis_samples.push(to_pixel(grad.at(remap(
+                        index as f64 - noise_offset as f64,
                         0.0,
-                        fw,
+                        f64::from(axis_size),
                         dmin,
                         dmax,
-                    )));
+                    ))));
                 }
             }
+        }
+        let axis_pixel = |grad: &dyn colorgrad::Gradient, position: f64, extent: f64| {
+            if axis_samples.is_empty() {
+                to_pixel(grad.at(remap(position, 0.0, extent, dmin, dmax)))
+            } else {
+                // position is axis - rng(0..noise_amount), or axis when noise
+                // is zero. Adding the offset lies in 0..axis_samples.len().
+                axis_samples[(position + noise_offset as f64) as usize]
+            }
+        };
+
+        match g.orientation {
+            GradientOrientation::Horizontal => {
+                rasterize_gradient_pixels(
+                    &mut imgbuf,
+                    g,
+                    grad.as_ref(),
+                    is_cancelled,
+                    pool,
+                    |grad, x, _, rng| {
+                        axis_pixel(grad, x as f64 + gradient_noise(rng, noise_amount), fw)
+                    },
+                )?;
+            }
             GradientOrientation::Vertical => {
-                for (index, (x, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
-                    if index.is_multiple_of(4_096) && is_cancelled() {
-                        anyhow::bail!("background gradient load was superseded");
-                    }
-                    if x == 0 {
-                        rng = row_seeds.fork();
-                    }
-                    *pixel = to_pixel(grad.at(remap(
-                        y as f64 + gradient_noise(&mut rng, noise_amount),
-                        0.0,
-                        fh,
-                        dmin,
-                        dmax,
-                    )));
-                }
+                rasterize_gradient_pixels(
+                    &mut imgbuf,
+                    g,
+                    grad.as_ref(),
+                    is_cancelled,
+                    pool,
+                    |grad, _, y, rng| {
+                        axis_pixel(grad, y as f64 + gradient_noise(rng, noise_amount), fh)
+                    },
+                )?;
             }
             GradientOrientation::Linear { angle } => {
                 let angle = angle.unwrap_or(0.0).to_radians();
                 let half_extent = linear_gradient_projection_half_extent(fw, fh, angle)?;
-                for (index, (x, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
-                    if index.is_multiple_of(4_096) && is_cancelled() {
-                        anyhow::bail!("background gradient load was superseded");
-                    }
-                    if x == 0 {
-                        rng = row_seeds.fork();
-                    }
-                    let (x, y) = (x as f64, y as f64);
-                    let (x, y) = (x - fw / 2., y - fh / 2.);
-                    let t = x * f64::cos(angle) - y * f64::sin(angle);
-                    *pixel = to_pixel(grad.at(remap(
-                        t + gradient_noise(&mut rng, noise_amount),
-                        -half_extent,
-                        half_extent,
-                        dmin,
-                        dmax,
-                    )));
-                }
+                rasterize_gradient_pixels(
+                    &mut imgbuf,
+                    g,
+                    grad.as_ref(),
+                    is_cancelled,
+                    pool,
+                    |grad, x, y, rng| {
+                        let (x, y) = (x as f64, y as f64);
+                        let (x, y) = (x - fw / 2., y - fh / 2.);
+                        let t = x * f64::cos(angle) - y * f64::sin(angle);
+                        to_pixel(grad.at(remap(
+                            t + gradient_noise(rng, noise_amount),
+                            -half_extent,
+                            half_extent,
+                            dmin,
+                            dmax,
+                        )))
+                    },
+                )?;
             }
             GradientOrientation::Radial { radius, cx, cy } => {
                 let radius = fw * radius.unwrap_or(0.5);
@@ -700,37 +841,38 @@ impl CachedGradient {
                     "background radial gradient center must be finite"
                 );
 
-                for (index, (x, y, pixel)) in imgbuf.enumerate_pixels_mut().enumerate() {
-                    if index.is_multiple_of(4_096) && is_cancelled() {
-                        anyhow::bail!("background gradient load was superseded");
-                    }
-                    if x == 0 {
-                        rng = row_seeds.fork();
-                    }
-                    let x = x as f64;
-                    let y = y as f64;
-                    // Consume both axes even when the center suppresses their
-                    // offsets, so that suppression never shifts later pixels.
-                    let noise_x = gradient_noise(&mut rng, noise_amount);
-                    let noise_y = gradient_noise(&mut rng, noise_amount);
+                rasterize_gradient_pixels(
+                    &mut imgbuf,
+                    g,
+                    grad.as_ref(),
+                    is_cancelled,
+                    pool,
+                    |grad, x, y, rng| {
+                        let x = x as f64;
+                        let y = y as f64;
+                        // Consume both axes even when the center suppresses their
+                        // offsets, so that suppression never shifts later pixels.
+                        let noise_x = gradient_noise(rng, noise_amount);
+                        let noise_y = gradient_noise(rng, noise_amount);
 
-                    // If we are close to the center, stop applying noise,
-                    // as the noise can wrap around and start using the
-                    // color from the other end of the gradient and look weird
-                    let nx = if ((cx - x).abs() as usize) < noise_amount {
-                        0.
-                    } else {
-                        noise_x
-                    };
-                    let ny = if ((cy - y).abs() as usize) < noise_amount {
-                        0.
-                    } else {
-                        noise_y
-                    };
+                        // If we are close to the center, stop applying noise,
+                        // as the noise can wrap around and start using the
+                        // color from the other end of the gradient and look weird
+                        let nx = if ((cx - x).abs() as usize) < noise_amount {
+                            0.
+                        } else {
+                            noise_x
+                        };
+                        let ny = if ((cy - y).abs() as usize) < noise_amount {
+                            0.
+                        } else {
+                            noise_y
+                        };
 
-                    let t = radial_gradient_distance(x, y, cx, cy, nx, ny, radius);
-                    *pixel = to_pixel(grad.at(t as f32));
-                }
+                        let t = radial_gradient_distance(x, y, cx, cy, nx, ny, radius);
+                        to_pixel(grad.at(t as f32))
+                    },
+                )?;
             }
         }
 
@@ -750,7 +892,7 @@ impl CachedGradient {
         width: u32,
         height: u32,
         max_decoded_bytes: usize,
-        is_cancelled: &dyn Fn() -> bool,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
     ) -> anyhow::Result<Arc<ImageData>> {
         anyhow::ensure!(!is_cancelled(), "background gradient load was superseded");
         let retained_bytes = checked_background_pixel_bytes(width, height)?;
@@ -1079,7 +1221,7 @@ fn load_background_layer(
     dimensions: &Dimensions,
     render_metrics: &RenderMetrics,
     max_decoded_bytes: usize,
-    is_cancelled: &dyn Fn() -> bool,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> anyhow::Result<LoadedBackgroundLayer> {
     anyhow::ensure!(!is_cancelled(), "background layer load was superseded");
     let h_context = DimensionContext {
@@ -1171,7 +1313,7 @@ fn reload_background_image(
     existing: &[LoadedBackgroundLayer],
     dimensions: &Dimensions,
     render_metrics: &RenderMetrics,
-    is_cancelled: &dyn Fn() -> bool,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<LoadedBackgroundLayer> {
     // We want to reuse the existing version of the image where possible
     // so that the textures we may have cached can be re-used and so that
@@ -1991,6 +2133,236 @@ mod tests {
         }
     }
 
+    // Retain the old per-pixel algorithm as an independent pixel oracle. It
+    // deliberately performs no lookup, sharing only the established RNG draw.
+    fn scalar_gradient_pixels(g: &Gradient, width: u32, height: u32) -> Vec<u8> {
+        let gradient = g.build().unwrap();
+        let (dmin, dmax) = gradient.domain();
+        let fw = f64::from(width);
+        let fh = f64::from(height);
+        let remap = |t: f64, a: f64, b: f64| {
+            ((t - a) * (f64::from(dmax - dmin) / (b - a)) + f64::from(dmin)) as f32
+        };
+        let noise = g.noise.unwrap_or_else(|| {
+            if matches!(g.orientation, GradientOrientation::Radial { .. }) {
+                16
+            } else {
+                64
+            }
+        });
+        let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            let mut rng = row_seeds.fork();
+            for x in 0..width {
+                let position = match g.orientation {
+                    GradientOrientation::Horizontal => {
+                        remap(f64::from(x) + gradient_noise(&mut rng, noise), 0.0, fw)
+                    }
+                    GradientOrientation::Vertical => {
+                        remap(f64::from(y) + gradient_noise(&mut rng, noise), 0.0, fh)
+                    }
+                    GradientOrientation::Linear { angle } => {
+                        let angle = angle.unwrap_or(0.0).to_radians();
+                        let extent = (fw * angle.cos().abs() + fh * angle.sin().abs()) / 2.0;
+                        let t = (f64::from(x) - fw / 2.) * angle.cos()
+                            - (f64::from(y) - fh / 2.) * angle.sin();
+                        remap(t + gradient_noise(&mut rng, noise), -extent, extent)
+                    }
+                    GradientOrientation::Radial { radius, cx, cy } => {
+                        let radius = fw * radius.unwrap_or(0.5);
+                        let cx = fw * cx.unwrap_or(0.5);
+                        let cy = fh * cy.unwrap_or(0.5);
+                        let x = f64::from(x);
+                        let y = f64::from(y);
+                        let noise_x = gradient_noise(&mut rng, noise);
+                        let noise_y = gradient_noise(&mut rng, noise);
+                        let nx = if ((cx - x).abs() as usize) < noise {
+                            0.
+                        } else {
+                            noise_x
+                        };
+                        let ny = if ((cy - y).abs() as usize) < noise {
+                            0.
+                        } else {
+                            noise_y
+                        };
+                        (((x + nx - cx).powi(2) + (y + ny - cy).powi(2)).sqrt() / radius) as f32
+                    }
+                };
+                pixels.extend_from_slice(&gradient.at(position).to_rgba8());
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn axis_gradient_lookup_matches_original_scalar_pixels() {
+        for orientation in [
+            GradientOrientation::Horizontal,
+            GradientOrientation::Vertical,
+        ] {
+            for interpolation in [
+                config::Interpolation::Linear,
+                config::Interpolation::Basis,
+                config::Interpolation::CatmullRom,
+            ] {
+                for blend in [
+                    config::BlendMode::Rgb,
+                    config::BlendMode::LinearRgb,
+                    config::BlendMode::Oklab,
+                ] {
+                    for noise in [
+                        None,
+                        Some(0),
+                        Some(1),
+                        Some(3),
+                        Some(64),
+                        Some(257),
+                        Some(65_536),
+                        Some(usize::MAX),
+                    ] {
+                        for (width, height) in [(1, 1), (13, 7), (73, 97)] {
+                            let mut gradient = test_gradient(orientation, noise);
+                            gradient.colors =
+                                vec!["#08152680".into(), "#ab49cdff".into(), "#12f39b20".into()];
+                            gradient.interpolation = interpolation;
+                            gradient.blend = blend;
+                            let actual =
+                                CachedGradient::compute(&gradient, width, height, &|| false)
+                                    .unwrap();
+                            assert_eq!(
+                                gradient_pixels(&actual),
+                                scalar_gradient_pixels(&gradient, width, height),
+                                "orientation={orientation:?} interpolation={interpolation:?} blend={blend:?} noise={noise:?} size={width}x{height}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_gradient_lookup_boundary_and_supersession_keep_scalar_contract() {
+        // Exactly 65,536 samples fit both the independent table cap and half
+        // the pixel count; one extra sample must take the unchanged fallback.
+        for noise in [65_536 - 1_024 + 1, 65_536 - 1_024 + 2] {
+            let gradient = test_gradient(GradientOrientation::Vertical, Some(noise));
+            let actual = CachedGradient::compute(&gradient, 128, 1_024, &|| false).unwrap();
+            assert_eq!(
+                gradient_pixels(&actual),
+                scalar_gradient_pixels(&gradient, 128, 1_024)
+            );
+        }
+
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let gradient = test_gradient(GradientOrientation::Vertical, Some(64_513));
+        let cancelled = CachedGradient::compute(&gradient, 128, 1_024, &|| {
+            checks.fetch_add(1, Ordering::Relaxed) + 1 >= 3
+        });
+        assert!(matches!(cancelled, Err(error) if error.to_string().contains("superseded")));
+        assert_eq!(checks.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn large_gradient_generation_matches_original_scalar_pixels() {
+        for orientation in [
+            GradientOrientation::Horizontal,
+            GradientOrientation::Vertical,
+            GradientOrientation::Linear { angle: Some(-45.0) },
+            GradientOrientation::Radial {
+                radius: Some(0.75),
+                cx: Some(0.2),
+                cy: Some(0.4),
+            },
+        ] {
+            for noise in [Some(0), None, Some(64)] {
+                let mut gradient = test_gradient(orientation, noise);
+                gradient.colors = vec!["#08152680".into(), "#ab49cdff".into(), "#12f39b20".into()];
+                let actual = CachedGradient::compute(&gradient, 513, 257, &|| false).unwrap();
+                assert_eq!(
+                    gradient_pixels(&actual),
+                    scalar_gradient_pixels(&gradient, 513, 257),
+                    "orientation={orientation:?} noise={noise:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_gradient_rows_preserve_scalar_coordinates_and_rng_draws() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let width = 513;
+        let height = 257;
+        let mut config =
+            test_gradient(GradientOrientation::Linear { angle: Some(-45.0) }, Some(64));
+        config.colors = vec!["#060a10".into(), "#0a1018".into(), "#0e1420".into()];
+        let gradient = config.build().unwrap();
+        let angle = (-45.0_f64).to_radians();
+        let half_extent =
+            linear_gradient_projection_half_extent(width as f64, height as f64, angle).unwrap();
+        let pixel =
+            |gradient: &dyn colorgrad::Gradient, x: u32, y: u32, rng: &mut fastrand::Rng| {
+                let x = x as f64 - width as f64 / 2.;
+                let y = y as f64 - height as f64 / 2.;
+                let t = x * angle.cos() - y * angle.sin() + gradient_noise(rng, 64);
+                image::Rgba(
+                    gradient
+                        .at(((t + half_extent) / (2. * half_extent)) as f32)
+                        .to_rgba8(),
+                )
+            };
+        let mut expected = Vec::new();
+        let mut row_seeds = fastrand::Rng::with_seed(GRADIENT_NOISE_SEED);
+        for y in 0..height {
+            let mut rng = row_seeds.fork();
+            for x in 0..width {
+                expected.extend_from_slice(&pixel(gradient.as_ref(), x, y, &mut rng).0);
+            }
+        }
+        let mut actual = image::RgbaImage::new(width, height);
+        rasterize_gradient_pixels(
+            &mut actual,
+            &config,
+            gradient.as_ref(),
+            &|| false,
+            Some(&pool),
+            pixel,
+        )
+        .unwrap();
+        assert_eq!(actual.into_raw(), expected);
+    }
+
+    #[test]
+    fn parallel_gradient_rows_stop_after_supersession() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let config = test_gradient(GradientOrientation::Vertical, None);
+        let gradient = config.build().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut image = image::RgbaImage::new(513, 257);
+        let result = rasterize_gradient_pixels(
+            &mut image,
+            &config,
+            gradient.as_ref(),
+            &|| cancelled.load(Ordering::Acquire),
+            Some(&pool),
+            |_, x, y, _| {
+                if x == 0 && y == 0 {
+                    cancelled.store(true, Ordering::Release);
+                }
+                image::Rgba([0, 0, 0, 255])
+            },
+        );
+        assert!(matches!(result, Err(error) if error.to_string().contains("superseded")));
+    }
+
     #[test]
     fn gradient_independent_computations_preserve_exact_pixels_and_content_authority() {
         for orientation in [
@@ -2177,9 +2549,9 @@ mod tests {
     fn cancelled_gradient_generation_never_enters_the_published_cache() {
         let mut gradient = test_gradient(GradientOrientation::Vertical, Some(17));
         gradient.colors = vec!["#123abd".to_string(), "#e6d5c4".to_string()];
-        let compute_checks = std::cell::Cell::new(0);
+        let compute_checks = std::sync::atomic::AtomicUsize::new(0);
         let reference = CachedGradient::compute(&gradient, 131, 79, &|| {
-            compute_checks.set(compute_checks.get() + 1);
+            compute_checks.fetch_add(1, Ordering::Relaxed);
             false
         })
         .unwrap();
@@ -2190,17 +2562,17 @@ mod tests {
                 .any(|entry| entry.g == gradient && entry.width == 131 && entry.height == 79)
         };
         assert!(!cached());
-        // Initial refusal, the unchanged 4096-pixel cancellation checkpoint,
-        // and the final load check after successful compute/validation.
-        for cancel_at in [1, 4, compute_checks.get() + 2] {
-            let checks = std::cell::Cell::new(0);
+        // Initial refusal, an intermediate cancellation checkpoint, and the
+        // final load check after successful compute/validation. This small
+        // image uses serial rows, so the callback count is deterministic.
+        for cancel_at in [1, 4, compute_checks.load(Ordering::Relaxed) + 2] {
+            let checks = std::sync::atomic::AtomicUsize::new(0);
             let result =
                 CachedGradient::load(&gradient, 131, 79, MAX_BACKGROUND_DECODED_BYTES, &|| {
-                    checks.set(checks.get() + 1);
-                    checks.get() >= cancel_at
+                    checks.fetch_add(1, Ordering::Relaxed) + 1 >= cancel_at
                 });
             assert!(result.is_err(), "cancellation at check {cancel_at}");
-            assert_eq!(checks.get(), cancel_at);
+            assert_eq!(checks.load(Ordering::Relaxed), cancel_at);
             assert!(
                 !cached(),
                 "cancelled pixels must not become reusable authority"
