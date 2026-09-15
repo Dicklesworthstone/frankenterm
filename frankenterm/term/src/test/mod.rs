@@ -95,9 +95,8 @@ impl TestTerm {
         scrollback: usize,
         scrollback_tier: crate::config::ScrollbackTierConfig,
     ) -> Self {
-        let _ = env_logger::Builder::new()
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
             .is_test(true)
-            .filter_level(log::LevelFilter::Trace)
             .try_init();
 
         let mut term = Terminal::new(
@@ -1149,9 +1148,8 @@ fn test_dec_double_width() {
     assert!(lines[3].is_single_width());
 }
 
-/// This test skips over an edge case with cursor positioning,
-/// while sizing down, but tries to trip over the same edge
-/// case while sizing back up again
+/// Word-aware wrapping moves the entire final word, and the cursor must
+/// follow its actual row length through narrowing and height changes.
 #[test]
 fn test_resize_2162_by_2_then_up_1() {
     let num_lines = 4;
@@ -1177,10 +1175,10 @@ fn test_resize_2162_by_2_then_up_1() {
         &term,
         file!(),
         line!(),
-        &["some long long tex", "t", "", ""],
+        &["some long long ", "text", "", ""],
     );
     eprintln!("check cursor pos 2");
-    term.assert_cursor_pos(1, 1, None, Some(6));
+    term.assert_cursor_pos(4, 1, None, Some(6));
     term.resize(TerminalSize {
         rows: num_lines - 1,
         cols: num_cols,
@@ -1208,8 +1206,8 @@ fn test_resize_2162_by_2_then_up_1() {
     term.assert_cursor_pos(19, 0, None, Some(8));
 }
 
-/// This test skips over an edge case with cursor positioning,
-/// so it passes even ahead of a fix for issue 2162.
+/// The cursor stays attached to the final word across a narrow/wide cycle,
+/// including the short physical row introduced by word-aware wrapping.
 #[test]
 fn test_resize_2162_by_2() {
     let num_lines = 4;
@@ -1235,10 +1233,10 @@ fn test_resize_2162_by_2() {
         &term,
         file!(),
         line!(),
-        &["some long long tex", "t", "", ""],
+        &["some long long ", "text", "", ""],
     );
     eprintln!("check cursor pos 2");
-    term.assert_cursor_pos(1, 1, None, Some(6));
+    term.assert_cursor_pos(4, 1, None, Some(6));
     term.resize(TerminalSize {
         rows: num_lines,
         cols: num_cols,
@@ -1536,31 +1534,8 @@ fn test_resize_wrap_roundtrip_with_dpi_and_mutation() {
 }
 
 #[test]
-fn test_resize_wrap_kp_policy_preserves_legacy_visible_semantics() {
+fn test_resize_wrap_kp_and_fallback_preserve_source_and_cursor() {
     const LINES: usize = 8;
-    let mut legacy = TestTerm::new(LINES, 10, 32);
-    let mut kp = TestTerm::new(LINES, 10, 32);
-
-    let mut legacy_model = MonospaceKpCostModel::terminal_default();
-    legacy_model.max_dp_states = 0;
-    legacy
-        .screen_mut()
-        .set_resize_wrap_policy(ResizeWrapPolicy {
-            kp_cost_model: legacy_model,
-            scorecard_enabled: false,
-            readability_gate: ResizeReadabilityGatePolicy::default(),
-        });
-    kp.screen_mut()
-        .set_resize_wrap_policy(ResizeWrapPolicy::default());
-
-    let seed = concat!(
-        "alpha beta gamma delta epsilon zeta eta theta\r\n",
-        "A_very_long_token_without_breaks_1234567890\r\n",
-        "rust wrap quality should stay stable under resize churn\r\n",
-    );
-    legacy.print(seed);
-    kp.print(seed);
-
     let sizes = [
         (7usize, 96u32),
         (5usize, 96u32),
@@ -1569,21 +1544,95 @@ fn test_resize_wrap_kp_policy_preserves_legacy_visible_semantics() {
         (10usize, 96u32),
     ];
 
-    for (step, &(cols, dpi)) in sizes.iter().enumerate() {
-        let size = TerminalSize {
-            rows: LINES,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-            dpi,
-        };
-        legacy.resize(size);
-        kp.resize(size);
-        assert_eq!(
-            visible_text_snapshot(&legacy),
-            visible_text_snapshot(&kp),
-            "kp reflow diverged from forced-legacy fallback semantics at step {step} (cols={cols}, dpi={dpi})"
-        );
+    for paragraphs in [
+        [
+            "alpha beta gamma delta epsilon zeta eta theta",
+            "A_very_long_token_without_breaks_1234567890",
+            "rust wrap quality should stay stable under resize churn",
+        ],
+        [
+            "alpha_beta_gamma_delta_epsilon_zeta_eta_theta",
+            "A_very_long_token_without_breaks_1234567890",
+            "rust_wrap_quality_should_stay_stable_under_resize_churn",
+        ],
+    ] {
+        let mut fallback = TestTerm::new(LINES, 10, 32);
+        let mut kp = TestTerm::new(LINES, 10, 32);
+        let mut fallback_model = MonospaceKpCostModel::terminal_default();
+        fallback_model.max_dp_states = 0;
+        fallback
+            .screen_mut()
+            .set_resize_wrap_policy(ResizeWrapPolicy {
+                kp_cost_model: fallback_model,
+                scorecard_enabled: false,
+                readability_gate: ResizeReadabilityGatePolicy::default(),
+            });
+        kp.screen_mut()
+            .set_resize_wrap_policy(ResizeWrapPolicy::default());
+        for paragraph in paragraphs {
+            fallback.print(format!("{paragraph}\r\n"));
+            kp.print(format!("{paragraph}\r\n"));
+        }
+
+        for (step, &(cols, dpi)) in sizes.iter().enumerate() {
+            let size = TerminalSize {
+                rows: LINES,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi,
+            };
+            fallback.resize(size);
+            kp.resize(size);
+
+            // Prose can have different physical rows: DP balances slack while
+            // fallback takes the widest admissible break. Check each against
+            // the literal input, not against the other planner's output.
+            for (mode, term) in [("fallback", &fallback), ("dp", &kp)] {
+                let rows = term.screen().all_lines();
+                let cursor = term.cursor_pos();
+                let cursor_row = rows.len() - LINES + usize::try_from(cursor.y).unwrap();
+                let mut recovered = Vec::new();
+                let mut logical = String::new();
+                for (row_index, row) in rows.iter().enumerate() {
+                    if row_index == cursor_row {
+                        assert_eq!(cursor.x, 0, "{mode} cursor column at step {step}");
+                        assert_eq!(recovered.len(), paragraphs.len());
+                        assert!(
+                            logical.is_empty(),
+                            "cursor must follow the final hard break"
+                        );
+                        assert!(
+                            row.as_str().is_empty(),
+                            "cursor must be on the empty prompt"
+                        );
+                    }
+                    logical.push_str(&row.as_str());
+                    if !row.last_cell_was_wrapped() {
+                        recovered.push(std::mem::take(&mut logical));
+                    }
+                }
+                assert!(cursor_row < rows.len(), "{mode} cursor must remain visible");
+                assert!(logical.is_empty(), "{mode} left an unterminated soft wrap");
+                assert!(recovered.len() > paragraphs.len());
+                assert_eq!(
+                    &recovered[..paragraphs.len()],
+                    &paragraphs,
+                    "{mode} changed source at step {step} (cols={cols}, dpi={dpi})"
+                );
+                assert!(recovered[paragraphs.len()..].iter().all(String::is_empty));
+            }
+
+            // Retain the previous exact-layout contract for unbroken tokens;
+            // word boundaries are the intentional reason prose can differ.
+            if paragraphs.iter().all(|paragraph| !paragraph.contains(' ')) {
+                assert_eq!(
+                    visible_text_snapshot(&fallback),
+                    visible_text_snapshot(&kp),
+                    "unbroken token layout diverged at step {step} (cols={cols}, dpi={dpi})"
+                );
+            }
+        }
     }
 }
 
