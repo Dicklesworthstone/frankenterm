@@ -4049,8 +4049,10 @@ impl Screen {
                         return false;
                     }
                     // Extending an unchanged prefix with already-current-width
-                    // rows does not invalidate older visual coordinates.
-                    !next.extends(current)
+                    // rows does not invalidate older visual coordinates. An
+                    // older validated read of that prefix is unchanged too;
+                    // installation keeps the more complete current layout.
+                    !next.extends(current) && !current.extends(next)
                 })
         })
     }
@@ -11907,6 +11909,22 @@ pub(crate) mod tests {
             .unwrap()
             .hydrate(|| true)
             .is_err());
+        let mut end = screen.lines.pop_front().unwrap();
+        end.set_last_cell_was_wrapped(false, 3);
+        assert!(screen.record_scrollback_spill(7, &end, 3));
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(3));
+        let extended = screen
+            .capture_line_read(3..8)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&extended));
+        screen.install_line_read_layout(&extended, 3);
+        assert!(screen.validates_line_read(&closed));
+        assert!(!screen.line_read_changes_layout(&closed));
+        screen.install_line_read_layout(&closed, 3);
+        assert_eq!(screen.expand_cold_logical_range(6..8), 6..8);
     }
 
     #[cfg(feature = "use_serde")]
