@@ -218,6 +218,43 @@ just code presence. Existing remote sessions remain outside the disposable test.
   native default and frozen-harness acceptance, four-target release, signature
   verification, canary, upgrade verification, and safe Mac activation above.
 
+### 23:11 UTC active qualification
+
+- [x] Execute the actual sealed Genesis catalog-to-broker child test: strict
+  RCH `30016197441357387`, source `87f193a78`, one named test passed.
+- [x] Wire authenticated durable Genesis staging in `33866f83c`; strict sealed
+  RCH `30016197441357390` passed 225 guardian tests with
+  `GENESIS_DURABLE_STAGING_SUCCESS`. One separately tested broker case remains
+  explicitly ignored in the ordinary suite. Seal/Spawn runtime activation is
+  still fenced pending durable recovery-capability custody.
+- [x] Execute workspace/all-targets check at `87f193a78`: strict RCH
+  `30016197441357385`, remote hz3, exit zero without compiler warnings/errors.
+- [x] Fix fitting separator placement (`979b157f0`, `6877ab882`) and greedy
+  overwide-word row utilization (`187bebc9d`) without removing source cells.
+  Full surface RCH `30016197441357393` passed 420 tests on `187bebc9d`.
+- [x] Retain full sealed cohort 57390's failures: surface 429 passed, terminal
+  507 passed / 3 failed, mux 1174 passed / 2 failed. No full-cohort pass claim.
+- [x] Replace obsolete cell-split/equal-prose-layout terminal expectations
+  with literal word-aware rows, exact source and cursor checks (`8d7f609b7`,
+  `61c2d77ba`). Make forced per-character test tracing opt-in.
+- [ ] Finish the two mux test-contract corrections and repeat the complete
+  sealed surface/terminal/mux/guardian cohort on their committed source.
+- [ ] Finish exact 21 GUI regression tests, RCH 57392 on `6877ab882`.
+- [ ] Finish workspace/all-targets Clippy, RCH 57394 on `61c2d77ba`.
+- [ ] Finish nine crash/watcher regressions, RCH 57350; compilation continues.
+- [x] Qualify and independently review the Windows DSR NFS/storage adapter;
+  DSR commit `d1660345260edfb9dd38592bbfeb7bb5faba7e68`, native command tests
+  117 passed, health tests 56 passed, latest storage checks 10 passed. Real
+  independent-process locking and NFS executable launch passed. C: pressure
+  remains explicitly reported; heavy outputs use the admitted NFS volume.
+- [ ] Freeze final source/version with positive owner acknowledgments, refresh
+  generated metadata, and run full DSR quality on that exact candidate.
+- [ ] Complete publishable DSR builds for all four configured targets while
+  serializing both Linux targets on ts1; do not substitute diagnostic artifacts.
+- [ ] Execute native default-zoom and frozen selection/reflow acceptance,
+  deferred producer runtime proof and Lindley calibration/holdout, then sign,
+  publish, verify canary/upgrade, and activate the qualified Mac application.
+
 This operator-requested TODO retires as an active checklist when its remaining
 work is completed or explicitly handed off with qualified evidence.
 
