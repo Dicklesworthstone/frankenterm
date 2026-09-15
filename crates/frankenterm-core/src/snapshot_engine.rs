@@ -11597,6 +11597,117 @@ fn read_checkpoint_artifact_from_parent_bounded_with_hook(
     Ok(bytes)
 }
 
+/// Which caller-enrolled file failed admission. No path or secret is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryKeyFileStage {
+    WrappingKey,
+    WrappedKey,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnrolledRecoveryKeyError {
+    #[error("enrolled recovery key file unavailable at {0:?}")]
+    Unavailable(RecoveryKeyFileStage),
+    #[error("enrolled recovery key file authority rejected at {0:?}")]
+    UnsafeFile(RecoveryKeyFileStage),
+    #[error("enrolled recovery key file size rejected at {0:?}")]
+    InvalidSize(RecoveryKeyFileStage),
+    #[error("enrolled recovery key file changed at {0:?}")]
+    Changed(RecoveryKeyFileStage),
+    #[error("strict enrolled recovery key loading is unsupported on this platform")]
+    UnsupportedPlatform,
+    #[error("enrolled recovery key cryptographic validation failed: {0}")]
+    Crypto(#[from] crate::snapshot_representation::RecoveryWrapError),
+}
+
+/// Load caller-enrolled KEK and wrapped DEK files without creating or changing
+/// either. Expectations must come from caller authority, never the wrapper.
+/// This establishes local file admission only, not independent key custody.
+pub fn load_enrolled_recovery_key(
+    kek_path: &Path,
+    wrapped_path: &Path,
+    expected: &crate::snapshot_representation::ExpectedRecoveryWrapContext,
+) -> Result<crate::snapshot_representation::RecoveryKey, EnrolledRecoveryKeyError> {
+    use crate::snapshot_representation::{
+        RecoveryWrappingKey, WRAPPED_RECOVERY_KEY_BYTES, WrappedRecoveryKey, unwrap_recovery_key,
+    };
+    let kek = read_enrolled_key_file::<32>(kek_path, RecoveryKeyFileStage::WrappingKey, || {})?;
+    let authority = RecoveryWrappingKey::from_bytes(*kek)?;
+    let wrapped = read_enrolled_key_file::<WRAPPED_RECOVERY_KEY_BYTES>(
+        wrapped_path,
+        RecoveryKeyFileStage::WrappedKey,
+        || {},
+    )?;
+    Ok(unwrap_recovery_key(
+        &WrappedRecoveryKey::from_bytes(wrapped.as_slice())?,
+        &authority,
+        expected,
+    )?)
+}
+
+fn read_enrolled_key_file<const N: usize>(
+    path: &Path,
+    stage: RecoveryKeyFileStage,
+    after_read: impl FnOnce(),
+) -> Result<zeroize::Zeroizing<[u8; N]>, EnrolledRecoveryKeyError> {
+    if !cfg!(unix) {
+        return Err(EnrolledRecoveryKeyError::UnsupportedPlatform);
+    }
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)
+        .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    let mut file = parent
+        .open_with(&leaf, &options)
+        .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
+    let before = validate_checkpoint_artifact_file_metadata(
+        &parent
+            .symlink_metadata(&leaf)
+            .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?,
+        &file
+            .metadata()
+            .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?,
+        None,
+    )
+    .map_err(|_| EnrolledRecoveryKeyError::UnsafeFile(stage))?;
+    if before.byte_len != N as u64 {
+        return Err(EnrolledRecoveryKeyError::InvalidSize(stage));
+    }
+    let mut bytes = zeroize::Zeroizing::new([0; N]);
+    file.read_exact(bytes.as_mut_slice())
+        .map_err(|_| EnrolledRecoveryKeyError::InvalidSize(stage))?;
+    let mut tail = zeroize::Zeroizing::new([0; 1]);
+    if file
+        .read(tail.as_mut_slice())
+        .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?
+        != 0
+    {
+        return Err(EnrolledRecoveryKeyError::InvalidSize(stage));
+    }
+    after_read();
+    let after = validate_checkpoint_artifact_file_metadata(
+        &parent
+            .symlink_metadata(&leaf)
+            .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?,
+        &file
+            .metadata()
+            .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?,
+        Some(N as u64),
+    )
+    .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?;
+    if before != after {
+        return Err(EnrolledRecoveryKeyError::Changed(stage));
+    }
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)
+        .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?;
+    Ok(bytes)
+}
+
 fn read_checkpoint_artifact_bounded(
     path: &Path,
     max_bytes: u64,
@@ -16443,6 +16554,131 @@ mod tests {
                 .unwrap();
         }
         directory
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enrolled_recovery_key_loading_checks_crypto_and_file_authority() {
+        use crate::snapshot_representation::{
+            ExpectedRecoveryWrapContext, RecoveryKey, RecoveryWrapContext, RecoveryWrappingKey,
+            wrap_recovery_key,
+        };
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let directory = checkpoint_artifact_test_directory();
+        let key = RecoveryKey::from_bytes([51; 32]).unwrap();
+        let authority = RecoveryWrappingKey::from_bytes([72; 32]).unwrap();
+        let context = RecoveryWrapContext {
+            namespace_id: [1; 32],
+            policy_id: [2; 32],
+        };
+        let expected = ExpectedRecoveryWrapContext {
+            namespace_id: context.namespace_id,
+            policy_id: context.policy_id,
+            recovery_key_id: key.key_id(),
+            authority_id: authority.authority_id(),
+        };
+        let kek = directory.path().join("kek");
+        let wrapped = directory.path().join("wrapped");
+        write_private_checkpoint_artifact_test_file(&kek, &[72; 32]);
+        write_private_checkpoint_artifact_test_file(
+            &wrapped,
+            &wrap_recovery_key(&key, &authority, &context)
+                .unwrap()
+                .to_bytes(),
+        );
+        assert_eq!(
+            load_enrolled_recovery_key(&kek, &wrapped, &expected)
+                .unwrap()
+                .as_bytes(),
+            key.as_bytes()
+        );
+        let mut wrong = expected;
+        wrong.policy_id[0] ^= 1;
+        assert!(matches!(
+            load_enrolled_recovery_key(&kek, &wrapped, &wrong),
+            Err(EnrolledRecoveryKeyError::Crypto(_))
+        ));
+        let foreign = directory.path().join("foreign");
+        assert!(matches!(
+            load_enrolled_recovery_key(&foreign, &wrapped, &expected),
+            Err(EnrolledRecoveryKeyError::Unavailable(
+                RecoveryKeyFileStage::WrappingKey
+            ))
+        ));
+        write_private_checkpoint_artifact_test_file(&foreign, &[73; 32]);
+        assert!(matches!(
+            load_enrolled_recovery_key(&foreign, &wrapped, &expected),
+            Err(EnrolledRecoveryKeyError::Crypto(_))
+        ));
+        for size in [0, 31, 33, 187, 189] {
+            let path = directory.path().join(format!("size-{size}"));
+            write_private_checkpoint_artifact_test_file(&path, &vec![1; size]);
+            let result = if size < 100 {
+                load_enrolled_recovery_key(&path, &wrapped, &expected)
+            } else {
+                load_enrolled_recovery_key(&kek, &path, &expected)
+            };
+            assert!(matches!(
+                result,
+                Err(EnrolledRecoveryKeyError::InvalidSize(_))
+            ));
+        }
+        let alias = directory.path().join("symlink");
+        // rustix's safe mkfifoat API is unavailable on Apple targets. The
+        // Linux qualification lane exercises the actual no-writer FIFO: open
+        // must reach regular-file admission rather than wait for a writer.
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = directory.path().join("fifo-key");
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap();
+            assert!(matches!(
+                load_enrolled_recovery_key(&fifo, &wrapped, &expected),
+                Err(EnrolledRecoveryKeyError::UnsafeFile(
+                    RecoveryKeyFileStage::WrappingKey
+                ))
+            ));
+        }
+        let malformed = directory.path().join("malformed-wrapper");
+        write_private_checkpoint_artifact_test_file(&malformed, &[0; 188]);
+        assert!(matches!(
+            load_enrolled_recovery_key(&kek, &malformed, &expected),
+            Err(EnrolledRecoveryKeyError::Crypto(
+                crate::snapshot_representation::RecoveryWrapError::InvalidEnvelope
+            ))
+        ));
+        symlink(&kek, &alias).unwrap();
+        assert!(load_enrolled_recovery_key(&alias, &wrapped, &expected).is_err());
+        let hard = directory.path().join("hardlink");
+        std::fs::hard_link(&foreign, &hard).unwrap();
+        assert!(matches!(
+            load_enrolled_recovery_key(&hard, &wrapped, &expected),
+            Err(EnrolledRecoveryKeyError::UnsafeFile(_))
+        ));
+        std::fs::set_permissions(&kek, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_enrolled_recovery_key(&kek, &wrapped, &expected),
+            Err(EnrolledRecoveryKeyError::UnsafeFile(_))
+        ));
+        std::fs::set_permissions(&kek, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = directory.path().join("replacement");
+        write_private_checkpoint_artifact_test_file(&replacement, &[72; 32]);
+        assert!(matches!(
+            read_enrolled_key_file::<32>(&kek, RecoveryKeyFileStage::WrappingKey, || {
+                std::fs::rename(&replacement, &kek).unwrap();
+            }),
+            Err(EnrolledRecoveryKeyError::Changed(_))
+        ));
+        assert_eq!(
+            load_enrolled_recovery_key(&kek, &wrapped, &expected)
+                .unwrap()
+                .as_bytes(),
+            key.as_bytes()
+        );
     }
 
     #[test]

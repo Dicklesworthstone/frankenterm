@@ -66,14 +66,23 @@ fn size() -> TerminalSize {
     }
 }
 
+// Production intentionally shares a bounded repair controller. Independent
+// fixture publishers must not compete for its permits due to test scheduling.
+static FIXTURE_PUBLICATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     captured: mux::MuxCapturedTopology,
     acks: Vec<mux::ModelParserCheckpointAck>,
     key: Arc<RecoveryKey>,
+    // Last field: release only after the fixture's captured resources are dropped.
+    _publication_guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let publication_guard = FIXTURE_PUBLICATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let acks: Vec<_> = (0..8)
             .map(|pane_id| {
                 let mut terminal = Terminal::new(
@@ -262,6 +271,7 @@ impl Fixture {
             },
             acks,
             key: Arc::new(RecoveryKey::from_bytes([13; 32]).unwrap()),
+            _publication_guard: publication_guard,
         }
     }
 
@@ -520,6 +530,17 @@ fn test_mux_recovery_e2e_reconstructs_hidden_stack_member() {
 
 #[test]
 fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
+    #[cfg(unix)]
+    if let Some(directory) = std::env::var_os("FT_RECOVERY_CHILD_ARTIFACTS") {
+        assert_eq!(
+            std::env::var("FT_RECOVERY_CHILD_PHASE").unwrap(),
+            "repair-generation-2"
+        );
+        verify_recovery_in_fresh_child(std::path::Path::new(&directory));
+        println!("\nFT_FRESH_PROCESS_RECOVERY_COMPLETE_V1");
+        return;
+    }
+    assert!(std::env::var_os("FT_RECOVERY_CHILD_PHASE").is_none());
     let fixture = Fixture::new();
     let cx = frankenterm_core::cx::for_request();
     let (_directory, store) = store();
@@ -557,6 +578,8 @@ fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     let recovered = fixture.current(&cx, &store);
     assert_eq!(recovered.generation(), 2);
     assert_exact_checkpoint_payloads(&fixture, &recovered);
+    #[cfg(unix)]
+    assert_fresh_process_recovery(&fixture, &store);
     // Destroy all authenticated symbols in one required chunk. Recovery must
     // now fail for generation 2 and preserve the complete predecessor.
     std::fs::write(&records_path, vec![0; records.len()]).unwrap();
@@ -568,6 +591,172 @@ fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     std::fs::write(&second.path, &original).unwrap();
     std::fs::write(&records_path, &records).unwrap();
     assert_eq!(fixture.current(&cx, &store).generation(), 2);
+}
+
+#[cfg(unix)]
+fn verify_recovery_in_fresh_child(directory: &std::path::Path) {
+    use frankenterm_core::snapshot_representation::ExpectedRecoveryWrapContext;
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("expected.json")).unwrap()).unwrap();
+    let context = ExpectedRecoveryWrapContext {
+        namespace_id: serde_json::from_value(expected["namespace"].clone()).unwrap(),
+        policy_id: serde_json::from_value(expected["policy"].clone()).unwrap(),
+        recovery_key_id: serde_json::from_value(expected["key_id"].clone()).unwrap(),
+        authority_id: serde_json::from_value(expected["authority_id"].clone()).unwrap(),
+    };
+    let key = frankenterm_core::snapshot_engine::load_enrolled_recovery_key(
+        &directory.join("authority.key"),
+        &directory.join("wrapped.key"),
+        &context,
+    )
+    .unwrap();
+    let store =
+        SnapshotPublicationStore::open(expected["store"].as_str().unwrap(), Default::default())
+            .unwrap();
+    let verifier = WholeMuxRecoveryVerifier::new_production(
+        Arc::new(key),
+        WholeMuxTrustedIdentityConfig::new(
+            serde_json::from_value(expected["root_id"].clone()).unwrap(),
+        )
+        .with_session_id(expected["session"].as_str().unwrap())
+        .with_mux_incarnation_id(expected["incarnation"].as_str().unwrap()),
+    );
+    let verified = select_verified_recovery_roots_with_cx(
+        &frankenterm_core::cx::for_request(),
+        &store,
+        &verifier,
+    )
+    .unwrap()
+    .current
+    .unwrap();
+    assert_eq!(verified.generation(), 2);
+    assert_eq!(verified.pane_count(), 8);
+    let reconstructed = reconstruct_whole_mux_image_inert(
+        &verified,
+        TerminalCheckpointLimits::default(),
+        Some("fresh-process-offline"),
+        &HashSet::new(),
+    )
+    .unwrap();
+    for id in 0..8u64 {
+        let oracle = std::fs::read(directory.join(format!("pane-{id}.json"))).unwrap();
+        let restored = reconstructed.pane_terminals[&id]
+            .terminal
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        assert_eq!(restored, oracle, "fresh process exact pane {id}");
+    }
+}
+
+#[cfg(unix)]
+fn assert_fresh_process_recovery(fixture: &Fixture, store: &SnapshotPublicationStore) {
+    use frankenterm_core::snapshot_representation::{
+        RecoveryWrapContext, RecoveryWrappingKey, wrap_recovery_key,
+    };
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let artifacts = tempfile::tempdir().unwrap();
+    let directory = artifacts.path().canonicalize().unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let write_private = |name: &str, bytes: &[u8]| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(name))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    };
+    let authority = RecoveryWrappingKey::from_bytes([0x63; 32]).unwrap();
+    let context = RecoveryWrapContext {
+        namespace_id: [0x64; 32],
+        policy_id: [0x65; 32],
+    };
+    let wrapped = wrap_recovery_key(&fixture.key, &authority, &context).unwrap();
+    write_private("authority.key", &[0x63; 32]);
+    write_private("wrapped.key", &wrapped.to_bytes());
+    write_private(
+        "expected.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "namespace": context.namespace_id, "policy": context.policy_id,
+            "key_id": fixture.key.key_id(), "authority_id": authority.authority_id(),
+            "store": store.root_path().canonicalize().unwrap(), "root_id": ROOT_ID,
+            "session": SESSION, "incarnation": hex::encode(INCARNATION),
+        }))
+        .unwrap(),
+    );
+    for (id, ack) in fixture.acks.iter().enumerate() {
+        write_private(
+            &format!("pane-{id}.json"),
+            ack.terminal_checkpoint.canonical_payload(),
+        );
+    }
+    let output_file = |name| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(name))
+            .unwrap()
+    };
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = OwnedChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FT_RECOVERY_CHILD_ARTIFACTS", &directory)
+            .env("FT_RECOVERY_CHILD_PHASE", "repair-generation-2")
+            .stdout(output_file("child.stdout"))
+            .stderr(output_file("child.stderr"))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fresh recovery child exceeded 30 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let read_output = |name| {
+        let mut bytes = Vec::new();
+        std::fs::File::open(directory.join(name))
+            .unwrap()
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() <= 65536, "child output exceeded 64 KiB");
+        String::from_utf8(bytes).unwrap()
+    };
+    let stdout = read_output("child.stdout");
+    let stderr = read_output("child.stderr");
+    assert!(status.success(), "child failed: {stdout}\n{stderr}");
+    assert!(stdout.lines().any(|line| line == "running 1 test"));
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| *line == "FT_FRESH_PROCESS_RECOVERY_COMPLETE_V1")
+            .count(),
+        1
+    );
+    assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
 }
 
 #[test]
