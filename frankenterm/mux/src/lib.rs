@@ -37362,7 +37362,9 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(Some("workspace-alpha".to_string()), None);
@@ -37385,7 +37387,7 @@ mod tests {
         tab3.assign_pane(&pane3);
 
         for tab in [&tab1, &tab2, &tab3] {
-            mux.add_tab_no_panes(tab).expect("register tab");
+            mux.add_tab_and_active_pane(tab).expect("register tab");
             mux.add_tab_to_window(tab, window_id).expect("attach tab");
         }
 
@@ -37445,11 +37447,13 @@ mod tests {
     }
 
     #[test]
-    fn capture_topology_coherent_detects_concurrent_mutation() {
+    fn capture_topology_coherent_records_advanced_revision() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(None, None);
@@ -37457,7 +37461,7 @@ mod tests {
         let pane = register_test_pane(&mux, 201);
         let tab = Arc::new(Tab::new(&test_size()));
         tab.assign_pane(&pane);
-        mux.add_tab_no_panes(&tab).expect("register tab");
+        mux.add_tab_and_active_pane(&tab).expect("register tab");
         mux.add_tab_to_window(&tab, window_id).expect("attach tab");
 
         let config = MuxTopologyCaptureConfig {
@@ -37522,7 +37526,9 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(Some("workspace-focus".to_string()), None);
@@ -37534,6 +37540,7 @@ mod tests {
         let pane_floating = register_test_pane(&mux, 504);
 
         let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab).expect("register empty tab");
         tab.set_title("focus-tab");
         tab.assign_pane(&pane_tiled);
 
@@ -37576,7 +37583,6 @@ mod tests {
         tab.add_floating_pane(Arc::clone(&pane_floating), float_rect)
             .expect("add floating pane");
 
-        mux.add_tab_no_panes(&tab).expect("register tab");
         mux.add_tab_to_window(&tab, window_id).expect("attach tab");
 
         let client_id = Arc::new(ClientId::new());
@@ -37656,23 +37662,32 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(None, None);
         let window_id = *window_builder;
 
-        // Pane 999 is NOT registered in mux
-        let (unregistered_pane, _) = KillCountingPane::new(999, test_size());
+        // Build valid topology, then fault only the registration map. The
+        // production attachment API correctly rejects an unregistered pane.
+        let pane = register_test_pane(&mux, 999);
         let tab = Arc::new(Tab::new(&test_size()));
-        tab.assign_pane(&unregistered_pane);
-        mux.add_tab_no_panes(&tab).expect("register tab");
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab).expect("register tab");
         mux.add_tab_to_window(&tab, window_id).expect("attach tab");
+        let registration = mux
+            .panes
+            .write()
+            .remove(&999)
+            .expect("registered fixture pane");
 
         let config = MuxTopologyCaptureConfig::default();
         let err = mux
             .capture_topology_coherent(config)
             .expect_err("should reject unregistered pane");
+        assert!(mux.panes.write().insert(999, registration).is_none());
         match err {
             MuxTopologyCaptureError::MissingPaneRegistration(id) => {
                 assert_eq!(id, 999);
@@ -37686,7 +37701,9 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(None, None);
@@ -37698,7 +37715,7 @@ mod tests {
 
         let tab = Arc::new(Tab::new(&test_size()));
         tab.assign_pane(&pane);
-        mux.add_tab_no_panes(&tab).expect("register tab");
+        mux.add_tab_and_active_pane(&tab).expect("register tab");
         mux.add_tab_to_window(&tab, window_id).expect("attach tab");
 
         let config = MuxTopologyCaptureConfig::default();
@@ -37718,7 +37735,9 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let mux = Arc::new(Mux::new(None));
+        let mux = Arc::new(Mux::new(Some(Arc::new(GuardedMutationTestDomain::new(
+            None,
+        )))));
         Mux::set_mux(&mux);
 
         let window_builder = mux.new_empty_window(None, None);
@@ -37730,7 +37749,7 @@ mod tests {
 
         let tab = Arc::new(Tab::new(&test_size()));
         tab.assign_pane(&pane);
-        mux.add_tab_no_panes(&tab).expect("register tab");
+        mux.add_tab_and_active_pane(&tab).expect("register tab");
         mux.add_tab_to_window(&tab, window_id).expect("attach tab");
 
         let config = MuxTopologyCaptureConfig::default();
@@ -37814,7 +37833,8 @@ mod tests {
                 LiveParserCheckpointError::StaleRegistration
                     | LiveParserCheckpointError::ReaderDead
             ),
-            "unexpected error variant: {err:?}",
+            "unexpected error variant: {:?}",
+            err,
         );
     }
 }
