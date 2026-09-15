@@ -578,6 +578,38 @@ fn gradient_noise(rng: &mut fastrand::Rng, noise_amount: usize) -> f64 {
     }
 }
 
+fn run_gradient_without_coordinator_reentry<R: Send>(
+    pool: &rayon::ThreadPool,
+    render: impl FnOnce() -> R + Send,
+) -> Option<R> {
+    if rayon::current_thread_index().is_none() || pool.current_thread_index().is_some() {
+        return Some(pool.install(render));
+    }
+
+    // Cross-pool Rayon install helps the caller's pool while waiting. A
+    // background coordinator could then recursively start more decodes,
+    // defeating its 1/2-worker retained-image bound. An ordinary scoped join
+    // keeps that coordinator blocked; only the bounded gradient pool renders.
+    // At most one temporary dispatcher exists per active coordinator.
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("background-gradient-dispatch".into())
+            .spawn_scoped(scope, || pool.install(render))
+        {
+            Ok(worker) => Some(match worker.join() {
+                Ok(result) => result,
+                // Preserve the original panic for the existing worker lease;
+                // this boundary forwards failures rather than recovering them.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }),
+            Err(error) => {
+                log::warn!("gradient dispatcher unavailable; using serial pixels: {error}");
+                None
+            }
+        }
+    })
+}
+
 fn rasterize_gradient_pixels(
     image: &mut image::RgbaImage,
     config: &Gradient,
@@ -618,7 +650,7 @@ fn rasterize_gradient_pixels(
                 seeds.push(row_seeds.fork());
             }
             let rows_per_group = height.div_ceil(pool.current_num_threads());
-            return pool.install(|| {
+            if let Some(result) = run_gradient_without_coordinator_reentry(pool, || {
                 image
                     .as_mut()
                     .par_chunks_mut(row_bytes * rows_per_group)
@@ -648,7 +680,9 @@ fn rasterize_gradient_pixels(
                             Ok(())
                         },
                     )
-            });
+            }) {
+                return result;
+            }
         }
     }
 
@@ -2350,6 +2384,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual.into_raw(), expected);
+    }
+
+    #[test]
+    fn parallel_gradient_wait_does_not_reenter_background_coordinator() {
+        let coordinator = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let gradient_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let image_alive = Arc::new(AtomicBool::new(true));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        coordinator.install(|| {
+            let config = test_gradient(GradientOrientation::Vertical, None);
+            let gradient = config.build().unwrap();
+            let mut image = image::RgbaImage::new(513, 257);
+            rasterize_gradient_pixels(
+                &mut image,
+                &config,
+                gradient.as_ref(),
+                &|| false,
+                Some(&gradient_pool),
+                |_, x, y, _| {
+                    if x == 0 && y == 0 {
+                        let alive = Arc::clone(&image_alive);
+                        let reentered = Arc::clone(&reentered);
+                        let finished = finished_tx.clone();
+                        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+                        coordinator.spawn(move || {
+                            reentered.store(alive.load(Ordering::Acquire), Ordering::Release);
+                            started_tx.send(()).ok();
+                            finished.send(()).unwrap();
+                        });
+                        // Keep the gradient outstanding while the old cross-
+                        // pool wait would execute the queued coordinator job.
+                        // The fixed OS join leaves it queued until image drop.
+                        let _ = started_rx.recv_timeout(std::time::Duration::from_millis(250));
+                    }
+                    image::Rgba([0, 0, 0, 255])
+                },
+            )
+            .unwrap();
+            drop(image);
+            image_alive.store(false, Ordering::Release);
+        });
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!reentered.load(Ordering::Acquire));
     }
 
     #[test]
