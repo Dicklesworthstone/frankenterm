@@ -21,8 +21,10 @@ use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
+#[cfg(test)]
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2;
 use frankenterm_term::terminalstate::checkpoint::{
-    TerminalCheckpointError, TerminalCheckpointLimits, TerminalCheckpointV2,
+    TerminalCheckpointError, TerminalCheckpointLimits,
 };
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
@@ -360,8 +362,6 @@ pub enum PendingActionDrainPolicy {
 /// Errors occurring during legacy mux-owned terminal checkpoint capture.
 #[derive(Debug, thiserror::Error)]
 pub enum LegacyTerminalCaptureError {
-    #[error("parser is not at recovery ground")]
-    ParserNotRecoveryGround,
     #[error("pending parser actions remain unapplied: {0} actions pending")]
     PendingActionsRemain(usize),
     #[error("cold scrollback snapshot generation is stale")]
@@ -2910,20 +2910,6 @@ impl LocalPane {
                     RecoveryTerminalCheckpointError::Checkpoint(other),
                 ),
             })
-    }
-
-    /// Convenience capture for legacy mux-owned panes when no pending actions or custom parser ground are needed.
-    pub fn capture_legacy_terminal_checkpoint_simple(
-        &self,
-        authority: ModelParserCaptureAuthority,
-        limits: TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
-        let mut parser = termwiz::escape::parser::Parser::new();
-        let ground = parser
-            .recovery_ground_boundary()
-            .ok_or(LegacyTerminalCaptureError::ParserNotRecoveryGround)?;
-        let mut pending = Vec::new();
-        self.capture_legacy_terminal_checkpoint(authority, &mut pending, ground, limits)
     }
 
     fn capture_title_metadata(terminal: &Terminal) -> PaneTitleMetadata {

@@ -74,10 +74,10 @@ use crate::guardian_output_journal::{
 use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::pane::{CachePolicy, CloseReason, GuardianLiveOutputReader, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
-use crate::tab::{
-    FloatingPaneRect, PaneEntry, PaneNode, SplitDirection, SplitRequest, SplitSize, Tab, TabId,
-};
+use crate::tab::{FloatingPaneRect, PaneEntry, PaneNode, SplitRequest, Tab, TabId};
 pub use crate::tab::{MuxCapturedFloatingPane, MuxCapturedPaneStack, MuxCapturedTab};
+#[cfg(test)]
+use crate::tab::{SplitDirection, SplitSize};
 use crate::tmux::TmuxDomain;
 use crate::window::{
     FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowPaneCount, PreparedWindowState,
@@ -263,7 +263,7 @@ pub struct MuxCapturedWorkspace {
     pub pane_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MuxCapturedWindow {
     pub window_id: WindowId,
     pub workspace: String,
@@ -306,7 +306,7 @@ pub struct MuxCapturedPaneBinding {
     pub is_zoomed_in_tab: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MuxCapturedTopology {
     pub session_incarnation: MuxSessionIncarnation,
     pub topology_revision: TopologyRevision,
@@ -380,7 +380,7 @@ pub enum MuxTopologyCaptureError {
     NilDurablePaneId(PaneId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ModelParserCheckpointAck {
     pub registration_wire_identity: [u8; 16],
     pub durable_pane_id: uuid::Uuid,
@@ -10240,6 +10240,7 @@ fn attempt_live_parser_checkpoint(
             }
         };
 
+        let stream_bytes = ground.stream_bytes();
         let capture = catch_recoverable(
             RecoverablePanicSite::MuxPaneCallback,
             std::panic::AssertUnwindSafe(|| {
@@ -10272,7 +10273,6 @@ fn attempt_live_parser_checkpoint(
             }
             Ok(Ok(staged)) => staged,
         };
-        let stream_bytes = ground.stream_bytes();
         let semantic_generation = staged.semantic_generation();
         let worker_generation = Arc::clone(generation);
         let request_id = request.request_id;
@@ -18374,20 +18374,16 @@ impl Mux {
                         MuxTopologyCaptureError::WindowOrder { window_id, source }
                     })?;
 
-                    if frozen_order.ordered_tabs.len() > config.max_tabs_per_window {
+                    if frozen_order.ordered_tabs().len() > config.max_tabs_per_window {
                         return Err(MuxTopologyCaptureError::TooManyTabs {
                             window_id,
-                            count: frozen_order.ordered_tabs.len(),
+                            count: frozen_order.ordered_tabs().len(),
                             max: config.max_tabs_per_window,
                         });
                     }
 
-                    let ordered_tab_ids: Vec<TabId> = frozen_order
-                        .ordered_tabs
-                        .iter()
-                        .map(|t| t.tab_id())
-                        .collect();
-                    let active_tab_id = frozen_order.active_tab.as_ref().map(|t| t.tab_id());
+                    let ordered_tab_ids: Vec<TabId> = frozen_order.ordered_tab_ids().collect();
+                    let active_tab_id = frozen_order.active_tab_id();
                     let active_tab_index = active_tab_id
                         .and_then(|id| ordered_tab_ids.iter().position(|&tab_id| tab_id == id));
 
@@ -18395,7 +18391,7 @@ impl Mux {
                         window_id,
                         workspace: window.get_workspace().to_string(),
                         title: window.get_title().to_string(),
-                        order_revision: frozen_order.order_revision,
+                        order_revision: frozen_order.order_revision(),
                         ordered_tab_ids,
                         active_tab_id,
                         active_tab_index,
@@ -18406,7 +18402,7 @@ impl Mux {
                     window_tabs.push((
                         window_id,
                         window.get_workspace().to_string(),
-                        frozen_order.ordered_tabs.clone(),
+                        frozen_order.ordered_tabs().to_vec(),
                     ));
                 }
 

@@ -1678,6 +1678,7 @@ mod tests {
     fn cipher_key_schedule_requires_zeroization_feature() {
         fn require_zeroizing_drop<T: zeroize::ZeroizeOnDrop>() {}
         require_zeroizing_drop::<XChaCha20Poly1305>();
+        require_zeroizing_drop::<Sha256>();
     }
 
     #[test]

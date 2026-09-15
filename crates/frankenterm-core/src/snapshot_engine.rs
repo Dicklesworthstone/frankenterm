@@ -13092,7 +13092,7 @@ mod tests {
         assert!(error.to_string().contains("capture binding mismatch"));
         assert!(store.list_object_ids().unwrap().is_empty());
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
-        let mut wrong_generation = acks[0].clone();
+        let mut wrong_generation = make_ack(1, b"pane-A");
         wrong_generation.semantic_generation += 1;
         let mut wrong_generation_inputs = inputs(false);
         wrong_generation_inputs[0].ack = &wrong_generation;
