@@ -46,8 +46,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cx::Cx;
 use crate::mux_recovery_image::{
-    CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, RecoveryImageHeader,
-    RecoveryPane, RecoveryTopology,
+    CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, RecoveryPane,
 };
 #[cfg(test)]
 use crate::mux_recovery_image::{
@@ -55,6 +54,8 @@ use crate::mux_recovery_image::{
     ParserCaptureIdentity, RecoveryDomain, RecoveryObjectRef, RecoverySplitNode, RecoveryTab,
     RecoveryWindow, SplitDirectionAndSize, TerminalSize,
 };
+#[cfg(any(test, feature = "frankenterm-deps"))]
+use crate::mux_recovery_image::{RecoveryImageHeader, RecoveryTopology};
 #[cfg(test)]
 use crate::snapshot_publication::{
     GenerationRootPublishRequest, PredecessorBinding, RecoveryObjectPayload, RootSlot, sha256_hex,
