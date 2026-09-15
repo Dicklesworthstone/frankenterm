@@ -7317,6 +7317,7 @@ mod tests {
     #[test]
     fn client_domain_binding_bridge_is_durable_across_reopen_and_endpoint_rotation() {
         use frankenterm_client::domain::ClientDomainConfig;
+        use frankenterm_core::runtime_async::CompatRuntime;
         let fixture = tempfile::tempdir().expect("binding bridge fixture");
         let path = fixture.path().join("window-state.json");
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
