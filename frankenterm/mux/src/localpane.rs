@@ -6048,6 +6048,78 @@ mod tests {
     }
 
     #[test]
+    fn native_render_frame_hyperlinks_settle_one_source_before_selection() {
+        use frankenterm_term::screen::SelectionAnchorCoordinate;
+
+        let pane = LocalPane::new(
+            705,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x75; 16],
+            "native-hyperlink-frame".to_string(),
+        );
+        pane.terminal.lock().advance_bytes(b"https://example.com");
+        let (floor, before, dimensions) = pane.selection_source_snapshot().unwrap();
+        let rules = [termwiz::hyperlink::Rule::new(r"https://[a-z.]+", "$0").unwrap()];
+        let frame = pane
+            .try_capture_render_frame(None, before, before, &rules, false)
+            .unwrap();
+        assert!(frame.source_sequence > before);
+        assert_eq!(frame.layout_floor, floor);
+        assert!(frame.dirty.contains(frame.first));
+        assert!(frame.selection_dirty.contains(frame.first));
+        assert!(frame.lines[0]
+            .visible_cells()
+            .any(|cell| cell.attrs().hyperlink().is_some()));
+        assert_eq!(
+            pane.selection_source_snapshot().unwrap(),
+            (floor, frame.source_sequence, dimensions)
+        );
+
+        let points = [Some(SelectionAnchorCoordinate {
+            row: frame.first,
+            column: Some(0),
+        }); 3];
+        assert!(pane
+            .capture_selection_anchor(floor, before, dimensions, points)
+            .is_none());
+        let anchor = pane
+            .capture_selection_anchor(floor, frame.source_sequence, dimensions, points)
+            .unwrap();
+        frame.lines[0].set_appdata(Arc::new(42u32));
+        pane.publish_render_frame_appdata(&frame);
+
+        // A real first-scan edit advances the source once. Repeated painting
+        // and renderer-cache publication must neither dirty the frame nor
+        // invalidate selection authority for this exact displayed source.
+        for _ in 0..3 {
+            let next = pane
+                .try_capture_render_frame(
+                    None,
+                    frame.source_sequence,
+                    frame.source_sequence,
+                    &rules,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(next.source_sequence, frame.source_sequence);
+            assert!(next.dirty.is_empty());
+            assert!(next.selection_dirty.is_empty());
+            assert_eq!(next.lines, frame.lines);
+            assert!(next.lines[0].get_appdata().is_some());
+            assert_eq!(
+                pane.selection_anchor_snapshot(&anchor).unwrap(),
+                (floor, frame.source_sequence, dimensions, Some(points))
+            );
+        }
+    }
+
+    #[test]
     fn native_selection_anchor_follows_resize_publication_and_rejects_screen_switch() {
         use frankenterm_term::screen::SelectionAnchorCoordinate;
         let pane = LocalPane::new(
