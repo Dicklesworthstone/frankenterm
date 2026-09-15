@@ -247,10 +247,21 @@ mod live_measurement {
         struct Observation {
             sequence: u32,
             transient_read_rejections: u32,
+            write_ack_ns: u64,
+            storage_submit_ns: u64,
+            poll: FramePollDiagnostics,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
             stages_ns: [[u64; 2]; 3],
             content_sha256: String,
+        }
+
+        #[derive(Clone, Default, Serialize)]
+        struct FramePollDiagnostics {
+            read_attempts: u64,
+            marker_misses: u64,
+            read_elapsed_ns: u64,
+            wait_elapsed_ns: u64,
         }
 
         fn retryable_capture_read(error: &frankenterm_core::Error) -> bool {
@@ -270,12 +281,13 @@ mod live_measurement {
             marker: &str,
             deadline: Instant,
             mut read: F,
-        ) -> Result<(String, u32), String>
+        ) -> Result<(String, u32, FramePollDiagnostics), String>
         where
             F: FnMut() -> Fut,
             Fut: std::future::Future<Output = frankenterm_core::Result<String>>,
         {
             let mut rejections = 0_u32;
+            let mut diagnostics = FramePollDiagnostics::default();
             loop {
                 cx.checkpoint().map_err(|error| error.to_string())?;
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -284,6 +296,8 @@ mod live_measurement {
                         "producer frame deadline expired; transient_read_rejections={rejections}"
                     ));
                 }
+                diagnostics.read_attempts += 1;
+                let read_started = Instant::now();
                 let result = frankenterm_core::runtime_async::timeout_with_cx(
                     cx,
                     remaining,
@@ -295,6 +309,9 @@ mod live_measurement {
                         "capture read deadline: {error}; transient_read_rejections={rejections}"
                     )
                 })?;
+                diagnostics.read_elapsed_ns = diagnostics
+                    .read_elapsed_ns
+                    .saturating_add(elapsed(read_started)?);
                 cx.checkpoint().map_err(|error| error.to_string())?;
                 if Instant::now() >= deadline {
                     return Err(format!(
@@ -307,8 +324,9 @@ mod live_measurement {
                             return Err("dedicated pane snapshot exceeds 8KiB".into());
                         }
                         if text.contains(marker) {
-                            return Ok((text, rejections));
+                            return Ok((text, rejections, diagnostics));
                         }
+                        diagnostics.marker_misses += 1;
                     }
                     Err(error) if retryable_capture_read(&error) => {
                         rejections = rejections.checked_add(1).ok_or("retry count overflow")?;
@@ -321,9 +339,13 @@ mod live_measurement {
                         "producer frame deadline expired; transient_read_rejections={rejections}"
                     ));
                 }
+                let wait_started = Instant::now();
                 sleep_with_cx(cx, remaining.min(Duration::from_millis(1)))
                     .await
                     .map_err(|error| error.to_string())?;
+                diagnostics.wait_elapsed_ns = diagnostics
+                    .wait_elapsed_ns
+                    .saturating_add(elapsed(wait_started)?);
             }
         }
 
@@ -338,6 +360,14 @@ mod live_measurement {
         }
 
         pub fn run() -> Result<bool, String> {
+            use tracing::instrument::WithSubscriber;
+            // Only numeric, content-free text-transaction events enter the
+            // already retained stderr. No global subscriber or recorder.
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter("off,frankenterm::mux_text_diagnostics=trace")
+                .with_writer(std::io::stderr)
+                .finish();
             #[cfg(unix)]
             use std::os::fd::AsFd;
             let watchdog_seconds = required("FT_LINDLEY_EXTERNAL_WATCHDOG_SECS")?
@@ -386,7 +416,7 @@ mod live_measurement {
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
-            let result = runtime.block_on(async {
+            let measurement = async {
                 let cx = Cx::for_request();
                 let storage = frankenterm_core::runtime_async::timeout_with_cx(
                     &cx,
@@ -418,7 +448,8 @@ mod live_measurement {
                         result.is_err()
                     )),
                 }
-            })?;
+            };
+            let result = runtime.block_on(measurement.with_subscriber(subscriber))?;
             let (model, observations, initial_read_rejections) = result;
             let (arrival, stages) = model.to_network_calculus_inputs()?;
             let bound = pipeline_delay_bound(arrival, &stages);
@@ -464,6 +495,7 @@ mod live_measurement {
                 "payload_bytes": 4096,
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
+                "diagnostic_timing": "write_ack_ns and storage_submit_ns share the stage epoch; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
                 "overlap_bytes": 4096,
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
@@ -513,7 +545,7 @@ mod live_measurement {
             // Socket/pane readiness does not prove the producer has finished
             // its warmup output. Use the same bounded, typed capture polling
             // before establishing the baseline; do not add a startup sleep.
-            let (initial, initial_read_rejections) = poll_frame(
+            let (initial, initial_read_rejections, _) = poll_frame(
                 cx,
                 "FT LINDLEY READY V1",
                 Instant::now() + Duration::from_secs(5),
@@ -566,9 +598,10 @@ mod live_measurement {
                         .send_text_no_paste_with_cx(cx, pane_id, &sequence.to_string())
                         .await
                         .map_err(|error| error.to_string())?;
+                    let write_ack_ns = elapsed(epoch)?;
                     let marker = format!("FT LINDLEY END {sequence:08}");
                     let capture_deadline = Instant::now() + Duration::from_secs(5);
-                    let (snapshot, transient_read_rejections) =
+                    let (snapshot, transient_read_rejections, poll) =
                         poll_frame(cx, &marker, capture_deadline, || {
                             client.get_text_with_cx(cx, pane_id, false)
                         })
@@ -593,45 +626,47 @@ mod live_measurement {
                         hash,
                         segment.content,
                         transient_read_rejections,
+                        write_ack_ns,
+                        poll,
                     ));
                 }
-                let results =
-                    futures::future::join_all(
-                        pending.iter().map(
-                            |(
-                                sequence,
-                                started,
-                                captured,
-                                extracted,
-                                hash,
-                                content,
-                                rejections,
-                            )| async move {
-                                let stored = storage
-                                    .append_segment_with_cx(cx, pane_id, content, None)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                let completed = elapsed(epoch)?;
-                                if stored.content != *content || stored.seq != u64::from(*sequence)
-                                {
-                                    return Err(
-                                        "committed segment content or sequence differs".to_string()
-                                    );
-                                }
-                                Ok(Observation {
-                                    sequence: *sequence,
-                                    transient_read_rejections: *rejections,
-                                    stages_ns: [
-                                        [*started, *captured],
-                                        [*captured, *extracted],
-                                        [*extracted, completed],
-                                    ],
-                                    content_sha256: hash.clone(),
-                                })
-                            },
-                        ),
-                    )
-                    .await;
+                let results = futures::future::join_all(pending.iter().map(
+                    |(
+                        sequence,
+                        started,
+                        captured,
+                        extracted,
+                        hash,
+                        content,
+                        rejections,
+                        write_ack_ns,
+                        poll,
+                    )| async move {
+                        let storage_submit_ns = elapsed(epoch)?;
+                        let stored = storage
+                            .append_segment_with_cx(cx, pane_id, content, None)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let completed = elapsed(epoch)?;
+                        if stored.content != *content || stored.seq != u64::from(*sequence) {
+                            return Err("committed segment content or sequence differs".to_string());
+                        }
+                        Ok(Observation {
+                            sequence: *sequence,
+                            transient_read_rejections: *rejections,
+                            write_ack_ns: *write_ack_ns,
+                            storage_submit_ns,
+                            poll: poll.clone(),
+                            stages_ns: [
+                                [*started, *captured],
+                                [*captured, *extracted],
+                                [*extracted, completed],
+                            ],
+                            content_sha256: hash.clone(),
+                        })
+                    },
+                ))
+                .await;
                 for result in results {
                     observations.push(result?);
                 }
@@ -771,13 +806,15 @@ mod live_measurement {
                         ))
                     };
                     let mut attempts = 0;
-                    let (text, count) = poll_frame(
+                    let (text, count, diagnostics) = poll_frame(
                         &cx,
                         "ready",
                         Instant::now() + Duration::from_secs(1),
                         || {
                             attempts += 1;
                             std::future::ready(if attempts == 1 {
+                                Ok("not yet".into())
+                            } else if attempts == 2 {
                                 Err(rejection())
                             } else {
                                 Ok("ready".into())
@@ -786,7 +823,10 @@ mod live_measurement {
                     )
                     .await
                     .expect("safe rejection followed by complete frame");
-                    assert_eq!((text.as_str(), count, attempts), ("ready", 1, 2));
+                    assert_eq!((text.as_str(), count, attempts), ("ready", 1, 3));
+                    assert_eq!(diagnostics.read_attempts, 3);
+                    assert_eq!(diagnostics.marker_misses, 1);
+                    assert!(diagnostics.wait_elapsed_ns > 0);
 
                     for authority in [
                         MuxRejection::backend_failure(MuxOperation::SendText),
@@ -854,6 +894,9 @@ mod live_measurement {
                 Observation {
                     sequence,
                     transient_read_rejections: 0,
+                    write_ack_ns: start,
+                    storage_submit_ns: start,
+                    poll: FramePollDiagnostics::default(),
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
                 }

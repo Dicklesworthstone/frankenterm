@@ -1320,6 +1320,52 @@ impl Drop for DirectMuxOutboundLease {
     }
 }
 
+// Transaction-local diagnostics survive early errors/cancellation through Drop;
+// they never retain pane text or alter request/retry authority.
+#[derive(Default)]
+struct TextReadDiagnostics {
+    enabled: bool,
+    connection_id: u64,
+    attempts: u32,
+    quota_reductions: u32,
+    chunk_layout_retries: u32,
+    final_source_retries: u32,
+}
+
+impl TextReadDiagnostics {
+    fn start_phase(&self) -> Option<std::time::Instant> {
+        self.enabled.then(std::time::Instant::now)
+    }
+
+    fn phase(&self, phase: &'static str, started: Option<std::time::Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        tracing::trace!(
+            target: "frankenterm::mux_text_diagnostics",
+            connection_id = self.connection_id,
+            attempt = self.attempts,
+            phase,
+            elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "text transaction phase settled"
+        );
+    }
+}
+
+impl Drop for TextReadDiagnostics {
+    fn drop(&mut self) {
+        tracing::trace!(
+            target: "frankenterm::mux_text_diagnostics",
+            connection_id = self.connection_id,
+            attempts = self.attempts,
+            quota_reductions = self.quota_reductions,
+            chunk_layout_retries = self.chunk_layout_retries,
+            final_source_retries = self.final_source_retries,
+            "text transaction ended"
+        );
+    }
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
     protocol_state: DirectMuxProtocolState,
@@ -2518,11 +2564,18 @@ impl DirectMuxClient {
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
         let mut chunk_rows = 512isize;
+        let mut diagnostics = TextReadDiagnostics {
+            enabled: tracing::enabled!(target: "frankenterm::mux_text_diagnostics", tracing::Level::TRACE),
+            connection_id: self.connection_id,
+            ..TextReadDiagnostics::default()
+        };
         'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
-            let initial = self
-                .get_pane_render_state_with_cx(cx, pane_id, true)
-                .await?;
+            diagnostics.attempts += 1;
+            let phase_started = diagnostics.start_phase();
+            let initial = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
+            diagnostics.phase("initial_fence", phase_started);
+            let initial = initial?;
             let layout = LineReadLayout {
                 seqno: initial.seqno,
                 dimensions: initial.dimensions,
@@ -2537,6 +2590,7 @@ impl DirectMuxClient {
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
                 let chunk_end = start.saturating_add(chunk_rows).min(end);
+                let phase_started = diagnostics.start_phase();
                 let response = self
                     .send_request_with_cx(
                         cx,
@@ -2547,6 +2601,7 @@ impl DirectMuxClient {
                         }),
                     )
                     .await;
+                diagnostics.phase("chunk", phase_started);
                 let response = match response {
                     Err(DirectMuxError::RemoteRejection(error))
                         if error.validate().is_ok()
@@ -2561,18 +2616,23 @@ impl DirectMuxClient {
                             // At most nine reductions for the whole transaction,
                             // including restarts. A one-row refusal is terminal.
                             chunk_rows = (chunk_end - start) / 2;
+                            diagnostics.quota_reductions += 1;
+                            let phase_started = diagnostics.start_phase();
                             crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
                                 .await
                                 .map_err(|error| cancelled_mux_error("text_read_backoff", error))?;
+                            diagnostics.phase("quota_wait", phase_started);
                             continue;
                         }
                         if error.code == codec::MuxErrorCode::BACKEND_FAILURE {
                             // Installing a cold visual layout can invalidate the
                             // first fence and move the oldest row. Observe the
                             // actual new state before deciding to restart.
-                            let current = self
-                                .get_pane_render_state_with_cx(cx, pane_id, true)
-                                .await?;
+                            let phase_started = diagnostics.start_phase();
+                            let current =
+                                self.get_pane_render_state_with_cx(cx, pane_id, true).await;
+                            diagnostics.phase("rejected_chunk_fence", phase_started);
+                            let current = current?;
                             if current.seqno != layout.seqno
                                 || current.dimensions != layout.dimensions
                             {
@@ -2582,11 +2642,14 @@ impl DirectMuxClient {
                                         attempts: MAX_SNAPSHOT_ATTEMPTS,
                                     });
                                 }
+                                diagnostics.chunk_layout_retries += 1;
+                                let phase_started = diagnostics.start_phase();
                                 crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
                                     .await
                                     .map_err(|error| {
                                         cancelled_mux_error("text_snapshot_backoff", error)
                                     })?;
+                                diagnostics.phase("chunk_layout_wait", phase_started);
                                 continue 'snapshot;
                             }
                         }
@@ -2633,17 +2696,21 @@ impl DirectMuxClient {
                 }
                 start = chunk_end;
             }
-            let final_state = self
-                .get_pane_render_state_with_cx(cx, pane_id, true)
-                .await?;
+            let phase_started = diagnostics.start_phase();
+            let final_state = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
+            diagnostics.phase("final_fence", phase_started);
+            let final_state = final_state?;
             checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
             if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
                 return Ok(Ok(MuxTextReadResult::Text(out)));
             }
             if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS {
+                diagnostics.final_source_retries += 1;
+                let phase_started = diagnostics.start_phase();
                 crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
                     .await
                     .map_err(|error| cancelled_mux_error("text_snapshot_backoff", error))?;
+                diagnostics.phase("final_source_wait", phase_started);
             }
         }
         Err(DirectMuxError::TextSnapshotChanged {
@@ -6961,10 +7028,49 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct TextDiagnosticLog(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for TextDiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TextDiagnosticLog {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let output = self.clone();
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter("off,frankenterm::mux_text_diagnostics=trace")
+                .with_writer(move || output.clone())
+                .finish()
+        }
+
+        fn summaries(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().unwrap();
+            bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["fields"]["message"] == "text transaction ended")
+                .map(|event| event["fields"].clone())
+                .collect()
+        }
+    }
+
     #[test]
     fn text_read_one_row_quota_and_changing_snapshot_stop_boundedly() {
+        use tracing::instrument::WithSubscriber;
         for quota in [true, false] {
-            run_async_test(async move {
+            let diagnostic_log = TextDiagnosticLog::default();
+            let subscriber = diagnostic_log.subscriber();
+            let future = async move {
                 let cx = crate::cx::for_testing();
                 let counts = Arc::new(StdMutex::new((0usize, 0usize)));
                 let seen = Arc::clone(&counts);
@@ -6994,7 +7100,13 @@ mod tests {
                         .await
                         .unwrap();
                 let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                let summaries = diagnostic_log.summaries();
+                assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0]["chunk_layout_retries"], 0);
                 if quota {
+                    assert_eq!(summaries[0]["attempts"], 1);
+                    assert_eq!(summaries[0]["quota_reductions"], 1);
+                    assert_eq!(summaries[0]["final_source_retries"], 0);
                     assert!(
                         matches!(error, DirectMuxError::RemoteRejection(ref e) if e.code == codec::MuxErrorCode::QUOTA_EXCEEDED)
                     );
@@ -7004,6 +7116,9 @@ mod tests {
                         "three rows shrink directly to one, then stop"
                     );
                 } else {
+                    assert_eq!(summaries[0]["attempts"], 3);
+                    assert_eq!(summaries[0]["quota_reductions"], 0);
+                    assert_eq!(summaries[0]["final_source_retries"], 2);
                     assert!(matches!(
                         error,
                         DirectMuxError::TextSnapshotChanged {
@@ -7022,7 +7137,8 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-            });
+            };
+            run_async_test(future.with_subscriber(subscriber));
         }
     }
 
@@ -7257,8 +7373,11 @@ mod tests {
 
     #[test]
     fn text_read_snapshot_churn_is_bounded_and_reuses_the_pool_connection() {
+        use tracing::instrument::WithSubscriber;
         for rejected_chunk in [false, true] {
-            run_async_test(async move {
+            let diagnostic_log = TextDiagnosticLog::default();
+            let subscriber = diagnostic_log.subscriber();
+            let future = async move {
                 use crate::vendored::mux_pool::{MuxPool, MuxPoolConfig, MuxPoolError};
                 let cx = crate::cx::for_testing();
                 let counts = Arc::new(StdMutex::new((0usize, 0usize)));
@@ -7292,6 +7411,18 @@ mod tests {
                     ..Default::default()
                 });
                 let error = pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                let summaries = diagnostic_log.summaries();
+                assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0]["attempts"], 3);
+                assert_eq!(summaries[0]["quota_reductions"], 0);
+                assert_eq!(
+                    summaries[0]["chunk_layout_retries"],
+                    if rejected_chunk { 2 } else { 0 }
+                );
+                assert_eq!(
+                    summaries[0]["final_source_retries"],
+                    if rejected_chunk { 0 } else { 2 }
+                );
                 let expected_phase = if rejected_chunk {
                     "chunk_layout"
                 } else {
@@ -7323,7 +7454,8 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-            });
+            };
+            run_async_test(future.with_subscriber(subscriber));
         }
     }
 
