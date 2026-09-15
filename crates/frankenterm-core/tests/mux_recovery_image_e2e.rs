@@ -469,6 +469,56 @@ fn test_mux_recovery_image_e2e_full_positive_journey() {
 }
 
 #[test]
+fn test_mux_recovery_e2e_reconstructs_hidden_stack_member() {
+    let mut fixture = Fixture::new();
+    let tab = fixture
+        .captured
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.tab_id == 10)
+        .unwrap();
+    let PaneNode::Split { left, .. } = &tab.split_tree else {
+        panic!("fixture tab 10 must begin with two tiled panes");
+    };
+    tab.split_tree = left.as_ref().clone();
+    tab.size = size();
+    tab.size_before_zoom = size();
+    tab.pane_stacks = vec![mux::MuxCapturedPaneStack {
+        slot_index: 0,
+        pane_ids: vec![0, 1],
+        active_index: 0,
+    }];
+    let cx = frankenterm_core::cx::for_request();
+    let (_directory, store) = store();
+    fixture.publish(&cx, &store, None);
+    let verified = fixture.current(&cx, &store);
+    let tab = &verified.image().topology.windows[0].tabs[0];
+    assert_eq!(tab.root_split.as_ref().unwrap().leaves().len(), 1);
+    assert_eq!(tab.pane_stacks[0].pane_ids, vec![0, 1]);
+    let reconstructed = reconstruct_whole_mux_image_inert(
+        &verified,
+        TerminalCheckpointLimits::default(),
+        Some("offline-stacked"),
+        &HashSet::new(),
+    )
+    .expect("both visible and hidden stack members must reconstruct");
+    for id in [0usize, 1] {
+        let pane = &reconstructed.pane_terminals[&(id as u64)];
+        assert_eq!(pane.tab_id, 10);
+        let canonical = pane
+            .terminal
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        assert_eq!(
+            canonical.as_slice(),
+            fixture.acks[id].terminal_checkpoint.canonical_payload()
+        );
+    }
+}
+
+#[test]
 fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
     let fixture = Fixture::new();
     let cx = frankenterm_core::cx::for_request();

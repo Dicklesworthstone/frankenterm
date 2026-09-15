@@ -6478,9 +6478,25 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
 // Whole-Mux Recovery Integration (ft-interactive-swarm-product-convergence-7xqz4.8.14.3.4)
 // =============================================================================
 
+/// Finite labels for disagreement between image metadata and its terminal checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalProjectionField {
+    SchemaVersion,
+    Geometry,
+    Title,
+    CurrentDirectory,
+    Cursor,
+    AlternateScreen,
+}
+
 /// Error during whole-mux recovery root verification, planning, or reconstruction.
 #[derive(Debug, thiserror::Error)]
 pub enum WholeMuxRecoveryError {
+    #[error("terminal projection mismatch for pane {pane_id}: {field:?}")]
+    TerminalProjectionMismatch {
+        pane_id: u64,
+        field: TerminalProjectionField,
+    },
     #[error("whole-mux recovery was cancelled")]
     Cancelled,
 
@@ -6986,31 +7002,7 @@ impl WholeMuxRecoveryVerifier {
         }
 
         let mut repair_permit = None;
-        let wire_bytes: Zeroizing<Vec<u8>> = if candidate
-            .manifest_bytes
-            .starts_with(&RECOVERY_OBJECT_MAGIC)
-        {
-            Zeroizing::new(candidate.manifest_bytes.clone())
-        } else {
-            if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
-                cx,
-                store,
-                &expected_rep_id,
-                self.trusted_identity.expected_root_object_id,
-                candidate.generation,
-                self.limits.max_image_bytes,
-            )? {
-                repair_permit = Some(permit);
-                reconstructed
-            } else {
-                return Err(WholeMuxRecoveryError::AeadRequired(
-                    "manifest is unencrypted; whole-mux recovery requires AEAD encrypted recovery objects"
-                        .to_string(),
-                ));
-            }
-        };
-
-        let enc_obj = match EncryptedRecoveryObject::from_bytes(wire_bytes.as_slice()) {
+        let enc_obj = match EncryptedRecoveryObject::from_bytes(&candidate.manifest_bytes) {
             Ok(obj) => obj,
             Err(parse_err) => {
                 if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
@@ -7024,6 +7016,11 @@ impl WholeMuxRecoveryVerifier {
                     repair_permit = Some(permit);
                     EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
                         .map_err(WholeMuxRecoveryError::Representation)?
+                } else if !candidate.manifest_bytes.starts_with(&RECOVERY_OBJECT_MAGIC) {
+                    return Err(WholeMuxRecoveryError::AeadRequired(
+                        "manifest is unencrypted; whole-mux recovery requires AEAD encrypted recovery objects"
+                            .to_string(),
+                    ));
                 } else {
                     return Err(WholeMuxRecoveryError::Representation(parse_err));
                 }
@@ -7050,7 +7047,6 @@ impl WholeMuxRecoveryVerifier {
         )
         .map_err(WholeMuxRecoveryError::Representation)?;
 
-        drop(wire_bytes);
         drop(enc_obj);
         drop(repair_permit);
         Ok((decoded.into_plaintext(), candidate.generation))
@@ -7275,11 +7271,49 @@ impl WholeMuxRecoveryVerifier {
             #[cfg(feature = "frankenterm-deps")]
             {
                 let term_limits = TerminalCheckpointLimits::default();
-                TerminalCheckpointV2::decode_canonical_json(decoded_json.as_slice(), term_limits)
-                    .map_err(|source| WholeMuxRecoveryError::TerminalCheckpointDecode {
-                    pane_id: pane.pane_id as u64,
-                    source,
+                let validated = TerminalCheckpointV2::decode_canonical_json(
+                    decoded_json.as_slice(),
+                    term_limits,
+                )
+                .map_err(|source| {
+                    WholeMuxRecoveryError::TerminalCheckpointDecode {
+                        pane_id: pane.pane_id as u64,
+                        source,
+                    }
                 })?;
+                let checkpoint = validated.checkpoint();
+                let (pixel_width, pixel_height, dpi) = checkpoint.pixel_dimensions_and_dpi();
+                let (row, column) = checkpoint.cursor_position();
+                let mismatch = if obj_ref.schema_version
+                    != frankenterm_term::terminalstate::checkpoint::TERMINAL_CHECKPOINT_VERSION
+                {
+                    Some(TerminalProjectionField::SchemaVersion)
+                } else if pane.size.rows != checkpoint.primary_rows()
+                    || pane.size.cols != checkpoint.primary_cols()
+                    || u64::try_from(pane.size.pixel_width).ok() != Some(pixel_width)
+                    || u64::try_from(pane.size.pixel_height).ok() != Some(pixel_height)
+                    || pane.size.dpi != dpi
+                {
+                    Some(TerminalProjectionField::Geometry)
+                } else if pane.title != checkpoint.title() {
+                    Some(TerminalProjectionField::Title)
+                } else if pane.cwd.as_deref() != checkpoint.current_directory() {
+                    Some(TerminalProjectionField::CurrentDirectory)
+                } else if usize::try_from(column).ok() != Some(pane.cursor_position.0)
+                    || usize::try_from(row).ok() != Some(pane.cursor_position.1)
+                {
+                    Some(TerminalProjectionField::Cursor)
+                } else if pane.alt_screen_active != checkpoint.is_alternate_screen_active() {
+                    Some(TerminalProjectionField::AlternateScreen)
+                } else {
+                    None
+                };
+                if let Some(field) = mismatch {
+                    return Err(WholeMuxRecoveryError::TerminalProjectionMismatch {
+                        pane_id: pane.pane_id as u64,
+                        field,
+                    });
+                }
             }
 
             total_bytes = total_bytes.saturating_add(decoded_json.len());
@@ -7386,13 +7420,8 @@ pub fn reconstruct_whole_mux_image_inert_with_config(
     let mut pane_to_tab = HashMap::new();
     for w in &validated.image().topology.windows {
         for t in &w.tabs {
-            if let Some(ref root_split) = t.root_split {
-                for (pane_id, _) in root_split.leaves() {
-                    pane_to_tab.insert(pane_id, t.tab_id as u64);
-                }
-            }
-            for fp in &t.floating_panes {
-                pane_to_tab.insert(fp.pane_id, t.tab_id as u64);
+            for pane_id in t.all_pane_ids() {
+                pane_to_tab.insert(pane_id, t.tab_id as u64);
             }
         }
     }
@@ -7597,6 +7626,8 @@ pub fn select_verified_recovery_roots_with_cx(
                                 .map_err(|error| RepairError::Storage(error.to_string()))
                         },
                     )?;
+                    let candidate_permit =
+                        admission.acquire(repaired.reconstructed_envelope.len())?;
                     let candidate =
                         store.decode_recovered_root(slot, &repaired.reconstructed_envelope)?;
                     if !store.root_candidate_matches_discovery(&candidate, discovery)? {
@@ -7608,6 +7639,8 @@ pub fn select_verified_recovery_roots_with_cx(
                     // Keep the reconstruction allocation's permit alive until
                     // all authenticated graph decoding has completed.
                     let result = verifier.verify_root_with_cx(cx, &candidate, store);
+                    drop(candidate);
+                    drop(candidate_permit);
                     drop(repaired);
                     result
                 })()
@@ -13493,10 +13526,10 @@ mod tests {
                 pane_id: 100,
                 pane_uuid: "uuid-pane-100".to_string(),
                 domain_name: "local".to_string(),
-                title: "editor".to_string(),
-                cwd: Some("/app".to_string()),
+                title: "frankenterm".to_string(),
+                cwd: None,
                 size: term_size1,
-                cursor_position: (0, 0),
+                cursor_position: (0, 1),
                 alt_screen_active: false,
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
@@ -13511,7 +13544,7 @@ mod tests {
                         object_id: obj1_id,
                         byte_length: payload1.len() as u64,
                         payload_digest: digest1,
-                        schema_version: 1,
+                        schema_version: 2,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -13523,10 +13556,10 @@ mod tests {
                 pane_id: 101,
                 pane_uuid: "uuid-pane-101".to_string(),
                 domain_name: "local".to_string(),
-                title: "logs".to_string(),
-                cwd: Some("/app/logs".to_string()),
+                title: "frankenterm".to_string(),
+                cwd: None,
                 size: term_size2,
-                cursor_position: (0, 0),
+                cursor_position: (0, 1),
                 alt_screen_active: false,
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
@@ -13541,7 +13574,7 @@ mod tests {
                         object_id: obj2_id,
                         byte_length: payload2.len() as u64,
                         payload_digest: digest2,
-                        schema_version: 1,
+                        schema_version: 2,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -13623,6 +13656,53 @@ mod tests {
             .verify_root(&candidate, &store)
             .expect("root verification must succeed");
 
+        // These roots are correctly encrypted and rehashed. The independent
+        // terminal object is unchanged: projection disagreement must be rejected
+        // during verification, before any inert terminal can be constructed.
+        let projection_mutations: &[(TerminalProjectionField, fn(&mut RecoveryPane))] = &[
+            (TerminalProjectionField::SchemaVersion, |p| {
+                p.checkpoint.checkpoint_ref.schema_version = 1
+            }),
+            (TerminalProjectionField::Geometry, |p| p.size.rows += 1),
+            (TerminalProjectionField::Geometry, |p| p.size.cols += 1),
+            (TerminalProjectionField::Geometry, |p| {
+                p.size.pixel_width += 1
+            }),
+            (TerminalProjectionField::Geometry, |p| {
+                p.size.pixel_height += 1
+            }),
+            (TerminalProjectionField::Geometry, |p| p.size.dpi += 1),
+            (TerminalProjectionField::Title, |p| {
+                p.title.push_str(" changed")
+            }),
+            (TerminalProjectionField::CurrentDirectory, |p| {
+                p.cwd = Some("file:///other".into())
+            }),
+            (TerminalProjectionField::Cursor, |p| {
+                p.cursor_position.0 += 1
+            }),
+            (TerminalProjectionField::AlternateScreen, |p| {
+                p.alt_screen_active = !p.alt_screen_active
+            }),
+        ];
+        for (expected, mutate) in projection_mutations {
+            let mut changed = image.clone();
+            mutate(&mut changed.panes[0]);
+            changed.image_digest = changed.compute_digest().expect("rehash changed projection");
+            let manifest_bytes = encrypted_test_image(&changed);
+            let mut changed_candidate = candidate.clone();
+            changed_candidate.manifest_sha256 = sha256_hex(&manifest_bytes);
+            changed_candidate.file_len = manifest_bytes.len() as u64;
+            changed_candidate.manifest_bytes = manifest_bytes;
+            assert!(
+                matches!(
+                    verifier.verify_root(&changed_candidate, &store),
+                    Err(WholeMuxRecoveryError::TerminalProjectionMismatch { pane_id: 100, field }) if field == *expected
+                ),
+                "authenticated projection mutation {expected:?} must fail before reconstruction"
+            );
+        }
+
         assert_eq!(validated.checkpoint_payloads.len(), 2);
 
         let active_sessions = HashSet::new();
@@ -13701,10 +13781,10 @@ mod tests {
             pane_id: 42,
             pane_uuid: "uuid-pane-42".to_string(),
             domain_name: "local".to_string(),
-            title: "shell".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 2),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -13719,7 +13799,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -13861,10 +13941,10 @@ mod tests {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
             domain_name: "local".to_string(),
-            title: "p1".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -13879,7 +13959,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -13965,10 +14045,10 @@ mod tests {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
             domain_name: "local".to_string(),
-            title: "p1".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -13983,7 +14063,7 @@ mod tests {
                     object_id: "obj-missing-gen-2".to_string(),
                     payload_digest: [0x55u8; 32],
                     byte_length: 128,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000001000,
@@ -14214,7 +14294,7 @@ mod tests {
                     object_id: "obj-never-published".to_string(),
                     byte_length: 64,
                     payload_digest: [0xAAu8; 32],
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -14353,7 +14433,7 @@ mod tests {
                     object_id: obj_id.clone(),
                     byte_length: tampered_payload.len() as u64,
                     payload_digest: valid_digest, // expected digest is for untampered
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -14538,7 +14618,7 @@ mod tests {
                     object_id: "obj-fake-guardian".to_string(),
                     payload_digest: [0x77u8; 32],
                     byte_length: 64,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::Guardian {
                     guardian_generation: 1,
@@ -14678,10 +14758,10 @@ mod tests {
                 pane_id: 10,
                 pane_uuid: "uuid-pane-10".to_string(),
                 domain_name: "domain-alpha".to_string(),
-                title: "alpha".to_string(),
-                cwd: Some("/app/alpha".to_string()),
+                title: "frankenterm".to_string(),
+                cwd: None,
                 size: term_size1,
-                cursor_position: (0, 0),
+                cursor_position: (0, 1),
                 alt_screen_active: false,
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
@@ -14696,7 +14776,7 @@ mod tests {
                         object_id: obj1_id,
                         byte_length: payload1.len() as u64,
                         payload_digest: digest1,
-                        schema_version: 1,
+                        schema_version: 2,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -14708,10 +14788,10 @@ mod tests {
                 pane_id: 20,
                 pane_uuid: "uuid-pane-20".to_string(),
                 domain_name: "domain-beta".to_string(),
-                title: "beta".to_string(),
-                cwd: Some("/app/beta".to_string()),
+                title: "frankenterm".to_string(),
+                cwd: None,
                 size: term_size2,
-                cursor_position: (0, 0),
+                cursor_position: (0, 1),
                 alt_screen_active: false,
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
@@ -14726,7 +14806,7 @@ mod tests {
                         object_id: obj2_id,
                         byte_length: payload2.len() as u64,
                         payload_digest: digest2,
-                        schema_version: 1,
+                        schema_version: 2,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -14927,10 +15007,10 @@ mod tests {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
             domain_name: "local".to_string(),
-            title: "secure-shell".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -14945,7 +15025,7 @@ mod tests {
                     object_id: obj_id_str.clone(),
                     byte_length: enc_checkpoint_bytes.len() as u64,
                     payload_digest: enc_checkpoint_digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -15136,10 +15216,10 @@ mod tests {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
             domain_name: "local".to_string(),
-            title: "shell".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -15154,7 +15234,7 @@ mod tests {
                     object_id: obj_id_str,
                     byte_length: enc_checkpoint_bytes.len() as u64,
                     payload_digest: enc_checkpoint_digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -15425,10 +15505,10 @@ mod tests {
             pane_id: 999, // not placed in tab split or floating
             pane_uuid: "uuid-pane-999".to_string(),
             domain_name: "local".to_string(),
-            title: "unplaced".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -15443,7 +15523,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -15558,10 +15638,10 @@ mod tests {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
             domain_name: "domain-does-not-exist".to_string(),
-            title: "ghost".to_string(),
+            title: "frankenterm".to_string(),
             cwd: None,
             size: term_size,
-            cursor_position: (0, 0),
+            cursor_position: (0, 1),
             alt_screen_active: false,
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
@@ -15576,7 +15656,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 1,
+                    schema_version: 2,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,

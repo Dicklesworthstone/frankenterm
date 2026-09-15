@@ -108,13 +108,14 @@ pub enum WholeMuxCaptureError {
 /// Capture actual mux/parser state and publish an encrypted offline model image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
-/// one attempt, at most 1,024 panes, a total deadline, and at most 100ms between
-/// caller cancellation checks while waiting for a parser ACK. PTY durability
+/// one attempt, at most 1,024 panes, a total deadline checked between phases,
+/// and at most 100ms for each parser ACK channel wait. Registry locks, staging,
+/// and cold-history filesystem calls are not preemptible by that wait bound.
+/// PTY durability
 /// and guardian replay suffixes are not asserted by this model-only operation.
 /// All periodic/manual callers must share this store authority and this entry
 /// point. The store additionally serializes the final root CAS across processes.
 #[cfg(feature = "frankenterm-deps")]
-#[allow(clippy::too_many_lines)]
 pub fn capture_and_publish_whole_mux_model(
     cx: &crate::cx::Cx,
     mux: &mux::Mux,
@@ -122,6 +123,31 @@ pub fn capture_and_publish_whole_mux_model(
     key: Arc<crate::snapshot_representation::RecoveryKey>,
     expected: &WholeMuxPublicationIdentity,
     capture_timeout: Duration,
+) -> Result<crate::snapshot_publication::GenerationPublicationReceipt, WholeMuxCaptureError> {
+    capture_and_publish_whole_mux_model_at_boundary(
+        cx,
+        mux,
+        store,
+        key,
+        expected,
+        capture_timeout,
+        || {},
+    )
+}
+
+/// The callback only schedules work between capture and validation; it cannot
+/// supply or replace any checkpoint or authority. Tests use real PTY output at
+/// this boundary to exercise a deterministic optimistic-cut race.
+#[cfg(feature = "frankenterm-deps")]
+#[allow(clippy::too_many_lines)]
+fn capture_and_publish_whole_mux_model_at_boundary(
+    cx: &crate::cx::Cx,
+    mux: &mux::Mux,
+    store: &crate::snapshot_publication::SnapshotPublicationStore,
+    key: Arc<crate::snapshot_representation::RecoveryKey>,
+    expected: &WholeMuxPublicationIdentity,
+    capture_timeout: Duration,
+    after_capture: impl FnOnce(),
 ) -> Result<crate::snapshot_publication::GenerationPublicationReceipt, WholeMuxCaptureError> {
     snapshot_cx_checkpoint(cx)?;
     if capture_timeout.is_zero() || capture_timeout > Duration::from_secs(30) {
@@ -173,11 +199,29 @@ pub fn capture_and_publish_whole_mux_model(
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
             .ok_or(WholeMuxCaptureError::CaptureDeadline)?;
+        let mut cancellation = None;
+        let mut capture_deadline_reached = false;
         let result = mux.capture_pane_model_checkpoint(
             pane.pane_id,
             frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
-            remaining.min(Duration::from_millis(100)),
+            remaining,
+            || match snapshot_cx_checkpoint(cx) {
+                Ok(()) => {
+                    capture_deadline_reached = Instant::now() >= deadline;
+                    capture_deadline_reached
+                }
+                Err(error) => {
+                    cancellation = Some(error);
+                    true
+                }
+            },
         );
+        if let Some(error) = cancellation {
+            return Err(WholeMuxCaptureError::Context(error));
+        }
+        if capture_deadline_reached {
+            return Err(WholeMuxCaptureError::CaptureDeadline);
+        }
         snapshot_cx_checkpoint(cx)?;
         let ack = result.map_err(|source| match source {
             mux::LiveParserCheckpointError::StaleRegistration => WholeMuxCaptureError::StaleCapture,
@@ -198,6 +242,7 @@ pub fn capture_and_publish_whole_mux_model(
             .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
         acks.push(ack);
     }
+    after_capture();
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
         return Err(WholeMuxCaptureError::CaptureDeadline);
@@ -12668,6 +12713,196 @@ mod tests {
         assert_eq!(receipt.generation, 1);
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    #[allow(clippy::too_many_lines)]
+    fn real_mux_capture_rejects_reader_title_aba_and_cancelled_cut() {
+        use crate::snapshot_publication::SnapshotPublicationStore;
+        use crate::snapshot_representation::RecoveryKey;
+        use mux::domain::{Domain, LocalDomain};
+        use std::ffi::OsStr;
+
+        struct OwnedPane {
+            mux: Arc<mux::Mux>,
+            pane: Arc<dyn mux::pane::Pane>,
+        }
+        impl Drop for OwnedPane {
+            fn drop(&mut self) {
+                self.pane.kill();
+                self.mux.remove_pane(self.pane.pane_id());
+            }
+        }
+        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("capture-real-pty").unwrap());
+        let mux = Arc::new(mux::Mux::new(Some(Arc::clone(&domain))));
+        let window = mux.new_empty_window(None, None);
+        let size = frankenterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        // The real child is silent between requests. Disabling echo ensures
+        // the two title transitions below originate in child output, not the
+        // terminal line discipline echoing our input.
+        let script = r#"/bin/stty -echo || exit 1; printf '\033]2;A\007'; while IFS= read -r title; do case "$title" in hold) printf '\033]2;HOLD\007\033]2;' ;; finish) printf 'A\007' ;; *) printf '\033]2;%s\007' "$title" ;; esac; done"#;
+        let command = config::Config::default()
+            .build_prog(
+                Some(vec![
+                    OsStr::new("/bin/sh"),
+                    OsStr::new("-c"),
+                    OsStr::new(script),
+                ]),
+                None,
+                None,
+            )
+            .unwrap();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let tab = runtime
+            .block_on(domain.spawn(&mux, size, Some(command), None, *window))
+            .unwrap();
+        let owned = OwnedPane {
+            mux: Arc::clone(&mux),
+            pane: tab.get_active_pane().unwrap(),
+        };
+        let wait_title = |title: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while owned.pane.get_title() != title {
+                assert!(
+                    Instant::now() < deadline,
+                    "real PTY never reached title {title}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait_title("A");
+        let topology = mux.capture_topology_coherent(Default::default()).unwrap();
+        assert_eq!(topology.pane_bindings.len(), 1);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
+        let key = Arc::new(RecoveryKey::from_bytes([31; 32]).unwrap());
+        let expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "real-reader-cut".into(),
+            mux_incarnation_id: hex::encode(topology.session_incarnation.as_bytes()),
+            root_object_id: [32; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+        };
+        let cx = crate::cx::Cx::for_testing();
+        let mutation_after_ack = std::cell::Cell::new(false);
+        let changed = capture_and_publish_whole_mux_model_at_boundary(
+            &cx,
+            &mux,
+            &store,
+            Arc::clone(&key),
+            &expected,
+            Duration::from_secs(5),
+            || {
+                mutation_after_ack.set(true);
+                for title in ["B", "A"] {
+                    {
+                        let mut writer = owned.pane.writer();
+                        writeln!(writer, "{title}").unwrap();
+                        writer.flush().unwrap();
+                    }
+                    wait_title(title);
+                }
+            },
+        );
+        assert!(
+            mutation_after_ack.get(),
+            "capture must reach the actual ACK boundary"
+        );
+        assert!(
+            matches!(changed, Err(WholeMuxCaptureError::StaleCapture)),
+            "{changed:?}"
+        );
+        assert_eq!(owned.pane.get_title(), "A");
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        assert!(store.list_object_ids().unwrap().is_empty());
+
+        let cancelled = crate::cx::Cx::for_testing();
+        let result = capture_and_publish_whole_mux_model_at_boundary(
+            &cancelled,
+            &mux,
+            &store,
+            Arc::clone(&key),
+            &expected,
+            Duration::from_secs(5),
+            || {
+                cancelled.cancel_with(CancelKind::User, Some("after actual parser ACK"));
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(WholeMuxCaptureError::Context(SnapshotError::Cancelled))
+            ),
+            "{result:?}"
+        );
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        assert!(store.list_object_ids().unwrap().is_empty());
+        // Keep the real parser inside an incomplete OSC for multiple polling
+        // slices. The callback supplies only input to the child, never an ACK.
+        for cancel_wait in [false, true] {
+            {
+                let mut writer = owned.pane.writer();
+                writeln!(writer, "hold").unwrap();
+                writer.flush().unwrap();
+            }
+            wait_title("HOLD");
+            let mut polls = 0usize;
+            let started = Instant::now();
+            let delayed = mux.capture_pane_model_checkpoint(
+                owned.pane.pane_id(),
+                frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+                || {
+                    polls += 1;
+                    if polls == 4 && !cancel_wait {
+                        let mut writer = owned.pane.writer();
+                        writeln!(writer, "finish").unwrap();
+                        writer.flush().unwrap();
+                    }
+                    polls >= 4 && cancel_wait
+                },
+            );
+            assert!(
+                polls >= 4,
+                "request must survive multiple real ACK polling slices"
+            );
+            assert!(started.elapsed() >= Duration::from_millis(200));
+            if cancel_wait {
+                assert!(matches!(
+                    delayed,
+                    Err(mux::LiveParserCheckpointError::Cancelled)
+                ));
+                let mut writer = owned.pane.writer();
+                writeln!(writer, "finish").unwrap();
+                writer.flush().unwrap();
+            } else {
+                let ack = delayed.expect("full timeout permits a delayed real parser ACK");
+                assert!(mux.model_checkpoint_is_current(owned.pane.pane_id(), &ack));
+            }
+            wait_title("A");
+        }
+        // Reuse the same real pane and authority after both failures; neither
+        // cancellation nor rejected ACK may poison or latch the next attempt.
+        let receipt = capture_and_publish_whole_mux_model(
+            &cx,
+            &mux,
+            &store,
+            key,
+            &expected,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(receipt.generation, 1);
     }
 
     #[test]

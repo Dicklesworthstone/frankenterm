@@ -265,6 +265,264 @@ impl std::fmt::Debug for RecoveryKey {
 }
 
 // =============================================================================
+// Wrapped recovery keys: cryptographic envelope only, not durable KEK custody.
+// =============================================================================
+
+const RECOVERY_WRAP_MAGIC: [u8; 8] = *b"FTWRAP01";
+const RECOVERY_WRAP_VERSION: u32 = 1;
+const RECOVERY_WRAP_DOMAIN: &[u8] = b"frankenterm.snapshot-recovery.key-wrap.v1\0";
+const RECOVERY_WRAPPING_KEY_ID_DOMAIN: &[u8] =
+    b"frankenterm.snapshot-recovery.wrapping-authority-id.v1\0";
+pub const WRAPPED_RECOVERY_KEY_BYTES: usize = 188;
+
+/// Explicit caller-owned wrapping authority. This type neither persists keys
+/// nor establishes enrollment, independent recovery, rotation, or revocation.
+pub struct RecoveryWrappingKey {
+    bytes: Zeroizing<[u8; KEY_BYTES]>,
+    authority_id: [u8; 32],
+}
+
+impl RecoveryWrappingKey {
+    pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Result<Self, RecoveryWrapError> {
+        let bytes = Zeroizing::new(bytes);
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(RecoveryWrapError::InvalidKey);
+        }
+        let mut digest = Sha256::new();
+        digest.update(RECOVERY_WRAPPING_KEY_ID_DOMAIN);
+        digest.update(bytes.as_slice());
+        Ok(Self {
+            bytes,
+            authority_id: digest.finalize().into(),
+        })
+    }
+
+    #[must_use]
+    pub const fn authority_id(&self) -> [u8; 32] {
+        self.authority_id
+    }
+}
+
+impl std::fmt::Debug for RecoveryWrappingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryWrappingKey")
+            .field("authority_id", &hex::encode(self.authority_id))
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryWrapContext {
+    pub namespace_id: [u8; 32],
+    pub policy_id: [u8; 32],
+}
+
+/// Caller-provided expectations, independent of the artifact being opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedRecoveryWrapContext {
+    pub namespace_id: [u8; 32],
+    pub policy_id: [u8; 32],
+    pub recovery_key_id: [u8; 8],
+    pub authority_id: [u8; 32],
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RecoveryWrapError {
+    #[error("wrapped recovery key has invalid fixed framing")]
+    InvalidEnvelope,
+    #[error("unsupported wrapped recovery key version {0}")]
+    UnsupportedVersion(u32),
+    #[error("invalid recovery wrapping key")]
+    InvalidKey,
+    #[error("recovery key wrapper identity mismatch: {field}")]
+    KeyMismatch { field: &'static str },
+    #[error("recovery key wrapper context mismatch: {field}")]
+    ContextMismatch { field: &'static str },
+    #[error("recovery key wrapper authentication failed")]
+    AuthenticationFailed,
+    #[error("recovery key wrapper entropy unavailable")]
+    EntropyUnavailable,
+}
+
+/// One independently authenticated wrapper for a DEK. Multiple authorities
+/// produce separate records sharing a recovery-key ID, not shared KEK material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WrappedRecoveryKey {
+    expected: ExpectedRecoveryWrapContext,
+    nonce: [u8; NONCE_BYTES],
+    ciphertext: [u8; KEY_BYTES + AEAD_TAG_BYTES],
+}
+
+impl std::fmt::Debug for WrappedRecoveryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrappedRecoveryKey")
+            .field("identity", &self.expected)
+            .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl WrappedRecoveryKey {
+    #[must_use]
+    pub const fn identity(&self) -> ExpectedRecoveryWrapContext {
+        self.expected
+    }
+
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; WRAPPED_RECOVERY_KEY_BYTES] {
+        let mut bytes = [0; WRAPPED_RECOVERY_KEY_BYTES];
+        bytes[..8].copy_from_slice(&RECOVERY_WRAP_MAGIC);
+        bytes[8..12].copy_from_slice(&RECOVERY_WRAP_VERSION.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.expected.recovery_key_id);
+        bytes[20..52].copy_from_slice(&self.expected.authority_id);
+        bytes[52..84].copy_from_slice(&self.expected.namespace_id);
+        bytes[84..116].copy_from_slice(&self.expected.policy_id);
+        bytes[116..140].copy_from_slice(&self.nonce);
+        bytes[140..].copy_from_slice(&self.ciphertext);
+        bytes
+    }
+
+    /// Decode fixed framing only. This does not authenticate or authorize use;
+    /// the caller must supply independent expectations to `unwrap_recovery_key`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryWrapError> {
+        if bytes.len() != WRAPPED_RECOVERY_KEY_BYTES || bytes[..8] != RECOVERY_WRAP_MAGIC {
+            return Err(RecoveryWrapError::InvalidEnvelope);
+        }
+        let mut version = [0; 4];
+        version.copy_from_slice(&bytes[8..12]);
+        let version = u32::from_le_bytes(version);
+        if version != RECOVERY_WRAP_VERSION {
+            return Err(RecoveryWrapError::UnsupportedVersion(version));
+        }
+        let mut wrapped = Self {
+            expected: ExpectedRecoveryWrapContext {
+                namespace_id: [0; 32],
+                policy_id: [0; 32],
+                recovery_key_id: [0; 8],
+                authority_id: [0; 32],
+            },
+            nonce: [0; NONCE_BYTES],
+            ciphertext: [0; KEY_BYTES + AEAD_TAG_BYTES],
+        };
+        wrapped
+            .expected
+            .recovery_key_id
+            .copy_from_slice(&bytes[12..20]);
+        wrapped
+            .expected
+            .authority_id
+            .copy_from_slice(&bytes[20..52]);
+        wrapped
+            .expected
+            .namespace_id
+            .copy_from_slice(&bytes[52..84]);
+        wrapped.expected.policy_id.copy_from_slice(&bytes[84..116]);
+        wrapped.nonce.copy_from_slice(&bytes[116..140]);
+        wrapped.ciphertext.copy_from_slice(&bytes[140..]);
+        Ok(wrapped)
+    }
+
+    fn aad(&self) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(RECOVERY_WRAP_DOMAIN.len() + 116);
+        aad.extend_from_slice(RECOVERY_WRAP_DOMAIN);
+        aad.extend_from_slice(&self.to_bytes()[..116]);
+        aad
+    }
+}
+
+pub fn wrap_recovery_key(
+    key: &RecoveryKey,
+    authority: &RecoveryWrappingKey,
+    context: &RecoveryWrapContext,
+) -> Result<WrappedRecoveryKey, RecoveryWrapError> {
+    let mut wrapped = WrappedRecoveryKey {
+        expected: ExpectedRecoveryWrapContext {
+            namespace_id: context.namespace_id,
+            policy_id: context.policy_id,
+            recovery_key_id: key.key_id(),
+            authority_id: authority.authority_id(),
+        },
+        nonce: [0; NONCE_BYTES],
+        ciphertext: [0; KEY_BYTES + AEAD_TAG_BYTES],
+    };
+    SysRng
+        .try_fill_bytes(&mut wrapped.nonce)
+        .map_err(|_| RecoveryWrapError::EntropyUnavailable)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(authority.bytes.as_slice())
+        .map_err(|_| RecoveryWrapError::InvalidKey)?;
+    let plaintext = Zeroizing::new(*key.as_bytes());
+    let aad = wrapped.aad();
+    let ciphertext = cipher
+        .encrypt(
+            &XNonce::from(wrapped.nonce),
+            Payload {
+                msg: plaintext.as_slice(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| RecoveryWrapError::AuthenticationFailed)?;
+    if ciphertext.len() != KEY_BYTES + AEAD_TAG_BYTES {
+        return Err(RecoveryWrapError::InvalidEnvelope);
+    }
+    wrapped.ciphertext.copy_from_slice(&ciphertext);
+    Ok(wrapped)
+}
+
+pub fn unwrap_recovery_key(
+    wrapped: &WrappedRecoveryKey,
+    authority: &RecoveryWrappingKey,
+    expected: &ExpectedRecoveryWrapContext,
+) -> Result<RecoveryKey, RecoveryWrapError> {
+    if wrapped.expected.authority_id != expected.authority_id
+        || authority.authority_id() != expected.authority_id
+    {
+        return Err(RecoveryWrapError::KeyMismatch {
+            field: "authority_id",
+        });
+    }
+    if wrapped.expected.recovery_key_id != expected.recovery_key_id {
+        return Err(RecoveryWrapError::KeyMismatch {
+            field: "recovery_key_id",
+        });
+    }
+    if wrapped.expected.namespace_id != expected.namespace_id {
+        return Err(RecoveryWrapError::ContextMismatch {
+            field: "namespace_id",
+        });
+    }
+    if wrapped.expected.policy_id != expected.policy_id {
+        return Err(RecoveryWrapError::ContextMismatch { field: "policy_id" });
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(authority.bytes.as_slice())
+        .map_err(|_| RecoveryWrapError::InvalidKey)?;
+    let aad = wrapped.aad();
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                &XNonce::from(wrapped.nonce),
+                Payload {
+                    msg: &wrapped.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| RecoveryWrapError::AuthenticationFailed)?,
+    );
+    if plaintext.len() != KEY_BYTES {
+        return Err(RecoveryWrapError::InvalidEnvelope);
+    }
+    let mut bytes = Zeroizing::new([0; KEY_BYTES]);
+    bytes.copy_from_slice(&plaintext);
+    let key = RecoveryKey::from_bytes(*bytes).map_err(|_| RecoveryWrapError::InvalidKey)?;
+    if key.key_id() != expected.recovery_key_id {
+        return Err(RecoveryWrapError::KeyMismatch {
+            field: "recovery_key_id",
+        });
+    }
+    Ok(key)
+}
+
+// =============================================================================
 // Context & AAD Data Structures
 // =============================================================================
 
@@ -1415,6 +1673,126 @@ pub fn decode_recovery_object_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cipher_key_schedule_requires_zeroization_feature() {
+        fn require_zeroizing_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroizing_drop::<XChaCha20Poly1305>();
+    }
+
+    #[test]
+    fn recovery_key_wrappers_roundtrip_with_independent_authorities() {
+        let key = RecoveryKey::from_bytes([0x63; KEY_BYTES]).unwrap();
+        let first = RecoveryWrappingKey::from_bytes([0x17; KEY_BYTES]).unwrap();
+        let second = RecoveryWrappingKey::from_bytes([0x28; KEY_BYTES]).unwrap();
+        let context = RecoveryWrapContext {
+            namespace_id: [0x41; 32],
+            policy_id: [0x52; 32],
+        };
+        for authority in [&first, &second] {
+            let expected = ExpectedRecoveryWrapContext {
+                namespace_id: context.namespace_id,
+                policy_id: context.policy_id,
+                recovery_key_id: key.key_id(),
+                authority_id: authority.authority_id(),
+            };
+            let wrapped = wrap_recovery_key(&key, authority, &context).unwrap();
+            let bytes = wrapped.to_bytes();
+            assert_eq!(bytes.len(), WRAPPED_RECOVERY_KEY_BYTES);
+            assert!(!bytes.windows(KEY_BYTES).any(|part| part == key.as_bytes()));
+            let decoded = WrappedRecoveryKey::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, wrapped);
+            let reopened = unwrap_recovery_key(&decoded, authority, &expected).unwrap();
+            assert_eq!(reopened.as_bytes(), key.as_bytes());
+            assert_eq!(reopened.key_id(), key.key_id());
+        }
+        assert_ne!(first.authority_id(), second.authority_id());
+        assert!(!format!("{first:?}").contains(&hex::encode([0x17; KEY_BYTES])));
+    }
+
+    #[test]
+    fn recovery_key_wrapper_rejects_tampering_and_wrong_expected_identity() {
+        let key = RecoveryKey::from_bytes([0x63; KEY_BYTES]).unwrap();
+        let authority = RecoveryWrappingKey::from_bytes([0x17; KEY_BYTES]).unwrap();
+        let foreign = RecoveryWrappingKey::from_bytes([0x28; KEY_BYTES]).unwrap();
+        let context = RecoveryWrapContext {
+            namespace_id: [0x41; 32],
+            policy_id: [0x52; 32],
+        };
+        let expected = ExpectedRecoveryWrapContext {
+            namespace_id: context.namespace_id,
+            policy_id: context.policy_id,
+            recovery_key_id: key.key_id(),
+            authority_id: authority.authority_id(),
+        };
+        let wrapped = wrap_recovery_key(&key, &authority, &context).unwrap();
+        assert!(matches!(
+            unwrap_recovery_key(&wrapped, &foreign, &expected),
+            Err(RecoveryWrapError::KeyMismatch {
+                field: "authority_id"
+            })
+        ));
+        for field in [
+            "namespace_id",
+            "policy_id",
+            "recovery_key_id",
+            "authority_id",
+        ] {
+            let mut wrong = expected;
+            match field {
+                "namespace_id" => wrong.namespace_id[0] ^= 1,
+                "policy_id" => wrong.policy_id[0] ^= 1,
+                "recovery_key_id" => wrong.recovery_key_id[0] ^= 1,
+                _ => wrong.authority_id[0] ^= 1,
+            }
+            assert!(unwrap_recovery_key(&wrapped, &authority, &wrong).is_err());
+        }
+        for offset in [116, 140, WRAPPED_RECOVERY_KEY_BYTES - 1] {
+            let mut corrupted = wrapped.to_bytes();
+            corrupted[offset] ^= 1;
+            let decoded = WrappedRecoveryKey::from_bytes(&corrupted).unwrap();
+            assert!(matches!(
+                unwrap_recovery_key(&decoded, &authority, &expected),
+                Err(RecoveryWrapError::AuthenticationFailed)
+            ));
+        }
+        // Even if an attacker changes both claimed and expected scope, the
+        // original AEAD tag still binds the producer's namespace and policy.
+        let mut changed = wrapped.to_bytes();
+        changed[52] ^= 1;
+        let changed = WrappedRecoveryKey::from_bytes(&changed).unwrap();
+        let mut changed_expected = expected;
+        changed_expected.namespace_id[0] ^= 1;
+        assert!(matches!(
+            unwrap_recovery_key(&changed, &authority, &changed_expected),
+            Err(RecoveryWrapError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn recovery_key_wrapper_fixed_framing_rejects_size_version_and_zero_authority() {
+        assert!(matches!(
+            RecoveryWrappingKey::from_bytes([0; KEY_BYTES]),
+            Err(RecoveryWrapError::InvalidKey)
+        ));
+        for size in [
+            0,
+            WRAPPED_RECOVERY_KEY_BYTES - 1,
+            WRAPPED_RECOVERY_KEY_BYTES + 1,
+        ] {
+            assert!(matches!(
+                WrappedRecoveryKey::from_bytes(&vec![0; size]),
+                Err(RecoveryWrapError::InvalidEnvelope)
+            ));
+        }
+        let mut bytes = [0; WRAPPED_RECOVERY_KEY_BYTES];
+        bytes[..8].copy_from_slice(&RECOVERY_WRAP_MAGIC);
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            WrappedRecoveryKey::from_bytes(&bytes),
+            Err(RecoveryWrapError::UnsupportedVersion(2))
+        ));
+    }
 
     #[test]
     fn repair_authentication_key_is_stable_and_separate_from_encryption_key() {

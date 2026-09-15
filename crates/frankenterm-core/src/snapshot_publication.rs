@@ -147,6 +147,12 @@ impl Default for PublicationLimits {
 /// Errors that can occur during recovery snapshot publication or selection.
 #[derive(Debug, Error)]
 pub enum PublicationError {
+    #[error("root envelope header exceeds its fixed byte limit")]
+    HeaderTooLarge,
+
+    #[error("bounded recovery publication allocation failed")]
+    AllocationFailed,
+
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -767,6 +773,15 @@ fn encode_root_envelope(
     request: &GenerationRootPublishRequest,
     manifest_sha256: &str,
 ) -> Result<Vec<u8>, PublicationError> {
+    if request.publisher_id.len() as u64 > MAX_ENVELOPE_HEADER_BYTES
+        || manifest_sha256.len() > 64
+        || request
+            .predecessor
+            .as_ref()
+            .is_some_and(|p| p.expected_hash.len() > 64)
+    {
+        return Err(PublicationError::HeaderTooLarge);
+    }
     let header = GenerationEnvelopeHeader {
         generation: request.generation,
         publisher_id: request.publisher_id.clone(),
@@ -782,23 +797,24 @@ fn encode_root_envelope(
     encode_root_parts(&header, &request.manifest_bytes)
 }
 
+fn encode_root_header(header: &GenerationEnvelopeHeader) -> Result<Vec<u8>, PublicationError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(MAX_ENVELOPE_HEADER_BYTES as usize)
+        .map_err(|_| PublicationError::AllocationFailed)?;
+    let mut writer =
+        crate::mux_recovery_image::BoundedWriter::new(bytes, MAX_ENVELOPE_HEADER_BYTES as usize);
+    if serde_json::to_writer(&mut writer, header).is_err() {
+        return Err(PublicationError::HeaderTooLarge);
+    }
+    Ok(writer.into_inner())
+}
+
 fn encode_root_parts(
     header: &GenerationEnvelopeHeader,
     manifest_bytes: &[u8],
 ) -> Result<Vec<u8>, PublicationError> {
-    let header_json = serde_json::to_vec(header).map_err(|e| {
-        PublicationError::InvalidEnvelope {
-            slot: RootSlot::SlotA, // context set by caller
-            reason: format!("failed to serialize envelope header: {e}"),
-        }
-    })?;
-
-    if (header_json.len() as u64) > MAX_ENVELOPE_HEADER_BYTES {
-        return Err(PublicationError::OversizedPayload {
-            max_bytes: MAX_ENVELOPE_HEADER_BYTES,
-            actual_bytes: header_json.len() as u64,
-        });
-    }
+    let header_json = encode_root_header(header)?;
 
     let header_len =
         u32::try_from(header_json.len()).map_err(|_| PublicationError::OversizedPayload {
@@ -806,9 +822,15 @@ fn encode_root_parts(
             actual_bytes: header_json.len() as u64,
         })?;
 
-    let total_capacity = ENVELOPE_MAGIC.len() + 4 + header_json.len() + manifest_bytes.len() + 32; // 32 bytes for SHA-256 trailer
+    let total_capacity = manifest_bytes
+        .len()
+        .checked_add(ENVELOPE_MAGIC.len() + 4 + header_json.len() + 32)
+        .ok_or(PublicationError::AllocationFailed)?;
 
-    let mut buffer = Vec::with_capacity(total_capacity);
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(total_capacity)
+        .map_err(|_| PublicationError::AllocationFailed)?;
     buffer.extend_from_slice(ENVELOPE_MAGIC);
     buffer.extend_from_slice(&header_len.to_le_bytes());
     buffer.extend_from_slice(&header_json);
@@ -886,9 +908,9 @@ fn decode_root_envelope(
     }
 
     let header: GenerationEnvelopeHeader = serde_json::from_slice(&bytes[header_start..header_end])
-        .map_err(|e| PublicationError::InvalidEnvelope {
+        .map_err(|_| PublicationError::InvalidEnvelope {
             slot,
-            reason: format!("malformed envelope header JSON: {e}"),
+            reason: "malformed envelope header JSON".to_owned(),
         })?;
 
     let manifest_bytes = bytes[header_end..content_len].to_vec();
@@ -1495,10 +1517,22 @@ impl SnapshotPublicationStore {
             manifest_len: candidate.manifest_bytes.len() as u64,
             created_at_ms: candidate.created_at_ms,
         };
-        let bytes = encode_root_parts(&header, &candidate.manifest_bytes)?;
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        Ok(bytes.len() as u64 == discovery.outer_envelope_len
-            && digest == discovery.outer_envelope_sha256)
+        let header_bytes = encode_root_header(&header)?;
+        let length = (candidate.manifest_bytes.len() as u64)
+            .checked_add(ENVELOPE_MAGIC.len() as u64 + 4 + header_bytes.len() as u64 + 32)
+            .ok_or(PublicationError::AllocationFailed)?;
+        if length != discovery.outer_envelope_len {
+            return Ok(false);
+        }
+        let mut content_hash = Sha256::new();
+        content_hash.update(ENVELOPE_MAGIC);
+        content_hash.update((header_bytes.len() as u32).to_le_bytes());
+        content_hash.update(&header_bytes);
+        content_hash.update(&candidate.manifest_bytes);
+        let trailer = content_hash.clone().finalize();
+        content_hash.update(trailer);
+        let digest: [u8; 32] = content_hash.finalize().into();
+        Ok(digest == discovery.outer_envelope_sha256)
     }
 
     /// Publishes an immutable recovery object into `objects/<object_id>.obj`.
@@ -1899,11 +1933,11 @@ impl SnapshotPublicationStore {
                 Ok(verified) => {
                     verified_entries.push((candidate.generation, candidate.slot, verified));
                 }
-                Err(e) => {
+                Err(_) => {
                     diagnostics.push(TornRootDiagnostic {
                         slot: candidate.slot,
                         generation: Some(candidate.generation),
-                        reason: format!("independent verifier rejected candidate: {e}"),
+                        reason: "independent verifier rejected candidate".to_owned(),
                     });
                 }
             }
@@ -1975,21 +2009,42 @@ impl SnapshotPublicationStore {
 
         // 2. Re-inspect existing candidates and determine verified active root
         //    (inside publication lock to avoid races with concurrent publishers)
-        let (mut candidates, _) = self.inspect_root_candidates()?;
+        let (ordinary_candidates, _) = self.inspect_root_candidates()?;
+        // Retain only each candidate and its verdict, never the decoded graph.
+        let verify_candidate = |candidate: &RootSlotCandidate| -> Result<bool, PublicationError> {
+            let valid = verifier.verify_root(candidate, self).is_ok();
+            if let Some(protection) = protection {
+                Self::checkpoint_publication(protection.cx)?;
+            }
+            Ok(valid)
+        };
+        let mut candidates = Vec::with_capacity(2);
+        for candidate in ordinary_candidates {
+            let valid = verify_candidate(&candidate)?;
+            candidates.push((candidate, valid));
+        }
         if let Some(protection) = protection {
-            let (discoveries, _) = self.inspect_repair_discovery(
+            let (discoveries, discovery_diagnostics) = self.inspect_repair_discovery(
                 protection.namespace,
                 &protection.root_object_id,
                 protection.key,
             )?;
+            if !discovery_diagnostics.is_empty() {
+                return Err(PublicationError::InvalidDiscovery(
+                    "cannot reconcile committed discovery before publication",
+                ));
+            }
             for discovery in discoveries {
                 Self::checkpoint_publication(protection.cx)?;
-                let ordinary = candidates.iter().find(|c| c.slot == discovery.slot);
-                if let Some(candidate) = ordinary {
-                    if self.root_candidate_matches_discovery(candidate, &discovery)?
-                        && verifier.verify_root(candidate, self).is_ok()
-                    {
-                        continue;
+                let ordinary = candidates.iter().find(|(c, _)| c.slot == discovery.slot);
+                if let Some((candidate, valid)) = ordinary {
+                    if self.root_candidate_matches_discovery(candidate, &discovery)? {
+                        if *valid {
+                            continue;
+                        }
+                        return Err(PublicationError::InvalidDiscovery(
+                            "committed graph rejected",
+                        ));
                     }
                 }
                 let expected = ExpectedRecoveryIdentity::new(
@@ -2027,10 +2082,12 @@ impl SnapshotPublicationStore {
                             .map_err(|error| RepairError::Storage(error.to_string()))
                     },
                 )?;
+                let _candidate_permit =
+                    shared_admission_controller().acquire(repaired.reconstructed_envelope.len())?;
                 let recovered =
                     self.decode_recovered_root(discovery.slot, &repaired.reconstructed_envelope)?;
                 if !self.root_candidate_matches_discovery(&recovered, &discovery)?
-                    || verifier.verify_root(&recovered, self).is_err()
+                    || !verify_candidate(&recovered)?
                 {
                     return Err(PublicationError::InvalidDiscovery(
                         "committed repair graph rejected",
@@ -2039,21 +2096,20 @@ impl SnapshotPublicationStore {
                 // A newer ordinary root can be the durable commit of a publication
                 // whose discovery write failed. Otherwise the authenticated
                 // committed root is the authority for CAS and inactive-slot choice.
-                let retain_newer = ordinary.is_some_and(|candidate| {
-                    candidate.generation > recovered.generation
-                        && verifier.verify_root(candidate, self).is_ok()
+                let retain_newer = ordinary.is_some_and(|(candidate, valid)| {
+                    candidate.generation > recovered.generation && *valid
                 });
                 if !retain_newer {
-                    candidates.retain(|candidate| candidate.slot != discovery.slot);
-                    candidates.push(recovered);
+                    candidates.retain(|(candidate, _)| candidate.slot != discovery.slot);
+                    candidates.push((recovered, true));
                 }
             }
             Self::checkpoint_publication(protection.cx)?;
         }
 
         let mut verified_candidates = Vec::new();
-        for candidate in &candidates {
-            if verifier.verify_root(candidate, self).is_ok() {
+        for (candidate, valid) in &candidates {
+            if *valid {
                 verified_candidates.push(candidate);
             }
         }
@@ -2275,15 +2331,20 @@ impl SnapshotPublicationStore {
         }
 
         // Verify actual candidate read from disk
-        if let Err(e) = verifier.verify_root(&actual_candidate, self) {
-            return Err(PublicationError::VerificationRejected {
+        let proposed_verdict = verifier
+            .verify_root(&actual_candidate, self)
+            .map(|_| ())
+            .map_err(|_| PublicationError::VerificationRejected {
                 slot: target_slot,
                 generation: request.generation,
-                reason: format!(
-                    "actual candidate failed caller verification in staging (both slots preserved): {e}"
-                ),
+                reason:
+                    "actual candidate failed caller verification in staging (both slots preserved)"
+                        .to_owned(),
             });
+        if let Some(protection) = protection {
+            Self::checkpoint_publication(protection.cx)?;
         }
+        proposed_verdict?;
 
         // 8. Revalidate stage binding before atomic rename
         let stage_named_meta = self
@@ -2654,6 +2715,36 @@ impl SnapshotPublicationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_header_encoding_bounds_escaped_metadata() {
+        let mut request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "publisher".to_owned(),
+            predecessor: None,
+            manifest_bytes: b"bounded manifest".to_vec(),
+            created_at_ms: 1,
+        };
+        let digest = sha256_hex(&request.manifest_bytes);
+        let envelope = encode_root_envelope(&request, &digest).unwrap();
+        assert_eq!(
+            decode_root_envelope(RootSlot::SlotA, &envelope, 1024, 128)
+                .unwrap()
+                .manifest_bytes,
+            request.manifest_bytes,
+        );
+        // The raw string fits, but JSON escaping must stop at the wire limit.
+        request.publisher_id = "\0".repeat(MAX_ENVELOPE_HEADER_BYTES as usize / 2);
+        assert!(matches!(
+            encode_root_envelope(&request, &digest),
+            Err(PublicationError::HeaderTooLarge)
+        ));
+        request.publisher_id = "x".repeat(MAX_ENVELOPE_HEADER_BYTES as usize + 1);
+        assert!(matches!(
+            encode_root_envelope(&request, &digest),
+            Err(PublicationError::HeaderTooLarge)
+        ));
+    }
     use tempfile::TempDir;
 
     /// Trivial verifier that accepts all structurally valid candidates.
@@ -2752,6 +2843,26 @@ mod tests {
         });
         request.manifest_bytes = b"second".to_vec();
         let second = publish(&request).unwrap();
+        let calls = std::cell::RefCell::new(std::collections::BTreeMap::<u64, usize>::new());
+        let counting_verifier =
+            |candidate: &RootSlotCandidate, _store: &SnapshotPublicationStore| {
+                *calls.borrow_mut().entry(candidate.generation).or_default() += 1;
+                Ok::<(), std::io::Error>(())
+            };
+        store
+            .publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &counting_verifier,
+            )
+            .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            std::collections::BTreeMap::from([(1, 1), (2, 1)])
+        );
         let first_bytes = std::fs::read(&first.path).unwrap();
         let discovery_path = temp
             .path()
@@ -2776,7 +2887,21 @@ mod tests {
             expected_hash: second.sha256,
         });
         request.manifest_bytes = b"third".to_vec();
-        let third = publish(&request).expect("recovered committed gen2 is the CAS predecessor");
+        calls.borrow_mut().clear();
+        let third = store
+            .publish_repair_protected_generation_root(
+                &cx,
+                &request,
+                "namespace",
+                root_id,
+                key,
+                &counting_verifier,
+            )
+            .expect("recovered committed gen2 is the CAS predecessor");
+        assert_eq!(
+            *calls.borrow(),
+            std::collections::BTreeMap::from([(1, 1), (2, 1), (3, 1)])
+        );
         assert_eq!(third.slot, first.slot);
         assert_eq!(std::fs::read(&second.path).unwrap(), torn_bytes);
         assert_eq!(std::fs::read(&discovery_path).unwrap(), discovery_bytes);
@@ -3424,6 +3549,41 @@ mod tests {
         // Since missing object is not present, both roots fail verification
         assert!(sel.current.is_none());
         assert_eq!(sel.torn_or_rejected.len(), 2);
+
+        let sensitive_error = "PRIVATE_CHECKPOINT_CONTENT_MUST_NOT_REACH_DIAGNOSTICS";
+        let reject_with_content = |_: &RootSlotCandidate, _: &SnapshotPublicationStore| {
+            Err::<(), _>(std::io::Error::other(sensitive_error))
+        };
+        let rejected = store.select_verified_roots(&reject_with_content).unwrap();
+        assert_eq!(rejected.torn_or_rejected.len(), 2);
+        assert!(!format!("{rejected:?}").contains(sensitive_error));
+
+        let request = GenerationRootPublishRequest {
+            generation: 3,
+            publisher_id: "host:pid:1".to_owned(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 2,
+                expected_hash: sha256_hex(&req2.manifest_bytes),
+            }),
+            manifest_bytes: b"rejected-third-generation".to_vec(),
+            created_at_ms: 3000,
+        };
+        let reject_proposal = |candidate: &RootSlotCandidate, _: &SnapshotPublicationStore| {
+            if candidate.generation == 3 {
+                Err(std::io::Error::other(sensitive_error))
+            } else {
+                Ok(())
+            }
+        };
+        let error = store
+            .publish_generation_root(&request, &reject_proposal)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PublicationError::VerificationRejected { .. }
+        ));
+        assert!(!format!("{error:?} {error}").contains(sensitive_error));
+        assert_eq!(store.inspect_root_candidates().unwrap().0.len(), 2);
     }
 
     #[test]

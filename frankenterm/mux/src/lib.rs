@@ -2132,6 +2132,8 @@ pub enum LiveParserCheckpointError {
         "live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}"
     )]
     InvalidTimeout,
+    #[error("live parser checkpoint caller cancelled the request")]
+    Cancelled,
     #[error("pane registration is no longer current")]
     StaleRegistration,
     #[error("pane does not expose a durable UUID")]
@@ -4818,14 +4820,23 @@ mod pane_registration_handle {
         ///
         /// This operation does not manufacture or require a guardian append receipt.
         /// The operation lease spans registration, bounded wait, capture, and
-        /// final registry revalidation.
+        /// final registry revalidation. Polling the cancellation predicate every
+        /// 100ms preserves the same request until its full deadline; it does
+        /// not preempt registry locks or cold-history I/O.
         pub fn capture_model_parser_checkpoint(
             &self,
             limits: TerminalCheckpointLimits,
             timeout: Duration,
+            mut cancelled: impl FnMut() -> bool,
         ) -> Result<ModelParserCheckpointAck, LiveParserCheckpointError> {
             if timeout.is_zero() || timeout > LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT {
                 return Err(LiveParserCheckpointError::InvalidTimeout);
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or(LiveParserCheckpointError::InvalidTimeout)?;
+            if cancelled() {
+                return Err(LiveParserCheckpointError::Cancelled);
             }
             let pane = Arc::clone(&self.pane);
             let mux = Arc::clone(&self.owner);
@@ -4840,19 +4851,29 @@ mod pane_registration_handle {
                 .generation
                 .live_parser_checkpoint
                 .register_model_checkpoint(&pane, &self.generation, durable_pane_id, limits)?;
-            let result = match completion.recv_timeout(timeout) {
-                Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.generation
-                        .live_parser_checkpoint
-                        .cancel_model_checkpoint(request_id);
-                    Err(LiveParserCheckpointError::Timeout)
+            // Cancel only this exact request on every exit, including a caller
+            // callback panic. A successful completion already removed it.
+            struct PendingWait<'a>(&'a crate::LiveParserCheckpointControl, u64);
+            impl Drop for PendingWait<'_> {
+                fn drop(&mut self) {
+                    self.0.cancel_model_checkpoint(self.1);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.generation
-                        .live_parser_checkpoint
-                        .cancel_model_checkpoint(request_id);
-                    Err(LiveParserCheckpointError::CompletionDisconnected)
+            }
+            let _pending = PendingWait(&self.generation.live_parser_checkpoint, request_id);
+            let result = loop {
+                if cancelled() {
+                    return Err(LiveParserCheckpointError::Cancelled);
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(LiveParserCheckpointError::Timeout)?;
+                match completion.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(LiveParserCheckpointError::CompletionDisconnected);
+                    }
                 }
             };
             if result.is_ok() {
@@ -4869,6 +4890,12 @@ mod pane_registration_handle {
                 if !remains_current {
                     return Err(LiveParserCheckpointError::StaleRegistration);
                 }
+            }
+            if cancelled() {
+                return Err(LiveParserCheckpointError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(LiveParserCheckpointError::Timeout);
             }
             result
         }
@@ -5573,6 +5600,7 @@ mod pane_registration_handle {
             &self,
             limits: TerminalCheckpointLimits,
             timeout: Duration,
+            cancelled: impl FnMut() -> bool,
         ) -> Result<ModelParserCheckpointAck, LiveParserCheckpointError> {
             let owner = self
                 .generation
@@ -5581,7 +5609,7 @@ mod pane_registration_handle {
                 .ok_or(LiveParserCheckpointError::StaleRegistration)?;
             self.operation_guard(&owner)
                 .ok_or(LiveParserCheckpointError::StaleRegistration)?
-                .capture_model_parser_checkpoint(limits, timeout)
+                .capture_model_parser_checkpoint(limits, timeout, cancelled)
         }
 
         /// Resolve the exact owner for mux-internal topology transactions.
@@ -18748,6 +18776,7 @@ impl Mux {
         pane_id: PaneId,
         limits: TerminalCheckpointLimits,
         timeout: Duration,
+        cancelled: impl FnMut() -> bool,
     ) -> Result<ModelParserCheckpointAck, LiveParserCheckpointError> {
         let pane = {
             let panes = self.panes.read();
@@ -18760,7 +18789,7 @@ impl Mux {
             .mux_registration_slot()
             .load()
             .ok_or(LiveParserCheckpointError::StaleRegistration)?;
-        registration.capture_model_parser_checkpoint(limits, timeout)
+        registration.capture_model_parser_checkpoint(limits, timeout, cancelled)
     }
 
     /// Recheck an exact model contribution without mutating the terminal or
@@ -22756,8 +22785,11 @@ mod tests {
             &self,
             timeout: Duration,
         ) -> Result<ModelParserCheckpointAck, LiveParserCheckpointError> {
-            self.registration
-                .capture_model_parser_checkpoint(TerminalCheckpointLimits::default(), timeout)
+            self.registration.capture_model_parser_checkpoint(
+                TerminalCheckpointLimits::default(),
+                timeout,
+                || false,
+            )
         }
 
         fn wait_until_parsed(&self, target: u64) {
@@ -37409,6 +37441,7 @@ mod tests {
                 pane_id,
                 TerminalCheckpointLimits::default(),
                 Duration::from_secs(5),
+                || false,
             )
             .expect_err("mux routing must preserve the legacy ownership boundary");
         assert_eq!(error, LiveParserCheckpointError::CaptureAndBind);
