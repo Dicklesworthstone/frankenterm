@@ -734,9 +734,11 @@ mod deferred_scrollback {
                     .filter(|row| row.stable_row >= rows.start && row.stable_row < end)
                     .map(|row| (row.stable_row, Arc::clone(&row.line)))
                     .collect::<Vec<_>>();
-                let cached_range = state.cached.front().zip(state.cached.back()).map(
-                    |(first, last)| first.stable_row..last.stable_row.saturating_add(1),
-                );
+                let cached_range = state
+                    .cached
+                    .front()
+                    .zip(state.cached.back())
+                    .map(|(first, last)| first.stable_row..last.stable_row.saturating_add(1));
                 (end, pending, interval, cached_range)
             };
             let durable_end = pending.first().map_or(end, |(row, _)| *row);
@@ -1086,11 +1088,18 @@ mod deferred_scrollback {
         deferred.flush_scrollback().unwrap();
         let state = deferred.state.lock().unwrap();
         assert!(!state.cached.is_empty());
-        assert!(state.cached.len() < 5, "byte limit applies before row limit");
+        assert!(
+            state.cached.len() < 5,
+            "byte limit applies before row limit"
+        );
         assert!(state.cached_bytes <= MAX_CACHED_BYTES);
         assert_eq!(
             state.cached_bytes,
-            state.cached.iter().map(|row| row.charged_bytes).sum::<usize>()
+            state
+                .cached
+                .iter()
+                .map(|row| row.charged_bytes)
+                .sum::<usize>()
         );
     }
 }
@@ -9901,7 +9910,9 @@ mod tests {
         let warmed = warm_rx.recv_timeout(std::time::Duration::from_secs(2));
         let (cold_tx, cold_rx) = std::sync::mpsc::sync_channel(1);
         let cold = std::thread::spawn(move || {
-            cold_tx.send(uncached.load_scrollback_lines(62..64)).unwrap();
+            cold_tx
+                .send(uncached.load_scrollback_lines(62..64))
+                .unwrap();
         });
         let blocked = cold_rx
             .recv_timeout(std::time::Duration::from_millis(100))
