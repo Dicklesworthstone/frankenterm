@@ -287,6 +287,54 @@ impl Line {
         }
     }
 
+    /// Retain only immutable semantic source data for a mutable callback fence.
+    /// Cells stay shared even in eager-clone profiling mode; caches are omitted.
+    pub fn semantic_snapshot(&self) -> Self {
+        Self {
+            cells: match &self.cells {
+                CellStorage::V(cells) => CellStorage::V(cells.snapshot_clone()),
+                CellStorage::C(line) => CellStorage::C(Arc::clone(line)),
+            },
+            zones: Vec::new(),
+            seqno: self.seqno,
+            bits: self.bits,
+            #[cfg(feature = "appdata")]
+            appdata: Mutex::new(None),
+        }
+    }
+
+    /// Compare checkpoint-relevant row state, excluding renderer caches and
+    /// hyperlink scan/presence flags derived from the actual cell attributes.
+    /// Unchanged shared cells compare in constant time.
+    pub fn matches_semantic_snapshot(&self, snapshot: &Self) -> bool {
+        let cache_bits = LineBits::HAS_HYPERLINK
+            | LineBits::HAS_IMPLICIT_HYPERLINKS
+            | LineBits::SCANNED_IMPLICIT_HYPERLINKS;
+        if self.seqno != snapshot.seqno || (self.bits - cache_bits) != (snapshot.bits - cache_bits)
+        {
+            return false;
+        }
+        if self.cells == snapshot.cells {
+            return true;
+        }
+        // Compression and deferred-row materialization may change storage
+        // without changing the visible cells that a checkpoint preserves.
+        let mut before = snapshot.visible_cells();
+        for cell in self.visible_cells() {
+            let Some(prior) = before.next() else {
+                return false;
+            };
+            if cell.cell_index() != prior.cell_index()
+                || cell.str() != prior.str()
+                || cell.width() != prior.width()
+                || cell.attrs() != prior.attrs()
+            {
+                return false;
+            }
+        }
+        before.next().is_none()
+    }
+
     /// Conservative, exact source check for work prepared from a cloned line.
     /// Image payloads can change through shared handles, so they never qualify.
     /// Renderer appdata and a no-match hyperlink scan do not change wrapping;
@@ -3492,6 +3540,20 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn semantic_snapshot_ignores_compression_and_scan_cache_but_detects_cells() {
+        let mut line = Line::from_text("plain text", &CellAttributes::default(), 7, None);
+        let before = line.semantic_snapshot();
+        line.compress_for_scrollback();
+        assert!(line.matches_semantic_snapshot(&before));
+        let rules = [Rule::new(r"https://[a-z.]+", "$0").unwrap()];
+        Line::apply_hyperlink_rules(&rules, &mut [&mut line]);
+        assert!(line.matches_semantic_snapshot(&before));
+        let seqno = line.current_seqno();
+        line.set_double_width(seqno);
+        assert!(!line.matches_semantic_snapshot(&before));
+    }
 
     fn geometry_screen_rows(source: Line, cols: usize, model: MonospaceKpCostModel) -> Vec<Line> {
         if source.len() <= cols {

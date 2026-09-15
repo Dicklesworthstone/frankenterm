@@ -148,14 +148,80 @@ pub fn terminal_get_dirty_lines(
     set
 }
 
+/// Fence actual live-row mutations, including a callback that unwinds after
+/// editing. Read-only and renderer-cache callbacks retain their source seqno.
+fn with_terminal_line_mutations(
+    term: &mut Terminal,
+    apply: impl FnOnce(&mut Terminal, SequenceNo, &mut bool),
+) {
+    struct TerminalMutation<'a> {
+        term: &'a mut Terminal,
+        changed: bool,
+    }
+    impl Drop for TerminalMutation<'_> {
+        fn drop(&mut self) {
+            if self.changed {
+                self.term.increment_seqno();
+            }
+        }
+    }
+    let next = term.current_seqno().saturating_add(1);
+    let mut guard = TerminalMutation {
+        term,
+        changed: false,
+    };
+    let TerminalMutation { term, changed } = &mut guard;
+    apply(term, next, changed);
+}
+
+fn with_semantic_line_mutation<R>(
+    lines: &mut [&mut Line],
+    next: SequenceNo,
+    changed: &mut bool,
+    apply: impl FnOnce(&mut [&mut Line]) -> R,
+) -> R {
+    struct RowMutation<'a, 'b, 'c> {
+        lines: &'a mut [&'b mut Line],
+        before: Vec<Line>,
+        next: SequenceNo,
+        changed: &'c mut bool,
+    }
+    impl Drop for RowMutation<'_, '_, '_> {
+        fn drop(&mut self) {
+            for (line, before) in self.lines.iter_mut().zip(&self.before) {
+                if std::thread::panicking() || !line.matches_semantic_snapshot(before) {
+                    line.update_last_change_seqno(self.next);
+                    *self.changed = true;
+                }
+            }
+        }
+    }
+    let before = lines.iter().map(|line| line.semantic_snapshot()).collect();
+    let guard = RowMutation {
+        lines,
+        before,
+        next,
+        changed,
+    };
+    // Reborrow the row slice; the guard keeps ownership of both the live
+    // references and the immutable witnesses until normal return or unwind.
+    apply(&mut *guard.lines)
+}
+
 pub fn terminal_for_each_logical_line_in_stable_range_mut(
     term: &mut Terminal,
     lines: Range<StableRowIndex>,
     for_line: &mut dyn ForEachPaneLogicalLine,
 ) {
-    let screen = term.screen_mut();
-    screen.for_each_logical_line_in_stable_range_mut(lines, |stable_range, lines| {
-        for_line.with_logical_line_mut(stable_range, lines)
+    with_terminal_line_mutations(term, |term, next, changed| {
+        term.screen_mut().for_each_logical_line_in_stable_range_mut(
+            lines,
+            |stable_range, lines| {
+                with_semantic_line_mutation(lines, next, changed, |lines| {
+                    for_line.with_logical_line_mut(stable_range, lines)
+                })
+            },
+        );
     });
 }
 
@@ -177,11 +243,16 @@ pub fn terminal_with_lines_mut(
     lines: Range<StableRowIndex>,
     with_lines: &mut dyn WithPaneLines,
 ) {
-    let screen = term.screen_mut();
-    let phys_range = screen.stable_range(&lines);
-    let first = screen.phys_to_stable_row_index(phys_range.start);
-
-    screen.with_phys_lines_mut(phys_range, |lines| with_lines.with_lines_mut(first, lines));
+    with_terminal_line_mutations(term, |term, next, changed| {
+        let screen = term.screen_mut();
+        let phys_range = screen.stable_range(&lines);
+        let first = screen.phys_to_stable_row_index(phys_range.start);
+        screen.with_phys_lines_mut(phys_range, |lines| {
+            with_semantic_line_mutation(lines, next, changed, |lines| {
+                with_lines.with_lines_mut(first, lines)
+            });
+        });
+    });
 }
 
 /// Apply implicit hyperlink rules and expose the requested physical rows while
@@ -247,6 +318,132 @@ pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn semantic_test_terminal() -> Terminal {
+        use frankenterm_term::{TerminalConfiguration, TerminalSize};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Config;
+        impl TerminalConfiguration for Config {
+            fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+                frankenterm_term::color::ColorPalette::default()
+            }
+        }
+        Terminal::new(
+            TerminalSize {
+                rows: 2,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 32,
+                dpi: 96,
+            },
+            Arc::new(Config),
+            "FrankenTerm",
+            "semantic-render-test",
+            Box::new(Vec::<u8>::new()),
+        )
+    }
+
+    #[test]
+    fn hyperlink_mutation_fences_checkpoint_but_observation_is_stable() {
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+
+        struct Observe;
+        impl WithPaneLines for Observe {
+            fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut Line]) {
+                for line in lines {
+                    let _owned = (**line).clone();
+                    line.clear_appdata();
+                }
+            }
+        }
+        let mut term = semantic_test_terminal();
+        term.advance_bytes(b"https://example.com\r\nplain text");
+        let limits = TerminalCheckpointLimits::default();
+        let before = term.capture_recovery_checkpoint(limits).unwrap();
+        let captured_generation = term.current_seqno();
+        terminal_with_lines_mut(&mut term, 0..2, &mut Observe);
+        terminal_with_lines(&mut term, 0..2, |_, _| {});
+        assert_eq!(term.current_seqno(), captured_generation);
+        let rules = [Rule::new(r"https://[a-z.]+", "$0").unwrap()];
+        terminal_with_lines_mut_and_apply_hyperlinks(&mut term, 1..2, &rules, &mut Observe);
+        assert_eq!(term.current_seqno(), captured_generation);
+        assert_eq!(
+            term.capture_recovery_checkpoint(limits)
+                .unwrap()
+                .canonical_payload(),
+            before.canonical_payload()
+        );
+        terminal_with_lines_mut_and_apply_hyperlinks(&mut term, 0..1, &rules, &mut Observe);
+        assert!(term.current_seqno() > captured_generation);
+        assert!(term.screen().lines_in_phys_range(0..1)[0]
+            .visible_cells()
+            .any(|cell| cell.attrs().hyperlink().is_some()));
+        let linked = term.capture_recovery_checkpoint(limits).unwrap();
+        assert_ne!(linked.canonical_payload(), before.canonical_payload());
+        let linked_generation = term.current_seqno();
+        terminal_with_lines_mut_and_apply_hyperlinks(&mut term, 0..2, &rules, &mut Observe);
+        assert_eq!(term.current_seqno(), linked_generation);
+        assert_eq!(
+            term.capture_recovery_checkpoint(limits)
+                .unwrap()
+                .canonical_payload(),
+            linked.canonical_payload()
+        );
+
+        struct Mutate;
+        impl WithPaneLines for Mutate {
+            fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut Line]) {
+                let seqno = lines[0].current_seqno();
+                lines[0].set_double_width(seqno);
+            }
+        }
+        terminal_with_lines_mut(&mut term, 1..2, &mut Mutate);
+        assert!(term.current_seqno() > linked_generation);
+    }
+
+    #[test]
+    fn row_replacement_before_callback_panic_advances_capture_generation() {
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+
+        struct ReplaceThenPanic;
+        impl WithPaneLines for ReplaceThenPanic {
+            fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut Line]) {
+                let seqno = lines[0].current_seqno();
+                *lines[0] = Line::from_text(
+                    "replacement survives unwind",
+                    &termwiz::cell::CellAttributes::default(),
+                    seqno,
+                    None,
+                );
+                panic!("semantic callback fault");
+            }
+        }
+        let mut term = semantic_test_terminal();
+        term.advance_bytes(b"before");
+        let limits = TerminalCheckpointLimits::default();
+        let before = term.capture_recovery_checkpoint(limits).unwrap();
+        let generation = term.current_seqno();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            terminal_with_lines_mut(&mut term, 0..1, &mut ReplaceThenPanic);
+        }))
+        .expect_err("the callback panic must propagate unchanged");
+        assert_eq!(
+            failure.downcast_ref::<&str>(),
+            Some(&"semantic callback fault")
+        );
+        assert!(term.current_seqno() > generation);
+        let rows = term.screen().lines_in_phys_range(0..1);
+        assert_eq!(rows[0].as_str(), "replacement survives unwind");
+        assert_eq!(rows[0].current_seqno(), term.current_seqno());
+        assert_ne!(
+            term.capture_recovery_checkpoint(limits)
+                .unwrap()
+                .canonical_payload(),
+            before.canonical_payload()
+        );
+    }
 
     #[test]
     fn stable_cursor_position_default() {
