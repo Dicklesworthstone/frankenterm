@@ -2782,6 +2782,46 @@ impl GuardianCheckpointCipher {
         })
     }
 
+    /// Finalize only the exact staged completion authenticated by this cipher's
+    /// committed catalog evidence. The caller must also prove durable catalog
+    /// publication and current lease authority; neither is inferred from bytes.
+    pub fn seal_ack_finalizer_from_catalog(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        ack_request: &GuardianCheckpointStageRequestV1,
+        binding: &GuardianCheckpointCatalogAdoptionBindingV1,
+        evidence: &GuardianEncryptedCheckpointStageRecordV1,
+        expected_mux: Uuid,
+    ) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError> {
+        let _authenticated = self.inspect_catalog_adoption_evidence(binding, evidence)?;
+        let (context, canonical_ack, plaintext_digest) =
+            checkpoint_catalog_ack_finalizer_parts(receipt, ack_request, binding, expected_mux)?;
+        self.seal_exact_payload(context, canonical_ack.as_slice(), &plaintext_digest)
+    }
+
+    /// Reconcile a retry with the same authenticated catalog adoption, including
+    /// the historical effect and mutation sequence, without minting a receipt.
+    pub fn inspect_ack_finalizer_from_catalog(
+        &self,
+        receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+        ack_request: &GuardianCheckpointStageRequestV1,
+        binding: &GuardianCheckpointCatalogAdoptionBindingV1,
+        evidence: &GuardianEncryptedCheckpointStageRecordV1,
+        expected_mux: Uuid,
+        record: &GuardianEncryptedCheckpointStageRecordV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        let _authenticated = self.inspect_catalog_adoption_evidence(binding, evidence)?;
+        let (context, canonical_ack, _) =
+            checkpoint_catalog_ack_finalizer_parts(receipt, ack_request, binding, expected_mux)?;
+        let opened =
+            self.open_exact_payload(&context, record, GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES)?;
+        if checkpoint_stage_bytes_match(&opened, &canonical_ack) {
+            Ok(())
+        } else {
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        }
+    }
+
     /// Seal the unique ACK finalizer for one authenticated durable completion
     /// only after the mutation-sequenced Checkpoint operation has committed
     /// the exact artifact and output-boundary identities into the catalog.
@@ -3473,6 +3513,67 @@ fn checkpoint_catalog_adoption_evidence_parts(
         return Err(GuardianCheckpointCipherError::InvalidCatalogAdoptionBinding);
     }
     Ok((context, payload, plaintext_digest))
+}
+
+fn checkpoint_catalog_ack_finalizer_parts(
+    receipt: &GuardianCheckpointDurableCompletionReceiptV1,
+    ack_request: &GuardianCheckpointStageRequestV1,
+    binding: &GuardianCheckpointCatalogAdoptionBindingV1,
+    expected_mux: Uuid,
+) -> Result<
+    (
+        GuardianCheckpointStageRecordContextV1,
+        Zeroizing<Vec<u8>>,
+        Zeroizing<[u8; 32]>,
+    ),
+    GuardianCheckpointCipherError,
+> {
+    let (context, canonical_request) = checkpoint_finalizer_request_parts(
+        receipt,
+        ack_request,
+        GuardianCheckpointStageKindV1::Ack,
+    )?;
+    let GuardianCheckpointStageScopeKindV1::Pane {
+        pane_id,
+        generation,
+    } = receipt.binding.scope.kind
+    else {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    };
+    let descriptor = &receipt.binding.descriptor;
+    if expected_mux.is_nil()
+        || binding.adoption_mux_incarnation != expected_mux
+        || binding.pane_id != pane_id
+        || binding.capture_generation != generation
+        || binding.upload_id != receipt.upload_id
+        || binding.completion_id != receipt.publication_id
+        || binding.checkpoint_id != receipt.binding.checkpoint_identity_digest()?
+        || binding.boundary_id != receipt.binding.boundary_identity_digest()?
+        || binding.terminal_payload_digest != descriptor.terminal_payload_digest
+        || binding.terminal_payload_bytes != descriptor.terminal_payload_bytes
+        || binding.chunk_count != ack_request.total_chunks()
+        || binding.replay_semantics_id != descriptor.replay_identity_digest
+        || binding.rows != descriptor.rows
+        || binding.cols != descriptor.cols
+        || binding.adoption_effect_id.is_nil()
+        || binding.adoption_sequence == 0
+    {
+        return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
+    }
+    let trailer = checkpoint_finalizer_trailer(
+        CHECKPOINT_FINALIZER_KIND_ACK,
+        binding.adoption_effect_id,
+        binding.adoption_sequence,
+    );
+    let canonical_ack = checkpoint_finalizer_payload(&canonical_request, &trailer)?;
+    let (plaintext_bytes, plaintext_digest) =
+        checkpoint_stage_plaintext_identity(canonical_ack.as_slice())?;
+    if plaintext_bytes != GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES
+        || context.plaintext_bytes() != plaintext_bytes
+    {
+        return Err(GuardianCheckpointCipherError::InvalidSealManifestLength);
+    }
+    Ok((context, canonical_ack, plaintext_digest))
 }
 
 fn checkpoint_ack_finalizer_parts(
@@ -10316,6 +10417,8 @@ mod tests {
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
             "from_output_cipher:pub:GuardianOutputCipher",
+            "seal_ack_finalizer_from_catalog:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1,Uuid",
+            "inspect_ack_finalizer_from_catalog:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1,Uuid,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_ack_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_ack_finalizer_with_adoption:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointReceipt,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_catalog_adoption_evidence:pub:GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1",
@@ -10486,6 +10589,20 @@ mod tests {
                 "fn open_exact_payload(&self, expected_context: &GuardianCheckpointStageRecordContextV1, record: &GuardianEncryptedCheckpointStageRecordV1, max_plaintext_bytes: u32) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError>",
             ),
         ];
+        expected_cipher_method_surfaces.extend([
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_ack_finalizer_from_catalog(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, binding: &GuardianCheckpointCatalogAdoptionBindingV1, evidence: &GuardianEncryptedCheckpointStageRecordV1, expected_mux: Uuid) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer_from_catalog(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, binding: &GuardianCheckpointCatalogAdoptionBindingV1, evidence: &GuardianEncryptedCheckpointStageRecordV1, expected_mux: Uuid, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+        ]);
         sort_authority_methods(&mut expected_cipher_method_surfaces);
         assert_eq!(
             inventory.cipher_method_surfaces,
@@ -10654,6 +10771,26 @@ mod tests {
                 "pub(crate)",
                 false,
                 "fn capture_and_bind_live_parser_checkpoint(pane: &Arc<dyn Pane>, capture_operation: &PaneRegistrationOperationLease, request: &LiveParserCaptureRequest, pending_actions: &mut Vec<Action>, ground: RecoveryGroundBoundary<'_>) -> Result<LiveParserCheckpointAck, LiveParserCaptureAndBindError>",
+            ),
+        ]);
+        expected_authority_signatures.extend([
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_ack_finalizer_from_catalog(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, binding: &GuardianCheckpointCatalogAdoptionBindingV1, evidence: &GuardianEncryptedCheckpointStageRecordV1, expected_mux: Uuid) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_ack_finalizer_from_catalog(&self, receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, binding: &GuardianCheckpointCatalogAdoptionBindingV1, evidence: &GuardianEncryptedCheckpointStageRecordV1, expected_mux: Uuid, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "private",
+                false,
+                "fn checkpoint_catalog_ack_finalizer_parts(receipt: &GuardianCheckpointDurableCompletionReceiptV1, ack_request: &GuardianCheckpointStageRequestV1, binding: &GuardianCheckpointCatalogAdoptionBindingV1, expected_mux: Uuid) -> Result<(GuardianCheckpointStageRecordContextV1, Zeroizing<Vec<u8>>, Zeroizing<[u8; 32]>,), GuardianCheckpointCipherError,>",
             ),
         ]);
         sort_authority_methods(&mut expected_authority_signatures);
@@ -11300,6 +11437,85 @@ mod tests {
                 receipt_ack_request.descriptor().boundary_id(),
             ),
         );
+        let catalog_mux = Uuid::from_u128(0xaacc01);
+        let catalog_binding = GuardianCheckpointCatalogAdoptionBindingV1::from_catalog_parts(
+            receipt_pane_id,
+            receipt_generation,
+            catalog_mux,
+            adoption_receipt.effect_id(),
+            adoption_receipt.sequence(),
+            1,
+            Uuid::from_u128(0xaacc02),
+            [0x73; 32],
+            None,
+            upload_id,
+            publication_id,
+            receipt_ack_request.checkpoint_id().into_bytes(),
+            receipt_ack_request.boundary_id().into_bytes(),
+            binding.descriptor.terminal_payload_digest,
+            binding.descriptor.terminal_payload_bytes,
+            receipt_ack_request.total_chunks(),
+            binding.descriptor.replay_identity_digest,
+            binding.descriptor.rows,
+            binding.descriptor.cols,
+        )
+        .expect("bind the exact completion to a catalog adoption");
+        let make_seed = || {
+            GuardianCheckpointCatalogAdoptionEvidenceSeedV1::issue_for_test(
+                receipt_pane_id,
+                catalog_mux,
+                Uuid::from_u128(0xaacc03),
+                receipt_generation,
+                adoption_receipt.sequence(),
+                adoption_receipt.effect_id(),
+                adoption_receipt.intent(),
+            )
+        };
+        let evidence = cipher
+            .seal_catalog_adoption_evidence(make_seed(), &catalog_binding)
+            .expect("authenticate catalog evidence");
+        let catalog_ack = cipher
+            .seal_ack_finalizer_from_catalog(
+                &completion_receipt,
+                &receipt_ack_request,
+                &catalog_binding,
+                &evidence,
+                catalog_mux,
+            )
+            .expect("catalog evidence authorizes the exact finalizer");
+        cipher
+            .inspect_ack_finalizer_from_catalog(
+                &completion_receipt,
+                &receipt_ack_request,
+                &catalog_binding,
+                &evidence,
+                catalog_mux,
+                &catalog_ack,
+            )
+            .expect("catalog retry authenticates the same adoption");
+        let foreign_cipher = checkpoint_stage_cipher(0xf8);
+        assert_ne!(foreign_cipher.key_id(), cipher.key_id());
+        let foreign_evidence = foreign_cipher
+            .seal_catalog_adoption_evidence(make_seed(), &catalog_binding)
+            .expect("foreign cipher seals identical semantic identities");
+        let mut forged_header = foreign_evidence.fixed_header();
+        forged_header[16..24].copy_from_slice(&cipher.key_id());
+        let foreign_evidence = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &forged_header,
+            foreign_evidence.ciphertext().to_vec(),
+            GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
+        )
+        .expect("foreign evidence retains a bounded structural envelope");
+        assert!(matches!(
+            cipher.seal_ack_finalizer_from_catalog(
+                &completion_receipt,
+                &receipt_ack_request,
+                &catalog_binding,
+                &foreign_evidence,
+                catalog_mux,
+            ),
+            Err(GuardianCheckpointCipherError::AuthenticationFailed)
+        ));
         let ack_record = cipher
             .seal_ack_finalizer(&completion_receipt, &receipt_ack_request, adoption_receipt)
             .expect("seal the unique completion ACK finalizer");

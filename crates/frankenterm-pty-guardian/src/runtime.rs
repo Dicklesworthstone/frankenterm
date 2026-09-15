@@ -753,10 +753,7 @@ fn execute_checkpoint_stage_job(
             store.apply_runtime_seal(permit, journal)
         }
         GuardianCheckpointStageKindV1::Ack => {
-            return Some(GuardianResponseEnvelope::rejection(
-                &job.request,
-                GuardianRejectionCode::InvalidRequest,
-            ));
+            store.apply_ack_from_committed_catalog(stage, job.request.header().mux_incarnation)
         }
     };
     let reply = reply.ok()?;
@@ -3431,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn production_checkpoint_worker_is_bounded_wipes_and_keeps_ack_disabled() {
+    fn production_checkpoint_worker_is_bounded_wipes_and_binds_catalog_ack() {
         let source = include_str!("runtime.rs");
         let worker_source = source
             .split("fn checkpoint_worker(")
@@ -3466,7 +3463,7 @@ mod tests {
         assert!(execution_source.contains("store.apply_query(stage)"));
         assert!(execution_source.contains("preflight_checkpoint_seal"));
         assert!(execution_source.contains("store.apply_runtime_seal(permit, journal)"));
-        assert!(!execution_source.contains("store.apply_ack"));
+        assert!(execution_source.contains("store.apply_ack_from_committed_catalog"));
         assert!(execution_source.contains("GuardianCheckpointStageKindV1::Ack =>"));
 
         let pipeline_source = source
@@ -3651,6 +3648,69 @@ mod tests {
         );
 
         let adoption_request_id = Uuid::from_u128(0xd005);
+        let completion_id = match GuardianReply::decode_for_operation(
+            GuardianOperation::CheckpointStage,
+            sealed.payload(),
+        )
+        .expect("decode real worker Seal reply")
+        {
+            GuardianReply::CheckpointStage(
+                mux::guardian_protocol::GuardianCheckpointStageReplyV1::Sealed {
+                    completion_id,
+                    ..
+                },
+            ) => completion_id,
+            other => panic!("expected sealed checkpoint, got {other:?}"),
+        };
+        let make_ack = |request_id| {
+            let shape = record_checkpoint_stage_request(
+                GuardianCheckpointStageKindV1::Query,
+                pane_id,
+                generation,
+                upload_id,
+                &terminal,
+                receipt,
+                chunk_bytes,
+                None,
+            );
+            let stage = GuardianCheckpointStageRequestV1::ack(
+                shape.scope(),
+                upload_id,
+                shape.descriptor(),
+                chunk_bytes,
+                completion_id,
+            )
+            .expect("exact sealed Ack request");
+            authenticated_record_checkpoint_stage_request(request_id, pane_id, generation, stage)
+        };
+        // A real durable Seal is insufficient authority until catalog adoption.
+        let unadopted_id = Uuid::from_u128(0xd010);
+        let unadopted = make_ack(unadopted_id);
+        let route = GuardianCheckpointRoute::new(Token(50), 1, unadopted_id).unwrap();
+        let before_unadopted = runtime.counters();
+        assert!(matches!(
+            runtime.submit_checkpoint(unadopted, route),
+            GuardianCheckpointSubmission::Pending
+        ));
+        let unadopted_result = wait_for_checkpoint_completion(&mut runtime);
+        let after_unadopted = runtime.counters();
+        assert_eq!(
+            after_unadopted.checkpoint_worker_panics,
+            before_unadopted.checkpoint_worker_panics
+        );
+        assert_eq!(
+            after_unadopted.checkpoint_token_authority_failures,
+            before_unadopted.checkpoint_token_authority_failures
+        );
+        assert_eq!(
+            after_unadopted.checkpoint_transactions_completed,
+            before_unadopted.checkpoint_transactions_completed + 1
+        );
+        assert!(
+            unadopted_result
+                .response
+                .is_none_or(|response| response.header().status != GuardianResponseStatus::Success)
+        );
         let adoption_effect_id = Uuid::from_u128(0xd006);
         let adoption = authenticated_checkpoint_adoption_request(
             adoption_request_id,
@@ -3716,6 +3776,24 @@ mod tests {
             replay_catalog_files, catalog_files,
             "an exact Checkpoint replay reconciles the durable marker without republishing"
         );
+        for request_id in [Uuid::from_u128(0xd011), Uuid::from_u128(0xd012)] {
+            let acked = submit_checkpoint_worker_request(&mut runtime, make_ack(request_id), 51);
+            assert_eq!(acked.header().status, GuardianResponseStatus::Success);
+            assert!(matches!(
+                GuardianReply::decode_for_operation(GuardianOperation::CheckpointStage, acked.payload()).unwrap(),
+                GuardianReply::CheckpointStage(mux::guardian_protocol::GuardianCheckpointStageReplyV1::Acked { completion_id: actual, .. }) if actual == completion_id
+            ));
+        }
+        // Historical authenticated catalog evidence must not bypass the live lease.
+        assert!(
+            runtime
+                .retire_disconnected_mux(Uuid::from_u128(2))
+                .unwrap()
+                .is_some()
+        );
+        let rejected =
+            submit_checkpoint_worker_request(&mut runtime, make_ack(Uuid::from_u128(0xd013)), 52);
+        assert_ne!(rejected.header().status, GuardianResponseStatus::Success);
     }
 
     #[test]

@@ -43,7 +43,7 @@ use mux::guardian_protocol::{
     GuardianCheckpointCatalogAdoptionEvidenceSeedV1, GuardianCheckpointCatalogAdoptionPermitV1,
     GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
     GuardianCheckpointOutputBoundaryV1, GuardianCheckpointPolicyExpiryReceiptV1,
-    GuardianCheckpointReceipt, GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
+    GuardianCheckpointRuntimeSealPermitV1, GuardianCheckpointScopeV1,
     GuardianCheckpointStageKindV1, GuardianCheckpointStageReplyV1,
     GuardianCheckpointStageRequestV1, GuardianEffectTransactionError, GuardianOperation,
     GuardianProtocolError, GuardianProtocolState, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
@@ -2174,12 +2174,12 @@ impl GuardianCheckpointStageStore {
         })
     }
 
-    pub(crate) fn apply_ack(
+    pub(crate) fn apply_ack_from_committed_catalog(
         &self,
         request: GuardianCheckpointStageRequestV1,
-        adoption_receipt: GuardianCheckpointReceipt,
+        expected_mux: Uuid,
     ) -> Result<GuardianCheckpointStageReplyV1, GuardianCheckpointStageStoreError> {
-        if request.kind() != GuardianCheckpointStageKindV1::Ack {
+        if request.kind() != GuardianCheckpointStageKindV1::Ack || expected_mux.is_nil() {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
         let shape = CheckpointStageRequestShape::from_request(&request)?;
@@ -2240,6 +2240,46 @@ impl GuardianCheckpointStageStore {
                 ordered_chunk_set_identity,
                 &seal_record,
             )?;
+            // A candidate alone is not committed. Scan validates synced marker,
+            // candidate checksum, complete chain, encrypted records and adoption
+            // evidence under this same exclusive store lock.
+            let (pane_id, generation) = shape
+                .binding
+                .scope()
+                .pane_identity()
+                .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+            let catalog = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+            let mut matching = catalog.published.iter().filter(|member| {
+                member.format == CheckpointCatalogFormat::ProtectedV3
+                    && member.metadata.capture_generation == generation
+                    && member.metadata.upload_id == shape.upload_id
+                    && member.metadata.completion_id == inspection.publication_id
+            });
+            let member = matching
+                .next()
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if matching.next().is_some() || member.metadata.adoption_mux_incarnation != expected_mux
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let candidate_bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&candidate_bytes)?;
+            if candidate.format != CheckpointCatalogFormat::ProtectedV3
+                || candidate.metadata != member.metadata
+                || candidate.checksum != member.candidate_checksum
+            {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            }
+            let adoption_binding = checkpoint_catalog_adoption_binding(&candidate)?;
+            let adoption_evidence = candidate
+                .adoption_evidence
+                .as_ref()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
             let ack_path = checkpoint_ack_path(inner, shape.key(), inspection.publication_id)?;
             let ack_plaintext_bytes = u32::try_from(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)
                 .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
@@ -2257,24 +2297,31 @@ impl GuardianCheckpointStageStore {
                     .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
                 let (_, ack_record, _) =
                     checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
-                inner.cipher.inspect_ack_finalizer_with_adoption(
+                inner.cipher.inspect_ack_finalizer_from_catalog(
                     &completion_receipt,
                     &request,
-                    adoption_receipt,
+                    &adoption_binding,
+                    adoption_evidence,
+                    expected_mux,
                     &ack_record,
                 )?;
             } else {
+                // Validate and encrypt before creating a file; an invalid tuple
+                // must not leave a torn finalizer behind. Exact retries above
+                // authenticate the existing bytes without requiring new entropy.
+                let prepared_ack = inner.cipher.seal_ack_finalizer_from_catalog(
+                    &completion_receipt,
+                    &request,
+                    &adoption_binding,
+                    adoption_evidence,
+                    expected_mux,
+                )?;
                 let record_bytes =
                     checkpoint_record_bytes_for_plaintext(CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES)?;
                 checkpoint_stage_require_capacity(inner, &census, shape.key(), 1, record_bytes)?;
                 match checkpoint_create_record_new(inner, &ack_path)? {
                     CheckpointStageCreateOutcome::Created(file) => {
-                        let record = inner.cipher.seal_ack_finalizer(
-                            &completion_receipt,
-                            &request,
-                            adoption_receipt,
-                        )?;
-                        checkpoint_write_created_record(inner, &ack_path, file, &record)?;
+                        checkpoint_write_created_record(inner, &ack_path, file, &prepared_ack)?;
                     }
                     CheckpointStageCreateOutcome::Existing => {
                         let refreshed = checkpoint_stage_census(inner)?;
@@ -2291,10 +2338,12 @@ impl GuardianCheckpointStageStore {
                             .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
                         let (_, ack_record, _) =
                             checkpoint_read_record(inner, ack_entry, ack_plaintext_bytes)?;
-                        inner.cipher.inspect_ack_finalizer_with_adoption(
+                        inner.cipher.inspect_ack_finalizer_from_catalog(
                             &completion_receipt,
                             &request,
-                            adoption_receipt,
+                            &adoption_binding,
+                            adoption_evidence,
+                            expected_mux,
                             &ack_record,
                         )?;
                     }
@@ -11533,6 +11582,209 @@ mod tests {
         store
             .apply_replay_ack(&request, preflight)
             .map_err(Into::into)
+    }
+
+    #[test]
+    fn committed_catalog_ack_requires_marker_identity_and_survives_store_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-ack-reopen-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xac100);
+        let mux = Uuid::from_u128(0xac101);
+        let pane = Uuid::from_u128(0xac102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            mux,
+            pane,
+            1,
+            1,
+            0xac110,
+            b"durable-ack-boundary",
+            b"durable-ack-boundary",
+        )?;
+        let captured = store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(catalog.published.len(), 1);
+            let member = &catalog.published[0];
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            Ok((
+                GuardianCheckpointStageRequestV1::decode(&plaintext)?,
+                member.metadata.completion_id,
+                member.marker_path.clone(),
+                member.candidate_path.clone(),
+            ))
+        })?;
+        let (begin, completion, marker_path, candidate_path) = captured;
+        let make_ack = |completion_id| {
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion_id,
+            )
+        };
+        let assert_no_ack =
+            || -> Result<(), GuardianCheckpointStageStoreError> {
+                store.with_exclusive_directory(|inner| {
+                    let census = checkpoint_stage_census(inner)?;
+                    assert!(census.entries.iter().all(|entry| {
+                        !matches!(entry.role, CheckpointStageFileRole::Ack { .. })
+                    }));
+                    Ok(())
+                })
+            };
+        assert!(matches!(
+            store
+                .apply_ack_from_committed_catalog(make_ack(completion)?, Uuid::from_u128(0xac199),),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        assert_no_ack()?;
+        assert!(matches!(
+            store.apply_ack_from_committed_catalog(make_ack(Uuid::from_u128(0xac198))?, mux),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        assert_no_ack()?;
+        let wrong_generation = GuardianCheckpointStageRequestV1::ack(
+            GuardianCheckpointScopeV1::Pane {
+                pane_id: pane,
+                generation: 2,
+            },
+            begin.upload_id(),
+            begin.descriptor(),
+            begin.chunk_bytes(),
+            completion,
+        )?;
+        assert!(matches!(
+            store.apply_ack_from_committed_catalog(wrong_generation, mux),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+        assert_no_ack()?;
+        // A second real durable output receipt produces a valid, distinct
+        // checkpoint/boundary pair. Splicing it onto the first upload is not an
+        // alternate encoding of that upload, even with the right completion ID.
+        let alternate_receipt = durable_commit(&pipeline, pane, &journal, b"-next")?;
+        let alternate_terminal = checkpoint_catalog_test_terminal(b"durable-ack-boundary-next");
+        assert_eq!(
+            alternate_terminal.parser_stream_bytes(),
+            alternate_receipt.cumulative_plaintext_bytes()
+        );
+        let alternate = checkpoint_catalog_test_record_stage_request(
+            GuardianCheckpointStageKindV1::Begin,
+            pane,
+            1,
+            Uuid::from_u128(0xac120),
+            &alternate_terminal,
+            alternate_receipt,
+            begin.chunk_bytes(),
+            None,
+        )?;
+        store.apply_begin(&alternate)?;
+        assert_ne!(alternate.checkpoint_id(), begin.checkpoint_id());
+        assert_ne!(alternate.boundary_id(), begin.boundary_id());
+        let spliced = GuardianCheckpointStageRequestV1::ack(
+            begin.scope(),
+            begin.upload_id(),
+            alternate.descriptor(),
+            begin.chunk_bytes(),
+            completion,
+        )?;
+        assert!(matches!(
+            store.apply_ack_from_committed_catalog(spliced, mux),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        assert_no_ack()?;
+        // ProtectedV3 appends adoption evidence after the checksummed candidate
+        // base. Corrupting its last ciphertext byte preserves the outer marker
+        // and candidate checksum, so this negative must reach authentication.
+        let original_candidate = std::fs::read(&candidate_path)?;
+        let mut damaged_candidate = original_candidate.clone();
+        *damaged_candidate
+            .last_mut()
+            .ok_or("empty protected candidate")? ^= 1;
+        std::fs::write(&candidate_path, &damaged_candidate)?;
+        File::open(&candidate_path)?.sync_all()?;
+        let damaged = store.apply_ack_from_committed_catalog(make_ack(completion)?, mux);
+        std::fs::write(&candidate_path, &original_candidate)?;
+        File::open(&candidate_path)?.sync_all()?;
+        assert!(matches!(
+            damaged,
+            Err(GuardianCheckpointStageStoreError::Cipher(
+                GuardianCheckpointCipherError::AuthenticationFailed
+            ))
+        ));
+        assert_no_ack()?;
+        // Retain the marker bytes outside the catalog namespace. A completely
+        // valid encrypted candidate without its committed marker is insufficient.
+        let retained_marker = directory.join("retained-ack-marker");
+        std::fs::rename(&marker_path, &retained_marker)?;
+        store.inner.directory.sync_all()?;
+        let absent_marker = store.apply_ack_from_committed_catalog(make_ack(completion)?, mux);
+        std::fs::rename(&retained_marker, &marker_path)?;
+        store.inner.directory.sync_all()?;
+        assert!(matches!(
+            absent_marker,
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+        assert_no_ack()?;
+        drop(state);
+        drop(journal);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+
+        let (reopened_poll, reopened_pipeline) =
+            reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let reopened = reopened_pipeline.checkpoint_stage_store();
+        let expected = GuardianCheckpointStageReplyV1::Acked {
+            upload_id: begin.upload_id(),
+            completion_id: completion,
+            checkpoint_id: begin.descriptor().checkpoint_id(),
+            boundary_id: begin.descriptor().boundary_id(),
+            total_bytes: begin.total_bytes(),
+        };
+        assert_eq!(
+            reopened.apply_ack_from_committed_catalog(make_ack(completion)?, mux)?,
+            expected
+        );
+        drop(reopened);
+        drop(reopened_pipeline);
+        drop(reopened_poll);
+        let (_final_poll, final_pipeline) =
+            reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        assert_eq!(
+            final_pipeline
+                .checkpoint_stage_store()
+                .apply_ack_from_committed_catalog(make_ack(completion)?, mux)?,
+            expected
+        );
+        Ok(())
     }
 
     #[test]
