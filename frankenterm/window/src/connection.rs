@@ -63,6 +63,26 @@ pub(crate) fn next_unique_window_id(counter: &AtomicUsize) -> Fallible<usize> {
     }
 }
 
+/// Remove only the allocation which owns this registration. A stale native
+/// callback must not retire a replacement that happens to reuse its number.
+/// Return ownership so native destruction happens after the map borrow ends.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn remove_exact_window_registration<T>(
+    windows: &RefCell<std::collections::HashMap<usize, Rc<T>>>,
+    window_id: usize,
+    expected: &Rc<T>,
+) -> Option<Rc<T>> {
+    let mut windows = windows.borrow_mut();
+    if windows
+        .get(&window_id)
+        .is_some_and(|current| Rc::ptr_eq(current, expected))
+    {
+        windows.remove(&window_id)
+    } else {
+        None
+    }
+}
+
 pub fn shutdown() {
     CONN.with(|m| drop(m.borrow_mut().take()));
 }
@@ -236,6 +256,63 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     static EVENT_HANDLER_TEST_CALLED: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn window_registration_retirement_preserves_same_number_replacements() {
+        use super::remove_exact_window_registration;
+        use std::cell::{Cell, RefCell};
+        use std::rc::{Rc, Weak};
+
+        struct View {
+            registry: Weak<RefCell<HashMap<usize, Rc<View>>>>,
+            destroyed: Rc<Cell<usize>>,
+        }
+        impl Drop for View {
+            fn drop(&mut self) {
+                if let Some(registry) = self.registry.upgrade() {
+                    assert!(
+                        registry.try_borrow_mut().is_ok(),
+                        "destroy outside map borrow"
+                    );
+                }
+                self.destroyed.set(self.destroyed.get() + 1);
+            }
+        }
+
+        let original = Rc::new(RefCell::new(HashMap::new()));
+        let replacement = Rc::new(RefCell::new(HashMap::new()));
+        let destroyed = Rc::new(Cell::new(0));
+        let old = Rc::new(View {
+            registry: Rc::downgrade(&original),
+            destroyed: Rc::clone(&destroyed),
+        });
+        let new = Rc::new(View {
+            registry: Rc::downgrade(&replacement),
+            destroyed: Rc::clone(&destroyed),
+        });
+        original.borrow_mut().insert(1, Rc::clone(&old));
+        replacement.borrow_mut().insert(1, Rc::clone(&new));
+
+        assert!(remove_exact_window_registration(&replacement, 1, &old).is_none());
+        assert!(Rc::ptr_eq(&replacement.borrow()[&1], &new));
+        let retired = remove_exact_window_registration(&original, 1, &old).unwrap();
+        assert!(Rc::ptr_eq(&retired, &old));
+        assert!(original.borrow().is_empty());
+        assert!(Rc::ptr_eq(&replacement.borrow()[&1], &new));
+        assert_eq!(destroyed.get(), 0);
+
+        original.borrow_mut().insert(1, Rc::clone(&new));
+        assert!(remove_exact_window_registration(&original, 1, &old).is_none());
+        assert!(Rc::ptr_eq(&original.borrow()[&1], &new));
+        drop(old);
+        drop(retired);
+        assert_eq!(destroyed.get(), 1);
+        assert!(remove_exact_window_registration(&replacement, 2, &new).is_none());
+        drop(remove_exact_window_registration(&original, 1, &new));
+        drop(remove_exact_window_registration(&replacement, 1, &new));
+        drop(new);
+        assert_eq!(destroyed.get(), 2);
+    }
 
     #[test]
     fn window_id_allocator_uses_the_last_unreserved_identity_once() {

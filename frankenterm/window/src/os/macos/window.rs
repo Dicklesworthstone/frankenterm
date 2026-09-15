@@ -583,6 +583,8 @@ impl Window {
 
             let inner = Rc::new(RefCell::new(Inner {
                 events,
+                owner_connection: Rc::downgrade(&conn),
+                registered_window: std::rc::Weak::new(),
                 view_id: None,
                 window_id,
                 window: None,
@@ -736,7 +738,11 @@ impl Window {
                 view,
                 config: config.clone(),
             }));
-            inner.borrow_mut().window.replace(weak_window);
+            {
+                let mut inner = inner.borrow_mut();
+                inner.window.replace(weak_window);
+                inner.registered_window = Rc::downgrade(&window_inner);
+            }
             conn.windows
                 .borrow_mut()
                 .insert(window_id, Rc::clone(&window_inner));
@@ -1653,6 +1659,8 @@ struct DeadKeyState {
 
 struct Inner {
     events: WindowEventSender,
+    owner_connection: std::rc::Weak<Connection>,
+    registered_window: std::rc::Weak<RefCell<WindowInner>>,
     view_id: Option<WeakPtr>,
     window: Option<WeakPtr>,
     screen_changed: bool,
@@ -2427,15 +2435,31 @@ impl WindowView {
 
     extern "C" fn window_will_close(this: &mut Object, _sel: Sel, _id: id) {
         if let Some(this) = Self::get_this(this) {
+            let (owner, registered_window, window_id) = {
+                let inner = this.inner.borrow();
+                (
+                    inner.owner_connection.upgrade(),
+                    inner.registered_window.upgrade(),
+                    inner.window_id,
+                )
+            };
             // Advise the window of its impending death
             this.inner
                 .borrow_mut()
                 .events
                 .dispatch(WindowEvent::Destroyed);
-            this.update_application_presentation(false);
-            if let Some(conn) = Connection::get() {
-                let window_id = this.inner.borrow_mut().window_id;
-                conn.windows.borrow_mut().remove(&window_id);
+            if let (Some(owner), Some(expected)) = (owner, registered_window) {
+                let retired = crate::connection::remove_exact_window_registration(
+                    &owner.windows,
+                    window_id,
+                    &expected,
+                );
+                if retired.is_some()
+                    && Connection::get().is_some_and(|current| Rc::ptr_eq(&current, &owner))
+                {
+                    this.update_application_presentation(false);
+                }
+                drop(retired);
             }
         }
     }
