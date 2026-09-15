@@ -13,12 +13,14 @@ use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
 use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input_worker_panic};
 use mux::guardian_protocol::{
-    AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES, GuardianCheckpointStageKindV1,
-    GuardianDurableSpawnFenceInstallV1, GuardianDurableSpawnFenceV1, GuardianEffectOutcome,
-    GuardianEffectTransactionError, GuardianMuxLeaseRetirement, GuardianOperation,
-    GuardianPaneState, GuardianProtocolError, GuardianProtocolState, GuardianRejectionCode,
-    GuardianReplayRequestV1, GuardianReplaySelectorV1, GuardianReply, GuardianResizePayload,
-    GuardianResponseEnvelope, GuardianSignal, GuardianSpawnPayload, InputEffectState,
+    AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES,
+    GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianCheckpointStageKindV1,
+    GuardianCheckpointStageRequestV1, GuardianDurableSpawnFenceInstallV1,
+    GuardianDurableSpawnFenceV1, GuardianEffectOutcome, GuardianEffectTransactionError,
+    GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState, GuardianProtocolError,
+    GuardianProtocolState, GuardianRejectionCode, GuardianReplayRequestV1,
+    GuardianReplaySelectorV1, GuardianReply, GuardianResizePayload, GuardianResponseEnvelope,
+    GuardianSignal, GuardianSpawnPayload, InputEffectState,
 };
 use portable_pty::{Child, ChildKiller, MasterPty, PollablePtyReader, native_pty_system};
 use std::collections::HashMap;
@@ -488,6 +490,7 @@ struct CheckpointJob {
     request: AuthenticatedGuardianRequest,
     journal: Option<GuardianPaneOutputJournal>,
     token_effect_authority: WorkerTokenEffectAuthority,
+    admitted_genesis_stage: Option<GuardianCheckpointStageRequestV1>,
 }
 
 struct CheckpointWorkerCompletion {
@@ -599,6 +602,10 @@ fn checkpoint_worker(
             Some(Ok(_)) | None => (None, false),
             Some(Err(_)) => (None, true),
         };
+        // A failed token check can skip execution entirely, leaving the
+        // preflight-decoded Chunk owned by the job. Wipe that owner before
+        // publishing completion just like the authenticated wire request.
+        drop(job.admitted_genesis_stage.take());
         let completion = CheckpointWorkerCompletion {
             route: job.route,
             operation,
@@ -718,9 +725,13 @@ fn replay_store_error_response(
 
 fn execute_checkpoint_stage_job(
     store: &GuardianCheckpointStageStore,
-    job: &CheckpointJob,
+    job: &mut CheckpointJob,
 ) -> Option<GuardianResponseEnvelope> {
-    let stage = match job.protocol.preflight_checkpoint_stage(&job.request) {
+    let admitted = job
+        .admitted_genesis_stage
+        .take()
+        .map_or_else(|| job.protocol.preflight_checkpoint_stage(&job.request), Ok);
+    let stage = match admitted {
         Ok(stage) => stage,
         Err(error) => {
             return Some(GuardianResponseEnvelope::rejection(
@@ -1099,7 +1110,10 @@ impl GuardianRuntime {
                 if request.payload().is_empty() {
                     self.apply_observation(request)
                 } else {
-                    Err(GuardianRejectionCode::InvalidRequest)
+                    match self.authenticate_genesis_connection(request) {
+                        Ok(_) => self.apply_observation(request),
+                        Err(error) => Err(GuardianRejectionCode::from_protocol_error(&error)),
+                    }
                 }
             }
             GuardianOperation::Census | GuardianOperation::QueryInputEffect => {
@@ -1352,23 +1366,35 @@ impl GuardianRuntime {
             .saturating_add(1);
     }
 
+    pub(crate) fn authenticate_genesis_connection(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianProtocolError> {
+        self.protocol
+            .as_ref()
+            .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?
+            .authenticate_mux_connection_for_genesis(request)
+    }
+
     /// Transfer the one global protocol authority and one owned authenticated
     /// checkpoint or replay request to the fixed durable worker. Record-backed
     /// Seal can reach storage only beside the process-local journal authority
     /// for its authenticated pane; Checkpoint adoption consumes its typed
     /// mutation permit on the same worker. Replay page plaintext and ReplayAck
-    /// ledger mutation remain off the readiness loop. Genesis remains
-    /// fail-closed.
+    /// ledger mutation remain off the readiness loop. Genesis permits only
+    /// owner-bound staging; Seal and Spawn activation remain fail-closed.
     pub(crate) fn submit_checkpoint_with_token_lease(
         &mut self,
         request: AuthenticatedGuardianRequest,
         route: GuardianCheckpointRoute,
         token_effect_lease: GuardianTokenEffectLease,
+        genesis_connection: Option<&GuardianAuthenticatedMuxConnectionAuthorityV1>,
     ) -> GuardianCheckpointSubmission {
         self.submit_checkpoint_with_authority(
             request,
             route,
             WorkerTokenEffectAuthority::Held(token_effect_lease),
+            genesis_connection,
         )
     }
 
@@ -1382,6 +1408,7 @@ impl GuardianRuntime {
             request,
             route,
             WorkerTokenEffectAuthority::TestOnlyBypass,
+            None,
         )
     }
 
@@ -1390,6 +1417,7 @@ impl GuardianRuntime {
         mut request: AuthenticatedGuardianRequest,
         route: GuardianCheckpointRoute,
         token_effect_authority: WorkerTokenEffectAuthority,
+        genesis_connection: Option<&GuardianAuthenticatedMuxConnectionAuthorityV1>,
     ) -> GuardianCheckpointSubmission {
         let operation = request.header().operation;
         if !matches!(
@@ -1420,6 +1448,31 @@ impl GuardianRuntime {
             request.zeroize_payload();
             return GuardianCheckpointSubmission::CloseRetryably;
         };
+        let admitted_genesis_stage = if operation == GuardianOperation::CheckpointStage
+            && request.header().pane_id.is_none()
+            && genesis_connection.is_some()
+        {
+            let admitted = genesis_connection
+                .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)
+                .and_then(|connection| {
+                    let guardian = protocol.live_build_authority_for_genesis()?;
+                    protocol.preflight_genesis_checkpoint_stage(&request, connection, &guardian)
+                });
+            match admitted {
+                Ok(stage) => Some(stage),
+                Err(error) => {
+                    self.protocol = Some(protocol);
+                    let response = GuardianResponseEnvelope::rejection(
+                        &request,
+                        GuardianRejectionCode::from_protocol_error(&error),
+                    );
+                    request.zeroize_payload();
+                    return GuardianCheckpointSubmission::Respond(response);
+                }
+            }
+        } else {
+            None
+        };
         let journal = request
             .header()
             .pane_id
@@ -1431,6 +1484,7 @@ impl GuardianRuntime {
             request,
             journal,
             token_effect_authority,
+            admitted_genesis_stage,
         };
         match self.checkpoint_pipeline.try_submit(job) {
             Ok(()) => {

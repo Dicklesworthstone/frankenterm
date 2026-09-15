@@ -12,9 +12,10 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, CorrelatedGuardianResponse, GUARDIAN_AUTH_TOKEN_BYTES,
     GUARDIAN_MAX_CENSUS_BYTES, GUARDIAN_MAX_CENSUS_ENTRIES, GUARDIAN_MAX_FRAME_BYTES,
-    GUARDIAN_MAX_PANES, GuardianCensusEntry, GuardianCensusPageRequest, GuardianCheckpointIntent,
-    GuardianCheckpointReceipt, GuardianCheckpointScopeV1, GuardianCheckpointStageReplyV1,
-    GuardianCheckpointStageRequestV1, GuardianInputEffectQuery, GuardianOperation,
+    GUARDIAN_MAX_PANES, GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianCensusEntry,
+    GuardianCensusPageRequest, GuardianCheckpointIntent, GuardianCheckpointReceipt,
+    GuardianCheckpointScopeV1, GuardianCheckpointStageReplyV1, GuardianCheckpointStageRequestV1,
+    GuardianHelloBuildIdentityV1, GuardianInputEffectQuery, GuardianOperation,
     GuardianProtocolError, GuardianRejectionCode, GuardianReplayAckReceiptV1, GuardianReplayAckV1,
     GuardianReplayPageDelivery, GuardianReplayRequestV1, GuardianReply, GuardianRequestEnvelope,
     GuardianRequestHeader, GuardianResizePayload, GuardianResponseEnvelope, GuardianResponseStatus,
@@ -212,6 +213,7 @@ struct Connection {
     write_buf: Option<GuardianWireFrame>,
     write_offset: usize,
     mux_incarnation: Option<Uuid>,
+    genesis_authority: Option<GuardianAuthenticatedMuxConnectionAuthorityV1>,
     close_after_write: bool,
     guarded_stop_response: Option<GuardedStopAuthority>,
     pending_input: Option<GuardianInputRoute>,
@@ -326,6 +328,7 @@ impl Connection {
             write_buf: None,
             write_offset: 0,
             mux_incarnation: None,
+            genesis_authority: None,
             close_after_write: false,
             guarded_stop_response: None,
             pending_input: None,
@@ -1451,6 +1454,17 @@ impl GuardianService {
                     return FrameProcessing::Close;
                 };
                 if response.header().status == GuardianResponseStatus::Success {
+                    let genesis_authority = if request.payload().is_empty() {
+                        None
+                    } else {
+                        match self.runtime.authenticate_genesis_connection(&request) {
+                            Ok(authority) => Some(authority),
+                            Err(_) => {
+                                request.zeroize_payload();
+                                return FrameProcessing::Close;
+                            }
+                        }
+                    };
                     let mux_incarnation = request.header().mux_incarnation;
                     if self
                         .mux_connections
@@ -1462,6 +1476,7 @@ impl GuardianService {
                         return FrameProcessing::Close;
                     }
                     connection.mux_incarnation = Some(mux_incarnation);
+                    connection.genesis_authority = genesis_authority;
                 } else {
                     connection.close_after_write = true;
                 }
@@ -1601,6 +1616,7 @@ impl GuardianService {
                         request,
                         route,
                         effect_lease,
+                        connection.genesis_authority.as_ref(),
                     ) {
                         GuardianCheckpointSubmission::Pending => {
                             connection.pending_checkpoint = Some(route);
@@ -1793,10 +1809,12 @@ impl GuardianService {
                 self.finish_connection(token, connection);
                 continue;
             };
-            match self
-                .runtime
-                .submit_checkpoint_with_token_lease(request, route, effect_lease)
-            {
+            match self.runtime.submit_checkpoint_with_token_lease(
+                request,
+                route,
+                effect_lease,
+                connection.genesis_authority.as_ref(),
+            ) {
                 GuardianCheckpointSubmission::Pending => {
                     debug_assert_eq!(connection.pending_checkpoint, Some(route));
                     self.connections.insert(token, connection);
@@ -2125,11 +2143,58 @@ impl Drop for OwnedEncodedFrame {
     }
 }
 
+fn checkpoint_resume_index(
+    progress: GuardianCheckpointStageReplyV1,
+    total_chunks: u32,
+    total_bytes: u64,
+    chunk_bytes: u32,
+) -> Result<usize, GuardianClientError> {
+    let GuardianCheckpointStageReplyV1::Ready {
+        next_index,
+        committed_bytes,
+        ..
+    } = progress
+    else {
+        return Err(GuardianClientError::UnexpectedReply);
+    };
+    if next_index > total_chunks
+        || committed_bytes != (u64::from(next_index) * u64::from(chunk_bytes)).min(total_bytes)
+    {
+        return Err(GuardianClientError::UnexpectedReply);
+    }
+    usize::try_from(next_index).map_err(|_| GuardianClientError::UnexpectedReply)
+}
+
 impl GuardianClient {
     pub fn connect(
         socket_path: &Path,
         token_path: &Path,
         mux_incarnation: Uuid,
+    ) -> Result<Self, GuardianClientError> {
+        Self::connect_with_hello(socket_path, token_path, mux_incarnation, Vec::new())
+    }
+
+    /// Authenticate the build compiled into this mux for Genesis staging.
+    /// This does not reserve or start a child.
+    pub fn connect_for_genesis(
+        socket_path: &Path,
+        token_path: &Path,
+        mux_incarnation: Uuid,
+    ) -> Result<Self, GuardianClientError> {
+        let hello = GuardianHelloBuildIdentityV1::for_compiled_mux()?;
+        Self::connect_with_hello(
+            socket_path,
+            token_path,
+            mux_incarnation,
+            hello.encode().to_vec(),
+        )
+    }
+
+    fn connect_with_hello(
+        socket_path: &Path,
+        token_path: &Path,
+        mux_incarnation: Uuid,
+        hello_payload: Vec<u8>,
     ) -> Result<Self, GuardianClientError> {
         if mux_incarnation.is_nil() {
             return Err(GuardianClientError::Protocol(
@@ -2161,9 +2226,9 @@ impl GuardianClient {
                 0,
                 0,
                 None,
-                &[],
+                &hello_payload,
             ),
-            Vec::new(),
+            hello_payload,
         ))?;
         let GuardianReply::Hello {
             guardian_incarnation,
@@ -2362,6 +2427,71 @@ impl GuardianClient {
             }
             _ => Err(GuardianClientError::UnexpectedReply),
         }
+    }
+
+    /// Durably stage a canonical pre-spawn checkpoint on a sealed connection.
+    /// Retries use the same owner-bound locator and exact chunk bytes. Success
+    /// proves complete staging only, not a Seal, child, or published snapshot.
+    pub fn stage_genesis_checkpoint(
+        &mut self,
+        spawn_effect_id: Uuid,
+        descriptor: mux::guardian_protocol::GuardianCheckpointDescriptorV1,
+        canonical_payload: &[u8],
+        chunk_bytes: u32,
+    ) -> Result<GuardianCheckpointStageReplyV1, GuardianClientError> {
+        descriptor.validate_canonical_payload(canonical_payload)?;
+        let upload_id = GuardianHelloBuildIdentityV1::for_compiled_mux()?.genesis_upload_id(
+            self.guardian_incarnation,
+            self.mux_incarnation,
+            spawn_effect_id,
+            descriptor,
+            chunk_bytes,
+        )?;
+        let scope = GuardianCheckpointScopeV1::Genesis { spawn_effect_id };
+        let begin =
+            GuardianCheckpointStageRequestV1::begin(scope, upload_id, descriptor, chunk_bytes)?;
+        let total_chunks = begin.total_chunks();
+        let total_bytes = begin.total_bytes();
+        let progress = self.checkpoint_stage(Uuid::new_v4(), begin)?;
+        let resume_index =
+            checkpoint_resume_index(progress, total_chunks, total_bytes, chunk_bytes)?;
+        let chunk_len = usize::try_from(chunk_bytes)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        for (index, bytes) in canonical_payload
+            .chunks(chunk_len)
+            .enumerate()
+            .skip(resume_index)
+        {
+            let index =
+                u32::try_from(index).map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+            let mut owned = Zeroizing::new(Vec::with_capacity(bytes.len()));
+            owned.extend_from_slice(bytes);
+            let stage = GuardianCheckpointStageRequestV1::chunk(
+                scope,
+                upload_id,
+                descriptor,
+                chunk_bytes,
+                index,
+                owned,
+            )?;
+            let reply = self.checkpoint_stage(Uuid::new_v4(), stage)?;
+            if !matches!(reply, GuardianCheckpointStageReplyV1::Progress { next_index, committed_bytes, .. }
+                if next_index == index + 1
+                    && committed_bytes == (u64::from(next_index) * u64::from(chunk_bytes)).min(total_bytes))
+            {
+                return Err(GuardianClientError::UnexpectedReply);
+            }
+        }
+        let reply = self.checkpoint_stage(
+            Uuid::new_v4(),
+            GuardianCheckpointStageRequestV1::query(scope, upload_id, descriptor, chunk_bytes)?,
+        )?;
+        if !matches!(reply, GuardianCheckpointStageReplyV1::Progress { next_index, committed_bytes, .. }
+            if next_index == total_chunks && committed_bytes == total_bytes)
+        {
+            return Err(GuardianClientError::UnexpectedReply);
+        }
+        Ok(reply)
     }
 
     /// Execute one typed checkpoint staging operation.
@@ -5440,6 +5570,181 @@ mod tests {
         server
             .join()
             .expect("ReplayAck expiry server exits cleanly");
+    }
+
+    #[test]
+    fn genesis_staging_resume_rejects_inconsistent_ready_progress() {
+        let upload_id = Uuid::new_v4();
+        for (next_index, committed_bytes, expected) in [
+            (0, 0, Some(0)),
+            (1, 1_024, Some(1)),
+            (2, 1_500, Some(2)),
+            (3, 1_500, None),
+            (1, 1_500, None),
+            (0, 1, None),
+            (2, 2_048, None),
+        ] {
+            let reply = GuardianCheckpointStageReplyV1::Ready {
+                upload_id,
+                next_index,
+                committed_bytes,
+            };
+            assert_eq!(
+                checkpoint_resume_index(reply, 2, 1_500, 1_024).ok(),
+                expected
+            );
+        }
+        assert!(
+            checkpoint_resume_index(
+                GuardianCheckpointStageReplyV1::Absent { upload_id },
+                2,
+                1_500,
+                1_024,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn genesis_staging_real_service_preserves_owner_and_reconnect_progress() {
+        use mux::guardian_protocol::GuardianCheckpointDescriptorV1;
+
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("ft-genesis-staging-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        let socket = directory.join("guardian.sock");
+        provision_guardian_token(&token).unwrap();
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop_guard = StopOnDrop(&stop);
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_stop = &stop;
+            let worker = scope.spawn(move || {
+                let mut service = GuardianService::bind(config).unwrap();
+                ready_tx.send(()).unwrap();
+                service.run_until(worker_stop).unwrap();
+                assert_eq!(service.runtime.pane_count(), 0);
+            });
+            ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            let mux = Uuid::new_v4();
+            let effect = Uuid::new_v4();
+            let terminal = transport_checkpoint();
+            let descriptor =
+                GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal).unwrap();
+            let hello = GuardianHelloBuildIdentityV1::for_compiled_mux().unwrap();
+            let connection = GuardianClient::connect_for_genesis(&socket, &token, mux);
+            let mut client = match connection {
+                Ok(client) => client,
+                Err(GuardianClientError::Rejected(_)) => {
+                    // The ordinary development build exercises a real refusal,
+                    // not positive staging. Sealed-source proof must also retain
+                    // GENESIS_DURABLE_STAGING_SUCCESS below.
+                    assert!(matches!(
+                        hello.genesis_upload_id(Uuid::new_v4(), mux, effect, descriptor, 1_024),
+                        Err(GuardianProtocolError::GenesisBuildIdentityUnavailable)
+                    ));
+                    let mut legacy = GuardianClient::connect(&socket, &token, mux).unwrap();
+                    let begin = GuardianCheckpointStageRequestV1::begin(
+                        GuardianCheckpointScopeV1::Genesis {
+                            spawn_effect_id: effect,
+                        },
+                        Uuid::new_v4(),
+                        descriptor,
+                        1_024,
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        legacy.checkpoint_stage(Uuid::new_v4(), begin),
+                        Err(GuardianClientError::Rejected(_))
+                    ));
+                    drop(stop_guard);
+                    worker.join().unwrap();
+                    return;
+                }
+                Err(error) => panic!("sealed Hello transport failure: {error}"),
+            };
+            let guardian = client.guardian_incarnation();
+            let upload = hello
+                .genesis_upload_id(guardian, mux, effect, descriptor, 1_024)
+                .unwrap();
+            let stage_scope = GuardianCheckpointScopeV1::Genesis {
+                spawn_effect_id: effect,
+            };
+            let query = || {
+                GuardianCheckpointStageRequestV1::query(stage_scope, upload, descriptor, 1_024)
+                    .unwrap()
+            };
+            let reply = client
+                .stage_genesis_checkpoint(effect, descriptor, terminal.canonical_payload(), 1_024)
+                .unwrap();
+            assert!(
+                matches!(reply, GuardianCheckpointStageReplyV1::Progress { committed_bytes, .. } if committed_bytes == u64::try_from(terminal.canonical_payload().len()).unwrap())
+            );
+            drop(client);
+            let mut reconnect = GuardianClient::connect_for_genesis(&socket, &token, mux).unwrap();
+            assert_eq!(
+                reconnect.checkpoint_stage(Uuid::new_v4(), query()).unwrap(),
+                reply
+            );
+            let retried = reconnect
+                .stage_genesis_checkpoint(effect, descriptor, terminal.canonical_payload(), 1_024)
+                .unwrap();
+            assert_eq!(retried, reply);
+            let mut other =
+                GuardianClient::connect_for_genesis(&socket, &token, Uuid::new_v4()).unwrap();
+            assert!(matches!(
+                other.checkpoint_stage(Uuid::new_v4(), query()),
+                Err(GuardianClientError::Rejected(_))
+            ));
+            let chunk = GuardianCheckpointStageRequestV1::chunk(
+                stage_scope,
+                upload,
+                descriptor,
+                1_024,
+                0,
+                Zeroizing::new(terminal.canonical_payload()[..1_024].to_vec()),
+            )
+            .unwrap();
+            assert!(matches!(
+                other.checkpoint_stage(Uuid::new_v4(), chunk),
+                Err(GuardianClientError::Rejected(_))
+            ));
+            let seal =
+                GuardianCheckpointStageRequestV1::seal(stage_scope, upload, descriptor, 1_024)
+                    .unwrap();
+            assert!(matches!(
+                reconnect.checkpoint_stage(Uuid::new_v4(), seal),
+                Err(GuardianClientError::Rejected(_))
+            ));
+            assert_eq!(
+                reconnect.checkpoint_stage(Uuid::new_v4(), query()).unwrap(),
+                reply
+            );
+            drop(stop_guard);
+            worker.join().unwrap();
+            println!("GENESIS_DURABLE_STAGING_SUCCESS");
+        });
     }
 
     #[test]

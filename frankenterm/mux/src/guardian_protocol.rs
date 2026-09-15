@@ -1127,6 +1127,40 @@ impl GuardianHelloBuildIdentityV1 {
         })
     }
 
+    /// Derive a resumable staging locator, not an authentication credential.
+    /// The guardian independently recomputes this from the accepted connection
+    /// authority and checks the encrypted candidate's complete Begin payload.
+    pub fn genesis_upload_id(
+        self,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        spawn_effect_id: Uuid,
+        descriptor: GuardianCheckpointDescriptorV1,
+        chunk_bytes: u32,
+    ) -> Result<Uuid, GuardianProtocolError> {
+        let build = self.require_sealed()?;
+        require_nonzero(guardian_incarnation, "guardian incarnation")?;
+        require_nonzero(mux_incarnation, "mux incarnation")?;
+        let begin = GuardianCheckpointStageRequestV1::begin(
+            GuardianCheckpointScopeV1::Genesis { spawn_effect_id },
+            Uuid::from_bytes([1; 16]),
+            descriptor,
+            chunk_bytes,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(b"frankenterm.guardian.genesis-staging-owner.v1\0");
+        digest.update(guardian_incarnation.as_bytes());
+        digest.update(mux_incarnation.as_bytes());
+        digest.update(build.as_bytes());
+        digest.update(begin.encode()?);
+        let digest = digest.finalize();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        let upload_id = Uuid::from_bytes(bytes);
+        require_nonzero(upload_id, "checkpoint upload")?;
+        Ok(upload_id)
+    }
+
     #[must_use]
     pub fn encode(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
         let mut payload = [0_u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES];
@@ -9314,17 +9348,63 @@ impl GuardianProtocolState {
         GuardianReplayAckV1::decode(request.payload())
     }
 
-    /// Validate one authenticated checkpoint Stage request against the live
-    /// pane lease before a guardian worker is allowed to inspect persistent
-    /// staging state.
-    ///
-    /// This is deliberately read-only and returns only the decoded wire
-    /// request, never publication authority. Record-backed Stage traffic must
-    /// name the exact currently claimed pane generation and mux incarnation;
-    /// pending input durability or an indeterminate checkpoint publication
-    /// blocks it. Genesis remains unavailable until the runtime can consume a
-    /// durable pre-Spawn reservation permit rather than trusting a raw effect
-    /// UUID from the wire.
+    /// Admit only owner-bound pre-spawn Begin, Chunk, and Query traffic.
+    /// This grants no Seal, publication, or child activation authority. The
+    /// durable store must authenticate the candidate's complete canonical
+    /// Begin shape before inspecting progress or writing any chunk.
+    pub fn preflight_genesis_checkpoint_stage(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+        connection: &GuardianAuthenticatedMuxConnectionAuthorityV1,
+        live_guardian: &GuardianLiveBuildAuthorityV1,
+    ) -> Result<GuardianCheckpointStageRequestV1, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::CheckpointStage {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        if connection.guardian_incarnation != self.incarnation
+            || connection.mux_incarnation != request.header.mux_incarnation
+            || live_guardian.guardian_incarnation != self.incarnation
+        {
+            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+        }
+        // Staging is not a Spawn reservation. The sealed guardian authority
+        // still comes from the production compiled-build factory.
+        let stage = GuardianCheckpointStageRequestV1::decode(request.payload())?;
+        let GuardianCheckpointScopeV1::Genesis { spawn_effect_id } = stage.scope() else {
+            return Err(GuardianProtocolError::InvalidGenesisReservation);
+        };
+        if !matches!(
+            stage.kind(),
+            GuardianCheckpointStageKindV1::Begin
+                | GuardianCheckpointStageKindV1::Chunk
+                | GuardianCheckpointStageKindV1::Query
+        ) {
+            return Err(GuardianProtocolError::GenesisAuthorityUnavailable);
+        }
+        let owner = GuardianHelloBuildIdentityV1 {
+            build_identity: AtomicBuildIdentity::Sealed(connection.mux_build_identity),
+        };
+        let expected_upload_id = owner.genesis_upload_id(
+            self.incarnation,
+            connection.mux_incarnation,
+            spawn_effect_id,
+            stage.descriptor(),
+            stage.chunk_bytes(),
+        )?;
+        if stage.upload_id() != expected_upload_id {
+            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+        }
+        Ok(stage)
+    }
+
+    /// Validate record-backed Stage traffic against the exact live pane lease.
+    /// Genesis traffic requires the distinct connection-bound staging path.
     pub fn preflight_checkpoint_stage(
         &self,
         request: &AuthenticatedGuardianRequest,
@@ -12577,6 +12657,126 @@ mod tests {
         let debug = format!("{authority:?}");
         assert!(!debug.contains(&"51".repeat(32)));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn genesis_staging_binds_known_upload_ids_to_authenticated_owner_and_build() {
+        let state = GuardianProtocolState::new(id(1)).unwrap();
+        let terminal = terminal_checkpoint();
+        let effect = id(5);
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal).unwrap();
+        let owner = mux_genesis_authority(&state, id(2), 0x51);
+        let reconnect = mux_genesis_authority(&state, id(2), 0x51);
+        let other_mux = mux_genesis_authority(&state, id(3), 0x51);
+        let other_build = mux_genesis_authority(&state, id(2), 0x52);
+        let guardian = live_genesis_authority(&state, 0x53);
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
+        );
+        let upload = hello
+            .genesis_upload_id(id(1), id(2), effect, descriptor, 1_024)
+            .unwrap();
+        let scope = GuardianCheckpointScopeV1::Genesis {
+            spawn_effect_id: effect,
+        };
+        for kind in [
+            GuardianCheckpointStageKindV1::Begin,
+            GuardianCheckpointStageKindV1::Chunk,
+            GuardianCheckpointStageKindV1::Query,
+        ] {
+            let stage = match kind {
+                GuardianCheckpointStageKindV1::Begin => {
+                    GuardianCheckpointStageRequestV1::begin(scope, upload, descriptor, 1_024)
+                }
+                GuardianCheckpointStageKindV1::Chunk => GuardianCheckpointStageRequestV1::chunk(
+                    scope,
+                    upload,
+                    descriptor,
+                    1_024,
+                    0,
+                    zeroizing_vec_from_slice(&terminal.canonical_payload()[..1_024]),
+                ),
+                GuardianCheckpointStageKindV1::Query => {
+                    GuardianCheckpointStageRequestV1::query(scope, upload, descriptor, 1_024)
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+            for authority in [&owner, &reconnect, &other_mux, &other_build] {
+                let envelope = request(
+                    GuardianOperation::CheckpointStage,
+                    id(1),
+                    authority.mux_incarnation,
+                    id(80),
+                    None,
+                    0,
+                    0,
+                    Some(effect),
+                    &stage.encode().unwrap(),
+                );
+                let request = authenticate(&envelope);
+                let admitted =
+                    state.preflight_genesis_checkpoint_stage(&request, authority, &guardian);
+                if authority.mux_incarnation == id(2)
+                    && authority.mux_build_identity == owner.mux_build_identity
+                {
+                    assert_eq!(admitted.unwrap().kind(), kind);
+                } else {
+                    assert!(
+                        matches!(
+                            admitted,
+                            Err(GuardianProtocolError::GenesisAuthorityMismatch)
+                        ),
+                        "known victim locator must not authorize another mux or build"
+                    );
+                }
+            }
+        }
+        let changed_descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
+            effect,
+            &terminal_checkpoint_with_size(25, 80, 640, 400),
+        )
+        .unwrap();
+        for (changed_effect, changed_descriptor, changed_chunk_bytes) in [
+            (effect, changed_descriptor, 1_024),
+            (effect, descriptor, 512),
+            (
+                id(6),
+                GuardianCheckpointDescriptorV1::for_genesis_artifact(id(6), &terminal).unwrap(),
+                1_024,
+            ),
+        ] {
+            assert_ne!(
+                hello
+                    .genesis_upload_id(
+                        id(1),
+                        id(2),
+                        changed_effect,
+                        changed_descriptor,
+                        changed_chunk_bytes
+                    )
+                    .unwrap(),
+                upload
+            );
+        }
+        let seal =
+            GuardianCheckpointStageRequestV1::seal(scope, upload, descriptor, 1_024).unwrap();
+        let seal = authenticate(&request(
+            GuardianOperation::CheckpointStage,
+            id(1),
+            id(2),
+            id(81),
+            None,
+            0,
+            0,
+            Some(effect),
+            &seal.encode().unwrap(),
+        ));
+        assert!(matches!(
+            state.preflight_genesis_checkpoint_stage(&seal, &owner, &guardian),
+            Err(GuardianProtocolError::GenesisAuthorityUnavailable)
+        ));
     }
 
     #[test]
