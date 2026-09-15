@@ -8924,6 +8924,83 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_ready_retries_once_without_resetting_failure_history() {
+        let mut recovery = super::RenderRecoveryState::default();
+        recovery.record_failure(super::RenderFailureStage::Paint);
+        recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+        recovery.enter_cooldown(
+            super::RenderWakeTicket(1),
+            super::RenderFailureStage::NativeFramePending,
+        );
+        assert!(recovery.mark_native_frame_ready());
+        assert!(!recovery.mark_retry_ready(super::RenderWakeTicket(1)));
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+
+        // A premature notification may race the worker's final publication.
+        // Every further notification must retain the ordinary timer bound.
+        for ticket in 2..102 {
+            recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+            recovery.enter_cooldown(
+                super::RenderWakeTicket(ticket),
+                super::RenderFailureStage::NativeFramePending,
+            );
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::SuppressCooldown);
+            assert!(!recovery.mark_retry_ready(super::RenderWakeTicket(1)));
+            assert_eq!(recovery.failed_attempts_since_success, 1);
+        }
+        assert!(recovery.mark_retry_ready(super::RenderWakeTicket(101)));
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        assert!(!recovery.mark_native_frame_ready());
+
+        recovery.record_success();
+        recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+        recovery.enter_cooldown(
+            super::RenderWakeTicket(102),
+            super::RenderFailureStage::NativeFramePending,
+        );
+        assert!(recovery.mark_native_frame_ready());
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        assert_eq!(recovery.failed_attempts_since_success, 0);
+    }
+
+    #[test]
+    fn native_frame_ready_does_not_bypass_backend_or_surface_recovery() {
+        let mut recovery = super::RenderRecoveryState::default();
+        assert!(!recovery.mark_native_frame_ready());
+        for stage in [
+            super::RenderFailureStage::Paint,
+            super::RenderFailureStage::Submission,
+            super::RenderFailureStage::Present,
+            super::RenderFailureStage::BackendFinish,
+            super::RenderFailureStage::SurfaceAcquire(
+                super::webgpu::WebGpuSurfaceTextureError::Timeout,
+            ),
+            super::RenderFailureStage::SurfaceAcquire(
+                super::webgpu::WebGpuSurfaceTextureError::Occluded,
+            ),
+            super::RenderFailureStage::SurfaceAcquire(
+                super::webgpu::WebGpuSurfaceTextureError::Validation,
+            ),
+        ] {
+            recovery.enter_cooldown(super::RenderWakeTicket(1), stage);
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::SuppressCooldown);
+            recovery.park(stage);
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::SuppressParked);
+            recovery.open_circuit(stage);
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::SuppressCircuit);
+        }
+        recovery.park(super::RenderFailureStage::NativeFramePending);
+        assert!(!recovery.mark_native_frame_ready());
+        recovery.open_circuit(super::RenderFailureStage::NativeFramePending);
+        assert!(!recovery.mark_native_frame_ready());
+    }
+
+    #[test]
     fn pending_native_frame_preserves_real_failure_budget_without_opening_circuit() {
         let mut recovery = super::RenderRecoveryState::default();
         recovery.record_failure(super::RenderFailureStage::Paint);
