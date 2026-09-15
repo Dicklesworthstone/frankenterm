@@ -571,6 +571,39 @@ fn test_mux_recovery_e2e_torn_generation_falls_back_to_intact_predecessor() {
 }
 
 #[test]
+fn test_mux_recovery_e2e_repair_pressure_does_not_select_older_generation() {
+    let fixture = Fixture::new();
+    let cx = frankenterm_core::cx::for_request();
+    let (_directory, store) = store();
+    let first = fixture.publish(&cx, &store, None);
+    let first_verified = fixture.current(&cx, &store);
+    let second = fixture.publish(&cx, &store, Some((&first, &first_verified)));
+    let original = std::fs::read(&second.path).unwrap();
+    std::fs::write(&second.path, &original[..original.len() / 2]).unwrap();
+
+    let reopened = SnapshotPublicationStore::open(store.root_path(), Default::default()).unwrap();
+    let verifier = fixture
+        .verifier()
+        .with_admission(Arc::new(RepairAdmissionController::new(
+            0,
+            256 * 1024 * 1024,
+            8192,
+        )));
+    assert!(matches!(
+        select_verified_recovery_roots_with_cx(&cx, &reopened, &verifier),
+        Err(WholeMuxRecoveryError::Repair(
+            RepairError::AdmissionExceeded(_)
+        ))
+    ));
+    // No source bytes change between the refused attempt and this fresh
+    // consumer: available decoder capacity must recover the newest generation.
+    let recovered = fixture.current(&cx, &store);
+    assert_eq!(recovered.generation(), 2);
+    assert_exact_checkpoint_payloads(&fixture, &recovered);
+    assert!(first.path.exists());
+}
+
+#[test]
 fn test_mux_recovery_e2e_production_verifier_repairs_tampered_object_from_disk() {
     let fixture = Fixture::new();
     let cx = frankenterm_core::cx::for_request();

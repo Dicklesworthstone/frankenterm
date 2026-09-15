@@ -7675,6 +7675,12 @@ pub fn select_verified_recovery_roots_with_cx(
                 ) => {
                     return Err(WholeMuxRecoveryError::Cancelled);
                 }
+                Err(error @ WholeMuxRecoveryError::Repair(RepairError::AdmissionExceeded(_)))
+                | Err(
+                    error @ WholeMuxRecoveryError::Publication(PublicationError::Repair(
+                        RepairError::AdmissionExceeded(_),
+                    )),
+                ) => return Err(error),
                 Err(_) => {
                     if diagnostics.len() < store.limits().max_error_records {
                         diagnostics.push(TornRootDiagnostic {

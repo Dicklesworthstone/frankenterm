@@ -2018,6 +2018,9 @@ impl SnapshotPublicationStore {
             }
             Ok(valid)
         };
+        // Drop retained candidate buffers before their reconstruction permits,
+        // including when publication exits early.
+        let mut recovered_candidate_permits = Vec::with_capacity(2);
         let mut candidates = Vec::with_capacity(2);
         for candidate in ordinary_candidates {
             let valid = verify_candidate(&candidate)?;
@@ -2082,7 +2085,7 @@ impl SnapshotPublicationStore {
                             .map_err(|error| RepairError::Storage(error.to_string()))
                     },
                 )?;
-                let _candidate_permit =
+                let candidate_permit =
                     shared_admission_controller().acquire(repaired.reconstructed_envelope.len())?;
                 let recovered =
                     self.decode_recovered_root(discovery.slot, &repaired.reconstructed_envelope)?;
@@ -2102,6 +2105,7 @@ impl SnapshotPublicationStore {
                 if !retain_newer {
                     candidates.retain(|(candidate, _)| candidate.slot != discovery.slot);
                     candidates.push((recovered, true));
+                    recovered_candidate_permits.push(candidate_permit);
                 }
             }
             Self::checkpoint_publication(protection.cx)?;
