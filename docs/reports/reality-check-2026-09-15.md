@@ -148,3 +148,41 @@ journey, followed by an explicitly authorized canary on an existing host.
   retained receipt is `/tmp/ft-native-profile-rch-0912/rc18-primary-comparison4-receipts.json`.
   These are scaled-capture matches, not native-resolution text-quality proof;
   live dragging was excluded and clean-host performance remains unqualified.
+
+## Focused result and admission blocker at 17:29 UTC
+
+Runtime job `30016197441357179` completed successfully on hz4: 14 tests passed
+in 17.95 seconds, with 27,672 filtered out, on exact `747c75cbd`. Both earlier
+intermittent cases passed. Only diagnostics changed; this is not a causal fix
+or a passing rerun of the entire 1,128-test selection.
+
+The formatting attempt on exact `451c39315e341505d444136cd276ca5f8f7f8941`
+was refused before worker execution with exit 103: `RCH-I002`, critical
+pressure, `disk_ratio_below_critical` on hz4. Local fallback was refused.
+The retained log is `/tmp/ft-recovery-wave31-format.log`. No cleanup or pressure
+override was attempted; corrected-source formatting remains unproven.
+
+## Source handoff at 17:42 UTC
+
+Workspace Clippy job `30016197441357178` ultimately failed with 14 library-test
+diagnostics. `6bbf996adb09c8fcd3eb1e19f317f49785fdca86` fixes all 14 in four
+test-bearing files, preserving the mutation cases, repair assertions, and
+deadlines. Scoped rustfmt and whitespace checks passed. Static UBS ran with
+its Cargo categories disabled; displayed fixture panics and the previously
+reviewed guarded `ordinary` expectation do not establish a clean aggregate
+scan. The corrected source has no full Clippy pass yet.
+
+Alternative-worker investigation found vmi1264463 had only 9.2 GiB available
+RAM with active memory pressure. hz3 had ample RAM and 65 GiB free disk, but
+its retained build directory lacked dependency artifacts. One strict RCH
+Clippy request against `6bbf996ad` was refused before execution with exit 103,
+`RCH-I006`, `missing_runtime` (required runtime/toolchain/target unavailable).
+Local fallback was refused; `/tmp/ft-recovery-wave32-workspace-clippy-hz3.log`
+retains the result. No worker cleanup, pressure override, or repair was used.
+
+No root Cargo job remains active. The startup defect remains blocked/open,
+all eight AGY panes are parked, and source reservations were released.
+Independent native work has identified a DPI-zero-divisor and double-position-
+scaling defect; its owner is handling that separate correction. Existing mux
+sessions remain untouched. Full recovery, a release, and native responsiveness
+are still not claimed complete.
