@@ -18479,7 +18479,7 @@ impl Mux {
                         ordered_tab_ids,
                         active_tab_id,
                         active_tab_index,
-                        position: *window.get_initial_position(),
+                        position: window.get_initial_position().clone(),
                         structural_pane_count: window.structural_pane_count(),
                     });
 
