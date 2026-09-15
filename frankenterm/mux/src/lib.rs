@@ -37513,7 +37513,7 @@ mod tests {
                 assert_eq!(count, 2);
                 assert_eq!(max, 1);
             }
-            other => panic!("expected TooManyWindows, got {other:?}"),
+            other => panic!("expected TooManyWindows, got {:?}", other),
         }
     }
 
@@ -37546,16 +37546,26 @@ mod tests {
         tab.split_and_insert(0, req, Arc::clone(&pane_stack_active))
             .expect("split and insert stack active");
 
-        {
-            let mut inner = tab.inner.lock();
-            inner.pane_stacks.insert(
-                0,
-                crate::layout::PaneStack::new(vec![
-                    Arc::clone(&pane_stack_active),
-                    Arc::clone(&pane_stack_hidden),
-                ]),
-            );
-        }
+        tab.split_and_insert(1, req, Arc::clone(&pane_stack_hidden))
+            .expect("insert pane that will become the hidden stack member");
+        assert!(tab.set_active_pane(&pane_tiled));
+        tab.set_layout_cycle(crate::layout::LayoutCycle::new(vec![
+            crate::layout::SwapLayout {
+                name: "capture-two-slots".to_string(),
+                description: None,
+                arrangement: crate::layout::LayoutArrangement::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(crate::layout::LayoutArrangement::Slot { is_main: true }),
+                    second: Box::new(crate::layout::LayoutArrangement::Slot { is_main: false }),
+                },
+            },
+        ]));
+        assert_eq!(
+            tab.swap_to_layout_index(0).as_deref(),
+            Some("capture-two-slots")
+        );
+        assert_eq!(tab.first_nontrivial_stack_slot_index(), Some(1));
 
         let float_rect = FloatingPaneRect {
             left: 5,
@@ -37586,7 +37596,7 @@ mod tests {
         assert_eq!(topology.tabs.len(), 1);
         assert_eq!(topology.tabs[0].pane_stacks.len(), 1);
         let captured_stack = &topology.tabs[0].pane_stacks[0];
-        assert_eq!(captured_stack.slot_index, 0);
+        assert_eq!(captured_stack.slot_index, 1);
         assert_eq!(captured_stack.active_index, 0);
         assert_eq!(captured_stack.pane_ids, vec![502, 503]);
 
@@ -37609,7 +37619,7 @@ mod tests {
         assert_eq!(
             b_stack_active.lane,
             MuxCapturedPaneLane::Stacked {
-                slot_index: 0,
+                slot_index: 1,
                 stack_index: 0,
                 is_active: true,
             }
@@ -37623,7 +37633,7 @@ mod tests {
         assert_eq!(
             b_stack_hidden.lane,
             MuxCapturedPaneLane::Stacked {
-                slot_index: 0,
+                slot_index: 1,
                 stack_index: 1,
                 is_active: false,
             }
@@ -37667,7 +37677,7 @@ mod tests {
             MuxTopologyCaptureError::MissingPaneRegistration(id) => {
                 assert_eq!(id, 999);
             }
-            other => panic!("expected MissingPaneRegistration, got {other:?}"),
+            other => panic!("expected MissingPaneRegistration, got {:?}", other),
         }
     }
 
@@ -37699,7 +37709,7 @@ mod tests {
             MuxTopologyCaptureError::MissingDurablePaneId(id) => {
                 assert_eq!(id, 998);
             }
-            other => panic!("expected MissingDurablePaneId, got {other:?}"),
+            other => panic!("expected MissingDurablePaneId, got {:?}", other),
         }
     }
 
@@ -37731,7 +37741,7 @@ mod tests {
             MuxTopologyCaptureError::NilDurablePaneId(id) => {
                 assert_eq!(id, 997);
             }
-            other => panic!("expected NilDurablePaneId, got {other:?}"),
+            other => panic!("expected NilDurablePaneId, got {:?}", other),
         }
     }
 
