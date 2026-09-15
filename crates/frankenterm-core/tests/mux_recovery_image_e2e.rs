@@ -341,8 +341,27 @@ impl Fixture {
     }
 }
 
+fn private_test_directory() -> tempfile::TempDir {
+    // RCH's TMPDIR can have peer-writable ancestors; the production key
+    // loader correctly rejects that authority even with a private leaf.
+    #[cfg(unix)]
+    let root = std::fs::canonicalize("/tmp").unwrap();
+    #[cfg(not(unix))]
+    let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix(".ft-recovery-e2e-")
+        .tempdir_in(root)
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    directory
+}
+
 fn store() -> (tempfile::TempDir, SnapshotPublicationStore) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = private_test_directory();
     let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
     (directory, store)
 }
@@ -656,10 +675,9 @@ fn assert_fresh_process_recovery(fixture: &Fixture, store: &SnapshotPublicationS
         RecoveryWrapContext, RecoveryWrappingKey, wrap_recovery_key,
     };
     use std::io::{Read, Write};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let artifacts = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::OpenOptionsExt;
+    let artifacts = private_test_directory();
     let directory = artifacts.path().canonicalize().unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let write_private = |name: &str, bytes: &[u8]| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
