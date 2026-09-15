@@ -73,6 +73,38 @@ pub struct WholeMuxPanePublication<'a> {
     pub ack: &'a mux::ModelParserCheckpointAck,
 }
 
+/// Typed failures before or during encrypted whole-mux publication.
+#[cfg(feature = "frankenterm-deps")]
+#[derive(Debug, thiserror::Error)]
+pub enum WholeMuxPublicationError {
+    #[error("{0}")]
+    Validation(&'static str),
+    #[error(transparent)]
+    Context(#[from] SnapshotError),
+    #[error(transparent)]
+    TerminalCheckpoint(
+        #[from] frankenterm_term::terminalstate::checkpoint::TerminalCheckpointError,
+    ),
+    #[error(transparent)]
+    Image(#[from] crate::mux_recovery_image::MuxRecoveryImageError),
+    #[error(transparent)]
+    Representation(#[from] crate::snapshot_representation::RepresentationError),
+    #[error(transparent)]
+    Publication(#[from] crate::snapshot_publication::PublicationError),
+}
+
+#[cfg(feature = "frankenterm-deps")]
+fn validate_whole_mux_publication(
+    valid: bool,
+    message: &'static str,
+) -> Result<(), WholeMuxPublicationError> {
+    if valid {
+        Ok(())
+    } else {
+        Err(WholeMuxPublicationError::Validation(message))
+    }
+}
+
 /// Failures of the bounded model-only mux capture coordinator.
 #[cfg(feature = "frankenterm-deps")]
 #[derive(Debug, thiserror::Error)]
@@ -102,7 +134,7 @@ pub enum WholeMuxCaptureError {
         source: mux::LiveParserCheckpointError,
     },
     #[error("encrypted model publication failed")]
-    Publication(#[source] anyhow::Error),
+    Publication(#[source] WholeMuxPublicationError),
 }
 
 /// Capture actual mux/parser state and publish an encrypted offline model image.
@@ -305,10 +337,7 @@ fn capture_and_publish_whole_mux_model_at_boundary(
             Ok(receipt)
         }
         Err(error) => {
-            if error
-                .downcast_ref::<crate::snapshot_publication::PublicationError>()
-                .is_some()
-            {
+            if matches!(&error, WholeMuxPublicationError::Publication(_)) {
                 // A filesystem error may follow root rename. Do not turn an
                 // unknown durable outcome into permission for another writer.
                 attempt.latch_and_settle();
@@ -338,7 +367,7 @@ pub fn publish_whole_mux_recovery(
     checkpoints: &[WholeMuxPanePublication<'_>],
     key: Arc<crate::snapshot_representation::RecoveryKey>,
     expected: &WholeMuxPublicationIdentity,
-) -> anyhow::Result<crate::snapshot_publication::GenerationPublicationReceipt> {
+) -> Result<crate::snapshot_publication::GenerationPublicationReceipt, WholeMuxPublicationError> {
     use crate::mux_recovery_image::{
         MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
     };
@@ -357,73 +386,78 @@ pub fn publish_whole_mux_recovery(
     };
 
     snapshot_cx_checkpoint(cx)?;
-    anyhow::ensure!(
+    validate_whole_mux_publication(
         hex::encode(captured.session_incarnation.as_bytes()) == expected.mux_incarnation_id,
-        "whole-mux publication identity mismatch"
-    );
-    anyhow::ensure!(
+        "whole-mux publication identity mismatch",
+    )?;
+    validate_whole_mux_publication(
         expected.predecessor.is_some() == expected.predecessor_image_digest.is_some()
             && expected
                 .predecessor
                 .as_ref()
                 .is_none_or(|p| p.expected_generation < expected.generation),
-        "whole-mux publication predecessor mismatch"
-    );
+        "whole-mux publication predecessor mismatch",
+    )?;
     let trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
         .with_session_id(expected.session_id.clone())
         .with_mux_incarnation_id(expected.mux_incarnation_id.clone());
     let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), trusted);
     let repair_key = key.derive_repair_authentication_key()?;
     let repair_namespace = format!("whole-mux-{}", hex::encode(expected.root_object_id));
-    anyhow::ensure!(
+    validate_whole_mux_publication(
         checkpoints.len() == captured.pane_bindings.len()
             && checkpoints.len() <= verifier.limits().max_panes,
-        "whole-mux checkpoint set mismatch or limit exceeded"
-    );
+        "whole-mux checkpoint set mismatch or limit exceeded",
+    )?;
     let mut by_pane = HashMap::new();
     let mut acks = HashMap::new();
     let mut object_ids = HashSet::new();
     let mut total_bytes = 0usize;
     for input in checkpoints {
         snapshot_cx_checkpoint(cx)?;
-        anyhow::ensure!(
+        validate_whole_mux_publication(
             by_pane.insert(input.pane_id, input).is_none()
                 && object_ids.insert(input.object_id)
                 && !input.object_id.is_empty()
                 && input.object_id.len() <= 255,
-            "duplicate or invalid whole-mux checkpoint identity"
-        );
-        anyhow::ensure!(
+            "duplicate or invalid whole-mux checkpoint identity",
+        )?;
+        validate_whole_mux_publication(
             !store.has_object(input.object_id)?,
-            "new whole-mux encryption attempt requires an unused object name"
-        );
+            "new whole-mux encryption attempt requires an unused object name",
+        )?;
         let payload = input.ack.terminal_checkpoint.canonical_payload();
-        total_bytes = total_bytes
-            .checked_add(payload.len())
-            .ok_or_else(|| anyhow::anyhow!("whole-mux checkpoint size overflow"))?;
-        anyhow::ensure!(
+        total_bytes =
+            total_bytes
+                .checked_add(payload.len())
+                .ok_or(WholeMuxPublicationError::Validation(
+                    "whole-mux checkpoint size overflow",
+                ))?;
+        validate_whole_mux_publication(
             payload.len() <= verifier.limits().max_per_pane_checkpoint_bytes
                 && total_bytes <= verifier.limits().max_total_checkpoint_bytes,
-            "whole-mux checkpoint byte limit exceeded"
-        );
+            "whole-mux checkpoint byte limit exceeded",
+        )?;
         let checkpoint = TerminalCheckpointV2::decode_canonical_json(
             payload,
             TerminalCheckpointLimits::default(),
         )?;
-        anyhow::ensure!(
+        validate_whole_mux_publication(
             input.ack.semantic_generation == checkpoint.checkpoint().semantic_generation()
                 && usize::try_from(input.ack.semantic_generation)
                     .is_ok_and(|generation| generation != usize::MAX),
-            "whole-mux checkpoint semantic generation mismatch or exhaustion"
-        );
+            "whole-mux checkpoint semantic generation mismatch or exhaustion",
+        )?;
         acks.insert(input.pane_id, input.ack);
     }
     // Complete identity preflight before the first immutable-object write.
     for pane in &captured.pane_bindings {
         let input = by_pane
             .get(&pane.pane_id)
-            .ok_or_else(|| anyhow::anyhow!("missing whole-mux checkpoint"))?;
-        anyhow::ensure!(
+            .ok_or(WholeMuxPublicationError::Validation(
+                "missing whole-mux checkpoint",
+            ))?;
+        validate_whole_mux_publication(
             pane.pane_uuid == input.ack.durable_pane_id.to_string()
                 && pane.registration_wire_identity == input.ack.registration_wire_identity
                 && input.ack.registration_wire_identity != [0; 16]
@@ -431,8 +465,8 @@ pub fn publish_whole_mux_recovery(
                 && pane.size.cols == input.ack.terminal_checkpoint.cols()
                 && input.ack.parser_stream_bytes
                     == input.ack.terminal_checkpoint.parser_stream_bytes(),
-            "whole-mux checkpoint capture binding mismatch"
-        );
+            "whole-mux checkpoint capture binding mismatch",
+        )?;
     }
     let mut prepared_objects = Vec::new();
     let mut refs = HashMap::new();
@@ -453,14 +487,14 @@ pub fn publish_whole_mux_recovery(
         )?
         .to_bytes()?;
         let payload_digest = representation_id_from_envelope_bytes(&envelope);
-        encrypted_bytes = encrypted_bytes
-            .checked_add(envelope.len())
-            .ok_or_else(|| anyhow::anyhow!("whole-mux encrypted byte size overflow"))?;
-        anyhow::ensure!(
+        encrypted_bytes = encrypted_bytes.checked_add(envelope.len()).ok_or(
+            WholeMuxPublicationError::Validation("whole-mux encrypted byte size overflow"),
+        )?;
+        validate_whole_mux_publication(
             envelope.len() as u64 <= store.limits().max_object_bytes
                 && encrypted_bytes <= verifier.limits().max_total_checkpoint_bytes,
-            "whole-mux encrypted byte limit exceeded"
-        );
+            "whole-mux encrypted byte limit exceeded",
+        )?;
         refs.insert(
             input.pane_id,
             RecoveryObjectRef {
@@ -503,10 +537,10 @@ pub fn publish_whole_mux_recovery(
         None,
     )?
     .to_bytes()?;
-    anyhow::ensure!(
+    validate_whole_mux_publication(
         manifest_bytes.len() as u64 <= store.limits().max_root_manifest_bytes,
-        "whole-mux root envelope byte limit exceeded"
-    );
+        "whole-mux root envelope byte limit exceeded",
+    )?;
     for object in prepared_objects {
         snapshot_cx_checkpoint(cx)?;
         store.publish_repair_protected_object(

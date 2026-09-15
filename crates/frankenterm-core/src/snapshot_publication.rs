@@ -42,10 +42,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
-#[cfg(unix)]
-use cap_std::fs::MetadataExt as _;
 use cap_std::fs::{Dir, File, OpenOptions};
-use fs2::FileExt as _;
+#[cfg(unix)]
+use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -521,7 +520,6 @@ fn check_opened_file_security(file: &File, path: &Path) -> Result<u64, Publicati
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Err(PublicationError::InsecurePermissions {
@@ -567,7 +565,7 @@ pub struct PublicationLock {
 
 impl Drop for PublicationLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -1204,7 +1202,6 @@ impl SnapshotPublicationStore {
 
             #[cfg(unix)]
             {
-                use cap_std::fs::MetadataExt as _;
                 use std::os::unix::fs::MetadataExt as _;
                 if opened_meta.dev() != named_meta.dev() || opened_meta.ino() != named_meta.ino() {
                     // The name changed during acquisition; close the old locked descriptor and retry.
@@ -1679,7 +1676,6 @@ impl SnapshotPublicationStore {
             .map_err(|e| PublicationError::io(&stage_path, e))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
             if stage_named_meta.dev() != stage_fd_meta.dev()
                 || stage_named_meta.ino() != stage_fd_meta.ino()
             {
@@ -2368,7 +2364,6 @@ impl SnapshotPublicationStore {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
             if stage_named_meta.dev() != stage_fd_meta.dev()
                 || stage_named_meta.ino() != stage_fd_meta.ino()
             {
@@ -2400,7 +2395,6 @@ impl SnapshotPublicationStore {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt as _;
             if target_meta.dev() != stage_fd_meta.dev() || target_meta.ino() != stage_fd_meta.ino()
             {
                 return Err(PublicationError::InsecurePermissions {

@@ -6929,6 +6929,10 @@ impl WholeMuxRecoveryVerifier {
             expected_generation,
         );
         let authentication_key = self.recovery_key.derive_repair_authentication_key()?;
+        let admission = match &self.admission {
+            Some(admission) => admission.as_ref(),
+            None => crate::snapshot_repair::shared_admission_controller(),
+        };
         match store.read_repair_descriptor(&expected, authentication_key.as_slice()) {
             Ok(descriptor) => {
                 let repaired = crate::snapshot_repair::decode_repair_object(
@@ -6936,9 +6940,7 @@ impl WholeMuxRecoveryVerifier {
                     &descriptor,
                     &expected,
                     authentication_key.as_slice(),
-                    self.admission
-                        .as_deref()
-                        .unwrap_or_else(crate::snapshot_repair::shared_admission_controller),
+                    admission,
                     crate::snapshot_repair::RepairObjectLimits {
                         max_envelope_bytes,
                         ..crate::snapshot_repair::RepairObjectLimits::default()
@@ -6978,9 +6980,7 @@ impl WholeMuxRecoveryVerifier {
             &bundle.symbols,
             &expected,
             repair_key.as_slice(),
-            self.admission
-                .as_deref()
-                .unwrap_or_else(crate::snapshot_repair::shared_admission_controller),
+            admission,
         )
         .map_err(WholeMuxRecoveryError::Repair)?;
 
