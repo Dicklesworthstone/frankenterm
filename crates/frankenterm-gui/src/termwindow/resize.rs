@@ -730,6 +730,7 @@ impl super::TermWindow {
         self.terminal_size = size;
 
         if grid_size_changed {
+            self.render_recovery_state.note_interactive_layout_change();
             // The same transition already retired coordinate-dependent quads
             // above; record the additional cause without invalidating twice.
             self.record_render_invalidation(RenderInvalidationCause::TerminalGrid);

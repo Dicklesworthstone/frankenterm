@@ -2928,6 +2928,10 @@ impl Default for RenderRecoveryMode {
 #[derive(Debug, Default)]
 struct RenderRecoveryState {
     mode: RenderRecoveryMode,
+    /// A grid change may finish before the first paint observes contention.
+    /// Only that interactive change, not ordinary output, admits a healthy
+    /// renderer's early paint. Successful presentation retires the intent.
+    interactive_layout_pending: bool,
     /// A dependency notification may release one pending-frame attempt early.
     /// Repeated output must not turn contention into an unbounded paint loop.
     native_ready_retry_used: bool,
@@ -3085,22 +3089,28 @@ impl RenderRecoveryState {
         }
     }
 
+    fn note_interactive_layout_change(&mut self) {
+        self.interactive_layout_pending = true;
+    }
+
     fn mark_native_frame_ready(&mut self) -> bool {
-        if self.native_ready_retry_used
-            || !matches!(
-                self.mode,
-                RenderRecoveryMode::Cooldown {
-                    stage: RenderFailureStage::NativeFramePending,
-                    ..
-                }
-            )
-        {
+        if self.native_ready_retry_used {
             return false;
         }
+        match self.mode {
+            RenderRecoveryMode::Healthy if self.interactive_layout_pending => {}
+            RenderRecoveryMode::Cooldown {
+                stage: RenderFailureStage::NativeFramePending,
+                ..
+            } => {
+                self.mode = RenderRecoveryMode::RetryReady {
+                    stage: RenderFailureStage::NativeFramePending,
+                };
+            }
+            _ => return false,
+        }
+        self.interactive_layout_pending = false;
         self.native_ready_retry_used = true;
-        self.mode = RenderRecoveryMode::RetryReady {
-            stage: RenderFailureStage::NativeFramePending,
-        };
         true
     }
 
@@ -3114,6 +3124,7 @@ impl RenderRecoveryState {
 
     fn record_success(&mut self) {
         self.mode = RenderRecoveryMode::Healthy;
+        self.interactive_layout_pending = false;
         self.failed_attempts_since_success = 0;
         self.native_ready_retry_used = false;
     }
@@ -4639,9 +4650,9 @@ impl TermWindow {
                     && self.render_recovery_state.mark_native_frame_ready()
                 {
                     // A resize/cold-read worker can publish a coherent frame
-                    // before the pending-frame timer expires. Paint once on
-                    // this main-thread notification instead of adding both
-                    // the retry delay and the native repaint throttle. The
+                    // before the first paint or pending-frame timer fires.
+                    // Paint once on this main-thread notification instead of
+                    // adding the retry delay and native repaint throttle. The
                     // ordinary paint path still acquires and validates the
                     // exact frame lease, and failure retains its bounded retry.
                     self.render_wake_state.cancel();
@@ -8959,6 +8970,54 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_ready_paints_completed_interactive_layout_before_first_paint() {
+        let mut recovery = super::RenderRecoveryState::default();
+        assert!(
+            !recovery.mark_native_frame_ready(),
+            "ordinary output is throttled"
+        );
+        recovery.note_interactive_layout_change();
+        recovery.note_interactive_layout_change();
+        assert!(recovery.mark_native_frame_ready());
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        assert_eq!(recovery.failed_attempts_since_success, 0);
+
+        // An unrelated visible-pane notification may arrive before the new
+        // layout is ready. It spends the same one-attempt budget, including
+        // across newer intents, rather than adding a second early retry.
+        recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+        recovery.enter_cooldown(
+            super::RenderWakeTicket(1),
+            super::RenderFailureStage::NativeFramePending,
+        );
+        for _ in 0..100 {
+            recovery.note_interactive_layout_change();
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::SuppressCooldown);
+        }
+        assert!(recovery.mark_retry_ready(super::RenderWakeTicket(1)));
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        recovery.record_success();
+        assert!(!recovery.mark_native_frame_ready());
+
+        recovery.note_interactive_layout_change();
+        assert!(recovery.mark_native_frame_ready());
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        recovery.record_success();
+        assert!(!recovery.mark_native_frame_ready());
+    }
+
+    #[test]
+    fn native_frame_ready_retires_interactive_intent_on_ordinary_presentation() {
+        let mut recovery = super::RenderRecoveryState::default();
+        recovery.note_interactive_layout_change();
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+        recovery.record_success();
+        assert!(!recovery.mark_native_frame_ready());
+        assert!(!recovery.native_ready_retry_used);
+    }
+
+    #[test]
     fn native_frame_ready_retries_once_without_resetting_failure_history() {
         let mut recovery = super::RenderRecoveryState::default();
         recovery.record_failure(super::RenderFailureStage::Paint);
@@ -9004,6 +9063,7 @@ mod tests {
     fn native_frame_ready_does_not_bypass_backend_or_surface_recovery() {
         let mut recovery = super::RenderRecoveryState::default();
         assert!(!recovery.mark_native_frame_ready());
+        recovery.note_interactive_layout_change();
         for stage in [
             super::RenderFailureStage::Paint,
             super::RenderFailureStage::Submission,
