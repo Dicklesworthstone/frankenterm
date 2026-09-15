@@ -266,6 +266,14 @@ pub enum DirectMuxError {
     UnexpectedResponse { expected: String, got: String },
     #[error("unexpected aligned response: expected {expected}, got {got}")]
     AlignedUnexpectedResponse { expected: String, got: String },
+    /// Every reply was framed and correlated, but the source changed during
+    /// all bounded snapshot attempts. The stream remains reusable; granting
+    /// the pool another retry budget would make this operation unbounded.
+    #[error("mux text snapshot changed during {phase} after {attempts} attempts")]
+    TextSnapshotChanged {
+        phase: &'static str,
+        attempts: usize,
+    },
     /// A local validation/admission failure proven to occur before the write
     /// boundary. The nested error retains its diagnostic kind while this
     /// wrapper carries the transport-alignment proof.
@@ -2569,9 +2577,10 @@ impl DirectMuxClient {
                                 || current.dimensions != layout.dimensions
                             {
                                 if attempt + 1 == MAX_SNAPSHOT_ATTEMPTS {
-                                    return Err(mux_text_contract_error(
-                                        "source/layout changed during bounded read",
-                                    ));
+                                    return Err(DirectMuxError::TextSnapshotChanged {
+                                        phase: "chunk_layout",
+                                        attempts: MAX_SNAPSHOT_ATTEMPTS,
+                                    });
                                 }
                                 crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
                                     .await
@@ -2637,9 +2646,10 @@ impl DirectMuxClient {
                     .map_err(|error| cancelled_mux_error("text_snapshot_backoff", error))?;
             }
         }
-        Err(mux_text_contract_error(
-            "source/layout changed during bounded read",
-        ))
+        Err(DirectMuxError::TextSnapshotChanged {
+            phase: "final_source",
+            attempts: MAX_SNAPSHOT_ATTEMPTS,
+        })
     }
 
     /// Fetch OSC 133 semantic zones from a pane through the native mux protocol.
@@ -6996,7 +7006,10 @@ mod tests {
                 } else {
                     assert!(matches!(
                         error,
-                        DirectMuxError::AlignedUnexpectedResponse { .. }
+                        DirectMuxError::TextSnapshotChanged {
+                            phase: "final_source",
+                            attempts: 3,
+                        }
                     ));
                     assert_eq!(
                         *counts.lock().unwrap(),
@@ -7233,6 +7246,78 @@ mod tests {
                     stats.recovery_successes, 0,
                     "a settled rejection is not a successful recovered operation"
                 );
+                pool.clear_with_cx(&cx).await.unwrap();
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_snapshot_churn_is_bounded_and_reuses_the_pool_connection() {
+        for rejected_chunk in [false, true] {
+            run_async_test(async move {
+                use crate::vendored::mux_pool::{MuxPool, MuxPoolConfig, MuxPoolError};
+                let cx = crate::cx::for_testing();
+                let counts = Arc::new(StdMutex::new((0usize, 0usize)));
+                let seen = Arc::clone(&counts);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => {
+                            let mut count = seen.lock().unwrap();
+                            count.0 += 1;
+                            // Three changing attempts, then one stable source
+                            // for a separate caller-initiated transaction.
+                            text_read_state(count.0.min(7), 0, 3)
+                        }
+                        Pdu::GetLinesAtLayout(request) => {
+                            let mut count = seen.lock().unwrap();
+                            count.1 += 1;
+                            if rejected_chunk && count.0 < 7 {
+                                Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            } else {
+                                text_read_reply(request, "settled")
+                            }
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let pool = MuxPool::new(MuxPoolConfig {
+                    mux: direct_mux_client_config(path),
+                    ..Default::default()
+                });
+                let error = pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                let expected_phase = if rejected_chunk {
+                    "chunk_layout"
+                } else {
+                    "final_source"
+                };
+                assert!(matches!(
+                    error,
+                    MuxPoolError::Mux(DirectMuxError::TextSnapshotChanged {
+                        phase,
+                        attempts: 3,
+                    }) if phase == expected_phase
+                ));
+                assert_eq!(*counts.lock().unwrap(), (6, 3));
+                let stats = pool.stats_with_cx(&cx).await.unwrap();
+                assert_eq!(stats.recovery_attempts, 0, "no second retry budget");
+                assert_eq!(stats.connections_created, 1);
+                assert_eq!(stats.pool.total_acquired, 1);
+
+                assert_eq!(
+                    pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
+                    MuxTextReadResult::Text(text_read_expected(0..3, "settled"))
+                );
+                assert_eq!(*counts.lock().unwrap(), (8, 4));
+                let stats = pool.stats_with_cx(&cx).await.unwrap();
+                assert_eq!(stats.connections_created, 1, "aligned stream stays usable");
+                assert_eq!(stats.pool.total_acquired, 2);
                 pool.clear_with_cx(&cx).await.unwrap();
                 timeout(Duration::from_secs(5), server)
                     .await

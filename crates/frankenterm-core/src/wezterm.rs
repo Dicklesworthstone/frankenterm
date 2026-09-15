@@ -3295,6 +3295,7 @@ impl WeztermClient {
             crate::vendored::DirectMuxError::RemoteRejection(_)
                 | crate::vendored::DirectMuxError::RemoteRejectionRequestMismatch { .. }
                 | crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. }
+                | crate::vendored::DirectMuxError::TextSnapshotChanged { .. }
         )
     }
 
@@ -3335,6 +3336,9 @@ impl WeztermClient {
             crate::vendored::MuxPoolError::Mux(
                 crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. },
             ) => "mux_authoritative_response_mismatch",
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::TextSnapshotChanged { .. },
+            ) => "mux_text_snapshot_changed",
             crate::vendored::MuxPoolError::Mux(
                 crate::vendored::DirectMuxError::IncompatibleCodec { .. },
             ) => "mux_codec_version_skew",
@@ -7147,6 +7151,16 @@ mod tests {
             got: "PaneResponse".to_string(),
         });
         assert_mux_recovery_axes(&aligned, MuxCircuitEvidence::SuccessfulResponse, false);
+
+        let changed = MuxPoolError::Mux(DirectMuxError::TextSnapshotChanged {
+            phase: "final_source",
+            attempts: 3,
+        });
+        assert_mux_recovery_axes(&changed, MuxCircuitEvidence::SuccessfulResponse, false);
+        assert_eq!(
+            WeztermClient::mux_error_public_code(&changed),
+            "mux_text_snapshot_changed"
+        );
 
         let prewrite = MuxPoolError::Mux(DirectMuxError::ProvenPreWriteRejection(Box::new(
             DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(

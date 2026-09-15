@@ -438,6 +438,16 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
             cancelled: false,
         },
 
+        // A live source can change while all wire replies remain valid. Its
+        // whole-snapshot retry budget is already spent; keep the connection
+        // without replaying the transaction or treating it as a protocol fault.
+        DirectMuxError::TextSnapshotChanged { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        },
+
         DirectMuxError::Disconnected
         | DirectMuxError::UnexpectedResponse { .. }
         | DirectMuxError::Codec(_)
@@ -1406,6 +1416,18 @@ mod tests {
                     got: "UnitResponse".to_string(),
                 },
                 recoverable_no_replay,
+            ),
+            (
+                DirectMuxError::TextSnapshotChanged {
+                    phase: "final_source",
+                    attempts: 3,
+                },
+                MuxRecoveryDecision {
+                    kind: ProtocolErrorKind::Transient,
+                    retry: false,
+                    connection: Reuse,
+                    cancelled: false,
+                },
             ),
             (
                 DirectMuxError::IncompatibleCodec {
