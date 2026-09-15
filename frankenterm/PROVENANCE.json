@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 43,
-        "fix": 45,
+        "fix": 46,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 14
       },
-      "fork_side_commit_count": 136,
+      "fork_side_commit_count": 137,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-15T16:09:24-04:00",
-        "sha": "d8a259a6e90c3e477fbc38b162bc951b74dc5ad4",
-        "subject": "fix(config): reload only for watched configuration dependencies"
+        "committed_at": "2026-09-15T17:55:46-04:00",
+        "sha": "a736fcd95a9ac8d38059acb8ec4c097240bea92a",
+        "subject": "fix(gui): preserve window size during font zoom by default"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 27,
         "docs": 6,
-        "feat": 189,
+        "feat": 190,
         "fix": 221,
         "other": 43,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 83
+        "test": 85
       },
-      "fork_side_commit_count": 604,
+      "fork_side_commit_count": 607,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-15T15:08:34-04:00",
-        "sha": "921917dff7186a4bc617c000998bd4658c69050b",
-        "subject": "fix(mux): wake the GUI after primary resize completion"
+        "classification": "test",
+        "committed_at": "2026-09-15T19:11:25-04:00",
+        "sha": "097696a9b02cd6ffe799773e61a3f038d7f95e88",
+        "subject": "test(guardian): preserve consuming chunks and freeze Genesis staging authority"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 37,
+        "fix": 41,
         "other": 29,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 21
       },
-      "fork_side_commit_count": 117,
+      "fork_side_commit_count": 121,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T21:09:53-04:00",
-        "sha": "6d0a416af62e2404358b26ad9a5368813b97dee1",
-        "subject": "fix(mux): fence actual semantic row mutations during rendering"
+        "committed_at": "2026-09-15T19:04:26-04:00",
+        "sha": "187bebc9d6bc66b01dab1c0d6236eedc1f08e777",
+        "subject": "fix(surface): use available row space before overwide words"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 55,
-        "fix": 105,
+        "fix": 108,
         "other": 54,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 55
+        "test": 57
       },
-      "fork_side_commit_count": 302,
+      "fork_side_commit_count": 307,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-14T23:20:16-04:00",
-        "sha": "f5f68e9f6f1714105e2ac64395c0d7f7168a5a83",
-        "subject": "fix(term): preserve checkpoint generation when activation fails"
+        "classification": "test",
+        "committed_at": "2026-09-15T19:08:10-04:00",
+        "sha": "61c2d77bacd14807d8f87e232ce0677ce874fcb8",
+        "subject": "test(term): import checked cursor conversion for Rust 2018"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2638,
-  "generated_at": "2026-09-15T20:48:15.565323Z",
+  "fork_side_commit_total": 2651,
+  "generated_at": "2026-09-15T23:15:56.799146Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
