@@ -6091,7 +6091,9 @@ mod tests {
         let anchor = pane
             .capture_selection_anchor(floor, frame.source_sequence, dimensions, points)
             .unwrap();
-        frame.lines[0].set_appdata(Arc::new(42u32));
+        // Line retains a weak cache reference; the renderer owns the payload.
+        let metadata = Arc::new(42u32);
+        frame.lines[0].set_appdata(Arc::clone(&metadata));
         pane.publish_render_frame_appdata(&frame);
 
         // A real first-scan edit advances the source once. Repeated painting
@@ -6358,15 +6360,21 @@ mod tests {
             .unwrap();
         let mut payload: serde_json::Value =
             serde_json::from_slice(checkpoint.canonical_payload()).unwrap();
-        payload["seqno"] = serde_json::json!(SequenceNo::MAX - 2);
+        payload["seqno"] = serde_json::json!(SequenceNo::MAX - 3);
         let checkpoint: TerminalCheckpointV2 = serde_json::from_value(payload).unwrap();
         let encoded = checkpoint.to_canonical_json(limits).unwrap();
-        let mut term = TerminalCheckpointV2::decode_canonical_json(&encoded, limits)
+        let inert = TerminalCheckpointV2::decode_canonical_json(&encoded, limits)
             .unwrap()
             .restore_inert(Arc::new(GuardianLifetimeTestTermConfig))
-            .unwrap()
-            .into_live(Box::new(Vec::<u8>::new()))
             .unwrap();
+        assert_eq!(
+            serde_json::to_value(inert.checkpoint().unwrap()).unwrap()["seqno"],
+            serde_json::json!(SequenceNo::MAX - 3)
+        );
+        // Activation itself invalidates the replay source. Reserve that step
+        // before exercising resize and the final publication boundary.
+        let mut term = inert.into_live(Box::new(Vec::<u8>::new())).unwrap();
+        assert_eq!(term.current_seqno(), SequenceNo::MAX - 2);
         let observation = Mutex::new(None);
         assert_eq!(
             LocalPane::refresh_line_layout_floor(&observation, &mut term),
