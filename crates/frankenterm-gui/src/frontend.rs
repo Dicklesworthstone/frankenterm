@@ -25,6 +25,30 @@ use wezterm_term::{Alert, ClipboardSelection};
 const MAX_RECONCILE_WAITERS: usize = 4_096;
 const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+/// Close only the newly allocated native view if initialization does not hand
+/// it to the frontend. The cleanup captures the exact platform window handle.
+pub(crate) struct PendingNativeWindow<F: FnOnce()> {
+    close: Option<F>,
+}
+
+impl<F: FnOnce()> PendingNativeWindow<F> {
+    pub(crate) fn new(close: F) -> Self {
+        Self { close: Some(close) }
+    }
+
+    pub(crate) fn publish(mut self) {
+        drop(self.close.take());
+    }
+}
+
+impl<F: FnOnce()> Drop for PendingNativeWindow<F> {
+    fn drop(&mut self) {
+        if let Some(close) = self.close.take() {
+            close();
+        }
+    }
+}
+
 /// Owns only a pending native view, never the sessions behind that view.
 /// Cancellation and errors release exactly this attempt's registration.
 struct PendingWindowCreation {
@@ -1035,6 +1059,45 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn pending_native_window_closes_only_unpublished_views() {
+        use super::PendingNativeWindow;
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::rc::Rc;
+        use std::task::{Context, Poll};
+
+        let closed = Rc::new(Cell::new(0));
+        let count = Rc::clone(&closed);
+        let failed = PendingNativeWindow::new(move || count.set(count.get() + 1));
+        let mut failure = Box::pin(async move {
+            let _view = failed;
+            Err::<(), _>(anyhow::anyhow!("post-allocation renderer failure"))
+        });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            failure.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        drop(failure);
+        assert_eq!(closed.get(), 1);
+
+        let count = Rc::clone(&closed);
+        let cancelled = PendingNativeWindow::new(move || count.set(count.get() + 1));
+        let mut initialization = Box::pin(async move {
+            let _view = cancelled;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(initialization.as_mut().poll(&mut cx), Poll::Pending);
+        drop(initialization);
+        assert_eq!(closed.get(), 2);
+
+        let count = Rc::clone(&closed);
+        PendingNativeWindow::new(move || count.set(count.get() + 1)).publish();
+        assert_eq!(closed.get(), 2, "published views must remain open");
+    }
 
     #[test]
     fn pending_workspace_reconcile_cancellation_releases_gate_and_all_waiters() {

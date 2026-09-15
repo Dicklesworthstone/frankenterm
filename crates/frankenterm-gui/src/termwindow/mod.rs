@@ -3269,6 +3269,7 @@ impl TermWindow {
         saved_workspace: String,
         saved_window_state: Option<crate::window_state_persist::PersistedWindowState>,
     ) -> anyhow::Result<()> {
+        let front_end = try_front_end().context("native window creation requires a frontend")?;
         let config = config_with_accessibility_palette(configuration());
         let dpi = config.dpi.unwrap_or_else(::window::default_dpi) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
@@ -3563,6 +3564,10 @@ impl TermWindow {
             },
         )
         .await?;
+        let pending_native = crate::frontend::PendingNativeWindow::new({
+            let window = window.clone();
+            move || window.close()
+        });
         tw.borrow_mut().window.replace(window.clone());
 
         Self::apply_icon(&window)?;
@@ -3582,14 +3587,22 @@ impl TermWindow {
             _ => Some(window.enable_opengl().await?),
         };
 
+        // Renderer initialization yields to native callbacks. Keep the
+        // TermWindow RefCell unborrowed so resize/config events can run.
+        let webgpu = match config.front_end {
+            FrontEndSelection::WebGpu => Some(Rc::new(
+                WebGpuState::new(&window, dimensions, &config).await?,
+            )),
+            _ => None,
+        };
+        ensure!(
+            try_front_end().is_some_and(|current| Rc::ptr_eq(&current, &front_end))
+                && Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &mux))
+                && mux.get_window(mux_window_id).is_some(),
+            "native window owner retired during renderer initialization"
+        );
         {
             let mut myself = tw.borrow_mut();
-            let webgpu = match config.front_end {
-                FrontEndSelection::WebGpu => Some(Rc::new(
-                    WebGpuState::new(&window, dimensions, &config).await?,
-                )),
-                _ => None,
-            };
             myself.config_subscription.replace(config_subscription);
             if config.use_resize_increments {
                 window.set_resize_increments(
@@ -3655,9 +3668,8 @@ impl TermWindow {
         }
 
         crate::update::start_update_checker();
-        if let Some(front_end) = try_front_end() {
-            front_end.record_known_window(window, mux_window_id);
-        }
+        front_end.record_known_window(window, mux_window_id);
+        pending_native.publish();
 
         Ok(())
     }
