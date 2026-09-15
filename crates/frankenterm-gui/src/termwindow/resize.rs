@@ -409,17 +409,38 @@ impl super::TermWindow {
             match self.pending_scale_changes.pop_front() {
                 Some(ScaleChange::Relative(change)) => {
                     if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
-                        self.adjust_font_scale(self.fonts.get_font_scale() * change, &window);
+                        self.profile_native_scale_stage("font_command", |this| {
+                            this.adjust_font_scale(this.fonts.get_font_scale() * change, &window);
+                        });
                     }
                 }
                 Some(ScaleChange::Absolute(change)) => {
                     if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
-                        self.adjust_font_scale(change, &window);
+                        self.profile_native_scale_stage("font_command", |this| {
+                            this.adjust_font_scale(change, &window);
+                        });
                     }
                 }
                 None => break,
             }
         }
+    }
+
+    /// Attribute font-command work on the same Mach clock as native submission.
+    /// Disabled by default; these brackets measure host work, not visible pixels.
+    fn profile_native_scale_stage<T>(
+        &mut self,
+        stage: &'static str,
+        work: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if log::log_enabled!(
+            target: "frankenterm_gui::native_present_stages",
+            log::Level::Debug
+        ) && let Some(webgpu) = self.webgpu.as_ref().cloned()
+        {
+            return webgpu.profile_native_stage(stage, || work(self));
+        }
+        work(self)
     }
 
     /// Returns whether the new metrics were installed. Optional glyph warmup
@@ -440,8 +461,12 @@ impl super::TermWindow {
             return false;
         }
 
-        let (prior_font, prior_dpi) = self.fonts.change_scaling(font_scale, dimensions.dpi);
-        let scale_applied = match RenderMetrics::new(&self.fonts) {
+        let (prior_font, prior_dpi) = self.profile_native_scale_stage("font_select", |this| {
+            this.fonts.change_scaling(font_scale, dimensions.dpi)
+        });
+        let metrics =
+            self.profile_native_scale_stage("font_metrics", |this| RenderMetrics::new(&this.fonts));
+        let scale_applied = match metrics {
             Ok(metrics) => {
                 self.render_metrics = metrics;
                 // Invalidate the shape cache: shaped runs cache per-glyph
@@ -516,11 +541,13 @@ impl super::TermWindow {
     /// Metrics, shaping generations and stale glyph eviction are already updated.
     /// Unwarmed glyphs continue through the identical lazy rasterization path.
     pub(super) fn warm_scale_change_glyphs(&mut self) {
-        if let Some(render_state) = self.render_state.as_ref() {
-            let mut glyph_cache = render_state.glyph_cache.borrow_mut();
-            let _warm = glyph_cache
-                .warm_up_default_glyphs(&self.render_metrics, SCALE_CHANGE_GLYPH_WARMUP_BUDGET);
-        }
+        self.profile_native_scale_stage("font_warmup", |this| {
+            if let Some(render_state) = this.render_state.as_ref() {
+                let mut glyph_cache = render_state.glyph_cache.borrow_mut();
+                let _warm = glyph_cache
+                    .warm_up_default_glyphs(&this.render_metrics, SCALE_CHANGE_GLYPH_WARMUP_BUDGET);
+            }
+        });
     }
 
     pub fn apply_dimensions(
@@ -837,7 +864,9 @@ impl super::TermWindow {
             "scaling_changed, follow with applying dimensions. scale_changed_cells={:?}",
             scale_changed_cells
         );
-        self.apply_dimensions(&dimensions, scale_changed_cells, window);
+        self.profile_native_scale_stage("scale_dimensions", |this| {
+            this.apply_dimensions(&dimensions, scale_changed_cells, window);
+        });
         if scale_applied {
             self.warm_scale_change_glyphs();
         }
@@ -867,7 +896,9 @@ impl super::TermWindow {
             // Compute new font metrics
             let scale_applied = self.apply_scale_change(&dimensions, font_scale);
             // Now revise the pty size to fit the window
-            self.apply_dimensions(&dimensions, None, window);
+            self.profile_native_scale_stage("scale_dimensions", |this| {
+                this.apply_dimensions(&dimensions, None, window);
+            });
             if scale_applied {
                 self.warm_scale_change_glyphs();
             }
