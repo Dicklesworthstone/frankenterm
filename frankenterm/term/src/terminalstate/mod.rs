@@ -3584,7 +3584,7 @@ mod tests {
     fn semantic_generation_rejects_config_focus_and_mouse_aba() {
         let (mut terminal, _output) = terminal_state_with_capture(false);
         let initial_config = terminal.get_config();
-        let original_version = terminal.unicode_version;
+        let original_version = terminal.unicode_version.clone();
         let before_config = terminal.current_seqno();
         terminal.set_config(Arc::new(TestTermConfig {
             kitty_budget: 2048,

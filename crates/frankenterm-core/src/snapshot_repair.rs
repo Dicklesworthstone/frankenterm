@@ -2997,7 +2997,7 @@ mod tests {
     #[test]
     fn test_caller_cancellation() {
         let cx = test_cx();
-        cx.cancel(); // Pre-cancel context
+        cx.cancel_fast(crate::outcome::CancelKind::User);
         let admission = RepairAdmissionController::default_production();
         let payload = sample_envelope(5_000);
         let obj_id = sample_object_id(14);
@@ -3308,8 +3308,8 @@ mod tests {
 
     #[test]
     fn test_decode_cancellation_fails_closed() {
-        let mut cx = test_cx();
-        cx.cancel(); // Pre-cancel context
+        let cx = test_cx();
+        cx.cancel_fast(crate::outcome::CancelKind::User);
         let admission = RepairAdmissionController::default_production();
         let payload = sample_envelope(4000);
         let obj_id = sample_object_id(21);

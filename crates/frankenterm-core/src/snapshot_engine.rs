@@ -12781,7 +12781,7 @@ mod tests {
     fn model_mux_capture_serializes_and_releases_prepublication_authority() {
         let mux = mux::Mux::new(None);
         let topology = mux.capture_topology_coherent(Default::default()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = checkpoint_artifact_test_directory();
         let store = crate::snapshot_publication::SnapshotPublicationStore::open(
             directory.path(),
             Default::default(),
@@ -12925,7 +12925,7 @@ mod tests {
         wait_title("A");
         let topology = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(topology.pane_bindings.len(), 1);
-        let directory = tempfile::tempdir().unwrap();
+        let directory = checkpoint_artifact_test_directory();
         let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
         let key = Arc::new(RecoveryKey::from_bytes([31; 32]).unwrap());
         let expected = WholeMuxPublicationIdentity {
@@ -13193,7 +13193,7 @@ mod tests {
             predecessor: None,
             predecessor_image_digest: None,
         };
-        let temp = tempfile::tempdir().unwrap();
+        let temp = checkpoint_artifact_test_directory();
         let store = SnapshotPublicationStore::open(temp.path(), Default::default()).unwrap();
         let key = Arc::new(RecoveryKey::from_bytes([7; 32]).unwrap());
         let cx = crate::cx::Cx::for_testing();

@@ -37574,6 +37574,8 @@ mod tests {
         );
         assert_eq!(tab.first_nontrivial_stack_slot_index(), Some(1));
 
+        mux.add_tab_to_window(&tab, window_id).expect("attach tab");
+
         let float_rect = FloatingPaneRect {
             left: 5,
             top: 5,
@@ -37582,8 +37584,6 @@ mod tests {
         };
         tab.add_floating_pane(Arc::clone(&pane_floating), float_rect)
             .expect("add floating pane");
-
-        mux.add_tab_to_window(&tab, window_id).expect("attach tab");
 
         let client_id = Arc::new(ClientId::new());
         mux.register_client(Arc::clone(&client_id));

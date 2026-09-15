@@ -2207,7 +2207,7 @@ mod tests {
         let metadata = sample_metadata(15, 1);
         let enc = encode_recovery_object(payload, metadata, &key, None).unwrap();
 
-        let mut canonical_wire = enc.to_bytes().unwrap();
+        let canonical_wire = enc.to_bytes().unwrap();
         let header_len = u32::from_be_bytes([
             canonical_wire[12],
             canonical_wire[13],
@@ -2233,7 +2233,7 @@ mod tests {
 
         let err = EncryptedRecoveryObject::from_bytes(&non_canonical_wire).unwrap_err();
         assert!(
-            matches!(err, RepresentationError::MalformedRepresentation { reason } if reason.contains("non-canonical header JSON")),
+            matches!(err, RepresentationError::MalformedRepresentation { ref reason } if reason.contains("non-canonical header JSON")),
             "expected non-canonical header JSON rejection, got {:?}",
             err
         );

@@ -5773,10 +5773,6 @@ mod tests {
             }
         }
 
-        fn add_row(&self, row: StableRowIndex, line: Line) {
-            self.rows.lock().unwrap().push((row, line));
-        }
-
         fn advance_identity(&self) {
             *self.identity.lock().unwrap() = crate::config::ScrollbackIntervalIdentity::default();
         }
@@ -5867,6 +5863,13 @@ mod tests {
         {
             Err(crate::config::ScrollbackSpillError::StorageUnavailable)
         }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<crate::config::ScrollbackClearCommit, crate::config::ScrollbackSpillError>
+        {
+            Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+        }
     }
 
     #[derive(Debug)]
@@ -5875,6 +5878,10 @@ mod tests {
     }
 
     impl TerminalConfiguration for StagedCaptureTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
         fn scrollback_size(&self) -> usize {
             1000
         }
@@ -5895,14 +5902,6 @@ mod tests {
     #[test]
     fn test_two_phase_staged_hot_capture_and_cold_materialization() {
         let sink = Arc::new(StagedCaptureTestSink::new());
-        let line0 = Line::from_text("cold row 0", &CellAttributes::blank(), 1, None);
-        sink.add_row(0, line0);
-
-        let mut bold_attr = CellAttributes::blank();
-        bold_attr.set_intensity(crate::color::Intensity::Bold);
-        let line1 = Line::from_text("cold row 1 bold", &bold_attr, 1, None);
-        sink.add_row(1, line1);
-
         let config: Arc<dyn TerminalConfiguration> = Arc::new(StagedCaptureTestConfig {
             sink: Arc::clone(&sink),
         });
@@ -5921,10 +5920,17 @@ mod tests {
             Box::new(Vec::<u8>::new()),
         );
 
-        terminal.screen.screen.stable_row_index_offset = 2;
+        terminal.advance_bytes(b"cold row 0\r\n");
+        terminal.advance_bytes(b"\x1b[1mcold row 1 bold\x1b[0m\r\n");
+        for i in 2..15 {
+            terminal.advance_bytes(format!("resident row {i}\r\n").as_bytes());
+        }
         terminal.advance_bytes("\x1b[1;31mHello \u{1F980}\x1b[0m\r\n".as_bytes());
         terminal.advance_bytes("\x1b[?2004h".as_bytes());
-        terminal.cursor = CursorPosition { x: 5, y: 3 };
+        terminal.advance_bytes(b"\x1b[4;6H");
+
+        assert_eq!(terminal.screen().phys_to_stable_row_index(0), 2);
+        assert_eq!(sink.rows.lock().unwrap().len(), 2);
 
         let limits = TerminalCheckpointLimits::default();
 
@@ -5964,22 +5970,30 @@ mod tests {
     #[test]
     fn test_two_phase_staged_capture_rejects_stale_cold_generation() {
         let sink = Arc::new(StagedCaptureTestSink::new());
-        let line0 = Line::from_text("cold row", &CellAttributes::blank(), 1, None);
-        sink.add_row(0, line0);
-
         let config: Arc<dyn TerminalConfiguration> = Arc::new(StagedCaptureTestConfig {
             sink: Arc::clone(&sink),
         });
 
         let mut terminal = Terminal::new(
-            TerminalSize::default(),
+            TerminalSize {
+                rows: 10,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
             config,
             "FrankenTerm",
             "stale-gen-test",
             Box::new(Vec::<u8>::new()),
         );
-        terminal.screen.screen.stable_row_index_offset = 1;
-        terminal.advance_bytes("resident\r\n".as_bytes());
+        terminal.advance_bytes(b"cold row\r\n");
+        for i in 1..15 {
+            terminal.advance_bytes(format!("resident row {i}\r\n").as_bytes());
+        }
+
+        assert_eq!(terminal.screen().phys_to_stable_row_index(0), 1);
+        assert_eq!(sink.rows.lock().unwrap().len(), 1);
 
         let limits = TerminalCheckpointLimits::default();
 

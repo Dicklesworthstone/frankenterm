@@ -3176,6 +3176,7 @@ mod converter_tests {
         acks.iter().map(|(&pane_id, ack)| (pane_id, ack)).collect()
     }
 
+    #[derive(Debug)]
     struct TestConfig;
     impl TerminalConfiguration for TestConfig {
         fn color_palette(&self) -> ColorPalette {

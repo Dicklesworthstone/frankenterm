@@ -52,14 +52,12 @@ use crate::mux_recovery_image::{
 #[cfg(test)]
 use crate::mux_recovery_image::{
     MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION, PaneCheckpointBinding,
-    ParserCaptureIdentity, RecoveryDomain, RecoveryFloatingPane, RecoveryObjectRef,
-    RecoverySplitNode, RecoveryTab, RecoveryWindow, SplitDirection as MuxSplitDirection,
-    SplitDirectionAndSize, TerminalSize,
+    ParserCaptureIdentity, RecoveryDomain, RecoveryObjectRef, RecoverySplitNode, RecoveryTab,
+    RecoveryWindow, SplitDirectionAndSize, TerminalSize,
 };
 #[cfg(test)]
 use crate::snapshot_publication::{
-    GenerationRootPublishRequest, PredecessorBinding, RecoveryObjectPayload, RootSlot,
-    TornRootDiagnostic, sha256_hex,
+    GenerationRootPublishRequest, PredecessorBinding, RecoveryObjectPayload, RootSlot, sha256_hex,
 };
 use crate::snapshot_publication::{
     PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
@@ -13407,14 +13405,32 @@ mod tests {
         );
         term.advance_bytes(text);
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&term, limits)
+        let recovery_checkpoint = term
+            .capture_recovery_checkpoint(limits)
             .expect("capture test checkpoint");
-        let canonical_bytes = checkpoint
-            .to_canonical_json(limits)
-            .expect("canonical json encoding")
-            .to_vec();
+        let canonical_bytes = recovery_checkpoint.canonical_payload().to_vec();
         let digest: [u8; 32] = Sha256::digest(&canonical_bytes).into();
         (canonical_bytes, digest)
+    }
+
+    fn private_test_directory() -> tempfile::TempDir {
+        // RCH's TMPDIR can have peer-writable ancestors; the production key
+        // loader correctly rejects that authority even with a private leaf.
+        #[cfg(unix)]
+        let root = std::fs::canonicalize("/tmp").unwrap();
+        #[cfg(not(unix))]
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(".ft-recovery-whole-mux-")
+            .tempdir_in(root)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        directory
     }
 
     fn whole_mux_test_key() -> Arc<RecoveryKey> {
@@ -13471,7 +13487,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_roundtrip_offline_layout() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -13540,7 +13556,7 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-100".to_string(),
-                    registration_generation: [1; 16],
+                    registration_wire_identity: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 512,
                         segment_id: None,
@@ -13570,7 +13586,7 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-101".to_string(),
-                    registration_generation: [1; 16],
+                    registration_wire_identity: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 1024,
                         segment_id: None,
@@ -13727,14 +13743,36 @@ mod tests {
         assert_eq!(p1.cols, 80);
         assert_eq!(p1.tab_id, 10);
         assert_eq!(p1.domain_id, 1);
-        assert!(p1.terminal.writer_is_inert_for_test());
+        let p1_recaptured = p1
+            .terminal
+            .checkpoint()
+            .expect("recapture p1 checkpoint")
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .expect("encode p1 canonical json")
+            .to_vec();
+        assert_eq!(
+            p1_recaptured.as_slice(),
+            validated.checkpoint_payload("obj-pane-100").unwrap(),
+            "recaptured inert terminal checkpoint for pane 100 must match verified payload"
+        );
 
         let p2 = &reconstructed.pane_terminals[&101];
         assert_eq!(p2.rows, 30);
         assert_eq!(p2.cols, 100);
         assert_eq!(p2.tab_id, 10);
         assert_eq!(p2.domain_id, 1);
-        assert!(p2.terminal.writer_is_inert_for_test());
+        let p2_recaptured = p2
+            .terminal
+            .checkpoint()
+            .expect("recapture p2 checkpoint")
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .expect("encode p2 canonical json")
+            .to_vec();
+        assert_eq!(
+            p2_recaptured.as_slice(),
+            validated.checkpoint_payload("obj-pane-101").unwrap(),
+            "recaptured inert terminal checkpoint for pane 101 must match verified payload"
+        );
 
         assert_eq!(validated.image().header.generation, 1);
         assert_eq!(validated.generation(), 1);
@@ -13746,7 +13784,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_terminal_state_restored() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -13795,7 +13833,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-42".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -13889,7 +13927,6 @@ mod tests {
         assert_eq!(pt.cols, 80);
         assert_eq!(pt.tab_id, 1);
         assert_eq!(pt.domain_id, 1);
-        assert!(pt.terminal.writer_is_inert_for_test());
 
         let recaptured = pt
             .terminal
@@ -13900,7 +13937,8 @@ mod tests {
             .to_vec();
 
         assert_eq!(
-            recaptured, plaintext,
+            recaptured.as_slice(),
+            validated.checkpoint_payload("obj-single-pane").unwrap(),
             "recaptured canonical terminal checkpoint must match original bytes"
         );
     }
@@ -13908,7 +13946,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_root_selection_predecessor_fallback() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -13955,7 +13993,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -14059,7 +14097,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [2; 16],
+                registration_wire_identity: [2; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 200,
                     segment_id: None,
@@ -14154,7 +14192,7 @@ mod tests {
 
     #[test]
     fn test_whole_mux_recovery_rejects_corrupted_header_or_version() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -14254,7 +14292,7 @@ mod tests {
 
     #[test]
     fn test_whole_mux_recovery_rejects_missing_checkpoint_object() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -14290,7 +14328,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -14377,7 +14415,7 @@ mod tests {
 
     #[test]
     fn test_whole_mux_recovery_rejects_tampered_checkpoint_object() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -14429,7 +14467,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -14577,7 +14615,7 @@ mod tests {
 
     #[test]
     fn test_whole_mux_recovery_rejects_fake_guardian_authority() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -14614,7 +14652,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-99".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 0,
                     segment_id: Some(1),
@@ -14703,7 +14741,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_multiple_nonzero_tab_and_domain_ids() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -14772,7 +14810,7 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-10".to_string(),
-                    registration_generation: [1; 16],
+                    registration_wire_identity: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 256,
                         segment_id: None,
@@ -14802,7 +14840,7 @@ mod tests {
                 checkpoint: PaneCheckpointBinding {
                     topology_incarnation_id: inc_id.clone(),
                     pane_uuid: "uuid-pane-20".to_string(),
-                    registration_generation: [1; 16],
+                    registration_wire_identity: [1; 16],
                     parser_capture: ParserCaptureIdentity {
                         watermark_bytes: 512,
                         segment_id: None,
@@ -14948,7 +14986,7 @@ mod tests {
     fn test_whole_mux_recovery_aead_encrypted_root_and_checkpoints_roundtrip() {
         use crate::snapshot_representation::encode_recovery_object;
 
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -15021,7 +15059,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -15149,7 +15187,18 @@ mod tests {
         let pt = &reconstructed.pane_terminals[&1];
         assert_eq!(pt.tab_id, 1);
         assert_eq!(pt.domain_id, 1);
-        assert!(pt.terminal.writer_is_inert_for_test());
+        let recaptured = pt
+            .terminal
+            .checkpoint()
+            .expect("recapture restored checkpoint")
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .expect("encode recaptured canonical json")
+            .to_vec();
+        assert_eq!(
+            recaptured.as_slice(),
+            validated.checkpoint_payload(&obj_id_str).unwrap(),
+            "recaptured inert checkpoint payload must match validated checkpoint payload"
+        );
     }
 
     #[test]
@@ -15158,7 +15207,7 @@ mod tests {
         use crate::snapshot_repair::encode_repair_envelope;
         use crate::snapshot_representation::encode_recovery_object;
 
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -15230,7 +15279,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -15366,7 +15415,7 @@ mod tests {
     fn test_whole_mux_recovery_aead_expected_context_mismatch_fails() {
         use crate::snapshot_representation::encode_recovery_object;
 
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -15447,7 +15496,8 @@ mod tests {
             image_digest: [0x11u8; 32],
         };
 
-        let secret_payload = b"SUPER_SECRET_PAYLOAD_CONTENT_NEVER_LEAK_IN_LOGS".to_vec();
+        let secret_payload =
+            Zeroizing::new(b"SUPER_SECRET_PAYLOAD_CONTENT_NEVER_LEAK_IN_LOGS".to_vec());
         let mut payloads = BTreeMap::new();
         payloads.insert("obj-secret-123".to_string(), secret_payload);
 
@@ -15472,7 +15522,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_unplaced_pane_fails_closed() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -15519,7 +15569,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-999".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,
@@ -15604,7 +15654,7 @@ mod tests {
     #[test]
     #[cfg(feature = "frankenterm-deps")]
     fn test_whole_mux_recovery_unknown_domain_fails_closed() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = private_test_directory();
         let store = SnapshotPublicationStore::open(temp_dir.path(), Default::default())
             .expect("open publication store");
 
@@ -15652,7 +15702,7 @@ mod tests {
             checkpoint: PaneCheckpointBinding {
                 topology_incarnation_id: inc_id.clone(),
                 pane_uuid: "uuid-pane-1".to_string(),
-                registration_generation: [1; 16],
+                registration_wire_identity: [1; 16],
                 parser_capture: ParserCaptureIdentity {
                     watermark_bytes: 100,
                     segment_id: None,

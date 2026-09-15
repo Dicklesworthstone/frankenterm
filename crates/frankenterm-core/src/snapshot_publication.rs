@@ -2745,6 +2745,24 @@ mod tests {
     }
     use tempfile::TempDir;
 
+    fn private_test_directory() -> TempDir {
+        #[cfg(unix)]
+        let root = std::fs::canonicalize("/tmp").unwrap();
+        #[cfg(not(unix))]
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(".ft-recovery-publication-")
+            .tempdir_in(root)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        directory
+    }
+
     /// Trivial verifier that accepts all structurally valid candidates.
     struct AcceptAllVerifier;
     impl RootVerifier for AcceptAllVerifier {
@@ -2787,7 +2805,7 @@ mod tests {
 
     #[test]
     fn test_object_publish_and_read_roundtrip() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -2810,7 +2828,7 @@ mod tests {
 
     #[test]
     fn protected_publication_reconciles_corrupt_committed_predecessor_before_cas() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let cx = Cx::for_testing();
@@ -2916,7 +2934,7 @@ mod tests {
     #[test]
     fn protected_root_discovery_repairs_corrupt_root_from_fresh_store() {
         use crate::snapshot_repair::decode_repair_object;
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let cx = Cx::for_testing();
@@ -3013,7 +3031,7 @@ mod tests {
 
     #[test]
     fn protected_discovery_retry_fsyncs_and_preserves_prior_slot() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let cx = Cx::for_testing();
@@ -3100,7 +3118,7 @@ mod tests {
 
     #[test]
     fn rejected_root_never_publishes_discovery() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let request = GenerationRootPublishRequest {
@@ -3132,7 +3150,7 @@ mod tests {
 
     #[test]
     fn test_object_publish_idempotent_adoption() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3154,7 +3172,7 @@ mod tests {
 
     #[test]
     fn object_adoption_retries_failed_directory_durability() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let bytes = b"rename-visible-but-sync-failed".to_vec();
@@ -3183,7 +3201,7 @@ mod tests {
 
     #[test]
     fn store_open_retry_completes_child_directory_durability() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         DIRECTORY_SYNC_FAILURE
             .with(|failure| *failure.borrow_mut() = Some(temp.path().to_path_buf()));
         assert!(matches!(
@@ -3202,7 +3220,7 @@ mod tests {
 
     #[test]
     fn directory_scan_limit_counts_ignored_staging_entries() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let limits = PublicationLimits {
             max_dir_entries: 1,
             ..PublicationLimits::default()
@@ -3226,7 +3244,7 @@ mod tests {
 
     #[test]
     fn generation_retry_completes_failed_directory_durability() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let request = GenerationRootPublishRequest {
@@ -3267,7 +3285,7 @@ mod tests {
 
     #[test]
     fn test_object_publish_conflict_rejected() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3296,7 +3314,7 @@ mod tests {
 
     #[test]
     fn test_object_path_traversal_rejected() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3313,7 +3331,7 @@ mod tests {
 
     #[test]
     fn duplicate_verified_generations_are_not_selected_arbitrarily() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let request = GenerationRootPublishRequest {
@@ -3343,7 +3361,7 @@ mod tests {
 
     #[test]
     fn generation_zero_is_rejected_before_publication() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let request = GenerationRootPublishRequest {
@@ -3362,7 +3380,7 @@ mod tests {
 
     #[test]
     fn test_dual_slot_progression_and_selection() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3424,7 +3442,7 @@ mod tests {
 
     #[test]
     fn test_predecessor_mismatch_fails_closed() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3455,7 +3473,7 @@ mod tests {
 
     #[test]
     fn test_torn_newest_root_falls_back_to_intact_predecessor() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3500,7 +3518,7 @@ mod tests {
 
     #[test]
     fn test_verifier_rejection_falls_back_to_prior_generation() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3586,7 +3604,7 @@ mod tests {
 
     #[test]
     fn test_has_object_and_list_objects() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3619,7 +3637,7 @@ mod tests {
 
     #[test]
     fn test_verifier_rejection_of_newest_falls_back_to_valid_predecessor() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -3660,7 +3678,7 @@ mod tests {
         // Verifier checks manifest contents: parses "manifest-gen-X:<obj-id>" and checks if obj exists
         struct ManifestObjectVerifier;
         impl RootVerifier for ManifestObjectVerifier {
-            type Error = std::io::Error;
+            type Error = PublicationError;
             type Verified = u64;
 
             fn verify_root(
@@ -3692,7 +3710,7 @@ mod tests {
 
     #[test]
     fn test_negative_no_half_published_root_accepted_and_last_good_never_overwritten() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3747,7 +3765,7 @@ mod tests {
 
     #[test]
     fn test_non_monotonic_generation_rejected() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3786,7 +3804,7 @@ mod tests {
 
     #[test]
     fn test_missing_predecessor_binding_rejected() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -3808,7 +3826,7 @@ mod tests {
 
     #[test]
     fn test_invalid_proposal_preserves_both_roots() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let v_accept = AcceptAllVerifier;
@@ -3901,7 +3919,7 @@ mod tests {
     #[test]
     fn test_concurrent_publishers_and_lock_serialization() {
         use std::sync::Arc;
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store = Arc::new(
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap(),
         );
@@ -3946,7 +3964,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_publisher_double_advance_race_prevented() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -4018,7 +4036,7 @@ mod tests {
 
     #[test]
     fn test_symlink_root_rejected_without_following_or_mutating() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let target_dir = temp.path().join("real_target_dir");
         std::fs::create_dir_all(&target_dir).unwrap();
 
@@ -4029,8 +4047,11 @@ mod tests {
             let symlink_path = temp.path().join("symlink_to_target");
             std::os::unix::fs::symlink(&target_dir, &symlink_path).unwrap();
 
-            let err = SnapshotPublicationStore::open(&symlink_path, PublicationLimits::default())
-                .unwrap_err();
+            let Err(err) =
+                SnapshotPublicationStore::open(&symlink_path, PublicationLimits::default())
+            else {
+                panic!("expected error opening symlink root");
+            };
             assert!(matches!(err, PublicationError::InsecurePermissions { .. }));
 
             // Prove: real target directory permissions were NOT modified (never chmod'd)
@@ -4041,7 +4062,7 @@ mod tests {
 
     #[test]
     fn test_untrusted_permissions_rejected_without_chmod() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let untrusted_dir = temp.path().join("untrusted_dir");
         std::fs::create_dir_all(&untrusted_dir).unwrap();
 
@@ -4051,8 +4072,11 @@ mod tests {
             std::fs::set_permissions(&untrusted_dir, std::fs::Permissions::from_mode(0o777))
                 .unwrap();
 
-            let err = SnapshotPublicationStore::open(&untrusted_dir, PublicationLimits::default())
-                .unwrap_err();
+            let Err(err) =
+                SnapshotPublicationStore::open(&untrusted_dir, PublicationLimits::default())
+            else {
+                panic!("expected error opening untrusted directory");
+            };
             assert!(matches!(err, PublicationError::InsecurePermissions { .. }));
 
             // Prove: untrusted directory was NOT chmod'd to 0700; stays 0777
@@ -4063,7 +4087,7 @@ mod tests {
 
     #[test]
     fn test_near_limit_manifest_publication_and_read_admitted() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         // Set a small manifest limit to easily test near-limit and over-limit
         let limits = PublicationLimits {
             max_root_manifest_bytes: 4096,
@@ -4193,7 +4217,7 @@ mod tests {
 
     #[test]
     fn test_lost_reply_retry_reconciles_idempotently_before_stale_predecessor_rejection() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
@@ -4254,7 +4278,7 @@ mod tests {
 
     #[test]
     fn test_object_publish_noreplace_and_exact_existing_adoption() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
@@ -4291,7 +4315,7 @@ mod tests {
 
     #[test]
     fn publication_lock_contention_returns_without_waiting() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let first = store.acquire_publication_lock().unwrap();
@@ -4305,7 +4329,7 @@ mod tests {
 
     #[test]
     fn test_lock_inode_revalidation_detects_replaced_file() {
-        let temp = TempDir::new().unwrap();
+        let temp = private_test_directory();
         let store =
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
 
