@@ -21627,11 +21627,209 @@ mod tests {
     #[test]
     fn broker_control_spawn_is_async_query_recoverable_and_exactly_once() {
         for _repetition in 0..20 {
-            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once();
+            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(false);
         }
     }
 
-    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once_once() {
+    #[test]
+    #[ignore = "requires candidate FT_ATOMIC_BUILD_IDENTITY; run exact test with --ignored in sealed strict RCH/DSR lane"]
+    fn broker_control_spawn_from_real_published_genesis_is_exactly_once() {
+        mux::guardian_protocol::GuardianProtocolState::new(id(7_301))
+            .expect("construct Genesis authority preflight")
+            .live_build_authority_for_genesis()
+            .expect("this test requires the actual sealed candidate build identity");
+        broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(true);
+    }
+
+    fn publish_test_genesis_admission(
+        token_path: &Path,
+        payload: &GuardianSpawnPayload,
+        connection: BrokerGuardianConnectionIdentityV1,
+    ) -> GuardianPublishedGenesisAdmissionPermitV1 {
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+        use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+        use mux::guardian_checkpoint::{
+            GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointStageBindingV1,
+            GuardianCheckpointStageScopeV1, GuardianCheckpointValidatedManifestAuthorityV1,
+        };
+        use mux::guardian_protocol::{
+            GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1,
+            GuardianCheckpointStageRequestV1, GuardianGenesisMuxAuthorityV1,
+            GuardianHelloBuildIdentityV1, GuardianOperation, GuardianProtocolState,
+            GuardianRequestEnvelope, GuardianRequestHeader, decode_guardian_request,
+            encode_guardian_request,
+        };
+
+        #[derive(Debug)]
+        struct GenesisConfig;
+        impl TerminalConfiguration for GenesisConfig {
+            fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+                frankenterm_term::color::ColorPalette::default()
+            }
+        }
+
+        let mut protocol = GuardianProtocolState::new(connection.guardian_incarnation)
+            .expect("construct real Genesis protocol");
+        let live_authority = protocol
+            .live_build_authority_for_genesis()
+            .expect("derive Genesis authority from the sealed compilation");
+        let secret = load_guardian_secret(token_path).expect("load actual broker token");
+        let authenticate =
+            |operation, request_id, pane_id, effect_id, bytes: Zeroizing<Vec<u8>>| {
+                let guardian = if operation == GuardianOperation::Hello {
+                    Uuid::nil()
+                } else {
+                    connection.guardian_incarnation
+                };
+                let header = GuardianRequestHeader::new(
+                    operation,
+                    guardian,
+                    connection.mux_incarnation,
+                    request_id,
+                    pane_id,
+                    0,
+                    0,
+                    effect_id,
+                    &bytes,
+                );
+                let request = GuardianRequestEnvelope::from_zeroizing_payload(header, bytes);
+                let frame = encode_guardian_request(&secret, &request)
+                    .expect("authenticate Genesis request");
+                decode_guardian_request(&secret, &frame)
+                    .expect("decode authenticated Genesis request")
+            };
+        let hello_bytes = GuardianHelloBuildIdentityV1::for_compiled_mux()
+            .expect("compiled mux identity")
+            .encode();
+        let mut hello_payload = Zeroizing::new(Vec::new());
+        hello_payload.extend_from_slice(&hello_bytes);
+        let hello = authenticate(
+            GuardianOperation::Hello,
+            id(7_320),
+            None,
+            None,
+            hello_payload,
+        );
+        let mux_authority = protocol
+            .authenticate_mux_connection_for_genesis(&hello)
+            .expect("authenticate build-bearing Genesis Hello");
+        let spawn = authenticate(
+            GuardianOperation::Spawn,
+            id(12),
+            Some(id(11)),
+            Some(id(10)),
+            payload.encode().expect("encode exact child payload"),
+        );
+        let size = payload.size();
+        let terminal = Terminal::new(
+            TerminalSize {
+                rows: usize::from(size.rows),
+                cols: usize::from(size.cols),
+                pixel_width: usize::from(size.pixel_width),
+                pixel_height: usize::from(size.pixel_height),
+                dpi: 96,
+            },
+            Arc::new(GenesisConfig),
+            "FrankenTerm",
+            "broker-genesis-test",
+            Box::new(Vec::<u8>::new()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .expect("capture canonical pre-spawn terminal");
+        let scope = GuardianCheckpointScopeV1::Genesis {
+            spawn_effect_id: id(10),
+        };
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(id(10), &terminal)
+            .expect("derive canonical Genesis descriptor");
+        let begin = GuardianCheckpointStageRequestV1::begin(scope, id(13), descriptor, 1024)
+            .expect("construct Genesis Begin");
+        let authenticated_begin = authenticate(
+            GuardianOperation::CheckpointStage,
+            id(7_321),
+            None,
+            Some(id(10)),
+            begin
+                .into_zeroizing_payload()
+                .expect("encode Genesis Begin"),
+        );
+        let permit = protocol
+            .reserve_genesis_spawn(
+                &spawn,
+                &authenticated_begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                    &mux_authority,
+                )),
+                Some(&live_authority),
+            )
+            .expect("reserve exactly one authenticated Genesis Spawn");
+        assert!(
+            matches!(
+                protocol.reserve_genesis_spawn(
+                    &spawn,
+                    &authenticated_begin,
+                    Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                        &mux_authority
+                    )),
+                    Some(&live_authority),
+                ),
+                Err(mux::guardian_protocol::GuardianProtocolError::GenesisReservationAlreadyIssued)
+            ),
+            "exact retry must not mint a second admission permit"
+        );
+        let binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
+            GuardianCheckpointStageScopeV1::genesis(id(10)).expect("Genesis scope"),
+            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(id(10), &terminal)
+                .expect("canonical manifest descriptor"),
+            1,
+        )
+        .expect("bind canonical Genesis manifest");
+        let (manifest_authority, reservation) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &binding, permit, &terminal,
+            )
+            .expect("split the one-shot seal and catalog authorities");
+        let poll = Poll::new().expect("Genesis pipeline poll");
+        let waker =
+            Arc::new(Waker::new(poll.registry(), Token(1)).expect("Genesis pipeline waker"));
+        let pipeline = GuardianOutputPipeline::open(token_path, 1, waker)
+            .expect("open actual encrypted Genesis storage");
+        let store = pipeline.checkpoint_stage_store();
+        store
+            .apply_begin(
+                &GuardianCheckpointStageRequestV1::begin(scope, id(13), descriptor, 1024)
+                    .expect("reconstruct exact Begin"),
+            )
+            .expect("persist Genesis Begin");
+        for (index, bytes) in terminal.canonical_payload().chunks(1024).enumerate() {
+            let mut chunk = Zeroizing::new(Vec::new());
+            chunk.extend_from_slice(bytes);
+            store
+                .apply_chunk(
+                    GuardianCheckpointStageRequestV1::chunk(
+                        scope,
+                        id(13),
+                        descriptor,
+                        1024,
+                        u32::try_from(index).expect("bounded chunk index"),
+                        chunk,
+                    )
+                    .expect("canonical Genesis chunk"),
+                )
+                .expect("persist Genesis chunk");
+        }
+        store
+            .apply_seal(
+                GuardianCheckpointStageRequestV1::seal(scope, id(13), descriptor, 1024)
+                    .expect("Genesis Seal"),
+                crate::output::GuardianCheckpointOriginAuthority::Genesis { manifest_authority },
+            )
+            .expect("durably seal actual Genesis payload");
+        store
+            .publish_genesis_catalog_admission(reservation)
+            .expect("publish and rescan actual Genesis catalog before admission")
+    }
+
+    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(real_genesis: bool) {
         let root = private_catalog_directory().keep();
         let spawn_catalog_path = root.join("spawn-catalog");
         fs::create_dir(&spawn_catalog_path).expect("create control Spawn catalog");
@@ -21658,11 +21856,17 @@ mod tests {
         .expect("bind control Spawn service");
         let broker_incarnation = service.incarnation();
         let service = TestBrokerControlService::start(service);
+        let compiled_identity = real_genesis.then(|| {
+            SealedAtomicBuildIdentity::from_lower_hex(
+                option_env!("FT_ATOMIC_BUILD_IDENTITY").expect("sealed candidate identity"),
+            )
+            .expect("canonical sealed candidate identity")
+        });
         let connection_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_301),
             id(7_302),
-            sealed(0xd6),
-            sealed(0xd7),
+            compiled_identity.unwrap_or_else(|| sealed(0xd6)),
+            compiled_identity.unwrap_or_else(|| sealed(0xd7)),
         )
         .expect("construct control Spawn connection identity");
         let mut client = BrokerControlClientV1::connect(
@@ -21689,11 +21893,28 @@ mod tests {
             "printf C >>\"$BROKER_SENTINEL\"; IFS= read -r ignored",
             &sentinel,
         );
-        let binding = binding_for(&payload, &authenticated);
+        let admission = real_genesis
+            .then(|| publish_test_genesis_admission(&token_path, &payload, connection_identity));
+        assert!(
+            !sentinel.exists(),
+            "Genesis publication must not spawn a child"
+        );
+        let binding = admission.as_ref().map_or_else(
+            || binding_for(&payload, &authenticated),
+            |permit| BrokerGenesisBinding::from(permit.reservation_identity()),
+        );
+        let checksum = admission
+            .as_ref()
+            .map_or([0xd8; BROKER_CATALOG_CHECKSUM_BYTES], |permit| {
+                *permit.catalog_candidate_checksum()
+            });
+        let submission_payload =
+            GuardianSpawnPayload::decode(&payload.encode().expect("encode retry payload"))
+                .expect("copy exact Spawn payload for client submission");
         let control_spawn = BrokerSpawnControlRequestV1::from_parts(
             id(7_303),
             id(7_304),
-            [0xd8; BROKER_CATALOG_CHECKSUM_BYTES],
+            checksum,
             binding,
             payload,
         )
@@ -21719,14 +21940,28 @@ mod tests {
                 .expect("construct authenticated control Spawn request")
         };
 
-        let submitted = client
-            .exchange(&spawn_request(header))
-            .expect("submit asynchronous control Spawn");
-        assert_eq!(
-            submitted.header.status,
-            BrokerControlResponseStatusV1::Retryable
-        );
-        assert!(submitted.header.child_identity.is_none());
+        if let Some(admission) = admission {
+            assert!(matches!(
+                client
+                    .spawn_from_published_admission(
+                        admission,
+                        submission_payload,
+                        id(7_303),
+                        id(7_304),
+                    )
+                    .expect("submit actual catalog admission through production client"),
+                BrokerSpawnSubmissionV1::Pending { .. }
+            ));
+        } else {
+            let submitted = client
+                .exchange(&spawn_request(header))
+                .expect("submit asynchronous control Spawn");
+            assert_eq!(
+                submitted.header.status,
+                BrokerControlResponseStatusV1::Retryable
+            );
+            assert!(submitted.header.child_identity.is_none());
+        }
         assert_eq!(
             client
                 .query_spawn_effect(binding.durable_pane_id, id(7_306))
