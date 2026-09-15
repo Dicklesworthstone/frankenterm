@@ -4020,14 +4020,19 @@ impl Screen {
     #[cfg(feature = "use_serde")]
     pub fn line_read_changes_layout(&self, read: &ScreenLineRead) -> bool {
         read.layout.as_ref().is_some_and(|next| {
-            self.current_cold_visual_layout().is_none_or(|current| {
-                if std::ptr::eq(next.as_ref(), current) {
-                    return false;
-                }
-                // Extending an unchanged prefix with already-current-width
-                // rows does not invalidate older visual coordinates.
-                !next.extends(current)
-            })
+            // This compares coordinate mappings, not permission to publish
+            // bytes. Source validation has its own retained-interval fence.
+            // Re-probing storage here can observe Busy just after validation
+            // and turn an unchanged mapping into a spurious sequence advance.
+            self.cold_visual_layout_at_current_coordinates()
+                .is_none_or(|current| {
+                    if std::ptr::eq(next.as_ref(), current) {
+                        return false;
+                    }
+                    // Extending an unchanged prefix with already-current-width
+                    // rows does not invalidate older visual coordinates.
+                    !next.extends(current)
+                })
         })
     }
 
@@ -10887,6 +10892,53 @@ pub(crate) mod tests {
         screen.install_line_read_layout(&ready, 2);
         assert_eq!(screen.lines_in_stable_range(requested).1, expected);
         assert!(screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_layout_comparison_does_not_turn_busy_storage_into_a_layout_change() {
+        let (mut screen, sink) = stored_physical_fixture(3, 32);
+        let read = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 2);
+        assert!(!screen.line_read_changes_layout(&read));
+        let sequence = screen.cold_visual_layout_seqno();
+
+        // Model contention starting after the caller's successful source
+        // validation. The old comparison sees None and reports a new layout.
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        assert!(screen.current_cold_visual_layout().is_none());
+        assert!(!screen.line_read_changes_layout(&read));
+        assert_eq!(screen.cold_visual_layout_seqno(), sequence);
+        assert!(
+            !screen.validates_line_read(&read),
+            "stable geometry must not grant source authority while storage is busy"
+        );
+
+        sink.force_busy_probe.store(false, Ordering::Relaxed);
+        assert!(screen.validates_line_read(&read));
+        assert!(sink.store_scrollback_line(
+            0,
+            &Line::from_text("changed", &CellAttributes::blank(), 3, None),
+            32,
+        ));
+        assert!(!screen.line_read_changes_layout(&read));
+        assert!(
+            !screen.validates_line_read(&read),
+            "same-coordinate content replacement must still reject the old read"
+        );
+
+        // A real coordinate change remains a layout change even when the
+        // sink cannot currently answer. It must not reuse the old mapping.
+        screen.physical_cols = 11;
+        screen.invalidate_coordinate_witnesses();
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        assert!(screen.line_read_changes_layout(&read));
+        assert!(!screen.validates_line_read(&read));
     }
 
     #[cfg(feature = "use_serde")]
