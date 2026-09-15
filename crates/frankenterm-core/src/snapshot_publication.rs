@@ -3770,14 +3770,30 @@ mod tests {
             SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
         let verifier = AcceptAllVerifier;
 
+        let initial = store
+            .publish_generation_root(
+                &GenerationRootPublishRequest {
+                    generation: 1,
+                    publisher_id: "pub-1".to_string(),
+                    predecessor: None,
+                    manifest_bytes: b"gen-1".to_vec(),
+                    created_at_ms: 500,
+                },
+                &verifier,
+            )
+            .unwrap();
         let req1 = GenerationRootPublishRequest {
             generation: 5,
             publisher_id: "pub-1".to_string(),
-            predecessor: None,
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 1,
+                expected_hash: initial.sha256,
+            }),
             manifest_bytes: b"gen-5".to_vec(),
             created_at_ms: 1000,
         };
-        store.publish_generation_root(&req1, &verifier).unwrap();
+        let active = store.publish_generation_root(&req1, &verifier).unwrap();
+        let active_bytes = std::fs::read(&active.path).unwrap();
 
         // Attempt publishing gen 4 (less than active 5)
         let req_stale = GenerationRootPublishRequest {
@@ -3800,6 +3816,7 @@ mod tests {
                 active: 5
             }
         ));
+        assert_eq!(std::fs::read(&active.path).unwrap(), active_bytes);
     }
 
     #[test]
@@ -3941,8 +3958,16 @@ mod tests {
 
         let mut already_present_count = 0;
         let mut newly_published_count = 0;
+        let mut busy_count = 0;
         for h in handles {
-            let receipt = h.join().unwrap().unwrap();
+            let receipt = match h.join().unwrap() {
+                Ok(receipt) => receipt,
+                Err(PublicationError::PublicationBusy) => {
+                    busy_count += 1;
+                    continue;
+                }
+                Err(error) => panic!("unexpected object publication failure: {error}"),
+            };
             if receipt.was_already_present {
                 already_present_count += 1;
             } else {
@@ -3953,6 +3978,24 @@ mod tests {
             newly_published_count, 1,
             "exactly one publisher should create the object"
         );
+        // The production lock is deliberately nonblocking. Retry only explicit
+        // Busy outcomes, after every concurrent attempt has settled; no sleep
+        // or scheduler-dependent deadline is needed to prove exact adoption.
+        for _ in 0..busy_count {
+            let payload = b"concurrent-identical-payload".to_vec();
+            let receipt = store
+                .publish_object(&RecoveryObjectPayload {
+                    object_id: "shared-obj".to_string(),
+                    expected_sha256: sha256_hex(&payload),
+                    ciphertext_bytes: payload,
+                })
+                .expect("settled contention permits exact retry");
+            assert!(
+                receipt.was_already_present,
+                "a Busy retry must adopt the one committed object"
+            );
+            already_present_count += 1;
+        }
         assert_eq!(
             already_present_count, 3,
             "other publishers should adopt idempotently"
@@ -4014,19 +4057,23 @@ mod tests {
             manifest_bytes: b"gen-3-pub-B".to_vec(),
             created_at_ms: 3000,
         };
-        store.publish_generation_root(&req3_b, &verifier).unwrap();
+        let r3_b = store.publish_generation_root(&req3_b, &verifier).unwrap();
+        let second_bytes = std::fs::read(&r2_b.path).unwrap();
+        let third_bytes = std::fs::read(&r3_b.path).unwrap();
 
         // Now active root is Gen 3 (Slot A), predecessor is Gen 2 (Slot B).
         // Stale Publisher A now tries to publish stale_req_gen2:
-        // Inside publication lock, CAS / predecessor check detects active is Gen 3, NOT Gen 1!
+        // Exact-generation reconciliation sees the retained Gen 2 from B
+        // before predecessor validation and rejects A's conflicting identity.
         let err = store
             .publish_generation_root(&stale_req_gen2, &verifier)
             .unwrap_err();
         assert!(matches!(
             err,
-            PublicationError::PredecessorMismatch { .. }
-                | PublicationError::NonMonotonicGeneration { .. }
+            PublicationError::GenerationConflict { generation: 2, .. }
         ));
+        assert_eq!(std::fs::read(&r2_b.path).unwrap(), second_bytes);
+        assert_eq!(std::fs::read(&r3_b.path).unwrap(), third_bytes);
 
         // Both Slot A (Gen 3) and Slot B (Gen 2) remain untouched!
         let sel = store.select_verified_roots(&verifier).unwrap();
@@ -4341,11 +4388,17 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
             let meta1 = std::fs::metadata(&lock_path).unwrap();
 
             // Atomically replace lock file with new inode (tests inode change without file deletion)
             let replacement_path = temp.path().join(".publication.lock.replacement");
-            let _ = std::fs::File::create(&replacement_path).unwrap();
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&replacement_path)
+                .unwrap();
             std::fs::rename(&replacement_path, &lock_path).unwrap();
             let meta2 = std::fs::metadata(&lock_path).unwrap();
             assert_ne!(

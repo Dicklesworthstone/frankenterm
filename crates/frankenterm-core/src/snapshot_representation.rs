@@ -2424,6 +2424,12 @@ mod tests {
         // 3. Wrong expected predecessor generation
         let mut wrong_pred = ExpectedContext::from_metadata(&metadata);
         wrong_pred.predecessor_generation = Some(42);
+        assert!(matches!(
+            decode_recovery_object(&encrypted, &wrong_pred, &key, None),
+            Err(RepresentationError::InvalidMetadata { .. })
+        ));
+        wrong_pred.predecessor_generation = Some(metadata.generation - 2);
+        wrong_pred.validate().unwrap();
         let err3 = decode_recovery_object(&encrypted, &wrong_pred, &key, None).unwrap_err();
         assert!(matches!(
             err3,

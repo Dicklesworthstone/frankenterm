@@ -3127,7 +3127,10 @@ mod tests {
     fn test_negative_invalid_magic_rejected() {
         let mut image = make_valid_test_image();
         image.header.magic = *b"BADM";
-        image.image_digest = image.compute_digest().unwrap();
+        assert!(matches!(
+            image.compute_digest(),
+            Err(MuxRecoveryImageError::InvalidMagic { .. })
+        ));
 
         let err = image.validate().unwrap_err();
         assert!(matches!(err, MuxRecoveryImageError::InvalidMagic { .. }));
@@ -3137,7 +3140,10 @@ mod tests {
     fn test_negative_unsupported_schema_version() {
         let mut image = make_valid_test_image();
         image.header.schema_version = 999;
-        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.compute_digest(),
+            Err(MuxRecoveryImageError::UnsupportedSchemaVersion(999))
+        );
 
         let err = image.validate().unwrap_err();
         assert_eq!(err, MuxRecoveryImageError::UnsupportedSchemaVersion(999));

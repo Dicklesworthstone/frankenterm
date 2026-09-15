@@ -11980,6 +11980,7 @@ impl RuntimeHandle {
                                         checkpoint.session_id.chars().take(64).collect::<String>();
                                     warn!(
                                         error = %error,
+                                        error_class = ?error,
                                         %session_id,
                                         checkpoint_id = checkpoint.checkpoint_id,
                                         pane_count = checkpoint.pane_count,
@@ -11987,18 +11988,18 @@ impl RuntimeHandle {
                                         "runtime terminal checkpoint committed but clean mark failed"
                                     );
                                     warnings.push(format!(
-                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed",
+                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed: {error:?}",
                                         checkpoint.checkpoint_id
                                     ));
                                 } else {
                                     warn!(
                                         error = %error,
+                                        error_class = ?error,
                                         "runtime terminal snapshot failed before a clean receipt"
                                     );
-                                    warnings.push(
-                                        "RuntimeBuilder terminal snapshot failed before publishing a clean receipt"
-                                            .to_string(),
-                                    );
+                                    warnings.push(format!(
+                                        "RuntimeBuilder terminal snapshot failed before publishing a clean receipt: {error:?}"
+                                    ));
                                 }
                             }
                         }

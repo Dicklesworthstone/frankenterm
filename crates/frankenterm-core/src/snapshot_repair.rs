@@ -3359,9 +3359,21 @@ mod tests {
     #[test]
     fn test_returned_buffer_permit_retention_and_shrink() {
         let cx = test_cx();
-        // Memory cap: 60,000 bytes, concurrency 2
-        let admission = RepairAdmissionController::new(2, 60_000, 100);
         let payload = sample_envelope(3_500);
+        let k = payload.len().div_ceil(DEFAULT_SYMBOL_SIZE);
+        let total_symbols = k + RepairProtectionClass::Standard.repair_symbol_count(k);
+        let params = SystematicParams::try_for_source_block(k, DEFAULT_SYMBOL_SIZE).unwrap();
+        // Admit exactly the larger operation peak for this geometry, including
+        // the encoder's retained scratch and output buffers.
+        let memory_budget =
+            calculate_encoder_memory_budget(&params, total_symbols, DEFAULT_SYMBOL_SIZE)
+                .unwrap()
+                .max(
+                    calculate_decoder_memory_budget(&params, total_symbols, DEFAULT_SYMBOL_SIZE)
+                        .unwrap(),
+                );
+        assert!(memory_budget > payload.len());
+        let admission = RepairAdmissionController::new(2, memory_budget, total_symbols);
         let obj_id = sample_object_id(22);
         let key = b"test-secret-key-32-bytes-long!!";
 
@@ -3399,9 +3411,9 @@ mod tests {
         assert_eq!(admission.allocated_memory_bytes(), 3_500);
         assert_eq!(admission.active_operations(), 1);
 
-        // Another acquisition exceeding remaining memory (60,000 - 3,500 = 56,500) fails
+        // One byte beyond the remaining budget fails while the result is held.
         let err = admission
-            .acquire(56_501)
+            .acquire(memory_budget - result.permit.allocated_bytes() + 1)
             .expect_err("must exceed remaining memory");
         match err {
             RepairError::AdmissionExceeded(msg) => assert!(msg.contains("memory limit")),
@@ -3413,9 +3425,9 @@ mod tests {
         assert_eq!(admission.allocated_memory_bytes(), 0);
         assert_eq!(admission.active_operations(), 0);
 
-        // Now full 60,000 reservation succeeds
+        // Now the full operation budget can be reserved again.
         let _permit = admission
-            .acquire(60_000)
+            .acquire(memory_budget)
             .expect("full reservation succeeds after drop");
     }
 
