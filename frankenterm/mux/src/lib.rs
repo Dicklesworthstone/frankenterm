@@ -18226,8 +18226,9 @@ impl Mux {
     /// Apply complete local mirror permutations in one window transaction.
     ///
     /// Every baseline revision and exact tab allocation is validated before
-    /// any window changes. This operation cannot attach, detach, or recreate
-    /// tabs. Remote identity/generation validation belongs to the client that
+    /// any window changes. Tabs may move between the supplied windows, but the
+    /// complete batch must preserve every exact tab allocation once. Remote
+    /// identity/generation validation belongs to the client that
     /// resolves the mirrors; this method supplies the atomic local commit.
     /// Subscribers run only after the complete batch has committed.
     pub fn apply_window_order_mirrors(
@@ -18238,28 +18239,53 @@ impl Mux {
         const MAX_TOTAL_TABS: usize = 65_536;
         anyhow::ensure!(mirrors.len() <= MAX_WINDOWS, "too many mirrored windows");
         let mut total_tabs = 0usize;
+        let mut expected_tabs = 0usize;
         for mirror in &mirrors {
             anyhow::ensure!(
-                mirror.ordered_tabs.len() == mirror.expected.ordered_tabs().len()
-                    && mirror.ordered_tabs.len() <= MAX_TABS_PER_ORDERED_WINDOW,
-                "mirrored window must preserve bounded membership",
+                mirror.ordered_tabs.len() <= MAX_TABS_PER_ORDERED_WINDOW
+                    && mirror.expected.ordered_tabs().len() <= MAX_TABS_PER_ORDERED_WINDOW,
+                "mirrored window exceeds bounded membership",
             );
             total_tabs = total_tabs
                 .checked_add(mirror.ordered_tabs.len())
                 .ok_or_else(|| anyhow!("mirrored tab count overflow"))?;
             anyhow::ensure!(total_tabs <= MAX_TOTAL_TABS, "too many mirrored tabs");
+            expected_tabs = expected_tabs
+                .checked_add(mirror.expected.ordered_tabs().len())
+                .ok_or_else(|| anyhow!("expected mirrored tab count overflow"))?;
+            anyhow::ensure!(
+                expected_tabs <= MAX_TOTAL_TABS,
+                "too many expected mirrored tabs"
+            );
         }
+        anyhow::ensure!(
+            total_tabs == expected_tabs,
+            "mirrored batch changes total membership"
+        );
         let mut prepared = Vec::new();
         prepared.try_reserve_exact(mirrors.len())?;
         let mut results = Vec::new();
         results.try_reserve_exact(mirrors.len())?;
         let mut seen = HashSet::new();
         seen.try_reserve(mirrors.len())?;
+        let mut prior_members = HashMap::new();
+        prior_members.try_reserve(expected_tabs)?;
+        let mut desired_members = HashSet::new();
+        desired_members.try_reserve(total_tabs)?;
+        let mut count_deltas: HashMap<WindowId, WindowPaneCountDelta> = HashMap::new();
+        count_deltas.try_reserve(mirrors.len())?;
+        let mut attached_tabs = Vec::new();
+        attached_tabs.try_reserve_exact(total_tabs)?;
+        let mut created_windows = Vec::new();
+        created_windows.try_reserve_exact(mirrors.len())?;
+        let mut pane_count_deltas = Vec::new();
+        pane_count_deltas.try_reserve_exact(mirrors.len())?;
         {
+            let authority = self.pane_authority.lock();
             let tabs = self.tabs.read();
             let mut windows = self.windows.write();
             let parents = self.tab_parents.read();
-            for mirror in mirrors {
+            for mirror in &mirrors {
                 let window_id = mirror.expected.window_id();
                 anyhow::ensure!(
                     seen.insert(window_id),
@@ -18268,6 +18294,10 @@ impl Mux {
                 let window = windows
                     .get(&window_id)
                     .ok_or_else(|| anyhow!("mirrored window {window_id} no longer exists"))?;
+                anyhow::ensure!(
+                    window.has_exact_mux_identity(self, window_id),
+                    "mirrored window {window_id} has a different exact owner",
+                );
                 for tab in mirror.expected.ordered_tabs() {
                     anyhow::ensure!(
                         tabs.get(&tab.tab_id())
@@ -18278,10 +18308,63 @@ impl Mux {
                         "mirrored tab {} is not the exact registered window member",
                         tab.tab_id(),
                     );
+                    anyhow::ensure!(
+                        prior_members
+                            .insert(tab.tab_id(), (Arc::as_ptr(tab), window_id))
+                            .is_none(),
+                        "mirrored batch repeats prior tab {}",
+                        tab.tab_id(),
+                    );
                 }
+            }
+            for mirror in &mirrors {
+                let window_id = mirror.expected.window_id();
+                for tab in &mirror.ordered_tabs {
+                    let &(allocation, prior_window) =
+                        prior_members.get(&tab.tab_id()).ok_or_else(|| {
+                            anyhow!(
+                                "mirrored tab {} is outside the supplied windows",
+                                tab.tab_id()
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        allocation == Arc::as_ptr(tab) && desired_members.insert(tab.tab_id()),
+                        "mirrored batch repeats or replaces exact tab {}",
+                        tab.tab_id(),
+                    );
+                    if prior_window != window_id {
+                        let count = Self::exact_tab_structural_pane_count(&authority, tab)?;
+                        let source = count_deltas
+                            .entry(prior_window)
+                            .or_insert_with(|| WindowPaneCountDelta::identity(prior_window));
+                        source.removals = source
+                            .removals
+                            .checked_add(count)
+                            .ok_or_else(|| anyhow!("mirrored source pane count overflow"))?;
+                        let destination = count_deltas
+                            .entry(window_id)
+                            .or_insert_with(|| WindowPaneCountDelta::identity(window_id));
+                        destination.additions = destination
+                            .additions
+                            .checked_add(count)
+                            .ok_or_else(|| anyhow!("mirrored destination pane count overflow"))?;
+                        attached_tabs.push((tab.tab_id(), window_id));
+                    }
+                }
+            }
+            for mirror in mirrors {
+                let window_id = mirror.expected.window_id();
+                let window = windows
+                    .get(&window_id)
+                    .expect("mirrored window validated above");
                 let unchanged = mirror.expected.clone();
-                match window.prepare_mirror_order(mirror)? {
+                match window.prepare_mirror_order(mirror, count_deltas.contains_key(&window_id))? {
                     Some(state) => {
+                        if !state.frozen().ordered_tabs().is_empty()
+                            && self.provisional_windows.lock().contains(&window_id)
+                        {
+                            created_windows.push(window_id);
+                        }
                         results.push(state.frozen().clone());
                         prepared.push((window_id, state));
                     }
@@ -18290,13 +18373,14 @@ impl Mux {
             }
             drop(parents);
             if !prepared.is_empty() {
+                pane_count_deltas.extend(count_deltas.into_values());
                 self.commit_prepared_window_states_locked(
                     &mut windows,
                     prepared,
+                    attached_tabs,
+                    created_windows,
                     Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                    pane_count_deltas,
                 )?;
             }
         }
@@ -34755,6 +34839,246 @@ mod tests {
         assert_eq!(observed.load(Ordering::SeqCst), 1);
         drop(left);
         drop(right);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_order_mirrors_transfer_cycle_preserves_panes_and_counts() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let builders = (0..3)
+            .map(|i| mux.new_empty_window(Some(format!("mirror-{i}")), None))
+            .collect::<Vec<_>>();
+        let ids = builders.iter().map(|window| **window).collect::<Vec<_>>();
+        let fixtures = (0..4)
+            .map(|i| tab_with_kill_counter(&mux, 8100 + i))
+            .collect::<Vec<_>>();
+        let tabs = fixtures
+            .iter()
+            .map(|(tab, _)| Arc::clone(tab))
+            .collect::<Vec<_>>();
+        let panes = tabs
+            .iter()
+            .map(|tab| tab.get_active_pane().expect("live pane"))
+            .collect::<Vec<_>>();
+        for (index, tab) in tabs.iter().enumerate() {
+            mux.add_tab_to_window(tab, ids[index.saturating_sub(1)])
+                .expect("initial attachment");
+        }
+        mux.create_window_tab_stack(
+            ids[0],
+            crate::tab::TabStackId(94),
+            vec![tabs[0].tab_id(), tabs[1].tab_id()],
+        )
+        .expect("source stack");
+        let target = vec![vec![3], vec![1, 0], vec![2]];
+        let snapshot = |id| {
+            mux.window_order_snapshot(id)
+                .expect("valid order")
+                .expect("window")
+        };
+        let before = ids.iter().map(|id| snapshot(*id)).collect::<Vec<_>>();
+        let topology = mux.topology_snapshot_authority().expect("before topology");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&observations);
+        let owner = Arc::downgrade(&mux);
+        let callback_ids = ids.clone();
+        let callback_target = target
+            .iter()
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|index| tabs[*index].tab_id())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowTopologyChanged(change) = notification {
+                if callback_ids.iter().all(|id| change.affects_window(*id)) {
+                    let mux = owner.upgrade().expect("exact owner");
+                    for (index, (id, desired)) in
+                        callback_ids.iter().zip(&callback_target).enumerate()
+                    {
+                        let window = mux.get_window(*id).expect("committed window");
+                        assert_eq!(
+                            window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
+                            *desired
+                        );
+                        assert_eq!(window.structural_pane_count(), desired.len());
+                        assert_eq!(
+                            mux.num_panes_by_workspace
+                                .read()
+                                .get(&format!("mirror-{index}")),
+                            Some(&desired.len())
+                        );
+                    }
+                    mux.assert_tab_parent_index_matches_windows();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            true
+        })
+        .expect("subscribe");
+        let result = mux
+            .apply_window_order_mirrors(
+                before
+                    .iter()
+                    .zip(&target)
+                    .map(|(expected, indices)| WindowOrderMirror {
+                        expected: expected.clone(),
+                        ordered_tabs: indices
+                            .iter()
+                            .map(|index| Arc::clone(&tabs[*index]))
+                            .collect(),
+                        active_tab: Some(Arc::clone(&tabs[indices[0]])),
+                    })
+                    .collect(),
+            )
+            .expect("complete cyclic transfer");
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("after topology")
+                .1
+                .get(),
+            topology.1.get() + 1
+        );
+        for (index, state) in result.iter().enumerate() {
+            assert_eq!(
+                state.order_revision().get(),
+                before[index].order_revision().get() + 1
+            );
+            let window = mux.get_window(ids[index]).expect("restored window");
+            assert_eq!(
+                window.get_last_active_idx(),
+                None,
+                "moved active tab must not remain in local history"
+            );
+            assert!(
+                window.tab_stack_entries().is_empty(),
+                "source stack must not retain moved tabs"
+            );
+            for &tab_index in &target[index] {
+                assert_eq!(
+                    mux.window_containing_tab(tabs[tab_index].tab_id()),
+                    Some(ids[index])
+                );
+                assert!(Arc::ptr_eq(
+                    &mux.get_tab(tabs[tab_index].tab_id())
+                        .expect("registered tab"),
+                    &tabs[tab_index]
+                ));
+                assert!(Arc::ptr_eq(
+                    &mux.get_pane(panes[tab_index].pane_id())
+                        .expect("registered pane"),
+                    &panes[tab_index]
+                ));
+            }
+        }
+        assert!(fixtures
+            .iter()
+            .all(|(_, kills)| kills.load(Ordering::SeqCst) == 0));
+        drop(builders);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_order_mirrors_transfer_into_empty_window_is_atomic() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source = mux.new_empty_window(Some("mirror-source".into()), None);
+        let target = mux.new_empty_window(Some("mirror-target".into()), None);
+        let (tab, kills) = tab_with_kill_counter(&mux, 8110);
+        mux.add_tab_to_window(&tab, *source)
+            .expect("source attachment");
+        let snapshot = |id| {
+            mux.window_order_snapshot(id)
+                .expect("valid order")
+                .expect("window")
+        };
+        let before = [snapshot(*source), snapshot(*target)];
+        let projection = || {
+            vec![
+                WindowOrderMirror {
+                    expected: before[0].clone(),
+                    ordered_tabs: vec![],
+                    active_tab: None,
+                },
+                WindowOrderMirror {
+                    expected: before[1].clone(),
+                    ordered_tabs: vec![Arc::clone(&tab)],
+                    active_tab: Some(Arc::clone(&tab)),
+                },
+            ]
+        };
+        let topology = mux.topology_snapshot_authority().expect("topology");
+        let counts = mux.num_panes_by_workspace.read().clone();
+        mux.get_window_mut(*target)
+            .expect("target")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let mut exhausted = projection();
+        exhausted[1].expected = snapshot(*target);
+        assert!(mux.apply_window_order_mirrors(exhausted).is_err());
+        assert_eq!(
+            snapshot(*source).order_revision(),
+            before[0].order_revision()
+        );
+        assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(*source));
+        assert_eq!(
+            mux.topology_snapshot_authority().expect("topology"),
+            topology
+        );
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts);
+        assert!(mux.provisional_windows.lock().contains(&*target));
+        mux.get_window_mut(*target)
+            .expect("target")
+            .set_order_revision_for_test(before[1].order_revision());
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowTopologyChanged(change) = notification {
+                captured.lock().push(change);
+            }
+            true
+        })
+        .expect("subscribe");
+        let restored = mux
+            .apply_window_order_mirrors(projection())
+            .expect("atomic transfer");
+        assert!(restored[0].ordered_tabs().is_empty());
+        assert_eq!(restored[0].active_tab_id(), None);
+        assert_eq!(restored[1].active_tab_id(), Some(tab.tab_id()));
+        assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(*target));
+        mux.assert_tab_parent_index_matches_windows();
+        assert_eq!(
+            mux.get_window(*source)
+                .expect("source")
+                .structural_pane_count(),
+            0
+        );
+        assert_eq!(
+            mux.get_window(*target)
+                .expect("target")
+                .structural_pane_count(),
+            1
+        );
+        assert_eq!(
+            mux.num_panes_by_workspace.read().get("mirror-target"),
+            Some(&1)
+        );
+        let events = events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attached_tabs(), &[(tab.tab_id(), *target)]);
+        assert_eq!(events[0].created_windows(), &[*target]);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        drop(events);
+        drop(target);
+        drop(source);
         Mux::shutdown();
     }
 

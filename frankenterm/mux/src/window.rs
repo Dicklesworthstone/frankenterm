@@ -784,15 +784,16 @@ impl Window {
         let mut tabs = self.tabs.clone();
         let tab = tabs.remove(source_index);
         tabs.insert(destination_index, tab);
-        self.prepare_ordered_state(tabs, self.get_active().cloned())
+        self.prepare_ordered_state(tabs, self.get_active().cloned(), false)
     }
 
-    /// Prepare a complete permutation and active identity without changing
-    /// membership. The mux commits every affected window together; neither
-    /// preparation nor a rejected stale projection publishes callbacks.
+    /// Prepare one projection after the mux validates the complete batch's
+    /// exact membership. Neither preparation nor a rejected stale projection
+    /// publishes callbacks.
     pub(crate) fn prepare_mirror_order(
         &self,
         mirror: WindowOrderMirror,
+        membership_changed: bool,
     ) -> anyhow::Result<Option<PreparedWindowState>> {
         anyhow::ensure!(
             mirror.expected.window_id == self.id
@@ -813,17 +814,18 @@ impl Window {
             self.id,
         );
         anyhow::ensure!(
-            mirror.ordered_tabs.len() == self.tabs.len(),
+            membership_changed || mirror.ordered_tabs.len() == self.tabs.len(),
             "window {} ordered mirror must preserve membership",
             self.id,
         );
-        self.prepare_ordered_state(mirror.ordered_tabs, mirror.active_tab)
+        self.prepare_ordered_state(mirror.ordered_tabs, mirror.active_tab, membership_changed)
     }
 
     fn prepare_ordered_state(
         &self,
         tabs: Vec<Arc<Tab>>,
         active_tab: Option<Arc<Tab>>,
+        membership_changed: bool,
     ) -> anyhow::Result<Option<PreparedWindowState>> {
         let active = match active_tab.as_ref() {
             Some(active) => tabs
@@ -862,13 +864,27 @@ impl Window {
         } else {
             (self.last_active, None)
         };
+        let mut tab_stacks = self.tab_stacks.clone();
+        let last_active = if membership_changed {
+            let mut retained = HashSet::new();
+            retained.try_reserve(tabs.len())?;
+            retained.extend(tabs.iter().map(|tab| tab.tab_id()));
+            for tab in &self.tabs {
+                if !retained.contains(&tab.tab_id()) {
+                    tab_stacks.remove_tab(tab.tab_id());
+                }
+            }
+            last_active.filter(|tab_id| retained.contains(tab_id))
+        } else {
+            last_active
+        };
         self.prepare_complete_state(
             tabs,
             active,
             last_active,
-            self.tab_stacks.clone(),
+            tab_stacks,
             focus_lost,
-            false,
+            membership_changed,
         )
         .map(Some)
     }
@@ -2862,11 +2878,14 @@ mod tests {
         let stacks = window.tab_stack_entries();
         let before = window.order_snapshot().expect("original order");
         let state = window
-            .prepare_mirror_order(WindowOrderMirror {
-                expected: before,
-                ordered_tabs: vec![Arc::clone(&second), Arc::clone(&first)],
-                active_tab: Some(Arc::clone(&second)),
-            })
+            .prepare_mirror_order(
+                WindowOrderMirror {
+                    expected: before,
+                    ordered_tabs: vec![Arc::clone(&second), Arc::clone(&first)],
+                    active_tab: Some(Arc::clone(&second)),
+                },
+                false,
+            )
             .expect("complete permutation and active identity")
             .expect("changed order");
         assert!(!state.membership_changed());
@@ -2881,19 +2900,25 @@ mod tests {
         window.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
         let before = window.order_snapshot().expect("exhausted but valid order");
         assert!(window
-            .prepare_mirror_order(WindowOrderMirror {
-                expected: before.clone(),
-                ordered_tabs: before.ordered_tabs().to_vec(),
-                active_tab: before.active_tab().cloned(),
-            })
+            .prepare_mirror_order(
+                WindowOrderMirror {
+                    expected: before.clone(),
+                    ordered_tabs: before.ordered_tabs().to_vec(),
+                    active_tab: before.active_tab().cloned(),
+                },
+                false,
+            )
             .expect("no-op does not need a successor revision")
             .is_none());
         assert!(window
-            .prepare_mirror_order(WindowOrderMirror {
-                expected: before.clone(),
-                ordered_tabs: vec![Arc::clone(&first), Arc::clone(&second)],
-                active_tab: Some(Arc::clone(&first)),
-            })
+            .prepare_mirror_order(
+                WindowOrderMirror {
+                    expected: before.clone(),
+                    ordered_tabs: vec![Arc::clone(&first), Arc::clone(&second)],
+                    active_tab: Some(Arc::clone(&first)),
+                },
+                false,
+            )
             .is_err());
         assert_eq!(window.order_revision(), before.order_revision());
         assert_eq!(window.tab_stack_entries(), stacks);
