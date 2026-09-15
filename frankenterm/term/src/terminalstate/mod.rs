@@ -1040,9 +1040,11 @@ impl TerminalState {
     }
 
     /// Returns a mutable reference to the active screen (either the primary or
-    /// the alternate screen).
+    /// the alternate screen). A mutable borrow also serves read-side cache
+    /// maintenance and selection observation, so it must not advance seqno.
+    /// Actual model mutations advance it at their action, resize, or explicit
+    /// mutation boundary before publishing changed rows or coordinates.
     pub fn screen_mut(&mut self) -> &mut Screen {
-        self.increment_seqno();
         &mut self.screen
     }
 
