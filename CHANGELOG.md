@@ -37,6 +37,16 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Flexible-pane layout no longer reads terminal dimensions while planning a resize. This avoids waiting on the parser's terminal lock for dimensions that only fixed-size panes require.
 - WebGPU rendering reuses vertex buffers across frames and uploads only the active vertices. Glyph instances from earlier allocator borrows survive until the end of the same frame.
 - Font scaling retains a bounded cache of the previous scale, and text wrapping reuses validated geometry and scan state. The wrap planner preserves the greedy layout bound.
+- Resize wrapping preserves ordinary word boundaries in live and persisted history, retains every separator cell, and splits a word only when it is wider than a row. Geometry-cache keys include space positions so equal-width text cannot reuse another paragraph's word breaks.
+- Completed interactive layouts notify the GUI even when no cold-history layout is available. The GUI can paint a newly ready resize before its first pending-frame retry, while retaining bounded retry and surface-recovery rules.
+- Large background gradients use bounded parallel row generation with the same pixel calculations and noise stream as the serial path. Cancellation and allocation limits cover preparation as well as rasterization.
+- A retained cold-history prefix no longer changes the layout sequence when a compatible successor is already installed. Temporary storage contention during geometry comparison also leaves an unchanged layout sequence intact.
+- Font-size shortcuts preserve the window size by default and reflow its contents. Setting `adjust_window_size_when_changing_font_size = true` explicitly retains window resizing.
+
+The `0.15.6-rc.23` candidate includes these changes. The 50 ms resize target,
+100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
+reopen remain unqualified; this entry does not claim those acceptance goals
+are complete.
 
 - Recorder flush, health and lag positions now identify the start of the last record in both storage backends, including after reopening the log.
 - Cold-scrollback reads capture bounded snapshots, hydrate persisted text outside native UI locks, and validate the retained source before publication. Shared cold visual coordinates and codec v65 layout checks prevent delayed line replies from populating a newer layout. Cold invalidation visits cached rows rather than iterating the entire history range.
