@@ -4253,10 +4253,12 @@ impl RuntimeMetrics {
         if restarts == 0 {
             return;
         }
-        if let Ok(mut detector) = self.crash_detector.lock() {
-            for _ in 0..restarts {
-                detector.record_crash(now_secs);
-            }
+        let mut detector = self
+            .crash_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..restarts {
+            detector.record_crash(now_secs);
         }
     }
 
@@ -4264,26 +4266,21 @@ impl RuntimeMetrics {
     /// resets the consecutive-crash counter (the windowed `restart_count` /
     /// `in_crash_loop` still age out on their own).
     pub fn note_clean_observation(&self) {
-        if let Ok(mut detector) = self.crash_detector.lock() {
-            detector.record_success();
-        }
+        self.crash_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_success();
     }
 
-    /// ft-u6zfw: crash-loop diagnostics for `HealthSnapshot`. Falls back to a
-    /// healthy default if the detector lock is poisoned rather than panicking on
-    /// the snapshot publish path.
+    /// Read one coherent crash-loop observation at the snapshot's epoch time.
+    /// Preserve retained evidence after lock poisoning instead of inventing a
+    /// healthy state or silently disabling future lifecycle observations.
     #[must_use]
-    pub fn crash_loop_diagnostics(&self) -> crate::crash::CrashLoopDiagnostics {
-        self.crash_detector.lock().map_or_else(
-            |_| crate::crash::CrashLoopDiagnostics {
-                restart_count: 0,
-                last_crash_at: None,
-                consecutive_crashes: 0,
-                current_backoff_ms: 0,
-                in_crash_loop: false,
-            },
-            |detector| detector.diagnostics(),
-        )
+    pub fn crash_loop_diagnostics(&self, now_secs: u64) -> crate::crash::CrashLoopDiagnostics {
+        self.crash_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diagnostics_at(now_secs)
     }
 
     /// Record an ingest lag sample.
@@ -6463,6 +6460,8 @@ impl ObservationRuntime {
                     // ── end fleet coordinator tick ──────────────────────────
 
                     let snapshot_timestamp = epoch_ms_u64();
+                    let crash_diagnostics =
+                        metrics.crash_loop_diagnostics(snapshot_timestamp / 1000);
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
@@ -6500,11 +6499,11 @@ impl ObservationRuntime {
                         backpressure_tier,
                         last_activity_by_pane,
                         // ft-u6zfw: real crash-loop diagnostics (was hardcoded zeros).
-                        restart_count: metrics.crash_loop_diagnostics().restart_count,
-                        last_crash_at: metrics.crash_loop_diagnostics().last_crash_at,
-                        consecutive_crashes: metrics.crash_loop_diagnostics().consecutive_crashes,
-                        current_backoff_ms: metrics.crash_loop_diagnostics().current_backoff_ms,
-                        in_crash_loop: metrics.crash_loop_diagnostics().in_crash_loop,
+                        restart_count: crash_diagnostics.restart_count,
+                        last_crash_at: crash_diagnostics.last_crash_at,
+                        consecutive_crashes: crash_diagnostics.consecutive_crashes,
+                        current_backoff_ms: crash_diagnostics.current_backoff_ms,
+                        in_crash_loop: crash_diagnostics.in_crash_loop,
                         fleet_pressure_tier: Some(format!("{:?}", fleet_eval.compound_tier)),
                         fleet_scrollback_telemetry: Some(
                             tiered_scrollback_fetch.health_snapshot(&observed_pane_ids),
@@ -12246,6 +12245,9 @@ impl RuntimeHandle {
             classify_backpressure_tier(capture_depth, capture_cap, write_depth, write_cap);
 
         let snapshot_timestamp = epoch_ms_u64();
+        let crash_diagnostics = self
+            .metrics
+            .crash_loop_diagnostics(snapshot_timestamp / 1000);
         let snapshot = HealthSnapshot {
             timestamp: snapshot_timestamp,
             observed_panes,
@@ -12280,11 +12282,11 @@ impl RuntimeHandle {
             backpressure_tier,
             last_activity_by_pane,
             // ft-u6zfw: real crash-loop diagnostics (was hardcoded zeros).
-            restart_count: self.metrics.crash_loop_diagnostics().restart_count,
-            last_crash_at: self.metrics.crash_loop_diagnostics().last_crash_at,
-            consecutive_crashes: self.metrics.crash_loop_diagnostics().consecutive_crashes,
-            current_backoff_ms: self.metrics.crash_loop_diagnostics().current_backoff_ms,
-            in_crash_loop: self.metrics.crash_loop_diagnostics().in_crash_loop,
+            restart_count: crash_diagnostics.restart_count,
+            last_crash_at: crash_diagnostics.last_crash_at,
+            consecutive_crashes: crash_diagnostics.consecutive_crashes,
+            current_backoff_ms: crash_diagnostics.current_backoff_ms,
+            in_crash_loop: crash_diagnostics.in_crash_loop,
             fleet_pressure_tier: None,
             fleet_scrollback_telemetry: None,
             swarm_capacity: Some(
@@ -13854,7 +13856,7 @@ mod tests {
 
         let metrics = RuntimeMetrics::default();
         record_discovery_lifecycle_health(&metrics, diff.lifecycle_replacements.len(), 100);
-        let health = metrics.crash_loop_diagnostics();
+        let health = metrics.crash_loop_diagnostics(100);
         assert_eq!(health.restart_count, 0);
         assert_eq!(health.consecutive_crashes, 0);
         assert!(!health.in_crash_loop);
@@ -13878,9 +13880,38 @@ mod tests {
 
         let metrics = RuntimeMetrics::default();
         record_discovery_lifecycle_health(&metrics, replacement.lifecycle_replacements.len(), 100);
-        assert_eq!(metrics.crash_loop_diagnostics().restart_count, 1);
+        assert_eq!(metrics.crash_loop_diagnostics(100).restart_count, 1);
         record_discovery_lifecycle_health(&metrics, stable.lifecycle_replacements.len(), 101);
-        assert_eq!(metrics.crash_loop_diagnostics().restart_count, 1);
+        assert_eq!(metrics.crash_loop_diagnostics(101).restart_count, 1);
+    }
+
+    #[test]
+    fn crash_diagnostics_retain_evidence_and_updates_after_poison() {
+        let metrics = RuntimeMetrics::default();
+        metrics.record_observed_restarts(3, 100);
+        // Deliberately poison the lock after a complete observation; this
+        // test inspects the panic rather than installing a recovery boundary.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = metrics.crash_detector.lock().unwrap();
+            panic!("test-only crash detector poison");
+        }));
+        assert!(panic.is_err());
+        let retained = metrics.crash_loop_diagnostics(100);
+        assert_eq!(retained.restart_count, 3);
+        assert_eq!(retained.consecutive_crashes, 3);
+        assert!(retained.in_crash_loop);
+
+        metrics.record_observed_restarts(1, 101);
+        assert_eq!(metrics.crash_loop_diagnostics(101).restart_count, 4);
+        metrics.note_clean_observation();
+        let stable = metrics.crash_loop_diagnostics(101);
+        assert_eq!(stable.consecutive_crashes, 0);
+        assert_eq!(stable.current_backoff_ms, 0);
+        assert!(stable.in_crash_loop);
+        let expired = metrics.crash_loop_diagnostics(402);
+        assert_eq!(expired.restart_count, 0);
+        assert_eq!(expired.last_crash_at, Some(101));
+        assert!(!expired.in_crash_loop);
     }
 
     #[test]

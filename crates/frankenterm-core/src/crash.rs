@@ -7998,7 +7998,7 @@ impl CrashLoopDetector {
     /// Record a crash event at the given timestamp (epoch seconds).
     pub fn record_crash(&mut self, timestamp: u64) {
         self.crash_timestamps.push(timestamp);
-        self.consecutive_crashes += 1;
+        self.consecutive_crashes = self.consecutive_crashes.saturating_add(1);
         // Prune timestamps older than the window
         self.prune_old(timestamp);
     }
@@ -8069,6 +8069,21 @@ impl CrashLoopDetector {
             consecutive_crashes: self.consecutive_crashes,
             current_backoff_ms: self.next_delay_ms(),
             in_crash_loop: self.is_crash_loop(),
+        }
+    }
+
+    /// Observe the detection window at the reporting time, even when no new
+    /// crash has arrived to prune history. The last crash remains historical
+    /// evidence; only the window count and loop classification expire.
+    #[must_use]
+    pub fn diagnostics_at(&self, now_secs: u64) -> CrashLoopDiagnostics {
+        let restart_count = self.crashes_in_window(now_secs);
+        CrashLoopDiagnostics {
+            restart_count,
+            last_crash_at: self.last_crash_timestamp(),
+            consecutive_crashes: self.consecutive_crashes,
+            current_backoff_ms: self.next_delay_ms(),
+            in_crash_loop: restart_count != 0 && restart_count >= self.config.crash_threshold,
         }
     }
 
@@ -11748,6 +11763,50 @@ mod tests {
         assert_eq!(diag.consecutive_crashes, 0);
         assert!(diag.in_crash_loop); // window-based: 3 crashes still in 300s window
         assert_eq!(diag.current_backoff_ms, 0); // consecutive=0 → no backoff
+    }
+
+    #[test]
+    fn crash_diagnostics_expire_without_another_crash() {
+        let mut detector = CrashLoopDetector::new(CrashLoopConfig::default());
+        for timestamp in [100, 101, 102] {
+            detector.record_crash(timestamp);
+        }
+        detector.record_success();
+        let at_boundary = detector.diagnostics_at(400);
+        assert_eq!(at_boundary.restart_count, 3);
+        assert!(at_boundary.in_crash_loop);
+        let past_boundary = detector.diagnostics_at(401);
+        assert_eq!(past_boundary.restart_count, 2);
+        assert!(!past_boundary.in_crash_loop);
+        let expired = detector.diagnostics_at(403);
+        assert_eq!(expired.restart_count, 0);
+        assert_eq!(expired.last_crash_at, Some(102));
+        assert_eq!(expired.consecutive_crashes, 0);
+        assert_eq!(expired.current_backoff_ms, 0);
+        assert!(!expired.in_crash_loop);
+    }
+
+    #[test]
+    fn crash_diagnostics_consecutive_count_saturates() {
+        let mut detector = CrashLoopDetector::new(CrashLoopConfig::default());
+        detector.consecutive_crashes = u32::MAX;
+        detector.record_crash(100);
+        let diagnostics = detector.diagnostics_at(100);
+        assert_eq!(diagnostics.consecutive_crashes, u32::MAX);
+        assert_eq!(diagnostics.current_backoff_ms, 60_000);
+        assert_eq!(diagnostics.restart_count, 1);
+    }
+
+    #[test]
+    fn crash_diagnostics_empty_window_is_not_a_loop_with_zero_threshold() {
+        let mut detector = CrashLoopDetector::new(CrashLoopConfig {
+            crash_threshold: 0,
+            ..CrashLoopConfig::default()
+        });
+        assert!(!detector.diagnostics_at(100).in_crash_loop);
+        detector.record_crash(100);
+        assert!(detector.diagnostics_at(100).in_crash_loop);
+        assert!(!detector.diagnostics_at(401).in_crash_loop);
     }
 
     // -----------------------------------------------------------------------
