@@ -120,9 +120,26 @@ just code presence. Existing remote sessions remain outside the disposable test.
   Five real filesystem-watcher tests are authored. Root reviewed the complete
   diff; formatting and diff checks passed. Tests are not executed.
 - [x] Record watcher proof blocker in `ft-dmm4l` comment 9396 and mark blocked.
-- [ ] Re-run the disk admission gate before any Cargo/RCH proof. Latest check:
-  exit 2, critical, 45,758,001,152 of 1,995,218,165,760 bytes free (2.293%).
+- [x] Recheck the actual heavy-work volumes: vmi1264463 and the external SSD
+  both passed `sbh check --need 20G`. Local APFS pressure does not establish
+  that remote verification is blocked. Route returned artifacts and temporary
+  files to `/Volumes/USB_NVME/ft-release-20260915`.
 - [ ] Serialize proof after RubyFortress's existing vmi job 57273 ends.
+- [x] Run DSR doctor, host health, and repository configuration inspection.
+- [x] Prepare a validated private DSR configuration retaining all six checks,
+  with external artifact destinations and one Cargo compile job.
+- [x] Diagnose static preflight: 25 passed, four failed, eight Cargo checks
+  skipped. Unix import was already function-gated; explicit import gating
+  passes the bounded scanner (`78a2b54b6`).
+- [ ] Refresh the three README source counts and vendored provenance metadata.
+- [ ] Re-run generated-artifact cleanliness with a private index at final HEAD.
+- [ ] Agree the RC22 source freeze with all writers before native DSR starts.
+- [ ] Execute the nine health/watcher regressions and GUI gradient regressions.
+- [ ] Complete the full DSR quality checks with retained remote receipts.
+- [ ] Prove native selection, resize/reflow, and fixed-window font changes.
+- [ ] Build and verify DSR release artifacts, then publish the verified release.
+- [ ] Verify the release, matching-version canary, and upgrade asset discovery.
+- [ ] Activate the verified Mac application without losing existing sessions.
 
 This operator-requested TODO retires as an active checklist when its remaining
 work is completed or explicitly handed off with qualified evidence.
