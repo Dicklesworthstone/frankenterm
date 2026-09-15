@@ -1489,12 +1489,23 @@ impl BackgroundLoadCoordinator {
                                         .increment(1);
                                     return;
                                 };
-                                term_window.window_background = layers;
-                                if let Some(window) = term_window.window.as_ref() {
-                                    window.invalidate();
+                                let webgpu = term_window.webgpu.as_ref().cloned();
+                                let apply = || {
+                                    term_window.window_background = layers;
+                                    if let Some(window) = term_window.window.as_ref() {
+                                        window.invalidate();
+                                    }
+                                    metrics::counter!("gui.background.load_committed.total")
+                                        .increment(1);
+                                };
+                                if let Some(webgpu) = webgpu {
+                                    // Use the submission clock to distinguish
+                                    // background preparation from the native
+                                    // repaint wait after these pixels are ready.
+                                    webgpu.profile_native_stage("background_commit", apply);
+                                } else {
+                                    apply();
                                 }
-                                metrics::counter!("gui.background.load_committed.total")
-                                    .increment(1);
                             },
                         )));
                     } else {
