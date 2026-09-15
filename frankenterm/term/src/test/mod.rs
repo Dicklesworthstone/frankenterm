@@ -1613,8 +1613,16 @@ fn test_resize_wrap_kp_and_fallback_preserve_source_and_cursor() {
                         recovered.push(std::mem::take(&mut logical));
                     }
                 }
-                assert!(cursor_row < rows.len(), "{mode} cursor must remain visible");
-                assert!(logical.is_empty(), "{mode} left an unterminated soft wrap");
+                assert!(
+                    cursor_row < rows.len(),
+                    "{} cursor must remain visible",
+                    mode
+                );
+                assert!(
+                    logical.is_empty(),
+                    "{} left an unterminated soft wrap",
+                    mode
+                );
                 assert!(recovered.len() > paragraphs.len());
                 assert_eq!(
                     &recovered[..paragraphs.len()],
