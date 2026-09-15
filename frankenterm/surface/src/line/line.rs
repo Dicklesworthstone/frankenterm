@@ -3280,15 +3280,15 @@ fn greedy_break_offsets_from_width_prefix(
         let mut start = 0;
         while start < token_count {
             let mut end = start;
-            let mut last_boundary = None;
+            let mut last_allowed_break = None;
             while end < token_count {
                 let next = end + 1;
                 if end > start && width_prefix.width_between(start, next) > width {
                     break;
                 }
                 end = next;
-                if width_prefix.word_boundary(end) {
-                    last_boundary = Some(end);
+                if width_prefix.allowed_word_break(start, end, width) {
+                    last_allowed_break = Some(end);
                 }
                 if width_prefix.width_between(start, end) > width {
                     break;
@@ -3297,7 +3297,7 @@ fn greedy_break_offsets_from_width_prefix(
             let stop = if end == token_count {
                 end
             } else {
-                last_boundary.unwrap_or(end)
+                last_allowed_break.unwrap_or(end)
             };
             offsets.push(stop);
             start = stop;
@@ -3662,6 +3662,30 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn leading_space_before_overwide_word_does_not_waste_a_row() {
+        let source = Line::from_text(" abcdef", &CellAttributes::default(), 7, None);
+        for fallback in [false, true] {
+            let mut model = MonospaceKpCostModel::terminal_default();
+            if fallback {
+                model.max_dp_states = 0;
+            }
+            let report = source.clone().wrap_with_report(5, 7, model);
+            let rows: Vec<String> = report
+                .lines
+                .iter()
+                .map(|row| row.as_str().into_owned())
+                .collect();
+            assert_eq!(rows.concat(), " abcdef");
+            assert_eq!(rows.len(), 2, "an overwide word can use the first row");
+            assert!(rows.iter().all(|row| row.len() <= 5));
+            assert!(rows.iter().all(|row| row.chars().any(|c| c != ' ')));
+            if fallback {
+                assert_eq!(rows, [" abcd", "ef"]);
+            }
+        }
+    }
 
     #[test]
     fn prose_wrap_has_exact_source_preserving_rows_in_dp_and_fallback() {
