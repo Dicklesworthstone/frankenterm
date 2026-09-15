@@ -34,7 +34,7 @@ use frankenterm_term::UnicodeVersion;
 use lazy_static::lazy_static;
 use ordered_float::NotNan;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 #[cfg(unix)]
@@ -908,7 +908,167 @@ struct ConfigInner {
     warnings: Vec<String>,
     generation: usize,
     watcher: Option<notify::RecommendedWatcher>,
+    registered_watch_paths: BTreeSet<PathBuf>,
+    watch_dependencies: Arc<Mutex<ConfigWatchDependencies>>,
+    last_good_watch_dependencies: ConfigWatchDependencies,
     subscribers: HashMap<usize, Box<dyn Fn() -> bool + Send>>,
+}
+
+/// Dependency identities are distinct from directories watched only to observe
+/// atomic replacement. A sibling event in those directories is not a reload.
+#[derive(Clone, Default)]
+struct ConfigWatchDependencies {
+    paths: BTreeMap<PathBuf, bool>,
+    registrations: BTreeSet<PathBuf>,
+}
+
+impl ConfigWatchDependencies {
+    fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut dependencies = Self::default();
+        for path in paths {
+            let path = std::path::absolute(&path).unwrap_or(path);
+            let directory = path.is_dir();
+            dependencies.add_alias(path.clone(), directory);
+            if let Ok(resolved) = path.canonicalize() {
+                dependencies.add_alias(resolved, directory);
+            }
+            // Keep the name even while it is absent during an atomic save.
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                if let Ok(parent) = parent.canonicalize() {
+                    dependencies.add_alias(parent.join(name), directory);
+                }
+            }
+            // Watch each symlink itself as well as its resolved target. This
+            // also covers a symlinked ancestor being replaced or retargeted.
+            for ancestor in path.ancestors() {
+                let mut link = ancestor.to_path_buf();
+                for _ in 0..40 {
+                    let Ok(target) = std::fs::read_link(&link) else {
+                        break;
+                    };
+                    dependencies.add_alias(link.clone(), false);
+                    link = if target.is_absolute() {
+                        target
+                    } else {
+                        link.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                    };
+                    dependencies.add_alias(link.clone(), false);
+                }
+            }
+        }
+        dependencies
+    }
+
+    fn add_alias(&mut self, path: PathBuf, directory: bool) {
+        // Resolve the parent but retain the leaf name: canonicalizing the full
+        // path would lose an intermediate symlink's own retarget identity.
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if let Ok(parent) = parent.canonicalize() {
+                self.insert_alias(parent.join(name), directory);
+            }
+        }
+        self.insert_alias(path, directory);
+    }
+
+    fn insert_alias(&mut self, path: PathBuf, directory: bool) {
+        self.paths
+            .entry(path.clone())
+            .and_modify(|value| *value |= directory)
+            .or_insert(directory);
+        self.registrations.insert(path.clone());
+        if let Some(parent) = path.parent() {
+            self.registrations.insert(parent.to_path_buf());
+        }
+    }
+
+    fn relevant(&self, event: &notify::Result<notify::Event>) -> bool {
+        use notify::{event::ModifyKind, EventKind};
+        let event = match event {
+            Ok(event) => event,
+            Err(_) => return true,
+        };
+        if event.need_rescan() || (event.kind == EventKind::Any && event.paths.is_empty()) {
+            return true;
+        }
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any
+        ) {
+            return false;
+        }
+        let can_replace_ancestor = matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(ModifyKind::Name(_))
+                | EventKind::Any
+        );
+        event.paths.iter().any(|path| {
+            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+            self.paths.iter().any(|(dependency, directory)| {
+                dependency == &absolute
+                    || (*directory && absolute.starts_with(dependency))
+                    || (can_replace_ancestor && dependency.starts_with(&absolute))
+            })
+        })
+    }
+}
+
+fn reconcile_config_watches(
+    watcher: &mut impl notify::Watcher,
+    registered: &mut BTreeSet<PathBuf>,
+    desired: &BTreeSet<PathBuf>,
+) {
+    // Retire first, then refresh every desired watch: on inode-based backends
+    // two path aliases can share a watch, and unwatching one can retire both.
+    let obsolete: Vec<_> = registered.difference(desired).cloned().collect();
+    for path in obsolete {
+        match watcher.unwatch(&path) {
+            Ok(()) => {
+                registered.remove(&path);
+            }
+            Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => {
+                registered.remove(&path);
+            }
+            Err(error) => log::warn!("unable to retire config watch {:?}: {error:#}", path),
+        }
+    }
+    for path in desired {
+        match watcher.watch(path, notify::RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                registered.insert(path.clone());
+            }
+            Err(error) => log::warn!("unable to watch config dependency {:?}: {error:#}", path),
+        }
+    }
+}
+
+fn run_config_watch_events(
+    rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    dependencies: Arc<Mutex<ConfigWatchDependencies>>,
+    mut reload_config: impl FnMut(),
+) {
+    let relevant = |event: &_| {
+        dependencies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .relevant(event)
+    };
+    while let Ok(event) = rx.recv() {
+        log::debug!("config filesystem event: {:?}", event);
+        if !relevant(&event) {
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // Every event, including watcher errors, is consumed. A relevant first
+        // event already requires reload; draining cannot cancel that decision.
+        for _ in 0..4096 {
+            if rx.try_recv().is_err() {
+                break;
+            }
+        }
+        reload_config();
+    }
 }
 
 #[track_caller]
@@ -944,6 +1104,9 @@ impl ConfigInner {
             warnings: vec![],
             generation: 0,
             watcher: None,
+            registered_watch_paths: BTreeSet::new(),
+            watch_dependencies: Arc::new(Mutex::new(ConfigWatchDependencies::default())),
+            last_good_watch_dependencies: ConfigWatchDependencies::default(),
             subscribers: HashMap::new(),
         }
     }
@@ -976,10 +1139,12 @@ impl ConfigInner {
         self.generation = generation;
     }
 
-    fn watch_path(&mut self, path: PathBuf) {
+    fn update_watch_paths(&mut self, paths: BTreeSet<PathBuf>) {
+        if paths.is_empty() && self.watcher.is_none() {
+            return;
+        }
         if self.watcher.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
-            const DELAY: Duration = Duration::from_millis(200);
             // `notify::recommended_watcher` can fail on platforms where
             // filesystem change notifications are unavailable — CI
             // sandboxes without inotify, minimal Linux containers, WSL1
@@ -1000,68 +1165,29 @@ impl ConfigInner {
                         "unable to install filesystem watcher for config reload \
                          (path {:?}): {err:#}; running without fs-watch, \
                          explicit reload()/SIGHUP still works",
-                        path
+                        paths
                     );
                     return;
                 }
             };
-            let watched_path = path.clone();
+            let dependencies = Arc::clone(&self.watch_dependencies);
 
             let event_thread = std::thread::Builder::new()
                 .name("config-file-watcher".to_string())
-                .spawn(move || {
-                    // block until we get an event
-                    use notify::EventKind;
-
-                    fn extract_path(event: notify::Event) -> Vec<PathBuf> {
-                        match event.kind {
-                            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
-                                event.paths
-                            }
-                            _ => vec![],
-                        }
-                    }
-
-                    while let Ok(event) = rx.recv() {
-                        log::debug!("event:{:?}", event);
-                        match event {
-                            Ok(event) => {
-                                let mut paths = extract_path(event);
-                                if !paths.is_empty() {
-                                    // Grace period to allow events to settle
-                                    std::thread::sleep(DELAY);
-                                    // Drain any other immediately ready events
-                                    while let Ok(Ok(event)) = rx.try_recv() {
-                                        paths.append(&mut extract_path(event));
-                                    }
-                                    paths.sort();
-                                    paths.dedup();
-                                    log::debug!("paths {:?} changed, reload config", watched_path);
-                                    reload();
-                                }
-                            }
-                            Err(_) => {
-                                reload();
-                            }
-                        }
-                    }
-                });
+                .spawn(move || run_config_watch_events(rx, dependencies, reload));
             if let Err(err) = event_thread {
                 log::warn!(
                     "unable to spawn config filesystem watcher thread \
                      (path {:?}): {err:#}; running without fs-watch, \
                      explicit reload()/SIGHUP still works",
-                    path
+                    paths
                 );
                 return;
             }
             self.watcher.replace(watcher);
         }
         if let Some(watcher) = self.watcher.as_mut() {
-            use notify::Watcher;
-            watcher
-                .watch(&path, notify::RecursiveMode::NonRecursive)
-                .ok();
+            reconcile_config_watches(watcher, &mut self.registered_watch_paths, &paths);
         }
     }
 
@@ -1096,22 +1222,35 @@ impl ConfigInner {
         // any paths that we should be watching
         let mut watch_paths = vec![];
         if let Some(path) = file_name {
-            // Let's also watch the parent directory for folks that do
-            // things with symlinks:
-            if let Some(parent) = path.parent() {
-                // But avoid watching the home dir itself, so that we
-                // don't keep reloading every time something in the
-                // home dir changes!
-                // <https://github.com/wezterm/wezterm/issues/1895>
-                if parent != &*HOME_DIR {
-                    watch_paths.push(parent.to_path_buf());
-                }
-            }
             watch_paths.push(path);
         }
         if let Some(lua) = &lua {
             ConfigInner::accumulate_watch_paths(lua, &mut watch_paths);
         }
+
+        let mut dependencies = ConfigWatchDependencies::from_paths(watch_paths);
+        if config.is_err() {
+            // An invalid edit must retain watches for the last good Lua imports
+            // so fixing an imported module can recover the configuration.
+            let previous = &self.last_good_watch_dependencies;
+            for (path, directory) in &previous.paths {
+                dependencies
+                    .paths
+                    .entry(path.clone())
+                    .and_modify(|value| *value |= *directory)
+                    .or_insert(*directory);
+            }
+            dependencies
+                .registrations
+                .extend(previous.registrations.clone());
+        } else {
+            self.last_good_watch_dependencies = dependencies.clone();
+        }
+        let watch_paths = dependencies.registrations.clone();
+        *self
+            .watch_dependencies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = dependencies;
 
         match config {
             Ok(config) => {
@@ -1140,9 +1279,13 @@ impl ConfigInner {
 
         self.notify();
         if self.config.automatically_reload_config {
-            for path in watch_paths {
-                self.watch_path(path);
-            }
+            self.update_watch_paths(watch_paths);
+        } else {
+            *self
+                .watch_dependencies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = ConfigWatchDependencies::default();
+            self.update_watch_paths(BTreeSet::new());
         }
     }
 
@@ -1353,6 +1496,222 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+
+    struct RealConfigWatcher {
+        watcher: Option<notify::RecommendedWatcher>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        dependencies: Arc<Mutex<ConfigWatchDependencies>>,
+        registered: BTreeSet<PathBuf>,
+        generations: std::sync::mpsc::Receiver<usize>,
+    }
+
+    impl RealConfigWatcher {
+        fn new(paths: Vec<PathBuf>) -> Self {
+            let (events_tx, events_rx) = std::sync::mpsc::channel();
+            let (generation_tx, generations) = std::sync::mpsc::channel();
+            let dependencies = Arc::new(Mutex::new(ConfigWatchDependencies::from_paths(paths)));
+            let mut watcher = notify::recommended_watcher(events_tx).expect("real native watcher");
+            let mut registered = BTreeSet::new();
+            reconcile_config_watches(
+                &mut watcher,
+                &mut registered,
+                &dependencies.lock().unwrap().registrations,
+            );
+            assert_eq!(registered, dependencies.lock().unwrap().registrations);
+            let observed = Arc::clone(&dependencies);
+            let worker = std::thread::spawn(move || {
+                let mut config = ConfigInner::new();
+                run_config_watch_events(events_rx, observed, || {
+                    config.install_config(Config::default_config(), None);
+                    generation_tx.send(config.generation).unwrap();
+                });
+            });
+            Self {
+                watcher: Some(watcher),
+                worker: Some(worker),
+                dependencies,
+                registered,
+                generations,
+            }
+        }
+
+        fn refresh(&mut self, paths: Vec<PathBuf>) {
+            let dependencies = ConfigWatchDependencies::from_paths(paths);
+            reconcile_config_watches(
+                self.watcher.as_mut().unwrap(),
+                &mut self.registered,
+                &dependencies.registrations,
+            );
+            assert_eq!(self.registered, dependencies.registrations);
+            *self.dependencies.lock().unwrap() = dependencies;
+        }
+
+        fn changed(&self) -> usize {
+            self.generations
+                .recv_timeout(Duration::from_secs(5))
+                .expect("relevant native event must advance config generation")
+        }
+
+        fn quiet(&self) {
+            assert!(
+                matches!(
+                    self.generations.recv_timeout(Duration::from_millis(600)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "unrelated native events must not advance configuration generation"
+            );
+        }
+    }
+
+    impl Drop for RealConfigWatcher {
+        fn drop(&mut self) {
+            drop(self.watcher.take());
+            if let Some(worker) = self.worker.take() {
+                if let Err(payload) = worker.join() {
+                    if !std::thread::panicking() {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_watcher_filters_siblings_and_preserves_atomic_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let config = root.join("config.lua");
+        std::fs::write(&config, "return {}").unwrap();
+        let mut watcher = RealConfigWatcher::new(vec![config.clone()]);
+        watcher.quiet();
+        let unrelated = root.join("diagnostic.log");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        std::fs::write(&unrelated, "more unrelated output").unwrap();
+        std::fs::rename(&unrelated, root.join("rotated.log")).unwrap();
+        watcher.quiet();
+
+        std::fs::write(&config, "return {font_size=12}").unwrap();
+        let first = watcher.changed();
+        watcher.quiet();
+        let replacement = root.join("replacement.lua");
+        std::fs::write(&replacement, "return {font_size=13}").unwrap();
+        watcher.quiet();
+        std::fs::rename(&replacement, &config).unwrap();
+        assert!(watcher.changed() > first);
+        watcher.refresh(vec![config.clone()]);
+        watcher.quiet();
+        std::fs::write(&config, "return {font_size=14}").unwrap();
+        watcher.changed();
+        watcher.quiet();
+        let removed = root.join("removed.lua");
+        std::fs::rename(&config, &removed).unwrap();
+        watcher.changed();
+        watcher.quiet();
+        std::fs::rename(&removed, &config).unwrap();
+        watcher.changed();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_watcher_follows_symlink_retarget_and_target_atomic_save() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let targets = root.join("targets");
+        std::fs::create_dir(&targets).unwrap();
+        let first = targets.join("first.lua");
+        let second = targets.join("second.lua");
+        std::fs::write(&first, "return {}").unwrap();
+        std::fs::write(&second, "return {}").unwrap();
+        let config = root.join("config.lua");
+        std::fs::create_dir(root.join("links")).unwrap();
+        let intermediate = root.join("target-link");
+        symlink(&first, &intermediate).unwrap();
+        symlink("links/../target-link", &config).unwrap();
+        let mut watcher = RealConfigWatcher::new(vec![config.clone()]);
+        watcher.quiet();
+        std::fs::write(&first, "return {font_size=11}").unwrap();
+        watcher.changed();
+        watcher.quiet();
+        let replacement = root.join("new-link");
+        symlink(&second, &replacement).unwrap();
+        std::fs::rename(&replacement, &intermediate).unwrap();
+        watcher.changed();
+        watcher.refresh(vec![config.clone()]);
+        watcher.quiet();
+        std::fs::write(&first, "old target must no longer reload").unwrap();
+        watcher.quiet();
+        std::fs::write(&second, "return {font_size=12}").unwrap();
+        watcher.changed();
+        watcher.quiet();
+        let new_target = targets.join("replacement.lua");
+        std::fs::write(&new_target, "return {font_size=13}").unwrap();
+        std::fs::rename(&new_target, &second).unwrap();
+        watcher.changed();
+        watcher.quiet();
+        symlink(&first, &replacement).unwrap();
+        std::fs::rename(&replacement, &config).unwrap();
+        watcher.changed();
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn config_watcher_preserves_lua_registered_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let config = root.join("config.lua");
+        let dependency = root.join("module.lua");
+        std::fs::write(&config, "return {}").unwrap();
+        std::fs::write(&dependency, "return {}").unwrap();
+        let lua = Lua::new();
+        lua.set_named_registry_value(
+            "wezterm-watch-paths",
+            vec![dependency.to_str().unwrap().to_owned()],
+        )
+        .unwrap();
+        let mut paths = vec![config];
+        ConfigInner::accumulate_watch_paths(&lua, &mut paths);
+        let watcher = RealConfigWatcher::new(paths);
+        watcher.quiet();
+        std::fs::write(root.join("unrelated.lua"), "return {}").unwrap();
+        watcher.quiet();
+        std::fs::write(&dependency, "return { changed = true }").unwrap();
+        watcher.changed();
+        watcher.quiet();
+        let replacement = root.join("new-module.lua");
+        std::fs::write(&replacement, "return { changed = false }").unwrap();
+        std::fs::rename(&replacement, &dependency).unwrap();
+        watcher.changed();
+    }
+
+    #[test]
+    fn config_watcher_errors_and_rescan_are_not_filtered() {
+        let dependencies = ConfigWatchDependencies::default();
+        assert!(dependencies.relevant(&Ok(notify::Event::new(notify::EventKind::Any))));
+        assert!(dependencies.relevant(&Err(notify::Error::generic("backend failure"))));
+        assert!(dependencies.relevant(&Ok(
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        )));
+        assert!(
+            !dependencies.relevant(&Ok(notify::Event::new(notify::EventKind::Access(
+                notify::event::AccessKind::Any
+            ))))
+        );
+    }
+
+    #[test]
+    fn config_watcher_explicit_directory_dependency_remains_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let watched = root.join("registered-directory");
+        std::fs::create_dir(&watched).unwrap();
+        let watcher = RealConfigWatcher::new(vec![watched.clone()]);
+        watcher.quiet();
+        std::fs::write(root.join("unrelated.log"), "ignored").unwrap();
+        watcher.quiet();
+        std::fs::write(watched.join("new-module.lua"), "return {}").unwrap();
+        watcher.changed();
+    }
 
     #[test]
     fn config_subscription_allocator_uses_the_last_unreserved_identity_once() {
