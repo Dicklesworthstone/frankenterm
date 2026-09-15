@@ -34,6 +34,9 @@ impl Menu {
         event: id,
         mut owns_event: impl FnMut() -> bool,
     ) -> bool {
+        let profile_start =
+            log::log_enabled!(target: "window::font_menu_profile", log::Level::Debug)
+                .then(std::time::Instant::now);
         let main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
         if main_thread != YES || event.is_null() || !owns_event() {
             return false;
@@ -159,12 +162,19 @@ impl Menu {
             }
             // May synchronously invoke WindowView::frankenterm_perform_key_assignment.
             // No WindowInner borrow is held here.
+            let dispatch_start = profile_start.map(|_| std::time::Instant::now());
             let handled: BOOL = msg_send![*menu.menu, performKeyEquivalent: event];
-            if handled == YES {
+            if let (Some(profile_start), Some(dispatch_start)) = (profile_start, dispatch_start) {
+                // Both durations include the synchronous font action, when one
+                // runs. The route duration starts at this callback, not at the
+                // physical key event; it does not measure AppKit queue delay.
                 log::debug!(
                     target: "window::font_menu_profile",
-                    "event=font_menu_accelerator_dispatch route={}",
+                    "event=font_menu_accelerator_dispatch route={} handled={} route_duration_us={} menu_duration_us={}",
                     if index == last { "font_parent" } else { "preceding_menu" },
+                    handled == YES,
+                    profile_start.elapsed().as_micros(),
+                    dispatch_start.elapsed().as_micros(),
                 );
             }
             Some(handled == YES)
