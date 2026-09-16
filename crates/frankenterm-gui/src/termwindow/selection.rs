@@ -712,10 +712,19 @@ fn selected_lines_from_logical_lines(
     let mut join_previous = false;
     while let Some((row, line)) = rows.next() {
         let cols = sel.cols_for_row(row, rectangular);
+        // BeforeZero on the next soft-wrapped row selects no cells there.
+        // It is an endpoint, not a continuation that makes trailing blanks
+        // significant. A hard line break still belongs to the selection.
+        let ends_before_wrapped_row = !rectangular
+            && line.last_cell_was_wrapped()
+            && rows.peek().is_some_and(|(next, _)| {
+                row.checked_add(1) == Some(*next) && sel.cols_for_row(*next, false).is_empty()
+            });
         // Container boundaries may be synthetic budget cuts. Only the actual
         // selected contiguous wrapped cells determine continuation. Rectangles
         // remain separate physical rows even across terminal soft wraps.
         let continues = !rectangular
+            && !ends_before_wrapped_row
             && cols.end >= line.len()
             && line.last_cell_was_wrapped()
             && rows.peek().is_some_and(|(next, _)| {
@@ -737,6 +746,9 @@ fn selected_lines_from_logical_lines(
             result.push(span);
         }
         join_previous = continues;
+        if ends_before_wrapped_row {
+            break;
+        }
     }
     result
 }
@@ -750,6 +762,49 @@ mod tests {
     use proptest::prelude::*;
     use termwiz::cell::{CellAttributes, unicode_column_width};
     use termwiz::surface::SEQ_ZERO;
+
+    #[test]
+    fn native_selection_before_zero_endpoint_trims_soft_wrap_tail_but_preserves_hard_newline() {
+        for wrapped in [false, true] {
+            let mut first = Line::from_text("A ", &CellAttributes::default(), SEQ_ZERO, None);
+            first.set_last_cell_was_wrapped(wrapped, SEQ_ZERO);
+            let next = Line::from_text("B", &CellAttributes::default(), SEQ_ZERO, None);
+            let lines = vec![logical_line_from_physical(vec![first, next])];
+            for reverse in [false, true] {
+                let start = SelectionCoordinate::x_y(0, 0);
+                let end = SelectionCoordinate {
+                    x: SelectionX::BeforeZero,
+                    y: 1,
+                };
+                let selection = if reverse {
+                    SelectionRange {
+                        start: end,
+                        end: start,
+                    }
+                } else {
+                    SelectionRange { start, end }
+                };
+                assert_eq!(
+                    selected_text_from_logical_lines(&lines, selection, false),
+                    if wrapped { "A" } else { "A\n" }
+                );
+            }
+        }
+        let lines = vec![logical_line_from_physical(vec![
+            Line::from_text("A", &CellAttributes::default(), SEQ_ZERO, None),
+            Line::from_text("", &CellAttributes::default(), SEQ_ZERO, None),
+            Line::from_text("B", &CellAttributes::default(), SEQ_ZERO, None),
+        ])];
+        assert_eq!(
+            selected_text_from_logical_lines(
+                &lines,
+                SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+                    .extend(SelectionCoordinate::x_y(0, 2)),
+                false,
+            ),
+            "A\n\nB"
+        );
+    }
 
     #[test]
     fn bounded_logical_groups_preserve_selected_wrapped_spaces_in_text_and_lines() {

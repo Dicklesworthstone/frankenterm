@@ -1210,6 +1210,21 @@ mod tests {
                 selection.remember_native_anchor(token.clone());
                 let expected = live_native_selection_text(&term, &selection);
                 assert!(!expected.is_empty());
+                if !starts_before {
+                    let row = term.screen().lines_in_phys_range(2..3).remove(0);
+                    assert_eq!(row.len(), 38);
+                    assert_eq!(
+                        row.as_str(),
+                        "café e\u{301} 中文 🙂 end café e\u{301} 中文 🙂 end "
+                    );
+                    assert!(row.last_cell_was_wrapped());
+                    // Endpoint extraction trims trailing blanks regardless of
+                    // whether the endpoint lies at a physical soft wrap.
+                    assert_eq!(
+                        expected,
+                        "café e\u{301} 中文 🙂 end café e\u{301} 中文 🙂 end"
+                    );
+                }
                 size.cols = 80;
                 term.resize(size);
                 let sequence = term.current_seqno();
@@ -1223,6 +1238,14 @@ mod tests {
                     ..selection.authority.unwrap()
                 };
                 assert!(selection.rebase_native_anchor(points, authority, sequence));
+                if !starts_before {
+                    let endpoint = if reverse {
+                        selection.range.unwrap().start
+                    } else {
+                        selection.range.unwrap().end
+                    };
+                    assert_eq!(endpoint, SelectionCoordinate::x_y(37, 2));
+                }
                 assert_eq!(
                     live_native_selection_text(&term, &selection),
                     expected,
