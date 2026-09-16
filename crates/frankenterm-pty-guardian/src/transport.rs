@@ -952,6 +952,10 @@ impl GuardianService {
     pub fn bind(config: GuardianServiceConfig) -> Result<Self, GuardianServiceError> {
         validate_private_parent(&config.socket_path)?;
         validate_private_parent(&config.token_path)?;
+        if let Some(endpoint) = config.broker_endpoint.as_ref() {
+            validate_private_parent(&endpoint.socket_path)?;
+            validate_distinct_broker_storage(&config.token_path, &endpoint.token_path)?;
+        }
         preflight_private_unix_listener_path(&config.socket_path)?;
         let (secret, mut token_authority) =
             load_guardian_secret_with_authority(&config.token_path)?;
@@ -994,7 +998,7 @@ impl GuardianService {
         )?;
         if let Some(endpoint) = config.broker_endpoint.as_ref() {
             validate_private_parent(&endpoint.socket_path)?;
-            validate_private_parent(&endpoint.token_path)?;
+            validate_distinct_broker_storage(&config.token_path, &endpoint.token_path)?;
             runtime.configure_broker(endpoint.clone())?;
         }
         let endpoint_capacity = config
@@ -4131,6 +4135,29 @@ fn open_private_parent(path: &Path) -> Result<std::fs::File, GuardianServiceErro
     Ok(directory)
 }
 
+/// Both processes derive their output directory from the token's parent.
+/// Distinct token filenames alone therefore do not establish separate stores.
+fn validate_distinct_broker_storage(
+    guardian_token: &Path,
+    broker_token: &Path,
+) -> Result<(), GuardianServiceError> {
+    let guardian_parent = open_private_parent(guardian_token)?;
+    let broker_parent = open_private_parent(broker_token)?;
+    let guardian = guardian_parent
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("guardian-storage-parent", error))?;
+    let broker = broker_parent
+        .metadata()
+        .map_err(|error| GuardianServiceError::io("broker-storage-parent", error))?;
+    if guardian.dev() == broker.dev() && guardian.ino() == broker.ino() {
+        return Err(GuardianServiceError::InvalidConfiguration(
+            "broker and receiving guardian require distinct private token directories",
+        ));
+    }
+    validate_pinned_private_parent(guardian_token, &guardian_parent)?;
+    validate_pinned_private_parent(broker_token, &broker_parent)
+}
+
 fn validate_pinned_private_parent(
     path: &Path,
     directory: &std::fs::File,
@@ -5791,6 +5818,16 @@ mod tests {
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_genesis_service_spawns_once_and_journals_broker_output_before_ack() {
+        run_configured_genesis_service(false);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_genesis_service_retries_original_permit_after_broker_starts() {
+        run_configured_genesis_service(true);
+    }
+
+    fn run_configured_genesis_service(broker_initially_absent: bool) {
         use crate::broker::{BrokerControlServiceConfigV1, BrokerControlServiceV1};
         use mux::guardian_protocol::{
             GuardianCheckpointDescriptorV1, GuardianCheckpointOutputBoundaryV1,
@@ -5815,16 +5852,22 @@ mod tests {
         let token = directory.join("token");
         provision_guardian_token(&token).unwrap();
         let socket = directory.join("guardian.sock");
-        let broker_socket = directory.join("broker.sock");
-        let spawn_catalog = directory.join("spawn-catalog");
-        let lease_catalog = directory.join("lease-catalog");
+        let broker_directory = directory.join("broker");
+        std::fs::create_dir(&broker_directory).unwrap();
+        std::fs::set_permissions(&broker_directory, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let broker_token = broker_directory.join("token");
+        provision_guardian_token(&broker_token).unwrap();
+        let broker_socket = broker_directory.join("broker.sock");
+        let spawn_catalog = broker_directory.join("spawn-catalog");
+        let lease_catalog = broker_directory.join("lease-catalog");
         for path in [&spawn_catalog, &lease_catalog] {
             std::fs::create_dir(path).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let broker_config = BrokerControlServiceConfigV1::new(
             broker_socket.clone(),
-            token.clone(),
+            broker_token.clone(),
             spawn_catalog,
             lease_catalog,
             build,
@@ -5842,7 +5885,7 @@ mod tests {
             Duration::from_millis(2),
         )
         .unwrap()
-        .with_broker_endpoint(broker_socket, token.clone())
+        .with_broker_endpoint(broker_socket.clone(), broker_token)
         .unwrap();
         let marker = directory.join("child-count");
         let expected = b"genesis-wire-output";
@@ -5850,13 +5893,27 @@ mod tests {
         std::thread::scope(|scope| {
             let stop_guard = StopOnDrop(&stop);
             let (broker_ready_tx, broker_ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (broker_start_tx, broker_start_rx) = std::sync::mpsc::sync_channel(1);
             let broker_stop = &stop;
             let broker = scope.spawn(move || {
+                loop {
+                    if broker_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match broker_start_rx.recv_timeout(Duration::from_millis(2)) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
                 let mut service = BrokerControlServiceV1::bind(broker_config).unwrap();
                 broker_ready_tx.send(()).unwrap();
                 service.run_until(broker_stop).unwrap();
             });
-            broker_ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            if !broker_initially_absent {
+                broker_start_tx.send(()).unwrap();
+                broker_ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            }
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let (proof_tx, proof_rx) = std::sync::mpsc::sync_channel(1);
             let guardian_stop = &stop;
@@ -5909,6 +5966,18 @@ mod tests {
                 .stage_genesis_checkpoint(effect, descriptor, terminal.canonical_payload(), 1_024)
                 .unwrap();
             assert!(!marker.exists(), "staging alone created a child");
+            if broker_initially_absent {
+                assert!(!broker_socket.exists());
+                assert!(
+                    client
+                        .spawn(pane, request, effect, command(), size)
+                        .is_err()
+                );
+                assert!(!marker.exists(), "missing broker still created a child");
+                broker_start_tx.send(()).unwrap();
+                broker_ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                client = GuardianClient::connect_for_genesis(&socket, &token, mux).unwrap();
+            }
             let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
             loop {
                 match client.spawn(pane, request, effect, command(), size) {
@@ -6029,6 +6098,9 @@ mod tests {
             guardian.join().unwrap();
             broker.join().unwrap();
             println!("GENESIS_RUNTIME_BROKER_OUTPUT_SUCCESS");
+            if broker_initially_absent {
+                println!("GENESIS_RUNTIME_RETAINED_PERMIT_RETRY_SUCCESS");
+            }
         });
     }
 
@@ -6717,6 +6789,52 @@ mod tests {
             std::fs::read(retained_parent.join("guardian.token")).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn broker_storage_collision_is_rejected_before_any_service_artifact() {
+        let directory = tempfile::Builder::new()
+            .prefix("ft-broker-storage-separation-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guardian_token = directory.join("guardian.token");
+        let broker_token = directory.join("broker.token");
+        let socket = directory.join("guardian.sock");
+        let config = GuardianServiceConfig::new(
+            socket.clone(),
+            guardian_token.clone(),
+            8,
+            1,
+            65_536,
+            65_536,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .with_broker_endpoint(directory.join("broker.sock"), broker_token.clone())
+        .unwrap();
+        assert!(matches!(
+            GuardianService::bind(config),
+            Err(GuardianServiceError::InvalidConfiguration(
+                "broker and receiving guardian require distinct private token directories"
+            ))
+        ));
+        assert!(!socket.exists());
+        assert!(!guardian_token.exists());
+        assert!(!broker_token.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+
+        let separate = directory.join("broker-private");
+        std::fs::create_dir(&separate).unwrap();
+        std::fs::set_permissions(&separate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        validate_distinct_broker_storage(&guardian_token, &separate.join("token")).unwrap();
+        let alias = directory.join("broker-alias");
+        symlink(&separate, &alias).unwrap();
+        assert!(matches!(
+            validate_distinct_broker_storage(&guardian_token, &alias.join("token")),
+            Err(GuardianServiceError::FilesystemSecurity(_))
+        ));
     }
 
     #[test]

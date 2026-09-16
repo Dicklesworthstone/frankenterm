@@ -3190,6 +3190,7 @@ impl GuardianCheckpointStageStore {
     /// Open or continue one immutable, process-local replay snapshot.
     /// Plaintext is never retained in the ledger: an exact retry reopens and
     /// reauthenticates the pinned encrypted artifacts into a fresh delivery.
+    #[cfg(test)]
     pub(crate) fn apply_replay(
         &self,
         request: &AuthenticatedGuardianRequest,

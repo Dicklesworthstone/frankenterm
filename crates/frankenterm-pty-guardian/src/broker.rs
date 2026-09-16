@@ -23481,6 +23481,13 @@ mod tests {
         let token_path = root.join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
             .expect("provision control Spawn token");
+        // Broker retention and receiving guardian journals are independent
+        // durable owners, even though they refer to the same pane identity.
+        let receiving_directory = root.join("receiving-guardian");
+        fs::create_dir(&receiving_directory).unwrap();
+        fs::set_permissions(&receiving_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let receiving_token_path = receiving_directory.join("guardian.token");
+        crate::transport::provision_guardian_token(&receiving_token_path).unwrap();
         let broker_build = sealed(0xd5);
         let service = BrokerControlServiceV1::bind(
             BrokerControlServiceConfigV1::new(
@@ -23539,8 +23546,9 @@ mod tests {
             },
             &sentinel,
         );
-        let admission = real_genesis
-            .then(|| publish_test_genesis_admission(&token_path, &payload, connection_identity));
+        let admission = real_genesis.then(|| {
+            publish_test_genesis_admission(&receiving_token_path, &payload, connection_identity)
+        });
         assert!(
             !sentinel.exists(),
             "Genesis publication must not spawn a child"
@@ -23657,7 +23665,7 @@ mod tests {
         let custody_waker =
             Arc::new(Waker::new(custody_poll.registry(), Token(1)).expect("custody waker"));
         let custody_pipeline =
-            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
                 .expect("open encrypted custody store");
         let custody_store = custody_pipeline.checkpoint_stage_store();
         for cut in [1, 2] {
@@ -23695,7 +23703,7 @@ mod tests {
         drop(custody_store);
         drop(custody_pipeline);
         let custody_pipeline =
-            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
                 .expect("reopen persisted key with only interrupted custody staging on disk");
         let custody_store = custody_pipeline.checkpoint_stage_store();
         let durable_custody = client
@@ -24760,7 +24768,7 @@ mod tests {
         drop(custody_store);
         drop(custody_pipeline);
         let reopened_pipeline =
-            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
                 .expect("load persisted encryption key and custody in a fresh store");
         let custody_store = reopened_pipeline.checkpoint_stage_store();
         let recovered_custody = restarted_client

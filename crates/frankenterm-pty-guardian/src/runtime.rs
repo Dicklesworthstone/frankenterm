@@ -198,6 +198,8 @@ struct StartingBrokerPane {
     input_journal: Option<GuardianPaneInputJournal>,
     activated: bool,
     original_spawn: Option<AuthenticatedGuardianRequest>,
+    original_begin: Option<AuthenticatedGuardianRequest>,
+    retry_before_publication: Option<Box<GenesisSpawnJob>>,
     activation: Option<GuardianGenesisActivationContinuationV1>,
     replay_origin: Option<GuardianGenesisReplayOriginV1>,
 }
@@ -662,6 +664,7 @@ struct GenesisSpawnCompletion {
     output_journal: Option<GuardianPaneOutputJournal>,
     input_journal: Option<GuardianPaneInputJournal>,
     replay_origin: Option<GuardianGenesisReplayOriginV1>,
+    retry_before_publication: Option<Box<GenesisSpawnJob>>,
 }
 
 struct CheckpointWorkerCompletion {
@@ -780,20 +783,32 @@ fn checkpoint_worker(
         // preflight-decoded Chunk owned by the job. Wipe that owner before
         // publishing completion just like the authenticated wire request.
         drop(job.admitted_genesis_stage.take());
-        let genesis_spawn = job
-            .genesis_spawn
-            .take()
-            .map(|spawn| GenesisSpawnCompletion {
+        let genesis_spawn = job.genesis_spawn.take().map(|mut spawn| {
+            let retryable = spawn.permit.is_some()
+                && !spawn.broker_attempted
+                && !worker_panicked
+                && !token_authority_failed;
+            let mut completion = GenesisSpawnCompletion {
                 mux_incarnation: job.request.header().mux_incarnation,
                 pane_id: job.request.header().pane_id.unwrap_or(Uuid::nil()),
-                session: spawn.session,
-                handle: spawn.handle,
+                session: spawn.session.take(),
+                handle: spawn.handle.take(),
                 initial_pending: spawn.submitted,
                 broker_attempted: spawn.broker_attempted,
-                output_journal: spawn.output_journal,
-                input_journal: spawn.input_journal,
-                replay_origin: spawn.replay_origin,
-            });
+                output_journal: None,
+                input_journal: None,
+                replay_origin: None,
+                retry_before_publication: None,
+            };
+            if retryable {
+                completion.retry_before_publication = Some(Box::new(spawn));
+            } else {
+                completion.output_journal = spawn.output_journal;
+                completion.input_journal = spawn.input_journal;
+                completion.replay_origin = spawn.replay_origin;
+            }
+            completion
+        });
         // Keep the authenticated Begin itself, never a reconstructed request,
         // for the later Spawn reservation. Its fixed descriptor contains no
         // terminal plaintext; every other request is wiped before handoff.
@@ -1017,20 +1032,24 @@ fn execute_genesis_spawn_job(store: &GuardianCheckpointStageStore, job: &mut Che
     let Ok(payload) = GuardianSpawnPayload::decode(job.request.payload()) else {
         return;
     };
-    let Ok(output) = spawn
-        .preparation
-        .prepare_output(job.protocol.incarnation(), pane_id)
-    else {
-        return;
-    };
-    spawn.output_journal = Some(output);
-    let Ok(input) = spawn
-        .preparation
-        .prepare_input(job.protocol.incarnation(), pane_id)
-    else {
-        return;
-    };
-    spawn.input_journal = Some(input);
+    if spawn.output_journal.is_none() {
+        let Ok(output) = spawn
+            .preparation
+            .prepare_output(job.protocol.incarnation(), pane_id)
+        else {
+            return;
+        };
+        spawn.output_journal = Some(output);
+    }
+    if spawn.input_journal.is_none() {
+        let Ok(input) = spawn
+            .preparation
+            .prepare_input(job.protocol.incarnation(), pane_id)
+        else {
+            return;
+        };
+        spawn.input_journal = Some(input);
+    }
     // Establish the authenticated broker connection before publishing. Neither
     // this handshake nor staging can create a PTY; only the published permit
     // below reaches the broker's durable Spawn transaction.
@@ -2171,6 +2190,14 @@ impl GuardianRuntime {
             {
                 return reject(&request, GuardianRejectionCode::RequestIdentityConflict);
             }
+            if existing.retry_before_publication.is_some() {
+                return self.resubmit_genesis_before_publication(
+                    request,
+                    route,
+                    token_effect_authority,
+                    connection,
+                );
+            }
             if existing.failed_before_spawn {
                 return reject(&request, GuardianRejectionCode::InternalInvariant);
             }
@@ -2268,11 +2295,12 @@ impl GuardianRuntime {
                 input_journal: None,
                 activated: false,
                 original_spawn: None,
+                original_begin: self.genesis_begins.remove(&(mux_incarnation, effect_id)),
+                retry_before_publication: None,
                 activation: Some(activation),
                 replay_origin: None,
             },
         );
-        self.genesis_begins.remove(&(mux_incarnation, effect_id));
         let job = CheckpointJob {
             route,
             protocol,
@@ -2295,6 +2323,101 @@ impl GuardianRuntime {
                 input_journal: None,
                 replay_origin: None,
             }),
+            broker_control: None,
+            replay_origin: None,
+        };
+        match self.checkpoint_pipeline.try_submit(job) {
+            Ok(()) => GuardianCheckpointSubmission::Pending,
+            Err(CheckpointSubmitError::Saturated(job)) => {
+                self.pending_genesis_submission = Some(job);
+                GuardianCheckpointSubmission::CloseRetryably
+            }
+            Err(CheckpointSubmitError::Unavailable(job)) => {
+                self.pending_genesis_submission = Some(job);
+                self.checkpoint_pipeline_failed = true;
+                GuardianCheckpointSubmission::CloseRetryably
+            }
+        }
+    }
+
+    fn resubmit_genesis_before_publication(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        token_effect_authority: WorkerTokenEffectAuthority,
+        connection_authority: &GuardianAuthenticatedMuxConnectionAuthorityV1,
+    ) -> GuardianCheckpointSubmission {
+        let Some(pane_id) = request.header().pane_id else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let (Some(protocol), Some(begin), Some(retry)) = (
+            self.protocol.as_ref(),
+            pane.original_begin.as_ref(),
+            pane.retry_before_publication.as_ref(),
+        ) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        if retry.permit.is_none() || retry.broker_attempted || pane.original_spawn.is_none() {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        let authorization = protocol
+            .live_build_authority_for_genesis()
+            .and_then(|live| {
+                protocol.preflight_genesis_checkpoint_stage(begin, connection_authority, &live)
+            });
+        if let Err(error) = authorization {
+            return GuardianCheckpointSubmission::Respond(GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::from_protocol_error(&error),
+            ));
+        }
+        let Some(connection) = self.broker_connections.get_mut(&pane.mux_incarnation) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        if connection.active_pane.is_some() {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        if let Some(worker) = connection.worker.as_mut() {
+            match worker.try_take_session() {
+                Ok(Some(session)) => connection.retained_session = Some(session),
+                Ok(None) => return GuardianCheckpointSubmission::CloseRetryably,
+                Err(_) => {
+                    connection.failed = true;
+                    return GuardianCheckpointSubmission::CloseRetryably;
+                }
+            }
+        }
+        drop(connection.worker.take());
+        let (mut retry, original_request, protocol) = match (
+            pane.retry_before_publication.take(),
+            pane.original_spawn.take(),
+            self.protocol.take(),
+        ) {
+            (Some(retry), Some(original_request), Some(protocol)) => {
+                (retry, original_request, protocol)
+            }
+            (retry, original_request, protocol) => {
+                pane.retry_before_publication = retry;
+                pane.original_spawn = original_request;
+                self.protocol = protocol;
+                return GuardianCheckpointSubmission::CloseRetryably;
+            }
+        };
+        retry.session = connection.retained_session.take();
+        connection.failed = false;
+        pane.failed_before_spawn = false;
+        let job = CheckpointJob {
+            route,
+            protocol,
+            request: original_request,
+            journal: None,
+            token_effect_authority,
+            admitted_genesis_stage: None,
+            retain_genesis_begin: false,
+            genesis_spawn: Some(*retry),
             broker_control: None,
             replay_origin: None,
         };
@@ -2744,11 +2867,13 @@ impl GuardianRuntime {
                 }
                 if let Some(spawn) = completion.genesis_spawn {
                     let failed = completion.worker_panicked || completion.token_authority_failed;
+                    let retry_before_publication = spawn.retry_before_publication.is_some();
                     if let Some(pane) = self.starting_broker_panes.get_mut(&spawn.pane_id) {
                         pane.handle = spawn.handle;
                         pane.output = spawn.output_journal.map(RuntimePaneOutput::new);
                         pane.input_journal = spawn.input_journal;
                         pane.replay_origin = spawn.replay_origin;
+                        pane.retry_before_publication = spawn.retry_before_publication;
                         pane.original_spawn = completion.genesis_spawn_request;
                         pane.initial_pending = spawn.initial_pending && pane.handle.is_none();
                         pane.failed_before_spawn = !spawn.broker_attempted;
@@ -2764,10 +2889,13 @@ impl GuardianRuntime {
                         }
                         if let Some(request) = pane.original_spawn.as_ref() {
                             if !spawn.broker_attempted {
-                                completion.response = Some(GuardianResponseEnvelope::rejection(
-                                    request,
-                                    GuardianRejectionCode::InternalInvariant,
-                                ));
+                                if !retry_before_publication {
+                                    completion.response =
+                                        Some(GuardianResponseEnvelope::rejection(
+                                            request,
+                                            GuardianRejectionCode::InternalInvariant,
+                                        ));
+                                }
                             } else if failed || (pane.handle.is_none() && !pane.initial_pending) {
                                 if let (Some(protocol), Some(activation)) =
                                     (self.protocol.as_mut(), pane.activation.as_ref())
@@ -2810,7 +2938,7 @@ impl GuardianRuntime {
                                 }
                             }
                         } else {
-                            connection.failed = true;
+                            connection.failed = !retry_before_publication;
                         }
                     }
                     if self
@@ -6261,6 +6389,8 @@ mod tests {
                 input_journal: None,
                 activated: false,
                 original_spawn: None,
+                original_begin: None,
+                retry_before_publication: None,
                 activation: None,
                 replay_origin: None,
             },
