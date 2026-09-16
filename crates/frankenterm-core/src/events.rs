@@ -2118,6 +2118,14 @@ impl NotificationCooldown {
     ///
     /// On `Suppress`: the caller should skip the notification.
     pub fn check(&mut self, key: &str) -> CooldownVerdict {
+        self.check_at(key, Instant::now())
+    }
+
+    /// Check at a caller-sampled monotonic instant.
+    ///
+    /// Supply nondecreasing instants from the same clock. This permits a batch
+    /// to share an observation time and makes cooldown boundaries deterministic.
+    pub fn check_at(&mut self, key: &str, now: Instant) -> CooldownVerdict {
         // [ft-w80kj] Zero capacity means cooldown tracking is disabled; do
         // not retain hidden state for a single key. Without this guard, the
         // len>=max_capacity eviction branch is entered with len=0 and cap=0,
@@ -2129,8 +2137,6 @@ impl NotificationCooldown {
                 suppressed_since_last: 0,
             };
         }
-        let now = Instant::now();
-
         if let Some(entry) = self.entries.get_mut(key) {
             if now.duration_since(entry.last_notified) < self.cooldown {
                 // Still in cooldown: suppress. Refresh the insertion_order
@@ -4226,13 +4232,13 @@ mod tests {
     #[test]
     fn cooldown_expired_sends_with_suppressed_count() {
         let mut cd = NotificationCooldown::with_config(Duration::from_millis(10), 100);
-        cd.check("k"); // Send(0)
-        cd.check("k"); // Suppress(1)
-        cd.check("k"); // Suppress(2)
-        std::thread::sleep(Duration::from_millis(20));
+        let now = Instant::now();
+        cd.check_at("k", now); // Send(0)
+        cd.check_at("k", now); // Suppress(1)
+        cd.check_at("k", now); // Suppress(2)
         // After cooldown expires, sends with suppressed count
         assert_eq!(
-            cd.check("k"),
+            cd.check_at("k", now + Duration::from_millis(10)),
             CooldownVerdict::Send {
                 suppressed_since_last: 2
             }
@@ -4242,13 +4248,19 @@ mod tests {
     #[test]
     fn cooldown_reset_after_send() {
         let mut cd = NotificationCooldown::with_config(Duration::from_millis(10), 100);
-        cd.check("k");
-        cd.check("k"); // Suppress(1)
-        std::thread::sleep(Duration::from_millis(20));
-        cd.check("k"); // Send(1) - resets counter
+        let now = Instant::now();
+        cd.check_at("k", now);
+        cd.check_at("k", now); // Suppress(1)
+        let expired = now + Duration::from_millis(10);
+        assert_eq!(
+            cd.check_at("k", expired),
+            CooldownVerdict::Send {
+                suppressed_since_last: 1
+            }
+        );
         // Now within cooldown again, suppressed count starts fresh
         assert_eq!(
-            cd.check("k"),
+            cd.check_at("k", expired),
             CooldownVerdict::Suppress {
                 total_suppressed: 1
             }
@@ -4434,26 +4446,24 @@ mod tests {
     // silently losing its cooldown state and flooding a notification that
     // should have carried a suppressed-count.
     //
-    // The test uses a short cooldown so we can observe the expired branch
-    // without slow wall-clock sleeps: 5ms cooldown + 50ms sleep is well
-    // outside the Instant::now() resolution floor on all supported
-    // platforms.
+    // Explicit instants exercise the expiry boundary without scheduler races.
     #[test]
     fn cooldown_expired_send_refreshes_lru_position_ft_hyrav() {
         let mut cd = NotificationCooldown::with_config(Duration::from_millis(5), 3);
+        let now = Instant::now();
 
         // Seed A, B, C in insertion order. Each is a first-occurrence
         // Send; insertion_order is [A, B, C].
-        cd.check("a");
-        cd.check("b");
-        cd.check("c");
+        cd.check_at("a", now);
+        cd.check_at("b", now);
+        cd.check_at("c", now);
         assert_eq!(cd.len(), 3);
 
         // Let A's cooldown expire, then re-check. Pre-fix: entry
         // last_notified bumped, but insertion_order stayed [A, B, C].
         // Post-fix: insertion_order becomes [B, C, A].
-        std::thread::sleep(Duration::from_millis(50));
-        let verdict = cd.check("a");
+        let expired = now + Duration::from_millis(5);
+        let verdict = cd.check_at("a", expired);
         assert!(
             matches!(verdict, CooldownVerdict::Send { .. }),
             "A's cooldown expired so check must emit Send, got {verdict:?}"
@@ -4463,21 +4473,10 @@ mod tests {
         // oldest by INSERTION is A, so A gets evicted even though it
         // was just refreshed. Post-fix: B is now the oldest-by-use,
         // so B is evicted.
-        cd.check("d");
+        cd.check_at("d", expired);
         assert_eq!(cd.len(), 3);
 
-        // The key observation: A's state must SURVIVE the D insert.
-        // If A was evicted (pre-fix behavior), re-checking A returns
-        // Send { suppressed_since_last: 0 } — indistinguishable from
-        // a first-occurrence. If A survived (post-fix), the entry is
-        // still in cooldown (its last_notified is ~50ms ago, still
-        // < 5ms, wait — actually 50ms > 5ms so cooldown has expired
-        // again). So we can't detect survival via Suppress alone.
-        //
-        // Instead, assert the deterministic LRU outcome: B must be
-        // the one that's gone. Re-checking B after eviction returns
-        // Send with suppressed_since_last=0 (first-occurrence shape),
-        // and cd.len() stays at 3.
+        // A survives and remains in cooldown; B is the eviction victim.
         assert!(
             cd.get("b").is_none(),
             "ft-hyrav: B must be evicted (oldest-by-use after A was refreshed), but it's still present"
@@ -4485,6 +4484,12 @@ mod tests {
         assert!(
             cd.get("a").is_some(),
             "ft-hyrav: A was just refreshed — it must NOT be the eviction victim"
+        );
+        assert_eq!(
+            cd.check_at("a", expired),
+            CooldownVerdict::Suppress {
+                total_suppressed: 1
+            }
         );
     }
 
@@ -5418,27 +5423,27 @@ mod tests {
     #[test]
     fn e2e_cooldown_suppressed_count_reported_on_send() {
         let mut cooldown = NotificationCooldown::with_config(Duration::from_millis(10), 100);
+        let now = Instant::now();
 
         // First: Send (0 suppressed)
         assert_eq!(
-            cooldown.check("key_a"),
+            cooldown.check_at("key_a", now),
             CooldownVerdict::Send {
                 suppressed_since_last: 0
             }
         );
 
         // Suppress 3 events within cooldown
-        for _ in 0..3 {
-            let v = cooldown.check("key_a");
-            assert!(matches!(v, CooldownVerdict::Suppress { .. }));
+        for total_suppressed in 1..=3 {
+            assert_eq!(
+                cooldown.check_at("key_a", now),
+                CooldownVerdict::Suppress { total_suppressed }
+            );
         }
-
-        // Wait for cooldown to expire
-        std::thread::sleep(Duration::from_millis(15));
 
         // Next check: Send with suppressed count = 3
         assert_eq!(
-            cooldown.check("key_a"),
+            cooldown.check_at("key_a", now + Duration::from_millis(10)),
             CooldownVerdict::Send {
                 suppressed_since_last: 3
             }

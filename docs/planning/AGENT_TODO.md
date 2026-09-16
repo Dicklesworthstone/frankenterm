@@ -833,3 +833,23 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Complete exact-source formatting, Clippy and all six DSR quality gates;
   qualify all native targets, final-family acceptance and four actual producers
   before signing, publication or session-preserving installation.
+
+### 2026-09-16 — scheduler-independent cooldown qualification
+
+- [x] Diagnose actual RCH31929 failure in
+  `cooldown_expired_includes_suppressed_count`: three unchecked calls within a
+  real 10 ms window can expire and reset the count when the worker is preempted.
+- [x] Add explicit monotonic `check_at` to the unchanged cooldown state machine;
+  normal `check` samples the clock once. Replace the affected integration and
+  unit timing assumptions with exact suppression, expiry, reset and LRU checks.
+- [x] Obtain independent source review and exact-file formatting/diff checks.
+- [ ] Execute strict remote cooldown regressions for `ft-nb5kl`, then complete
+  the final source's full workspace, Clippy and formatting checks. Existing
+  `939da9667` receipts remain bound to that earlier source; RC29 is untagged.
+- [ ] Execute the three audited, non-foreground GUI selection tests through
+  the opt-in `glyphcache_unit` target on the final source. Native mouse input,
+  visual output and latency still require separate native acceptance.
+- [ ] Complete successor topology integration under `.8.14.3.2` and `.3.4`,
+  including stable window/tab identities, titles, tab-stack membership/visible
+  member and last-active history. Inert image reconstruction is not live
+  successor recovery; preserve that distinction in release claims.
