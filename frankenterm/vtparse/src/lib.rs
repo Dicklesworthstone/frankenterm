@@ -390,6 +390,11 @@ impl OscState {
         }
 
         if param == ';' {
+            // A leading separator closes an empty first field, just as a
+            // separator after text closes the field initialized below.
+            if self.num_params == 0 {
+                self.num_params = 1;
+            }
             match self.num_params {
                 MAX_OSC => {
                     self.full = true;
@@ -401,7 +406,7 @@ impl OscState {
                     });
                 }
                 num => {
-                    self.param_indices[num.saturating_sub(1)] = self.buffer.len();
+                    self.param_indices[num - 1] = self.buffer.len();
                     self.num_params += 1;
                 }
             }
@@ -1091,6 +1096,49 @@ mod test {
             parse_as_vec(b"\x1b]\x07"),
             vec![VTAction::OscDispatch(vec![])]
         );
+    }
+
+    #[test]
+    fn test_osc_preserves_empty_fields_at_parameter_limit() {
+        for field_count in 2..=MAX_OSC {
+            let input = format!("\x1b]{}\x07", ";".repeat(field_count - 1));
+            assert_eq!(
+                parse_as_vec(input.as_bytes()),
+                vec![VTAction::OscDispatch(vec![Vec::new(); field_count])]
+            );
+        }
+
+        let input = format!("\x1b]{}\x07", ";".repeat(MAX_OSC));
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        parser.parse(input.as_bytes(), &mut actor);
+        assert_eq!(actor.into_vec(), Vec::new());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::OperatingSystemCommand,
+                maximum: MAX_OSC,
+            })
+        );
+    }
+
+    #[test]
+    fn test_osc_preserves_leading_and_trailing_empty_fields_across_chunks() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        for byte in b"\x1b];hello;;\x07" {
+            parser.parse(&[*byte], &mut actor);
+        }
+        assert_eq!(
+            actor.into_vec(),
+            vec![VTAction::OscDispatch(vec![
+                Vec::new(),
+                b"hello".to_vec(),
+                Vec::new(),
+                Vec::new(),
+            ])]
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
     }
 
     #[test]

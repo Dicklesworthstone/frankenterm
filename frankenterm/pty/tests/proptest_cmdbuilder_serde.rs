@@ -212,15 +212,55 @@ fn golden_command_builder_env_cwd_umask_wire_format() {
     assert_command_builder_golden(&cmd, include_str!("goldens/command_builder_env_cwd.json"));
 }
 
+#[test]
+fn command_builder_json_roundtrip_repeated_env_assignment() {
+    // Retain the minimized full-workspace failure, then exercise replacement
+    // with a different value. Environment assignment is not a multimap.
+    for final_value in [" ", "replacement"] {
+        let cmd = build_command(
+            &["¡".to_string()],
+            None,
+            &[
+                ("/".to_string(), " ".to_string()),
+                ("/".to_string(), final_value.to_string()),
+            ],
+            false,
+        );
+        let back: CommandBuilder =
+            serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        assert_eq!(back, cmd);
+        assert_eq!(
+            back.iter_extra_env_as_str().collect::<Vec<_>>(),
+            vec![("/", final_value)]
+        );
+    }
+}
+
+#[test]
+fn command_builder_json_roundtrip_env_key_case() {
+    let mut cmd = CommandBuilder::new("ft");
+    cmd.env_clear();
+    cmd.env("FT_KEY", "first");
+    cmd.env("ft_key", "last");
+    let back: CommandBuilder = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+    assert_eq!(back, cmd);
+    let expected = if cfg!(windows) {
+        vec![("ft_key", "last")]
+    } else {
+        vec![("FT_KEY", "first"), ("ft_key", "last")]
+    };
+    assert_eq!(back.iter_extra_env_as_str().collect::<Vec<_>>(), expected);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     /// JSON roundtrip for CommandBuilder argv, cwd, controlling_tty, and env.
     ///
     /// Note: `env_clear()` is called to remove the process-inherited
-    /// `BTreeMap<OsString, EnvEntry>` base environment. Generated env
-    /// pairs use ASCII-safe `String` keys that serialize as valid JSON
-    /// map keys.
+    /// base environment. Generated Unicode keys may repeat; the last
+    /// assignment wins (case-insensitively on Windows), retaining its spelling.
+    /// The wire representation is a sequence of lossless OS-string pairs.
     #[test]
     fn command_builder_json_roundtrip(
         argv in arb_args(),
@@ -232,13 +272,19 @@ proptest! {
 
         let json = serde_json::to_string(&cmd).unwrap();
         let back: CommandBuilder = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back, &cmd);
 
         let expected_argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
         prop_assert_eq!(back.get_argv(), &expected_argv);
         prop_assert_eq!(back.get_controlling_tty(), controlling_tty);
         prop_assert_eq!(back.get_cwd().cloned(), cwd.clone().map(OsString::from));
 
-        let mut expected_env = env_pairs.clone();
+        let mut assigned_env = std::collections::BTreeMap::new();
+        for (key, value) in &env_pairs {
+            let identity = if cfg!(windows) { key.to_lowercase() } else { key.clone() };
+            assigned_env.insert(identity, (key.clone(), value.clone()));
+        }
+        let mut expected_env: Vec<_> = assigned_env.into_values().collect();
         expected_env.sort();
         let mut actual_env: Vec<(String, String)> = back
             .iter_extra_env_as_str()
@@ -446,13 +492,11 @@ proptest! {
     ) {
         use std::os::unix::ffi::OsStringExt;
 
-        // Two different invalid-UTF-8 byte sequences — both contain a lone
-        // continuation byte (0x80) but at a different position, so neither
-        // is valid UTF-8 and both would render as U+FFFD under lossy
-        // conversion, collapsing to the same String key.
-        let key_a = OsString::from_vec(vec![0x80, 0x41]);
-        let key_b = OsString::from_vec(vec![0x42, 0x80]);
-        prop_assume!(key_a != key_b);
+        // Distinct lone continuation bytes both render as exactly U+FFFD.
+        let key_a = OsString::from_vec(vec![0x80]);
+        let key_b = OsString::from_vec(vec![0x81]);
+        prop_assert_ne!(&key_a, &key_b);
+        prop_assert_eq!(key_a.to_string_lossy(), key_b.to_string_lossy());
 
         let mut cmd = CommandBuilder::new("/bin/true");
         cmd.env_clear();

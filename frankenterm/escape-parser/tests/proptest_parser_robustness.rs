@@ -219,6 +219,15 @@ fn render_canonical_actions(actions: &[Action]) -> String {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+#[test]
+fn leading_empty_osc_fields_are_a_render_fixed_point() {
+    // Minimized property failure: C1 OSC, two separators, then a C1 control
+    // that ends the sequence. Neither empty field may disappear on reparse.
+    let rendered = parse_and_render(&[0x9d, b';', b';', 0x80]);
+    assert_eq!(rendered, "\x1b];;\x1b\\");
+    assert_eq!(parse_and_render(rendered.as_bytes()), rendered);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
