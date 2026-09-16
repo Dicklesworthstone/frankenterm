@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 193,
-        "fix": 227,
+        "fix": 230,
         "other": 46,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 90
       },
-      "fork_side_commit_count": 626,
+      "fork_side_commit_count": 629,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-16T16:13:53-04:00",
-        "sha": "c812e3c0dad647e6ef927ecbe195904f2cc47de1",
-        "subject": "test(bocpd): enforce the observation-count warmup boundary"
+        "classification": "fix",
+        "committed_at": "2026-09-16T16:40:01-04:00",
+        "sha": "578bc9fcf6debe82756812d9f5c31705c8986a77",
+        "subject": "fix(guardian): require durable custody before successor acknowledgement"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2678,
-  "generated_at": "2026-09-16T20:22:39.054303Z",
+  "fork_side_commit_total": 2681,
+  "generated_at": "2026-09-16T20:43:49.394480Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
