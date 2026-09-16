@@ -48,9 +48,11 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Native window creation waits for the first attached tab and uses its actual geometry. A delayed tab attachment wakes reconciliation instead of leaving the window at an invented 80×24 size until the next resize.
 - Snapshot-change diagnostics agree with the typed transient error while retaining the exhausted retry budget. Text reads emit one transaction summary, including when they fail.
 - macOS application packaging includes the transitive native library dependencies, relocates their loader paths, and retains their license notices and provenance. Packaging rejects unresolved dependencies and verifies that source binaries remain unchanged.
-- The guardian broker's Spawn acknowledgment now requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Ordinary broker-backed pane activation and full mux recovery remain unfinished.
+- The guardian broker's Spawn acknowledgment requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Explicit guardian-domain opt-in now connects fresh child creation, durable output, terminal replay and mux pane publication. Cancellation retires the pane lease without terminating the child; an unpublished birth prevents another spawn until reconciled. This does not migrate existing sessions or enable successor attachment, guardian restart recovery, or full mux recovery.
+- Broker output acknowledgements authenticate the exact durable terminal journal record instead of rereading every earlier record. Foreign receipts, corruption, truncation and poisoned storage remain errors.
+- Fenced text replies report the exact captured layout range, so a clamped or rebased history read cannot be accepted as the originally requested range.
 
-The `0.15.6-rc.25` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.26` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.

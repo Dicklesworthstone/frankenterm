@@ -1,7 +1,7 @@
-//! Production-disabled PTY broker typestate foundation.
+//! PTY broker ownership, authenticated control, and durable birth admission.
 //!
 //! This module models the process-local ownership and authority transitions
-//! needed by a future separately spawned broker process. The broker retains
+//! used by the separately spawned broker process. The broker retains
 //! the sole PTY master and exposes bounded authenticated proxy operations;
 //! guardians never receive a master descriptor. That is essential because an
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
@@ -20,11 +20,11 @@
 //! catalog members remain read-only and cannot share a pane, effect, journal,
 //! or origin-request namespace with a new Spawn. Exact effect acknowledgement
 //! now durably transfers a retained Spawn result into live-pane authority;
-//! live-pane startup adoption, activation wiring, durable output replay, and
-//! successor lease rotation
-//! must still land before any production selector may start it. The
-//! process-local PTY typestate below therefore still does **not** prove guardian-`SIGKILL`
-//! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
+//! live-pane startup adoption, activation, and durable output replay are wired
+//! through the explicit guardian domain for fresh births. Successor lease
+//! rotation and recovery after a guardian restart remain unavailable; this
+//! process-local ownership does **not** prove guardian-`SIGKILL` continuity.
+//! Catalog Genesis admission remains durable pre-Spawn intent,
 //! never proof that a child exists, and recovered lifecycle rows explicitly
 //! report that PTY, lease, output-replay, and mutation authorities are absent.
 //!
@@ -88,6 +88,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream as BlockingUnixStream;
@@ -17937,7 +17939,7 @@ impl BrokerAdoptedPaneV1 {
             .proxy_reader
             .as_ref()
             .ok_or(BrokerError::ProxyWouldBlock)?;
-        let flags = rustix::fs::fcntl_getfl(std::os::fd::AsFd::as_fd(reader.as_ref()))
+        let flags = rustix::fs::fcntl_getfl(reader.as_ref().as_fd())
             .map_err(|_| BrokerError::InvalidProxyOperation)?;
         if !flags.contains(rustix::fs::OFlags::NONBLOCK) {
             return Err(BrokerError::InvalidProxyOperation);

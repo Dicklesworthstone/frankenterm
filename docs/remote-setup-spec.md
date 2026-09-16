@@ -429,9 +429,9 @@ WantedBy=default.target
 ```
 
 The future mux unit intentionally has no guardian ordering claim.
-Once the guardian control surface exists and passes its mock-free service proof,
-a future lease-authorized unit publisher may use the following one-way start
-contract:
+After the configured guardian service and lifecycle contracts have their
+release qualification, a future lease-authorized unit publisher may use the
+following one-way start contract:
 
 ```ini
 [Unit]
@@ -451,9 +451,88 @@ mux execution unless the already-started guardian proves readiness. There is
 no `Requires=`, `PartOf=`, or `BindsTo=` edge: stopping or restarting the mux
 must not enqueue a guardian stop or restart.
 
+#### Explicit guardian domain for new panes
+
+Current source exposes an opt-in Unix mux domain for fresh guardian-backed
+panes. This is separate from the withheld automatic unit publisher below.
+Do not restart an existing mux or redirect its clients to use this procedure:
+it does not migrate existing sessions, and successor/restart attachment is not
+yet available.
+
+Use the mux server and guardian executable from the same sealed DSR process
+family. The broker and receiving guardian run as separate processes using that
+same guardian executable. Genesis authenticates the compiled family identity;
+an unsealed development executable or a different family is not an acceptable
+substitute.
+
+Prepare two **physically distinct**, current-user-owned, mode-0700 directories:
+one for the receiving guardian token/store and one for the broker token/store.
+Different token filenames in the same directory are insufficient; startup
+compares the opened parent directories' device/inode identities. Paths must
+pass the existing private-parent and no-symlink checks. Prepare private broker
+Spawn and lease catalog directories as well. Use new owned paths, preserving
+any existing tokens, stores, sockets, and processes.
+
+For example, with absolute paths already prepared and checked:
+
+```sh
+family=/absolute/path/to/pinned-dsr-family
+receiver=/absolute/private/guardian-receiver
+broker=/absolute/private/guardian-broker
+
+"$family/frankenterm-pty-guardian" provision-token --token-path "$receiver/token"
+"$family/frankenterm-pty-guardian" provision-token --token-path "$broker/token"
+```
+
+Run each of the following foreground services under its own supervisor or
+terminal. Start the broker first, then the receiving guardian:
+
+```sh
+"$family/frankenterm-pty-guardian" broker-serve \
+  --socket-path "$broker/broker.sock" --token-path "$broker/token" \
+  --spawn-catalog-path "$broker/spawn-catalog" \
+  --lease-catalog-path "$broker/lease-catalog"
+
+"$family/frankenterm-pty-guardian" serve \
+  --socket-path "$receiver/guardian.sock" --token-path "$receiver/token" \
+  --broker-socket-path "$broker/broker.sock" --broker-token-path "$broker/token"
+```
+
+After authenticated readiness, start a **new**, isolated mux endpoint with both
+guardian flags. Its configuration must select a fresh mux listener socket and
+must leave `default_mux_server_domain` unset or set it to `"guardian"`:
+
+```sh
+"$family/frankenterm-pty-guardian" probe \
+  --socket-path "$receiver/guardian.sock" --token-path "$receiver/token"
+
+"$family/frankenterm-mux-server" --daemonize=false \
+  --config-file /absolute/path/to/isolated-mux.lua \
+  --guardian-socket-path "$receiver/guardian.sock" \
+  --guardian-token-path "$receiver/token"
+```
+
+The mux flags are mutually required. Omitting both preserves the ordinary
+local domain. With guardian opt-in, a conflicting configured default is rejected
+at startup and during domain reconciliation; it must not silently switch new
+panes back to a local PTY. The generic readiness probe is not a Genesis or
+family-compatibility proof: the actual birth path performs the sealed handshake,
+durable checkpoint staging, broker Spawn, Claim, and replay before publication.
+
+Each guardian domain admits one in-flight birth. Transport loss permits only
+bounded replay of the identical Spawn request against the same guardian
+incarnation. An unknown outcome or a birth that never reaches mux publication
+retains its pane/request/effect identities and fences further spawning in that
+domain. Cancellation after birth retires the acquired lease without killing the
+broker-owned child; it does not authorize a replacement birth. Cancellation
+before birth can finish without creating a child. These limits are intentional:
+this path does not yet provide successor attachment, restart recovery, or an
+operator command that clears an unadopted-birth fence.
+
 #### Guardian unit scaffold (not activated yet)
 
-The source-owned unit contract is:
+The following native-owner scaffold does not configure the separate broker or
+enable the guardian mux domain described above. Its source-owned unit contract is:
 
 ```ini
 [Unit]

@@ -830,6 +830,16 @@ fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
         args.push(OsString::from("--cwd"));
         args.push(cwd.clone());
     }
+    #[cfg(unix)]
+    for (flag, path) in [
+        ("--guardian-socket-path", &opts.guardian_socket_path),
+        ("--guardian-token-path", &opts.guardian_token_path),
+    ] {
+        if let Some(path) = path {
+            args.push(OsString::from(flag));
+            args.push(path.as_os_str().to_os_string());
+        }
+    }
     if !opts.prog.is_empty() {
         args.push(OsString::from("--"));
         args.extend(opts.prog.iter().cloned());
@@ -1345,6 +1355,39 @@ mod tests {
             !args.iter().any(|arg| arg == OsStr::new("--")),
             "separator should only appear when forwarding a child program"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemonized_guardian_flags_roundtrip_non_utf8_paths_before_program_separator() {
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let socket = OsString::from_vec(b"/private/guardian-\xff/socket".to_vec());
+        let token = OsString::from_vec(b"/private/guardian-\xfe/token".to_vec());
+        let program = vec![
+            OsString::from("sh"),
+            OsString::from("--guardian-token-path"),
+            OsString::from_vec(b"literal-child-\xfd".to_vec()),
+        ];
+        let mut original_args = vec![
+            OsString::from("mux"),
+            OsString::from("--daemonize=true"),
+            OsString::from("--guardian-socket-path"),
+            socket.clone(),
+            OsString::from("--guardian-token-path"),
+            token.clone(),
+            OsString::from("--"),
+        ];
+        original_args.extend(program.iter().cloned());
+        let original = Opt::try_parse_from(original_args).unwrap();
+        let forwarded = daemonized_child_args(&original);
+        let child =
+            Opt::try_parse_from(std::iter::once(OsString::from("mux")).chain(forwarded)).unwrap();
+        assert!(!child.daemonize);
+        assert_eq!(child.guardian_socket_path, Some(PathBuf::from(socket)));
+        assert_eq!(child.guardian_token_path, Some(PathBuf::from(token)));
+        assert_eq!(child.prog, program);
     }
 
     // ── ft-gqbpk SIGTERM/SIGINT graceful-shutdown regressions ────────

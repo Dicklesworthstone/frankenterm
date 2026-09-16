@@ -5076,6 +5076,7 @@ mod tests {
 
     fn run_guardian_domain_real_birth(cancel_in_flight: bool) {
         use frankenterm_pty_guardian::provision_guardian_token;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         struct StopOwnedServices {
@@ -5204,7 +5205,10 @@ mod tests {
             mux.set_default_domain(&registered).unwrap();
             let command = || {
                 let mut command = portable_pty::CommandBuilder::new("/bin/sh");
-                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_RELEASE\" && test $n -lt 200; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                // The release file is normal cleanup. This approximately
+                // 120-second emergency fuse is separate from the unchanged
+                // five-second phase assertions, not an accepted latency bound.
+                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
                 command.env("FT_BIRTHS", &births);
                 command.env("FT_SIGNALED", &signaled);
                 command.env("FT_RELEASE", &release);
