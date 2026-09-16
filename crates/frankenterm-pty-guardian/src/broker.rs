@@ -25923,11 +25923,19 @@ mod tests {
         );
         assert_eq!(successor_context.lease_generation, 2);
         assert_eq!(successor_context.ack_id, successor_ack_id);
+        let mut other_mux_client = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            other_mux_identity,
+            broker_build,
+        )
+        .expect("reconnect wrong-mux client for successor custody negative control");
         assert!(
             other_mux_client
                 .acknowledge_successor_claim(successor_custody)
                 .is_err()
         );
+        drop(other_mux_client);
         for stage in [1, 2] {
             let token = custody_store
                 .reopen_successor_custody(&successor_context)

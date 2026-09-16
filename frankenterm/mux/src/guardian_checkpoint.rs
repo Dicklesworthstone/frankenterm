@@ -9145,7 +9145,8 @@ mod tests {
             corrupt[offset] ^= 1;
             assert!(
                 cipher.open_successor_custody_record(&corrupt).is_err(),
-                "offset {offset}"
+                "offset {}",
+                offset
             );
         }
         assert!(checkpoint_stage_cipher(0xa4)
