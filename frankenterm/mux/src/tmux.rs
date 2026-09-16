@@ -14448,6 +14448,23 @@ mod tests {
         tmux_domain.inner.send_next_command();
         wait_until("split reconciliation timeout", || {
             tmux_domain.inner.is_terminal()
+                && tmux_domain.inner.pending_splits.lock().is_empty()
+                && tmux_domain
+                    .inner
+                    .remote_split_identity_permits
+                    .load(Ordering::Acquire)
+                    == 0
+                && tmux_domain
+                    .inner
+                    .split_cleanup_obligations
+                    .lock()
+                    .is_empty()
+                && tmux_domain
+                    .inner
+                    .split_cleanup_quarantine
+                    .lock()
+                    .iter()
+                    .any(|entry| entry.request_id == 89)
         });
 
         assert!(block_on(future).is_err());
@@ -14492,7 +14509,21 @@ mod tests {
         drop(reservation);
         tmux_domain.inner.send_next_command();
         wait_until("split compensation timeout", || {
+            // Exit fences new commands before the I/O failure handler settles
+            // its exact cleanup obligation. Observe that settlement too.
             tmux_domain.inner.is_terminal()
+                && cleanup.status() == TmuxSplitCleanupStatus::Failed
+                && tmux_domain
+                    .inner
+                    .split_cleanup_obligations
+                    .lock()
+                    .is_empty()
+                && tmux_domain
+                    .inner
+                    .split_cleanup_quarantine
+                    .lock()
+                    .iter()
+                    .any(|entry| entry.request_id == 90 && entry.candidates == vec![46])
         });
 
         assert_eq!(launcher.recorded_writes(), b"kill-pane -t %46\n");
@@ -14508,6 +14539,47 @@ mod tests {
             .lock()
             .iter()
             .any(|entry| entry.request_id == 90 && entry.candidates == vec![46]));
+    }
+
+    #[test]
+    fn tmux_atomic_publication_terminal_fence_precedes_compensation_settlement() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(310);
+        let reservation = tmux_domain
+            .inner
+            .reserve_test_remote_split(91, 47, 48)
+            .expect("reserve staged compensation failure");
+        let cleanup = reservation.cleanup_obligation();
+        assert!(cleanup.claim());
+
+        // Drive the two real failure-handler phases separately, without a
+        // timer or sender: the admission fence is deliberately visible first.
+        assert!(tmux_domain.inner.try_claim_failure_terminal(|_, _| true));
+        assert!(tmux_domain.inner.is_terminal());
+        assert_eq!(cleanup.status(), TmuxSplitCleanupStatus::Claimed);
+        assert!(tmux_domain
+            .inner
+            .split_cleanup_obligations
+            .lock()
+            .contains_key(&91));
+        assert!(tmux_domain.inner.split_cleanup_quarantine.lock().is_empty());
+
+        tmux_domain.inner.fail_split_transaction_authority(Some(
+            TmuxSplitFailureAuthority::Compensation(Arc::clone(&cleanup)),
+        ));
+        assert_eq!(cleanup.status(), TmuxSplitCleanupStatus::Failed);
+        assert!(tmux_domain
+            .inner
+            .split_cleanup_obligations
+            .lock()
+            .is_empty());
+        assert!(tmux_domain
+            .inner
+            .split_cleanup_quarantine
+            .lock()
+            .iter()
+            .any(|entry| entry.request_id == 91 && entry.candidates == vec![48]));
+        assert!(launcher.recorded_writes().is_empty());
+        drop(reservation);
     }
 
     #[test]
