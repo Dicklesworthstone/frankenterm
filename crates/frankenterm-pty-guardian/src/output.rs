@@ -10,6 +10,7 @@
 //! readiness loop never calls synchronous journal or PTY-write operations.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
+use hmac::{Hmac, Mac as _};
 use mio::Waker;
 use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
@@ -42,6 +43,7 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
+    GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES, GUARDIAN_MUX_ROTATION_TAG,
     GuardianCheckpointCatalogAdoptionEvidenceSeedV1, GuardianCheckpointCatalogAdoptionPermitV1,
     GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
     GuardianCheckpointOutputBoundaryV1, GuardianCheckpointPolicyExpiryReceiptV1,
@@ -617,6 +619,55 @@ impl GuardianDurableSuccessorCustodyV1 {
 }
 
 impl GuardianDurableSpawnCustodyV1 {
+    pub(crate) fn into_mux_rotation_payload(
+        self,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            let secret = read_spawn_custody_locked(inner, &self.context)?;
+            let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(
+                inner,
+                &spawn_custody_path(inner, &self.context),
+            )?;
+            let mut payload = Zeroizing::new(GUARDIAN_MUX_ROTATION_TAG.to_vec());
+            payload.extend_from_slice(&bytes);
+            payload.extend_from_slice(secret.as_slice());
+            Ok(payload)
+        })
+    }
+
+    /// Recover local possession of an existing encrypted Spawn capability.
+    /// Neither a transport token nor a checkpoint/image digest is sufficient:
+    /// the independently generated output key and exact authenticated custody
+    /// record must already exist. This path never provisions missing state.
+    pub fn open_existing(
+        token_path: &Path,
+        scope: GuardianSpawnCustodyScopeV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let (directory, directory_path, parent_identity, directory_identity) =
+            open_output_directory_with_creation(token_path, false)?;
+        let (cipher, key_path, key_identity) =
+            open_output_key_with_creation(&directory, &directory_path, false)?;
+        let persistence = Arc::new(PersistentOutputAuthority {
+            parent_path: directory_path
+                .parent()
+                .ok_or(GuardianOutputError::InvalidPath)?
+                .to_path_buf(),
+            parent_identity,
+            directory_path: directory_path.clone(),
+            directory_identity,
+            key_path,
+            key_identity,
+        });
+        GuardianCheckpointStageStore::open(
+            &directory,
+            &directory_path,
+            &cipher,
+            persistence,
+            GuardianCheckpointStagePolicy::production(),
+        )?
+        .lookup_spawn_custody(scope)
+    }
+
     pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
         self.context
     }
@@ -2224,6 +2275,44 @@ impl GuardianCheckpointStageStore {
         expected: &GuardianSpawnCustodyContextV1,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
+    }
+
+    pub(crate) fn authenticate_mux_rotation_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<
+        (GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>),
+        GuardianCheckpointStageStoreError,
+    > {
+        if payload.len() != GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES
+            || !payload.starts_with(GUARDIAN_MUX_ROTATION_TAG)
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        self.with_exclusive_directory(|inner| {
+            let record_end = GUARDIAN_MUX_ROTATION_TAG.len() + GUARDIAN_SPAWN_CUSTODY_BYTES;
+            let bytes = payload[GUARDIAN_MUX_ROTATION_TAG.len()..record_end]
+                .try_into()
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            let (context, stored_secret) = inner.cipher.open_spawn_custody_record(bytes)?;
+            // Validate the exact existing record, but never substitute its
+            // decrypted secret for the proof presented by the new mux.
+            drop(read_spawn_custody_locked(inner, &context)?);
+            let mut presented = Zeroizing::new([0; 32]);
+            presented.copy_from_slice(&payload[record_end..]);
+            let mut proof = Hmac::<Sha256>::new_from_slice(presented.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            proof.update(b"frankenterm.mux-owner-rotation.possession.v1\0");
+            proof.update(bytes);
+            let mut verifier = Hmac::<Sha256>::new_from_slice(stored_secret.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            verifier.update(b"frankenterm.mux-owner-rotation.possession.v1\0");
+            verifier.update(bytes);
+            verifier
+                .verify_slice(&proof.finalize().into_bytes())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            Ok((context, presented))
+        })
     }
 
     pub(crate) fn persist_successor_custody(
@@ -9118,6 +9207,13 @@ fn create_private_file_new_at(
 fn open_output_directory(
     token_path: &Path,
 ) -> Result<(File, PathBuf, DirectoryIdentity, DirectoryIdentity), GuardianOutputError> {
+    open_output_directory_with_creation(token_path, true)
+}
+
+fn open_output_directory_with_creation(
+    token_path: &Path,
+    create: bool,
+) -> Result<(File, PathBuf, DirectoryIdentity, DirectoryIdentity), GuardianOutputError> {
     validate_normalized_absolute_file_path(token_path)?;
     let parent = token_path
         .parent()
@@ -9145,10 +9241,12 @@ fn open_output_directory(
     )?;
 
     let directory_path = parent.join(OUTPUT_DIRECTORY_NAME);
-    match create_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(GuardianOutputError::io("output-directory-create", error)),
+    if create {
+        match create_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(GuardianOutputError::io("output-directory-create", error)),
+        }
     }
     let directory = open_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME))
         .map_err(|error| GuardianOutputError::io("output-directory-open-at", error))?;
@@ -9197,6 +9295,14 @@ fn load_or_create_output_key(
     directory: &File,
     directory_path: &Path,
 ) -> Result<(GuardianOutputCipher, PathBuf, FileIdentity), GuardianOutputError> {
+    open_output_key_with_creation(directory, directory_path, true)
+}
+
+fn open_output_key_with_creation(
+    directory: &File,
+    directory_path: &Path,
+    create: bool,
+) -> Result<(GuardianOutputCipher, PathBuf, FileIdentity), GuardianOutputError> {
     validate_output_key_directory_authority(directory, directory_path)?;
     let key_path = directory_path.join(OUTPUT_KEY_NAME);
     let expected_len = u64::try_from(GuardianOutputCipher::KEY_BYTES)
@@ -9208,7 +9314,9 @@ fn load_or_create_output_key(
                 .map_err(|error| GuardianOutputError::io("output-key-metadata-at", error))?;
             validate_private_file_metadata(&metadata, Some(expected_len))?;
         }
-        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+        Err(GuardianOutputError::Io { source, .. })
+            if create && source.kind() == ErrorKind::NotFound =>
+        {
             ensure_absent_output_key_has_no_abandoned_ciphertext(
                 directory,
                 directory_path,
@@ -9223,11 +9331,13 @@ fn load_or_create_output_key(
     // atomically moving the stage into this final name without replacement.
     // A crash therefore leaves either a resumable stage or a complete key,
     // never a partially written `journal.key` that blocks every later open.
-    provision_guardian_token_in_pinned_parent(&key_path, directory).map_err(|_| {
-        GuardianOutputError::FilesystemAuthority(
-            "guardian output key provisioning did not reach a complete private authority",
-        )
-    })?;
+    if create {
+        provision_guardian_token_in_pinned_parent(&key_path, directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority(
+                "guardian output key provisioning did not reach a complete private authority",
+            )
+        })?;
+    }
     validate_output_key_directory_authority(directory, directory_path)?;
 
     let mut file = open_private_file_at(directory, directory_path, &key_path, false)?;
@@ -12236,6 +12346,37 @@ mod tests {
         let store = pipeline.checkpoint_stage_store();
         let recovered = store.lookup_spawn_custody(scope)?;
         let context = recovered.context();
+        let local =
+            GuardianDurableSpawnCustodyV1::open_existing(&directory.join("guardian.token"), scope)?;
+        let payload = local.into_mux_rotation_payload()?;
+        let (presented_context, presented_secret) =
+            store.authenticate_mux_rotation_payload(&payload)?;
+        assert_eq!(presented_context, context);
+        assert_eq!(*presented_secret, [0x93; 32]);
+        let mut wrong_possession = Zeroizing::new(payload.to_vec());
+        *wrong_possession.last_mut().unwrap() ^= 1;
+        assert!(
+            store
+                .authenticate_mux_rotation_payload(&wrong_possession)
+                .is_err()
+        );
+        for malformed_len in [payload.len() - 1, payload.len() + 1] {
+            let mut malformed = Zeroizing::new(payload.to_vec());
+            malformed.resize(malformed_len, 0);
+            assert!(store.authenticate_mux_rotation_payload(&malformed).is_err());
+        }
+        let mut wrong_tag = Zeroizing::new(payload.to_vec());
+        wrong_tag[0] ^= 1;
+        assert!(store.authenticate_mux_rotation_payload(&wrong_tag).is_err());
+        let (still_valid_context, still_valid_secret) =
+            store.authenticate_mux_rotation_payload(&payload)?;
+        assert_eq!(still_valid_context, context);
+        assert_eq!(*still_valid_secret, [0x93; 32]);
+        assert_eq!(
+            std::fs::read(&path)?,
+            ciphertext,
+            "opening custody cannot rewrite its record"
+        );
         assert_eq!(context.ack_id, Uuid::from_u128(7));
         assert_eq!(context.broker_incarnation, Uuid::from_u128(1));
         assert_eq!(context.child_pid, 12);
