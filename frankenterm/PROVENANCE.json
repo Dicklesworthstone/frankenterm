@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 192,
-        "fix": 226,
+        "fix": 227,
         "other": 45,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 89
       },
-      "fork_side_commit_count": 622,
+      "fork_side_commit_count": 623,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-16T14:20:24-04:00",
-        "sha": "47281d9a023fbec00626141a30752407f390c655",
-        "subject": "style(mux): use crate-edition import ordering"
+        "classification": "fix",
+        "committed_at": "2026-09-16T16:01:48-04:00",
+        "sha": "cabba2122e586eda22e7e33616bc4dfd0f14b989",
+        "subject": "fix(recovery): preserve window titles, tab stacks and focus history"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2674,
-  "generated_at": "2026-09-16T18:45:45.040394Z",
+  "fork_side_commit_total": 2675,
+  "generated_at": "2026-09-16T20:02:32.467911Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
