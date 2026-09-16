@@ -950,3 +950,21 @@ power loss nor migration of those live sessions has been demonstrated.
   and an eight-observation-minimum suppression control (`ft-cb5l2`).
 - [ ] Run the full `proptest_bocpd` target and deterministic boundary test through
   strict RCH. No production detector, threshold or generator was changed.
+
+### 2026-09-16 — measured snapshot retry latency and release blockers
+
+- [x] Retain the completed RC28 production measurement: 2,000 events, unchanged
+  offered envelope, failed finite-trace bound, and 1,987 explicit 10 ms retry
+  sleeps across 2,008 text reads. This does not establish maximum capacity.
+- [x] Remove the first source/layout retry's unconditional timer in `20a089aa0`;
+  yield cooperatively, preserve all consistency fences and the three-attempt
+  budget, retain repeated-churn and quota backoff, and obtain independent review.
+- [ ] Execute the real-socket text-read regressions and cancellation controls
+  through strict RCH, then rerun the unchanged producer on newly built binaries.
+- [ ] Repair the RCH client heartbeat gap before expensive source validation;
+  jobs 32025/32027 were cancelled by the stuck detector before compilation.
+  Do not disable detection or count these cancellations as product test results.
+- [ ] Wire durable lease-journal transitions into the live broker asynchronously;
+  preserve fencing during I/O, quarantine failures, and test consecutive handoffs.
+- [ ] Reject malformed, nil and noncanonical durable window/tab UUIDs when
+  validating recovery images, including authenticated-image reconstruction.
