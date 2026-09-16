@@ -811,3 +811,25 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Complete all four native DSR targets and final-family acceptance;
   qualify the four producers, retain all 32 manifest slots, and pass all six
   quality gates before signing, publication, or installation.
+
+### 2026-09-16 — RC29 late workspace failures and qualification
+
+- [x] Diagnose the three late failures in full-workspace RCH31913. OSC parsing
+  dropped leading empty fields (`ft-ebuyt`); the PTY property expected duplicate
+  environment assignments to survive last-write map semantics (`ft-vhc52`);
+  the MCP property incorrectly required secret-shaped server names to appear
+  unredacted in duplicate diagnostics (`ft-ywxwy`).
+- [x] Preserve the minimized OSC failure and correct the production field count.
+  Add exact empty-field, chunking and parameter-limit regressions. Correct the
+  PTY and MCP oracles without weakening raw-key preservation or redaction.
+- [x] Retain strict RCH31944 focused four-package proof: 885 passed, 0 failed,
+  0 ignored. Receipt `three-late-regressions-fixed-rch.log` SHA-256
+  `463547eda48b9a87e030f3376810ae5f2bca1bfd4e582941050c6f3757943c5a`
+  is under `/Volumes/USB_NVME/ft-release-20260915/`. Fixes are committed as
+  `99213c76c`; this focused result does not qualify the full workspace.
+- [ ] Complete full-workspace tests on the corrected RC29 source before
+  creating its tag or starting native release builds. RC29 remains untagged;
+  RC28 is immutable and must not be promoted or reused as corrected-source proof.
+- [ ] Complete exact-source formatting, Clippy and all six DSR quality gates;
+  qualify all native targets, final-family acceptance and four actual producers
+  before signing, publication or session-preserving installation.

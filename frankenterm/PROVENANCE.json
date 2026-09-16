@@ -401,20 +401,20 @@
         "cosmetic": 5,
         "docs": 1,
         "feat": 7,
-        "fix": 20,
+        "fix": 21,
         "other": 6,
         "refactor": 1,
         "rename": 1,
         "security-fix": 49,
         "test": 6
       },
-      "fork_side_commit_count": 98,
+      "fork_side_commit_count": 99,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T11:53:35-04:00",
-        "sha": "997b2e2056d7875c7f1ac253bc296ce712a4d40a",
-        "subject": "fix(parser): drop ESC sequences with extra intermediates instead of rewriting them"
+        "committed_at": "2026-09-16T14:45:16-04:00",
+        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
+        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
       },
       "name": "frankenterm-escape-parser",
       "path": "frankenterm/escape-parser",
@@ -733,19 +733,19 @@
       "classification_summary": {
         "cosmetic": 4,
         "feat": 7,
-        "fix": 23,
+        "fix": 24,
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
         "test": 16
       },
-      "fork_side_commit_count": 57,
+      "fork_side_commit_count": 58,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-15T22:42:02-04:00",
-        "sha": "d8bd1dac462f863d72910f7e4e5731a9a6bd4de5",
-        "subject": "test(pty): separate raw reader readiness and bound child cleanup"
+        "classification": "fix",
+        "committed_at": "2026-09-16T14:45:16-04:00",
+        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
+        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -1013,18 +1013,18 @@
       "classification_summary": {
         "cosmetic": 1,
         "feat": 1,
-        "fix": 3,
+        "fix": 4,
         "other": 2,
         "security-fix": 2,
         "test": 4
       },
-      "fork_side_commit_count": 13,
+      "fork_side_commit_count": 14,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-08-25T01:45:04-04:00",
-        "sha": "a4a28f00906eb7e8039cf7f3ab14d8deab0d5107",
-        "subject": "feat(mux,term,client,guardian): refactor and modernize terminal state, guardian protocol, and client pane multiplexing"
+        "classification": "fix",
+        "committed_at": "2026-09-16T14:45:16-04:00",
+        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
+        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
       },
       "name": "vtparse",
       "path": "frankenterm/vtparse",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2671,
-  "generated_at": "2026-09-16T18:20:59.454180Z",
+  "fork_side_commit_total": 2674,
+  "generated_at": "2026-09-16T18:45:45.040394Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
