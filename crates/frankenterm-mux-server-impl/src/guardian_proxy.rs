@@ -379,8 +379,8 @@ pub enum GuardianProxyError {
     TerminalCheckpoint(#[source] TerminalCheckpointError),
     #[error("guardian terminal suffix replay failed")]
     TerminalReplay(#[source] InertTerminalError),
-    #[error("guardian terminal activation failed before topology publication")]
-    TerminalActivation,
+    #[error("guardian terminal activation failed before topology publication: {0}")]
+    TerminalActivation(#[source] InertTerminalError),
     #[error("guardian mutation outcome is indeterminate; the lease is quarantined")]
     MutationOutcomeIndeterminate,
     #[error("guardian returned a reply inconsistent with the pending mutation")]
@@ -441,7 +441,7 @@ impl From<GuardianProxyError> for io::Error {
             | GuardianProxyError::ReplayDelivery(_)
             | GuardianProxyError::TerminalCheckpoint(_)
             | GuardianProxyError::TerminalReplay(_)
-            | GuardianProxyError::TerminalActivation => {
+            | GuardianProxyError::TerminalActivation(_) => {
                 Self::new(io::ErrorKind::InvalidData, error)
             }
             other => Self::other(other),
@@ -4669,7 +4669,7 @@ impl GuardianProxyStaging {
                 log::error!(
                     "guardian terminal activation failed before topology publication: {error}"
                 );
-                return Err(GuardianProxyError::TerminalActivation);
+                return Err(GuardianProxyError::TerminalActivation(error));
             }
         };
         let actor = Arc::clone(&self.actor);
@@ -5080,6 +5080,53 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
+        let _global_state = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        struct ResetSpillFactory;
+        impl Drop for ResetSpillFactory {
+            fn drop(&mut self) {
+                config::set_scrollback_spill_sink_factory(None);
+                config::use_test_configuration();
+            }
+        }
+        let _reset_spill_factory = ResetSpillFactory;
+        config::use_test_configuration();
+        assert!(config::configuration().scrollback_tiered_enabled);
+        // An otherwise valid pristine model still needs the live storage
+        // capability when default tiered retention is enabled. Preserve that
+        // refusal rather than disabling tiering to make this fixture pass.
+        let missing_storage_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(config::TermConfig::new());
+        let pristine = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::clone(&missing_storage_config),
+            "FrankenTerm",
+            config::wezterm_version(),
+            Box::new(io::sink()),
+        );
+        let limits = TerminalCheckpointLimits::default();
+        let checkpoint = TerminalCheckpointV2::capture_with_limits(&pristine, limits).unwrap();
+        let encoded = checkpoint.to_canonical_json(limits).unwrap();
+        let inert = TerminalCheckpointV2::decode_and_validate(&encoded, limits)
+            .unwrap()
+            .restore_inert(missing_storage_config)
+            .unwrap();
+        let failure = match inert.into_live(Box::new(io::sink())) {
+            Ok(_) => panic!("tiered activation accepted a missing storage capability"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.into_parts().0,
+            InertTerminalError::ScrollbackActivation(
+                wezterm_term::config::ScrollbackActivationError::MissingStorageCapability
+            )
+        ));
+
         struct StopOwnedServices {
             children: Vec<std::process::Child>,
             release: PathBuf,
@@ -5121,6 +5168,21 @@ mod tests {
             .unwrap()
             .keep();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!(
+            "GUARDIAN_DOMAIN_SERVICE_LOG_DIRECTORY={}",
+            directory.display()
+        );
+        // Normal mux startup installs this real spill backend before building
+        // TermConfig. Keep the same storage implementations, isolated beneath
+        // this fixture's retained directory rather than the user's cache.
+        let scrollback_directory = directory.join("scrollback");
+        config::set_scrollback_spill_sink_factory(Some(Arc::new(move |context| {
+            let sink = crate::LiveScrollbackSpillSink::new(scrollback_directory.clone(), &context)
+                .expect("initialize real domain scrollback storage");
+            let sink = crate::deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink))
+                .expect("initialize real domain deferred scrollback storage");
+            Some(Arc::new(sink))
+        })));
         let broker_dir = directory.join("broker");
         let spawn_catalog = broker_dir.join("spawn-catalog");
         let lease_catalog = broker_dir.join("lease-catalog");
