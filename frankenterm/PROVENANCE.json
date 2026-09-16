@@ -638,24 +638,24 @@
       "classification_summary": {
         "chore": 9,
         "cleanup": 3,
-        "cosmetic": 27,
+        "cosmetic": 28,
         "docs": 6,
-        "feat": 190,
-        "fix": 222,
-        "other": 43,
+        "feat": 192,
+        "fix": 225,
+        "other": 45,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 86
+        "test": 88
       },
-      "fork_side_commit_count": 609,
+      "fork_side_commit_count": 619,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-15T22:58:22-04:00",
-        "sha": "6e179e439bd396b0b76badd94246d618f54776e5",
-        "subject": "test(mux): audit fixed-width custody decoding import"
+        "classification": "other",
+        "committed_at": "2026-09-16T06:13:06-04:00",
+        "sha": "a524abff6f630bdff8e69294f83154c3da7f6f01",
+        "subject": "perf(guardian): resume authenticated replay without repeated prefix scans"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2658,
-  "generated_at": "2026-09-16T03:02:44.365764Z",
+  "fork_side_commit_total": 2668,
+  "generated_at": "2026-09-16T10:13:46.149832Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
