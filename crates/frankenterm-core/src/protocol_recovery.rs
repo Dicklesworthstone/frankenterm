@@ -199,6 +199,11 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     if lower.starts_with("remote mux rejection request mismatch:") {
         return ProtocolErrorKind::Permanent;
     }
+    // Snapshot instability is transient, but its typed operation has already
+    // exhausted its retry budget. This string projection grants no replay.
+    if lower.starts_with("mux text snapshot changed during ") {
+        return ProtocolErrorKind::Transient;
+    }
     if lower.starts_with("mux ") && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
     {
         return ProtocolErrorKind::Transient;
@@ -1729,6 +1734,44 @@ mod tests {
             classify_error_message(&cancelled.to_string()),
             ProtocolErrorKind::Transient,
             "legacy cancellation text preserves only the kind projection"
+        );
+    }
+
+    #[test]
+    fn classify_text_snapshot_change_preserves_prefix_and_typed_no_replay() {
+        for phase in ["final_source", "incompatible", "timeout"] {
+            let message = format!("mux text snapshot changed during {phase} after 3 attempts");
+            assert_eq!(
+                classify_error_message(&message),
+                ProtocolErrorKind::Transient
+            );
+            #[cfg(all(feature = "vendored", unix))]
+            {
+                let error =
+                    crate::vendored::DirectMuxError::TextSnapshotChanged { phase, attempts: 3 };
+                assert_eq!(error.to_string(), message);
+                assert_eq!(
+                    mux_recovery_decision(&error),
+                    MuxRecoveryDecision {
+                        kind: ProtocolErrorKind::Transient,
+                        retry: false,
+                        connection: MuxConnectionDisposition::Reuse,
+                        cancelled: false,
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            classify_error_message("codec error: mux text snapshot changed during timeout"),
+            ProtocolErrorKind::Recoverable
+        );
+        assert_eq!(
+            classify_error_message("unrelated mux text snapshot changed during final_source"),
+            ProtocolErrorKind::Recoverable
+        );
+        assert_eq!(
+            classify_error_message("unrelated mux text snapshot changed during incompatible"),
+            ProtocolErrorKind::Permanent
         );
     }
 

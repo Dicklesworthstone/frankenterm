@@ -1322,7 +1322,6 @@ impl Drop for DirectMuxOutboundLease {
 
 // Transaction-local diagnostics survive early errors/cancellation through Drop;
 // they never retain pane text or alter request/retry authority.
-#[derive(Default)]
 struct TextReadDiagnostics {
     enabled: bool,
     connection_id: u64,
@@ -2567,7 +2566,10 @@ impl DirectMuxClient {
         let mut diagnostics = TextReadDiagnostics {
             enabled: tracing::enabled!(target: "frankenterm::mux_text_diagnostics", tracing::Level::TRACE),
             connection_id: self.connection_id,
-            ..TextReadDiagnostics::default()
+            attempts: 0,
+            quota_reductions: 0,
+            chunk_layout_retries: 0,
+            final_source_retries: 0,
         };
         'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
@@ -7102,6 +7104,7 @@ mod tests {
                 let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0]["connection_id"], client.connection_id);
                 assert_eq!(summaries[0]["chunk_layout_retries"], 0);
                 if quota {
                     assert_eq!(summaries[0]["attempts"], 1);
@@ -7413,6 +7416,7 @@ mod tests {
                 let error = pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
+                assert!(summaries[0]["connection_id"].as_u64().unwrap() > 0);
                 assert_eq!(summaries[0]["attempts"], 3);
                 assert_eq!(summaries[0]["quota_reductions"], 0);
                 assert_eq!(
