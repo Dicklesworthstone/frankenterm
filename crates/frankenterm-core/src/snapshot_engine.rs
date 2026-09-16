@@ -13091,14 +13091,14 @@ mod tests {
                 .with_session_id(expected.session_id.clone())
                 .with_mux_incarnation_id(expected.mux_incarnation_id.clone()),
         );
-        let verified = crate::session_restore::select_verified_recovery_roots_with_cx(
+        let authenticated_root = crate::session_restore::select_verified_recovery_roots_with_cx(
             &cx, &reopened, &verifier,
         )
         .unwrap()
         .current
         .expect("durable real-mux image must authenticate after reopening");
         let restored = crate::session_restore::reconstruct_whole_mux_image_inert(
-            &verified,
+            &authenticated_root,
             frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
             Some("offline-window-metadata"),
             &std::collections::HashSet::new(),
