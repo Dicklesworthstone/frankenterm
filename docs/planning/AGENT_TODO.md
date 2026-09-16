@@ -986,11 +986,16 @@ power loss nor migration of those live sessions has been demonstrated.
   1148 by 774 pixel window while the grid changes 80 by 24 to 69 by 21 and back.
   Ordinary edge drag changes the window to 844 by 644 and grid to 58 by 19,
   with visible reflow. These observations are not latency benchmark results.
-- [ ] Resolve the observed history-prefix join after clear-screen/cursor-home
-  followed by reflow; reproduce the stale preceding-row wrap boundary in a
-  terminal regression and verify the repair through strict RCH.
-- [ ] Distinguish synthesized Command-equals behavior from an actual native
-  shortcut defect: automation typed equals, while Command-minus and menu actions
-  worked. Do not claim keyboard font increase has passed.
+- [x] Trace the history-prefix join to the stale incoming scrollback wrap flag.
+  Retain regression-only `da37591d9` and reviewed repair `d99529957`, covering
+  full first-row erases while preserving partial-erase continuations.
+- [ ] Execute the negative baseline and fixed CSI controls through strict RCH,
+  then repeat native clear/repaint/reflow against the final artifact.
+- [x] Capture actual native key events: the synthesized equals event arrives as
+  Shift+Command with raw plus. Adding only its missing binding to the isolated
+  Lua configuration makes the identical event increase font size at fixed pixels.
+  Commit default alias repair `ce0582ee0` with InputMap/custom/disable controls.
+- [ ] Run both `cmd_plus` tests in `glyphcache_unit` through strict RCH and
+  verify final native default bindings without the diagnostic Lua override.
 - [ ] Repeat native acceptance against the final source and final DSR artifacts,
   including remote-session reconnect, before release/install claims.

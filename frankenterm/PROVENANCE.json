@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 55,
-        "fix": 108,
+        "fix": 109,
         "other": 54,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 58
+        "test": 59
       },
-      "fork_side_commit_count": 308,
+      "fork_side_commit_count": 310,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-15T19:34:31-04:00",
-        "sha": "7865a302a01bff379df0fc1da12c36fc66c6001a",
-        "subject": "test(term): format Rust 2018 assertion diagnostics explicitly"
+        "classification": "fix",
+        "committed_at": "2026-09-16T17:31:07-04:00",
+        "sha": "d9952995747ac76374f40078172bf071615ea6cf",
+        "subject": "fix(term): sever erased viewport wrap from retained history"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2681,
-  "generated_at": "2026-09-16T20:43:49.394480Z",
+  "fork_side_commit_total": 2683,
+  "generated_at": "2026-09-16T21:41:18.136381Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
