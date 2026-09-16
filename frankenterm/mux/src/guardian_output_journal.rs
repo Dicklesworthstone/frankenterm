@@ -5628,7 +5628,7 @@ mod tests {
             Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
         ));
         let (_other_directory, _other_path, _other, other_receipts) =
-            real_journal_with_records("terminal-foreign.ftgout", &[&large, b"tail"]);
+            real_journal_with_records("terminal-foreign.ftgout", &[&large, b"else"]);
         assert!(matches!(
             journal.verify_terminal_record(other_receipts[1], 4),
             Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
