@@ -823,23 +823,25 @@ pub struct HealthSnapshot {
     #[serde(default)]
     pub last_activity_by_pane: Vec<(u64, u64)>,
 
-    /// Total number of watcher restarts since process start.
+    /// Observed pane lifecycle replacements within the detection window.
+    /// The runtime retains these observations in memory; this is not persisted
+    /// watcher-process restart history (tracked separately by ft-u6zfw).
     #[serde(default)]
     pub restart_count: u32,
 
-    /// Timestamp of the most recent crash (epoch ms), if any.
+    /// Timestamp of the most recent observed pane replacement (epoch seconds).
     #[serde(default)]
     pub last_crash_at: Option<u64>,
 
-    /// Number of consecutive crashes without a stable run.
+    /// Pane replacements since the last discovery tick with no replacements.
     #[serde(default)]
     pub consecutive_crashes: u32,
 
-    /// Current backoff delay in milliseconds (0 if healthy).
+    /// Detector-recommended backoff in milliseconds, not an applied runtime delay.
     #[serde(default)]
     pub current_backoff_ms: u64,
 
-    /// Whether the watcher is currently in a detected crash loop.
+    /// Whether observed pane replacements meet the detector's window threshold.
     #[serde(default)]
     pub in_crash_loop: bool,
 
@@ -8097,7 +8099,8 @@ impl CrashLoopDetector {
 /// Diagnostic summary from a [`CrashLoopDetector`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashLoopDiagnostics {
-    /// Total number of watcher restarts in the detection window.
+    /// Number of recorded crash observations in the detection window.
+    /// The observation runtime currently supplies pane lifecycle replacements.
     pub restart_count: u32,
     /// Timestamp of the most recent crash (epoch seconds).
     pub last_crash_at: Option<u64>,

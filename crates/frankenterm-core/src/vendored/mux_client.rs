@@ -57,10 +57,53 @@ pub enum MuxTextReadResult {
     OutputTooLarge { len: usize, cap: usize },
 }
 
-fn mux_text_contract_error(reason: &'static str) -> DirectMuxError {
+#[derive(Clone, Copy)]
+enum MuxTextContractReason {
+    ScrollbackRowCountOverflow,
+    ScrollbackRangeOverflow,
+    ReplyPaneMismatch,
+    ReplyLayoutMismatch,
+    ReplyRowCountMismatch,
+    ReplyRowOrderMismatch,
+}
+
+impl MuxTextContractReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ScrollbackRowCountOverflow => "scrollback_row_count_overflow",
+            Self::ScrollbackRangeOverflow => "scrollback_range_overflow",
+            Self::ReplyPaneMismatch => "reply_pane_mismatch",
+            Self::ReplyLayoutMismatch => "reply_layout_mismatch",
+            Self::ReplyRowCountMismatch => "reply_row_count_mismatch",
+            Self::ReplyRowOrderMismatch => "reply_row_order_mismatch",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::ScrollbackRowCountOverflow => "scrollback row count overflow",
+            Self::ScrollbackRangeOverflow => "scrollback range overflow",
+            Self::ReplyPaneMismatch | Self::ReplyLayoutMismatch => {
+                "line reply pane/layout mismatch"
+            }
+            Self::ReplyRowCountMismatch | Self::ReplyRowOrderMismatch => {
+                "line reply range incomplete or unordered"
+            }
+        }
+    }
+}
+
+fn mux_text_contract_error(reason: MuxTextContractReason) -> DirectMuxError {
+    // Public errors deliberately collapse aligned response failures. Retain
+    // only a closed reason label here, never terminal content or identifiers.
+    tracing::warn!(
+        target: "frankenterm::mux_text_diagnostics",
+        reason = reason.label(),
+        "text transaction contract rejected"
+    );
     DirectMuxError::AlignedUnexpectedResponse {
         expected: "complete text from one pane and source/layout".to_string(),
-        got: reason.to_string(),
+        got: reason.description().to_string(),
     }
 }
 
@@ -1322,7 +1365,6 @@ impl Drop for DirectMuxOutboundLease {
 
 // Transaction-local diagnostics survive early errors/cancellation through Drop;
 // they never retain pane text or alter request/retry authority.
-#[derive(Default)]
 struct TextReadDiagnostics {
     enabled: bool,
     connection_id: u64,
@@ -2567,7 +2609,10 @@ impl DirectMuxClient {
         let mut diagnostics = TextReadDiagnostics {
             enabled: tracing::enabled!(target: "frankenterm::mux_text_diagnostics", tracing::Level::TRACE),
             connection_id: self.connection_id,
-            ..TextReadDiagnostics::default()
+            attempts: 0,
+            quota_reductions: 0,
+            chunk_layout_retries: 0,
+            final_source_retries: 0,
         };
         'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
@@ -2580,12 +2625,13 @@ impl DirectMuxClient {
                 seqno: initial.seqno,
                 dimensions: initial.dimensions,
             };
-            let rows = isize::try_from(layout.dimensions.scrollback_rows)
-                .map_err(|_| mux_text_contract_error("scrollback row count overflow"))?;
+            let rows = isize::try_from(layout.dimensions.scrollback_rows).map_err(|_| {
+                mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
+            })?;
             let mut start = layout.dimensions.scrollback_top;
-            let end = start
-                .checked_add(rows)
-                .ok_or_else(|| mux_text_contract_error("scrollback range overflow"))?;
+            let end = start.checked_add(rows).ok_or_else(|| {
+                mux_text_contract_error(MuxTextContractReason::ScrollbackRangeOverflow)
+            })?;
             let mut out = String::new();
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
@@ -2672,18 +2718,29 @@ impl DirectMuxClient {
                         return self.unexpected_response("GetLinesAtLayoutResponse", &other, true);
                     }
                 };
-                if response.pane_id != initial.pane_id || response.layout != layout {
-                    return Err(mux_text_contract_error("line reply pane/layout mismatch"));
+                if response.pane_id != initial.pane_id {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyPaneMismatch,
+                    ));
+                }
+                if response.layout != layout {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyLayoutMismatch,
+                    ));
                 }
                 let (lines, _images) = response.lines.extract_data();
-                if lines.len() != (chunk_end - start) as usize
-                    || lines
-                        .iter()
-                        .enumerate()
-                        .any(|(offset, (row, _))| *row != start + offset as isize)
+                if lines.len() != (chunk_end - start) as usize {
+                    return Err(mux_text_contract_error(
+                        MuxTextContractReason::ReplyRowCountMismatch,
+                    ));
+                }
+                if lines
+                    .iter()
+                    .enumerate()
+                    .any(|(offset, (row, _))| *row != start + offset as isize)
                 {
                     return Err(mux_text_contract_error(
-                        "line reply range incomplete or unordered",
+                        MuxTextContractReason::ReplyRowOrderMismatch,
                     ));
                 }
                 for (_, line) in lines {
@@ -6967,15 +7024,37 @@ mod tests {
 
     #[test]
     fn text_read_refuses_incomplete_wrong_pane_or_wrong_layout_replies() {
-        for defect in ["missing", "extra", "gap", "reordered", "pane", "layout"] {
-            run_async_test(async move {
+        use tracing::instrument::WithSubscriber;
+        for (defect, reason) in [
+            ("missing", "reply_row_count_mismatch"),
+            ("extra", "reply_row_count_mismatch"),
+            ("gap", "reply_row_order_mismatch"),
+            ("reordered", "reply_row_order_mismatch"),
+            ("pane", "reply_pane_mismatch"),
+            ("layout", "reply_layout_mismatch"),
+            ("row_count_overflow", "scrollback_row_count_overflow"),
+            ("range_overflow", "scrollback_range_overflow"),
+        ] {
+            let diagnostic_log = TextDiagnosticLog::default();
+            let subscriber = diagnostic_log.subscriber();
+            let future = async move {
                 let cx = crate::cx::for_testing();
                 let (_dir, path, server) = text_read_server(1, move |_, pdu| {
                     Some(match pdu {
-                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetPaneRenderChanges(_) => {
+                            let mut reply = text_read_state(7, 0, 3);
+                            if let Pdu::GetPaneRenderChangesResponse(ref mut state) = reply {
+                                if defect == "row_count_overflow" {
+                                    state.dimensions.scrollback_rows = usize::MAX;
+                                } else if defect == "range_overflow" {
+                                    state.dimensions.scrollback_top = isize::MAX;
+                                }
+                            }
+                            reply
+                        }
                         Pdu::GetLinesAtLayout(request) => {
                             let Pdu::GetLinesAtLayoutResponse(mut reply) =
-                                text_read_reply(request, "test")
+                                text_read_reply(request, "PRIVATE_TEXT_CONTRACT_SENTINEL")
                             else {
                                 unreachable!()
                             };
@@ -7004,6 +7083,7 @@ mod tests {
                             reply.lines = lines.into();
                             Pdu::GetLinesAtLayoutResponse(reply)
                         }
+                        Pdu::ListPanes(_) => empty_list_panes_response(),
                         other => panic!("unexpected text request {other:?}"),
                     })
                 })
@@ -7019,12 +7099,39 @@ mod tests {
                     ),
                     "{defect}"
                 );
+                assert!(!client.is_connection_poisoned(), "{defect}");
+                assert!(
+                    client
+                        .list_panes_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .tabs
+                        .is_empty()
+                );
                 drop(client);
                 timeout(Duration::from_secs(5), server)
                     .await
                     .unwrap()
                     .unwrap();
-            });
+            };
+            run_async_test(future.with_subscriber(subscriber));
+            let bytes = diagnostic_log.0.lock().unwrap();
+            let events = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["fields"]["message"] == "text transaction contract rejected")
+                .map(|event| event["fields"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events,
+                vec![serde_json::json!({
+                    "message": "text transaction contract rejected",
+                    "reason": reason,
+                })],
+                "one finite reason and no content, coordinates, counts or identifiers: {defect}"
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_TEXT_CONTRACT_SENTINEL"));
         }
     }
 
@@ -7102,6 +7209,7 @@ mod tests {
                 let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
+                assert_eq!(summaries[0]["connection_id"], client.connection_id);
                 assert_eq!(summaries[0]["chunk_layout_retries"], 0);
                 if quota {
                     assert_eq!(summaries[0]["attempts"], 1);
@@ -7413,6 +7521,7 @@ mod tests {
                 let error = pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
                 let summaries = diagnostic_log.summaries();
                 assert_eq!(summaries.len(), 1);
+                assert!(summaries[0]["connection_id"].as_u64().unwrap() > 0);
                 assert_eq!(summaries[0]["attempts"], 3);
                 assert_eq!(summaries[0]["quota_reductions"], 0);
                 assert_eq!(

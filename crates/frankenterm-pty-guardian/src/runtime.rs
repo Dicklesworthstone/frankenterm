@@ -1,22 +1,32 @@
 //! Guardian-owned PTY and child lifetime state.
 
-use crate::output::{
-    GuardianCheckpointStageStore, GuardianOutputCompletionState, GuardianOutputPipeline,
-    GuardianOutputSubmitError, GuardianPaneInputCompletionError, GuardianPaneInputJournal,
-    GuardianPaneInputTransaction, GuardianPaneInputTransactionError, GuardianPaneOutputJournal,
-    OUTPUT_RECORD_BYTES,
+use crate::broker::{
+    BrokerControlClientV1, BrokerGuardianConnectionIdentityV1, BrokerOutputDeliveryV1,
+    BrokerPaneChildStatusV1, BrokerPaneInputWriterV1, BrokerPaneIoCommandV1,
+    BrokerPaneIoCompletionV1, BrokerPaneIoSessionV1, BrokerPaneIoWorkerV1,
+    BrokerPaneOutputHandleV1, BrokerPaneOutputV1,
 };
-use crate::transport::GuardianTokenEffectLease;
+use crate::output::{
+    GuardianBrokerOutputSubmitError, GuardianCheckpointStageStore,
+    GuardianDurableBrokerOutputAckV1, GuardianGenesisReplayOriginV1, GuardianJournalPreparation,
+    GuardianOutputCompletionState, GuardianOutputPipeline, GuardianOutputSubmitError,
+    GuardianPaneInputCompletionError, GuardianPaneInputJournal, GuardianPaneInputTransaction,
+    GuardianPaneInputTransactionError, GuardianPaneOutputJournal, OUTPUT_RECORD_BYTES,
+};
+use crate::transport::{GuardianBrokerEndpoint, GuardianTokenEffectLease};
+use frankenterm_build_identity::SealedAtomicBuildIdentity;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mio::Waker;
 use mio::unix::SourceFd;
 use mio::{Interest, Registry, Token};
+use mux::guardian_checkpoint::GuardianCheckpointGenesisSpawnPermitV1;
 use mux::guardian_input_journal::{GuardianInputDisposition, catch_guardian_input_worker_panic};
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_PANES,
     GuardianAuthenticatedMuxConnectionAuthorityV1, GuardianCheckpointStageKindV1,
     GuardianCheckpointStageRequestV1, GuardianDurableSpawnFenceInstallV1,
     GuardianDurableSpawnFenceV1, GuardianEffectOutcome, GuardianEffectTransactionError,
+    GuardianGenesisActivationContinuationV1, GuardianGenesisMuxAuthorityV1,
     GuardianMuxLeaseRetirement, GuardianOperation, GuardianPaneState, GuardianProtocolError,
     GuardianProtocolState, GuardianRejectionCode, GuardianReplayRequestV1,
     GuardianReplaySelectorV1, GuardianReply, GuardianResizePayload, GuardianResponseEnvelope,
@@ -30,8 +40,14 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
+
+// Connection ownership, threads, and socket buffers are bounded independently
+// of pane count. A connection is shared by every pane of its authenticated mux.
+const MAX_BROKER_CONNECTIONS: usize = 4;
+const BROKER_IO_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Bounded resources assigned to one guardian runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +122,9 @@ pub struct GuardianRuntimeCounters {
     pub pty_bytes_drained: u64,
     pub pty_bytes_durably_committed: u64,
     pub pty_records_durably_committed: u64,
+    pub broker_output_acknowledgements: u64,
+    pub broker_starting_panes_adopted: u64,
+    pub broker_control_failures: u64,
     pub pty_read_failures: u64,
     pub output_commit_failures: u64,
     pub output_deregister_failures: u64,
@@ -158,6 +177,92 @@ struct RuntimePane {
     pty_eof_observed: bool,
     exit_observed: bool,
     token: Token,
+}
+
+struct StartingBrokerPane {
+    mux_incarnation: Uuid,
+    spawn_request_id: Uuid,
+    spawn_effect_id: Uuid,
+    spawn_payload_digest: [u8; 32],
+    custody_ack_id: Uuid,
+    initial_pending: bool,
+    failed_before_spawn: bool,
+    output: Option<RuntimePaneOutput>,
+    handle: Option<BrokerPaneOutputHandleV1>,
+    pending_delivery: Option<BrokerOutputDeliveryV1>,
+    pending_ack: Option<GuardianDurableBrokerOutputAckV1>,
+    read_reservation: usize,
+    terminal: bool,
+    child_exit_observed: bool,
+    status_due: bool,
+    input_journal: Option<GuardianPaneInputJournal>,
+    activated: bool,
+    original_spawn: Option<AuthenticatedGuardianRequest>,
+    original_begin: Option<AuthenticatedGuardianRequest>,
+    retry_before_publication: Option<Box<GenesisSpawnJob>>,
+    activation: Option<GuardianGenesisActivationContinuationV1>,
+    replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+struct RuntimeBrokerConnection {
+    worker: Option<BrokerPaneIoWorkerV1>,
+    retained_session: Option<Box<BrokerPaneIoSessionV1>>,
+    active_pane: Option<Uuid>,
+    last_pane: Option<Uuid>,
+    failed: bool,
+}
+
+fn activate_ready_broker_pane(
+    protocol: &mut GuardianProtocolState,
+    pane_id: Uuid,
+    pane: &mut StartingBrokerPane,
+) -> Option<GuardianResponseEnvelope> {
+    if pane.activated
+        || pane.initial_pending
+        || pane.handle.is_none()
+        || pane.input_journal.is_none()
+        || pane.replay_origin.is_none()
+        || pane.output.as_ref().is_none_or(|output| output.failed)
+    {
+        return None;
+    }
+    let (request, continuation) = match (pane.original_spawn.take(), pane.activation.take()) {
+        (Some(request), Some(continuation)) => (request, continuation),
+        (request, continuation) => {
+            pane.original_spawn = request;
+            pane.activation = continuation;
+            return None;
+        }
+    };
+    let result = protocol.finalize_genesis_spawn_transactionally(
+        &request,
+        &continuation,
+        |reply| {
+            if !matches!(reply, GuardianReply::Spawned { pane_id: reply_pane, generation: 0 } if *reply_pane == pane_id) {
+                return GuardianEffectOutcome::DefinitelyNotApplied(RuntimeEffectError::InternalInvariant);
+            }
+            // The installed backend owns the actual broker custody handle,
+            // both prepared journals, and authenticated Genesis replay origin.
+            // Only this transition exposes it to leased input and controls.
+            pane.activated = true;
+            GuardianEffectOutcome::Applied
+        },
+    );
+    let mut indeterminate = false;
+    let response = match effect_result(&request, result, &mut indeterminate) {
+        Ok(reply) => GuardianResponseEnvelope::reply(&request, &reply).ok(),
+        Err(code) => Some(GuardianResponseEnvelope::rejection(&request, code)),
+    };
+    if !pane.activated {
+        pane.original_spawn = Some(request);
+        pane.activation = Some(continuation);
+    }
+    if indeterminate {
+        if let Some(output) = pane.output.as_mut() {
+            output.failed = true;
+        }
+    }
+    response
 }
 
 #[derive(Default)]
@@ -384,12 +489,34 @@ impl WorkerTokenEffectAuthority {
     }
 }
 
+enum RuntimeInputWriter {
+    Native(Box<dyn Write + Send>),
+    Broker(BrokerPaneInputWriterV1),
+}
+
+impl RuntimeInputWriter {
+    fn writer(&mut self) -> &mut dyn Write {
+        match self {
+            Self::Native(writer) => writer.as_mut(),
+            Self::Broker(writer) => writer,
+        }
+    }
+}
+
 struct InputJob {
     route: GuardianInputRoute,
     pane_id: Uuid,
     protocol: GuardianProtocolState,
-    writer: Box<dyn Write + Send>,
+    writer: RuntimeInputWriter,
     journal: GuardianPaneInputJournal,
+    request: OwnedInputRequest,
+    token_effect_authority: WorkerTokenEffectAuthority,
+}
+
+struct PendingBrokerInput {
+    route: GuardianInputRoute,
+    pane_id: Uuid,
+    protocol: GuardianProtocolState,
     request: OwnedInputRequest,
     token_effect_authority: WorkerTokenEffectAuthority,
 }
@@ -403,7 +530,7 @@ struct InputWorkerCompletion {
     route: GuardianInputRoute,
     pane_id: Uuid,
     protocol: GuardianProtocolState,
-    writer: Box<dyn Write + Send>,
+    writer: RuntimeInputWriter,
     journal: GuardianPaneInputJournal,
     response: Option<GuardianResponseEnvelope>,
     disposition: Option<GuardianInputDisposition>,
@@ -491,6 +618,53 @@ struct CheckpointJob {
     journal: Option<GuardianPaneOutputJournal>,
     token_effect_authority: WorkerTokenEffectAuthority,
     admitted_genesis_stage: Option<GuardianCheckpointStageRequestV1>,
+    retain_genesis_begin: bool,
+    genesis_spawn: Option<GenesisSpawnJob>,
+    broker_control: Option<BrokerControlJob>,
+    replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+struct BrokerControlJob {
+    pane_id: Uuid,
+    mux_incarnation: Uuid,
+    session: Box<BrokerPaneIoSessionV1>,
+    handle: BrokerPaneOutputHandleV1,
+}
+
+struct PendingBrokerControl {
+    route: GuardianCheckpointRoute,
+    pane_id: Uuid,
+    protocol: GuardianProtocolState,
+    request: AuthenticatedGuardianRequest,
+    token_effect_authority: WorkerTokenEffectAuthority,
+}
+
+struct GenesisSpawnJob {
+    begin: GuardianCheckpointStageRequestV1,
+    permit: Option<GuardianCheckpointGenesisSpawnPermitV1>,
+    endpoint: GuardianBrokerEndpoint,
+    session: Option<Box<BrokerPaneIoSessionV1>>,
+    handle: Option<BrokerPaneOutputHandleV1>,
+    custody_ack_id: Uuid,
+    submitted: bool,
+    broker_attempted: bool,
+    preparation: GuardianJournalPreparation,
+    output_journal: Option<GuardianPaneOutputJournal>,
+    input_journal: Option<GuardianPaneInputJournal>,
+    replay_origin: Option<GuardianGenesisReplayOriginV1>,
+}
+
+struct GenesisSpawnCompletion {
+    mux_incarnation: Uuid,
+    pane_id: Uuid,
+    session: Option<Box<BrokerPaneIoSessionV1>>,
+    handle: Option<BrokerPaneOutputHandleV1>,
+    initial_pending: bool,
+    broker_attempted: bool,
+    output_journal: Option<GuardianPaneOutputJournal>,
+    input_journal: Option<GuardianPaneInputJournal>,
+    replay_origin: Option<GuardianGenesisReplayOriginV1>,
+    retry_before_publication: Option<Box<GenesisSpawnJob>>,
 }
 
 struct CheckpointWorkerCompletion {
@@ -500,6 +674,10 @@ struct CheckpointWorkerCompletion {
     response: Option<GuardianResponseEnvelope>,
     worker_panicked: bool,
     token_authority_failed: bool,
+    genesis_begin: Option<AuthenticatedGuardianRequest>,
+    genesis_spawn: Option<GenesisSpawnCompletion>,
+    genesis_spawn_request: Option<AuthenticatedGuardianRequest>,
+    broker_control: Option<BrokerControlJob>,
 }
 
 enum CheckpointSubmitError {
@@ -596,7 +774,6 @@ fn checkpoint_worker(
         let token_authority_failed = !authority_valid_before || !authority_valid_after;
         // Response correlation validates against the authenticated request, so
         // build it first. Then wipe plaintext before publishing any completion.
-        job.request.zeroize_payload();
         let (response, worker_panicked) = match execution {
             Some(Ok(response)) if !token_authority_failed => (response, false),
             Some(Ok(_)) | None => (None, false),
@@ -606,6 +783,47 @@ fn checkpoint_worker(
         // preflight-decoded Chunk owned by the job. Wipe that owner before
         // publishing completion just like the authenticated wire request.
         drop(job.admitted_genesis_stage.take());
+        let genesis_spawn = job.genesis_spawn.take().map(|mut spawn| {
+            let retryable = spawn.permit.is_some()
+                && !spawn.broker_attempted
+                && !worker_panicked
+                && !token_authority_failed;
+            let mut completion = GenesisSpawnCompletion {
+                mux_incarnation: job.request.header().mux_incarnation,
+                pane_id: job.request.header().pane_id.unwrap_or(Uuid::nil()),
+                session: spawn.session.take(),
+                handle: spawn.handle.take(),
+                initial_pending: spawn.submitted,
+                broker_attempted: spawn.broker_attempted,
+                output_journal: None,
+                input_journal: None,
+                replay_origin: None,
+                retry_before_publication: None,
+            };
+            if retryable {
+                completion.retry_before_publication = Some(Box::new(spawn));
+            } else {
+                completion.output_journal = spawn.output_journal;
+                completion.input_journal = spawn.input_journal;
+                completion.replay_origin = spawn.replay_origin;
+            }
+            completion
+        });
+        // Keep the authenticated Begin itself, never a reconstructed request,
+        // for the later Spawn reservation. Its fixed descriptor contains no
+        // terminal plaintext; every other request is wiped before handoff.
+        let (genesis_begin, genesis_spawn_request) = if genesis_spawn.is_some() {
+            (None, Some(job.request))
+        } else if job.retain_genesis_begin
+            && response.is_some()
+            && !worker_panicked
+            && !token_authority_failed
+        {
+            (Some(job.request), None)
+        } else {
+            job.request.zeroize_payload();
+            (None, None)
+        };
         let completion = CheckpointWorkerCompletion {
             route: job.route,
             operation,
@@ -613,6 +831,10 @@ fn checkpoint_worker(
             response,
             worker_panicked,
             token_authority_failed,
+            genesis_begin,
+            genesis_spawn,
+            genesis_spawn_request,
+            broker_control: job.broker_control,
         };
         if completions.send(completion).is_err() {
             return;
@@ -625,7 +847,22 @@ fn execute_checkpoint_job(
     store: &GuardianCheckpointStageStore,
     job: &mut CheckpointJob,
 ) -> Option<GuardianResponseEnvelope> {
+    if let Some(control) = job.broker_control.as_mut() {
+        return execute_broker_control_job(
+            &mut job.protocol,
+            &job.request,
+            &mut control.session,
+            &control.handle,
+        );
+    }
     match job.request.header().operation {
+        GuardianOperation::Spawn => {
+            execute_genesis_spawn_job(store, job);
+            // The broker child is durably owned, but is not yet a live mux
+            // pane. Claim stays fenced until mutation and replay activation
+            // have completed; never manufacture a successful Spawn receipt.
+            None
+        }
         GuardianOperation::CheckpointStage => execute_checkpoint_stage_job(store, job),
         GuardianOperation::Checkpoint => {
             let receipt = match job
@@ -657,7 +894,12 @@ fn execute_checkpoint_job(
                     ));
                 }
             };
-            let page = match store.apply_replay(&job.request, replay, job.journal.as_ref()) {
+            let page = match store.apply_replay_with_genesis(
+                &job.request,
+                replay,
+                job.journal.as_ref(),
+                job.replay_origin.as_ref(),
+            ) {
                 Ok(page) => page,
                 Err(error) => {
                     return replay_store_error_response(&job.request, &error);
@@ -690,6 +932,172 @@ fn execute_checkpoint_job(
     }
 }
 
+/// Execute one leased broker mutation on the authority worker. The original
+/// authenticated effect transaction owns deduplication; a socket error cannot
+/// establish that the child did not observe the mutation.
+fn execute_broker_control_job(
+    protocol: &mut GuardianProtocolState,
+    request: &AuthenticatedGuardianRequest,
+    session: &mut BrokerPaneIoSessionV1,
+    handle: &BrokerPaneOutputHandleV1,
+) -> Option<GuardianResponseEnvelope> {
+    let reject = |code| Some(GuardianResponseEnvelope::rejection(request, code));
+    if request.header().pane_id != Some(handle.pane_id()) {
+        return reject(GuardianRejectionCode::InvalidRequest);
+    }
+    let resize = match request.header().operation {
+        GuardianOperation::Resize => match GuardianResizePayload::decode(request.payload()) {
+            Ok(payload) => Some(payload.size()),
+            Err(_) => return reject(GuardianRejectionCode::InvalidRequest),
+        },
+        GuardianOperation::Signal => match GuardianSignal::decode(request.payload()) {
+            Ok(GuardianSignal::Terminate) => None,
+            Err(_) => return reject(GuardianRejectionCode::InvalidRequest),
+        },
+        GuardianOperation::Close if request.payload().is_empty() => None,
+        _ => return reject(GuardianRejectionCode::InvalidRequest),
+    };
+    let result = protocol.apply_effect_transactionally(request, |reply| {
+        if request.header().operation == GuardianOperation::Close {
+            let GuardianReply::MutationApplied { sequence, .. } = reply else {
+                return GuardianEffectOutcome::DefinitelyNotApplied(
+                    RuntimeEffectError::InternalInvariant,
+                );
+            };
+            if *sequence == 0 {
+                return GuardianEffectOutcome::Applied;
+            }
+        }
+        let deadline = Instant::now() + BROKER_IO_DEADLINE;
+        let result = match request.header().operation {
+            GuardianOperation::Resize => {
+                let Some(size) = resize else {
+                    return GuardianEffectOutcome::DefinitelyNotApplied(
+                        RuntimeEffectError::InternalInvariant,
+                    );
+                };
+                session.client.resize(handle, size, deadline)
+            }
+            GuardianOperation::Signal => session.client.signal_terminate(handle, deadline),
+            GuardianOperation::Close => session.client.close_pane(handle, deadline),
+            _ => {
+                return GuardianEffectOutcome::DefinitelyNotApplied(
+                    RuntimeEffectError::InternalInvariant,
+                );
+            }
+        };
+        classify_external_mutation_result(result)
+    });
+    let mut indeterminate = false;
+    match effect_result(request, result, &mut indeterminate) {
+        Ok(reply) => GuardianResponseEnvelope::reply(request, &reply).ok(),
+        Err(code) => reject(code),
+    }
+}
+
+fn execute_genesis_spawn_job(store: &GuardianCheckpointStageStore, job: &mut CheckpointJob) {
+    let Some(spawn) = job.genesis_spawn.as_mut() else {
+        return;
+    };
+    let Some(permit) = spawn.permit.as_ref() else {
+        return;
+    };
+    let identity = permit.reservation_identity();
+    let pane_id = identity.durable_pane_id();
+    let effect_id = identity.spawn_effect_id();
+    let build = |digest: [u8; 32]| {
+        let mut encoded = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in digest {
+            if write!(&mut encoded, "{byte:02x}").is_err() {
+                return None;
+            }
+        }
+        SealedAtomicBuildIdentity::from_lower_hex(&encoded).ok()
+    };
+    let Some(guardian_build) = build(identity.live_guardian_build_identity_digest()) else {
+        return;
+    };
+    let Some(mux_build) = build(identity.spawning_mux_build_identity_digest()) else {
+        return;
+    };
+    let Ok(connection_identity) = BrokerGuardianConnectionIdentityV1::new(
+        job.protocol.incarnation(),
+        identity.mux_incarnation(),
+        guardian_build,
+        mux_build,
+    ) else {
+        return;
+    };
+    let Ok(payload) = GuardianSpawnPayload::decode(job.request.payload()) else {
+        return;
+    };
+    if spawn.output_journal.is_none() {
+        let Ok(output) = spawn
+            .preparation
+            .prepare_output(job.protocol.incarnation(), pane_id)
+        else {
+            return;
+        };
+        spawn.output_journal = Some(output);
+    }
+    if spawn.input_journal.is_none() {
+        let Ok(input) = spawn
+            .preparation
+            .prepare_input(job.protocol.incarnation(), pane_id)
+        else {
+            return;
+        };
+        spawn.input_journal = Some(input);
+    }
+    // Establish the authenticated broker connection before publishing. Neither
+    // this handshake nor staging can create a PTY; only the published permit
+    // below reaches the broker's durable Spawn transaction.
+    if spawn.session.is_none() {
+        let Ok(client) = BrokerControlClientV1::connect(
+            &spawn.endpoint.socket_path,
+            &spawn.endpoint.token_path,
+            connection_identity,
+            guardian_build,
+        ) else {
+            return;
+        };
+        spawn.session = Some(Box::new(BrokerPaneIoSessionV1 { client }));
+    }
+    let Some(permit) = spawn.permit.take() else {
+        return;
+    };
+    let Ok(admission) = store.publish_staged_genesis(&spawn.begin, permit) else {
+        return;
+    };
+    let Some(output_journal) = spawn.output_journal.as_ref() else {
+        return;
+    };
+    let Ok(replay_origin) = store.prepare_genesis_replay_origin(&admission, output_journal) else {
+        return;
+    };
+    spawn.replay_origin = Some(replay_origin);
+    let Some(session) = spawn.session.as_mut() else {
+        return;
+    };
+    spawn.broker_attempted = true;
+    if session
+        .client
+        .spawn_from_published_admission(admission, payload, Uuid::new_v4(), Uuid::new_v4())
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(handle) =
+        session
+            .client
+            .open_initial_from_claim(store, pane_id, effect_id, spawn.custody_ack_id)
+    {
+        spawn.submitted = true;
+        spawn.handle = handle;
+    }
+}
+
 fn replay_store_error_response(
     request: &AuthenticatedGuardianRequest,
     error: &crate::output::GuardianCheckpointStageStoreError,
@@ -712,7 +1120,8 @@ fn replay_store_error_response(
         GuardianCheckpointStageStoreError::Capacity
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
-        GuardianCheckpointStageStoreError::Cipher(_)
+        GuardianCheckpointStageStoreError::SpawnCustody(_)
+        | GuardianCheckpointStageStoreError::Cipher(_)
         | GuardianCheckpointStageStoreError::Boundary(_)
         | GuardianCheckpointStageStoreError::Output(_)
         | GuardianCheckpointStageStoreError::Journal(_)
@@ -740,6 +1149,11 @@ fn execute_checkpoint_stage_job(
             ));
         }
     };
+    let retain_genesis_begin = stage.kind() == GuardianCheckpointStageKindV1::Begin
+        && matches!(
+            stage.scope(),
+            mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { .. }
+        );
     let reply = match stage.kind() {
         GuardianCheckpointStageKindV1::Begin => store.apply_begin(&stage),
         GuardianCheckpointStageKindV1::Chunk => store.apply_chunk(stage),
@@ -768,6 +1182,7 @@ fn execute_checkpoint_stage_job(
         }
     };
     let reply = reply.ok()?;
+    job.retain_genesis_begin = retain_genesis_begin;
     GuardianResponseEnvelope::reply(&job.request, &GuardianReply::CheckpointStage(reply)).ok()
 }
 
@@ -822,7 +1237,7 @@ fn execute_input_job(job: &mut InputJob) -> InputJobExecution {
             accepted_reply: _,
             permit,
         }) => {
-            let outcome = permit.write_once(job.writer.as_mut(), job.request.payload());
+            let outcome = permit.write_once(job.writer.writer(), job.request.payload());
             // The original authenticated byte length remains available for
             // terminal correlation, so plaintext can die before terminal fsync.
             job.request.zeroize_payload();
@@ -919,14 +1334,22 @@ pub struct GuardianRuntime {
     output_pipeline: GuardianOutputPipeline,
     input_pipeline: GuardianInputPipeline,
     input_pipeline_failed: bool,
+    pending_broker_input: Option<PendingBrokerInput>,
+    pending_broker_control: Option<PendingBrokerControl>,
     checkpoint_pipeline: GuardianCheckpointPipeline,
     checkpoint_pipeline_failed: bool,
+    pending_genesis_submission: Option<Box<CheckpointJob>>,
+    genesis_begins: HashMap<(Uuid, Uuid), AuthenticatedGuardianRequest>,
+    broker_endpoint: Option<GuardianBrokerEndpoint>,
+    broker_connections: HashMap<Uuid, RuntimeBrokerConnection>,
+    starting_broker_panes: HashMap<Uuid, StartingBrokerPane>,
+    completion_waker: Arc<Waker>,
     // This slot is reachable only if the pane map violates the invariant that
     // a worker-owned pane cannot retire while the sole protocol authority is
     // in flight.  Retain the descriptor-pinned WAL and writer even then: an
     // invariant failure must quarantine input, never silently drop its only
     // recovery authority.
-    orphaned_input_authority: Option<(Box<dyn Write + Send>, GuardianPaneInputJournal)>,
+    orphaned_input_authority: Option<(RuntimeInputWriter, GuardianPaneInputJournal)>,
     pending_child_exits: Vec<(Uuid, i32)>,
     output_pipeline_failed: bool,
     output_rearm_cursor: OutputRearmCursor,
@@ -951,7 +1374,7 @@ impl GuardianRuntime {
         let checkpoint_store = output_pipeline.checkpoint_stage_store();
         let input_pipeline = GuardianInputPipeline::new(Arc::clone(&completion_waker))?;
         let checkpoint_pipeline =
-            GuardianCheckpointPipeline::new(checkpoint_store, completion_waker)?;
+            GuardianCheckpointPipeline::new(checkpoint_store, Arc::clone(&completion_waker))?;
         Ok(Self {
             incarnation,
             protocol: Some(GuardianProtocolState::new(incarnation)?),
@@ -964,8 +1387,16 @@ impl GuardianRuntime {
             output_pipeline,
             input_pipeline,
             input_pipeline_failed: false,
+            pending_broker_input: None,
+            pending_broker_control: None,
             checkpoint_pipeline,
             checkpoint_pipeline_failed: false,
+            pending_genesis_submission: None,
+            genesis_begins: HashMap::new(),
+            broker_endpoint: None,
+            broker_connections: HashMap::new(),
+            starting_broker_panes: HashMap::new(),
+            completion_waker,
             orphaned_input_authority: None,
             pending_child_exits,
             output_pipeline_failed: false,
@@ -982,11 +1413,60 @@ impl GuardianRuntime {
         self.incarnation
     }
 
+    pub(crate) fn configure_broker(
+        &mut self,
+        endpoint: GuardianBrokerEndpoint,
+    ) -> Result<(), GuardianProtocolError> {
+        // Configuration cannot turn an unsealed development process into
+        // production authority, nor change the endpoint after effects exist.
+        if self.pane_count() != 0 || !self.genesis_begins.is_empty() {
+            return Err(GuardianProtocolError::GenesisAuthorityMismatch);
+        }
+        self.protocol
+            .as_ref()
+            .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?
+            .live_build_authority_for_genesis()?;
+        self.broker_endpoint = Some(endpoint);
+        Ok(())
+    }
+
     #[must_use]
     pub fn pane_count(&self) -> usize {
         let retained_authority = usize::from(self.orphaned_input_authority.is_some());
+        let broker_live_resources = self
+            .starting_broker_panes
+            .iter()
+            .filter(|(pane_id, pane)| {
+                // Retain the exact failed reservation for retry diagnostics,
+                // but no broker call means no child or PTY can be live.
+                if pane.failed_before_spawn {
+                    return false;
+                }
+                let settled = pane.activated
+                    && pane.child_exit_observed
+                    && pane.terminal
+                    && pane.pending_delivery.is_none()
+                    && pane.pending_ack.is_none()
+                    && pane.read_reservation == 0
+                    && pane.handle.is_some()
+                    && pane
+                        .output
+                        .as_ref()
+                        .is_some_and(RuntimePaneOutput::is_quiescent)
+                    && self.protocol.as_ref().is_some_and(|protocol| {
+                        matches!(
+                            protocol.pane_state(**pane_id),
+                            Some(GuardianPaneState::ClosedTerminal { .. })
+                        )
+                    });
+                !settled
+            })
+            .count();
         effective_pane_occupancy(
-            self.panes.len().saturating_add(retained_authority),
+            self.panes
+                .len()
+                .saturating_add(broker_live_resources)
+                .saturating_add(retained_authority),
             self.indeterminate_effect,
         )
     }
@@ -1128,7 +1608,22 @@ impl GuardianRuntime {
             }
             GuardianOperation::Spawn => self.apply_spawn(request),
             GuardianOperation::Claim | GuardianOperation::RetireLease => {
-                if request.payload().is_empty() {
+                let unsupported_broker_handoff = request.header().operation
+                    == GuardianOperation::Claim
+                    && request
+                        .header()
+                        .pane_id
+                        .and_then(|pane_id| self.starting_broker_panes.get(&pane_id))
+                        .is_some_and(|pane| {
+                            pane.mux_incarnation != request.header().mux_incarnation
+                                || request.header().lease_generation != 0
+                        });
+                if unsupported_broker_handoff {
+                    // The initial custody handle is bound to generation one
+                    // of this mux. A later claimant needs real broker lease
+                    // transfer; changing only the outer protocol is unsafe.
+                    Err(GuardianRejectionCode::InvalidRequest)
+                } else if request.payload().is_empty() {
                     self.apply_metadata_effect(request)
                 } else {
                     Err(GuardianRejectionCode::InvalidRequest)
@@ -1231,6 +1726,30 @@ impl GuardianRuntime {
                 GuardianRejectionCode::InvalidRequest,
             ));
         };
+        if let Some(pane) = self.starting_broker_panes.get(&pane_id) {
+            if !pane.activated {
+                return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
+                    &request,
+                    GuardianRejectionCode::PaneNotFound,
+                ));
+            }
+            if pane.output.as_ref().is_none_or(|output| output.failed)
+                || self.pending_broker_input.is_some()
+            {
+                return GuardianInputSubmission::CloseRetryably;
+            }
+            let Some(protocol) = self.protocol.take() else {
+                return GuardianInputSubmission::CloseRetryably;
+            };
+            self.pending_broker_input = Some(PendingBrokerInput {
+                route,
+                pane_id,
+                protocol,
+                request,
+                token_effect_authority,
+            });
+            return GuardianInputSubmission::Pending;
+        }
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return GuardianInputSubmission::Respond(GuardianResponseEnvelope::rejection(
                 &request,
@@ -1265,7 +1784,7 @@ impl GuardianRuntime {
             route,
             pane_id,
             protocol,
-            writer,
+            writer: RuntimeInputWriter::Native(writer),
             journal,
             request,
             token_effect_authority,
@@ -1325,14 +1844,20 @@ impl GuardianRuntime {
         let Some(pane_id) = request.header().pane_id else {
             return GuardianReplayWaitReadiness::Immediate;
         };
-        let Some(pane) = self.panes.get(&pane_id) else {
+        let (output, terminal) = if let Some(pane) = self.panes.get(&pane_id) {
+            (&pane.output, pane.pty_eof_observed || pane.exit_observed)
+        } else if let Some(pane) = self.starting_broker_panes.get(&pane_id) {
+            let Some(output) = pane.output.as_ref() else {
+                return GuardianReplayWaitReadiness::Immediate;
+            };
+            (
+                output,
+                !pane.activated || pane.terminal || pane.child_exit_observed,
+            )
+        } else {
             return GuardianReplayWaitReadiness::Immediate;
         };
-        if pane.output.failed
-            || pane.pty_eof_observed
-            || pane.exit_observed
-            || pane.output.expected_sequence != Some(next_sequence)
-        {
+        if output.failed || terminal || output.expected_sequence != Some(next_sequence) {
             GuardianReplayWaitReadiness::Immediate
         } else {
             GuardianReplayWaitReadiness::Pending { wait_millis }
@@ -1374,6 +1899,16 @@ impl GuardianRuntime {
             .as_ref()
             .ok_or(GuardianProtocolError::GenesisAuthorityUnavailable)?
             .authenticate_mux_connection_for_genesis(request)
+    }
+
+    pub(crate) fn is_broker_control_request(&self, request: &AuthenticatedGuardianRequest) -> bool {
+        matches!(
+            request.header().operation,
+            GuardianOperation::Resize | GuardianOperation::Signal | GuardianOperation::Close
+        ) && request
+            .header()
+            .pane_id
+            .is_some_and(|pane_id| self.starting_broker_panes.contains_key(&pane_id))
     }
 
     /// Transfer the one global protocol authority and one owned authenticated
@@ -1420,6 +1955,39 @@ impl GuardianRuntime {
         genesis_connection: Option<&GuardianAuthenticatedMuxConnectionAuthorityV1>,
     ) -> GuardianCheckpointSubmission {
         let operation = request.header().operation;
+        if operation == GuardianOperation::Spawn {
+            return self.submit_genesis_spawn(
+                request,
+                route,
+                token_effect_authority,
+                genesis_connection,
+            );
+        }
+        if self.is_broker_control_request(&request) {
+            if request.header().request_id != route.request_id {
+                return GuardianCheckpointSubmission::Respond(GuardianResponseEnvelope::rejection(
+                    &request,
+                    GuardianRejectionCode::InvalidRequest,
+                ));
+            }
+            if self.checkpoint_pipeline_failed || self.indeterminate_effect {
+                return GuardianCheckpointSubmission::CloseRetryably;
+            }
+            let Some(pane_id) = request.header().pane_id else {
+                return GuardianCheckpointSubmission::CloseRetryably;
+            };
+            let Some(protocol) = self.protocol.take() else {
+                return GuardianCheckpointSubmission::CloseRetryably;
+            };
+            self.pending_broker_control = Some(PendingBrokerControl {
+                route,
+                pane_id,
+                protocol,
+                request,
+                token_effect_authority,
+            });
+            return GuardianCheckpointSubmission::Pending;
+        }
         if !matches!(
             operation,
             GuardianOperation::CheckpointStage
@@ -1473,11 +2041,46 @@ impl GuardianRuntime {
         } else {
             None
         };
+        if let Some(stage) = admitted_genesis_stage.as_ref() {
+            if stage.kind() == GuardianCheckpointStageKindV1::Begin {
+                let mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis { spawn_effect_id } =
+                    stage.scope()
+                else {
+                    unreachable!("Genesis preflight admitted a non-Genesis scope")
+                };
+                let key = (request.header().mux_incarnation, spawn_effect_id);
+                if (!self.genesis_begins.contains_key(&key)
+                    && self.genesis_begins.len() >= self.config.max_panes)
+                    || self.genesis_begins.try_reserve(1).is_err()
+                {
+                    self.protocol = Some(protocol);
+                    let response = GuardianResponseEnvelope::rejection(
+                        &request,
+                        GuardianRejectionCode::CapacityExhausted,
+                    );
+                    request.zeroize_payload();
+                    return GuardianCheckpointSubmission::Respond(response);
+                }
+            }
+        }
         let journal = request
             .header()
             .pane_id
             .and_then(|pane_id| self.panes.get(&pane_id))
-            .map(|pane| pane.output.journal.clone());
+            .map(|pane| pane.output.journal.clone())
+            .or_else(|| {
+                request
+                    .header()
+                    .pane_id
+                    .and_then(|pane_id| self.starting_broker_panes.get(&pane_id))
+                    .and_then(|pane| pane.output.as_ref())
+                    .map(|output| output.journal.clone())
+            });
+        let replay_origin = request
+            .header()
+            .pane_id
+            .and_then(|pane_id| self.starting_broker_panes.get(&pane_id))
+            .and_then(|pane| pane.replay_origin.clone());
         let job = CheckpointJob {
             route,
             protocol,
@@ -1485,6 +2088,10 @@ impl GuardianRuntime {
             journal,
             token_effect_authority,
             admitted_genesis_stage,
+            retain_genesis_begin: false,
+            genesis_spawn: None,
+            broker_control: None,
+            replay_origin,
         };
         match self.checkpoint_pipeline.try_submit(job) {
             Ok(()) => {
@@ -1523,6 +2130,277 @@ impl GuardianRuntime {
         }
     }
 
+    fn submit_genesis_spawn(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        token_effect_authority: WorkerTokenEffectAuthority,
+        connection: Option<&GuardianAuthenticatedMuxConnectionAuthorityV1>,
+    ) -> GuardianCheckpointSubmission {
+        let reject = |request: &AuthenticatedGuardianRequest, code| {
+            GuardianCheckpointSubmission::Respond(GuardianResponseEnvelope::rejection(
+                request, code,
+            ))
+        };
+        if route.request_id != request.header().request_id {
+            return reject(&request, GuardianRejectionCode::InvalidRequest);
+        }
+        let (Some(endpoint), Some(connection), Some(pane_id), Some(effect_id)) = (
+            self.broker_endpoint.clone(),
+            connection,
+            request.header().pane_id,
+            request.header().effect_id,
+        ) else {
+            return reject(&request, GuardianRejectionCode::InvalidRequest);
+        };
+        if self.indeterminate_effect {
+            return self
+                .protocol
+                .as_ref()
+                .and_then(|protocol| protocol.indeterminate_effect_reply(&request).ok().flatten())
+                .and_then(|reply| GuardianResponseEnvelope::reply(&request, &reply).ok())
+                .map_or(
+                    GuardianCheckpointSubmission::CloseRetryably,
+                    GuardianCheckpointSubmission::Respond,
+                );
+        }
+        if self.protocol.is_none() || self.checkpoint_pipeline_failed {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        if let Some(protocol) = self.protocol.as_ref() {
+            match protocol.completed_genesis_spawn_reply(&request) {
+                Ok(Some(reply)) => {
+                    return GuardianResponseEnvelope::reply(&request, &reply).map_or(
+                        GuardianCheckpointSubmission::CloseRetryably,
+                        GuardianCheckpointSubmission::Respond,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return reject(&request, GuardianRejectionCode::from_protocol_error(&error));
+                }
+            }
+        }
+        let mux_incarnation = request.header().mux_incarnation;
+        if let Some(existing) = self.starting_broker_panes.get(&pane_id) {
+            if existing.mux_incarnation != mux_incarnation
+                || existing.spawn_request_id != request.header().request_id
+                || existing.spawn_effect_id != effect_id
+                || existing.spawn_payload_digest != request.header().payload_sha256
+            {
+                return reject(&request, GuardianRejectionCode::RequestIdentityConflict);
+            }
+            if existing.retry_before_publication.is_some() {
+                return self.resubmit_genesis_before_publication(
+                    request,
+                    route,
+                    token_effect_authority,
+                    connection,
+                );
+            }
+            if existing.failed_before_spawn {
+                return reject(&request, GuardianRejectionCode::InternalInvariant);
+            }
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        if self.pane_count() >= self.config.max_panes
+            || self.starting_broker_panes.len() >= self.config.max_panes
+            || (!self.broker_connections.contains_key(&mux_incarnation)
+                && self.broker_connections.len() >= MAX_BROKER_CONNECTIONS)
+            || self.broker_connections.try_reserve(1).is_err()
+            || self.starting_broker_panes.try_reserve(1).is_err()
+        {
+            return reject(&request, GuardianRejectionCode::CapacityExhausted);
+        }
+        if self
+            .broker_connections
+            .get(&mux_incarnation)
+            .is_some_and(|connection| connection.failed)
+        {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        let Some(begin) = self.genesis_begins.get(&(mux_incarnation, effect_id)) else {
+            return reject(&request, GuardianRejectionCode::InvalidRequest);
+        };
+        let Ok(stage) = GuardianCheckpointStageRequestV1::decode(begin.payload()) else {
+            return reject(&request, GuardianRejectionCode::InvalidRequest);
+        };
+        let Some(protocol) = self.protocol.as_ref() else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let live = match protocol.live_build_authority_for_genesis() {
+            Ok(live) => live,
+            Err(error) => {
+                return reject(&request, GuardianRejectionCode::from_protocol_error(&error));
+            }
+        };
+        let broker =
+            self.broker_connections
+                .entry(mux_incarnation)
+                .or_insert(RuntimeBrokerConnection {
+                    worker: None,
+                    retained_session: None,
+                    active_pane: None,
+                    last_pane: None,
+                    failed: false,
+                });
+        let Some(mut protocol) = self.protocol.take() else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let (permit, activation) = match protocol.reserve_genesis_spawn_for_activation(
+            &request,
+            begin,
+            Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(
+                connection,
+            )),
+            Some(&live),
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.protocol = Some(protocol);
+                return reject(&request, GuardianRejectionCode::from_protocol_error(&error));
+            }
+        };
+        let session = broker.retained_session.take();
+        let custody_ack_id = Uuid::new_v4();
+        self.starting_broker_panes.insert(
+            pane_id,
+            StartingBrokerPane {
+                mux_incarnation,
+                spawn_request_id: request.header().request_id,
+                spawn_effect_id: effect_id,
+                spawn_payload_digest: request.header().payload_sha256,
+                custody_ack_id,
+                initial_pending: false,
+                failed_before_spawn: false,
+                output: None,
+                handle: None,
+                pending_delivery: None,
+                pending_ack: None,
+                read_reservation: 0,
+                terminal: false,
+                child_exit_observed: false,
+                status_due: true,
+                input_journal: None,
+                activated: false,
+                original_spawn: None,
+                original_begin: self.genesis_begins.remove(&(mux_incarnation, effect_id)),
+                retry_before_publication: None,
+                activation: Some(activation),
+                replay_origin: None,
+            },
+        );
+        let job = CheckpointJob {
+            route,
+            protocol,
+            request,
+            journal: None,
+            token_effect_authority,
+            admitted_genesis_stage: None,
+            retain_genesis_begin: false,
+            genesis_spawn: Some(GenesisSpawnJob {
+                begin: stage,
+                permit: Some(permit),
+                endpoint,
+                session,
+                handle: None,
+                custody_ack_id,
+                submitted: false,
+                broker_attempted: false,
+                preparation: self.output_pipeline.journal_preparation(),
+                output_journal: None,
+                input_journal: None,
+                replay_origin: None,
+            }),
+            broker_control: None,
+            replay_origin: None,
+        };
+        // Retain the authenticated request and its linear permit before
+        // waiting for the shared broker session. This also tells the output
+        // scheduler to drain its current job without immediately replacing it.
+        self.pending_genesis_submission = Some(Box::new(job));
+        GuardianCheckpointSubmission::Pending
+    }
+
+    fn resubmit_genesis_before_publication(
+        &mut self,
+        request: AuthenticatedGuardianRequest,
+        route: GuardianCheckpointRoute,
+        token_effect_authority: WorkerTokenEffectAuthority,
+        connection_authority: &GuardianAuthenticatedMuxConnectionAuthorityV1,
+    ) -> GuardianCheckpointSubmission {
+        let Some(pane_id) = request.header().pane_id else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        let (Some(protocol), Some(begin), Some(retry)) = (
+            self.protocol.as_ref(),
+            pane.original_begin.as_ref(),
+            pane.retry_before_publication.as_ref(),
+        ) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        if retry.permit.is_none() || retry.broker_attempted || pane.original_spawn.is_none() {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        let authorization = protocol
+            .live_build_authority_for_genesis()
+            .and_then(|live| {
+                protocol.preflight_genesis_checkpoint_stage(begin, connection_authority, &live)
+            });
+        if let Err(error) = authorization {
+            return GuardianCheckpointSubmission::Respond(GuardianResponseEnvelope::rejection(
+                &request,
+                GuardianRejectionCode::from_protocol_error(&error),
+            ));
+        }
+        let Some(connection) = self.broker_connections.get_mut(&pane.mux_incarnation) else {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        };
+        // A retained pre-publication request does not own failures that may
+        // have arisen on this shared connection while another pane used it.
+        if connection.failed {
+            return GuardianCheckpointSubmission::CloseRetryably;
+        }
+        let (mut retry, original_request, protocol) = match (
+            pane.retry_before_publication.take(),
+            pane.original_spawn.take(),
+            self.protocol.take(),
+        ) {
+            (Some(retry), Some(original_request), Some(protocol)) => {
+                (retry, original_request, protocol)
+            }
+            (retry, original_request, protocol) => {
+                pane.retry_before_publication = retry;
+                pane.original_spawn = original_request;
+                self.protocol = protocol;
+                return GuardianCheckpointSubmission::CloseRetryably;
+            }
+        };
+        if retry.session.is_none() {
+            retry.session = connection.retained_session.take();
+        }
+        pane.failed_before_spawn = false;
+        let job = CheckpointJob {
+            route,
+            protocol,
+            request: original_request,
+            journal: None,
+            token_effect_authority,
+            admitted_genesis_stage: None,
+            retain_genesis_begin: false,
+            genesis_spawn: Some(*retry),
+            broker_control: None,
+            replay_origin: None,
+        };
+        // Exact retries need the same foreground handoff as initial admission:
+        // retain the original permit and request while current broker I/O drains.
+        self.pending_genesis_submission = Some(Box::new(job));
+        GuardianCheckpointSubmission::Pending
+    }
+
     fn record_durable_retryable_close(&mut self, operation: GuardianOperation) {
         if is_replay_operation(operation) {
             self.counters.replay_retryable_capacity_closes = self
@@ -1555,27 +2433,271 @@ impl GuardianRuntime {
     fn restore_pane_input_authority(
         &mut self,
         pane_id: Uuid,
-        writer: Box<dyn Write + Send>,
+        writer: RuntimeInputWriter,
         journal: GuardianPaneInputJournal,
     ) -> bool {
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            if pane.writer.is_none() && pane.input_journal.is_none() {
-                pane.writer = Some(writer);
-                pane.input_journal = Some(journal);
-                return true;
+        match writer {
+            RuntimeInputWriter::Native(writer) => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    if pane.writer.is_none() && pane.input_journal.is_none() {
+                        pane.writer = Some(writer);
+                        pane.input_journal = Some(journal);
+                        return true;
+                    }
+                }
+                self.orphaned_input_authority = Some((RuntimeInputWriter::Native(writer), journal));
+            }
+            RuntimeInputWriter::Broker(writer) => {
+                if let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) {
+                    if pane.handle.is_none() && pane.input_journal.is_none() {
+                        if let Some(connection) =
+                            self.broker_connections.get_mut(&pane.mux_incarnation)
+                        {
+                            if connection.worker.is_none() && connection.retained_session.is_none()
+                            {
+                                let (session, handle) = writer.into_parts();
+                                pane.handle = Some(handle);
+                                pane.input_journal = Some(journal);
+                                connection.retained_session = Some(session);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                self.orphaned_input_authority = Some((RuntimeInputWriter::Broker(writer), journal));
             }
         }
         self.indeterminate_effect = true;
         // Only one job can exist because it owns the sole protocol state;
         // therefore a second orphan is structurally unreachable.
-        debug_assert!(self.orphaned_input_authority.is_none());
-        self.orphaned_input_authority = Some((writer, journal));
         false
     }
 
     /// Restore worker-owned authorities, replay child exits accumulated while
     /// the protocol was absent, and yield one exact transport completion.
+    fn resume_broker_control(
+        &mut self,
+        pending: PendingBrokerControl,
+    ) -> Option<GuardianRuntimeCheckpointCompletion> {
+        let route = pending.route;
+        let Some(pane) = self.starting_broker_panes.get_mut(&pending.pane_id) else {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeCheckpointCompletion {
+                route,
+                response: None,
+            });
+        };
+        let Some(connection) = self.broker_connections.get_mut(&pane.mux_incarnation) else {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeCheckpointCompletion {
+                route,
+                response: None,
+            });
+        };
+        if connection.failed
+            || !pane.activated
+            || pane.output.as_ref().is_none_or(|output| output.failed)
+        {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeCheckpointCompletion {
+                route,
+                response: None,
+            });
+        }
+        if connection.active_pane.is_some() || pane.handle.is_none() {
+            self.pending_broker_control = Some(pending);
+            return None;
+        }
+        if let Some(worker) = connection.worker.as_mut() {
+            match worker.try_take_session() {
+                Ok(Some(session)) => connection.retained_session = Some(session),
+                Ok(None) => {
+                    self.pending_broker_control = Some(pending);
+                    return None;
+                }
+                Err(_) => {
+                    connection.failed = true;
+                    self.protocol = Some(pending.protocol);
+                    return Some(GuardianRuntimeCheckpointCompletion {
+                        route,
+                        response: None,
+                    });
+                }
+            }
+        }
+        drop(connection.worker.take());
+        let (session, handle) = match (connection.retained_session.take(), pane.handle.take()) {
+            (Some(session), Some(handle)) => (session, handle),
+            (session, handle) => {
+                connection.retained_session = session;
+                pane.handle = handle;
+                connection.failed = true;
+                self.protocol = Some(pending.protocol);
+                return Some(GuardianRuntimeCheckpointCompletion {
+                    route,
+                    response: None,
+                });
+            }
+        };
+        let job = CheckpointJob {
+            route,
+            protocol: pending.protocol,
+            request: pending.request,
+            journal: None,
+            token_effect_authority: pending.token_effect_authority,
+            admitted_genesis_stage: None,
+            retain_genesis_begin: false,
+            genesis_spawn: None,
+            broker_control: Some(BrokerControlJob {
+                pane_id: pending.pane_id,
+                mux_incarnation: pane.mux_incarnation,
+                session,
+                handle,
+            }),
+            replay_origin: None,
+        };
+        match self.checkpoint_pipeline.try_submit(job) {
+            Ok(()) => None,
+            Err(error) => {
+                let job = match error {
+                    CheckpointSubmitError::Saturated(job) => job,
+                    CheckpointSubmitError::Unavailable(job) => {
+                        self.checkpoint_pipeline_failed = true;
+                        job
+                    }
+                };
+                let mut job = *job;
+                if let Some(control) = job.broker_control.take() {
+                    pane.handle = Some(control.handle);
+                    connection.retained_session = Some(control.session);
+                }
+                self.protocol = Some(job.protocol);
+                Some(GuardianRuntimeCheckpointCompletion {
+                    route,
+                    response: None,
+                })
+            }
+        }
+    }
+
+    fn resume_broker_input(
+        &mut self,
+        pending: PendingBrokerInput,
+    ) -> Option<GuardianRuntimeInputCompletion> {
+        let route = pending.route;
+        let Some(pane) = self.starting_broker_panes.get_mut(&pending.pane_id) else {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeInputCompletion {
+                route,
+                response: None,
+            });
+        };
+        let Some(connection) = self.broker_connections.get_mut(&pane.mux_incarnation) else {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeInputCompletion {
+                route,
+                response: None,
+            });
+        };
+        if connection.failed
+            || pane.output.as_ref().is_none_or(|output| output.failed)
+            || !pane.activated
+        {
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeInputCompletion {
+                route,
+                response: None,
+            });
+        }
+        if connection.active_pane.is_some() || pane.handle.is_none() || pane.input_journal.is_none()
+        {
+            self.pending_broker_input = Some(pending);
+            return None;
+        }
+        if let Some(worker) = connection.worker.as_mut() {
+            match worker.try_take_session() {
+                Ok(Some(session)) => connection.retained_session = Some(session),
+                Ok(None) => {
+                    self.pending_broker_input = Some(pending);
+                    return None;
+                }
+                Err(_) => {
+                    connection.failed = true;
+                    self.protocol = Some(pending.protocol);
+                    return Some(GuardianRuntimeInputCompletion {
+                        route,
+                        response: None,
+                    });
+                }
+            }
+        }
+        drop(connection.worker.take());
+        let Some(session) = connection.retained_session.take() else {
+            connection.failed = true;
+            self.protocol = Some(pending.protocol);
+            return Some(GuardianRuntimeInputCompletion {
+                route,
+                response: None,
+            });
+        };
+        let (handle, journal) = match (pane.handle.take(), pane.input_journal.take()) {
+            (Some(handle), Some(journal)) => (handle, journal),
+            (handle, journal) => {
+                pane.handle = handle;
+                pane.input_journal = journal;
+                connection.retained_session = Some(session);
+                connection.failed = true;
+                self.protocol = Some(pending.protocol);
+                return Some(GuardianRuntimeInputCompletion {
+                    route,
+                    response: None,
+                });
+            }
+        };
+        let writer = RuntimeInputWriter::Broker(BrokerPaneInputWriterV1::new(
+            session,
+            handle,
+            Instant::now() + BROKER_IO_DEADLINE,
+        ));
+        let job = InputJob {
+            route,
+            pane_id: pending.pane_id,
+            protocol: pending.protocol,
+            writer,
+            journal,
+            request: pending.request,
+            token_effect_authority: pending.token_effect_authority,
+        };
+        match self.input_pipeline.try_submit(job) {
+            Ok(()) => {
+                self.counters.input_transactions_submitted =
+                    self.counters.input_transactions_submitted.saturating_add(1);
+                None
+            }
+            Err(InputSubmitError::Saturated(job)) => {
+                self.restore_unsent_input_job(*job);
+                Some(GuardianRuntimeInputCompletion {
+                    route,
+                    response: None,
+                })
+            }
+            Err(InputSubmitError::Unavailable(job)) => {
+                self.restore_unsent_input_job(*job);
+                self.input_pipeline_failed = true;
+                Some(GuardianRuntimeInputCompletion {
+                    route,
+                    response: None,
+                })
+            }
+        }
+    }
+
     pub(crate) fn try_input_completion(&mut self) -> GuardianRuntimeInputCompletionState {
+        if let Some(pending) = self.pending_broker_input.take() {
+            if let Some(response) = self.resume_broker_input(pending) {
+                return GuardianRuntimeInputCompletionState::Ready(Box::new(response));
+            }
+        }
         match self.input_pipeline.try_completion() {
             GuardianRuntimeInputCompletionStateInternal::Ready(completion) => {
                 let completion = *completion;
@@ -1658,11 +2780,260 @@ impl GuardianRuntime {
     /// publication retains its indeterminate pane fence until an exact catalog
     /// replay proves the marker durable.
     pub(crate) fn try_checkpoint_completion(&mut self) -> GuardianRuntimeCheckpointCompletionState {
+        if let Some(pending) = self.pending_broker_control.take() {
+            if let Some(completion) = self.resume_broker_control(pending) {
+                return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(completion));
+            }
+        }
+        if !self.checkpoint_pipeline_failed {
+            if let Some(mut job) = self.pending_genesis_submission.take() {
+                let mux_incarnation = job.request.header().mux_incarnation;
+                let mut failed = false;
+                if let Some(connection) = self.broker_connections.get_mut(&mux_incarnation) {
+                    if connection.failed {
+                        failed = true;
+                    } else if connection.active_pane.is_some() {
+                        self.pending_genesis_submission = Some(job);
+                        return GuardianRuntimeCheckpointCompletionState::Empty;
+                    } else if let Some(worker) = connection.worker.as_mut() {
+                        match worker.try_take_session() {
+                            Ok(Some(session)) => {
+                                connection.retained_session = Some(session);
+                            }
+                            Ok(None) => {
+                                self.pending_genesis_submission = Some(job);
+                                return GuardianRuntimeCheckpointCompletionState::Empty;
+                            }
+                            Err(_) => {
+                                connection.failed = true;
+                                failed = true;
+                            }
+                        }
+                        drop(connection.worker.take());
+                    }
+                    if !failed {
+                        if let Some(spawn) = job.genesis_spawn.as_mut() {
+                            if spawn.session.is_none() {
+                                spawn.session = connection.retained_session.take();
+                            }
+                        }
+                    }
+                } else {
+                    failed = true;
+                }
+                if failed {
+                    // No Spawn worker has received this job. Retain its exact
+                    // failed reservation metadata without claiming a PTY effect.
+                    let response = GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::InternalInvariant,
+                    );
+                    if let Some(pane) = job
+                        .request
+                        .header()
+                        .pane_id
+                        .and_then(|id| self.starting_broker_panes.get_mut(&id))
+                    {
+                        pane.failed_before_spawn = true;
+                        pane.original_spawn = Some(job.request);
+                        pane.retry_before_publication = job.genesis_spawn.map(Box::new);
+                    }
+                    self.protocol = Some(job.protocol);
+                    return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
+                        GuardianRuntimeCheckpointCompletion {
+                            route: job.route,
+                            response: Some(response),
+                        },
+                    ));
+                }
+                match self.checkpoint_pipeline.try_submit(*job) {
+                    Ok(()) => {}
+                    Err(CheckpointSubmitError::Saturated(job)) => {
+                        self.pending_genesis_submission = Some(job);
+                    }
+                    Err(CheckpointSubmitError::Unavailable(mut job)) => {
+                        self.checkpoint_pipeline_failed = true;
+                        self.counters.checkpoint_worker_disconnects = self
+                            .counters
+                            .checkpoint_worker_disconnects
+                            .saturating_add(1);
+                        // Checkpoint-worker failure does not revoke the healthy
+                        // shared broker session from already-live panes.
+                        if let Some(connection) = self
+                            .broker_connections
+                            .get_mut(&job.request.header().mux_incarnation)
+                        {
+                            if !connection.failed
+                                && connection.worker.is_none()
+                                && connection.retained_session.is_none()
+                            {
+                                connection.retained_session = job
+                                    .genesis_spawn
+                                    .as_mut()
+                                    .and_then(|spawn| spawn.session.take());
+                            }
+                        }
+                        // The channel returned the owned job without running
+                        // it. Unblock its exact socket route and retain all
+                        // pre-publication authority/resources in the pane.
+                        let route = job.route;
+                        if let Some(pane) = job
+                            .request
+                            .header()
+                            .pane_id
+                            .and_then(|id| self.starting_broker_panes.get_mut(&id))
+                        {
+                            pane.failed_before_spawn = true;
+                            pane.original_spawn = Some(job.request);
+                            pane.retry_before_publication = job.genesis_spawn.map(Box::new);
+                        }
+                        self.protocol = Some(job.protocol);
+                        return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
+                            GuardianRuntimeCheckpointCompletion {
+                                route,
+                                response: None,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
         match self.checkpoint_pipeline.try_completion() {
             GuardianRuntimeCheckpointCompletionStateInternal::Ready(completion) => {
-                let completion = *completion;
+                let mut completion = *completion;
                 debug_assert!(self.protocol.is_none());
                 self.protocol = Some(completion.protocol);
+                if let Some(control) = completion.broker_control {
+                    let failed = completion.worker_panicked
+                        || completion.token_authority_failed
+                        || completion.response.as_ref().is_none_or(|response| {
+                            response.header().status
+                                == mux::guardian_protocol::GuardianResponseStatus::Indeterminate
+                        });
+                    if let Some(pane) = self.starting_broker_panes.get_mut(&control.pane_id) {
+                        pane.handle = Some(control.handle);
+                        if failed {
+                            if let Some(output) = pane.output.as_mut() {
+                                output.failed = true;
+                            }
+                        }
+                    }
+                    if let Some(connection) =
+                        self.broker_connections.get_mut(&control.mux_incarnation)
+                    {
+                        connection.retained_session = Some(control.session);
+                        connection.failed |= failed;
+                    }
+                    if failed {
+                        self.indeterminate_effect = true;
+                        self.counters.broker_control_failures =
+                            self.counters.broker_control_failures.saturating_add(1);
+                    }
+                }
+                if let Some(spawn) = completion.genesis_spawn {
+                    let failed = completion.worker_panicked || completion.token_authority_failed;
+                    let retry_before_publication = spawn.retry_before_publication.is_some();
+                    if let Some(pane) = self.starting_broker_panes.get_mut(&spawn.pane_id) {
+                        pane.handle = spawn.handle;
+                        pane.output = spawn.output_journal.map(RuntimePaneOutput::new);
+                        pane.input_journal = spawn.input_journal;
+                        pane.replay_origin = spawn.replay_origin;
+                        pane.retry_before_publication = spawn.retry_before_publication;
+                        pane.original_spawn = completion.genesis_spawn_request;
+                        pane.initial_pending = spawn.initial_pending && pane.handle.is_none();
+                        pane.failed_before_spawn = !spawn.broker_attempted;
+                        if let Some(output) = pane.output.as_mut() {
+                            output.failed |=
+                                failed || (pane.handle.is_none() && !pane.initial_pending);
+                        }
+                        if pane.handle.is_some() && !failed {
+                            self.counters.broker_starting_panes_adopted = self
+                                .counters
+                                .broker_starting_panes_adopted
+                                .saturating_add(1);
+                        }
+                        if let Some(request) = pane.original_spawn.as_ref() {
+                            if !spawn.broker_attempted {
+                                if !retry_before_publication {
+                                    completion.response =
+                                        Some(GuardianResponseEnvelope::rejection(
+                                            request,
+                                            GuardianRejectionCode::InternalInvariant,
+                                        ));
+                                }
+                            } else if failed || (pane.handle.is_none() && !pane.initial_pending) {
+                                if let (Some(protocol), Some(activation)) =
+                                    (self.protocol.as_mut(), pane.activation.as_ref())
+                                {
+                                    let result = protocol.finalize_genesis_spawn_transactionally(
+                                        request,
+                                        activation,
+                                        |_| GuardianEffectOutcome::OutcomeIndeterminate,
+                                    );
+                                    completion.response = effect_result(
+                                        request,
+                                        result,
+                                        &mut self.indeterminate_effect,
+                                    )
+                                    .ok()
+                                    .and_then(|reply| {
+                                        GuardianResponseEnvelope::reply(request, &reply).ok()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(connection) =
+                        self.broker_connections.get_mut(&spawn.mux_incarnation)
+                    {
+                        if let Some(session) = spawn.session {
+                            if failed {
+                                connection.retained_session = Some(session);
+                                connection.failed = true;
+                            } else {
+                                match BrokerPaneIoWorkerV1::start(
+                                    session,
+                                    Arc::clone(&self.completion_waker),
+                                ) {
+                                    Ok(worker) => connection.worker = Some(worker),
+                                    Err(failure) => {
+                                        connection.retained_session = Some(failure.session);
+                                        connection.failed = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            connection.failed |= !retry_before_publication;
+                        }
+                    }
+                    if self
+                        .broker_connections
+                        .get(&spawn.mux_incarnation)
+                        .is_some_and(|connection| !connection.failed)
+                    {
+                        if let (Some(protocol), Some(pane)) = (
+                            self.protocol.as_mut(),
+                            self.starting_broker_panes.get_mut(&spawn.pane_id),
+                        ) {
+                            if let Some(response) =
+                                activate_ready_broker_pane(protocol, spawn.pane_id, pane)
+                            {
+                                completion.response = Some(response);
+                            }
+                        }
+                    }
+                }
+                if let Some(begin) = completion.genesis_begin {
+                    if let Ok(stage) = GuardianCheckpointStageRequestV1::decode(begin.payload()) {
+                        if let mux::guardian_protocol::GuardianCheckpointScopeV1::Genesis {
+                            spawn_effect_id,
+                        } = stage.scope()
+                        {
+                            self.genesis_begins
+                                .insert((begin.header().mux_incarnation, spawn_effect_id), begin);
+                        }
+                    }
+                }
                 if is_replay_operation(completion.operation) {
                     self.counters.replay_transactions_completed = self
                         .counters
@@ -1864,9 +3235,62 @@ impl GuardianRuntime {
     /// zeroizes and drops the plaintext allocation before publishing one of
     /// these completions, so reader rearming cannot precede plaintext disposal.
     pub fn handle_output_completions(&mut self) {
+        self.poll_broker_output();
         loop {
             match self.output_pipeline.try_completion() {
                 GuardianOutputCompletionState::Ready(completion) => {
+                    if let Some(pane) = self.starting_broker_panes.get_mut(&completion.pane_id) {
+                        let Some(output) = pane.output.as_mut() else {
+                            self.counters.protocol_transition_failures =
+                                self.counters.protocol_transition_failures.saturating_add(1);
+                            continue;
+                        };
+                        let valid = output.in_flight_bytes == completion.payload_bytes
+                            && pane.pending_ack.is_none();
+                        let remaining = self
+                            .buffered_output_bytes
+                            .checked_sub(completion.payload_bytes);
+                        output.in_flight_bytes = 0;
+                        if let Some(remaining) = remaining {
+                            self.buffered_output_bytes = remaining;
+                        }
+                        match (completion.result, completion.broker_ack) {
+                            (Ok(receipt), Some(ack))
+                                if valid
+                                    && remaining.is_some()
+                                    && !output.failed
+                                    && output.journal.receipt_is_current(receipt)
+                                    && output.expected_sequence == Some(receipt.sequence())
+                                    && usize::try_from(receipt.payload_bytes()).ok()
+                                        == Some(completion.payload_bytes)
+                                    && output
+                                        .durable_plaintext_bytes
+                                        .checked_add(u64::from(receipt.payload_bytes()))
+                                        == Some(receipt.cumulative_plaintext_bytes()) =>
+                            {
+                                output.durable_plaintext_bytes =
+                                    receipt.cumulative_plaintext_bytes();
+                                output.expected_sequence = receipt.sequence().checked_add(1);
+                                output.remaining_record_capacity =
+                                    output.remaining_record_capacity.saturating_sub(1);
+                                pane.pending_ack = Some(ack);
+                                self.counters.pty_bytes_durably_committed = self
+                                    .counters
+                                    .pty_bytes_durably_committed
+                                    .saturating_add(u64::from(receipt.payload_bytes()));
+                                self.counters.pty_records_durably_committed = self
+                                    .counters
+                                    .pty_records_durably_committed
+                                    .saturating_add(1);
+                            }
+                            _ => {
+                                output.failed = true;
+                                self.counters.output_commit_failures =
+                                    self.counters.output_commit_failures.saturating_add(1);
+                            }
+                        }
+                        continue;
+                    }
                     let Some(pane) = self.panes.get_mut(&completion.pane_id) else {
                         self.counters.protocol_transition_failures =
                             self.counters.protocol_transition_failures.saturating_add(1);
@@ -1976,12 +3400,321 @@ impl GuardianRuntime {
                             pane.output.waiting_for_slot = false;
                             deregister_reader(&self.registry, pane, &mut self.counters);
                         }
+                        for pane in self.starting_broker_panes.values_mut() {
+                            if let Some(output) = pane.output.as_mut() {
+                                output.failed = true;
+                            }
+                        }
                     }
                     break;
                 }
             }
         }
         self.resume_output_flow();
+        self.poll_broker_output();
+    }
+
+    fn poll_broker_output(&mut self) {
+        for connection in self.broker_connections.values_mut() {
+            if !connection.failed && connection.worker.is_none() {
+                if let Some(session) = connection.retained_session.take() {
+                    match BrokerPaneIoWorkerV1::start(session, Arc::clone(&self.completion_waker)) {
+                        Ok(worker) => connection.worker = Some(worker),
+                        Err(failure) => {
+                            connection.retained_session = Some(failure.session);
+                            connection.failed = true;
+                        }
+                    }
+                }
+            }
+            let Some(worker) = connection.worker.as_mut() else {
+                continue;
+            };
+            match worker.try_completion() {
+                Ok(completion) => {
+                    let Some(pane_id) = connection.active_pane.take() else {
+                        connection.failed = true;
+                        continue;
+                    };
+                    let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) else {
+                        connection.failed = true;
+                        continue;
+                    };
+                    let Some(output) = pane.output.as_mut() else {
+                        connection.failed = true;
+                        continue;
+                    };
+                    match completion {
+                        BrokerPaneIoCompletionV1::OpenInitial { result } => match result {
+                            Ok(Some(handle)) => {
+                                pane.handle = Some(handle);
+                                pane.initial_pending = false;
+                                self.counters.broker_starting_panes_adopted = self
+                                    .counters
+                                    .broker_starting_panes_adopted
+                                    .saturating_add(1);
+                            }
+                            Ok(None) => {}
+                            Err(_) => output.failed = true,
+                        },
+                        BrokerPaneIoCompletionV1::Read { handle, result } => {
+                            pane.handle = Some(handle);
+                            let reserved = std::mem::take(&mut pane.read_reservation);
+                            let Some(remaining) = self.buffered_output_bytes.checked_sub(reserved)
+                            else {
+                                output.failed = true;
+                                connection.failed = true;
+                                continue;
+                            };
+                            self.buffered_output_bytes = remaining;
+                            match result {
+                                Ok(BrokerPaneOutputV1::Data(delivery))
+                                    if !output.failed
+                                        && delivery.bytes().len() <= reserved
+                                        && pane.pending_delivery.is_none()
+                                        && output.in_flight_bytes == 0 =>
+                                {
+                                    self.buffered_output_bytes += delivery.bytes().len();
+                                    pane.pending_delivery = Some(delivery);
+                                }
+                                Ok(BrokerPaneOutputV1::Pending) => {}
+                                Ok(BrokerPaneOutputV1::Terminal { sequence })
+                                    if sequence == output.durable_plaintext_bytes =>
+                                {
+                                    pane.terminal = true;
+                                }
+                                _ => output.failed = true,
+                            }
+                        }
+                        BrokerPaneIoCompletionV1::Acknowledge { claim, result } => {
+                            if result.is_err() {
+                                pane.pending_ack = Some(claim);
+                                output.failed = true;
+                            } else {
+                                self.counters.broker_output_acknowledgements = self
+                                    .counters
+                                    .broker_output_acknowledgements
+                                    .saturating_add(1);
+                            }
+                        }
+                        BrokerPaneIoCompletionV1::ChildStatus { handle, result } => {
+                            pane.handle = Some(handle);
+                            pane.status_due = false;
+                            match result {
+                                Ok(BrokerPaneChildStatusV1::Running) => {}
+                                Ok(BrokerPaneChildStatusV1::Exited { exit_code, .. }) => {
+                                    if !pane.child_exit_observed {
+                                        if self.pending_child_exits.len() < self.config.max_panes {
+                                            self.pending_child_exits.push((
+                                                pane_id,
+                                                i32::try_from(exit_code).unwrap_or(i32::MAX),
+                                            ));
+                                            pane.child_exit_observed = true;
+                                        } else {
+                                            output.failed = true;
+                                            self.indeterminate_effect = true;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    output.failed = true;
+                                    self.counters.child_poll_failures =
+                                        self.counters.child_poll_failures.saturating_add(1);
+                                }
+                            }
+                        }
+                        BrokerPaneIoCompletionV1::Resize { handle, .. } => {
+                            // No status request is issued until activation can
+                            // consume it. An unexpected completion stays fenced.
+                            pane.handle = Some(handle);
+                            output.failed = true;
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => connection.failed = true,
+            }
+        }
+        if let Some(protocol) = self.protocol.as_mut() {
+            for (pane_id, pane) in &mut self.starting_broker_panes {
+                if self
+                    .broker_connections
+                    .get(&pane.mux_incarnation)
+                    .is_some_and(|connection| {
+                        !connection.failed && connection.active_pane.is_none()
+                    })
+                {
+                    let _ = activate_ready_broker_pane(protocol, *pane_id, pane);
+                }
+            }
+        }
+        self.replay_deferred_child_exits();
+        if self.output_pipeline_failed {
+            return;
+        }
+        for pane in self.starting_broker_panes.values_mut() {
+            let Some(output) = pane.output.as_mut() else {
+                continue;
+            };
+            if output.failed {
+                continue;
+            }
+            if let Some(delivery) = pane.pending_delivery.take() {
+                let bytes = delivery.bytes().len();
+                match self
+                    .output_pipeline
+                    .try_submit_broker_output(output.journal.clone(), delivery)
+                {
+                    Ok(()) => output.in_flight_bytes = bytes,
+                    Err(GuardianBrokerOutputSubmitError::Rejected(delivery)) => {
+                        pane.pending_delivery = Some(delivery);
+                    }
+                    Err(GuardianBrokerOutputSubmitError::Invariant) => {
+                        output.failed = true;
+                        self.buffered_output_bytes =
+                            self.buffered_output_bytes.saturating_sub(bytes);
+                    }
+                }
+            }
+        }
+        for (mux_incarnation, connection) in &mut self.broker_connections {
+            if self
+                .pending_genesis_submission
+                .as_ref()
+                .is_some_and(|job| job.request.header().mux_incarnation == *mux_incarnation)
+            {
+                continue;
+            }
+            if self
+                .pending_broker_control
+                .as_ref()
+                .and_then(|pending| self.starting_broker_panes.get(&pending.pane_id))
+                .is_some_and(|pane| pane.mux_incarnation == *mux_incarnation)
+            {
+                continue;
+            }
+            if self
+                .pending_broker_input
+                .as_ref()
+                .and_then(|pending| self.starting_broker_panes.get(&pending.pane_id))
+                .is_some_and(|pane| pane.mux_incarnation == *mux_incarnation)
+            {
+                continue;
+            }
+            if connection.failed || connection.active_pane.is_some() {
+                continue;
+            }
+            let Some(worker) = connection.worker.as_mut() else {
+                continue;
+            };
+            let eligible = |pane: &StartingBrokerPane| {
+                let Some(output) = pane.output.as_ref() else {
+                    return false;
+                };
+                pane.mux_incarnation == *mux_incarnation
+                    && !output.failed
+                    && pane.pending_delivery.is_none()
+                    && output.in_flight_bytes == 0
+                    && (pane.initial_pending
+                        || pane.pending_ack.is_some()
+                        || (pane.handle.is_some()
+                            && ((pane.activated
+                                && !pane.child_exit_observed
+                                && (pane.status_due || pane.terminal))
+                                || (!pane.terminal && output.remaining_record_capacity != 0))))
+            };
+            let pane_id = self
+                .starting_broker_panes
+                .iter()
+                .filter(|(id, pane)| {
+                    eligible(pane) && connection.last_pane.is_none_or(|last| **id > last)
+                })
+                .map(|(id, _)| *id)
+                .min()
+                .or_else(|| {
+                    self.starting_broker_panes
+                        .iter()
+                        .filter(|(_, pane)| eligible(pane))
+                        .map(|(id, _)| *id)
+                        .min()
+                });
+            let Some(pane_id) = pane_id else {
+                continue;
+            };
+            let Some(pane) = self.starting_broker_panes.get_mut(&pane_id) else {
+                continue;
+            };
+            let command = if pane.initial_pending {
+                BrokerPaneIoCommandV1::OpenInitial {
+                    pane_id,
+                    effect_id: pane.spawn_effect_id,
+                    store: self.output_pipeline.checkpoint_stage_store(),
+                    ack_id: pane.custody_ack_id,
+                }
+            } else if let Some(claim) = pane.pending_ack.take() {
+                BrokerPaneIoCommandV1::Acknowledge {
+                    claim,
+                    deadline: Instant::now() + BROKER_IO_DEADLINE,
+                }
+            } else if pane.activated
+                && !pane.child_exit_observed
+                && (pane.status_due || pane.terminal)
+            {
+                let Some(handle) = pane.handle.take() else {
+                    continue;
+                };
+                BrokerPaneIoCommandV1::ChildStatus {
+                    handle,
+                    deadline: Instant::now() + BROKER_IO_DEADLINE,
+                }
+            } else {
+                let maximum_bytes = self
+                    .config
+                    .max_total_output_bytes
+                    .saturating_sub(self.buffered_output_bytes)
+                    .min(self.config.max_output_bytes_per_pane)
+                    .min(OUTPUT_RECORD_BYTES);
+                if maximum_bytes == 0 {
+                    continue;
+                }
+                let Some(handle) = pane.handle.take() else {
+                    continue;
+                };
+                pane.read_reservation = maximum_bytes;
+                pane.status_due = true;
+                self.buffered_output_bytes += maximum_bytes;
+                BrokerPaneIoCommandV1::Read {
+                    handle,
+                    maximum_bytes,
+                    deadline: Instant::now() + BROKER_IO_DEADLINE,
+                }
+            };
+            match worker.try_submit(Box::new(command)) {
+                Ok(()) => {
+                    connection.active_pane = Some(pane_id);
+                    connection.last_pane = Some(pane_id);
+                }
+                Err(command) => match *command {
+                    BrokerPaneIoCommandV1::OpenInitial { .. } => {}
+                    BrokerPaneIoCommandV1::Acknowledge { claim, .. } => {
+                        pane.pending_ack = Some(claim);
+                    }
+                    BrokerPaneIoCommandV1::Read { handle, .. } => {
+                        pane.handle = Some(handle);
+                        self.buffered_output_bytes -= std::mem::take(&mut pane.read_reservation);
+                    }
+                    BrokerPaneIoCommandV1::ChildStatus { handle, .. } => {
+                        pane.handle = Some(handle);
+                    }
+                    BrokerPaneIoCommandV1::Resize { handle, .. } => {
+                        pane.handle = Some(handle);
+                        if let Some(output) = pane.output.as_mut() {
+                            output.failed = true;
+                        }
+                    }
+                },
+            }
+        }
     }
 
     fn resume_output_flow(&mut self) {
@@ -2186,6 +3919,7 @@ impl GuardianRuntime {
             .ok_or(GuardianRejectionCode::InvalidRequest)?;
         let guardian_incarnation = self.incarnation;
         let max_panes = self.config.max_panes;
+        let starting_broker_panes = self.starting_broker_panes.len();
         let Self {
             protocol,
             registry,
@@ -2202,7 +3936,11 @@ impl GuardianRuntime {
         effect_result(
             request,
             protocol.apply_effect_transactionally(request, |_| {
-                if effective_pane_occupancy(panes.len(), *indeterminate_effect) >= max_panes {
+                if effective_pane_occupancy(
+                    panes.len().saturating_add(starting_broker_panes),
+                    *indeterminate_effect,
+                ) >= max_panes
+                {
                     return GuardianEffectOutcome::DefinitelyNotApplied(
                         RuntimeEffectError::CapacityExhausted,
                     );
@@ -3872,7 +5610,7 @@ mod tests {
                 route,
                 pane_id,
                 protocol,
-                writer,
+                writer: RuntimeInputWriter::Native(writer),
                 journal,
                 request,
                 token_effect_authority: WorkerTokenEffectAuthority::TestOnlyBypass,
@@ -4696,6 +6434,72 @@ mod tests {
             Some(pane_ids[0])
         );
         Ok(())
+    }
+
+    #[test]
+    fn failed_before_broker_spawn_retains_identity_without_live_occupancy() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let pane_id = Uuid::new_v4();
+        runtime.starting_broker_panes.insert(
+            pane_id,
+            StartingBrokerPane {
+                mux_incarnation: Uuid::new_v4(),
+                spawn_request_id: Uuid::new_v4(),
+                spawn_effect_id: Uuid::new_v4(),
+                spawn_payload_digest: [1; 32],
+                custody_ack_id: Uuid::new_v4(),
+                initial_pending: false,
+                failed_before_spawn: false,
+                output: None,
+                handle: None,
+                pending_delivery: None,
+                pending_ack: None,
+                read_reservation: 0,
+                terminal: false,
+                child_exit_observed: false,
+                status_due: true,
+                input_journal: None,
+                activated: false,
+                original_spawn: None,
+                original_begin: None,
+                retry_before_publication: None,
+                activation: None,
+                replay_origin: None,
+            },
+        );
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "unknown child disposition stays owned"
+        );
+        runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .failed_before_spawn = true;
+        assert_eq!(
+            runtime.pane_count(),
+            0,
+            "no broker call means no live child"
+        );
+        assert!(runtime.starting_broker_panes.contains_key(&pane_id));
+        runtime.indeterminate_effect = true;
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "another ambiguous effect still blocks shutdown"
+        );
+        runtime.indeterminate_effect = false;
+        runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .failed_before_spawn = false;
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "possibly attempted Spawn stays owned"
+        );
     }
 
     #[test]

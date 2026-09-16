@@ -12,12 +12,15 @@
 //! that loses the reply can query the exact effect by its sequence, byte length,
 //! and authenticated SHA-256 commitment without retaining plaintext.
 //! Authenticated output replay and checkpoint Stage/catalog adoption are live
-//! behind typed, identity-bound transport operations. Production guardian
-//! selection, Genesis recovery-base creation, topology publication, service
-//! activation, and automated mux migration remain intentionally rejected until
-//! their anti-rollback and recovery authorities are integrated. The
-//! production-disabled broker separately exposes a content-free, paginated
-//! view of authenticated recovered Spawn journals. A live pre-acknowledgement
+//! behind typed, identity-bound transport operations. With an explicitly
+//! configured broker endpoint, the service publishes the authenticated Genesis
+//! model and prepares its encrypted journals before broker Spawn, then requires
+//! durable custody and real I/O handles before activating the pane. Replay
+//! binds that model to its original journal chain. Automatic mux selection,
+//! topology publication, successor lease transfer and guardian restart recovery
+//! still require integration; existing mux panes are never migrated implicitly.
+//! The separately supervised broker exposes a content-free, paginated view of
+//! authenticated recovered Spawn journals. A live pre-acknowledgement
 //! Spawn also mints one plaintext recovery capability while persisting only its
 //! pane-bound verifier; recovered-journal Census entries still grant no PTY,
 //! lease, output-replay, or mutation authority. The service can be stopped
@@ -26,7 +29,7 @@
 //! retains the socket path, so restart remains fail-closed until an explicit
 //! non-overwriting retirement design lands. Successor Claim/Query/Ack is live
 //! and effect-fenced in process, but its lease transitions are not yet in the
-//! authenticated WAL; production activation therefore remains disabled.
+//! authenticated WAL; successor activation therefore remains disabled.
 
 pub use frankenterm_build_identity::{
     AtomicBuildIdentity, AtomicComponentIdentityError, SealedAtomicBuildIdentity,

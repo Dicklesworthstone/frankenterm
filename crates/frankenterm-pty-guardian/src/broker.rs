@@ -1,7 +1,7 @@
-//! Production-disabled PTY broker typestate foundation.
+//! PTY broker ownership, authenticated control, and durable birth admission.
 //!
 //! This module models the process-local ownership and authority transitions
-//! needed by a future separately spawned broker process. The broker retains
+//! used by the separately spawned broker process. The broker retains
 //! the sole PTY master and exposes bounded authenticated proxy operations;
 //! guardians never receive a master descriptor. That is essential because an
 //! `SCM_RIGHTS` transfer cannot be revoked and socket EOF cannot fence a master
@@ -20,11 +20,11 @@
 //! catalog members remain read-only and cannot share a pane, effect, journal,
 //! or origin-request namespace with a new Spawn. Exact effect acknowledgement
 //! now durably transfers a retained Spawn result into live-pane authority;
-//! live-pane startup adoption, activation wiring, durable output replay, and
-//! successor lease rotation
-//! must still land before any production selector may start it. The
-//! process-local PTY typestate below therefore still does **not** prove guardian-`SIGKILL`
-//! continuity. Catalog Genesis admission remains durable pre-Spawn intent,
+//! live-pane startup adoption, activation, and durable output replay are wired
+//! through the explicit guardian domain for fresh births. Successor lease
+//! rotation and recovery after a guardian restart remain unavailable; this
+//! process-local ownership does **not** prove guardian-`SIGKILL` continuity.
+//! Catalog Genesis admission remains durable pre-Spawn intent,
 //! never proof that a child exists, and recovered lifecycle rows explicitly
 //! report that PTY, lease, output-replay, and mutation authorities are absent.
 //!
@@ -88,6 +88,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream as BlockingUnixStream;
@@ -1319,9 +1321,10 @@ fn run_broker_exec_bootstrap_with_identity(
 
 /// Fixed operation vocabulary for the guardian-to-broker control channel.
 ///
-/// Every effect has an explicit query and acknowledgement path. Reads remain
-/// replayable until `AcknowledgeOutput`; writes, resizes, Spawn, attachment,
-/// and retirement retain content-free receipts until `AcknowledgeEffect`.
+/// Reads remain replayable until `AcknowledgeOutput`. Spawn and attachment
+/// use the broker's durable effect receipts. Input, resize, and termination
+/// use the caller's canonical guardian operation ledger; their raw transport
+/// requests must never be replayed after an ambiguous outcome.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrokerControlOperationV1 {
@@ -1336,6 +1339,8 @@ pub(crate) enum BrokerControlOperationV1 {
     AttachSuccessor = 9,
     Census = 10,
     ClosePane = 11,
+    QueryChildStatus = 12,
+    SignalTerminate = 13,
 }
 
 impl BrokerControlOperationV1 {
@@ -1352,6 +1357,8 @@ impl BrokerControlOperationV1 {
             9 => Ok(Self::AttachSuccessor),
             10 => Ok(Self::Census),
             11 => Ok(Self::ClosePane),
+            12 => Ok(Self::QueryChildStatus),
+            13 => Ok(Self::SignalTerminate),
             _ => Err(BrokerControlProtocolError::InvalidOperation),
         }
     }
@@ -1559,7 +1566,9 @@ impl BrokerControlRequestHeaderV1 {
                     && !self.operation_id.is_nil()
                     && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
             }
-            BrokerControlOperationV1::ClosePane => {
+            BrokerControlOperationV1::ClosePane
+            | BrokerControlOperationV1::QueryChildStatus
+            | BrokerControlOperationV1::SignalTerminate => {
                 !self.broker_incarnation.is_nil()
                     && !self.durable_pane_id.is_nil()
                     && self.lease_generation > 0
@@ -1755,6 +1764,7 @@ impl BrokerControlResponseHeaderV1 {
             }
             BrokerControlOperationV1::Write
             | BrokerControlOperationV1::Resize
+            | BrokerControlOperationV1::SignalTerminate
             | BrokerControlOperationV1::AcknowledgeOutput => {
                 pane_scoped
                     && self.lease_generation > 0
@@ -1793,6 +1803,14 @@ impl BrokerControlResponseHeaderV1 {
                         || (self.status == BrokerControlResponseStatusV1::Terminal
                             && output_bytes == Some(0)
                             && payload_bytes == 0))
+            }
+            BrokerControlOperationV1::QueryChildStatus => {
+                pane_scoped
+                    && self.lease_generation > 0
+                    && self.child_identity.is_none()
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && ((successful && payload_bytes == 6) || (unsuccessful && payload_bytes == 0))
             }
         };
         if valid {
@@ -3533,21 +3551,110 @@ fn reconcile_broker_catalog_under_token_authority_with_hook(
     result
 }
 
-/// Separately spawned, single-owner broker control loop.
-///
-/// The service authenticates and fences connections, opens the complete Spawn
-/// catalog before listening, admits new Spawn effects through one serialized
-/// durability worker, and exposes lost-reply Query recovery plus an immutable
-/// paginated Census. Every recovered journal keeps append authority
-/// withheld, and every namespace collision with recovered state is
-/// quarantined. Exact Spawn acknowledgement is serialized through the same
-/// durability worker and transfers the retained PTY into live-pane authority.
-/// Live Census rows retain exact PTY and lease availability, and authenticated
-/// owner-connection EOF fences the corresponding logical lease. Successor
-/// Claim/Query/Ack is capability-authenticated and effect-fenced in process;
-/// its lease transitions are not yet recorded in the authenticated WAL. Proxy
-/// effects and production activation remain disabled until those durable
-/// ownership transitions are integrated and proven together.
+struct BrokerOutputDrainJobV1 {
+    pane_id: Uuid,
+    sequence: u64,
+    reader: Box<dyn PollablePtyReader>,
+    journal: BrokerDurableOutputJournalV1,
+    bytes: Zeroizing<Vec<u8>>,
+    result: Result<Option<BrokerOutputTerminalReasonV1>, ()>,
+    token_lease: GuardianTokenEffectLease,
+}
+
+impl BrokerOutputDrainJobV1 {
+    fn run(&mut self) -> Result<Option<BrokerOutputTerminalReasonV1>, ()> {
+        self.token_lease.validate().map_err(|_| ())?;
+        let read = match self.reader.read(&mut self.bytes) {
+            Ok(0) => {
+                self.bytes.clear();
+                return Ok(Some(BrokerOutputTerminalReasonV1::ZeroLengthRead));
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                self.bytes.clear();
+                return Ok(None);
+            }
+            Err(error) if is_pty_terminal_eio(&error) => {
+                self.bytes.clear();
+                return Ok(Some(BrokerOutputTerminalReasonV1::PtyIoClosed));
+            }
+            Err(_) => return Err(()),
+        };
+        self.bytes.truncate(read);
+        self.journal
+            .append_and_sync(self.sequence, &self.bytes)
+            .map_err(|_| ())?;
+        self.token_lease.validate().map_err(|_| ())?;
+        Ok(None)
+    }
+}
+
+/// One global cold-I/O job. The poll owner keeps the PTY master, child and
+/// attachment; only the sole reader and encrypted journal cross this channel.
+struct BrokerOutputWorkerV1 {
+    jobs: Option<SyncSender<BrokerOutputDrainJobV1>>,
+    completions: Receiver<BrokerOutputDrainJobV1>,
+    join: Option<JoinHandle<()>>,
+    active: bool,
+    retained: Option<BrokerOutputDrainJobV1>,
+}
+
+impl BrokerOutputWorkerV1 {
+    fn start(completion_waker: Arc<Waker>) -> Result<Self, BrokerControlServiceError> {
+        let (jobs, receiver) = sync_channel::<BrokerOutputDrainJobV1>(1);
+        let (sender, completions) = sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("ft-broker-output".into())
+            .spawn(move || {
+                while let Ok(mut job) = receiver.recv() {
+                    job.result = catch_recoverable(
+                        RecoverablePanicSite::StorageWriter,
+                        AssertUnwindSafe(|| job.run()),
+                    )
+                    .unwrap_or(Err(()));
+                    if job.token_lease.validate().is_err() {
+                        job.result = Err(());
+                    }
+                    if job.result.is_err() {
+                        job.journal.failed = true;
+                    }
+                    if sender.send(job).is_err() {
+                        break;
+                    }
+                    // The completion owns both facets before notification.
+                    // Periodic draining remains a fallback if waking fails.
+                    let _ = completion_waker.wake();
+                }
+            })
+            .map_err(|error| BrokerControlServiceError::io("output-worker-start", error))?;
+        Ok(Self {
+            jobs: Some(jobs),
+            completions,
+            join: Some(join),
+            active: false,
+            retained: None,
+        })
+    }
+}
+
+impl Drop for BrokerOutputWorkerV1 {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(join) = self.join.take() {
+            if let Err(payload) = join.join() {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::StorageWriter,
+                    AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+            }
+        }
+    }
+}
+
+/// Live authority retained after synchronized Spawn acknowledgement.
+/// Owner-connection EOF fences the logical lease while the broker keeps the
+/// child and master. Reads and mutations require this exact attachment;
+/// input replay decisions remain owned by the guardian's durable input WAL.
 struct BrokerLiveSpawnV1 {
     fingerprint: BrokerSpawnWorkerFingerprintV1,
     ack_id: Uuid,
@@ -3857,6 +3964,7 @@ pub struct BrokerControlServiceV1 {
     token_authority: GuardianTokenPathAuthority,
     control_authenticator: GuardianBrokerControlAuthenticatorV1,
     spawn_worker: BrokerSpawnWorkerV1,
+    output_worker: BrokerOutputWorkerV1,
     spawn_completion_token: Token,
     retained_spawns: HashMap<Uuid, BrokerSpawnWorkerCompletionV1>,
     live_spawns: HashMap<Uuid, BrokerLiveSpawnV1>,
@@ -4065,8 +4173,10 @@ impl BrokerControlServiceV1 {
                 #[cfg(test)]
                 effect_lease_probe: None,
             },
-            spawn_completion_waker,
+            Arc::clone(&spawn_completion_waker),
         )?;
+
+        let output_worker = BrokerOutputWorkerV1::start(spawn_completion_waker)?;
 
         // Bind only after catalog policy and every avoidable fallible
         // allocation have succeeded. A post-bind permission or registration
@@ -4091,6 +4201,7 @@ impl BrokerControlServiceV1 {
             token_authority,
             control_authenticator,
             spawn_worker,
+            output_worker,
             spawn_completion_token,
             retained_spawns,
             live_spawns,
@@ -4205,6 +4316,7 @@ impl BrokerControlServiceV1 {
         self.token_authority.validate()?;
         self.socket_authority.validate()?;
         self.drain_spawn_completion();
+        self.drain_output_completion();
         match self.poll.poll(&mut self.events, Some(self.poll_interval)) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(()),
@@ -4238,6 +4350,7 @@ impl BrokerControlServiceV1 {
             .any(|event| event.token == self.spawn_completion_token && event.readable)
         {
             self.drain_spawn_completion();
+            self.drain_output_completion();
         }
         for index in 0..self.ready.len() {
             let event = self.ready[index];
@@ -4265,6 +4378,27 @@ impl BrokerControlServiceV1 {
         self.expire_unauthenticated_connections();
         self.drain_spawn_completion();
         Ok(())
+    }
+
+    fn drain_output_completion(&mut self) {
+        let Ok(job) = self.output_worker.completions.try_recv() else {
+            return;
+        };
+        let Some(live) = self.live_spawns.get_mut(&job.pane_id) else {
+            self.output_worker.retained = Some(job);
+            return;
+        };
+        let pane = &mut live.adoption.pane;
+        let sequence_matches_submission = pane.next_output_sequence == job.sequence;
+        if pane.proxy_reader.is_some()
+            || pane.output_journal.is_some()
+            || !sequence_matches_submission
+        {
+            self.output_worker.retained = Some(job);
+            return;
+        }
+        pane.install_output_completion(job);
+        self.output_worker.active = false;
     }
 
     fn drain_spawn_completion(&mut self) {
@@ -4646,6 +4780,24 @@ impl BrokerControlServiceV1 {
             BrokerControlOperationV1::AcknowledgeEffect if request.header.lease_generation > 0 => {
                 return self.dispatch_successor_acknowledgement(owner, request);
             }
+            BrokerControlOperationV1::ReadOutput => {
+                return self.dispatch_output_read(owner, request);
+            }
+            BrokerControlOperationV1::AcknowledgeOutput => {
+                return self.dispatch_output_ack(owner, request);
+            }
+            BrokerControlOperationV1::QueryChildStatus => {
+                return self.dispatch_child_status(owner, request);
+            }
+            BrokerControlOperationV1::Resize => {
+                return self.dispatch_resize(owner, request);
+            }
+            BrokerControlOperationV1::Write => {
+                return self.dispatch_write(owner, request);
+            }
+            BrokerControlOperationV1::ClosePane | BrokerControlOperationV1::SignalTerminate => {
+                return self.dispatch_termination(owner, request);
+            }
             _ => {}
         }
         BrokerControlResponseV1::new(
@@ -4653,6 +4805,274 @@ impl BrokerControlServiceV1 {
             &[],
         )
         .map_err(|_| ())
+    }
+
+    fn dispatch_termination(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
+            if let Some(identity) = live.observes_owner(owner).filter(|identity| {
+                identity.lease_generation == request.header.lease_generation
+                    && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+            }) {
+                let attachment = BrokerPtyAttachmentV1 { identity };
+                if let Ok(permit) = live.adoption.pane.admit_proxy_termination(
+                    &attachment,
+                    request.header.operation == BrokerControlOperationV1::ClosePane,
+                ) {
+                    header.status = match live.adoption.pane.execute_proxy_termination(permit) {
+                        Ok(_) => BrokerControlResponseStatusV1::Applied,
+                        Err(_) => BrokerControlResponseStatusV1::Quarantined,
+                    };
+                }
+            }
+        }
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_write(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
+            if let Some(identity) = live.observes_owner(owner).filter(|identity| {
+                identity.lease_generation == request.header.lease_generation
+                    && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+            }) {
+                let attachment = BrokerPtyAttachmentV1 { identity };
+                if let Ok(permit) = live
+                    .adoption
+                    .pane
+                    .admit_proxy_write(&attachment, request.payload())
+                {
+                    // The guardian's input WAL owns intent/disposition. This
+                    // route performs one attempt, never a Retryable raw write.
+                    header.status = match live
+                        .adoption
+                        .pane
+                        .execute_proxy_write(permit, request.payload())
+                    {
+                        Ok(_) => BrokerControlResponseStatusV1::Applied,
+                        Err(_) => BrokerControlResponseStatusV1::Quarantined,
+                    };
+                }
+            }
+        }
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_resize(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        let bytes: [u8; 8] = request.payload().try_into().map_err(|_| ())?;
+        let size = PtySize {
+            rows: u16::from_be_bytes([bytes[0], bytes[1]]),
+            cols: u16::from_be_bytes([bytes[2], bytes[3]]),
+            pixel_width: u16::from_be_bytes([bytes[4], bytes[5]]),
+            pixel_height: u16::from_be_bytes([bytes[6], bytes[7]]),
+        };
+        if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
+            if let Some(identity) = live.observes_owner(owner).filter(|identity| {
+                identity.lease_generation == request.header.lease_generation
+                    && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+            }) {
+                let attachment = BrokerPtyAttachmentV1 { identity };
+                if let Ok(permit) = live.adoption.pane.admit_proxy_resize(&attachment, size) {
+                    header.status = match live.adoption.pane.execute_proxy_resize(permit) {
+                        Ok(_) => BrokerControlResponseStatusV1::Applied,
+                        Err(_) => BrokerControlResponseStatusV1::Quarantined,
+                    };
+                }
+            }
+        }
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_child_status(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
+            if live.observes_owner(owner).is_some_and(|identity| {
+                identity.lease_generation == request.header.lease_generation
+                    && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+            }) {
+                // Child::try_wait is the nonblocking OS status operation. An
+                // output EOF alone must never be fabricated into child exit.
+                if let Ok(status) = live.adoption.pane.child.try_wait() {
+                    let mut payload = [0_u8; 6];
+                    if let Some(status) = status {
+                        payload[0] = 1;
+                        payload[1] = u8::from(status.signal().is_some());
+                        payload[2..].copy_from_slice(&status.exit_code().to_be_bytes());
+                    }
+                    header.status = BrokerControlResponseStatusV1::Applied;
+                    return BrokerControlResponseV1::new(header, &payload).map_err(|_| ());
+                }
+            }
+        }
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_output_ack(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        let through = u64::from_be_bytes(request.payload().try_into().map_err(|_| ())?);
+        if let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) {
+            if let Some(identity) = live.observes_owner(owner).filter(|identity| {
+                identity.lease_generation == request.header.lease_generation
+                    && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+            }) {
+                let attachment = BrokerPtyAttachmentV1 { identity };
+                if let Ok(permit) = live
+                    .adoption
+                    .pane
+                    .admit_proxy_output_ack(&attachment, through)
+                {
+                    if live.adoption.pane.execute_proxy_output_ack(permit).is_ok() {
+                        header.status = BrokerControlResponseStatusV1::Applied;
+                    }
+                }
+            }
+        }
+        BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+    }
+
+    fn dispatch_output_read(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut header =
+            self.response_header(request.header, BrokerControlResponseStatusV1::Rejected);
+        let maximum = u32::from_be_bytes(request.payload().try_into().map_err(|_| ())?);
+        let maximum = usize::try_from(maximum).map_err(|_| ())?;
+        if maximum == 0 || maximum > BROKER_OUTPUT_PUMP_CHUNK_BYTES {
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        }
+        let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) else {
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        };
+        if maximum > live.adoption.pane.limits.max_proxy_operation_bytes {
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        }
+        let Some(identity) = live.observes_owner(owner).filter(|identity| {
+            identity.lease_generation == request.header.lease_generation
+                && live.fingerprint.binding.spawn_effect_id == request.header.operation_id
+        }) else {
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        };
+        // No descriptor is transferred. Admission and execution both recheck
+        // the sole live attachment before touching the replay cursor.
+        let attachment = BrokerPtyAttachmentV1 { identity };
+        if live.adoption.pane.next_output_sequence == live.adoption.pane.buffer_start_sequence
+            && live.adoption.pane.output_terminal.is_none()
+        {
+            header.status = BrokerControlResponseStatusV1::Retryable;
+            if self.output_worker.active {
+                return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+            }
+            let pane = &mut live.adoption.pane;
+            if pane
+                .output_journal
+                .as_ref()
+                .is_none_or(|journal| journal.failed)
+            {
+                header.status = BrokerControlResponseStatusV1::Quarantined;
+                return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+            }
+            let remaining = pane
+                .limits
+                .max_buffered_output_bytes
+                .checked_sub(pane.output_buffer.len())
+                .ok_or(())?;
+            let count = maximum.min(remaining);
+            if count == 0
+                || pane
+                    .next_output_sequence
+                    .checked_add(u64::try_from(count).map_err(|_| ())?)
+                    .is_none()
+            {
+                return Err(());
+            }
+            let token_lease = self
+                .token_authority
+                .acquire_effect_lease()
+                .map_err(|_| ())?;
+            let bytes = Zeroizing::new(vec![0; count]);
+            // Allocate before transferring either irreplaceable facet.
+            let reader = pane.proxy_reader.take().ok_or(())?;
+            let Some(journal) = pane.output_journal.take() else {
+                pane.proxy_reader = Some(reader);
+                return Err(());
+            };
+            let job = BrokerOutputDrainJobV1 {
+                pane_id: request.header.durable_pane_id,
+                sequence: pane.next_output_sequence,
+                reader,
+                journal,
+                bytes,
+                result: Err(()),
+                token_lease,
+            };
+            let Some(sender) = self.output_worker.jobs.as_ref() else {
+                pane.proxy_reader = Some(job.reader);
+                pane.output_journal = Some(job.journal);
+                return Err(());
+            };
+            match sender.try_send(job) {
+                Ok(()) => self.output_worker.active = true,
+                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                    pane.proxy_reader = Some(job.reader);
+                    pane.output_journal = Some(job.journal);
+                    return Err(());
+                }
+            }
+            return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
+        }
+        let permit = live
+            .adoption
+            .pane
+            .admit_proxy_read(&attachment, maximum)
+            .map_err(|_| ())?;
+        let mut bytes = Zeroizing::new(vec![0; maximum]);
+        match live.adoption.pane.execute_proxy_read(permit, &mut bytes) {
+            Ok(receipt) => {
+                header.status = BrokerControlResponseStatusV1::Applied;
+                header.output_sequence_start = receipt.output_sequence_start;
+                header.output_sequence_end = receipt.output_sequence_end;
+                BrokerControlResponseV1::new(header, &bytes[..receipt.bytes_read]).map_err(|_| ())
+            }
+            Err(BrokerError::ProxyWouldBlock) => {
+                header.status = BrokerControlResponseStatusV1::Retryable;
+                BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+            }
+            Err(BrokerError::ProxyOutputTerminalDrained) => {
+                header.status = BrokerControlResponseStatusV1::Terminal;
+                header.output_sequence_start = live.adoption.pane.next_output_sequence;
+                header.output_sequence_end = header.output_sequence_start;
+                BrokerControlResponseV1::new(header, &[]).map_err(|_| ())
+            }
+            Err(_) => Err(()),
+        }
     }
 
     fn dispatch_spawn(
@@ -5939,6 +6359,9 @@ fn evict_one_inactive_hello_receipt(
     Ok(true)
 }
 
+/// Publicly nameable, privately minted post-synchronization custody capability.
+pub use crate::output::GuardianDurableSpawnCustodyV1;
+
 /// Blocking guardian-side client for the production-disabled broker process.
 pub struct BrokerControlClientV1 {
     stream: BlockingUnixStream,
@@ -5946,8 +6369,450 @@ pub struct BrokerControlClientV1 {
     identity: BrokerGuardianConnectionIdentityV1,
     connection_id: Uuid,
     broker_incarnation: Uuid,
+    broker_lineage: Uuid,
+    broker_build: SealedAtomicBuildIdentity,
     recovered_hello: bool,
     poisoned: bool,
+}
+
+/// Connection-bound output authority minted only after durable Spawn custody
+/// and its authenticated acknowledgement. It grants no output-prefix release.
+pub struct BrokerPaneOutputHandleV1 {
+    broker_incarnation: Uuid,
+    connection_id: Uuid,
+    pane_id: Uuid,
+    spawn_effect_id: Uuid,
+    lease_generation: u64,
+}
+
+impl BrokerPaneOutputHandleV1 {
+    pub(crate) const fn pane_id(&self) -> Uuid {
+        self.pane_id
+    }
+}
+
+/// OS child status, independent of whether retained terminal output is drained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrokerPaneChildStatusV1 {
+    Running,
+    Exited { exit_code: u32, signaled: bool },
+}
+
+/// One broker connection transferred to an owned off-loop transport worker.
+/// Pane handles travel with commands, so pane count does not allocate threads
+/// or additional sockets.
+pub(crate) struct BrokerPaneIoSessionV1 {
+    pub(crate) client: BrokerControlClientV1,
+}
+
+/// One physical input attempt under the caller's canonical durable input
+/// transaction. Recovering this object never authorizes replaying its bytes.
+pub(crate) struct BrokerPaneInputWriterV1 {
+    session: Box<BrokerPaneIoSessionV1>,
+    handle: BrokerPaneOutputHandleV1,
+    deadline: Instant,
+    attempted: bool,
+}
+
+impl BrokerPaneInputWriterV1 {
+    pub(crate) fn new(
+        session: Box<BrokerPaneIoSessionV1>,
+        handle: BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            session,
+            handle,
+            deadline: deadline.min(Instant::now() + BROKER_CONTROL_CLIENT_IO_TIMEOUT),
+            attempted: false,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Box<BrokerPaneIoSessionV1>, BrokerPaneOutputHandleV1) {
+        (self.session, self.handle)
+    }
+}
+
+impl Write for BrokerPaneInputWriterV1 {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.attempted {
+            return Err(std::io::Error::other(
+                "broker input attempt already consumed",
+            ));
+        }
+        self.attempted = true;
+        self.session
+            .client
+            .write_input_once(&self.handle, bytes, self.deadline)
+            .map_err(|_| {
+                std::io::Error::other("broker input result unavailable or indeterminate")
+            })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Applied already includes the broker's physical writer flush.
+        Ok(())
+    }
+}
+
+pub(crate) enum BrokerPaneIoCommandV1 {
+    OpenInitial {
+        pane_id: Uuid,
+        effect_id: Uuid,
+        store: crate::output::GuardianCheckpointStageStore,
+        ack_id: Uuid,
+    },
+    Resize {
+        handle: BrokerPaneOutputHandleV1,
+        size: PtySize,
+        deadline: Instant,
+    },
+    ChildStatus {
+        handle: BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    },
+    Read {
+        handle: BrokerPaneOutputHandleV1,
+        maximum_bytes: usize,
+        deadline: Instant,
+    },
+    Acknowledge {
+        claim: crate::output::GuardianDurableBrokerOutputAckV1,
+        deadline: Instant,
+    },
+}
+
+pub(crate) enum BrokerPaneIoCompletionV1 {
+    OpenInitial {
+        result: Result<Option<BrokerPaneOutputHandleV1>, BrokerControlClientError>,
+    },
+    Resize {
+        handle: BrokerPaneOutputHandleV1,
+        result: Result<(), BrokerControlClientError>,
+    },
+    ChildStatus {
+        handle: BrokerPaneOutputHandleV1,
+        result: Result<BrokerPaneChildStatusV1, BrokerControlClientError>,
+    },
+    Read {
+        handle: BrokerPaneOutputHandleV1,
+        result: Result<BrokerPaneOutputV1, BrokerControlClientError>,
+    },
+    Acknowledge {
+        claim: crate::output::GuardianDurableBrokerOutputAckV1,
+        result: Result<(), BrokerControlClientError>,
+    },
+}
+
+pub(crate) struct BrokerPaneIoStartFailureV1 {
+    pub(crate) session: Box<BrokerPaneIoSessionV1>,
+    pub(crate) error: BrokerControlClientError,
+}
+
+/// Capacity-one guardian-side broker transport. No socket I/O or journal
+/// readback executes on the guardian poll thread. Completion retains ACK
+/// authority even on failure; dropping this worker closes only the lease.
+pub(crate) struct BrokerPaneIoWorkerV1 {
+    jobs: Option<SyncSender<Box<BrokerPaneIoCommandV1>>>,
+    completions: Receiver<BrokerPaneIoCompletionV1>,
+    join: Option<JoinHandle<Option<Box<BrokerPaneIoSessionV1>>>>,
+    active: bool,
+}
+
+impl BrokerPaneIoWorkerV1 {
+    pub(crate) fn start(
+        session: Box<BrokerPaneIoSessionV1>,
+        waker: Arc<Waker>,
+    ) -> Result<Self, BrokerPaneIoStartFailureV1> {
+        let (session_sender, session_receiver) = sync_channel::<Box<BrokerPaneIoSessionV1>>(1);
+        let (jobs, receiver) = sync_channel::<Box<BrokerPaneIoCommandV1>>(1);
+        let (sender, completions) = sync_channel(1);
+        let join = match std::thread::Builder::new()
+            .name("ft-guardian-broker-io".into())
+            .spawn(move || {
+                let Ok(mut session) = session_receiver.recv() else {
+                    return None;
+                };
+                while let Ok(command) = receiver.recv() {
+                    let completion = match *command {
+                        BrokerPaneIoCommandV1::OpenInitial {
+                            pane_id,
+                            effect_id,
+                            store,
+                            ack_id,
+                        } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| {
+                                    session
+                                        .client
+                                        .open_initial_from_claim(&store, pane_id, effect_id, ack_id)
+                                }),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::OpenInitial { result }
+                        }
+                        BrokerPaneIoCommandV1::Resize {
+                            handle,
+                            size,
+                            deadline,
+                        } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| session.client.resize(&handle, size, deadline)),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::Resize { handle, result }
+                        }
+                        BrokerPaneIoCommandV1::ChildStatus { handle, deadline } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| session.client.child_status(&handle, deadline)),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::ChildStatus { handle, result }
+                        }
+                        BrokerPaneIoCommandV1::Read {
+                            handle,
+                            maximum_bytes,
+                            deadline,
+                        } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| {
+                                    session.client.read_output(&handle, maximum_bytes, deadline)
+                                }),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::Read { handle, result }
+                        }
+                        BrokerPaneIoCommandV1::Acknowledge { claim, deadline } => {
+                            let result = catch_recoverable(
+                                RecoverablePanicSite::StorageWriter,
+                                AssertUnwindSafe(|| {
+                                    session.client.acknowledge_output(&claim, deadline)
+                                }),
+                            );
+                            let result = match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    session.client.poisoned = true;
+                                    Err(BrokerControlClientError::ConnectionPoisoned)
+                                }
+                            };
+                            BrokerPaneIoCompletionV1::Acknowledge { claim, result }
+                        }
+                    };
+                    if sender.send(completion).is_err() {
+                        break;
+                    }
+                    let _ = waker.wake();
+                }
+                Some(session)
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                return Err(BrokerPaneIoStartFailureV1 {
+                    session,
+                    error: BrokerControlClientError::Io(error),
+                });
+            }
+        };
+        if let Err(error) = session_sender.send(session) {
+            drop(jobs);
+            if let Err(payload) = join.join() {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::StorageWriter,
+                    AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+            }
+            return Err(BrokerPaneIoStartFailureV1 {
+                session: error.0,
+                error: BrokerControlClientError::ConnectionPoisoned,
+            });
+        }
+        Ok(Self {
+            jobs: Some(jobs),
+            completions,
+            join: Some(join),
+            active: false,
+        })
+    }
+
+    pub(crate) fn try_submit(
+        &mut self,
+        mut command: Box<BrokerPaneIoCommandV1>,
+    ) -> Result<(), Box<BrokerPaneIoCommandV1>> {
+        if self.active {
+            return Err(command);
+        }
+        let Some(sender) = self.jobs.as_ref() else {
+            return Err(command);
+        };
+        // A caller cannot turn worker teardown into an unbounded socket wait.
+        // Queue capacity and the deadline apply to the whole connection.
+        let deadline = match &mut *command {
+            BrokerPaneIoCommandV1::OpenInitial { .. } => None,
+            BrokerPaneIoCommandV1::Resize { deadline, .. }
+            | BrokerPaneIoCommandV1::ChildStatus { deadline, .. }
+            | BrokerPaneIoCommandV1::Read { deadline, .. }
+            | BrokerPaneIoCommandV1::Acknowledge { deadline, .. } => Some(deadline),
+        };
+        if let Some(deadline) = deadline {
+            *deadline = (*deadline).min(Instant::now() + BROKER_CONTROL_CLIENT_IO_TIMEOUT);
+        }
+        match sender.try_send(command) {
+            Ok(()) => {
+                self.active = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(command) | TrySendError::Disconnected(command)) => Err(command),
+        }
+    }
+
+    pub(crate) fn try_completion(&mut self) -> Result<BrokerPaneIoCompletionV1, TryRecvError> {
+        let completion = self.completions.try_recv()?;
+        self.active = false;
+        Ok(completion)
+    }
+
+    /// Return the exact authenticated client only after its outstanding
+    /// completion has been consumed. The caller can then run another lawful
+    /// Spawn transaction without disconnecting existing pane leases.
+    pub(crate) fn try_take_session(
+        &mut self,
+    ) -> Result<Option<Box<BrokerPaneIoSessionV1>>, BrokerControlClientError> {
+        if self.active {
+            return Ok(None);
+        }
+        drop(self.jobs.take());
+        let join = self
+            .join
+            .take()
+            .ok_or(BrokerControlClientError::ConnectionPoisoned)?;
+        match join.join() {
+            Ok(Some(session)) => Ok(Some(session)),
+            Ok(None) => Err(BrokerControlClientError::ConnectionPoisoned),
+            Err(payload) => {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::StorageWriter,
+                    AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+                Err(BrokerControlClientError::ConnectionPoisoned)
+            }
+        }
+    }
+}
+
+impl Drop for BrokerPaneIoWorkerV1 {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(join) = self.join.take() {
+            if let Err(payload) = join.join() {
+                let _ = catch_recoverable(
+                    RecoverablePanicSite::StorageWriter,
+                    AssertUnwindSafe(|| std::panic::resume_unwind(payload)),
+                );
+            }
+        }
+    }
+}
+
+/// Bounded replay delivery. Plaintext is erased on drop and is never Debug printed.
+pub enum BrokerPaneOutputV1 {
+    Data(BrokerOutputDeliveryV1),
+    Pending,
+    Terminal { sequence: u64 },
+}
+
+/// Authenticated output bytes with privately minted range and owner binding.
+pub struct BrokerOutputDeliveryV1 {
+    token: Box<BrokerOutputDeliveryTokenV1>,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+pub(crate) struct BrokerOutputDeliveryTokenV1 {
+    broker_incarnation: Uuid,
+    connection_id: Uuid,
+    guardian_incarnation: Uuid,
+    pane_id: Uuid,
+    spawn_effect_id: Uuid,
+    lease_generation: u64,
+    request_id: Uuid,
+    start: u64,
+    end: u64,
+    digest: [u8; 32],
+}
+
+impl BrokerOutputDeliveryV1 {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn sequence_range(&self) -> (u64, u64) {
+        (self.token.start, self.token.end)
+    }
+
+    pub(crate) fn into_parts(self) -> (Box<BrokerOutputDeliveryTokenV1>, Zeroizing<Vec<u8>>) {
+        (self.token, self.bytes)
+    }
+
+    pub(crate) fn from_parts(
+        token: Box<BrokerOutputDeliveryTokenV1>,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Self {
+        Self { token, bytes }
+    }
+}
+
+impl BrokerOutputDeliveryTokenV1 {
+    pub(crate) fn pane_id(&self) -> Uuid {
+        self.pane_id
+    }
+    pub(crate) fn guardian_incarnation(&self) -> Uuid {
+        self.guardian_incarnation
+    }
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.start, self.end)
+    }
+    pub(crate) fn matches_payload(&self, payload: &[u8]) -> bool {
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        self.end.checked_sub(self.start) == u64::try_from(payload.len()).ok()
+            && digest
+                .iter()
+                .zip(self.digest)
+                .fold(0_u8, |difference, (left, right)| {
+                    difference | (left ^ right)
+                })
+                == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5981,6 +6846,10 @@ pub enum BrokerSpawnEffectQueryV1 {
 /// received it; the broker then drops its plaintext copy and retains only the
 /// verifier.
 pub struct BrokerInitialPaneClaimV1 {
+    broker_incarnation: Uuid,
+    broker_lineage: Uuid,
+    broker_build: SealedAtomicBuildIdentity,
+    origin: BrokerGuardianConnectionIdentityV1,
     durable_pane_id: Uuid,
     spawn_effect_id: Uuid,
     child_identity: BrokerKernelChildIdentityV1,
@@ -6178,6 +7047,8 @@ impl BrokerControlClientV1 {
             identity,
             connection_id,
             broker_incarnation: Uuid::nil(),
+            broker_lineage: expected_lineage,
+            broker_build: expected_broker_build_identity,
             recovered_hello: false,
             poisoned: false,
         };
@@ -6313,6 +7184,473 @@ impl BrokerControlClientV1 {
         }
     }
 
+    pub(crate) fn persist_spawn_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        claim: &BrokerInitialPaneClaimV1,
+        ack_id: Uuid,
+    ) -> Result<GuardianDurableSpawnCustodyV1, crate::output::GuardianCheckpointStageStoreError>
+    {
+        if claim.origin != self.identity {
+            return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
+        }
+        if claim.broker_lineage != self.broker_lineage || claim.broker_build != self.broker_build {
+            return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
+        }
+        let context = mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+            broker_incarnation: claim.broker_incarnation,
+            broker_lineage: claim.broker_lineage,
+            guardian_incarnation: claim.origin.guardian_incarnation,
+            mux_incarnation: claim.origin.mux_incarnation,
+            broker_build: claim.broker_build.into_bytes(),
+            guardian_build: claim.origin.guardian_build_identity.into_bytes(),
+            mux_build: claim.origin.mux_build_identity.into_bytes(),
+            pane_id: claim.durable_pane_id,
+            effect_id: claim.spawn_effect_id,
+            ack_id,
+            child_pid: claim.child_identity.process_id,
+            child_nonce: claim.child_identity.broker_child_nonce,
+            child_start_digest: claim.child_identity.kernel_start_identity_digest,
+            wire_ack_generation: 0,
+            secret_lease_generation: 1,
+        };
+        store.persist_spawn_custody(&context, claim.recovery_secret.as_wire())
+    }
+
+    /// Recover original ACK/child provenance using only authenticated stable client scope.
+    pub(crate) fn reopen_spawn_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        pane_id: Uuid,
+        effect_id: Uuid,
+    ) -> Result<GuardianDurableSpawnCustodyV1, crate::output::GuardianCheckpointStageStoreError>
+    {
+        store.lookup_spawn_custody(mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+            broker_lineage: self.broker_lineage,
+            guardian_incarnation: self.identity.guardian_incarnation,
+            mux_incarnation: self.identity.mux_incarnation,
+            broker_build: self.broker_build.into_bytes(),
+            guardian_build: self.identity.guardian_build_identity.into_bytes(),
+            mux_build: self.identity.mux_build_identity.into_bytes(),
+            pane_id,
+            effect_id,
+        })
+    }
+
+    /// Consume custody established by encrypted file and directory synchronization.
+    /// The record is reopened, reauthenticated and resynchronized before network I/O.
+    /// Lost replies use the same immutable record and stored acknowledgement ID.
+    pub fn acknowledge_spawn_effect(
+        &mut self,
+        custody: GuardianDurableSpawnCustodyV1,
+    ) -> Result<BrokerSpawnEffectAcknowledgementV1, BrokerControlClientError> {
+        let context = custody.context();
+        // Incarnation is immutable origin provenance; a restarted broker proves
+        // the same stable lineage in Hello and revalidates the exact ACK in WAL.
+        if context.broker_lineage != self.broker_lineage
+            || context.broker_build != self.broker_build.into_bytes()
+            || context.guardian_incarnation != self.identity.guardian_incarnation
+            || context.mux_incarnation != self.identity.mux_incarnation
+            || context.guardian_build != self.identity.guardian_build_identity.into_bytes()
+            || context.mux_build != self.identity.mux_build_identity.into_bytes()
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let secret = custody
+            .into_secret()
+            .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+        let secret = BrokerPaneRecoverySecretV1::from_wire(secret.as_slice())
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        self.acknowledge_spawn_effect_request(
+            context.pane_id,
+            context.effect_id,
+            context.ack_id,
+            &secret,
+        )
+    }
+
+    /// Reconcile a submitted Spawn without ever resubmitting its payload.
+    pub(crate) fn open_initial_from_claim(
+        &mut self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        pane_id: Uuid,
+        effect_id: Uuid,
+        ack_id: Uuid,
+    ) -> Result<Option<BrokerPaneOutputHandleV1>, BrokerControlClientError> {
+        let custody = match self.query_spawn_claim(pane_id, effect_id)? {
+            BrokerSpawnClaimQueryV1::Pending => return Ok(None),
+            BrokerSpawnClaimQueryV1::Claim(claim) => {
+                self.persist_spawn_custody(store, &claim, ack_id)
+            }
+            BrokerSpawnClaimQueryV1::Acknowledged {
+                lease_generation: 1,
+            } => self.reopen_spawn_custody(store, pane_id, effect_id),
+            _ => return Err(BrokerControlClientError::AuthenticationAuthority),
+        }
+        .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+        if custody.context().ack_id != ack_id {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        self.open_initial_output(custody)
+    }
+
+    /// Mint initial output authority only after the custody-backed ACK succeeds.
+    /// Pending custody can be reopened for the exact retry; no handle is minted.
+    pub fn open_initial_output(
+        &mut self,
+        custody: GuardianDurableSpawnCustodyV1,
+    ) -> Result<Option<BrokerPaneOutputHandleV1>, BrokerControlClientError> {
+        let context = custody.context();
+        match self.acknowledge_spawn_effect(custody)? {
+            BrokerSpawnEffectAcknowledgementV1::Acknowledged => {
+                if self.query_spawn_effect(context.pane_id, context.effect_id)?
+                    != (BrokerSpawnEffectQueryV1::Acknowledged {
+                        lease_generation: context.secret_lease_generation,
+                    })
+                {
+                    return Err(BrokerControlClientError::AuthenticationAuthority);
+                }
+                Ok(Some(BrokerPaneOutputHandleV1 {
+                    broker_incarnation: self.broker_incarnation,
+                    connection_id: self.connection_id,
+                    pane_id: context.pane_id,
+                    spawn_effect_id: context.effect_id,
+                    lease_generation: context.secret_lease_generation,
+                }))
+            }
+            BrokerSpawnEffectAcknowledgementV1::Pending => Ok(None),
+            BrokerSpawnEffectAcknowledgementV1::Absent
+            | BrokerSpawnEffectAcknowledgementV1::Quarantined => {
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            }
+        }
+    }
+
+    /// Read at most one bounded chunk without acknowledging or discarding it.
+    /// The caller supplies an end-to-end deadline; ambiguous I/O poisons this
+    /// connection. Retrying a read never advances the broker's retained prefix.
+    pub fn read_output(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        maximum_bytes: usize,
+        deadline: Instant,
+    ) -> Result<BrokerPaneOutputV1, BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        if maximum_bytes == 0 || maximum_bytes > BROKER_OUTPUT_PUMP_CHUNK_BYTES {
+            return Err(BrokerControlClientError::Protocol);
+        }
+        let maximum =
+            u32::try_from(maximum_bytes).map_err(|_| BrokerControlClientError::Protocol)?;
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::ReadOutput,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            &maximum.to_be_bytes(),
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
+                if !response.payload().is_empty() && response.payload().len() <= maximum_bytes =>
+            {
+                Ok(BrokerPaneOutputV1::Data(BrokerOutputDeliveryV1 {
+                    token: Box::new(BrokerOutputDeliveryTokenV1 {
+                        broker_incarnation: self.broker_incarnation,
+                        connection_id: self.connection_id,
+                        guardian_incarnation: self.identity.guardian_incarnation,
+                        pane_id: handle.pane_id,
+                        spawn_effect_id: handle.spawn_effect_id,
+                        lease_generation: handle.lease_generation,
+                        request_id: request.header.request_id,
+                        start: response.header.output_sequence_start,
+                        end: response.header.output_sequence_end,
+                        digest: Sha256::digest(response.payload()).into(),
+                    }),
+                    bytes: Zeroizing::new(response.payload().to_vec()),
+                }))
+            }
+            BrokerControlResponseStatusV1::Retryable => Ok(BrokerPaneOutputV1::Pending),
+            BrokerControlResponseStatusV1::Terminal => Ok(BrokerPaneOutputV1::Terminal {
+                sequence: response.header.output_sequence_end,
+            }),
+            BrokerControlResponseStatusV1::Rejected
+            | BrokerControlResponseStatusV1::Quarantined => {
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    fn write_input_once(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        if bytes.is_empty() || bytes.len() > BROKER_CONTROL_MAX_PAYLOAD_BYTES {
+            return Err(BrokerControlClientError::Protocol);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Write,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            bytes,
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        if response.header.status == BrokerControlResponseStatusV1::Applied {
+            return Ok(());
+        }
+        // No status permits retransmission of raw input. The outer canonical
+        // WAL records the failed/ambiguous attempt and resolves future Query.
+        self.poisoned = true;
+        Err(BrokerControlClientError::UnexpectedResponse)
+    }
+
+    /// Change geometry once under the exact attachment. Ambiguous transport
+    /// failure poisons the connection and is never retried here.
+    pub fn resize(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        size: PtySize,
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        if size.rows == 0 || size.cols == 0 {
+            return Err(BrokerControlClientError::Protocol);
+        }
+        let mut payload = [0_u8; 8];
+        payload[..2].copy_from_slice(&size.rows.to_be_bytes());
+        payload[2..4].copy_from_slice(&size.cols.to_be_bytes());
+        payload[4..6].copy_from_slice(&size.pixel_width.to_be_bytes());
+        payload[6..].copy_from_slice(&size.pixel_height.to_be_bytes());
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::Resize,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            &payload,
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Applied => Ok(()),
+            BrokerControlResponseStatusV1::Rejected => {
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Request termination once under the exact attachment. No retry is made
+    /// after an ambiguous response; the guardian operation ledger owns Query.
+    pub fn signal_terminate(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        self.terminate_once(handle, deadline, BrokerControlOperationV1::SignalTerminate)
+    }
+
+    /// Close the owned child using the native pane-close signal semantics.
+    /// This does not discard the PTY or authorize final retirement EOF.
+    pub fn close_pane(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        self.terminate_once(handle, deadline, BrokerControlOperationV1::ClosePane)
+    }
+
+    fn terminate_once(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+        operation: BrokerControlOperationV1,
+    ) -> Result<(), BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Applied => Ok(()),
+            BrokerControlResponseStatusV1::Rejected => {
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Query the actual owned child without consuming terminal output.
+    pub fn child_status(
+        &mut self,
+        handle: &BrokerPaneOutputHandleV1,
+        deadline: Instant,
+    ) -> Result<BrokerPaneChildStatusV1, BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryChildStatus,
+                request_id: Uuid::new_v4(),
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: handle.pane_id,
+                lease_generation: handle.lease_generation,
+                operation_id: handle.spawn_effect_id,
+            },
+            &[],
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        match (response.header.status, response.payload()) {
+            (BrokerControlResponseStatusV1::Applied, [0, 0, 0, 0, 0, 0]) => {
+                Ok(BrokerPaneChildStatusV1::Running)
+            }
+            (BrokerControlResponseStatusV1::Applied, [1, signaled @ 0..=1, a, b, c, d]) => {
+                Ok(BrokerPaneChildStatusV1::Exited {
+                    exit_code: u32::from_be_bytes([*a, *b, *c, *d]),
+                    signaled: *signaled != 0,
+                })
+            }
+            (
+                BrokerControlResponseStatusV1::Rejected
+                | BrokerControlResponseStatusV1::Quarantined,
+                _,
+            ) => Err(BrokerControlClientError::AuthenticationAuthority),
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    /// Release broker output only after the canonical guardian journal worker
+    /// produced and revalidated an exact durable delivery claim.
+    pub fn acknowledge_output(
+        &mut self,
+        claim: &crate::output::GuardianDurableBrokerOutputAckV1,
+        deadline: Instant,
+    ) -> Result<(), BrokerControlClientError> {
+        let token = claim
+            .validated_token()
+            .ok_or(BrokerControlClientError::AuthenticationAuthority)?;
+        if token.broker_incarnation != self.broker_incarnation
+            || token.connection_id != self.connection_id
+            || token.guardian_incarnation != self.identity.guardian_incarnation
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::AcknowledgeOutput,
+                request_id: token.request_id,
+                broker_incarnation: self.broker_incarnation,
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build_identity_digest: self.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: token.pane_id,
+                lease_generation: token.lease_generation,
+                operation_id: token.spawn_effect_id,
+            },
+            &token.end.to_be_bytes(),
+        )
+        .map_err(|_| BrokerControlClientError::Protocol)?;
+        let response = self.exchange_with_deadline(&request, Some(deadline))?;
+        match response.header.status {
+            BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered => {
+                Ok(())
+            }
+            BrokerControlResponseStatusV1::Rejected
+            | BrokerControlResponseStatusV1::Quarantined => {
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            }
+            _ => {
+                self.poisoned = true;
+                Err(BrokerControlClientError::UnexpectedResponse)
+            }
+        }
+    }
+
     /// Durably acknowledge the exact generation-zero Spawn result without
     /// blocking the client-facing readiness loop on WAL synchronization.
     ///
@@ -6322,7 +7660,7 @@ impl BrokerControlClientV1 {
     /// recovery capability must already be stored durably by the caller: a
     /// successful acknowledgement causes the broker to destroy its plaintext
     /// copy and retain only the authenticated verifier.
-    pub fn acknowledge_spawn_effect(
+    fn acknowledge_spawn_effect_request(
         &mut self,
         durable_pane_id: Uuid,
         spawn_effect_id: Uuid,
@@ -6510,6 +7848,10 @@ impl BrokerControlClientV1 {
                 let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(response.payload())
                     .map_err(|_| BrokerControlClientError::Protocol)?;
                 Ok(BrokerSpawnClaimQueryV1::Claim(BrokerInitialPaneClaimV1 {
+                    broker_incarnation: self.broker_incarnation,
+                    broker_lineage: self.broker_lineage,
+                    broker_build: self.broker_build,
+                    origin: self.identity,
                     durable_pane_id,
                     spawn_effect_id,
                     child_identity: response
@@ -15972,6 +17314,8 @@ pub enum BrokerProxyOperationKindV1 {
     Write,
     Resize,
     AcknowledgeOutput,
+    Close,
+    Terminate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15980,6 +17324,8 @@ enum BrokerProxyOperationV1 {
     Write { bytes: usize, digest: [u8; 32] },
     Resize { size: PtySize },
     AcknowledgeOutput { through_sequence: u64 },
+    Close,
+    Terminate,
 }
 
 /// Nonduplicable admission for one bounded proxy operation.
@@ -16011,6 +17357,8 @@ impl BrokerProxyOperationV1 {
             Self::Write { .. } => BrokerProxyOperationKindV1::Write,
             Self::Resize { .. } => BrokerProxyOperationKindV1::Resize,
             Self::AcknowledgeOutput { .. } => BrokerProxyOperationKindV1::AcknowledgeOutput,
+            Self::Close => BrokerProxyOperationKindV1::Close,
+            Self::Terminate => BrokerProxyOperationKindV1::Terminate,
         }
     }
 }
@@ -16092,6 +17440,38 @@ pub struct BrokerAdoptedPaneV1 {
 }
 
 impl BrokerAdoptedPaneV1 {
+    // Caller has matched the retained job's pane/sequence and verified that
+    // both facets are still exclusively owned by this completion.
+    fn install_output_completion(&mut self, job: BrokerOutputDrainJobV1) {
+        let BrokerOutputDrainJobV1 {
+            reader,
+            journal,
+            bytes,
+            result,
+            ..
+        } = job;
+        self.proxy_reader = Some(reader);
+        self.output_journal = Some(journal);
+        // Ambiguous bytes remain owned but outside the readable prefix.
+        self.output_buffer.extend(bytes.iter().copied());
+        if let Ok(terminal) = result {
+            if let Some(end) = u64::try_from(bytes.len())
+                .ok()
+                .and_then(|count| self.next_output_sequence.checked_add(count))
+            {
+                self.next_output_sequence = end;
+            } else {
+                if let Some(journal) = self.output_journal.as_mut() {
+                    journal.failed = true;
+                }
+                return;
+            }
+            if let Some(reason) = terminal {
+                self.observe_output_terminal(reason);
+            }
+        }
+    }
+
     #[must_use]
     pub const fn child_identity(&self) -> BrokerChildIdentityV1 {
         self.child_identity
@@ -16482,11 +17862,59 @@ impl BrokerAdoptedPaneV1 {
         })
     }
 
+    fn admit_proxy_termination(
+        &self,
+        attachment: &BrokerPtyAttachmentV1,
+        close: bool,
+    ) -> Result<BrokerProxyOperationPermitV1, BrokerError> {
+        self.validate_active_attachment(attachment.identity)?;
+        Ok(BrokerProxyOperationPermitV1 {
+            operation_id: Uuid::new_v4(),
+            attachment: attachment.identity,
+            operation: if close {
+                BrokerProxyOperationV1::Close
+            } else {
+                BrokerProxyOperationV1::Terminate
+            },
+        })
+    }
+
+    fn execute_proxy_termination(
+        &mut self,
+        permit: BrokerProxyOperationPermitV1,
+    ) -> Result<BrokerProxyEffectReceiptV1, BrokerError> {
+        let kind = match permit.operation {
+            BrokerProxyOperationV1::Close => BrokerProxyOperationKindV1::Close,
+            BrokerProxyOperationV1::Terminate => BrokerProxyOperationKindV1::Terminate,
+            _ => return Err(BrokerError::InvalidProxyOperation),
+        };
+        self.validate_proxy_permit(&permit, kind)?;
+        // An unreaped owned child pins its PID. A completed child must never
+        // be signaled after try_wait has reaped it and allowed PID reuse.
+        if self
+            .child
+            .try_wait()
+            .map_err(|_| BrokerError::ProxyEffectIndeterminate)?
+            .is_none()
+        {
+            // The native pane path uses the same non-waiting ProcessSignaller.
+            // Child::kill instead waits/escalates and cannot run on this loop.
+            self.child
+                .clone_killer()
+                .kill()
+                .map_err(|_| BrokerError::ProxyEffectIndeterminate)?;
+        }
+        Ok(BrokerProxyEffectReceiptV1 {
+            operation_id: permit.operation_id,
+            lease_generation: permit.attachment.lease_generation,
+        })
+    }
+
     /// Revalidate and execute one admitted write immediately before effect.
     ///
     /// A low-level partial-write failure is classified indeterminate. The
-    /// future activated broker must place this behind its durable input
-    /// intent/disposition Query/Ack protocol before exposing it remotely.
+    /// guardian caller must hold its canonical durable input permit; neither
+    /// this method nor the transport may replay bytes after an ambiguous cut.
     pub fn execute_proxy_write(
         &mut self,
         permit: BrokerProxyOperationPermitV1,
@@ -16504,13 +17932,43 @@ impl BrokerAdoptedPaneV1 {
         if bytes.len() != expected_bytes || actual_digest != digest {
             return Err(BrokerError::ProxyPayloadMismatch);
         }
+        // The Unix reader and byte-silent writer duplicate the same master
+        // file description. Check the actual flag, not just the constructor
+        // convention, before any write that runs on the broker poll owner.
+        let reader = self
+            .proxy_reader
+            .as_ref()
+            .ok_or(BrokerError::ProxyWouldBlock)?;
+        let flags = rustix::fs::fcntl_getfl(reader.as_ref().as_fd())
+            .map_err(|_| BrokerError::InvalidProxyOperation)?;
+        if !flags.contains(rustix::fs::OFlags::NONBLOCK) {
+            return Err(BrokerError::InvalidProxyOperation);
+        }
         let writer = self
             .proxy_writer
             .as_mut()
             .ok_or(BrokerError::FinalTerminalEofAlreadySent)?;
+        let mut written = 0;
+        // Both progress and Interrupted consume the fixed syscall budget.
+        // A partial tail is never resent by this operation on failure.
+        for _ in 0..128 {
+            match writer.write(&bytes[written..]) {
+                Ok(0) => return Err(BrokerError::ProxyEffectIndeterminate),
+                Ok(count) if count <= bytes.len() - written => {
+                    written += count;
+                    if written == bytes.len() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Ok(_) | Err(_) => return Err(BrokerError::ProxyEffectIndeterminate),
+            }
+        }
+        if written != bytes.len() {
+            return Err(BrokerError::ProxyEffectIndeterminate);
+        }
         writer
-            .write_all(bytes)
-            .and_then(|()| writer.flush())
+            .flush()
             .map_err(|_| BrokerError::ProxyEffectIndeterminate)?;
         Ok(BrokerProxyEffectReceiptV1 {
             operation_id: permit.operation_id,
@@ -20662,6 +22120,8 @@ mod tests {
                 identity: connection_identity,
                 connection_id,
                 broker_incarnation,
+                broker_lineage: wal_authenticator(authority_byte).lineage_id(),
+                broker_build: sealed(0xc3),
                 recovered_hello: false,
                 poisoned: false,
             };
@@ -20790,6 +22250,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xc6).lineage_id(),
+            broker_build: sealed(0xc9),
             recovered_hello: false,
             poisoned: false,
         };
@@ -20930,6 +22392,8 @@ mod tests {
                 identity: connection_identity,
                 connection_id,
                 broker_incarnation,
+                broker_lineage: wal_authenticator(authority_byte).lineage_id(),
+                broker_build: sealed(0xc9),
                 recovered_hello: false,
                 poisoned: false,
             };
@@ -20983,6 +22447,8 @@ mod tests {
             identity: connection_identity,
             connection_id: id(6_252),
             broker_incarnation: id(6_253),
+            broker_lineage: wal_authenticator(0xcc).lineage_id(),
+            broker_build: sealed(0xcb),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21041,6 +22507,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xcf).lineage_id(),
+            broker_build: sealed(0xd2),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21234,6 +22702,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xbc).lineage_id(),
+            broker_build: sealed(0xbf),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21627,7 +23097,9 @@ mod tests {
     #[test]
     fn broker_control_spawn_is_async_query_recoverable_and_exactly_once() {
         for _repetition in 0..20 {
-            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(false);
+            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(
+                false, false, None,
+            );
         }
     }
 
@@ -21638,7 +23110,194 @@ mod tests {
             .expect("construct Genesis authority preflight")
             .live_build_authority_for_genesis()
             .expect("this test requires the actual sealed candidate build identity");
-        broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(true);
+        broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(true, false, None);
+        broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(true, true, None);
+        for operation in [
+            BrokerControlOperationV1::ClosePane,
+            BrokerControlOperationV1::SignalTerminate,
+        ] {
+            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(
+                true,
+                false,
+                Some(operation),
+            );
+        }
+    }
+
+    #[test]
+    fn broker_control_input_resize_and_actual_child_exit() {
+        broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(false, true, None);
+    }
+
+    #[test]
+    fn broker_control_close_and_terminate_require_current_owner_and_signal_actual_child() {
+        for operation in [
+            BrokerControlOperationV1::ClosePane,
+            BrokerControlOperationV1::SignalTerminate,
+        ] {
+            broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(
+                false,
+                false,
+                Some(operation),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires candidate FT_ATOMIC_BUILD_IDENTITY; run exact test with --ignored in sealed strict RCH/DSR lane"]
+    fn published_genesis_empty_replay_revalidates_journal_before_complete() {
+        use mux::guardian_protocol::{
+            GuardianOperation, GuardianReplayAckV1, GuardianReplayPageBodyDelivery,
+            GuardianReplayPhaseV1, GuardianReplayRequestV1, GuardianReplaySelectorV1,
+            GuardianRequestEnvelope, GuardianRequestHeader, decode_guardian_request,
+            encode_guardian_request,
+        };
+        let Some(build) = option_env!("FT_ATOMIC_BUILD_IDENTITY") else {
+            panic!("real Genesis replay test requires sealed candidate identity");
+        };
+        let build = SealedAtomicBuildIdentity::from_lower_hex(build).unwrap();
+        let directory = private_catalog_directory().keep();
+        let token_path = directory.join("guardian.token");
+        crate::transport::provision_guardian_token(&token_path).unwrap();
+        let connection =
+            BrokerGuardianConnectionIdentityV1::new(id(0x9301), id(0x9302), build, build).unwrap();
+        let payload = command_payload("exit 0", &directory.join("never-spawned"));
+        let admission = publish_test_genesis_admission(&token_path, &payload, connection);
+        let pane_id = admission.reservation_identity().durable_pane_id();
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1)).unwrap());
+        let pipeline = GuardianOutputPipeline::open(&token_path, 1, waker).unwrap();
+        let store = pipeline.checkpoint_stage_store();
+        let journal = pipeline
+            .prepare_pane(connection.guardian_incarnation, pane_id)
+            .unwrap();
+        let origin = store
+            .prepare_genesis_replay_origin(&admission, &journal)
+            .unwrap();
+        let secret = load_guardian_secret(&token_path).unwrap();
+        let authenticated = |operation, bytes: Vec<u8>| {
+            let bytes = Zeroizing::new(bytes);
+            let header = GuardianRequestHeader::new(
+                operation,
+                connection.guardian_incarnation,
+                connection.mux_incarnation,
+                Uuid::new_v4(),
+                Some(pane_id),
+                1,
+                0,
+                None,
+                &bytes,
+            );
+            let request = GuardianRequestEnvelope::from_zeroizing_payload(header, bytes);
+            let frame = encode_guardian_request(&secret, &request).unwrap();
+            decode_guardian_request(&secret, &frame).unwrap()
+        };
+        let mut replay = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::LatestCompatible,
+            max_plaintext_bytes: mux::guardian_protocol::GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+            max_records: 1,
+            wait_millis: 0,
+        };
+        let foreign_payload = Zeroizing::new(replay.encode().unwrap());
+        let foreign_header = GuardianRequestHeader::new(
+            GuardianOperation::Replay,
+            id(0x93ff),
+            connection.mux_incarnation,
+            Uuid::new_v4(),
+            Some(pane_id),
+            1,
+            0,
+            None,
+            &foreign_payload,
+        );
+        let foreign_request =
+            GuardianRequestEnvelope::from_zeroizing_payload(foreign_header, foreign_payload);
+        let foreign_frame = encode_guardian_request(&secret, &foreign_request).unwrap();
+        let foreign_request = decode_guardian_request(&secret, &foreign_frame).unwrap();
+        assert!(
+            matches!(
+                store.apply_replay_with_genesis(
+                    &foreign_request,
+                    replay,
+                    Some(&journal),
+                    Some(&origin),
+                ),
+                Err(crate::output::GuardianCheckpointStageStoreError::OriginAuthorityMismatch)
+            ),
+            "signed foreign guardian cannot relabel the initial journal's origin"
+        );
+        let mut reached_output = false;
+        let mut canonical = Zeroizing::new(Vec::new());
+        for _ in 0..256 {
+            let request = authenticated(GuardianOperation::Replay, replay.encode().unwrap());
+            let page = store
+                .apply_replay_with_genesis(&request, replay, Some(&journal), Some(&origin))
+                .unwrap();
+            let cursor = page
+                .header()
+                .next_cursor()
+                .expect("checkpoint page continues to output phase");
+            let ack = GuardianReplayAckV1::new(
+                page.header().snapshot_id(),
+                page.header().snapshot_digest(),
+                page.header().page_index(),
+                page.header().declassify_page_digest_for_ack(),
+                Some(cursor.digest()),
+                0,
+                [0; 32],
+                false,
+            )
+            .unwrap();
+            let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = page.into_body() else {
+                panic!("pre-spawn snapshot must deliver its actual Genesis checkpoint");
+            };
+            chunk
+                .write_all_bounded(
+                    &mut *canonical,
+                    mux::guardian_protocol::GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
+                )
+                .unwrap();
+            let request =
+                authenticated(GuardianOperation::ReplayAck, ack.encode().unwrap().to_vec());
+            store.apply_replay_ack(&request, ack).unwrap();
+            replay = GuardianReplayRequestV1::Continue { cursor };
+            if cursor.phase() == GuardianReplayPhaseV1::Output {
+                reached_output = true;
+                break;
+            }
+        }
+        assert!(
+            reached_output,
+            "bounded checkpoint transfer reaches empty output phase"
+        );
+        frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+            &canonical,
+            frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        let path = journal.current_segment_path_for_test();
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+        let request = authenticated(GuardianOperation::Replay, replay.encode().unwrap());
+        assert!(
+            matches!(
+                store.apply_replay_with_genesis(&request, replay, Some(&journal), Some(&origin)),
+                Err(crate::output::GuardianCheckpointStageStoreError::Journal(
+                    mux::guardian_output_journal::GuardianOutputJournalError::InvalidFileMagic
+                ))
+            ),
+            "an authenticated catalog cannot certify empty completion after journal header corruption"
+        );
+        assert!(
+            !directory.join("never-spawned").exists(),
+            "this replay proof creates no child"
+        );
     }
 
     fn publish_test_genesis_admission(
@@ -21648,10 +23307,6 @@ mod tests {
     ) -> GuardianPublishedGenesisAdmissionPermitV1 {
         use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
         use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
-        use mux::guardian_checkpoint::{
-            GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointStageBindingV1,
-            GuardianCheckpointStageScopeV1, GuardianCheckpointValidatedManifestAuthorityV1,
-        };
         use mux::guardian_protocol::{
             GuardianCheckpointDescriptorV1, GuardianCheckpointScopeV1,
             GuardianCheckpointStageRequestV1, GuardianGenesisMuxAuthorityV1,
@@ -21776,18 +23431,6 @@ mod tests {
             ),
             "exact retry must not mint a second admission permit"
         );
-        let binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
-            GuardianCheckpointStageScopeV1::genesis(id(10)).expect("Genesis scope"),
-            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(id(10), &terminal)
-                .expect("canonical manifest descriptor"),
-            1,
-        )
-        .expect("bind canonical Genesis manifest");
-        let (manifest_authority, reservation) =
-            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
-                &binding, permit, &terminal,
-            )
-            .expect("split the one-shot seal and catalog authorities");
         let poll = Poll::new().expect("Genesis pipeline poll");
         let waker =
             Arc::new(Waker::new(poll.registry(), Token(1)).expect("Genesis pipeline waker"));
@@ -21818,18 +23461,19 @@ mod tests {
                 .expect("persist Genesis chunk");
         }
         store
-            .apply_seal(
-                GuardianCheckpointStageRequestV1::seal(scope, id(13), descriptor, 1024)
-                    .expect("Genesis Seal"),
-                crate::output::GuardianCheckpointOriginAuthority::Genesis { manifest_authority },
+            .publish_staged_genesis(
+                &GuardianCheckpointStageRequestV1::begin(scope, id(13), descriptor, 1024)
+                    .expect("reconstruct exact persisted Genesis Begin"),
+                permit,
             )
-            .expect("durably seal actual Genesis payload");
-        store
-            .publish_genesis_catalog_admission(reservation)
             .expect("publish and rescan actual Genesis catalog before admission")
     }
 
-    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(real_genesis: bool) {
+    fn broker_control_spawn_is_async_query_recoverable_and_exactly_once_once(
+        real_genesis: bool,
+        terminal_probe: bool,
+        termination: Option<BrokerControlOperationV1>,
+    ) {
         let root = private_catalog_directory().keep();
         let spawn_catalog_path = root.join("spawn-catalog");
         fs::create_dir(&spawn_catalog_path).expect("create control Spawn catalog");
@@ -21840,6 +23484,13 @@ mod tests {
         let token_path = root.join("guardian.token");
         crate::transport::provision_guardian_token(&token_path)
             .expect("provision control Spawn token");
+        // Broker retention and receiving guardian journals are independent
+        // durable owners, even though they refer to the same pane identity.
+        let receiving_directory = root.join("receiving-guardian");
+        fs::create_dir(&receiving_directory).unwrap();
+        fs::set_permissions(&receiving_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let receiving_token_path = receiving_directory.join("guardian.token");
+        crate::transport::provision_guardian_token(&receiving_token_path).unwrap();
         let broker_build = sealed(0xd5);
         let service = BrokerControlServiceV1::bind(
             BrokerControlServiceConfigV1::new(
@@ -21857,10 +23508,11 @@ mod tests {
         let broker_incarnation = service.incarnation();
         let service = TestBrokerControlService::start(service);
         let compiled_identity = real_genesis.then(|| {
-            SealedAtomicBuildIdentity::from_lower_hex(
-                option_env!("FT_ATOMIC_BUILD_IDENTITY").expect("sealed candidate identity"),
-            )
-            .expect("canonical sealed candidate identity")
+            let Some(identity) = option_env!("FT_ATOMIC_BUILD_IDENTITY") else {
+                panic!("real Genesis test requires a sealed candidate identity");
+            };
+            SealedAtomicBuildIdentity::from_lower_hex(identity)
+                .expect("canonical sealed candidate identity")
         });
         let connection_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_301),
@@ -21890,11 +23542,16 @@ mod tests {
         };
         let sentinel = root.join("control-spawn-count");
         let payload = command_payload(
-            "printf C >>\"$BROKER_SENTINEL\"; IFS= read -r ignored",
+            if terminal_probe {
+                "printf C >>\"$BROKER_SENTINEL\"; IFS= read -r ignored; stty size >\"$BROKER_SENTINEL.geometry\"; printf '%s' \"$ignored\" >\"$BROKER_SENTINEL.input\"; exit 7"
+            } else {
+                "printf C >>\"$BROKER_SENTINEL\"; printf broker-output-prefix; IFS= read -r ignored"
+            },
             &sentinel,
         );
-        let admission = real_genesis
-            .then(|| publish_test_genesis_admission(&token_path, &payload, connection_identity));
+        let admission = real_genesis.then(|| {
+            publish_test_genesis_admission(&receiving_token_path, &payload, connection_identity)
+        });
         assert!(
             !sentinel.exists(),
             "Genesis publication must not spawn a child"
@@ -22007,6 +23664,55 @@ mod tests {
             outcome => panic!("control Spawn did not expose its initial claim: {outcome:?}"),
         };
         assert_eq!(initial_claim.child_identity(), child_identity);
+        let custody_poll = Poll::new().expect("custody pipeline poll");
+        let custody_waker =
+            Arc::new(Waker::new(custody_poll.registry(), Token(1)).expect("custody waker"));
+        let custody_pipeline =
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
+                .expect("open encrypted custody store");
+        let custody_store = custody_pipeline.checkpoint_stage_store();
+        for cut in [1, 2] {
+            custody_store.interrupt_spawn_custody_publication_for_test(cut);
+            assert!(
+                client
+                    .persist_spawn_custody(&custody_store, &initial_claim, id(7_308))
+                    .is_err()
+            );
+            assert!(
+                client
+                    .reopen_spawn_custody(
+                        &custody_store,
+                        binding.durable_pane_id,
+                        binding.spawn_effect_id
+                    )
+                    .is_err(),
+                "interrupted staging must never expose a final custody claim"
+            );
+            let reissued = match client
+                .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("broker must retain the genuine secret until durable custody ACK")
+            {
+                BrokerSpawnClaimQueryV1::Claim(claim) => claim,
+                outcome => {
+                    panic!("interrupted custody publication lost initial secret: {outcome:?}")
+                }
+            };
+            assert_eq!(reissued.child_identity(), child_identity);
+            assert_eq!(
+                reissued.recovery_secret().as_wire(),
+                initial_claim.recovery_secret().as_wire()
+            );
+        }
+        drop(custody_store);
+        drop(custody_pipeline);
+        let custody_pipeline =
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
+                .expect("reopen persisted key with only interrupted custody staging on disk");
+        let custody_store = custody_pipeline.checkpoint_stage_store();
+        let durable_custody = client
+            .persist_spawn_custody(&custody_store, &initial_claim, id(7_308))
+            .expect("sync and authenticate custody before any ACK");
+        let custody_context = durable_custody.context();
         let other_mux_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_311),
             id(7_312),
@@ -22021,6 +23727,14 @@ mod tests {
             broker_build,
         )
         .expect("connect cross-mux control Spawn client");
+        assert!(matches!(
+            other_mux_client.acknowledge_spawn_effect(
+                custody_store
+                    .reopen_spawn_custody(&custody_context)
+                    .expect("reopen genuine custody for wrong mux negative")
+            ),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
         assert_eq!(
             other_mux_client
                 .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
@@ -22029,7 +23743,7 @@ mod tests {
         );
         assert_eq!(
             other_mux_client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_313),
@@ -22039,13 +23753,83 @@ mod tests {
             BrokerSpawnEffectAcknowledgementV1::Absent
         );
         drop(other_mux_client);
+        // A real second Hello authenticates a different token-derived lineage,
+        // even with the same mux/guardian/build identifiers.
+        let foreign_root = private_catalog_directory().keep();
+        let foreign_spawn = foreign_root.join("spawn");
+        fs::create_dir(&foreign_spawn).expect("foreign spawn catalog");
+        fs::set_permissions(&foreign_spawn, fs::Permissions::from_mode(0o700))
+            .expect("private foreign catalog");
+        let foreign_lease = create_private_lease_catalog(&foreign_root);
+        let foreign_socket = foreign_root.join("broker.sock");
+        let foreign_token = foreign_root.join("guardian.token");
+        crate::transport::provision_guardian_token(&foreign_token)
+            .expect("independent foreign token");
+        let foreign_service = BrokerControlServiceV1::bind(
+            BrokerControlServiceConfigV1::new(
+                foreign_socket.clone(),
+                foreign_token.clone(),
+                foreign_spawn,
+                foreign_lease,
+                broker_build,
+                2,
+                Duration::from_millis(2),
+            )
+            .expect("foreign broker config"),
+        )
+        .expect("foreign broker bind");
+        let foreign_service = TestBrokerControlService::start(foreign_service);
+        let mut foreign_client = BrokerControlClientV1::connect(
+            &foreign_socket,
+            &foreign_token,
+            connection_identity,
+            broker_build,
+        )
+        .expect("authenticate actual foreign lineage");
+        assert_ne!(
+            foreign_client.broker_lineage,
+            custody_context.broker_lineage
+        );
+        assert!(matches!(
+            foreign_client.acknowledge_spawn_effect(
+                custody_store
+                    .reopen_spawn_custody(&custody_context)
+                    .expect("genuine custody for foreign lineage control")
+            ),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
+        assert_eq!(
+            foreign_client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("foreign connection remains usable"),
+            BrokerSpawnEffectQueryV1::Absent
+        );
+        drop(foreign_client);
+        foreign_service.finish();
+        for failed_stage in [1, 2] {
+            let claim = custody_store
+                .reopen_spawn_custody(&custody_context)
+                .expect("reopen before sync-failure control");
+            custody_store.fail_spawn_custody_sync_for_test(failed_stage);
+            assert!(matches!(
+                client.acknowledge_spawn_effect(claim),
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            ));
+            custody_store.fail_spawn_custody_sync_for_test(0);
+            assert!(matches!(
+                client
+                    .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+                    .expect("no ACK may reach broker after failed custody sync"),
+                BrokerSpawnClaimQueryV1::Claim(_)
+            ));
+        }
         let ack_id = id(7_308);
         let forged_recovery_secret =
             BrokerPaneRecoverySecretV1::from_wire(&[0xa5; BROKER_PANE_RECOVERY_SECRET_BYTES])
                 .expect("construct nonzero forged recovery capability");
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     ack_id,
@@ -22056,18 +23840,13 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
-                )
+                .acknowledge_spawn_effect(durable_custody)
                 .expect("submit asynchronous Spawn acknowledgement"),
             BrokerSpawnEffectAcknowledgementV1::Pending
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_309),
@@ -22078,7 +23857,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     id(7_314),
                     ack_id,
@@ -22089,7 +23868,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     id(7_315),
                     binding.spawn_effect_id,
                     ack_id,
@@ -22102,10 +23881,9 @@ mod tests {
         loop {
             match client
                 .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
+                    custody_store
+                        .reopen_spawn_custody(&custody_context)
+                        .expect("reopen immutable custody for lost reply"),
                 )
                 .expect("recover asynchronous Spawn acknowledgement")
             {
@@ -22119,10 +23897,9 @@ mod tests {
         assert_eq!(
             client
                 .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
+                    custody_store
+                        .reopen_spawn_custody(&custody_context)
+                        .expect("reopen custody for exact retry")
                 )
                 .expect("recover a second exact acknowledgement reply"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
@@ -22142,6 +23919,436 @@ mod tests {
                 lease_generation: 1
             }
         );
+        let output_handle = client
+            .open_initial_from_claim(
+                &custody_store,
+                binding.durable_pane_id,
+                binding.spawn_effect_id,
+                custody_context.ack_id,
+            )
+            .expect("authenticate acknowledged output authority")
+            .expect("completed Spawn ACK mints output authority");
+        let output_deadline = Instant::now() + Duration::from_secs(5);
+        if let Some(operation) = termination {
+            let mut foreign = BrokerControlClientV1::connect(
+                &socket_path,
+                &token_path,
+                other_mux_identity,
+                broker_build,
+            )
+            .unwrap();
+            for (connection, generation, effect) in [
+                (&mut foreign, 1, binding.spawn_effect_id),
+                (&mut client, 2, binding.spawn_effect_id),
+            ] {
+                let request = BrokerControlRequestV1::new(
+                    BrokerControlRequestHeaderV1 {
+                        operation,
+                        request_id: Uuid::new_v4(),
+                        broker_incarnation,
+                        guardian_incarnation: connection.identity.guardian_incarnation,
+                        connection_id: connection.connection_id,
+                        mux_incarnation: connection.identity.mux_incarnation,
+                        guardian_build_identity_digest: connection
+                            .identity
+                            .guardian_build_identity
+                            .into_bytes(),
+                        mux_build_identity_digest: connection
+                            .identity
+                            .mux_build_identity
+                            .into_bytes(),
+                        durable_pane_id: binding.durable_pane_id,
+                        lease_generation: generation,
+                        operation_id: effect,
+                    },
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(
+                    connection
+                        .exchange_with_deadline(&request, Some(output_deadline))
+                        .unwrap()
+                        .header
+                        .status,
+                    BrokerControlResponseStatusV1::Rejected
+                );
+            }
+            assert_eq!(
+                client
+                    .child_status(&output_handle, output_deadline)
+                    .unwrap(),
+                BrokerPaneChildStatusV1::Running
+            );
+            match operation {
+                BrokerControlOperationV1::ClosePane => {
+                    client.close_pane(&output_handle, output_deadline).unwrap();
+                }
+                BrokerControlOperationV1::SignalTerminate => client
+                    .signal_terminate(&output_handle, output_deadline)
+                    .unwrap(),
+                _ => unreachable!("fixture only accepts termination operations"),
+            }
+            loop {
+                match client
+                    .child_status(&output_handle, output_deadline)
+                    .unwrap()
+                {
+                    BrokerPaneChildStatusV1::Exited { signaled: true, .. } => break,
+                    BrokerPaneChildStatusV1::Running if Instant::now() < output_deadline => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    other => {
+                        panic!("owned child did not exit from the termination signal: {other:?}")
+                    }
+                }
+            }
+            assert_eq!(fs::read(&sentinel).unwrap(), b"C");
+            // Reaped child identity cannot be signaled again or release the master.
+            client.close_pane(&output_handle, output_deadline).unwrap();
+            drop(foreign);
+            drop(client);
+            service.finish();
+            return;
+        }
+        if terminal_probe {
+            assert_eq!(
+                client
+                    .child_status(&output_handle, output_deadline)
+                    .unwrap(),
+                BrokerPaneChildStatusV1::Running
+            );
+            client
+                .resize(
+                    &output_handle,
+                    PtySize {
+                        rows: 37,
+                        cols: 109,
+                        pixel_width: 872,
+                        pixel_height: 592,
+                    },
+                    output_deadline,
+                )
+                .unwrap();
+            let mut writer = BrokerPaneInputWriterV1::new(
+                Box::new(BrokerPaneIoSessionV1 { client }),
+                output_handle,
+                output_deadline,
+            );
+            assert_eq!(writer.write(b"one-physical-input\n").unwrap(), 19);
+            assert!(writer.write(b"duplicate\n").is_err());
+            let (mut session, handle) = writer.into_parts();
+            loop {
+                match session
+                    .client
+                    .child_status(&handle, output_deadline)
+                    .unwrap()
+                {
+                    BrokerPaneChildStatusV1::Exited {
+                        exit_code: 7,
+                        signaled: false,
+                    } => break,
+                    BrokerPaneChildStatusV1::Running if Instant::now() < output_deadline => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    other => panic!("actual child status did not report exit 7: {other:?}"),
+                }
+            }
+            let geometry_path = sentinel.with_extension("geometry");
+            let input_path = sentinel.with_extension("input");
+            assert_eq!(fs::read_to_string(geometry_path).unwrap().trim(), "37 109");
+            assert_eq!(fs::read(input_path).unwrap(), b"one-physical-input");
+            assert_eq!(fs::read(&sentinel).unwrap(), b"C");
+            drop(session);
+            service.finish();
+            return;
+        }
+        for invalid_maximum in [0, BROKER_OUTPUT_PUMP_CHUNK_BYTES + 1] {
+            assert!(matches!(
+                client.read_output(&output_handle, invalid_maximum, output_deadline),
+                Err(BrokerControlClientError::Protocol)
+            ));
+        }
+        assert_eq!(
+            client
+                .child_status(&output_handle, output_deadline)
+                .unwrap(),
+            BrokerPaneChildStatusV1::Running
+        );
+        let mut foreign_reader = BrokerControlClientV1::connect(
+            &socket_path,
+            &token_path,
+            other_mux_identity,
+            broker_build,
+        )
+        .unwrap();
+        assert!(matches!(
+            foreign_reader.read_output(&output_handle, 1, output_deadline),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
+        assert!(matches!(
+            foreign_reader.child_status(&output_handle, output_deadline),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
+        let foreign_request = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::ReadOutput,
+                request_id: Uuid::new_v4(),
+                broker_incarnation,
+                guardian_incarnation: other_mux_identity.guardian_incarnation,
+                connection_id: foreign_reader.connection_id,
+                mux_incarnation: other_mux_identity.mux_incarnation,
+                guardian_build_identity_digest: other_mux_identity
+                    .guardian_build_identity
+                    .into_bytes(),
+                mux_build_identity_digest: other_mux_identity.mux_build_identity.into_bytes(),
+                durable_pane_id: binding.durable_pane_id,
+                lease_generation: 1,
+                operation_id: binding.spawn_effect_id,
+            },
+            &1_u32.to_be_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_reader
+                .exchange(&foreign_request)
+                .unwrap()
+                .header
+                .status,
+            BrokerControlResponseStatusV1::Rejected,
+            "known pane and generation under authenticated foreign owner grant no read authority"
+        );
+        let foreign_status = BrokerControlRequestV1::new(
+            BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::QueryChildStatus,
+                request_id: Uuid::new_v4(),
+                ..foreign_request.header
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_reader
+                .exchange(&foreign_status)
+                .unwrap()
+                .header
+                .status,
+            BrokerControlResponseStatusV1::Rejected,
+            "foreign owner cannot query the real child behind a known pane identity"
+        );
+        drop(foreign_reader);
+        let first_delivery = loop {
+            match client
+                .read_output(&output_handle, 1, output_deadline)
+                .expect("read real PTY through authenticated broker worker")
+            {
+                BrokerPaneOutputV1::Pending if Instant::now() < output_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerPaneOutputV1::Data(delivery) => break delivery,
+                _ => panic!("real broker output did not become durably readable"),
+            }
+        };
+        let (start, end) = first_delivery.sequence_range();
+        assert_eq!(first_delivery.bytes(), b"b");
+        assert_eq!(
+            end - start,
+            u64::try_from(first_delivery.bytes().len()).unwrap()
+        );
+        match client
+            .read_output(&output_handle, 1, output_deadline)
+            .expect("replay unacknowledged output")
+        {
+            BrokerPaneOutputV1::Data(delivery) => {
+                assert_eq!(delivery.sequence_range(), (start, end));
+                assert_eq!(delivery.bytes(), first_delivery.bytes());
+            }
+            _ => panic!("read advanced output without durable downstream acknowledgement"),
+        }
+        let mut denied = header;
+        denied.operation = BrokerControlOperationV1::ReadOutput;
+        denied.request_id = Uuid::new_v4();
+        denied.lease_generation = 2;
+        let denied = BrokerControlRequestV1::new(denied, &8192_u32.to_be_bytes()).unwrap();
+        assert_eq!(
+            client.exchange(&denied).unwrap().header.status,
+            BrokerControlResponseStatusV1::Rejected,
+            "stale/future generation cannot read output"
+        );
+        assert!(
+            matches!(
+                client.read_output(&output_handle, 1, output_deadline),
+                Ok(BrokerPaneOutputV1::Data(_))
+            ),
+            "denied generation preserves the actual lease"
+        );
+        let guardian_journal = custody_pipeline
+            .prepare_pane(
+                connection_identity.guardian_incarnation,
+                binding.durable_pane_id,
+            )
+            .expect("prepare canonical receiving guardian output journal");
+        let await_output = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match custody_pipeline.try_completion() {
+                    crate::output::GuardianOutputCompletionState::Ready(completion) => {
+                        break completion;
+                    }
+                    crate::output::GuardianOutputCompletionState::Empty
+                        if Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    _ => panic!("canonical output worker did not settle"),
+                }
+            }
+        };
+        let wrong_journal = custody_pipeline
+            .prepare_pane(connection_identity.guardian_incarnation, Uuid::new_v4())
+            .unwrap();
+        let BrokerPaneOutputV1::Data(delivery) = client
+            .read_output(&output_handle, 1, output_deadline)
+            .unwrap()
+        else {
+            panic!("retained prefix")
+        };
+        assert!(
+            custody_pipeline
+                .try_submit_broker_output(wrong_journal, delivery)
+                .is_ok()
+        );
+        let rejected = await_output();
+        assert!(rejected.result.is_err());
+        assert!(
+            rejected.broker_ack.is_none(),
+            "wrong journal cannot grant output ACK"
+        );
+        let BrokerPaneOutputV1::Data(mut delivery) = client
+            .read_output(&output_handle, 1, output_deadline)
+            .unwrap()
+        else {
+            panic!("retained prefix")
+        };
+        delivery.token.start += 1;
+        assert!(
+            custody_pipeline
+                .try_submit_broker_output(guardian_journal.clone(), delivery)
+                .is_ok()
+        );
+        let rejected = await_output();
+        assert!(rejected.result.is_err());
+        assert!(
+            rejected.broker_ack.is_none(),
+            "mutated range cannot grant output ACK"
+        );
+        assert!(
+            custody_pipeline
+                .try_submit_broker_output(guardian_journal.clone(), first_delivery)
+                .is_ok()
+        );
+        let mut completion = await_output();
+        let first_receipt = completion.result.unwrap();
+        assert_eq!(first_receipt.cumulative_plaintext_bytes(), end);
+        drop(
+            completion
+                .broker_ack
+                .take()
+                .expect("successful append mints ACK claim"),
+        );
+        // Lose the completion/ACK after actual fsync, then redeliver the same
+        // broker range through the canonical worker. It must not append twice.
+        let BrokerPaneOutputV1::Data(delivery) = client
+            .read_output(&output_handle, 1, output_deadline)
+            .unwrap()
+        else {
+            panic!("retained prefix")
+        };
+        assert!(
+            custody_pipeline
+                .try_submit_broker_output(guardian_journal.clone(), delivery)
+                .is_ok()
+        );
+        let mut retried = await_output();
+        assert_eq!(retried.result.unwrap(), first_receipt);
+        let ack = retried.broker_ack.take().unwrap();
+        client
+            .acknowledge_output(&ack, output_deadline)
+            .expect("release exactly durable guardian prefix");
+        client
+            .acknowledge_output(&ack, output_deadline)
+            .expect("exact ACK retry is idempotent");
+        loop {
+            match client
+                .read_output(&output_handle, 1, output_deadline)
+                .unwrap()
+            {
+                BrokerPaneOutputV1::Pending if Instant::now() < output_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                BrokerPaneOutputV1::Data(delivery) => {
+                    assert_eq!(delivery.sequence_range(), (end, end + 1));
+                    assert_eq!(delivery.bytes(), b"r");
+                    break;
+                }
+                _ => panic!("durable ACK did not release next broker byte"),
+            }
+        }
+        let BrokerPaneOutputV1::Data(delivery) = client
+            .read_output(&output_handle, 1, output_deadline)
+            .unwrap()
+        else {
+            panic!("second byte remains broker-owned until durable append");
+        };
+        let segment_path = guardian_journal.current_segment_path_for_test();
+        let mut segment = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment_path)
+            .unwrap();
+        let mut header_byte = [0_u8; 1];
+        segment.read_exact(&mut header_byte).unwrap();
+        header_byte[0] ^= 1;
+        segment.seek(SeekFrom::Start(0)).unwrap();
+        segment.write_all(&header_byte).unwrap();
+        segment.sync_all().unwrap();
+        drop(segment);
+        assert!(
+            matches!(
+                client.acknowledge_output(&ack, output_deadline),
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            ),
+            "same-inode corruption must fail authenticated ACK readback"
+        );
+        let retained_segment = segment_path.with_extension(format!("retained-{}", Uuid::new_v4()));
+        assert!(!retained_segment.exists());
+        fs::rename(&segment_path, &retained_segment)
+            .expect("retain actual segment while invalidating canonical path authority");
+        assert!(
+            custody_pipeline
+                .try_submit_broker_output(guardian_journal.clone(), delivery)
+                .is_ok()
+        );
+        let failed = await_output();
+        assert!(failed.result.is_err());
+        assert!(
+            failed.broker_ack.is_none(),
+            "failed real persistence authority produces no ACK capability"
+        );
+        assert!(
+            matches!(
+                client.acknowledge_output(&ack, output_deadline),
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            ),
+            "even retained old ACK claims revalidate journal path authority"
+        );
+        let BrokerPaneOutputV1::Data(delivery) = client
+            .read_output(&output_handle, 1, output_deadline)
+            .unwrap()
+        else {
+            panic!("failed append must not release broker prefix");
+        };
+        assert_eq!(delivery.sequence_range(), (end, end + 1));
+        assert_eq!(delivery.bytes(), b"r");
         assert!(matches!(
             client
                 .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
@@ -22203,7 +24410,125 @@ mod tests {
             b"C",
             "control retry created more than one child"
         );
-        drop(client);
+        let mut io_worker = BrokerPaneIoWorkerV1::start(
+            Box::new(BrokerPaneIoSessionV1 { client }),
+            Arc::clone(&custody_waker),
+        )
+        .unwrap_or_else(|_| panic!("start connection-owned broker IO worker"));
+        let worker_deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            io_worker
+                .try_submit(Box::new(BrokerPaneIoCommandV1::Read {
+                    handle: output_handle,
+                    maximum_bytes: 1,
+                    deadline: worker_deadline,
+                }))
+                .is_ok()
+        );
+        let rejected = io_worker
+            .try_submit(Box::new(BrokerPaneIoCommandV1::Acknowledge {
+                claim: ack,
+                deadline: worker_deadline,
+            }))
+            .expect_err("one outstanding command per broker connection");
+        assert!(io_worker.try_take_session().unwrap().is_none());
+        let output_handle = loop {
+            match io_worker.try_completion() {
+                Ok(BrokerPaneIoCompletionV1::Read {
+                    handle,
+                    result: Ok(BrokerPaneOutputV1::Data(delivery)),
+                }) => {
+                    assert_eq!(delivery.sequence_range(), (end, end + 1));
+                    assert_eq!(delivery.bytes(), b"r");
+                    break handle;
+                }
+                Err(TryRecvError::Empty) if Instant::now() < worker_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("owned IO worker failed to return retained broker prefix"),
+            }
+        };
+        let mut returned_session = io_worker
+            .try_take_session()
+            .unwrap()
+            .expect("idle worker returns the same live connection");
+        let returned_census = returned_session.client.census().unwrap();
+        assert_eq!(returned_census.entries().len(), 1);
+        assert_eq!(returned_census.entries()[0].lease_generation, 1);
+        assert_eq!(
+            returned_census.entries()[0].owner_mux_incarnation,
+            Some(authenticated.owner.mux_incarnation)
+        );
+        returned_session
+            .client
+            .resize(
+                &output_handle,
+                PtySize {
+                    rows: 37,
+                    cols: 109,
+                    pixel_width: 872,
+                    pixel_height: 592,
+                },
+                worker_deadline,
+            )
+            .expect("apply geometry through authenticated broker transport");
+        // This fixture isolates transport ownership; runtime tests separately
+        // require the canonical durable input permit before this adapter.
+        let mut input_writer =
+            BrokerPaneInputWriterV1::new(returned_session, output_handle, worker_deadline);
+        assert_eq!(input_writer.write(b"q").unwrap(), 1);
+        assert!(
+            input_writer.write(b"q").is_err(),
+            "one input adapter must never replay raw bytes"
+        );
+        let (returned_session, output_handle) = input_writer.into_parts();
+        drop(io_worker);
+        let mut io_worker =
+            BrokerPaneIoWorkerV1::start(returned_session, Arc::clone(&custody_waker))
+                .unwrap_or_else(|_| {
+                    panic!("resume exact connection after idle ownership transfer")
+                });
+        assert!(io_worker.try_submit(rejected).is_ok());
+        loop {
+            match io_worker.try_completion() {
+                Ok(BrokerPaneIoCompletionV1::Acknowledge {
+                    claim,
+                    result: Err(BrokerControlClientError::AuthenticationAuthority),
+                }) => {
+                    assert!(claim.validated_token().is_none());
+                    break;
+                }
+                Err(TryRecvError::Empty) if Instant::now() < worker_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("owned IO worker accepted unavailable journal authority"),
+            }
+        }
+        assert!(
+            io_worker
+                .try_submit(Box::new(BrokerPaneIoCommandV1::ChildStatus {
+                    handle: output_handle,
+                    deadline: worker_deadline,
+                }))
+                .is_ok()
+        );
+        loop {
+            match io_worker.try_completion() {
+                Ok(BrokerPaneIoCompletionV1::ChildStatus {
+                    handle,
+                    result: Ok(BrokerPaneChildStatusV1::Running),
+                }) => {
+                    assert_eq!(handle.pane_id, binding.durable_pane_id);
+                    assert_eq!(handle.lease_generation, 1);
+                    break;
+                }
+                Err(TryRecvError::Empty) if Instant::now() < worker_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("worker status query fabricated child exit from output state"),
+            }
+        }
+        drop(io_worker);
         let mut reconnect = BrokerControlClientV1::connect(
             &socket_path,
             &token_path,
@@ -22441,24 +24766,47 @@ mod tests {
             broker_build,
         )
         .expect("connect to restarted acknowledged Spawn service");
+        drop(initial_claim);
+        drop(custody_store);
+        drop(custody_pipeline);
+        let reopened_pipeline =
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
+                .expect("load persisted encryption key and custody in a fresh store");
+        let custody_store = reopened_pipeline.checkpoint_stage_store();
+        let recovered_custody = restarted_client
+            .reopen_spawn_custody(
+                &custody_store,
+                binding.durable_pane_id,
+                binding.spawn_effect_id,
+            )
+            .expect("discover original ACK and child from encrypted disk using stable scope only");
+        assert_eq!(recovered_custody.context().ack_id, id(7_308));
+        assert_eq!(
+            recovered_custody.context().child_pid,
+            child_identity.process_id()
+        );
+        let custody_context = recovered_custody.context();
         assert_eq!(
             restarted_client
-                .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
-                )
+                .acknowledge_spawn_effect(recovered_custody)
                 .expect("recover durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
         );
         assert_eq!(
             restarted_client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_310),
-                    initial_claim.recovery_secret(),
+                    &BrokerPaneRecoverySecretV1::from_wire(
+                        custody_store
+                            .reopen_spawn_custody(&custody_context)
+                            .expect("reopen for protocol negative")
+                            .into_secret()
+                            .expect("decrypt persisted capability")
+                            .as_slice()
+                    )
+                    .expect("recover nonzero secret"),
                 )
                 .expect("reject mutated durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
@@ -25415,7 +27763,7 @@ mod tests {
 
     #[test]
     fn durable_output_append_failure_is_sticky_and_never_exposes_undurable_tail() {
-        let temp = tempfile::tempdir().expect("test directory");
+        let temp = private_catalog_directory();
         let sentinel = temp.path().join("unused");
         let auth = authority(id(121), id(122), id(123), id(124), 0x95, 0x96);
         let payload = command_payload("printf abcdefgh", &sentinel);
@@ -25459,21 +27807,52 @@ mod tests {
         assert!(first.bytes_drained > 0 && first.bytes_drained <= 4);
         let durable_end = first.output_sequence_end;
 
+        let token_path = temp.path().join("output-worker.token");
+        crate::transport::provision_guardian_token(&token_path).unwrap();
+        let (_, mut token_authority) = load_guardian_secret_with_authority(&token_path).unwrap();
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1)).unwrap());
+        let worker = BrokerOutputWorkerV1::start(waker).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match pane.pump_ready_output_durably() {
-                Err(BrokerError::DurableOutputJournalUnavailable) => break,
-                Err(BrokerError::ProxyWouldBlock) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Ok(BrokerOutputPumpOutcomeV1::TerminalDrained(receipt)) => {
-                    panic!("PTY became terminal before journal capacity fence: {receipt:?}")
-                }
-                Ok(BrokerOutputPumpOutcomeV1::Drained(receipt)) => {
-                    panic!("second journal record bypassed max_records=1: {receipt:?}")
-                }
-                Err(error) => panic!("unexpected durable journal failure: {error}"),
+            assert!(
+                Instant::now() < deadline,
+                "worker must settle within fixture deadline"
+            );
+            let job = BrokerOutputDrainJobV1 {
+                pane_id: binding.durable_pane_id,
+                sequence: pane.next_output_sequence,
+                reader: pane.proxy_reader.take().unwrap(),
+                journal: pane.output_journal.take().unwrap(),
+                bytes: Zeroizing::new(vec![0; 4]),
+                result: Err(()),
+                token_lease: token_authority.acquire_effect_lease().unwrap(),
+            };
+            assert!(worker.jobs.as_ref().unwrap().send(job).is_ok());
+            let completion = worker
+                .completions
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let failed = completion.result.is_err();
+            assert_eq!(completion.pane_id, binding.durable_pane_id);
+            assert_eq!(completion.sequence, durable_end);
+            pane.install_output_completion(completion);
+            assert!(
+                pane.proxy_reader.is_some(),
+                "failed append retains sole PTY reader"
+            );
+            assert!(
+                pane.output_journal.is_some(),
+                "failed append retains encrypted journal"
+            );
+            if failed {
+                break;
             }
+            assert_eq!(
+                pane.next_output_sequence, durable_end,
+                "capacity-fenced worker must not expose a second record"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(pane.status().output_sequence, durable_end);
         assert!(pane.resource_usage().buffered_output_bytes > first.bytes_drained);
@@ -25513,6 +27892,58 @@ mod tests {
             Err(BrokerError::ProxyWouldBlock),
             "undurable buffered tail became guardian-visible"
         );
+        pane.terminate_and_wait_for_test();
+
+        let other_auth = authority(id(126), id(127), id(128), id(129), 0x97, 0x98);
+        let other_payload = command_payload("printf z", &sentinel);
+        let other_binding = binding_for(&other_payload, &other_auth);
+        let (prepared, control) =
+            prepare_for_test(other_payload, other_binding, &other_auth, limits).unwrap();
+        let prepared = prepared
+            .bind_fresh_output_journal(create_test_output_journal(
+                temp.path(),
+                other_binding.durable_pane_id,
+                id(130),
+                GuardianOutputJournalLimits::default(),
+            ))
+            .unwrap();
+        let BrokerAdoptionV1 {
+            mut pane,
+            attachment,
+        } = commit_for_test(prepared, control, other_binding).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.next_output_sequence == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "failed pane must not strand worker capacity"
+            );
+            let job = BrokerOutputDrainJobV1 {
+                pane_id: other_binding.durable_pane_id,
+                sequence: 0,
+                reader: pane.proxy_reader.take().unwrap(),
+                journal: pane.output_journal.take().unwrap(),
+                bytes: Zeroizing::new(vec![0; 1]),
+                result: Err(()),
+                token_lease: token_authority.acquire_effect_lease().unwrap(),
+            };
+            assert!(worker.jobs.as_ref().unwrap().send(job).is_ok());
+            let completion = worker
+                .completions
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                completion.result.is_ok(),
+                "other pane uses its independent healthy journal"
+            );
+            pane.install_output_completion(completion);
+            if pane.next_output_sequence == 0 {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let permit = pane.admit_proxy_read(&attachment, 1).unwrap();
+        let mut bytes = [0; 1];
+        pane.execute_proxy_read(permit, &mut bytes).unwrap();
+        assert_eq!(bytes, *b"z");
         pane.terminate_and_wait_for_test();
     }
 

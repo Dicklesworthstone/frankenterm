@@ -162,6 +162,16 @@ struct Opt {
     #[arg(long = "dispatch-io-backend", value_enum, default_value_t = DispatchIoBackendArg::Auto)]
     dispatch_io_backend: DispatchIoBackendArg,
 
+    /// Use a configured guardian for new panes (same-session Unix opt-in).
+    #[cfg(unix)]
+    #[arg(long, requires = "guardian_token_path")]
+    guardian_socket_path: Option<std::path::PathBuf>,
+
+    /// Private authentication token for the configured guardian.
+    #[cfg(unix)]
+    #[arg(long, requires = "guardian_socket_path")]
+    guardian_token_path: Option<std::path::PathBuf>,
+
     /// Specify the current working directory for the initially
     /// spawned program
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
@@ -260,6 +270,12 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
 
     let config = config::configuration();
 
+    #[cfg(unix)]
+    validate_guardian_domain_default(
+        opts.guardian_socket_path.is_some(),
+        config.default_mux_server_domain.as_deref(),
+    )?;
+
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
         set_process_env_for_mux_server_startup("SSH_AUTH_SOCK", value.as_str());
@@ -339,8 +355,28 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         None
     };
 
-    let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
-    let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
+    #[cfg(unix)]
+    let guardian_paths = opts.guardian_socket_path.zip(opts.guardian_token_path);
+    #[cfg(not(unix))]
+    let guardian_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
+    let mux: Arc<Mux> = match guardian_paths {
+        #[cfg(unix)]
+        Some((socket, token)) => {
+            let mux = Arc::new(Mux::new(None));
+            let domain: Arc<dyn Domain> = Arc::new(
+                frankenterm_mux_server_impl::guardian_proxy::GuardianDomain::new(
+                    &mux, socket, token,
+                )?,
+            );
+            mux.add_domain(&domain)?;
+            mux.set_default_domain(&domain)?;
+            mux
+        }
+        _ => {
+            let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+            Arc::new(Mux::new(Some(domain)))
+        }
+    };
     Mux::set_mux(&mux);
 
     let executor = promise::spawn::SimpleExecutor::new();
@@ -403,6 +439,18 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
         let args = lua.pack_multi(())?;
         config::lua::emit_event(lua.as_ref().clone(), ("mux-startup".to_string(), args)).await?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_guardian_domain_default(
+    guardian_selected: bool,
+    configured_default: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !guardian_selected || matches!(configured_default, None | Some("guardian")),
+        "--guardian-socket-path requires default_mux_server_domain to be unset or guardian"
+    );
     Ok(())
 }
 
@@ -782,6 +830,16 @@ fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
         args.push(OsString::from("--cwd"));
         args.push(cwd.clone());
     }
+    #[cfg(unix)]
+    for (flag, path) in [
+        ("--guardian-socket-path", &opts.guardian_socket_path),
+        ("--guardian-token-path", &opts.guardian_token_path),
+    ] {
+        if let Some(path) = path {
+            args.push(OsString::from(flag));
+            args.push(path.as_os_str().to_os_string());
+        }
+    }
     if !opts.prog.is_empty() {
         args.push(OsString::from("--"));
         args.extend(opts.prog.iter().cloned());
@@ -856,9 +914,49 @@ mod tests {
             config_override: Vec::new(),
             daemonize: false,
             dispatch_io_backend: DispatchIoBackendArg::Auto,
+            #[cfg(unix)]
+            guardian_socket_path: None,
+            #[cfg(unix)]
+            guardian_token_path: None,
             cwd: None,
             prog: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_domain_flags_require_explicit_pair() {
+        for flag in ["--guardian-socket-path", "--guardian-token-path"] {
+            assert!(Opt::try_parse_from(["mux", flag, "/private/guardian"]).is_err());
+        }
+        let opts = Opt::try_parse_from([
+            "mux",
+            "--guardian-socket-path",
+            "/private/guardian.sock",
+            "--guardian-token-path",
+            "/private/guardian.token",
+        ])
+        .unwrap();
+        assert_eq!(
+            opts.guardian_socket_path,
+            Some(PathBuf::from("/private/guardian.sock"))
+        );
+        assert_eq!(
+            opts.guardian_token_path,
+            Some(PathBuf::from("/private/guardian.token"))
+        );
+        let default = Opt::try_parse_from(["mux"]).unwrap();
+        assert!(default.guardian_socket_path.is_none());
+        assert!(default.guardian_token_path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_domain_opt_in_rejects_conflicting_configured_default() {
+        assert!(validate_guardian_domain_default(true, None).is_ok());
+        assert!(validate_guardian_domain_default(true, Some("guardian")).is_ok());
+        assert!(validate_guardian_domain_default(true, Some("local")).is_err());
+        assert!(validate_guardian_domain_default(false, Some("local")).is_ok());
     }
 
     fn make_config_with_unix_domains(domains: Vec<UnixDomain>) -> config::ConfigHandle {
@@ -1257,6 +1355,39 @@ mod tests {
             !args.iter().any(|arg| arg == OsStr::new("--")),
             "separator should only appear when forwarding a child program"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemonized_guardian_flags_roundtrip_non_utf8_paths_before_program_separator() {
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let socket = OsString::from_vec(b"/private/guardian-\xff/socket".to_vec());
+        let token = OsString::from_vec(b"/private/guardian-\xfe/token".to_vec());
+        let program = vec![
+            OsString::from("sh"),
+            OsString::from("--guardian-token-path"),
+            OsString::from_vec(b"literal-child-\xfd".to_vec()),
+        ];
+        let mut original_args = vec![
+            OsString::from("mux"),
+            OsString::from("--daemonize=true"),
+            OsString::from("--guardian-socket-path"),
+            socket.clone(),
+            OsString::from("--guardian-token-path"),
+            token.clone(),
+            OsString::from("--"),
+        ];
+        original_args.extend(program.iter().cloned());
+        let original = Opt::try_parse_from(original_args).unwrap();
+        let forwarded = daemonized_child_args(&original);
+        let child =
+            Opt::try_parse_from(std::iter::once(OsString::from("mux")).chain(forwarded)).unwrap();
+        assert!(!child.daemonize);
+        assert_eq!(child.guardian_socket_path, Some(PathBuf::from(socket)));
+        assert_eq!(child.guardian_token_path, Some(PathBuf::from(token)));
+        assert_eq!(child.prog, program);
     }
 
     // ── ft-gqbpk SIGTERM/SIGINT graceful-shutdown regressions ────────

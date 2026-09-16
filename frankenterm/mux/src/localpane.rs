@@ -4451,6 +4451,23 @@ impl LocalPane {
         )
     }
 
+    /// Check mux-owned publication prerequisites without performing I/O or
+    /// minting any transport, parser, or lease authority.
+    pub(crate) fn validate_unpublished_guardian_proxy(&self) -> anyhow::Result<()> {
+        let LocalPaneOwnership::Guardian(ownership) = &self.ownership else {
+            anyhow::bail!("unpublished guardian pane requires guardian ownership");
+        };
+        if *ownership.disposition.lock() != GuardianLeaseDisposition::Attached
+            || self.durable_pane_id != *ownership.identity.pane_id().as_bytes()
+            || self.mux_registration.load().is_some()
+            || self.guardian_live_output_reader.lock().is_none()
+            || self.guardian_checkpoint_publisher.is_none()
+        {
+            anyhow::bail!("unpublished guardian pane has incomplete or consumed authority");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_with_ownership(
         pane_id: PaneId,
@@ -6812,6 +6829,186 @@ mod tests {
             0,
             "guardian ownership must make the legacy LocalPane Drop killer unreachable",
         );
+    }
+
+    #[test]
+    fn unpublished_guardian_cancellation_retires_once_without_close_or_signal() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(721, identity, control.clone(), Arc::clone(&kills));
+        let unpublished = crate::domain::UnpublishedPane::from_guardian_proxy(pane)
+            .expect("complete guardian facets admit unpublished ownership");
+        let publication = unpublished.guardian_publication_receipt().unwrap();
+        assert!(!publication.was_published());
+        drop(unpublished);
+        assert!(!publication.was_published());
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(control.retirement_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unpublished_guardian_admission_rejects_missing_or_consumed_facets() {
+        for missing in 0..4 {
+            let identity = guardian_lifetime_test_identity(1);
+            let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+            let kills = Arc::new(AtomicUsize::new(0));
+            let mut pane =
+                guardian_lifetime_test_pane(722, identity, control.clone(), Arc::clone(&kills));
+            match missing {
+                0 => {
+                    pane.guardian_live_output_reader.lock().take();
+                }
+                1 => {
+                    pane.guardian_checkpoint_publisher.take();
+                }
+                2 => {
+                    pane.durable_pane_id = [0x91; 16];
+                }
+                3 => {
+                    Pane::kill(&pane);
+                }
+                _ => unreachable!(),
+            }
+            assert!(crate::domain::UnpublishedPane::from_guardian_proxy(pane).is_err());
+            assert_eq!(kills.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                control.close_attempts.load(Ordering::SeqCst),
+                usize::from(missing == 3)
+            );
+            assert_eq!(
+                control.retirement_attempts.load(Ordering::SeqCst),
+                usize::from(missing != 3)
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_guardian_admission_rejects_native_and_preserves_native_rollback() {
+        let native = |kills| {
+            LocalPane::new(
+                723,
+                guardian_lifetime_test_terminal(),
+                Box::new(KillCountingChild { kills }),
+                Box::new(GuardianLifetimeTestMasterPty),
+                Box::new(Vec::<u8>::new()),
+                1,
+                [0x73; 16],
+                "native-unpublished-test".to_string(),
+            )
+        };
+        let kills = Arc::new(AtomicUsize::new(0));
+        assert!(
+            crate::domain::UnpublishedPane::from_guardian_proxy(native(Arc::clone(&kills)))
+                .is_err()
+        );
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn Pane> = Arc::new(native(Arc::clone(&kills)));
+        let unpublished = crate::domain::UnpublishedPane::new(Arc::clone(&pane));
+        assert!(unpublished.guardian_publication_receipt().is_none());
+        drop(unpublished);
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "native guard still explicitly kills before releasing its Arc"
+        );
+    }
+
+    #[test]
+    fn unpublished_guardian_publication_registers_then_rejects_readmission() {
+        struct HeldReader(std::sync::mpsc::Receiver<()>);
+        impl GuardianLiveOutputReader for HeldReader {
+            fn deliver_next_record(
+                &mut self,
+                _deliver: &mut dyn FnMut(
+                    crate::guardian_output_journal::GuardianOutputSegmentIdentity,
+                    crate::guardian_output_journal::GuardianOutputAppendReceipt,
+                    Arc<[u8]>,
+                ) -> std::io::Result<()>,
+            ) -> std::io::Result<GuardianLiveOutputDelivery> {
+                let _ = self.0.recv_timeout(Duration::from_secs(5));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "publication fixture released",
+                ))
+            }
+        }
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let pane = guardian_lifetime_test_pane(724, identity, control.clone(), Arc::clone(&kills));
+        let (release, wait) = std::sync::mpsc::channel();
+        *pane.guardian_live_output_reader.lock() = Some(Box::new(HeldReader(wait)));
+        let mux = Arc::new(crate::Mux::new(None));
+        assert!(mux.get_pane(724).is_none());
+        let unpublished = crate::domain::UnpublishedPane::from_guardian_proxy(pane).unwrap();
+        let publication = unpublished.guardian_publication_receipt().unwrap();
+        let publication_clone = publication.clone();
+        assert!(!publication.was_published());
+        let published = unpublished
+            .publish(&mux)
+            .expect("register guardian pane through consuming mux-owned publication");
+        assert!(publication.was_published());
+        assert!(publication_clone.was_published());
+        assert!(mux.get_pane(724).is_some());
+        let local = published
+            .downcast_ref::<LocalPane>()
+            .expect("published guardian LocalPane");
+        assert!(
+            local.validate_unpublished_guardian_proxy().is_err(),
+            "registered pane cannot be admitted as unpublished"
+        );
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        let rejected_identity = GuardianPaneLeaseIdentity::new(
+            identity.guardian_incarnation(),
+            identity.mux_incarnation(),
+            Uuid::from_bytes([0x44; 16]),
+            1,
+        )
+        .unwrap();
+        let rejected_control = Arc::new(FencedGuardianLeaseControl::new(rejected_identity));
+        let rejected_kills = Arc::new(AtomicUsize::new(0));
+        let rejected = guardian_lifetime_test_pane(
+            724,
+            rejected_identity,
+            rejected_control.clone(),
+            Arc::clone(&rejected_kills),
+        );
+        let rejected = crate::domain::UnpublishedPane::from_guardian_proxy(rejected).unwrap();
+        let rejected_publication = rejected.guardian_publication_receipt().unwrap();
+        assert!(
+            rejected.publish(&mux).is_err(),
+            "numeric pane collision must fail publication"
+        );
+        assert!(!rejected_publication.was_published());
+        assert_eq!(
+            rejected_control.retirement_attempts.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            rejected_control.retirement_effects.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(rejected_control.close_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(rejected_kills.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&mux.get_pane(724).unwrap(), &published));
+        assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        drop(release);
+        mux.remove_pane(724);
+        assert!(mux.get_pane(724).is_none());
+        drop(published);
+        drop(mux);
+        assert!(publication.was_published());
+        assert!(publication_clone.was_published());
+        assert!(!rejected_publication.was_published());
     }
 
     #[test]

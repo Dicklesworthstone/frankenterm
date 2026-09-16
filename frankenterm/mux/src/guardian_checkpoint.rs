@@ -28,7 +28,7 @@ use frankenterm_term::{
     RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID,
 };
 use sha2::{Digest as _, Sha256};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::sync::{Arc, Weak};
 use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;
 use termwiz::escape::{parser::RecoveryGroundBoundary, Action};
@@ -950,6 +950,11 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             terminal_checkpoint,
         )
         .expect("test Genesis checkpoint descriptor must be valid");
+        let terminal = TerminalCheckpointV2::decode_canonical_json(
+            terminal_checkpoint.canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("test Genesis canonical model must be valid");
         let identity = GuardianGenesisReservationIdentityV1::from_authenticated_spawn(
             Uuid::from_u128(1),
             spawn_effect_id,
@@ -961,8 +966,8 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             [3; 32],
             u16::try_from(terminal_checkpoint.rows()).expect("test Genesis rows must fit u16"),
             u16::try_from(terminal_checkpoint.cols()).expect("test Genesis columns must fit u16"),
-            0,
-            0,
+            u16::try_from(terminal.pixel_width()).expect("test Genesis pixel width must fit u16"),
+            u16::try_from(terminal.pixel_height()).expect("test Genesis pixel height must fit u16"),
             descriptor
                 .recompute_checkpoint_identity_digest()
                 .expect("test Genesis checkpoint identity must be valid"),
@@ -1319,39 +1324,73 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
     /// into catalog admission. This one-time split lets manifest sealing and
     /// durable catalog publication consume distinct capabilities without ever
     /// cloning or reissuing the authenticated Spawn permit.
+    /// The live witness additionally proves a zero parser watermark; its
+    /// canonical model uses the same complete geometry checks as staged input.
     pub fn from_genesis_spawn_permit(
         binding: &GuardianCheckpointStageBindingV1,
         permit: GuardianCheckpointGenesisSpawnPermitV1,
         terminal_checkpoint: &RecoveryTerminalCheckpointV2,
     ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
+        if terminal_checkpoint.parser_stream_bytes() != 0 {
+            return Err(GuardianCheckpointBoundaryError::GenesisParserWatermark);
+        }
+        Self::from_staged_genesis_spawn_permit(
+            binding,
+            permit,
+            terminal_checkpoint.canonical_payload(),
+        )
+    }
+
+    /// Authorize the authenticated initial model for a not-yet-spawned child
+    /// using its retained Spawn reservation. Canonical JSON does not carry a
+    /// live parser watermark, so decoding it does not manufacture a live
+    /// parser capture. The fresh child's stream starts at zero; its initial
+    /// model may contain configured content. This authority cannot publish a
+    /// record-backed checkpoint for an existing child.
+    pub fn from_staged_genesis_spawn_permit(
+        binding: &GuardianCheckpointStageBindingV1,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+        canonical_payload: &[u8],
+    ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
         let reservation = permit.into_reservation_identity();
-        let spawn_effect_id = reservation.spawn_effect_id();
-        let authoritative_descriptor =
-            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
-                spawn_effect_id,
-                terminal_checkpoint,
-            )?;
         if !binding.descriptor.origin.is_genesis() {
             return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
         }
-        if binding.descriptor.origin.spawn_effect_id() != Some(spawn_effect_id) {
+        if binding.descriptor.origin.spawn_effect_id() != Some(reservation.spawn_effect_id()) {
             return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
         }
-        if binding.descriptor != authoritative_descriptor
+        let terminal = TerminalCheckpointV2::decode_canonical_json(
+            canonical_payload,
+            TerminalCheckpointLimits::default(),
+        )
+        .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
+        let (terminal_payload_bytes, terminal_payload_digest) =
+            terminal_payload_identity(canonical_payload)?;
+        let descriptor = GuardianCheckpointArtifactDescriptorV1 {
+            origin: GuardianCheckpointOriginV1::from_genesis_effect(reservation.spawn_effect_id())?,
+            parser_stream_bytes: 0,
+            replay_identity_digest: current_replay_identity_digest(),
+            rows: terminal.rows(),
+            cols: terminal.cols(),
+            terminal_payload_bytes,
+            terminal_payload_digest,
+        };
+        if binding.descriptor != descriptor
             || reservation.checkpoint_identity_digest()
-                != authoritative_descriptor.recompute_checkpoint_identity_digest()?
+                != descriptor.recompute_checkpoint_identity_digest()?
             || reservation.boundary_identity_digest()
-                != authoritative_descriptor.recompute_boundary_identity_digest()?
-            || u32::from(reservation.rows()) != authoritative_descriptor.rows()
-            || u32::from(reservation.cols()) != authoritative_descriptor.cols()
+                != descriptor.recompute_boundary_identity_digest()?
+            || u32::from(reservation.rows()) != terminal.rows()
+            || u32::from(reservation.cols()) != terminal.cols()
+            || u64::from(reservation.pixel_width()) != terminal.pixel_width()
+            || u64::from(reservation.pixel_height()) != terminal.pixel_height()
         {
             return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
         }
-        let upload_id = reservation.upload_id();
         Ok((
             Self {
                 binding: *binding,
-                genesis_upload_id: Some(upload_id),
+                genesis_upload_id: Some(reservation.upload_id()),
             },
             reservation,
         ))
@@ -2491,20 +2530,230 @@ impl std::fmt::Debug for GuardianCheckpointStageRecordContextV1 {
     }
 }
 
-/// Checkpoint-only encryption authority backed by the guardian output key.
-///
-/// The API exposes neither key bytes, generic associated data, nor a sealing
-/// operation with a caller-selected nonce. Generic records use fresh random
-/// nonces. Catalog-adoption evidence alone uses an internally derived,
-/// replay-stable nonce so a torn publication can reproduce exact bytes; its
-/// typed context and single-use evidence seed prevent caller-selected reuse.
+/// Complete authenticated provenance for custody of one initial Spawn capability.
+/// The original broker incarnation remains immutable across broker restarts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSpawnCustodyContextV1 {
+    pub broker_incarnation: Uuid,
+    pub broker_lineage: Uuid,
+    pub guardian_incarnation: Uuid,
+    pub mux_incarnation: Uuid,
+    pub broker_build: [u8; 32],
+    pub guardian_build: [u8; 32],
+    pub mux_build: [u8; 32],
+    pub pane_id: Uuid,
+    pub effect_id: Uuid,
+    pub ack_id: Uuid,
+    pub child_pid: u32,
+    pub child_nonce: Uuid,
+    pub child_start_digest: [u8; 32],
+    pub wire_ack_generation: u64,
+    pub secret_lease_generation: u64,
+}
+
+/// Caller-trusted stable lookup scope. ACK ID and child provenance are recovered
+/// from the authenticated record, not supplied from volatile state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSpawnCustodyScopeV1 {
+    pub broker_lineage: Uuid,
+    pub guardian_incarnation: Uuid,
+    pub mux_incarnation: Uuid,
+    pub broker_build: [u8; 32],
+    pub guardian_build: [u8; 32],
+    pub mux_build: [u8; 32],
+    pub pane_id: Uuid,
+    pub effect_id: Uuid,
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianSpawnCustodyError {
+    #[error("invalid guardian spawn custody identity")]
+    InvalidIdentity,
+    #[error("guardian spawn custody encryption failed")]
+    Encryption,
+    #[error("guardian spawn custody authentication failed")]
+    Authentication,
+}
+
+impl GuardianSpawnCustodyContextV1 {
+    #[must_use]
+    pub const fn scope(self) -> GuardianSpawnCustodyScopeV1 {
+        GuardianSpawnCustodyScopeV1 {
+            broker_lineage: self.broker_lineage,
+            guardian_incarnation: self.guardian_incarnation,
+            mux_incarnation: self.mux_incarnation,
+            broker_build: self.broker_build,
+            guardian_build: self.guardian_build,
+            mux_build: self.mux_build,
+            pane_id: self.pane_id,
+            effect_id: self.effect_id,
+        }
+    }
+
+    fn from_header(header: &[u8]) -> Result<Self, GuardianSpawnCustodyError> {
+        fn take<const N: usize>(
+            header: &[u8],
+            offset: &mut usize,
+        ) -> Result<[u8; N], GuardianSpawnCustodyError> {
+            let value = header
+                .get(*offset..*offset + N)
+                .ok_or(GuardianSpawnCustodyError::Authentication)?;
+            *offset += N;
+            value
+                .try_into()
+                .map_err(|_| GuardianSpawnCustodyError::Authentication)
+        }
+        if !header.starts_with(SPAWN_CUSTODY_DOMAIN) || header.len() != SPAWN_CUSTODY_HEADER_BYTES {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        let mut offset = SPAWN_CUSTODY_DOMAIN.len();
+        let mut ids = [Uuid::nil(); 8];
+        for id in &mut ids {
+            *id = Uuid::from_bytes(take(header, &mut offset)?);
+        }
+        let mut digests = [[0; 32]; 4];
+        for digest in &mut digests {
+            *digest = take(header, &mut offset)?;
+        }
+        let context = Self {
+            broker_incarnation: ids[0],
+            broker_lineage: ids[1],
+            guardian_incarnation: ids[2],
+            mux_incarnation: ids[3],
+            pane_id: ids[4],
+            effect_id: ids[5],
+            ack_id: ids[6],
+            child_nonce: ids[7],
+            broker_build: digests[0],
+            guardian_build: digests[1],
+            mux_build: digests[2],
+            child_start_digest: digests[3],
+            child_pid: u32::from_le_bytes(take(header, &mut offset)?),
+            wire_ack_generation: u64::from_le_bytes(take(header, &mut offset)?),
+            secret_lease_generation: u64::from_le_bytes(take(header, &mut offset)?),
+        };
+        context.authenticated_header()?;
+        Ok(context)
+    }
+
+    fn authenticated_header(self) -> Result<Vec<u8>, GuardianSpawnCustodyError> {
+        let identities = [
+            self.broker_incarnation,
+            self.broker_lineage,
+            self.guardian_incarnation,
+            self.mux_incarnation,
+            self.pane_id,
+            self.effect_id,
+            self.ack_id,
+            self.child_nonce,
+        ];
+        if identities.iter().any(Uuid::is_nil)
+            || [
+                self.broker_build,
+                self.guardian_build,
+                self.mux_build,
+                self.child_start_digest,
+            ]
+            .contains(&[0; 32])
+            || self.child_pid == 0
+            || self.wire_ack_generation != 0
+            || self.secret_lease_generation != 1
+        {
+            return Err(GuardianSpawnCustodyError::InvalidIdentity);
+        }
+        let mut aad = SPAWN_CUSTODY_DOMAIN.to_vec();
+        for identity in identities {
+            aad.extend_from_slice(identity.as_bytes());
+        }
+        for digest in [
+            self.broker_build,
+            self.guardian_build,
+            self.mux_build,
+            self.child_start_digest,
+        ] {
+            aad.extend_from_slice(&digest);
+        }
+        aad.extend_from_slice(&self.child_pid.to_le_bytes());
+        aad.extend_from_slice(&self.wire_ack_generation.to_le_bytes());
+        aad.extend_from_slice(&self.secret_lease_generation.to_le_bytes());
+        Ok(aad)
+    }
+}
+
+const SPAWN_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-spawn-secret-custody.v1\0";
+const SPAWN_CUSTODY_HEADER_BYTES: usize = SPAWN_CUSTODY_DOMAIN.len() + 8 * 16 + 4 * 32 + 4 + 8 + 8;
+/// Fixed self-describing authenticated header, nonce, and encrypted capability.
+pub const GUARDIAN_SPAWN_CUSTODY_BYTES: usize = SPAWN_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
+
+/// Typed checkpoint and Spawn-custody encryption backed by the guardian output key.
+/// No key bytes, generic AAD, or caller-selected nonce are exposed. Custody uses
+/// a distinct domain and fresh random nonces; it cannot mint checkpoint receipts.
+/// Generic checkpoint records also use random nonces. Catalog-adoption evidence
+/// alone derives replay-stable nonces internally from its typed context and
+/// single-use evidence seed, allowing exact recovery of torn publication.
 #[derive(Clone)]
 pub struct GuardianCheckpointCipher {
     output_cipher: GuardianOutputCipher,
 }
 
 impl GuardianCheckpointCipher {
-    /// Clone the provisioned guardian cipher into a checkpoint-only authority.
+    /// Custody is a separate AEAD domain, never a checkpoint chunk or receipt.
+    pub fn seal_spawn_custody(
+        &self,
+        context: GuardianSpawnCustodyContextV1,
+        secret: &[u8; 32],
+    ) -> Result<[u8; GUARDIAN_SPAWN_CUSTODY_BYTES], GuardianSpawnCustodyError> {
+        let aad = context.authenticated_header()?;
+        if secret == &[0; 32] {
+            return Err(GuardianSpawnCustodyError::InvalidIdentity);
+        }
+        let (nonce, ciphertext) = self
+            .output_cipher
+            .seal_guardian_metadata(secret, &aad)
+            .map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+        let mut bytes = [0; GUARDIAN_SPAWN_CUSTODY_BYTES];
+        bytes[..SPAWN_CUSTODY_HEADER_BYTES].copy_from_slice(&aad);
+        bytes[SPAWN_CUSTODY_HEADER_BYTES..SPAWN_CUSTODY_HEADER_BYTES + 24].copy_from_slice(&nonce);
+        bytes[SPAWN_CUSTODY_HEADER_BYTES + 24..].copy_from_slice(&ciphertext);
+        Ok(bytes)
+    }
+
+    pub fn open_spawn_custody(
+        &self,
+        expected: GuardianSpawnCustodyContextV1,
+        bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES],
+    ) -> Result<Zeroizing<[u8; 32]>, GuardianSpawnCustodyError> {
+        let (context, secret) = self.open_spawn_custody_record(bytes)?;
+        if context != expected {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        Ok(secret)
+    }
+
+    /// Parse only the fixed header, authenticate it, then return its provenance.
+    pub fn open_spawn_custody_record(
+        &self,
+        bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES],
+    ) -> Result<(GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>
+    {
+        let aad = &bytes[..SPAWN_CUSTODY_HEADER_BYTES];
+        let context = GuardianSpawnCustodyContextV1::from_header(aad)?;
+        let nonce = bytes[SPAWN_CUSTODY_HEADER_BYTES..SPAWN_CUSTODY_HEADER_BYTES + 24]
+            .try_into()
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        let plaintext = self
+            .output_cipher
+            .open_guardian_metadata(nonce, &bytes[SPAWN_CUSTODY_HEADER_BYTES + 24..], aad)
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        let mut secret = Zeroizing::new([0; 32]);
+        if plaintext.len() != secret.len() || plaintext.iter().all(|byte| *byte == 0) {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        secret.copy_from_slice(&plaintext);
+        Ok((context, secret))
+    }
+
+    /// Clone the provisioned cipher into typed checkpoint and Spawn-custody authority.
     #[must_use]
     pub fn from_output_cipher(output_cipher: &GuardianOutputCipher) -> Self {
         Self {
@@ -10034,6 +10283,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1::context:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
@@ -10285,6 +10535,12 @@ mod tests {
                 "GuardianCheckpointValidatedManifestAuthorityV1",
                 "pub",
                 false,
+                "fn from_staged_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, canonical_payload: &[u8]) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
                 "fn bind_seal_operation(self, assembly: GuardianCheckpointValidatedStageAssemblyV1) -> Result<GuardianCheckpointManifestSealCapabilitiesV1, GuardianCheckpointCipherError>",
             ),
             expected_authority_method(
@@ -10482,6 +10738,9 @@ mod tests {
 
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
+            "open_spawn_custody_record:pub:u8",
+            "seal_spawn_custody:pub:GuardianSpawnCustodyContextV1,u8",
+            "open_spawn_custody:pub:GuardianSpawnCustodyContextV1,u8",
             "from_output_cipher:pub:GuardianOutputCipher",
             "seal_ack_finalizer_from_catalog:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1,Uuid",
             "inspect_ack_finalizer_from_catalog:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1,Uuid,GuardianEncryptedCheckpointStageRecordV1",
@@ -10516,6 +10775,22 @@ mod tests {
 
         sort_authority_methods(&mut inventory.cipher_method_surfaces);
         let mut expected_cipher_method_surfaces = vec![
+            expected_authority_method(
+                "GuardianCheckpointCipher", "pub", false,
+                "fn open_spawn_custody_record(&self, bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES]) -> Result<(GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_spawn_custody(&self, context: GuardianSpawnCustodyContextV1, secret: &[u8; 32]) -> Result<[u8; GUARDIAN_SPAWN_CUSTODY_BYTES], GuardianSpawnCustodyError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn open_spawn_custody(&self, expected: GuardianSpawnCustodyContextV1, bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES]) -> Result<Zeroizing<[u8; 32]>, GuardianSpawnCustodyError>",
+            ),
             expected_authority_method(
                 "GuardianCheckpointCipher",
                 "pub",
@@ -10897,6 +11172,7 @@ mod tests {
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding:private:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
@@ -10904,6 +11180,7 @@ mod tests {
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::into_reservation_identity:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::reservation_identity:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianGenesisReservationIdentityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianGenesisReservationIdentityV1::from_authenticated_spawn:pub(crate):production",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
@@ -10926,7 +11203,7 @@ mod tests {
             "GuardianCheckpointOrderedChunkSetIdentityV1@GuardianCheckpointOrderedChunkSetBuilderV1::finish",
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit",
-            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly",
@@ -10957,7 +11234,9 @@ mod tests {
                     "use frankenterm_term::{terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID};",
                 ),
                 expected_use("use sha2::{Digest as _, Sha256};"),
-                expected_use("use std::convert::TryFrom;"),
+                // Rust 2018 custody decoding uses TryInto only for fixed-width
+                // header fields and the nonce; it grants no authority constructor.
+                expected_use("use std::convert::{TryFrom, TryInto};"),
                 expected_use("use std::sync::{Arc, Weak};"),
                 expected_use("use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;",),
                 expected_use("use termwiz::escape::{parser::RecoveryGroundBoundary, Action};",),
@@ -11860,6 +12139,87 @@ mod tests {
         )
         .expect("bind exact Genesis capture generation");
         let genesis_upload_id = Uuid::new_v4();
+        let staged_permit = || {
+            GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                spawn_effect_id,
+                &genesis_terminal,
+                genesis_upload_id,
+            )
+        };
+        let (staged_authority, staged_reservation) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                genesis_terminal.canonical_payload(),
+            )
+            .expect("authenticated staged Genesis retains exact reservation");
+        assert_eq!(staged_authority.binding, genesis_binding);
+        assert_eq!(staged_authority.genesis_upload_id, Some(genesis_upload_id));
+        assert_eq!(staged_reservation.upload_id(), genesis_upload_id);
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                b"{}",
+            ),
+            Err(GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)
+        ));
+        let staged_splice = terminal_checkpoint_with(24, 80, "different staged model");
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                staged_splice.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        let mut wrong_pixels = staged_permit();
+        wrong_pixels.identity.pixel_width += 1;
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                wrong_pixels,
+                genesis_terminal.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        for change_width in [true, false] {
+            let mut wrong_pixels = staged_permit();
+            if change_width {
+                wrong_pixels.identity.pixel_width += 1;
+            } else {
+                wrong_pixels.identity.pixel_height += 1;
+            }
+            assert!(
+                matches!(
+                    GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                        &genesis_binding,
+                        wrong_pixels,
+                        &genesis_terminal,
+                    ),
+                    Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+                ),
+                "live Genesis authority must bind both pixel dimensions"
+            );
+        }
+        let nonzero_stream = record_terminal_checkpoint();
+        assert!(nonzero_stream.parser_stream_bytes() > 0);
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                &nonzero_stream,
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisParserWatermark)
+        ));
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &binding,
+                staged_permit(),
+                genesis_terminal.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
+        ));
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,

@@ -23,6 +23,16 @@ use wezterm_term::TerminalSize;
 /// a native scale-change-to-present experiment qualifies a replacement.
 const SCALE_CHANGE_GLYPH_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Put visible work ahead of hidden tabs on the shared mux connection. Keep
+/// every tab's resize and preserve the relative order of the remaining tabs.
+/// A missing active index falls back to the original order.
+fn resize_tab_indices(tab_count: usize, active_index: usize) -> impl Iterator<Item = usize> {
+    let active = (active_index < tab_count).then_some(active_index);
+    active
+        .into_iter()
+        .chain((0..tab_count).filter(move |index| Some(*index) != active))
+}
+
 /// Finite production reasons, shared by cache mutation, overlay hooks and
 /// content-free render traces. Row-keyed causes retain global caches: line
 /// content/sequence, cursor, selection, composition, position and expiration
@@ -736,8 +746,10 @@ impl super::TermWindow {
             self.record_render_invalidation(RenderInvalidationCause::TerminalGrid);
             if let Some(mux) = Mux::try_get() {
                 if let Some(window) = mux.get_window(self.mux_window_id) {
-                    for tab in window.iter() {
-                        tab.resize(size);
+                    for index in resize_tab_indices(window.len(), window.get_active_idx()) {
+                        if let Some(tab) = window.get_by_idx(index) {
+                            tab.resize(size);
+                        }
                     }
                 }
             }
@@ -1016,7 +1028,7 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 mod tests {
     use super::{
         CacheRebuild, RenderCaches, RenderInvalidationCause as Cause, RenderInvalidationSet,
-        clear_generation_keyed_line_shape_cache, next_cache_generation,
+        clear_generation_keyed_line_shape_cache, next_cache_generation, resize_tab_indices,
     };
     use crate::glyphcache::GlyphCache;
     use crate::quad::HeapQuadAllocator;
@@ -1035,6 +1047,34 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{CellAttributes, Line};
     use window::bitmaps::{BitmapImage, Image, TextureRect};
+
+    #[test]
+    fn active_tab_resize_precedes_hidden_tabs_without_changing_ui_order() {
+        let ui_order = ["hidden-a", "hidden-b", "visible", "hidden-c"];
+        let dispatched: Vec<_> = resize_tab_indices(ui_order.len(), 2)
+            .map(|index| ui_order[index])
+            .collect();
+        assert_eq!(dispatched, ["visible", "hidden-a", "hidden-b", "hidden-c"]);
+        assert_eq!(ui_order, ["hidden-a", "hidden-b", "visible", "hidden-c"]);
+    }
+
+    #[test]
+    fn active_tab_resize_visits_every_tab_once_for_all_active_positions() {
+        for count in 0..16 {
+            for active in 0..=count {
+                let dispatched: Vec<_> = resize_tab_indices(count, active).collect();
+                let mut visited = dispatched.clone();
+                visited.sort_unstable();
+                assert_eq!(visited, (0..count).collect::<Vec<_>>());
+                if active < count {
+                    assert_eq!(dispatched[0], active);
+                    assert!(dispatched[1..].windows(2).all(|pair| pair[0] < pair[1]));
+                } else {
+                    assert_eq!(dispatched, (0..count).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
 
     struct CacheFixture {
         shapes: RefCell<LfuCache<ShapeCacheKey, Rc<CachedShape>>>,

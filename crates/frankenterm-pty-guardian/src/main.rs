@@ -37,7 +37,7 @@ enum Command {
     ProvisionToken(TokenArgs),
     /// Stop the guardian only if it currently owns no panes.
     GuardedStop(EndpointArgs),
-    /// Production-disabled same-binary PTY broker process.
+    /// Run the separately supervised same-binary PTY broker process.
     #[command(name = "broker-serve", hide = true)]
     BrokerServe(BrokerServeArgs),
     /// Same-binary child held behind one authenticated durable Spawn barrier.
@@ -90,6 +90,14 @@ struct ServeArgs {
     /// Readiness and child-reap cadence in milliseconds.
     #[arg(long, default_value_t = 25)]
     poll_interval_ms: u64,
+
+    /// Connect Genesis transactions to this separately supervised broker.
+    #[arg(long, requires = "broker_token_path")]
+    broker_socket_path: Option<PathBuf>,
+
+    /// Existing private token for the configured broker endpoint.
+    #[arg(long, requires = "broker_socket_path")]
+    broker_token_path: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -133,7 +141,7 @@ fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Serve(args) => {
-            let config = GuardianServiceConfig::new(
+            let mut config = GuardianServiceConfig::new(
                 args.endpoint.socket_path,
                 args.endpoint.token_path,
                 args.max_connections,
@@ -142,6 +150,11 @@ fn main() -> anyhow::Result<()> {
                 args.max_total_output_bytes,
                 Duration::from_millis(args.poll_interval_ms),
             )?;
+            if let (Some(socket_path), Some(token_path)) =
+                (args.broker_socket_path, args.broker_token_path)
+            {
+                config = config.with_broker_endpoint(socket_path, token_path)?;
+            }
             let mut service = GuardianService::bind(config)?;
             service.run_forever()?;
         }

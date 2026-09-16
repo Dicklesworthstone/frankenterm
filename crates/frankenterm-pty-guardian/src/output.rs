@@ -15,16 +15,18 @@ use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
     GUARDIAN_CHECKPOINT_EXPIRY_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
     GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES, GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
-    GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GuardianCheckpointArtifactDescriptorV1,
-    GuardianCheckpointBoundaryError, GuardianCheckpointCandidateIdentityV1,
-    GuardianCheckpointCatalogAdoptionBindingV1, GuardianCheckpointCatalogAdoptionEvidenceV1,
-    GuardianCheckpointCatalogPredecessorBindingV1, GuardianCheckpointCipher,
-    GuardianCheckpointCipherError, GuardianCheckpointOrderedChunkSetBuilderV1,
+    GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES, GUARDIAN_SPAWN_CUSTODY_BYTES,
+    GuardianCheckpointArtifactDescriptorV1, GuardianCheckpointBoundaryError,
+    GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCatalogAdoptionBindingV1,
+    GuardianCheckpointCatalogAdoptionEvidenceV1, GuardianCheckpointCatalogPredecessorBindingV1,
+    GuardianCheckpointCipher, GuardianCheckpointCipherError,
+    GuardianCheckpointGenesisSpawnPermitV1, GuardianCheckpointOrderedChunkSetBuilderV1,
     GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointStageBindingV1,
     GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
     GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
     GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
-    GuardianGenesisReservationIdentityV1, current_replay_identity_digest,
+    GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1, GuardianSpawnCustodyError,
+    GuardianSpawnCustodyScopeV1, current_replay_identity_digest,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -36,7 +38,7 @@ use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
     GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalReader,
     GuardianOutputJournalTail, GuardianOutputKey, GuardianOutputPredecessor,
-    GuardianOutputSegmentIdentity,
+    GuardianOutputRecoveryBookmark, GuardianOutputRecoveryCursor, GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
@@ -270,6 +272,8 @@ impl GuardianOutputError {
 
 #[derive(Debug, Error)]
 pub enum GuardianCheckpointStageStoreError {
+    #[error(transparent)]
+    SpawnCustody(#[from] GuardianSpawnCustodyError),
     #[error("guardian checkpoint staging request is invalid")]
     Protocol(#[from] GuardianProtocolError),
     #[error("guardian checkpoint staging cipher rejected the record")]
@@ -506,6 +510,29 @@ struct GuardianCheckpointStageStoreInner {
     gate: Mutex<()>,
     durable_records: Mutex<Vec<FileIdentity>>,
     replay: Mutex<GuardianReplayState>,
+    #[cfg(test)]
+    custody_sync_failure: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    custody_publication_cut: std::sync::atomic::AtomicU8,
+}
+
+/// An encrypted, synchronized, read-back capability. There is no raw constructor.
+/// A lost ACK reply is retried by reopening the same custody record.
+pub struct GuardianDurableSpawnCustodyV1 {
+    store: GuardianCheckpointStageStore,
+    context: GuardianSpawnCustodyContextV1,
+}
+
+impl GuardianDurableSpawnCustodyV1 {
+    pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
+        self.context
+    }
+
+    pub(crate) fn into_secret(
+        self,
+    ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
+        self.store.read_spawn_custody(&self.context)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -639,6 +666,18 @@ struct CheckpointCatalogGenesisReservationBinding {
     checkpoint_identity_digest: [u8; 32],
     boundary_identity_digest: [u8; 32],
     upload_id: Uuid,
+}
+
+/// Read authority connecting one published initial model to the freshly
+/// prepared output journal of that exact child. Cloning permits independent
+/// immutable replay snapshots; it never grants Spawn or mutation authority.
+#[derive(Clone)]
+pub struct GuardianGenesisReplayOriginV1 {
+    reservation: CheckpointCatalogGenesisReservationBinding,
+    catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    guardian_incarnation: Uuid,
+    initial_segment: GuardianOutputSegmentIdentity,
+    persistence: Arc<PersistentOutputAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -820,6 +859,7 @@ struct GuardianReplaySnapshot {
 }
 
 struct GuardianReplayCatalogPin {
+    genesis_origin: Option<GuardianGenesisReplayOriginV1>,
     selected: PublishedCheckpointCatalogMember,
     settled_head_identity: CheckpointCatalogIdentity,
     settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
@@ -832,7 +872,6 @@ struct GuardianReplayCatalogPin {
 struct GuardianReplayOutputPin {
     directory: File,
     directory_path: PathBuf,
-    cipher: GuardianOutputCipher,
     policy: OutputSegmentPolicy,
     manifest: OutputManifestSnapshot,
     manifest_path: PathBuf,
@@ -845,12 +884,85 @@ struct GuardianReplayOutputPin {
     cumulative_plaintext_bytes: u64,
 }
 
-#[derive(Clone)]
 struct GuardianReplayOutputSegmentPin {
     authority: SegmentPathAuthority,
+    reader: GuardianOutputJournalReader,
+    // At most the preceding page boundary and the following boundary. These
+    // retain authenticated cursor state, never delivered plaintext.
+    bookmarks: Mutex<VecDeque<GuardianOutputRecoveryBookmark>>,
     committed_bytes: u64,
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
     was_current: bool,
+    #[cfg(test)]
+    read_work: Mutex<GuardianReplayReadWork>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct GuardianReplayReadWork {
+    historical_frames: u64,
+    interval_frames: u64,
+    terminal_frames: u64,
+}
+
+impl GuardianReplayOutputSegmentPin {
+    fn cursor_at(
+        &self,
+        sequence: u64,
+        max_record_bytes: u32,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianCheckpointStageStoreError> {
+        let bookmarks = self
+            .bookmarks
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        let cached = bookmarks
+            .iter()
+            .filter(|cursor| cursor.next_sequence().is_some_and(|next| next <= sequence))
+            .max_by_key(|cursor| cursor.next_sequence());
+        let mut cursor = match cached {
+            Some(bookmark) => self.reader.cursor_from_bookmark(bookmark)?,
+            None => self.reader.frozen_replay_cursor(
+                self.authority.segment_identity.first_sequence(),
+                max_record_bytes,
+            )?,
+        };
+        drop(bookmarks);
+        while cursor.next_sequence().is_some_and(|next| next < sequence) {
+            if cursor.next_record()?.is_none() {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            #[cfg(test)]
+            {
+                self.read_work.lock().unwrap().historical_frames += 1;
+            }
+        }
+        if cursor.next_sequence() != Some(sequence) {
+            return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+        }
+        Ok(cursor)
+    }
+
+    fn remember_position(
+        &self,
+        cursor: &GuardianOutputRecoveryCursor,
+    ) -> Result<(), GuardianCheckpointStageStoreError> {
+        let saved = cursor.bookmark()?;
+        let mut bookmarks = self
+            .bookmarks
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        if bookmarks
+            .iter()
+            .any(|bookmark| bookmark.next_sequence() == saved.next_sequence())
+        {
+            return Ok(());
+        }
+        if bookmarks.len() == 2 {
+            bookmarks.pop_front();
+        }
+        bookmarks.push_back(saved);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1345,6 +1457,72 @@ struct PaneJournalAuthority {
 }
 
 impl PaneJournalAuthority {
+    fn append_broker_delivery(
+        &mut self,
+        token: &crate::broker::BrokerOutputDeliveryTokenV1,
+        payload: &[u8],
+    ) -> Result<GuardianOutputAppendReceipt, OutputCommitError> {
+        self.validate_path_authority()?;
+        if self.failed
+            || self.manifest.snapshot.durable_pane_id != token.pane_id()
+            || self.manifest.snapshot.guardian_incarnation != token.guardian_incarnation()
+            || !token.matches_payload(payload)
+        {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        let (start, end) = token.range();
+        let current = self.current_journal.cumulative_plaintext_bytes();
+        if current == start {
+            return self.append_and_sync(payload);
+        }
+        // A lost completion/ACK may replay an already committed delivery.
+        // Reauthenticate its exact terminal record instead of appending twice.
+        let receipt = self
+            .current_journal
+            .terminal_receipt()
+            .filter(|receipt| {
+                current == end
+                    && receipt.cumulative_plaintext_bytes() == end
+                    && usize::try_from(receipt.payload_bytes()).ok() == Some(payload.len())
+            })
+            .ok_or(OutputCommitError::PersistenceAuthority)?;
+        self.verify_broker_receipt(token, receipt)?;
+        Ok(receipt)
+    }
+
+    fn verify_broker_receipt(
+        &self,
+        token: &crate::broker::BrokerOutputDeliveryTokenV1,
+        receipt: GuardianOutputAppendReceipt,
+    ) -> Result<(), OutputCommitError> {
+        self.validate_path_authority()?;
+        if self.failed
+            || self.current_journal.is_poisoned()
+            || self.current_journal.tail() != GuardianOutputJournalTail::Clean
+            || self.current_journal.directory_entry_sync_required()
+            || !self.receipt_is_current(receipt)
+            || self.manifest.snapshot.durable_pane_id != token.pane_id()
+            || self.manifest.snapshot.guardian_incarnation != token.guardian_incarnation()
+            || receipt.cumulative_plaintext_bytes() != token.range().1
+        {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        let record = self.current_journal.verify_terminal_record(
+            receipt,
+            u32::try_from(OUTPUT_RECORD_BYTES).map_err(|_| OutputCommitError::Capacity)?,
+        )?;
+        let mut persisted = Zeroizing::new(Vec::new());
+        record.into_authenticated_delivery()?.write_all_bounded(
+            &mut *persisted,
+            u32::try_from(OUTPUT_RECORD_BYTES).map_err(|_| OutputCommitError::Capacity)?,
+        )?;
+        if !token.matches_payload(&persisted) {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        self.validate_path_authority()?;
+        Ok(())
+    }
+
     fn append_and_sync(
         &mut self,
         payload: &[u8],
@@ -1671,6 +1849,18 @@ pub struct GuardianPaneOutputJournal {
 }
 
 impl GuardianPaneOutputJournal {
+    #[cfg(test)]
+    pub(crate) fn current_segment_path_for_test(&self) -> std::path::PathBuf {
+        self.authority
+            .lock()
+            .unwrap()
+            .segments
+            .last()
+            .unwrap()
+            .path
+            .clone()
+    }
+
     pub(crate) fn receipt_is_current(&self, receipt: GuardianOutputAppendReceipt) -> bool {
         self.authority
             .lock()
@@ -1833,6 +2023,116 @@ impl GuardianPaneOutputJournal {
 
 #[allow(dead_code)]
 impl GuardianCheckpointStageStore {
+    #[cfg(test)]
+    pub(crate) fn fail_spawn_custody_sync_for_test(&self, stage: u8) {
+        self.inner
+            .custody_sync_failure
+            .store(stage, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_spawn_custody_publication_for_test(&self, cut: u8) {
+        self.inner
+            .custody_publication_cut
+            .store(cut, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn persist_spawn_custody(
+        &self,
+        context: &GuardianSpawnCustodyContextV1,
+        secret: &[u8; 32],
+    ) -> Result<GuardianDurableSpawnCustodyV1, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            let path = spawn_custody_path(inner, context);
+            match read_spawn_custody_locked(inner, context) {
+                Ok(recovered) => {
+                    return if recovered.as_slice() == secret {
+                        Ok(())
+                    } else {
+                        Err(GuardianCheckpointStageStoreError::Conflict)
+                    };
+                }
+                Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                    source,
+                    ..
+                })) if source.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let names = read_directory_names(&inner.directory)?;
+            let count = names
+                .iter()
+                .filter(|name| name.as_bytes().starts_with(b"spawn-custody-v1-"))
+                .count();
+            if count >= inner.policy.max_stage_files {
+                return Err(GuardianCheckpointStageStoreError::Capacity);
+            }
+            let bytes = inner.cipher.seal_spawn_custody(*context, secret)?;
+            // A fresh nonce cannot reproduce an interrupted ciphertext prefix.
+            // Keep each interrupted staging file and retry in a new bounded slot.
+            let mut attempt = [0; 16];
+            getrandom::fill(&mut attempt).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+            let staging_name = format!(
+                "spawn-custody-v1-{}-{}.pending-{}",
+                context.pane_id,
+                context.effect_id,
+                Uuid::from_bytes(attempt)
+            );
+            if staging_name.len() > inner.name_max {
+                return Err(GuardianCheckpointStageStoreError::NameLimit);
+            }
+            let staging_path = inner.directory_path.join(staging_name);
+            checkpoint_catalog_publish_file_with_staging(
+                inner,
+                &path,
+                &bytes,
+                "spawn-custody-write",
+                "spawn-custody-stage-sync",
+                &staging_path,
+            )?;
+            let recovered = read_spawn_custody_locked(inner, context)?;
+            if recovered.as_slice() != secret {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok(())
+        })?;
+        Ok(GuardianDurableSpawnCustodyV1 {
+            store: self.clone(),
+            context: *context,
+        })
+    }
+
+    pub(crate) fn reopen_spawn_custody(
+        &self,
+        expected: &GuardianSpawnCustodyContextV1,
+    ) -> Result<GuardianDurableSpawnCustodyV1, GuardianCheckpointStageStoreError> {
+        drop(self.read_spawn_custody(expected)?);
+        Ok(GuardianDurableSpawnCustodyV1 {
+            store: self.clone(),
+            context: *expected,
+        })
+    }
+
+    pub(crate) fn lookup_spawn_custody(
+        &self,
+        trusted_scope: GuardianSpawnCustodyScopeV1,
+    ) -> Result<GuardianDurableSpawnCustodyV1, GuardianCheckpointStageStoreError> {
+        let (context, secret) = self.with_exclusive_directory(|inner| {
+            read_spawn_custody_scope_locked(inner, trusted_scope)
+        })?;
+        drop(secret);
+        Ok(GuardianDurableSpawnCustodyV1 {
+            store: self.clone(),
+            context,
+        })
+    }
+
+    fn read_spawn_custody(
+        &self,
+        expected: &GuardianSpawnCustodyContextV1,
+    ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
+    }
+
     fn open(
         directory: &File,
         directory_path: &Path,
@@ -1867,6 +2167,10 @@ impl GuardianCheckpointStageStore {
                 gate: Mutex::new(()),
                 durable_records: Mutex::new(Vec::new()),
                 replay: Mutex::new(GuardianReplayState::new()),
+                #[cfg(test)]
+                custody_sync_failure: std::sync::atomic::AtomicU8::new(0),
+                #[cfg(test)]
+                custody_publication_cut: std::sync::atomic::AtomicU8::new(0),
             }),
         })
     }
@@ -2196,8 +2500,8 @@ impl GuardianCheckpointStageStore {
             )?
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if !inspection.seal_present
-                || inspection.next_index != shape.total_chunks
-                || inspection.committed_bytes != shape.total_bytes
+                || (inspection.next_index, inspection.committed_bytes)
+                    != (shape.total_chunks, shape.total_bytes)
             {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
@@ -2723,6 +3027,65 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// Seal the exact authenticated upload before granting broker admission.
+    /// The Spawn permit is consumed once; stored bytes never become a live
+    /// parser witness. Each durable transition revalidates the upload under
+    /// the store lock, including the final catalog rescan.
+    pub(crate) fn publish_staged_genesis(
+        &self,
+        begin: &GuardianCheckpointStageRequestV1,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+    ) -> Result<GuardianPublishedGenesisAdmissionPermitV1, GuardianCheckpointStageStoreError> {
+        if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let shape = CheckpointStageRequestShape::from_request(begin)?;
+        if !matches!(shape.path_scope, CheckpointStagePathScope::Genesis { .. }) {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        if permit.reservation_identity().upload_id() != shape.upload_id {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let payload = self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            let all_chunks_present = inspection.next_index == shape.total_chunks;
+            let all_bytes_present = inspection.committed_bytes == shape.total_bytes;
+            if inspection.ack_present
+                || inspection.expiry_present
+                || !all_chunks_present
+                || !all_bytes_present
+            {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)
+        })?;
+        let (manifest_authority, reservation) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &shape.binding,
+                permit,
+                payload.as_slice(),
+            )?;
+        drop(payload);
+        let seal = GuardianCheckpointStageRequestV1::seal(
+            shape.scope,
+            shape.upload_id,
+            shape.descriptor,
+            shape.chunk_bytes,
+        )?;
+        self.apply_seal(
+            seal,
+            GuardianCheckpointOriginAuthority::Genesis { manifest_authority },
+        )?;
+        self.publish_genesis_catalog_admission(reservation)
+    }
+
     /// Consume the exact reservation continuation produced when the nonclone
     /// Spawn permit was split into Genesis-seal authority, publish its already
     /// sealed upload, and return PTY-admission authority only after a candidate
@@ -2804,14 +3167,119 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// Bind publication to a real, still-empty journal before broker Spawn.
+    /// Neither raw pane/effect identifiers nor an arbitrary checkpoint can
+    /// establish this origin. The output chain is revalidated on every replay.
+    pub(crate) fn prepare_genesis_replay_origin(
+        &self,
+        admission: &GuardianPublishedGenesisAdmissionPermitV1,
+        journal: &GuardianPaneOutputJournal,
+    ) -> Result<GuardianGenesisReplayOriginV1, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            let reservation =
+                CheckpointCatalogGenesisReservationBinding::from(&admission.reservation_identity);
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::Genesis {
+                    spawn_effect_id: reservation.spawn_effect_id,
+                },
+            )?;
+            checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+            let [member] = scan.published.as_slice() else {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            };
+            if member.format != CheckpointCatalogFormat::ProtectedV3
+                || member.candidate_checksum != admission.catalog_candidate_checksum
+                || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                    &member.metadata,
+                    reservation,
+                )
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            let authority = journal
+                .authority
+                .lock()
+                .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+            authority
+                .validate_path_authority()
+                .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+            let [segment] = authority.segments.as_slice() else {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            };
+            if authority.failed
+                || authority.persistence.directory_identity != inner.persistence.directory_identity
+                || authority.persistence.key_identity != inner.persistence.key_identity
+                || authority.current_journal.is_poisoned()
+                || authority.current_journal.tail() != GuardianOutputJournalTail::Clean
+                || authority.current_journal.directory_entry_sync_required()
+                || authority.current_journal.record_count() != 0
+                || authority.current_journal.cumulative_plaintext_bytes() != 0
+                || authority.current_journal.terminal_receipt().is_some()
+                || authority.current_journal.identity() != segment.segment_identity
+                || authority.manifest.snapshot.durable_pane_id != reservation.durable_pane_id
+                || authority.manifest.snapshot.predecessor.is_some()
+                || authority.manifest.snapshot.segments.as_slice() != [segment.segment_identity]
+                || segment.segment_identity.durable_pane_id() != reservation.durable_pane_id
+                || segment.segment_identity.first_sequence() != 1
+                || segment.segment_identity.predecessor().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            validate_replayable_segment_chain(
+                &authority.directory,
+                &authority.directory_path,
+                &authority.segments,
+                &authority.cipher,
+                authority.policy,
+            )?;
+            let file = open_private_file_read_only_at_identity(
+                &authority.directory,
+                &authority.directory_path,
+                &segment.path,
+                segment.file_identity,
+            )?;
+            let initial = GuardianOutputJournalReader::open_existing(
+                file,
+                segment.segment_identity,
+                authority.cipher.clone(),
+                authority.policy.journal_limits,
+            )?;
+            if initial.tail() != GuardianOutputJournalTail::Clean
+                || initial.record_count() != 0
+                || initial.terminal_receipt().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            Ok(GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: admission.catalog_candidate_checksum,
+                guardian_incarnation: authority.manifest.snapshot.guardian_incarnation,
+                initial_segment: segment.segment_identity,
+                persistence: Arc::clone(&authority.persistence),
+            })
+        })
+    }
+
     /// Open or continue one immutable, process-local replay snapshot.
     /// Plaintext is never retained in the ledger: an exact retry reopens and
     /// reauthenticates the pinned encrypted artifacts into a fresh delivery.
+    #[cfg(test)]
     pub(crate) fn apply_replay(
         &self,
         request: &AuthenticatedGuardianRequest,
         replay: GuardianReplayRequestV1,
         journal: Option<&GuardianPaneOutputJournal>,
+    ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
+        self.apply_replay_with_genesis(request, replay, journal, None)
+    }
+
+    pub(crate) fn apply_replay_with_genesis(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+        replay: GuardianReplayRequestV1,
+        journal: Option<&GuardianPaneOutputJournal>,
+        genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
     ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
         let fingerprint = guardian_replay_request_fingerprint(request, replay)?;
         let request_id = request.header().request_id;
@@ -2854,6 +3322,7 @@ impl GuardianCheckpointStageStore {
                         max_plaintext_bytes,
                         max_records,
                         journal,
+                        genesis_origin,
                         access_epoch,
                     )
                 })?;
@@ -3448,6 +3917,7 @@ fn guardian_replay_open_snapshot(
     max_plaintext_bytes: u32,
     max_records: u16,
     journal: Option<&GuardianPaneOutputJournal>,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
     access_epoch: u64,
 ) -> Result<GuardianReplaySnapshot, GuardianCheckpointStageStoreError> {
     let pane_id = request
@@ -3455,7 +3925,7 @@ fn guardian_replay_open_snapshot(
         .pane_id
         .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
     let generation = request.header().lease_generation;
-    let scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+    let mut scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
     checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
     checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
     let has_evidence = |member: &PublishedCheckpointCatalogMember| {
@@ -3484,14 +3954,62 @@ fn guardian_replay_open_snapshot(
                 has_evidence(member) && member.metadata.checkpoint_id == checkpoint_id.into_bytes()
             })
         }
-    }
-    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    };
+    let mut selected_genesis_origin = None;
+    let selected_index = if let Some(index) = selected_index {
+        index
+    } else {
+        let origin = genesis_origin
+            .filter(|origin| origin.reservation.durable_pane_id == pane_id)
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+        if origin.guardian_incarnation != request.header().guardian_incarnation
+            || origin.persistence.directory_identity != inner.persistence.directory_identity
+            || origin.persistence.key_identity != inner.persistence.key_identity
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        scan = checkpoint_catalog_scan(
+            inner,
+            CheckpointCatalogScope::Genesis {
+                spawn_effect_id: origin.reservation.spawn_effect_id,
+            },
+        )?;
+        checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+        let [member] = scan.published.as_slice() else {
+            return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+        };
+        if member.format != CheckpointCatalogFormat::ProtectedV3
+            || member.candidate_checksum != origin.catalog_candidate_checksum
+            || member.metadata.capture_generation > generation
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &member.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        let matches_selector = match selector {
+            GuardianReplaySelectorV1::LatestCompatible => {
+                member.metadata.replay_semantics_id == current_replay_identity_digest()
+            }
+            GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id }
+            | GuardianReplaySelectorV1::Resume { checkpoint_id, .. } => {
+                member.metadata.checkpoint_id == checkpoint_id.into_bytes()
+            }
+        };
+        if !matches_selector {
+            return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+        }
+        selected_genesis_origin = Some(origin.clone());
+        0
+    };
     let selected = scan.published[selected_index].clone();
     let head = scan
         .published
         .last()
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
     let catalog = GuardianReplayCatalogPin {
+        genesis_origin: selected_genesis_origin,
         selected,
         settled_head_identity: head.metadata.identity,
         settled_head_candidate_checksum: head.candidate_checksum,
@@ -3500,18 +4018,28 @@ fn guardian_replay_open_snapshot(
         settled_head_marker_path: head.marker_path.clone(),
         settled_head_marker_file_identity: head.marker_file_identity,
     };
-    let descriptor = guardian_replay_open_catalog_descriptor(inner, &catalog.selected)?;
-    if descriptor.durable_pane_id() != Some(pane_id) || descriptor.capture_generation() > generation
+    let descriptor = guardian_replay_open_catalog_descriptor(
+        inner,
+        &catalog.selected,
+        catalog.genesis_origin.as_ref(),
+    )?;
+    if (catalog.genesis_origin.is_none() && descriptor.durable_pane_id() != Some(pane_id))
+        || descriptor.capture_generation() > generation
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let (suffix_first_sequence, suffix_previous_record_digest) = descriptor
         .suffix_start()
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    if catalog.genesis_origin.is_some() && journal.is_none() {
+        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+    }
     let output = journal
         .map(|journal| {
-            journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
-            guardian_replay_capture_output(journal, descriptor)
+            if catalog.genesis_origin.is_none() {
+                journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
+            }
+            guardian_replay_capture_output(journal, descriptor, catalog.genesis_origin.as_ref())
         })
         .transpose()?;
     let (initial_phase, initial_next_sequence, initial_previous_record_digest) = match selector {
@@ -3577,12 +4105,14 @@ fn guardian_replay_open_snapshot(
 fn guardian_replay_open_catalog_descriptor(
     inner: &GuardianCheckpointStageStoreInner,
     member: &PublishedCheckpointCatalogMember,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
 ) -> Result<GuardianCheckpointDescriptorV1, GuardianCheckpointStageStoreError> {
     if member.format != CheckpointCatalogFormat::ProtectedV3
-        || !matches!(
-            member.metadata.identity.scope,
-            CheckpointCatalogScope::Pane { .. }
-        )
+        || (genesis_origin.is_none()
+            && !matches!(
+                member.metadata.identity.scope,
+                CheckpointCatalogScope::Pane { .. }
+            ))
     {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
@@ -3600,7 +4130,18 @@ fn guardian_replay_open_catalog_descriptor(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
-    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &candidate)?;
+    if let Some(origin) = genesis_origin {
+        if candidate.checksum != origin.catalog_candidate_checksum
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &candidate.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+    } else {
+        let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &candidate)?;
+    }
     let begin_record = candidate
         .records
         .first()
@@ -3624,6 +4165,7 @@ fn guardian_replay_open_catalog_descriptor(
 fn guardian_replay_capture_output(
     journal: &GuardianPaneOutputJournal,
     descriptor: GuardianCheckpointDescriptorV1,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
 ) -> Result<GuardianReplayOutputPin, GuardianCheckpointStageStoreError> {
     let authority = journal
         .authority
@@ -3632,17 +4174,15 @@ fn guardian_replay_capture_output(
     authority
         .validate_path_authority()
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-    validate_replayable_segment_chain(
-        &authority.directory,
-        &authority.directory_path,
-        &authority.segments,
-        &authority.cipher,
-        authority.policy,
-    )?;
+    if authority.segments.is_empty() || authority.segments.len() > authority.policy.max_segments {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     let mut segments = Vec::new();
     segments
         .try_reserve_exact(authority.segments.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut previous_terminal = None;
+    let mut total_committed_bytes = 0_u64;
     for (index, segment) in authority.segments.iter().enumerate() {
         let file = open_private_file_read_only_at_identity(
             &authority.directory,
@@ -3650,6 +4190,10 @@ fn guardian_replay_capture_output(
             &segment.path,
             segment.file_identity,
         )?;
+        let metadata = file.metadata().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("replay-capture-metadata", error)
+        })?;
+        let frozen_identity = FileIdentity::capture(&metadata, Some(metadata.len()));
         let opened = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
@@ -3659,37 +4203,97 @@ fn guardian_replay_capture_output(
         if opened.tail() != GuardianOutputJournalTail::Clean {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
+        validate_file_identity_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            frozen_identity,
+        )?;
+        if segment.segment_identity.predecessor() != previous_terminal {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        previous_terminal = opened.terminal_predecessor();
+        if index + 1 != authority.segments.len() && previous_terminal.is_none() {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        total_committed_bytes = total_committed_bytes
+            .checked_add(opened.committed_bytes())
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if total_committed_bytes > authority.policy.max_durable_pane_bytes {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        let mut bookmarks = VecDeque::new();
+        bookmarks
+            .try_reserve_exact(2)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
         segments.push(GuardianReplayOutputSegmentPin {
             authority: segment.clone(),
             committed_bytes: opened.committed_bytes(),
             terminal_receipt: opened.terminal_receipt(),
             was_current: index + 1 == authority.segments.len(),
+            reader: opened,
+            bookmarks: Mutex::new(bookmarks),
+            #[cfg(test)]
+            read_work: Mutex::new(GuardianReplayReadWork::default()),
         });
     }
     let terminal = segments
         .iter()
         .rev()
-        .find_map(|segment| segment.terminal_receipt)
-        .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
-    let GuardianCheckpointOutputBoundaryV1::Record {
-        sequence,
-        record_digest,
-        ..
-    } = descriptor.output_boundary()
-    else {
-        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
-    };
-    if terminal.sequence() < sequence
-        || (terminal.sequence() == sequence && terminal.record_digest() != record_digest)
-    {
-        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        .find_map(|segment| segment.terminal_receipt);
+    match descriptor.output_boundary() {
+        GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            ..
+        } => {
+            let terminal =
+                terminal.ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            if genesis_origin.is_some()
+                || terminal.sequence() < sequence
+                || (terminal.sequence() == sequence && terminal.record_digest() != record_digest)
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+        }
+        GuardianCheckpointOutputBoundaryV1::Genesis {
+            spawn_effect_id,
+            parser_stream_bytes,
+        } => {
+            let origin =
+                genesis_origin.ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            if parser_stream_bytes != 0
+                || spawn_effect_id != origin.reservation.spawn_effect_id
+                || descriptor.checkpoint_id().into_bytes()
+                    != origin.reservation.checkpoint_identity_digest
+                || descriptor.boundary_id().into_bytes()
+                    != origin.reservation.boundary_identity_digest
+                || authority.failed
+                || authority.persistence.directory_identity != origin.persistence.directory_identity
+                || authority.persistence.key_identity != origin.persistence.key_identity
+                || authority.current_journal.is_poisoned()
+                || authority.current_journal.directory_entry_sync_required()
+                || authority.current_journal.tail() != GuardianOutputJournalTail::Clean
+                || authority.manifest.snapshot.guardian_incarnation != origin.guardian_incarnation
+                || authority.manifest.snapshot.durable_pane_id != origin.reservation.durable_pane_id
+                || authority.manifest.snapshot.segments.first() != Some(&origin.initial_segment)
+                || authority
+                    .segments
+                    .first()
+                    .map(|segment| segment.segment_identity)
+                    != Some(origin.initial_segment)
+                || origin.initial_segment.first_sequence() != 1
+                || origin.initial_segment.predecessor().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+        }
     }
     Ok(GuardianReplayOutputPin {
         directory: authority.directory.try_clone().map_err(|error| {
             GuardianCheckpointStageStoreError::io("replay-output-directory-clone", error)
         })?,
         directory_path: authority.directory_path.clone(),
-        cipher: authority.cipher.clone(),
         policy: authority.policy,
         manifest: authority.manifest.snapshot.clone(),
         manifest_path: authority.manifest.path.clone(),
@@ -3697,9 +4301,10 @@ fn guardian_replay_capture_output(
         publication_path: authority.manifest.publication_path.clone(),
         publication_file_identity: authority.manifest.publication_file_identity,
         segments,
-        terminal_sequence: terminal.sequence(),
-        terminal_record_digest: terminal.record_digest(),
-        cumulative_plaintext_bytes: terminal.cumulative_plaintext_bytes(),
+        terminal_sequence: terminal.map_or(0, |receipt| receipt.sequence()),
+        terminal_record_digest: terminal.map_or([0; 32], |receipt| receipt.record_digest()),
+        cumulative_plaintext_bytes: terminal
+            .map_or(0, |receipt| receipt.cumulative_plaintext_bytes()),
     })
 }
 
@@ -3773,40 +4378,26 @@ fn guardian_replay_validate_output_pin(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     for segment in &output.segments {
-        let file = open_private_file_read_only_at_identity(
+        validate_file_identity_at(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
             segment.authority.file_identity,
         )?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.authority.segment_identity,
-            output.cipher.clone(),
-            output.policy.journal_limits,
+        // Cold capture authenticated the whole prefix. Each page rechecks its
+        // header and frozen terminal frame, then authenticates every delivered
+        // interval below. Historical bytes outside that interval are not scrubbed.
+        segment.reader.validate_frozen_prefix(segment.was_current)?;
+        #[cfg(test)]
+        if segment.terminal_receipt.is_some() {
+            segment.read_work.lock().unwrap().terminal_frames += 1;
+        }
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
         )?;
-        if journal.tail() != GuardianOutputJournalTail::Clean
-            || journal.committed_bytes() < segment.committed_bytes
-            || (!segment.was_current && journal.committed_bytes() != segment.committed_bytes)
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        match segment.terminal_receipt {
-            Some(expected) => {
-                let mut cursor = journal.recovery_cursor(
-                    expected.sequence(),
-                    output.policy.journal_limits.max_record_bytes,
-                )?;
-                let recovered = cursor
-                    .next_record()?
-                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-                if recovered.receipt() != expected {
-                    return Err(GuardianCheckpointStageStoreError::Poisoned);
-                }
-            }
-            None if segment.committed_bytes == OUTPUT_V3_FILE_HEADER_BYTES => {}
-            None => return Err(GuardianCheckpointStageStoreError::Poisoned),
-        }
     }
     Ok(())
 }
@@ -3828,23 +4419,35 @@ fn guardian_replay_recover_receipt(
             first <= sequence && sequence <= last
         })
         .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
-    let file = open_private_file_read_only_at_identity(
-        &output.directory,
-        &output.directory_path,
-        &segment.authority.path,
-        segment.authority.file_identity,
-    )?;
-    let journal = GuardianOutputJournalReader::open_existing(
-        file,
-        segment.authority.segment_identity,
-        output.cipher.clone(),
-        output.policy.journal_limits,
-    )?;
-    let mut cursor =
-        journal.recovery_cursor(sequence, output.policy.journal_limits.max_record_bytes)?;
+    let bookmark = segment
+        .bookmarks
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?
+        .iter()
+        .find(|bookmark| bookmark.next_sequence() == sequence.checked_add(1))
+        .copied();
+    if let Some(bookmark) = bookmark {
+        let receipt = segment
+            .reader
+            .receipt_before_bookmark(&bookmark)?
+            .filter(|receipt| receipt.sequence() == sequence)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
+        )?;
+        return Ok(receipt);
+    }
+    let mut cursor = segment.cursor_at(sequence, output.policy.journal_limits.max_record_bytes)?;
     let recovered = cursor
         .next_record()?
         .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+    #[cfg(test)]
+    {
+        segment.read_work.lock().unwrap().historical_frames += 1;
+    }
     if recovered.receipt().sequence() != sequence
         || segment
             .terminal_receipt
@@ -3852,6 +4455,13 @@ fn guardian_replay_recover_receipt(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
+    validate_file_identity_at(
+        &output.directory,
+        &output.directory_path,
+        &segment.authority.path,
+        segment.authority.file_identity,
+    )?;
+    segment.remember_position(&cursor)?;
     Ok(recovered.receipt())
 }
 
@@ -3974,7 +4584,19 @@ fn guardian_replay_validate_catalog_pin(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
+    if let Some(origin) = pin.genesis_origin.as_ref() {
+        if selected.checksum != origin.catalog_candidate_checksum
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &selected.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        checkpoint_catalog_validate_candidate_records(inner, &selected)?;
+    } else {
+        let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
+    }
 
     let head_bytes = checkpoint_catalog_read_file(
         inner,
@@ -4003,6 +4625,7 @@ fn guardian_replay_validate_catalog_pin(
 fn guardian_replay_checkpoint_chunk(
     inner: &GuardianCheckpointStageStoreInner,
     snapshot: &GuardianReplaySnapshot,
+    candidate: &CheckpointCatalogCandidate,
     offset: u64,
 ) -> Result<GuardianCheckpointChunkDelivery, GuardianCheckpointStageStoreError> {
     let total_bytes = snapshot.descriptor.total_bytes();
@@ -4015,7 +4638,6 @@ fn guardian_replay_checkpoint_chunk(
         .min(u64::from(snapshot.max_plaintext_bytes));
     let requested_bytes_usize = usize::try_from(requested_bytes)
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
-    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
     let begin_record = candidate
         .records
         .first()
@@ -4146,24 +4768,18 @@ fn guardian_replay_output_page(
         if next_sequence > segment_terminal.sequence() || next_sequence < segment_first {
             continue;
         }
-        let file = open_private_file_read_only_at_identity(
-            &output.directory,
-            &output.directory_path,
-            &segment.authority.path,
-            segment.authority.file_identity,
-        )?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.authority.segment_identity,
-            output.cipher.clone(),
-            output.policy.journal_limits,
-        )?;
-        let mut cursor = journal
-            .recovery_cursor(next_sequence, output.policy.journal_limits.max_record_bytes)?;
+        let mut cursor =
+            segment.cursor_at(next_sequence, output.policy.journal_limits.max_record_bytes)?;
+        segment.remember_position(&cursor)?;
         while deliveries.len() < usize::from(max_records) {
+            let before_record = cursor.bookmark()?;
             let Some(recovered) = cursor.next_record()? else {
                 break;
             };
+            #[cfg(test)]
+            {
+                segment.read_work.lock().unwrap().interval_frames += 1;
+            }
             let receipt = recovered.receipt();
             if receipt.sequence() > segment_terminal.sequence() {
                 break;
@@ -4178,6 +4794,7 @@ fn guardian_replay_output_page(
                 if deliveries.is_empty() {
                     return Err(GuardianCheckpointStageStoreError::Capacity);
                 }
+                cursor = segment.reader.cursor_from_bookmark(&before_record)?;
                 break;
             }
             let predecessor = segment
@@ -4218,6 +4835,13 @@ fn guardian_replay_output_page(
                 break;
             }
         }
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
+        )?;
+        segment.remember_position(&cursor)?;
         if deliveries.len() >= usize::from(max_records)
             || plaintext_bytes >= max_plaintext_bytes
             || terminal_receipt.is_some_and(|receipt| {
@@ -4245,7 +4869,7 @@ fn guardian_replay_build_page(
     incoming_cursor: Option<GuardianReplayCursorV1>,
 ) -> Result<(GuardianReplayPageDelivery, GuardianReplayIssuedPage), GuardianCheckpointStageStoreError>
 {
-    let _candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
+    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
     let (
         phase,
         page_index,
@@ -4290,7 +4914,11 @@ fn guardian_replay_build_page(
             {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
             }
-            let chunk = guardian_replay_checkpoint_chunk(inner, snapshot, checkpoint_offset)?;
+            // Consume this page's already-authenticated catalog bytes. Reopening
+            // and authenticating the entire candidate again here repeats the
+            // same full-checkpoint work without adding an authority boundary.
+            let chunk =
+                guardian_replay_checkpoint_chunk(inner, snapshot, &candidate, checkpoint_offset)?;
             let chunk_bytes = u64::try_from(chunk.byte_len())
                 .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
             let next_offset = checkpoint_offset
@@ -4319,13 +4947,19 @@ fn guardian_replay_build_page(
                 snapshot.max_plaintext_bytes,
                 snapshot.max_records,
             )?;
-            let GuardianCheckpointOutputBoundaryV1::Record {
-                sequence,
-                record_digest,
-                ..
-            } = snapshot.descriptor.output_boundary()
-            else {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            let (sequence, record_digest) = match snapshot.descriptor.output_boundary() {
+                GuardianCheckpointOutputBoundaryV1::Record {
+                    sequence,
+                    record_digest,
+                    ..
+                } => (sequence, record_digest),
+                GuardianCheckpointOutputBoundaryV1::Genesis {
+                    parser_stream_bytes: 0,
+                    ..
+                } if snapshot.catalog.genesis_origin.is_some() => (0, [0; 32]),
+                GuardianCheckpointOutputBoundaryV1::Genesis { .. } => {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
             };
             (
                 GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
@@ -4368,6 +5002,9 @@ fn guardian_replay_build_page(
                             .checked_add(1)
                             .ok_or(GuardianCheckpointStageStoreError::Capacity)?
                     {
+                        // Even an empty suffix must still own its pinned
+                        // journal when it declares restoration complete.
+                        guardian_replay_validate_output_pin(output)?;
                         (
                             GuardianReplayPageBodyDelivery::Complete {
                                 checkpoint_id: snapshot.descriptor.checkpoint_id(),
@@ -5150,6 +5787,86 @@ fn checkpoint_create_record_new(
     }
 }
 
+fn spawn_custody_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    context: &GuardianSpawnCustodyContextV1,
+) -> PathBuf {
+    // One immutable record per initial pane/effect. Changed ACK IDs cannot fork custody.
+    inner.directory_path.join(format!(
+        "spawn-custody-v1-{}-{}.bin",
+        context.pane_id, context.effect_id
+    ))
+}
+
+fn read_spawn_custody_locked(
+    inner: &GuardianCheckpointStageStoreInner,
+    expected: &GuardianSpawnCustodyContextV1,
+) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
+    let (context, secret) = read_spawn_custody_scope_locked(inner, expected.scope())?;
+    if context != *expected {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok(secret)
+}
+
+fn read_spawn_custody_scope_locked(
+    inner: &GuardianCheckpointStageStoreInner,
+    expected: GuardianSpawnCustodyScopeV1,
+) -> Result<(GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>), GuardianCheckpointStageStoreError>
+{
+    let path = inner.directory_path.join(format!(
+        "spawn-custody-v1-{}-{}.bin",
+        expected.pane_id, expected.effect_id
+    ));
+    let mut file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+    let size = GUARDIAN_SPAWN_CUSTODY_BYTES as u64;
+    let metadata = file
+        .metadata()
+        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-metadata", error))?;
+    validate_private_file_metadata(&metadata, Some(size))?;
+    let identity = FileIdentity::capture(&metadata, Some(size));
+    #[cfg(test)]
+    if inner
+        .custody_sync_failure
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 1
+    {
+        return Err(GuardianCheckpointStageStoreError::io(
+            "spawn-custody-file-sync",
+            std::io::Error::other("injected sync failure"),
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-file-sync", error))?;
+    #[cfg(test)]
+    if inner
+        .custody_sync_failure
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 2
+    {
+        return Err(GuardianCheckpointStageStoreError::io(
+            "spawn-custody-directory-sync",
+            std::io::Error::other("injected sync failure"),
+        ));
+    }
+    inner.directory.sync_all().map_err(|error| {
+        GuardianCheckpointStageStoreError::io("spawn-custody-directory-sync", error)
+    })?;
+    let mut bytes = [0; GUARDIAN_SPAWN_CUSTODY_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-read", error))?;
+    let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
+    if context.scope() != expected {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    inner
+        .persistence
+        .validate(&inner.directory)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+    validate_file_identity_at(&inner.directory, &inner.directory_path, &path, identity)?;
+    Ok((context, secret))
+}
+
 fn checkpoint_write_created_record(
     inner: &GuardianCheckpointStageStoreInner,
     path: &Path,
@@ -5864,6 +6581,30 @@ struct OutputJob {
     pane_id: Uuid,
     journal: GuardianPaneOutputJournal,
     payload: Zeroizing<Vec<u8>>,
+    broker_delivery: Option<Box<crate::broker::BrokerOutputDeliveryTokenV1>>,
+}
+
+/// Constructor-private proof of canonical guardian journal durability for one
+/// exact authenticated broker delivery. No numeric output prefix can mint it.
+pub struct GuardianDurableBrokerOutputAckV1 {
+    token: Box<crate::broker::BrokerOutputDeliveryTokenV1>,
+    journal: GuardianPaneOutputJournal,
+    receipt: GuardianOutputAppendReceipt,
+}
+
+pub enum GuardianBrokerOutputSubmitError {
+    Rejected(crate::broker::BrokerOutputDeliveryV1),
+    Invariant,
+}
+
+impl GuardianDurableBrokerOutputAckV1 {
+    pub(crate) fn validated_token(&self) -> Option<&crate::broker::BrokerOutputDeliveryTokenV1> {
+        let authority = self.journal.authority.lock().ok()?;
+        authority
+            .verify_broker_receipt(&self.token, self.receipt)
+            .ok()?;
+        Some(self.token.as_ref())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -5886,11 +6627,16 @@ pub struct GuardianOutputCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) payload_bytes: usize,
     pub(crate) result: Result<GuardianOutputAppendReceipt, GuardianOutputCommitFailure>,
+    pub(crate) broker_ack: Option<GuardianDurableBrokerOutputAckV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianOutputCommitFailure;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transient receive result retains the bounded queue's owned receipt without a heap allocation per output record"
+)]
 pub enum GuardianOutputCompletionState {
     Ready(GuardianOutputCompletion),
     Empty,
@@ -6014,14 +6760,31 @@ impl OutputQueue {
     }
 }
 
-/// Fixed-size worker pool plus secure per-pane journal factory.
-pub struct GuardianOutputPipeline {
-    directory: File,
+/// Cloneable journal creation authority without worker queues or receivers.
+#[derive(Clone)]
+pub struct GuardianJournalPreparation {
+    directory: Arc<File>,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
-    checkpoint_store: GuardianCheckpointStageStore,
     policy: OutputSegmentPolicy,
     persistence: Arc<PersistentOutputAuthority>,
+}
+
+/// Fixed-size append workers and their completion receiver. Journal preparation
+/// authority can move independently to the checkpoint worker.
+pub struct GuardianOutputPipeline {
+    #[cfg(test)]
+    directory: File,
+    #[cfg(test)]
+    directory_path: PathBuf,
+    #[cfg(test)]
+    cipher: GuardianOutputCipher,
+    checkpoint_store: GuardianCheckpointStageStore,
+    #[cfg(test)]
+    policy: OutputSegmentPolicy,
+    #[cfg(test)]
+    persistence: Arc<PersistentOutputAuthority>,
+    preparation: GuardianJournalPreparation,
     queue: Arc<OutputQueue>,
     completions: Option<Receiver<GuardianOutputCompletion>>,
     workers: Vec<JoinHandle<()>>,
@@ -6072,6 +6835,16 @@ impl GuardianOutputPipeline {
             Arc::clone(&persistence),
             GuardianCheckpointStagePolicy::production(),
         )?;
+        let preparation =
+            GuardianJournalPreparation {
+                directory: Arc::new(directory.try_clone().map_err(|error| {
+                    GuardianOutputError::io("preparation-directory-clone", error)
+                })?),
+                directory_path: directory_path.clone(),
+                cipher: cipher.clone(),
+                policy,
+                persistence: Arc::clone(&persistence),
+            };
         let max_outstanding = max_panes.clamp(1, OUTPUT_MAX_IN_FLIGHT);
         let queue = Arc::new(OutputQueue::new(max_outstanding)?);
         let (completion_tx, completions) = sync_channel(max_outstanding);
@@ -6103,12 +6876,18 @@ impl GuardianOutputPipeline {
         drop(completion_tx);
 
         Ok(Self {
+            #[cfg(test)]
             directory,
+            #[cfg(test)]
             directory_path,
+            #[cfg(test)]
             cipher,
             checkpoint_store,
+            #[cfg(test)]
             policy,
+            #[cfg(test)]
             persistence,
+            preparation,
             queue,
             completions: Some(completions),
             workers,
@@ -6122,7 +6901,32 @@ impl GuardianOutputPipeline {
         self.checkpoint_store.clone()
     }
 
+    pub(crate) fn journal_preparation(&self) -> GuardianJournalPreparation {
+        self.preparation.clone()
+    }
+
     pub(crate) fn prepare_pane(
+        &self,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
+        self.preparation
+            .prepare_output(guardian_incarnation, pane_id)
+    }
+
+    pub(crate) fn prepare_input(
+        &self,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneInputJournal, GuardianOutputError> {
+        self.preparation
+            .prepare_input(guardian_incarnation, pane_id)
+    }
+}
+
+impl GuardianJournalPreparation {
+    /// Performs cold filesystem work; call only from the owned authority worker.
+    pub(crate) fn prepare_output(
         &self,
         guardian_incarnation: Uuid,
         pane_id: Uuid,
@@ -6233,7 +7037,9 @@ impl GuardianOutputPipeline {
         input.validate_path_authority()?;
         Ok(input)
     }
+}
 
+impl GuardianOutputPipeline {
     #[cfg(test)]
     fn cold_open_pane_for_validation(
         &self,
@@ -6328,6 +7134,7 @@ impl GuardianOutputPipeline {
             pane_id,
             journal,
             payload,
+            broker_delivery: None,
         };
         self.queue.try_push(job).map_err(|error| match error {
             OutputQueuePushError::Saturated(job) => {
@@ -6337,6 +7144,38 @@ impl GuardianOutputPipeline {
                 GuardianOutputSubmitError::Unavailable(job.payload)
             }
         })
+    }
+
+    pub(crate) fn try_submit_broker_output(
+        &self,
+        journal: GuardianPaneOutputJournal,
+        delivery: crate::broker::BrokerOutputDeliveryV1,
+    ) -> Result<(), GuardianBrokerOutputSubmitError> {
+        if delivery.bytes().is_empty() || delivery.bytes().len() > OUTPUT_RECORD_BYTES {
+            return Err(GuardianBrokerOutputSubmitError::Rejected(delivery));
+        }
+        let (token, payload) = delivery.into_parts();
+        let job = OutputJob {
+            pane_id: token.pane_id(),
+            journal,
+            payload,
+            broker_delivery: Some(token),
+        };
+        match self.queue.try_push(job) {
+            Ok(()) => Ok(()),
+            Err(
+                OutputQueuePushError::Saturated(mut job) | OutputQueuePushError::Shutdown(mut job),
+            ) => {
+                // This private path always inserts the nonforgeable token.
+                let token = job
+                    .broker_delivery
+                    .take()
+                    .ok_or(GuardianBrokerOutputSubmitError::Invariant)?;
+                Err(GuardianBrokerOutputSubmitError::Rejected(
+                    crate::broker::BrokerOutputDeliveryV1::from_parts(token, job.payload),
+                ))
+            }
+        }
     }
 
     pub(crate) fn try_completion(&self) -> GuardianOutputCompletionState {
@@ -6369,7 +7208,10 @@ fn output_worker(
     while let Some(mut job) = queue.pop() {
         let payload_bytes = job.payload.len();
         let mut result = match job.journal.authority.lock() {
-            Ok(mut authority) => authority.append_and_sync(job.payload.as_slice()),
+            Ok(mut authority) => match job.broker_delivery.as_deref() {
+                Some(token) => authority.append_broker_delivery(token, job.payload.as_slice()),
+                None => authority.append_and_sync(job.payload.as_slice()),
+            },
             Err(_) => Err(OutputCommitError::JournalLockPoisoned),
         };
         job.payload.zeroize();
@@ -6377,10 +7219,21 @@ fn output_worker(
         if !queue.complete_one() {
             result = Err(OutputCommitError::QueueInvariant);
         }
+        let broker_ack = match (&result, job.broker_delivery) {
+            (Ok(receipt), Some(token)) if job.journal.receipt_is_current(*receipt) => {
+                Some(GuardianDurableBrokerOutputAckV1 {
+                    token,
+                    journal: job.journal,
+                    receipt: *receipt,
+                })
+            }
+            _ => None,
+        };
         let completion = GuardianOutputCompletion {
             pane_id: job.pane_id,
             payload_bytes,
             result: result.map_err(|_| GuardianOutputCommitFailure),
+            broker_ack,
         };
         if completions.send(completion).is_err() {
             return;
@@ -10154,6 +11007,25 @@ fn checkpoint_catalog_publish_file(
     write_site: &'static str,
     sync_site: &'static str,
 ) -> Result<FileIdentity, GuardianCheckpointStageStoreError> {
+    let staging_path = checkpoint_catalog_staging_path(inner, path)?;
+    checkpoint_catalog_publish_file_with_staging(
+        inner,
+        path,
+        bytes,
+        write_site,
+        sync_site,
+        &staging_path,
+    )
+}
+
+fn checkpoint_catalog_publish_file_with_staging(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    bytes: &[u8],
+    write_site: &'static str,
+    sync_site: &'static str,
+    staging_path: &Path,
+) -> Result<FileIdentity, GuardianCheckpointStageStoreError> {
     let expected_len =
         u64::try_from(bytes.len()).map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
     match open_private_file_at(&inner.directory, &inner.directory_path, path, false) {
@@ -10189,19 +11061,13 @@ fn checkpoint_catalog_publish_file(
         Err(error) => return Err(error.into()),
     }
 
-    let staging_path = checkpoint_catalog_staging_path(inner, path)?;
     let mut file =
-        match create_private_file_new_at(&inner.directory, &inner.directory_path, &staging_path) {
+        match create_private_file_new_at(&inner.directory, &inner.directory_path, staging_path) {
             Ok(file) => file,
             Err(GuardianOutputError::Io { source, .. })
                 if source.kind() == ErrorKind::AlreadyExists =>
             {
-                open_private_file_at(
-                    &inner.directory,
-                    &inner.directory_path,
-                    &staging_path,
-                    false,
-                )?
+                open_private_file_at(&inner.directory, &inner.directory_path, staging_path, false)?
             }
             Err(error) => return Err(error.into()),
         };
@@ -10216,7 +11082,7 @@ fn checkpoint_catalog_publish_file(
     validate_file_identity_at(
         &inner.directory,
         &inner.directory_path,
-        &staging_path,
+        staging_path,
         FileIdentity::capture(&before, Some(before.len())),
     )?;
     let observed_len = checkpoint_catalog_verify_file_prefix(
@@ -10233,6 +11099,22 @@ fn checkpoint_catalog_publish_file(
     }
     file.seek(SeekFrom::Start(before.len()))
         .map_err(|error| GuardianCheckpointStageStoreError::io(write_site, error))?;
+    #[cfg(test)]
+    if write_site == "spawn-custody-write" {
+        let cut = inner
+            .custody_publication_cut
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if cut == 1 || cut == 2 {
+            if cut == 2 {
+                file.write_all(&bytes[..bytes.len() / 2])
+                    .map_err(|error| GuardianCheckpointStageStoreError::io(write_site, error))?;
+            }
+            return Err(GuardianCheckpointStageStoreError::io(
+                "spawn-custody-interrupted-publication",
+                std::io::Error::new(ErrorKind::Interrupted, "injected publication interruption"),
+            ));
+        }
+    }
     file.write_all(&bytes[observed_len..])
         .map_err(|error| GuardianCheckpointStageStoreError::io(write_site, error))?;
     file.sync_all()
@@ -10258,16 +11140,28 @@ fn checkpoint_catalog_publish_file(
     validate_file_identity_at(
         &inner.directory,
         &inner.directory_path,
-        &staging_path,
+        staging_path,
         identity,
     )?;
-    let staging_name = output_child_name(&inner.directory_path, &staging_path)?;
+    let staging_name = output_child_name(&inner.directory_path, staging_path)?;
     let canonical_name = output_child_name(&inner.directory_path, path)?;
     checkpoint_catalog_publish_noreplace(&inner.directory, staging_name, canonical_name).map_err(
         |error| {
             GuardianCheckpointStageStoreError::io("checkpoint-catalog-atomic-publication", error)
         },
     )?;
+    #[cfg(test)]
+    if write_site == "spawn-custody-write"
+        && inner
+            .custody_publication_cut
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 3
+    {
+        return Err(GuardianCheckpointStageStoreError::io(
+            "spawn-custody-interrupted-directory-sync",
+            std::io::Error::new(ErrorKind::Interrupted, "injected post-rename interruption"),
+        ));
+    }
     inner.directory.sync_all().map_err(|error| {
         GuardianCheckpointStageStoreError::io(
             "checkpoint-catalog-publication-directory-sync",
@@ -10882,6 +11776,358 @@ mod tests {
         owned
     }
 
+    fn spawn_custody_context() -> GuardianSpawnCustodyContextV1 {
+        GuardianSpawnCustodyContextV1 {
+            broker_incarnation: Uuid::from_u128(1),
+            broker_lineage: Uuid::from_u128(2),
+            guardian_incarnation: Uuid::from_u128(3),
+            mux_incarnation: Uuid::from_u128(4),
+            broker_build: [1; 32],
+            guardian_build: [2; 32],
+            mux_build: [3; 32],
+            pane_id: Uuid::from_u128(5),
+            effect_id: Uuid::from_u128(6),
+            ack_id: Uuid::from_u128(7),
+            child_pid: 12,
+            child_nonce: Uuid::from_u128(8),
+            child_start_digest: [4; 32],
+            wire_ack_generation: 0,
+            secret_lease_generation: 1,
+        }
+    }
+
+    #[test]
+    fn spawn_custody_survives_fresh_store_and_rejects_tamper_and_wrong_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = OutputSegmentPolicy::production();
+        let (directory, path, ciphertext, scope) = {
+            let (directory, poll, pipeline) = pipeline_with_policy("ft-spawn-custody-", policy)?;
+            let store = pipeline.checkpoint_stage_store();
+            let context = spawn_custody_context();
+            let secret = Zeroizing::new([0x93; 32]);
+            let claim = store.persist_spawn_custody(&context, &secret)?;
+            let path = spawn_custody_path(&store.inner, &context);
+            let ciphertext = std::fs::read(&path)?;
+            assert_eq!(ciphertext.len(), GUARDIAN_SPAWN_CUSTODY_BYTES);
+            assert!(
+                !ciphertext
+                    .windows(32)
+                    .any(|bytes| bytes == secret.as_slice())
+            );
+            drop(claim);
+            drop(secret);
+            drop(store);
+            drop(pipeline);
+            drop(poll);
+            (directory, path, ciphertext, context.scope())
+        };
+        let (_poll, pipeline) = reopen_pipeline(&directory, policy)?;
+        let store = pipeline.checkpoint_stage_store();
+        let recovered = store.lookup_spawn_custody(scope)?;
+        let context = recovered.context();
+        assert_eq!(context.ack_id, Uuid::from_u128(7));
+        assert_eq!(context.broker_incarnation, Uuid::from_u128(1));
+        assert_eq!(context.child_pid, 12);
+        assert_eq!(*recovered.into_secret()?, [0x93; 32]);
+        for wrong in [
+            GuardianSpawnCustodyContextV1 {
+                broker_incarnation: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                broker_lineage: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                guardian_incarnation: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                mux_incarnation: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                broker_build: [90; 32],
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                guardian_build: [90; 32],
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                mux_build: [90; 32],
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                ack_id: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                child_pid: 90,
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                child_nonce: Uuid::from_u128(90),
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                child_start_digest: [90; 32],
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                wire_ack_generation: 1,
+                ..context
+            },
+            GuardianSpawnCustodyContextV1 {
+                secret_lease_generation: 2,
+                ..context
+            },
+        ] {
+            assert!(matches!(
+                store.reopen_spawn_custody(&wrong),
+                Err(GuardianCheckpointStageStoreError::Conflict)
+            ));
+        }
+        let wrong_key = GuardianOutputCipher::try_from_key_slice(&[0x44; 32])?;
+        let wrong_cipher = GuardianCheckpointCipher::from_output_cipher(&wrong_key);
+        assert!(
+            wrong_cipher
+                .open_spawn_custody(context, &ciphertext.clone().try_into().unwrap())
+                .is_err()
+        );
+        assert!(store.persist_spawn_custody(&context, &[0x94; 32]).is_err());
+        assert_eq!(std::fs::read(&path)?, ciphertext);
+        let ack_offset = ciphertext
+            .windows(16)
+            .position(|bytes| bytes == context.ack_id.as_bytes())
+            .expect("ACK ID is physically persisted in the header");
+        for offset in [ack_offset + 15, ciphertext.len() - 1] {
+            let mut corrupt = ciphertext.clone();
+            corrupt[offset] ^= 1;
+            std::fs::write(&path, corrupt)?;
+            assert!(matches!(
+                store.lookup_spawn_custody(scope),
+                Err(GuardianCheckpointStageStoreError::SpawnCustody(
+                    GuardianSpawnCustodyError::Authentication
+                ))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_custody_sync_failure_cannot_issue_or_reuse_a_claim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for stage in [1, 2] {
+            let (_directory, _poll, pipeline) =
+                pipeline_with_policy("ft-spawn-custody-sync-", OutputSegmentPolicy::production())?;
+            let store = pipeline.checkpoint_stage_store();
+            let context = spawn_custody_context();
+            store
+                .inner
+                .custody_sync_failure
+                .store(stage, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                store.persist_spawn_custody(&context, &[0x93; 32]),
+                Err(GuardianCheckpointStageStoreError::Io { .. })
+            ));
+            assert!(store.reopen_spawn_custody(&context).is_err());
+            store
+                .inner
+                .custody_sync_failure
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            let claim = store.reopen_spawn_custody(&context)?;
+            store
+                .inner
+                .custody_sync_failure
+                .store(stage, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                claim.into_secret().is_err(),
+                "ACK consumption must revalidate durability"
+            );
+            store
+                .inner
+                .custody_sync_failure
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                *store.reopen_spawn_custody(&context)?.into_secret()?,
+                [0x93; 32]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_custody_interrupted_staging_is_retained_and_genuine_retry_publishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = OutputSegmentPolicy::production();
+        let (directory, poll, pipeline) =
+            pipeline_with_policy("ft-spawn-custody-interrupted-", policy)?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let canonical = spawn_custody_path(&store.inner, &context);
+        for cut in [1, 2] {
+            store.interrupt_spawn_custody_publication_for_test(cut);
+            assert!(matches!(
+                store.persist_spawn_custody(&context, &[0x93; 32]),
+                Err(GuardianCheckpointStageStoreError::Io {
+                    site: "spawn-custody-interrupted-publication",
+                    ..
+                })
+            ));
+            assert!(!canonical.try_exists()?);
+            assert!(store.lookup_spawn_custody(context.scope()).is_err());
+        }
+        let retained = read_directory_names(&store.inner.directory)?
+            .into_iter()
+            .filter(|name| name.as_bytes().starts_with(b"spawn-custody-v1-"))
+            .map(|name| {
+                let path = store.inner.directory_path.join(name);
+                let bytes = std::fs::read(&path)?;
+                Ok((path, bytes))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let mut lengths: Vec<_> = retained.iter().map(|(_, bytes)| bytes.len()).collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, vec![0, GUARDIAN_SPAWN_CUSTODY_BYTES / 2]);
+        store.interrupt_spawn_custody_publication_for_test(3);
+        assert!(matches!(
+            store.persist_spawn_custody(&context, &[0x93; 32]),
+            Err(GuardianCheckpointStageStoreError::Io {
+                site: "spawn-custody-interrupted-directory-sync",
+                ..
+            })
+        ));
+        assert!(
+            canonical.try_exists()?,
+            "rename succeeded before directory-sync interruption"
+        );
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        let (_poll, pipeline) = reopen_pipeline(&directory, policy)?;
+        let store = pipeline.checkpoint_stage_store();
+        let claim = store.persist_spawn_custody(&context, &[0x93; 32])?;
+        assert_eq!(*claim.into_secret()?, [0x93; 32]);
+        for (path, bytes) in retained {
+            assert_eq!(
+                std::fs::read(path)?,
+                bytes,
+                "interrupted bytes must remain unchanged"
+            );
+        }
+        let committed = std::fs::read(&canonical)?;
+        assert!(
+            store
+                .persist_spawn_custody(
+                    &GuardianSpawnCustodyContextV1 {
+                        ack_id: Uuid::from_u128(99),
+                        ..context
+                    },
+                    &[0x93; 32]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&canonical)?,
+            committed,
+            "conflicting valid final must never be overwritten"
+        );
+        assert_eq!(
+            *store.lookup_spawn_custody(context.scope())?.into_secret()?,
+            [0x93; 32]
+        );
+        let mut bounded = GuardianCheckpointStageStore::open(
+            &pipeline.directory,
+            &pipeline.directory_path,
+            &pipeline.cipher,
+            Arc::clone(&pipeline.persistence),
+            GuardianCheckpointStagePolicy::production(),
+        )?;
+        // Lower only this isolated test store's admission threshold to its
+        // three retained files; exercise exhaustion without creating 8,216 files.
+        Arc::get_mut(&mut bounded.inner)
+            .expect("test store is uniquely owned")
+            .policy
+            .max_stage_files = 3;
+        assert!(matches!(
+            bounded.persist_spawn_custody(
+                &GuardianSpawnCustodyContextV1 {
+                    pane_id: Uuid::from_u128(100),
+                    ..context
+                },
+                &[0x93; 32]
+            ),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        assert_eq!(
+            *bounded
+                .persist_spawn_custody(&context, &[0x93; 32])?
+                .into_secret()?,
+            [0x93; 32],
+            "an existing canonical claim remains retryable at full capacity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_custody_refuses_noncanonical_files_before_secret_delivery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-spawn-custody-files-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        for (index, length) in [
+            0,
+            GUARDIAN_SPAWN_CUSTODY_BYTES - 1,
+            GUARDIAN_SPAWN_CUSTODY_BYTES + 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let context = GuardianSpawnCustodyContextV1 {
+                pane_id: Uuid::from_u128(100 + u128::try_from(index)?),
+                ..spawn_custody_context()
+            };
+            drop(store.persist_spawn_custody(&context, &[0x93; 32])?);
+            let path = spawn_custody_path(&store.inner, &context);
+            OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(u64::try_from(length)?)?;
+            assert!(matches!(
+                store.lookup_spawn_custody(context.scope()),
+                Err(GuardianCheckpointStageStoreError::Output(_))
+            ));
+        }
+        let context = spawn_custody_context();
+        drop(store.persist_spawn_custody(&context, &[0x93; 32])?);
+        let path = spawn_custody_path(&store.inner, &context);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        assert!(matches!(
+            store.lookup_spawn_custody(context.scope()),
+            Err(GuardianCheckpointStageStoreError::Output(_))
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::hard_link(
+            &path,
+            store.inner.directory_path.join("custody-hardlink-probe"),
+        )?;
+        assert!(matches!(
+            store.lookup_spawn_custody(context.scope()),
+            Err(GuardianCheckpointStageStoreError::Output(_))
+        ));
+        let symlink_context = GuardianSpawnCustodyContextV1 {
+            pane_id: Uuid::from_u128(200),
+            ..context
+        };
+        symlink(&path, spawn_custody_path(&store.inner, &symlink_context))?;
+        assert!(matches!(
+            store.lookup_spawn_custody(symlink_context.scope()),
+            Err(GuardianCheckpointStageStoreError::Output(_))
+        ));
+        Ok(())
+    }
+
     #[test]
     fn directory_identity_ignores_child_link_count_but_rejects_mode_change()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -10953,6 +12199,55 @@ mod tests {
         let waker = Arc::new(Waker::new(poll.registry(), Token(1))?);
         let pipeline = GuardianOutputPipeline::open_with_policy(&token_path, 1, waker, policy)?;
         Ok((directory, poll, pipeline))
+    }
+
+    #[test]
+    fn journal_preparation_moves_without_pipeline_and_rejects_replaced_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-preparation-worker-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let factory = pipeline.journal_preparation();
+        let worker_factory = factory.clone();
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        drop(pipeline);
+        let worker = thread::spawn(move || {
+            let output = worker_factory.prepare_output(guardian, pane)?;
+            let input = worker_factory.prepare_input(guardian, pane)?;
+            Ok::<_, GuardianOutputError>((output, input))
+        });
+        let (output, input) = worker
+            .join()
+            .expect("journal preparation worker panicked")?;
+        assert_eq!(output.initial_cumulative_plaintext_bytes, 0);
+        assert_eq!(input.journal.record_count(), 0);
+        drop(output);
+        drop(input);
+        assert!(
+            factory.prepare_input(guardian, pane).is_err(),
+            "factory must preserve canonical input reopen refusal"
+        );
+
+        let retained = factory
+            .directory_path
+            .with_file_name(format!("retained-preparation-directory-{}", Uuid::new_v4()));
+        std::fs::rename(&factory.directory_path, &retained)?;
+        std::fs::create_dir(&factory.directory_path)?;
+        std::fs::set_permissions(
+            &factory.directory_path,
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let new_pane = Uuid::new_v4();
+        assert!(factory.prepare_output(guardian, new_pane).is_err());
+        assert!(factory.prepare_input(guardian, new_pane).is_err());
+        assert_eq!(
+            std::fs::read_dir(&factory.directory_path)?.count(),
+            0,
+            "replaced pathname must receive no journal effects"
+        );
+        Ok(())
     }
 
     fn reopen_pipeline(
@@ -11811,6 +13106,156 @@ mod tests {
     }
 
     #[test]
+    fn genesis_output_pins_start_at_zero_and_preserve_rollover_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-genesis-output-origin-", tiny_rotation_policy(4))?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let terminal = checkpoint_catalog_test_terminal(b"");
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal)?;
+        let mut reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        reservation.durable_pane_id = pane;
+        reservation.spawn_effect_id = effect;
+        reservation.checkpoint_identity_digest = descriptor.checkpoint_id().into_bytes();
+        reservation.boundary_identity_digest = descriptor.boundary_id().into_bytes();
+        // This unit test isolates output-origin validation. Production origin
+        // issuance is separately exercised through the sealed service fixture.
+        let origin = {
+            let authority = journal.authority.lock().map_err(|_| "poisoned journal")?;
+            GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: [0x57; 32],
+                guardian_incarnation: guardian,
+                initial_segment: authority.current_journal.identity(),
+                persistence: Arc::clone(&authority.persistence),
+            }
+        };
+        assert!(guardian_replay_capture_output(&journal, descriptor, None).is_err());
+        let empty = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(empty.terminal_sequence, 0);
+        assert_eq!(empty.terminal_record_digest, [0; 32]);
+        assert_eq!(empty.cumulative_plaintext_bytes, 0);
+        guardian_replay_validate_resume(&empty, 1, [0; 32], 1, [0; 32])?;
+        assert!(guardian_replay_validate_resume(&empty, 1, [0; 32], 1, [1; 32]).is_err());
+
+        let foreign = pipeline.prepare_pane(guardian, Uuid::new_v4())?;
+        assert!(guardian_replay_capture_output(&foreign, descriptor, Some(&origin)).is_err());
+        let mut wrong_guardian = origin.clone();
+        wrong_guardian.guardian_incarnation = Uuid::new_v4();
+        assert!(
+            guardian_replay_capture_output(&journal, descriptor, Some(&wrong_guardian)).is_err()
+        );
+        let mut wrong_segment = origin.clone();
+        wrong_segment.initial_segment =
+            GuardianOutputSegmentIdentity::new(pane, Uuid::new_v4(), 1, None)?;
+        assert!(
+            guardian_replay_capture_output(&journal, descriptor, Some(&wrong_segment)).is_err()
+        );
+        let (_other_directory, _other_poll, other_pipeline) =
+            pipeline_with_policy("ft-genesis-foreign-store-", tiny_rotation_policy(4))?;
+        let other_journal = other_pipeline.prepare_pane(guardian, pane)?;
+        assert!(guardian_replay_capture_output(&other_journal, descriptor, Some(&origin)).is_err());
+
+        durable_commit(&pipeline, pane, &journal, b"alpha")?;
+        let last = durable_commit(&pipeline, pane, &journal, b"beta")?;
+        let populated = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(populated.segments.len(), 2);
+        assert_eq!(populated.terminal_sequence, 2);
+        assert_eq!(populated.terminal_record_digest, last.record_digest());
+        assert_eq!(populated.cumulative_plaintext_bytes, 9);
+        let (records, receipt) = guardian_replay_output_page(&populated, 1, [0; 32], 64, 4)?;
+        assert_eq!(receipt, last);
+        let mut text = Vec::new();
+        for record in records.into_records() {
+            record.write_all_bounded(&mut text, 64)?;
+        }
+        assert_eq!(text, b"alphabeta");
+        Ok(())
+    }
+
+    #[test]
+    fn replay_output_pages_reuse_bounded_bookmarks_and_revalidate_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-replay-bookmarks-", OutputSegmentPolicy::production())?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let terminal = checkpoint_catalog_test_terminal(b"");
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal)?;
+        let mut reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        reservation.durable_pane_id = pane;
+        reservation.spawn_effect_id = effect;
+        reservation.checkpoint_identity_digest = descriptor.checkpoint_id().into_bytes();
+        reservation.boundary_identity_digest = descriptor.boundary_id().into_bytes();
+        // Isolate replay interval mechanics; sealed service tests cover the
+        // production-only publication authority that issues this origin.
+        let origin = {
+            let authority = journal.authority.lock().map_err(|_| "poisoned journal")?;
+            GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: [0x58; 32],
+                guardian_incarnation: guardian,
+                initial_segment: authority.current_journal.identity(),
+                persistence: Arc::clone(&authority.persistence),
+            }
+        };
+        let mut receipts = Vec::new();
+        for _ in 0..16 {
+            receipts.push(durable_commit(&pipeline, pane, &journal, b"page")?);
+        }
+        let output = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        let mut previous = [0; 32];
+        for expected in receipts {
+            let (replay_page, actual) =
+                guardian_replay_output_page(&output, expected.sequence(), previous, 4, 1)?;
+            assert_eq!(actual, expected);
+            let mut bytes = Vec::new();
+            for record in replay_page.into_records() {
+                record.write_all_bounded(&mut bytes, 4)?;
+            }
+            assert_eq!(bytes, b"page");
+            let bookmarks = output.segments[0]
+                .bookmarks
+                .lock()
+                .map_err(|_| "poisoned bookmarks")?;
+            assert_eq!(bookmarks.len(), 2);
+            assert_eq!(bookmarks[0].next_sequence(), Some(expected.sequence()));
+            assert_eq!(
+                bookmarks[1].next_sequence(),
+                expected.sequence().checked_add(1)
+            );
+            drop(bookmarks);
+            let (_, retry) =
+                guardian_replay_output_page(&output, expected.sequence(), previous, 4, 1)?;
+            assert_eq!(retry, expected);
+            previous = expected.record_digest();
+        }
+        durable_commit(&pipeline, pane, &journal, b"later")?;
+        guardian_replay_validate_output_pin(&output)?;
+        assert!(guardian_replay_output_page(&output, 17, previous, 8, 1).is_err());
+        let segment = &output.segments[0];
+        let retained = segment
+            .authority
+            .path
+            .with_extension("retained-replay-probe");
+        std::fs::rename(&segment.authority.path, &retained)?;
+        let replacement = create_private_file_new_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+        )?;
+        replacement.sync_all()?;
+        output.directory.sync_all()?;
+        assert!(guardian_replay_output_page(&output, 16, previous, 4, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn replay_snapshot_pages_checkpoint_then_exact_output_and_acks_idempotently()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
@@ -11838,7 +13283,9 @@ mod tests {
             b"checkpoint-boundary",
             b"checkpoint-boundary",
         )?;
-        durable_commit(&pipeline, pane, &journal, b"-durable-suffix")?;
+        for _ in 0..16 {
+            durable_commit(&pipeline, pane, &journal, b"-durable-suffix")?;
+        }
 
         let maximum_plaintext_bytes = 64 * 1024;
         let open = GuardianReplayRequestV1::Open {
@@ -11895,7 +13342,17 @@ mod tests {
         let mut cursor = first.next_cursor.ok_or("checkpoint page cursor")?;
         let mut suffix = Vec::new();
         let mut request_identity = 0xf130_u128;
-        loop {
+        let read_work = || {
+            let replay = store.inner.replay.lock().unwrap();
+            let output = replay.snapshots[&first.snapshot_id]
+                .output
+                .as_ref()
+                .unwrap();
+            assert_eq!(output.segments.len(), 1);
+            let work = *output.segments[0].read_work.lock().unwrap();
+            work
+        };
+        let work = loop {
             let continuation = GuardianReplayRequestV1::Continue { cursor };
             let request = checkpoint_catalog_replay_request(
                 guardian,
@@ -11909,6 +13366,25 @@ mod tests {
             let replay_outcome =
                 store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
             let observed = observe_replay_page(replay_outcome, maximum_plaintext_bytes)?;
+            let before_retry = read_work();
+            let retry =
+                store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
+            let retry = observe_replay_page(retry, maximum_plaintext_bytes)?;
+            let after_retry = read_work();
+            assert_eq!(retry.page_digest, observed.page_digest);
+            assert_eq!(retry.output_plaintext, observed.output_plaintext);
+            assert_eq!(
+                after_retry.historical_frames, before_retry.historical_frames,
+                "full request retry must not rescan the predecessor's history"
+            );
+            assert_eq!(
+                after_retry.interval_frames - before_retry.interval_frames,
+                u64::try_from(observed.output_plaintext.len() / b"-durable-suffix".len())?
+            );
+            assert!(
+                after_retry.terminal_frames - before_retry.terminal_frames <= 2,
+                "one segment's terminal may be checked by resume and page validation"
+            );
             suffix.extend_from_slice(&observed.output_plaintext);
             ack_observed_replay_page(
                 &store,
@@ -11922,11 +13398,35 @@ mod tests {
             )?;
             request_identity += 1;
             if observed.complete {
-                break;
+                // Terminal ACK releases the snapshot and its owned counters.
+                // Retain the actual final read observation from before ACK.
+                break after_retry;
             }
             cursor = observed.next_cursor.ok_or("nonterminal replay cursor")?;
-        }
-        assert_eq!(suffix, b"-durable-suffix");
+        };
+        assert_eq!(suffix, b"-durable-suffix".repeat(16));
+        assert!(
+            !store
+                .inner
+                .replay
+                .lock()
+                .unwrap()
+                .snapshots
+                .contains_key(&first.snapshot_id),
+            "terminal ACK must release the completed snapshot"
+        );
+        assert_eq!(
+            work.historical_frames, 1,
+            "initial checkpoint-prefix seek happens once"
+        );
+        assert_eq!(
+            work.interval_frames, 32,
+            "16 delivered frames plus 16 exact retry reads"
+        );
+        assert_eq!(
+            work.terminal_frames, 18,
+            "bounded terminal checks are counted separately"
+        );
         Ok(())
     }
 
@@ -16256,12 +17756,14 @@ mod tests {
             pane_id,
             journal: journal.clone(),
             payload: zeroizing_test_bytes(b"reserved"),
+            broker_delivery: None,
         };
         assert!(queue.try_push(first).is_ok());
         let second = OutputJob {
             pane_id,
             journal,
             payload: zeroizing_test_bytes(b"backpressured"),
+            broker_delivery: None,
         };
         let OutputQueuePushError::Saturated(mut second) = queue
             .try_push(second)
@@ -16281,6 +17783,7 @@ mod tests {
             pane_id,
             journal: retained.journal,
             payload: zeroizing_test_bytes(b"unavailable"),
+            broker_delivery: None,
         };
         let OutputQueuePushError::Shutdown(mut after_shutdown) = queue
             .try_push(after_shutdown)

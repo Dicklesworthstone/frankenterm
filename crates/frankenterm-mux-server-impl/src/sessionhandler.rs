@@ -160,6 +160,26 @@ fn record_line_read_failure(stage: &'static str, error: &anyhow::Error) {
     log::warn!("owned line read failed stage={stage} reason={reason}");
 }
 
+fn retain_line_read_plan(
+    plans: &mut Vec<wezterm_term::screen::ScreenLineRead>,
+    plan: wezterm_term::screen::ScreenLineRead,
+    requested: &std::ops::Range<StableRowIndex>,
+    layout_fenced: bool,
+) -> anyhow::Result<()> {
+    let exact_range = plan.first_row() == requested.start
+        && usize::try_from(requested.end.saturating_sub(requested.start).max(0))
+            == Ok(plan.requested_row_count());
+    // Even a refused plan must leave pane authority through the existing
+    // worker retirement path. Dropping its captured cells here can be costly.
+    plans.push(plan);
+    if layout_fenced && !exact_range {
+        // Legacy GetLines permits clamping; a fenced reply promises the
+        // caller's exact coordinates, including across hot-row eviction.
+        return Err(MuxServerRejection::backend_failure().into());
+    }
+    Ok(())
+}
+
 fn complete_owned_line_read(
     result: anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>,
     permit: mux::pane::LineReadPermit,
@@ -8581,7 +8601,12 @@ impl SessionHandler {
                                     wezterm_term::screen::LineReadCaptureBudget::default();
                                 for range in &lines {
                                     match pane.capture_line_read(range.clone(), &mut budget) {
-                                        Some(plan) => plans.push(plan?),
+                                        Some(plan) => retain_line_read_plan(
+                                            &mut plans,
+                                            plan?,
+                                            range,
+                                            layout.is_some(),
+                                        )?,
                                         None => return Ok(false),
                                     }
                                 }
@@ -9427,6 +9452,106 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fenced_line_read_rejects_evicted_range_and_retires_captured_plan() {
+        #[derive(Debug)]
+        struct Config;
+        impl wezterm_term::TerminalConfiguration for Config {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                wezterm_term::color::ColorPalette::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                0
+            }
+        }
+        let mut term = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 16,
+                pixel_width: 160,
+                pixel_height: 80,
+                dpi: 96,
+            },
+            Arc::new(Config),
+            "fenced-line-range",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        term.advance_bytes(b"first\r\nsecond\r\nthird\r\nlast");
+        let before = mux::renderable::terminal_get_dimensions(&mut term);
+        let requested = before.scrollback_top..before.scrollback_top + 4;
+        term.advance_bytes(b"\r\nnext");
+        let after = mux::renderable::terminal_get_dimensions(&mut term);
+        assert!(mux::renderable::same_line_layout_geometry(&before, &after));
+        assert!(after.scrollback_top > before.scrollback_top);
+
+        let plan = term
+            .screen()
+            .capture_line_read(requested.clone())
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(term.screen().validates_line_read(&plan));
+        assert_ne!(plan.first_row(), requested.start);
+        assert_eq!(plan.row_count(), 4);
+        let mut plans = Vec::new();
+        let error = retain_line_read_plan(&mut plans, plan, &requested, true).unwrap_err();
+        let rejection = error.downcast_ref::<MuxServerRejection>().unwrap();
+        assert_eq!(rejection.code, MuxErrorCode::BACKEND_FAILURE);
+        assert_eq!(rejection.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(rejection.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        assert_eq!(plans.len(), 1, "refused cells remain owned for retirement");
+
+        let caller = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = line_read_test_permit()
+            .start(
+                || true,
+                move |result, permit| {
+                    assert!(result.is_err());
+                    drop(permit);
+                    let _ = sender.send(std::thread::current().id());
+                },
+            )
+            .unwrap();
+        worker.submit(plans);
+        assert_ne!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            caller
+        );
+    }
+
+    #[test]
+    fn fenced_line_read_range_check_preserves_exact_empty_and_legacy_reads() {
+        let term = line_read_test_terminal();
+        let exact = term.screen().capture_line_read(0..4).unwrap();
+        let mut plans = Vec::new();
+        retain_line_read_plan(&mut plans, exact, &(0..4), true).unwrap();
+        // Same count alone cannot certify a shifted coordinate range.
+        let shifted = term.screen().capture_line_read(-1..3).unwrap();
+        retain_line_read_plan(&mut plans, shifted, &(-1..3), false).unwrap();
+        let shifted = term.screen().capture_line_read(-1..3).unwrap();
+        assert!(retain_line_read_plan(&mut plans, shifted, &(-1..3), true).is_err());
+        let shorter = term.screen().capture_line_read(0..5).unwrap();
+        assert!(retain_line_read_plan(&mut plans, shorter, &(0..5), true).is_err());
+        assert_eq!(plans.len(), 4);
+
+        for (start, end) in [(0, 0), (-10, -10), (10, 10), (4, 2)] {
+            let range = start..end;
+            let empty = term.screen().capture_line_read(range.clone()).unwrap();
+            assert_eq!(empty.requested_row_count(), 0);
+            retain_line_read_plan(&mut plans, empty, &range, true).unwrap();
+        }
+        // A request beyond the current tail is rebased by the legacy screen
+        // API even when its length fits; fenced reads must refuse that too.
+        let range = 3..5;
+        let past_tail = term.screen().capture_line_read(range.clone()).unwrap();
+        assert_ne!(past_tail.first_row(), range.start);
+        assert!(retain_line_read_plan(&mut plans, past_tail, &range, true).is_err());
+    }
+
     fn line_read_test_permit() -> mux::pane::LineReadPermit {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -9442,6 +9567,13 @@ mod tests {
     }
 
     fn line_read_test_plan() -> wezterm_term::screen::ScreenLineRead {
+        line_read_test_terminal()
+            .screen()
+            .capture_line_read(0..4)
+            .unwrap()
+    }
+
+    fn line_read_test_terminal() -> wezterm_term::Terminal {
         #[derive(Debug)]
         struct Config;
         impl wezterm_term::TerminalConfiguration for Config {
@@ -9463,7 +9595,7 @@ mod tests {
             Box::new(Vec::<u8>::new()),
         );
         term.advance_bytes("first 界\r\nsecond\r\nthird\r\nlast".as_bytes());
-        term.screen().capture_line_read(0..4).unwrap()
+        term
     }
 
     #[test]

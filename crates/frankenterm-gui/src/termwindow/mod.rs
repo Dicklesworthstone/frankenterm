@@ -3102,6 +3102,9 @@ impl RenderRecoveryState {
             RenderRecoveryMode::Cooldown {
                 stage: RenderFailureStage::NativeFramePending,
                 ..
+            }
+            | RenderRecoveryMode::RetryReady {
+                stage: RenderFailureStage::NativeFramePending,
             } => {
                 self.mode = RenderRecoveryMode::RetryReady {
                     stage: RenderFailureStage::NativeFramePending,
@@ -3274,26 +3277,29 @@ where
     })
 }
 
+pub(crate) fn initial_native_window_size(
+    mux: &Mux,
+    mux_window_id: MuxWindowId,
+) -> Option<TerminalSize> {
+    mux.get_active_tab_for_window(mux_window_id)
+        .map(|tab| tab.get_size())
+}
+
 impl TermWindow {
     pub async fn new_window(
         mux_window_id: MuxWindowId,
         saved_workspace: String,
         saved_window_state: Option<crate::window_state_persist::PersistedWindowState>,
     ) -> anyhow::Result<()> {
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow!("cannot create GUI window without an active mux"))?;
+        let size = initial_native_window_size(&mux, mux_window_id)
+            .context("cannot create GUI window before its first tab is attached")?;
         let front_end = try_front_end().context("native window creation requires a frontend")?;
         let config = config_with_accessibility_palette(configuration());
         let dpi = config.dpi.unwrap_or_else(::window::default_dpi) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow!("cannot create GUI window without an active mux"))?;
-        let size = match mux.get_active_tab_for_window(mux_window_id) {
-            Some(tab) => tab.get_size(),
-            None => {
-                log::debug!("new_window has no tabs... yet?");
-                Default::default()
-            }
-        };
         let physical_rows = size.rows as usize;
         let physical_cols = size.cols as usize;
 
@@ -9060,6 +9066,36 @@ mod tests {
     }
 
     #[test]
+    fn native_frame_ready_after_retry_timer_uses_only_the_unspent_early_attempt() {
+        let mut recovery = super::RenderRecoveryState::default();
+        recovery.record_failure(super::RenderFailureStage::Paint);
+        recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+        recovery.enter_cooldown(
+            super::RenderWakeTicket(1),
+            super::RenderFailureStage::NativeFramePending,
+        );
+        // The timer only invalidates the native view. A coherent publication
+        // before its throttled repaint must still be able to paint once now.
+        assert!(recovery.mark_retry_ready(super::RenderWakeTicket(1)));
+        assert!(recovery.mark_native_frame_ready());
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+        assert!(!recovery.mark_native_frame_ready());
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+
+        // An early notification can still precede the actual publication.
+        // Firing another timer must not replenish the one-attempt budget.
+        recovery.record_failure(super::RenderFailureStage::NativeFramePending);
+        recovery.enter_cooldown(
+            super::RenderWakeTicket(2),
+            super::RenderFailureStage::NativeFramePending,
+        );
+        assert!(recovery.mark_retry_ready(super::RenderWakeTicket(2)));
+        assert!(!recovery.mark_native_frame_ready());
+        assert_eq!(recovery.failed_attempts_since_success, 1);
+        assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
+    }
+
+    #[test]
     fn native_frame_ready_does_not_bypass_backend_or_surface_recovery() {
         let mut recovery = super::RenderRecoveryState::default();
         assert!(!recovery.mark_native_frame_ready());
@@ -9082,6 +9118,9 @@ mod tests {
             recovery.enter_cooldown(super::RenderWakeTicket(1), stage);
             assert!(!recovery.mark_native_frame_ready());
             assert_eq!(recovery.admit(), super::PaintAdmission::SuppressCooldown);
+            assert!(recovery.mark_retry_ready(super::RenderWakeTicket(1)));
+            assert!(!recovery.mark_native_frame_ready());
+            assert_eq!(recovery.admit(), super::PaintAdmission::Admit);
             recovery.park(stage);
             assert!(!recovery.mark_native_frame_ready());
             assert_eq!(recovery.admit(), super::PaintAdmission::SuppressParked);

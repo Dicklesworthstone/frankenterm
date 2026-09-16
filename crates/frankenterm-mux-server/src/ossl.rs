@@ -169,19 +169,14 @@ impl OpenSSLNetListener {
                                 promise::spawn::MainThreadReservationOutcome::Reserved(
                                     reservation,
                                 ) => {
-                                    reservation
-                                        .spawn_local(async move {
-                                            log::debug!("Making new AsyncSslStream");
-                                            if let Err(error) = frankenterm_mux_server_impl::dispatch::process_with_config(
-                                                AsyncSslStream::new(stream),
-                                                dispatch_config,
-                                            )
-                                            .await
-                                            {
-                                                log::error!("process: {error:?}");
-                                            }
-                                        })
-                                        .detach();
+                                    admit_tls_session(reservation, move || {
+                                        log::debug!("Making new AsyncSslStream");
+                                        frankenterm_mux_server_impl::dispatch::process_with_config(
+                                            AsyncSslStream::new(stream),
+                                            dispatch_config,
+                                        )
+                                    })
+                                    .detach();
                                 }
                                 rejected => {
                                     metrics::counter!(
@@ -207,6 +202,27 @@ impl OpenSSLNetListener {
             }
         }
     }
+}
+
+// The TLS listener owns authentication and its timeout. Transfer the same
+// admission and authenticated stream before constructing a thread-bound session.
+fn admit_tls_session<Make, Fut>(
+    reservation: promise::spawn::MainThreadSpawnReservation,
+    make_session: Make,
+) -> promise::spawn::MainThreadSpawnedTask<()>
+where
+    Make: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + 'static,
+{
+    reservation.handoff_to_main_thread_local(move |reservation| {
+        reservation
+            .spawn_local(async move {
+                if let Err(error) = make_session().await {
+                    log::error!("process: {error:?}");
+                }
+            })
+            .detach();
+    })
 }
 
 fn build_tls_acceptor(tls_server: &TlsDomainServer) -> Result<SslAcceptor, Error> {
@@ -305,6 +321,80 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn tls_session_factory_and_non_send_future_run_on_executor_owner() {
+        use std::io::Write as _;
+
+        // Exercise the actual admission handoff with an owned TCP stream.
+        // This is a scheduler/ownership test, not a TLS authentication test.
+        let executor = promise::spawn::SimpleExecutor::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected TLS admission reservation, got {other:?}"),
+        };
+        let owner = std::thread::current().id();
+        let (finished, completion) = mpsc::channel();
+        std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), owner);
+            admit_tls_session(reservation, move || {
+                assert_eq!(
+                    std::thread::current().id(),
+                    owner,
+                    "session factory ran off owner"
+                );
+                let affinity = std::rc::Rc::new(owner);
+                async move {
+                    std::future::ready(()).await;
+                    assert_eq!(
+                        std::thread::current().id(),
+                        *affinity,
+                        "session polled off owner"
+                    );
+                    server.write_all(b"owned")?;
+                    finished.send(std::thread::current().id()).unwrap();
+                    Ok(())
+                }
+            })
+            .detach();
+        })
+        .join()
+        .expect("listener admission must not construct a local task");
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(polled_on) = completion.try_recv() {
+                assert_eq!(polled_on, owner);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TLS session handoff did not settle"
+            );
+            assert!(executor.try_tick().unwrap(), "admitted TLS work vanished");
+        }
+        let mut bytes = [0; 5];
+        client.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"owned");
+        assert_eq!(
+            client.read(&mut [0; 1]).unwrap(),
+            0,
+            "session owns stream teardown"
+        );
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+    }
 
     #[test]
     fn peer_cert_verification_failure_rejects_only_current_connection() {
