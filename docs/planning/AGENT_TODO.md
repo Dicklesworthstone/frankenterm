@@ -871,8 +871,19 @@ power loss nor migration of those live sessions has been demonstrated.
   `Io(WouldBlock)`, exactly reproducing the defect; no compile failure or skip.
 - [x] Execute the same test on fixed `caa7ddc39`: strict ovh-a proof passed
   exactly one test; the unacquired-guard control also passed exactly one test.
-- [ ] Run all recorder stack integration tests and focused recorder unit
-  tests, including initialization failure, buffered repair and fsync faults.
+- [x] Run all 45 recorder stack integration tests on `caa7ddc39` through strict
+  ovh-a RCH: 45 passed, zero failed/ignored/filtered. Retain
+  `/Volumes/USB_NVME/ft-release-20260915/rc29-recorder-integration-ovh-rch.log`
+  (SHA256 `c126f06b3e788499efcafcbf63ccc22a680762958aa62f2ed6b4b92fa54810ec`).
+- [x] Run all 158 `recorder_storage::tests::` tests, including initialization
+  failure, buffered repair and fsync faults, through strict RCH using the
+  hash-pinned core test binary built from `caa7ddc39`: 158 passed, zero
+  failed/ignored, 31,664 filtered. Before/after binary SHA256 remained
+  `1ece9192dfa3eea6efdb81c39edd3e1882c9085459e281781d8c9a0dae4c632d`.
+  Retain `rc29-recorder-storage-prebuilt-ovh-rch-attempt4.log` in the same
+  evidence directory (SHA256
+  `92d73a2e807e74332144ff7758f9d37e69cdae1058e72a77dd87345ab0ca0e16`).
+  This is scoped committed-source proof, not final-source qualification.
 - [ ] Complete final-source workspace check, Clippy, tests and formatting
   through strict RCH before tagging or starting another native release build.
 
