@@ -4518,6 +4518,7 @@ fn guardian_replay_validate_catalog_pin(
 fn guardian_replay_checkpoint_chunk(
     inner: &GuardianCheckpointStageStoreInner,
     snapshot: &GuardianReplaySnapshot,
+    candidate: &CheckpointCatalogCandidate,
     offset: u64,
 ) -> Result<GuardianCheckpointChunkDelivery, GuardianCheckpointStageStoreError> {
     let total_bytes = snapshot.descriptor.total_bytes();
@@ -4530,7 +4531,6 @@ fn guardian_replay_checkpoint_chunk(
         .min(u64::from(snapshot.max_plaintext_bytes));
     let requested_bytes_usize = usize::try_from(requested_bytes)
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
-    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
     let begin_record = candidate
         .records
         .first()
@@ -4760,7 +4760,7 @@ fn guardian_replay_build_page(
     incoming_cursor: Option<GuardianReplayCursorV1>,
 ) -> Result<(GuardianReplayPageDelivery, GuardianReplayIssuedPage), GuardianCheckpointStageStoreError>
 {
-    let _candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
+    let candidate = guardian_replay_validate_catalog_pin(inner, &snapshot.catalog)?;
     let (
         phase,
         page_index,
@@ -4805,7 +4805,11 @@ fn guardian_replay_build_page(
             {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
             }
-            let chunk = guardian_replay_checkpoint_chunk(inner, snapshot, checkpoint_offset)?;
+            // Consume this page's already-authenticated catalog bytes. Reopening
+            // and authenticating the entire candidate again here repeats the
+            // same full-checkpoint work without adding an authority boundary.
+            let chunk =
+                guardian_replay_checkpoint_chunk(inner, snapshot, &candidate, checkpoint_offset)?;
             let chunk_bytes = u64::try_from(chunk.byte_len())
                 .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
             let next_offset = checkpoint_offset
