@@ -315,7 +315,69 @@ CASS query for crash_loop_diagnostics returned stale/misaligned line references;
 it supplies no additional historical proof. Disposition: unfinished and
 unqualified, with the coordination collision disclosed; no done declaration.
 
-Current source handoff: `d895ed512` (health, four tests) and `d8a259a6e`
-(watcher, five tests). Nine authored regressions, zero executed in this batch.
-All remaining compilation, execution, native, and recovery-integration tasks
-above stay open. No existing session or installed application was changed.
+### 2026-09-16 02:03 UTC — current implementation and release checklist
+
+This checkpoint supersedes earlier pending-result statements above. Earlier
+receipts retain their original source identity; none qualifies RC24 by itself.
+
+- [x] Run six real watcher regressions on `3a5c13390`, strict RCH 57397:
+  six passed, including the original symlink/atomic-save failure.
+- [x] Complete RC23 workspace check on `cd561733c`, strict RCH 57398:
+  remote exit zero, no compiler diagnostics.
+- [x] Diagnose three failures in the actual RC23 core suite (31,811 passed):
+  transient snapshot classification and duplicate Drop-based text summaries.
+- [x] Commit both causal fixes as `94a8d1182`; retain original assertions.
+- [x] Commit real resize admission/completion handling and seven causal tests
+  as `804ff9f74`; uncertain operations are not automatically replayed.
+- [x] Commit active-tab-first resize dispatch as `9166fa098`; every hidden
+  tab still receives its resize, in its original relative order.
+- [x] Commit transitive macOS library packaging as `f479938ac`; ten focused
+  dependency graph tests, shell syntax and ShellCheck pass. Actual Mac probe
+  relocated and signed 14 libraries across 18 images and loaded successfully.
+- [x] Run real isolated Linux mux text/input smoke and native Mac headless
+  observation smoke using the RC23 development binaries; owned children settled.
+- [x] Run held Unicode selection through all seven original native phases,
+  including resize and Cmd±, on the exact RC23 GUI. All text/cursor oracles
+  passed. Its explicit fixed-window configuration does not prove the default.
+- [x] Run background 10,000-record resize: exact before/after content, ten
+  applied commits, no cancellation/rejection. This is not visible latency proof.
+- [x] Retain failed RC23 DSR run `cb7517fe-9850-4caa-be22-a21b93dbf690`.
+  Repair its diagnosed timeout, NFS AppleDouble packaging, and nested Windows
+  PowerShell launch causes in the private DSR configuration. No retry is armed.
+- [x] Commit authenticated spawn-capability custody as `444d936fa`: durable
+  self-describing encrypted record, fresh-process lookup, lost-ACK recovery,
+  and interrupted-write retry without poisoning the canonical record.
+- [x] Complete independent custody publication review, including the final
+  fresh-store test after only incomplete staging files have survived.
+- [ ] Execute strict RCH guardian/mux custody tests on the committed source.
+- [ ] Finish the old immutable RC23 full-suite failure inventory; its control
+  loop is stopped so later gates cannot accidentally read the changed checkout.
+- [ ] Verify the two core corrections, full client library, and two active-tab
+  dispatch tests through strict RCH on the final committed candidate.
+- [x] Execute both actual panic-profile subprocess artifacts: RCH job 57436 on
+  hz4 returned zero with `PANIC_CONTRACT_SUBPROCESS_SUCCESS`. Binary source is
+  `cd561733c`; current profile policy and both artifact hashes were checked
+  before and after execution. This is not a final RC24 binary qualification.
+- [ ] Finish native default Cmd±, real window resize/tiling, natural wrapping,
+  selection variants, and the unchanged visible performance acceptance workload.
+- [ ] Commit coherent RC24 metadata and tracker export, obtain owner freeze
+  acknowledgments, and tag the exact source before DSR admission.
+- [ ] Complete all six DSR quality gates on that source, including workspace
+  Clippy and exact clean-source formatting with a nonzero named test result.
+- [ ] Build all four DSR target families with the corrected 21,600-second
+  deadline, native APFS packaging, PS7 launcher, and serialized Linux host lock.
+- [ ] Run the actual completed Lindley producer with the unchanged workload,
+  arrival rate and held-out thresholds; retain failures without weakening them.
+- [ ] Finish the four attestation producers and verify their final source,
+  target, profile and manifest bindings before signing and publication.
+- [ ] Publish through DSR, verify release signatures/assets, canary and upgrade.
+- [ ] Safely activate the verified Mac bundle and prove Dock launches its exact
+  binary while preserving the existing GUI's local children and remote owners.
+- [ ] Complete broker-backed RuntimePane I/O, resize, exit and lease adoption;
+  encrypted custody alone does not enable ordinary guardian-owned sessions.
+- [ ] Complete full mux/parser/image serialization and RaptorQ recovery, then
+  prove disposable detach/restart/reattachment before any existing remote update.
+
+Existing remote muxes still perform their old terminal reflow. Client-side
+selection, dispatch and font-policy improvements do not replace that code.
+No existing remote owner has been restarted or updated by this campaign.

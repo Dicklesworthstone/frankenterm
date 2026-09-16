@@ -43,7 +43,13 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - A retained cold-history prefix no longer changes the layout sequence when a compatible successor is already installed. Temporary storage contention during geometry comparison also leaves an unchanged layout sequence intact.
 - Font-size shortcuts preserve the window size by default and reflow its contents. Setting `adjust_window_size_when_changing_font_size = true` explicitly retains window resizing.
 
-The `0.15.6-rc.23` candidate includes these changes. The 50 ms resize target,
+- Remote resize admission failures preserve the prior cached geometry. Failed or cancelled completion waits notify the original pane and permit an explicit retry without automatically replaying an uncertain operation.
+- Window resize dispatches the active tab before hidden tabs on shared mux connections, while still resizing every tab and preserving their displayed order.
+- Snapshot-change diagnostics agree with the typed transient error while retaining the exhausted retry budget. Text reads emit one transaction summary, including when they fail.
+- macOS application packaging includes the transitive native library dependencies, relocates their loader paths, and retains their license notices and provenance. Packaging rejects unresolved dependencies and verifies that source binaries remain unchanged.
+- The guardian broker's Spawn acknowledgment now requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Ordinary broker-backed pane activation and full mux recovery remain unfinished.
+
+The `0.15.6-rc.24` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.
