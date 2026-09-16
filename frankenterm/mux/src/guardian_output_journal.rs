@@ -3103,6 +3103,59 @@ impl GuardianOutputJournal {
         })
     }
 
+    /// Reauthenticate only the current terminal record and canonical file header.
+    ///
+    /// The exact opaque receipt must already belong to this journal's durable
+    /// append/reopen authority. It pins the frame offset, ciphertext digest and
+    /// plaintext binding; callers cannot supply an arbitrary seek position.
+    /// This costs one header plus one bounded frame, independent of history.
+    /// It is not a full-prefix scrub: use the recovery cursor for that claim.
+    /// The owner must separately revalidate its directory/path authority.
+    pub fn verify_terminal_record(
+        &self,
+        receipt: GuardianOutputAppendReceipt,
+        max_plaintext_bytes: u32,
+    ) -> Result<GuardianRecoveredOutputRecord, GuardianOutputJournalError> {
+        if self.terminal_receipt != Some(receipt)
+            || self.tail != GuardianOutputJournalTail::Clean
+            || receipt.committed_log_bytes != self.committed_bytes
+            || receipt.cumulative_plaintext_bytes != self.cumulative_plaintext_bytes
+        {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        // Reuse the canonical header validation and bounded authenticated frame
+        // decoder. This private cursor never escapes as full-prefix authority.
+        let mut cursor = self.recovery_cursor(receipt.sequence, max_plaintext_bytes)?;
+        let frame_bytes = RECORD_HEADER_BYTES_U64
+            .checked_add(u64::from(AEAD_TAG_BYTES))
+            .and_then(|bytes| bytes.checked_add(u64::from(receipt.payload_bytes)))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        cursor.offset = receipt
+            .committed_log_bytes
+            .checked_sub(frame_bytes)
+            .filter(|offset| *offset >= FILE_HEADER_BYTES_U64)
+            .ok_or(GuardianOutputJournalError::RecoveryAuthorityMismatch)?;
+        cursor.record_count = self
+            .record_count
+            .checked_sub(1)
+            .ok_or(GuardianOutputJournalError::RecoveryAuthorityMismatch)?;
+        cursor.cumulative_plaintext_bytes = receipt
+            .cumulative_plaintext_bytes
+            .checked_sub(u64::from(receipt.payload_bytes))
+            .ok_or(GuardianOutputJournalError::RecoveryAuthorityMismatch)?;
+        cursor.next_sequence = Some(receipt.sequence);
+        let record = cursor
+            .next_record()?
+            .filter(|record| record.receipt() == receipt)
+            .ok_or(GuardianOutputJournalError::RecoveryAuthorityMismatch)?;
+        if cursor.offset != self.committed_bytes
+            || self.file.metadata()?.len() != self.committed_bytes
+        {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        Ok(record)
+    }
+
     /// Re-read and authenticate a bounded contiguous page of the committed
     /// plaintext suffix. Every frame in the committed prefix is verified;
     /// bytes from an incomplete physical tail are reported but never returned.
@@ -5542,6 +5595,132 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_record_verification_is_bounded_and_receipt_anchored() {
+        let large = vec![b'x'; 4096];
+        let (_directory, _path, journal, receipts) =
+            real_journal_with_records("terminal-bounded.ftgout", &[&large, b"tail"]);
+        // Negative control: a full-prefix cursor must decode the oversized
+        // earlier record even when asked to deliver only the terminal one.
+        let mut full = journal.recovery_cursor(2, 4).unwrap();
+        assert!(matches!(
+            full.next_record(),
+            Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit { .. })
+        ));
+        let record = journal.verify_terminal_record(receipts[1], 4).unwrap();
+        assert_eq!(record.receipt(), receipts[1]);
+        let mut plaintext = Zeroizing::new(Vec::new());
+        record
+            .into_authenticated_delivery()
+            .unwrap()
+            .write_all_bounded(&mut *plaintext, 4)
+            .unwrap();
+        assert_eq!(plaintext.as_slice(), b"tail");
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[0], 4096),
+            Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
+        ));
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[1], 3),
+            Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit { .. })
+        ));
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[1], 0),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+        let (_other_directory, _other_path, _other, other_receipts) =
+            real_journal_with_records("terminal-foreign.ftgout", &[&large, b"tail"]);
+        assert!(matches!(
+            journal.verify_terminal_record(other_receipts[1], 4),
+            Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_record_verification_rejects_header_frame_and_aead_tamper() {
+        for attack in ["header", "sequence", "ciphertext", "rehashed-ciphertext"] {
+            let (_directory, path, journal, receipts) =
+                real_journal_with_records("terminal-tamper.ftgout", &[b"prefix", b"tail"]);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let offset = usize::try_from(receipts[0].committed_log_bytes()).unwrap();
+            match attack {
+                "header" => bytes[0] ^= 1,
+                "sequence" => bytes[offset + 8] ^= 1,
+                "ciphertext" | "rehashed-ciphertext" => {
+                    let ciphertext_offset = offset + RECORD_HEADER_BYTES;
+                    bytes[ciphertext_offset] ^= 1;
+                    if attack == "rehashed-ciphertext" {
+                        let mut nonce = [0; NONCE_BYTES];
+                        nonce.copy_from_slice(&bytes[offset + 32..offset + 56]);
+                        let digest = record_digest(
+                            journal.identity(),
+                            receipts[1].sequence(),
+                            receipts[1].payload_bytes(),
+                            read_u32(&bytes[offset + 20..offset + 24]),
+                            &nonce,
+                            &bytes[ciphertext_offset..],
+                        );
+                        bytes[offset + 56..offset + 88].copy_from_slice(&digest);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.write_all(&bytes).unwrap();
+            writer.sync_all().unwrap();
+            let result = journal.verify_terminal_record(receipts[1], 4);
+            assert!(result.is_err(), "{attack} must not mint delivery authority");
+            if attack == "rehashed-ciphertext" {
+                assert!(matches!(
+                    result,
+                    Err(GuardianOutputJournalError::DecryptionFailed)
+                ));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_record_verification_refuses_unhealthy_or_changed_length() {
+        let (_directory, path, mut journal, receipts) =
+            real_journal_with_records("terminal-health.ftgout", &[b"tail"]);
+        journal.poisoned = true;
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[0], 4),
+            Err(GuardianOutputJournalError::Poisoned)
+        ));
+        journal.poisoned = false;
+        journal.tail = GuardianOutputJournalTail::Incomplete {
+            committed_bytes: journal.committed_bytes(),
+            trailing_bytes: 1,
+        };
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[0], 4),
+            Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
+        ));
+        journal.tail = GuardianOutputJournalTail::Clean;
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"torn-tail").unwrap();
+        writer.sync_all().unwrap();
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[0], 4),
+            Err(GuardianOutputJournalError::ExternalLengthChange { .. })
+        ));
+        writer
+            .set_len(receipts[0].committed_log_bytes() - 1)
+            .unwrap();
+        writer.sync_all().unwrap();
+        assert!(matches!(
+            journal.verify_terminal_record(receipts[0], 4),
+            Err(GuardianOutputJournalError::ExternalLengthChange { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recovery_cursor_is_linear_ordered_and_never_repeats_after_loss_or_eof() {
         let payloads: [&[u8]; 3] = [
             b"FT-CURSOR-FIRST-SECRET",
@@ -6144,6 +6323,13 @@ mod tests {
             .expect("commit the maximal representable sequence");
         assert_eq!(terminal.sequence(), u64::MAX);
         assert_eq!(journal.next_sequence(), None);
+        assert_eq!(
+            journal
+                .verify_terminal_record(terminal, 8)
+                .unwrap()
+                .receipt(),
+            terminal
+        );
         assert!(matches!(
             journal.append_and_sync(b"must-not-wrap"),
             Err(GuardianOutputJournalError::SequenceExhausted)
@@ -6253,6 +6439,13 @@ mod tests {
         let successor_receipt = successor
             .append_and_sync(successor_payload)
             .expect("append successor record");
+        assert_eq!(
+            successor
+                .verify_terminal_record(successor_receipt, 1024)
+                .unwrap()
+                .plaintext(),
+            successor_payload
+        );
         assert_eq!(
             successor_receipt.cumulative_plaintext_bytes(),
             first_receipt
