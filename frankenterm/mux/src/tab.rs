@@ -49,6 +49,7 @@ pub struct TabStackEntry {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TabStackError {
     EmptyStack,
+    DuplicateStack(TabStackId),
     DuplicateTab(TabId),
     TabAlreadyStacked { tab_id: TabId, stack_id: TabStackId },
     MissingStack(TabStackId),
@@ -148,6 +149,9 @@ impl TabStackState {
     ) -> Result<(), TabStackError> {
         if tabs.is_empty() {
             return Err(TabStackError::EmptyStack);
+        }
+        if self.stacks.contains_key(&stack_id) {
+            return Err(TabStackError::DuplicateStack(stack_id));
         }
 
         let mut seen = HashSet::new();
@@ -14662,6 +14666,36 @@ mod test {
                 stack_id: TabStackId(1),
             })
         );
+    }
+
+    #[test]
+    fn tab_stack_state_rejects_reused_id_without_losing_members_or_visibility() {
+        let mut state = TabStackState::default();
+        let first = TabStackId(7);
+        state.create_stack(first, vec![10, 20]).unwrap();
+        assert_eq!(state.cycle_visible(first, 1), Some(20));
+        let original = state.clone();
+
+        assert_eq!(
+            state.create_stack(first, vec![30, 40]),
+            Err(TabStackError::DuplicateStack(first))
+        );
+        assert_eq!(state, original);
+        assert_eq!(state.tabs_in_stack(first), Some([10, 20].as_slice()));
+        assert_eq!(state.visible_tab(first), Some(20));
+        for tab in [10, 20] {
+            assert_eq!(state.stack_for_tab(tab), Some(first));
+        }
+        for tab in [30, 40] {
+            assert_eq!(state.stack_for_tab(tab), None);
+        }
+
+        let second = TabStackId(8);
+        state.create_stack(second, vec![30, 40]).unwrap();
+        assert_eq!(state.visible_tab(first), Some(20));
+        assert_eq!(state.remove_stack(first), Some(vec![10, 20]));
+        state.create_stack(first, vec![10, 20]).unwrap();
+        assert_eq!(state.tabs_in_stack(second), Some([30, 40].as_slice()));
     }
 
     #[test]

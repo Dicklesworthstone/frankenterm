@@ -272,6 +272,8 @@ pub struct MuxCapturedWindow {
     pub ordered_tab_ids: Vec<TabId>,
     pub active_tab_id: Option<TabId>,
     pub active_tab_index: Option<usize>,
+    pub last_active_tab_id: Option<TabId>,
+    pub tab_stacks: Vec<crate::tab::TabStackEntry>,
     pub position: Option<GuiPosition>,
     pub structural_pane_count: usize,
 }
@@ -18479,6 +18481,8 @@ impl Mux {
                         ordered_tab_ids,
                         active_tab_id,
                         active_tab_index,
+                        last_active_tab_id: window.last_active_tab_id(),
+                        tab_stacks: window.tab_stack_entries(),
                         position: window.get_initial_position().clone(),
                         structural_pane_count: window.structural_pane_count(),
                     });

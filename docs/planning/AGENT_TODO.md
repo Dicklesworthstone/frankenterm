@@ -843,8 +843,9 @@ power loss nor migration of those live sessions has been demonstrated.
   normal `check` samples the clock once. Replace the affected integration and
   unit timing assumptions with exact suppression, expiry, reset and LRU checks.
 - [x] Obtain independent source review and exact-file formatting/diff checks.
-- [ ] Execute strict remote cooldown regressions for `ft-nb5kl`, then complete
-  the final source's full workspace, Clippy and formatting checks. Existing
+- [x] Execute strict remote cooldown regressions for `ft-nb5kl`: 34 integration
+  tests and 106 core-library tests passed on exact `9f7a895e8` through ovh-a.
+- [ ] Complete the final source's full workspace, Clippy and formatting checks. Existing
   `939da9667` receipts remain bound to that earlier source; RC29 is untagged.
 - [ ] Execute the three audited, non-foreground GUI selection tests through
   the opt-in `glyphcache_unit` target on the final source. Native mouse input,
@@ -865,9 +866,33 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Implement acquired-only lease guards for data, state and path locks;
   preserve final buffered-write ordering and report unlock failures. Add a
   control proving that an unacquired guard cannot unlock another owner.
-- [ ] Execute the regression-only baseline and require the named test's
-  `WouldBlock` failure, then execute the same test on the fixed source.
+- [x] Execute the regression-only baseline: strict ovh-a RCH31970 ran the
+  named test on `f17a2098a` and failed at successor acquisition with
+  `Io(WouldBlock)`, exactly reproducing the defect; no compile failure or skip.
+- [ ] Execute the same test on the fixed source.
 - [ ] Run all recorder stack integration tests and focused recorder unit
   tests, including initialization failure, buffered repair and fsync faults.
 - [ ] Complete final-source workspace check, Clippy, tests and formatting
   through strict RCH before tagging or starting another native release build.
+
+### 2026-09-16 — preserve window metadata in whole-mux recovery
+
+- [x] Trace concrete losses: capture omitted window tab stacks and previous
+  active identity; conversion additionally discarded the captured window title.
+- [x] Preserve raw history and ordered stack entries under the window read lock.
+  Require title, history and grouped stack metadata in image schema 2.
+- [x] Validate membership, positions, visibility, history, canonical stack order
+  and bounded metadata; reject older schemas and absent required fields.
+- [x] Author real-PTY capture/publication/reopen/verification/inert reconstruction
+  coverage plus malformed, missing-field and bounds regressions.
+- [ ] Complete independent review and strict-RCH execution of these regressions.
+- [ ] Finish durable tab/window identity mapping and atomic live successor
+  publication under existing `.8.14.3.2` and `.3.4`; this metadata slice does
+  not close those requirements or authorize restarting existing mux sessions.
+- [x] Diagnose adjacent duplicate-stack-ID corruption (`ft-7vav0`): disjoint
+  replacement members overwrote the forward stack but left old reverse mappings.
+- [x] Reject duplicate IDs before any mutation and add a regression preserving
+  complete state, nonfirst visibility and inverse membership, followed by valid
+  creation and reuse after removal.
+- [ ] Independently review and execute the mux tab-stack regressions through
+  strict RCH; preserve the distinction from live restored-window publication.

@@ -243,6 +243,8 @@ impl Fixture {
                     order_revision: mux::window::WindowOrderRevision::new(2),
                     active_tab_id: Some(ordered_tab_ids[0]),
                     active_tab_index: Some(0),
+                    last_active_tab_id: None,
+                    tab_stacks: vec![],
                     ordered_tab_ids,
                     position: None,
                     structural_pane_count,
@@ -495,6 +497,58 @@ fn test_mux_recovery_image_e2e_full_positive_journey() {
             reference.payload_digest
         );
     }
+}
+
+#[test]
+fn test_mux_recovery_e2e_preserves_nonfirst_visible_window_stack_member() {
+    let mut fixture = Fixture::new();
+    let window = &mut fixture.captured.windows[1];
+    window.title = "review Ω".into();
+    window.ordered_tab_ids = vec![14, 12, 13];
+    window.active_tab_id = Some(12);
+    window.active_tab_index = Some(1);
+    window.last_active_tab_id = Some(14);
+    window.tab_stacks = vec![
+        mux::tab::TabStackEntry {
+            stack_id: mux::tab::TabStackId(7),
+            tab_id: 14,
+            position: 0,
+            is_visible: false,
+        },
+        mux::tab::TabStackEntry {
+            stack_id: mux::tab::TabStackId(7),
+            tab_id: 13,
+            position: 1,
+            is_visible: true,
+        },
+    ];
+    let cx = frankenterm_core::cx::for_request();
+    let (_directory, store) = store();
+    fixture.publish(&cx, &store, None);
+    let verified = fixture.current(&cx, &store);
+    let reconstructed = reconstruct_whole_mux_image_inert(
+        &verified,
+        TerminalCheckpointLimits::default(),
+        Some("offline"),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let window = &reconstructed.topology.windows[1];
+    assert_eq!(window.title, "review Ω");
+    assert_eq!(
+        window.tabs.iter().map(|tab| tab.tab_id).collect::<Vec<_>>(),
+        vec![14, 12, 13]
+    );
+    assert_eq!(window.active_tab_index, 1);
+    assert_eq!(window.last_active_tab_id, Some(14));
+    assert_eq!(
+        window.tab_stacks,
+        vec![frankenterm_core::mux_recovery_image::RecoveryTabStack {
+            stack_id: 7,
+            tab_ids: vec![14, 13],
+            visible_tab_id: 13,
+        }]
+    );
 }
 
 #[test]

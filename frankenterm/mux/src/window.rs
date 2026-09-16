@@ -1456,6 +1456,12 @@ impl Window {
         }
     }
 
+    /// Preserve the exact history identity during capture, including a dangling
+    /// value that recovery validation must reject rather than silently omit.
+    pub const fn last_active_tab_id(&self) -> Option<TabId> {
+        self.last_active
+    }
+
     /// If `idx` is different from the current active tab,
     /// save the current tabid and then make `idx` the active
     /// tab position.
@@ -1563,6 +1569,14 @@ mod tests {
     use frankenterm_term::TerminalSize;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::convert::TryFrom;
+
+    #[test]
+    fn captured_last_active_identity_does_not_hide_dangling_history() {
+        let mut window = Window::new(None, None);
+        window.last_active = Some(usize::MAX);
+        assert_eq!(window.get_last_active_idx(), None);
+        assert_eq!(window.last_active_tab_id(), Some(usize::MAX));
+    }
 
     const CONTRACT_MAX_WINDOWS: usize = 4_096;
     const CONTRACT_MAX_TABS_PER_WINDOW: usize = 4_096;

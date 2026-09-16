@@ -13038,16 +13038,92 @@ mod tests {
         }
         // Reuse the same real pane and authority after both failures; neither
         // cancellation nor rejected ACK may poison or latch the next attempt.
+        let mut extra_panes = Vec::new();
+        let mut tabs = vec![Arc::clone(&tab)];
+        for _ in 0..2 {
+            let command = config::Config::default()
+                .build_prog(
+                    Some(vec![
+                        OsStr::new("/bin/sh"),
+                        OsStr::new("-c"),
+                        OsStr::new("while IFS= read -r line; do :; done"),
+                    ]),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let extra = runtime
+                .block_on(domain.spawn(&mux, size, Some(command), None, *window))
+                .unwrap();
+            extra_panes.push(OwnedPane {
+                mux: Arc::clone(&mux),
+                pane: extra.get_active_pane().unwrap(),
+            });
+            tabs.push(extra);
+        }
+        mux.move_tab_between_windows(tabs[2].tab_id(), *window, Some(0))
+            .unwrap();
+        mux.activate_tab_at_index(*window, 1, false).unwrap();
+        mux.activate_tab_at_index(*window, 2, true).unwrap();
+        mux.set_window_title(*window, "review Ω").unwrap();
+        mux.create_window_tab_stack(
+            *window,
+            mux::tab::TabStackId(41),
+            vec![tabs[2].tab_id(), tabs[1].tab_id()],
+        )
+        .unwrap();
         let receipt = capture_and_publish_whole_mux_model(
             &cx,
             &mux,
             &store,
-            key,
+            Arc::clone(&key),
             &expected,
             Duration::from_secs(5),
         )
         .unwrap();
         assert_eq!(receipt.generation, 1);
+        let reopened =
+            SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
+        let verifier = crate::session_restore::WholeMuxRecoveryVerifier::new_production(
+            key,
+            crate::session_restore::WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
+                .with_session_id(expected.session_id.clone())
+                .with_mux_incarnation_id(expected.mux_incarnation_id.clone()),
+        );
+        let verified = crate::session_restore::select_verified_recovery_roots_with_cx(
+            &cx, &reopened, &verifier,
+        )
+        .unwrap()
+        .current
+        .expect("durable real-mux image must authenticate after reopening");
+        let restored = crate::session_restore::reconstruct_whole_mux_image_inert(
+            &verified,
+            frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            Some("offline-window-metadata"),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(restored.pane_terminals.len(), 3);
+        let restored_window = &restored.topology.windows[0];
+        assert_eq!(restored_window.title, "review Ω");
+        assert_eq!(
+            restored_window
+                .tabs
+                .iter()
+                .map(|tab| tab.tab_id)
+                .collect::<Vec<_>>(),
+            vec![tabs[2].tab_id(), tabs[0].tab_id(), tabs[1].tab_id()]
+        );
+        assert_eq!(restored_window.active_tab_index, 2);
+        assert_eq!(restored_window.last_active_tab_id, Some(tabs[0].tab_id()));
+        assert_eq!(
+            restored_window.tab_stacks,
+            vec![crate::mux_recovery_image::RecoveryTabStack {
+                stack_id: 41,
+                tab_ids: vec![tabs[2].tab_id(), tabs[1].tab_id()],
+                visible_tab_id: tabs[2].tab_id(),
+            }]
+        );
     }
 
     #[test]
@@ -13177,6 +13253,8 @@ mod tests {
                 ordered_tab_ids: vec![0, 1],
                 active_tab_id: Some(0),
                 active_tab_index: Some(0),
+                last_active_tab_id: None,
+                tab_stacks: vec![],
                 position: None,
                 structural_pane_count: 2,
             }],
