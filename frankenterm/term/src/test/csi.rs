@@ -206,6 +206,41 @@ fn test_ed() {
 }
 
 #[test]
+fn test_ed2_severs_scrollback_wrap_before_repaint_and_resize() {
+    for tiered in [false, true] {
+        let mut term = TestTerm::new_with_scrollback_tier(
+            2,
+            5,
+            8,
+            crate::config::ScrollbackTierConfig {
+                enabled: tiered,
+                hot_lines: 1,
+                warm_max_bytes: std::mem::size_of::<Line>(),
+            },
+        );
+        // The viewport begins in the middle of a soft-wrapped logical line.
+        term.print("abcdefghijk");
+        assert_all_contents(&term, file!(), line!(), &["abcde", "fghij", "k"]);
+        let predecessor = term.screen().phys_row(0) - 1;
+        assert!(term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+        term.print("\x1b[2J\x1b[HXYZ");
+        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ", ""]);
+        assert!(
+            !term.screen().all_lines()[predecessor].last_cell_was_wrapped(),
+            "erased continuation must not join replacement text to retained history"
+        );
+        term.resize(TerminalSize {
+            rows: 2,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 32,
+            dpi: 0,
+        });
+        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ", ""]);
+    }
+}
+
+#[test]
 fn test_ed_erase_scrollback() {
     let mut term = TestTerm::new(3, 3, 3);
     term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na\x1b[3J");
