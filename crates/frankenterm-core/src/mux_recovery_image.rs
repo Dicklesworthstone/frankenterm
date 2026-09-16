@@ -114,6 +114,9 @@ pub enum MuxRecoveryImageError {
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
 
+    #[error("{field} must be a canonical nonnil UUID")]
+    InvalidDurableIdentity { field: &'static str },
+
     #[error("duplicate incarnation window id {0}")]
     DuplicateWindowId(usize),
 
@@ -1308,6 +1311,7 @@ impl MuxRecoveryImage {
             if !seen_window_ids.insert(window.window_id) {
                 return Err(MuxRecoveryImageError::DuplicateWindowId(window.window_id));
             }
+            validate_durable_identity("window.stable_window_id", &window.stable_window_id)?;
             if !seen_stable_window_ids.insert(&window.stable_window_id) {
                 return Err(MuxRecoveryImageError::DuplicateStableWindowId(
                     window.stable_window_id.clone(),
@@ -1350,6 +1354,7 @@ impl MuxRecoveryImage {
             }
 
             for tab in &window.tabs {
+                validate_durable_identity("tab.stable_tab_id", &tab.stable_tab_id)?;
                 if !seen_tab_ids.insert(tab.tab_id) {
                     return Err(MuxRecoveryImageError::DuplicateTabId(tab.tab_id));
                 }
@@ -2130,6 +2135,18 @@ fn convert_mux_pane_node(
 // Helper Functions
 // =============================================================================
 
+fn validate_durable_identity(
+    field: &'static str,
+    value: &str,
+) -> Result<(), MuxRecoveryImageError> {
+    let identity = uuid::Uuid::parse_str(value)
+        .map_err(|_| MuxRecoveryImageError::InvalidDurableIdentity { field })?;
+    if identity.is_nil() || identity.to_string() != value {
+        return Err(MuxRecoveryImageError::InvalidDurableIdentity { field });
+    }
+    Ok(())
+}
+
 fn validate_string_len(
     field: &'static str,
     val: &str,
@@ -2240,6 +2257,71 @@ fn validate_split_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_window_and_tab_ids_require_canonical_nonnil_uuids() {
+        for window_identity in [true, false] {
+            for invalid in [
+                "",
+                "window-1",
+                "00000000-0000-0000-0000-000000000000",
+                "000000000000000000000000000000ab",
+                "00000000-0000-0000-0000-0000000000AB",
+                "urn:uuid:00000000-0000-0000-0000-0000000000ab",
+            ] {
+                let mut image = make_valid_test_image();
+                let field = if window_identity {
+                    image.topology.windows[0].stable_window_id = invalid.into();
+                    "window.stable_window_id"
+                } else {
+                    image.topology.windows[0].tabs[0].stable_tab_id = invalid.into();
+                    "tab.stable_tab_id"
+                };
+                image.image_digest = image.compute_digest().unwrap();
+                assert_eq!(
+                    image.validate().unwrap_err(),
+                    MuxRecoveryImageError::InvalidDurableIdentity { field }
+                );
+                assert!(matches!(
+                    MuxRecoveryImage::from_json_slice(&serde_json::to_vec(&image).unwrap()),
+                    Err(MuxRecoveryImageError::InvalidDurableIdentity { field: actual })
+                        if actual == field
+                ));
+            }
+        }
+        let mut image = make_valid_test_image();
+        image.topology.windows[0].stable_window_id = "00000000-0000-0000-0000-0000000000ab".into();
+        image.topology.windows[0].tabs[0].stable_tab_id =
+            "00000000-0000-0000-0000-0000000000cd".into();
+        image.image_digest = image.compute_digest().unwrap();
+        image.validate().unwrap();
+    }
+
+    #[test]
+    fn canonical_durable_id_duplicates_are_rejected_across_numeric_identities() {
+        let mut image = make_valid_test_image();
+        let mut duplicate = image.topology.windows[0].clone();
+        duplicate.window_id += 1;
+        duplicate.tabs.clear();
+        let expected = duplicate.stable_window_id.clone();
+        image.topology.windows.push(duplicate);
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::DuplicateStableWindowId(expected)
+        );
+
+        let mut image = make_valid_test_image();
+        let mut duplicate = image.topology.windows[0].tabs[0].clone();
+        duplicate.tab_id += 1;
+        let expected = duplicate.stable_tab_id.clone();
+        image.topology.windows[0].tabs.push(duplicate);
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::DuplicateStableTabId(expected)
+        );
+    }
 
     #[test]
     fn window_recovery_metadata_is_required_and_prior_schema_is_rejected() {
@@ -2448,7 +2530,7 @@ mod tests {
 
         let tab = RecoveryTab {
             tab_id: 10,
-            stable_tab_id: "uuid-tab-10".to_string(),
+            stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
             title: "main_tab".to_string(),
             working_dir: Some("/project".to_string()),
             size: TerminalSize {
@@ -2475,7 +2557,7 @@ mod tests {
 
         let window = RecoveryWindow {
             window_id: 100,
-            stable_window_id: "uuid-window-100".to_string(),
+            stable_window_id: "00000000-0000-0000-0000-000000000100".to_string(),
             workspace: "default".to_string(),
             title: "recovery window".to_string(),
             last_active_tab_id: None,
@@ -2554,11 +2636,19 @@ mod tests {
         assert!(image.find_pane_by_uuid("nonexistent").is_none());
 
         assert!(image.find_window(100).is_some());
-        assert!(image.find_window_by_stable_id("uuid-window-100").is_some());
+        assert!(
+            image
+                .find_window_by_stable_id("00000000-0000-0000-0000-000000000100")
+                .is_some()
+        );
         assert!(image.find_window(999).is_none());
 
         assert!(image.find_tab(10).is_some());
-        assert!(image.find_tab_by_stable_id("uuid-tab-10").is_some());
+        assert!(
+            image
+                .find_tab_by_stable_id("00000000-0000-0000-0000-000000000010")
+                .is_some()
+        );
         assert!(image.find_tab(999).is_none());
 
         let tab = image.find_tab(10).unwrap();
@@ -2865,7 +2955,7 @@ mod tests {
         let mut image = make_valid_test_image();
         let mut dup_tab = image.topology.windows[0].tabs[0].clone();
         dup_tab.tab_id = 11;
-        dup_tab.stable_tab_id = "uuid-tab-11".to_string();
+        dup_tab.stable_tab_id = "00000000-0000-0000-0000-000000000011".to_string();
         dup_tab.floating_panes.clear();
         dup_tab.floating_focus = None;
         dup_tab.pane_stacks.clear();
@@ -3117,7 +3207,7 @@ mod tests {
 
         let tab = RecoveryTab {
             tab_id: 10,
-            stable_tab_id: "uuid-tab-10".to_string(),
+            stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
             title: "tree_tab".to_string(),
             working_dir: None,
             size: TerminalSize::default(),
@@ -3149,7 +3239,7 @@ mod tests {
                 }],
                 windows: vec![RecoveryWindow {
                     window_id: 100,
-                    stable_window_id: "win-100".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000100".to_string(),
                     workspace: "default".to_string(),
                     title: String::new(),
                     last_active_tab_id: None,
@@ -3254,7 +3344,7 @@ mod tests {
     fn test_negative_duplicate_window_id() {
         let mut image = make_valid_test_image();
         let mut dup_win = image.topology.windows[0].clone();
-        dup_win.stable_window_id = "uuid-window-other".to_string();
+        dup_win.stable_window_id = "00000000-0000-0000-0000-000000000101".to_string();
         image.topology.windows.push(dup_win);
         image.image_digest = image.compute_digest().unwrap();
 
@@ -3266,7 +3356,7 @@ mod tests {
     fn test_negative_duplicate_tab_id() {
         let mut image = make_valid_test_image();
         let mut dup_tab = image.topology.windows[0].tabs[0].clone();
-        dup_tab.stable_tab_id = "uuid-tab-other".to_string();
+        dup_tab.stable_tab_id = "00000000-0000-0000-0000-000000000011".to_string();
         dup_tab.root_split = None;
         dup_tab.floating_panes.clear();
         dup_tab.pane_stacks.clear();

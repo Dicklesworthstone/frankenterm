@@ -13620,13 +13620,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 10,
-                    stable_tab_id: "tab-10".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
                     title: "dev".to_string(),
                     working_dir: Some("/app".to_string()),
                     size: term_size1,
@@ -13686,6 +13686,38 @@ mod tests {
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("root verification must succeed");
+
+        // Authentication alone cannot make an invalid durable topology identity
+        // safe for reconstruction. Re-encrypt each malformed model so the
+        // structural identity check, rather than an AEAD/digest failure, rejects it.
+        for window_identity in [true, false] {
+            for invalid in [
+                "window-1",
+                "00000000-0000-0000-0000-000000000000",
+                "00000000000000000000000000000001",
+            ] {
+                let mut changed = image.clone();
+                let field = if window_identity {
+                    changed.topology.windows[0].stable_window_id = invalid.into();
+                    "window.stable_window_id"
+                } else {
+                    changed.topology.windows[0].tabs[0].stable_tab_id = invalid.into();
+                    "tab.stable_tab_id"
+                };
+                changed.image_digest = changed.compute_digest().unwrap();
+                let manifest_bytes = encrypted_test_image(&changed);
+                let mut changed_candidate = candidate.clone();
+                changed_candidate.manifest_sha256 = sha256_hex(&manifest_bytes);
+                changed_candidate.file_len = manifest_bytes.len() as u64;
+                changed_candidate.manifest_bytes = manifest_bytes;
+                assert!(matches!(
+                    verifier.verify_root(&changed_candidate, &store),
+                    Err(WholeMuxRecoveryError::Image(
+                        MuxRecoveryImageError::InvalidDurableIdentity { field: actual }
+                    )) if actual == field
+                ));
+            }
+        }
 
         // These roots are correctly encrypted and rehashed. The independent
         // terminal object is unchanged: projection disagreement must be rejected
@@ -13869,13 +13901,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14032,13 +14064,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14139,13 +14171,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 2,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14373,13 +14405,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14515,13 +14547,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14704,13 +14736,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14903,13 +14935,13 @@ mod tests {
             windows: vec![
                 RecoveryWindow {
                     window_id: 1,
-                    stable_window_id: "win-1".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     workspace: "workspace-1".to_string(),
                     order_revision: 1,
                     gui_position: None,
                     tabs: vec![RecoveryTab {
                         tab_id: 88,
-                        stable_tab_id: "tab-88".to_string(),
+                        stable_tab_id: "00000000-0000-0000-0000-000000000088".to_string(),
                         title: "tab-alpha".to_string(),
                         working_dir: Some("/app/alpha".to_string()),
                         size: term_size1,
@@ -14931,13 +14963,13 @@ mod tests {
                 },
                 RecoveryWindow {
                     window_id: 2,
-                    stable_window_id: "win-2".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000002".to_string(),
                     workspace: "workspace-2".to_string(),
                     order_revision: 2,
                     gui_position: None,
                     tabs: vec![RecoveryTab {
                         tab_id: 99,
-                        stable_tab_id: "tab-99".to_string(),
+                        stable_tab_id: "00000000-0000-0000-0000-000000000099".to_string(),
                         title: "tab-beta".to_string(),
                         working_dir: Some("/app/beta".to_string()),
                         size: term_size2,
@@ -15119,13 +15151,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15342,13 +15374,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15635,13 +15667,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15771,13 +15803,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
