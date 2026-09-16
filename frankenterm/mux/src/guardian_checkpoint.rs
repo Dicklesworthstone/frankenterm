@@ -1324,42 +1324,21 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
     /// into catalog admission. This one-time split lets manifest sealing and
     /// durable catalog publication consume distinct capabilities without ever
     /// cloning or reissuing the authenticated Spawn permit.
+    /// The live witness additionally proves a zero parser watermark; its
+    /// canonical model uses the same complete geometry checks as staged input.
     pub fn from_genesis_spawn_permit(
         binding: &GuardianCheckpointStageBindingV1,
         permit: GuardianCheckpointGenesisSpawnPermitV1,
         terminal_checkpoint: &RecoveryTerminalCheckpointV2,
     ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
-        let reservation = permit.into_reservation_identity();
-        let spawn_effect_id = reservation.spawn_effect_id();
-        let authoritative_descriptor =
-            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
-                spawn_effect_id,
-                terminal_checkpoint,
-            )?;
-        if !binding.descriptor.origin.is_genesis() {
-            return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
+        if terminal_checkpoint.parser_stream_bytes() != 0 {
+            return Err(GuardianCheckpointBoundaryError::GenesisParserWatermark);
         }
-        if binding.descriptor.origin.spawn_effect_id() != Some(spawn_effect_id) {
-            return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
-        }
-        if binding.descriptor != authoritative_descriptor
-            || reservation.checkpoint_identity_digest()
-                != authoritative_descriptor.recompute_checkpoint_identity_digest()?
-            || reservation.boundary_identity_digest()
-                != authoritative_descriptor.recompute_boundary_identity_digest()?
-            || u32::from(reservation.rows()) != authoritative_descriptor.rows()
-            || u32::from(reservation.cols()) != authoritative_descriptor.cols()
-        {
-            return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
-        }
-        let upload_id = reservation.upload_id();
-        Ok((
-            Self {
-                binding: *binding,
-                genesis_upload_id: Some(upload_id),
-            },
-            reservation,
-        ))
+        Self::from_staged_genesis_spawn_permit(
+            binding,
+            permit,
+            terminal_checkpoint.canonical_payload(),
+        )
     }
 
     /// Authorize the authenticated initial model for a not-yet-spawned child
@@ -11224,7 +11203,6 @@ mod tests {
             "GuardianCheckpointOrderedChunkSetIdentityV1@GuardianCheckpointOrderedChunkSetBuilderV1::finish",
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit",
-            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
@@ -12204,6 +12182,35 @@ mod tests {
                 genesis_terminal.canonical_payload(),
             ),
             Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        for change_width in [true, false] {
+            let mut wrong_pixels = staged_permit();
+            if change_width {
+                wrong_pixels.identity.pixel_width += 1;
+            } else {
+                wrong_pixels.identity.pixel_height += 1;
+            }
+            assert!(
+                matches!(
+                    GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                        &genesis_binding,
+                        wrong_pixels,
+                        &genesis_terminal,
+                    ),
+                    Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+                ),
+                "live Genesis authority must bind both pixel dimensions"
+            );
+        }
+        let nonzero_stream = record_terminal_checkpoint();
+        assert!(nonzero_stream.parser_stream_bytes() > 0);
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                &nonzero_stream,
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisParserWatermark)
         ));
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
