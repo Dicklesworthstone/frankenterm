@@ -1827,6 +1827,11 @@ impl MuxRecoveryImage {
         // 6. Build windows and tabs
         let mut captured_tabs_by_id = HashMap::new();
         for tab in &captured.tabs {
+            if tab.durable_tab_id.is_nil() {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "captured tab has no durable identity",
+                ));
+            }
             if captured_tabs_by_id.insert(tab.tab_id, tab).is_some() {
                 return Err(MuxRecoveryImageError::DuplicateTabId(tab.tab_id));
             }
@@ -1834,6 +1839,11 @@ impl MuxRecoveryImage {
 
         let mut windows = Vec::with_capacity(captured.windows.len());
         for win in &captured.windows {
+            if win.durable_window_id.is_nil() {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "captured window has no durable identity",
+                ));
+            }
             let mut tabs = Vec::with_capacity(win.ordered_tab_ids.len());
             for &tab_id in &win.ordered_tab_ids {
                 {
@@ -1900,7 +1910,7 @@ impl MuxRecoveryImage {
 
                     tabs.push(RecoveryTab {
                         tab_id: tab.tab_id,
-                        stable_tab_id: format!("tab-{}", tab.tab_id),
+                        stable_tab_id: tab.durable_tab_id.to_string(),
                         title: tab.title.clone(),
                         working_dir: None,
                         size: TerminalSize {
@@ -1944,7 +1954,7 @@ impl MuxRecoveryImage {
 
             windows.push(RecoveryWindow {
                 window_id: win.window_id,
-                stable_window_id: format!("win-{}", win.window_id),
+                stable_window_id: win.durable_window_id.to_string(),
                 workspace: win.workspace.clone(),
                 title: win.title.clone(),
                 order_revision: win.order_revision.get(),
@@ -3669,6 +3679,7 @@ mod converter_tests {
 
         let tab = mux::MuxCapturedTab {
             tab_id: 20,
+            durable_tab_id: uuid::Uuid::from_u128(0x7420),
             window_id: 10,
             title: "main".to_string(),
             size: frankenterm_term::TerminalSize {
@@ -3695,6 +3706,7 @@ mod converter_tests {
 
         let window = mux::MuxCapturedWindow {
             window_id: 10,
+            durable_window_id: uuid::Uuid::from_u128(0x7710),
             workspace: "default".to_string(),
             title: "win".to_string(),
             order_revision: mux::window::WindowOrderRevision::new(1),
@@ -3785,6 +3797,75 @@ mod converter_tests {
         assert_eq!(tab.active_pane_id, 101);
         assert!(tab.root_split.is_some());
         assert_eq!(tab.all_pane_ids(), vec![101, 102]);
+    }
+
+    #[test]
+    fn converter_uses_durable_object_identity_despite_reused_numeric_ids() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        let first = MuxRecoveryImage::from_mux_captured(
+            meta.clone(),
+            &captured,
+            &borrowed_acks(&acks),
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(
+            first.topology.windows[0].stable_window_id,
+            captured.windows[0].durable_window_id.to_string()
+        );
+        assert_eq!(
+            first.topology.windows[0].tabs[0].stable_tab_id,
+            captured.tabs[0].durable_tab_id.to_string()
+        );
+
+        // A subsequent process may reuse both numeric counters. Its different
+        // object identities must not alias the prior recovery image.
+        captured.windows[0].durable_window_id = uuid::Uuid::from_u128(0x8810);
+        captured.tabs[0].durable_tab_id = uuid::Uuid::from_u128(0x8820);
+        let second = MuxRecoveryImage::from_mux_captured(
+            meta.clone(),
+            &captured,
+            &borrowed_acks(&acks),
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(
+            first.topology.windows[0].window_id,
+            second.topology.windows[0].window_id
+        );
+        assert_eq!(
+            first.topology.windows[0].tabs[0].tab_id,
+            second.topology.windows[0].tabs[0].tab_id
+        );
+        assert_ne!(
+            first.topology.windows[0].stable_window_id,
+            second.topology.windows[0].stable_window_id
+        );
+        assert_ne!(
+            first.topology.windows[0].tabs[0].stable_tab_id,
+            second.topology.windows[0].tabs[0].stable_tab_id
+        );
+        let reopened =
+            MuxRecoveryImage::from_json_slice(&second.to_canonical_json().unwrap()).unwrap();
+        assert_eq!(reopened.topology, second.topology);
+
+        for missing_window in [true, false] {
+            let mut invalid = captured.clone();
+            if missing_window {
+                invalid.windows[0].durable_window_id = uuid::Uuid::nil();
+            } else {
+                invalid.tabs[0].durable_tab_id = uuid::Uuid::nil();
+            }
+            assert!(matches!(
+                MuxRecoveryImage::from_mux_captured(
+                    meta.clone(),
+                    &invalid,
+                    &borrowed_acks(&acks),
+                    &refs
+                ),
+                Err(MuxRecoveryImageError::InvalidCapturedTopology(_))
+            ));
+        }
     }
 
     #[test]

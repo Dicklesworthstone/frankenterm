@@ -13072,6 +13072,7 @@ mod tests {
             vec![tabs[2].tab_id(), tabs[1].tab_id()],
         )
         .unwrap();
+        let durable_window_id = mux.get_window(*window).unwrap().durable_id();
         let receipt = capture_and_publish_whole_mux_model(
             &cx,
             &mux,
@@ -13105,6 +13106,20 @@ mod tests {
         .unwrap();
         assert_eq!(restored.pane_terminals.len(), 3);
         let restored_window = &restored.topology.windows[0];
+        assert_eq!(
+            restored_window.stable_window_id,
+            durable_window_id.to_string()
+        );
+        assert_eq!(
+            restored_window
+                .tabs
+                .iter()
+                .map(|tab| tab.stable_tab_id.clone())
+                .collect::<Vec<_>>(),
+            [2, 0, 1]
+                .map(|index| tabs[index].durable_id().to_string())
+                .to_vec()
+        );
         assert_eq!(restored_window.title, "review Ω");
         assert_eq!(
             restored_window
@@ -13205,6 +13220,7 @@ mod tests {
         let tabs = (0..2)
             .map(|index| mux::MuxCapturedTab {
                 tab_id: index,
+                durable_tab_id: uuid::Uuid::from_u128(100 + index as u128),
                 window_id: 0,
                 title: String::new(),
                 size,
@@ -13247,6 +13263,7 @@ mod tests {
             }],
             windows: vec![mux::MuxCapturedWindow {
                 window_id: 0,
+                durable_window_id: uuid::Uuid::from_u128(200),
                 workspace: "default".into(),
                 title: String::new(),
                 order_revision: mux::window::WindowOrderRevision::new(1),

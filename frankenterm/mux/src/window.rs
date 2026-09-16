@@ -245,6 +245,7 @@ pub enum PrepareWindowOrderError {
 
 pub struct Window {
     id: WindowId,
+    durable_id: uuid::Uuid,
     owner: std::sync::Weak<Mux>,
     tabs: Vec<Arc<Tab>>,
     active: usize,
@@ -281,6 +282,7 @@ impl Window {
         });
         Self {
             id: crate::next_unique_usize_id(&WIN_ID, "mux window"),
+            durable_id: uuid::Uuid::new_v4(),
             owner,
             tabs: vec![],
             active: 0,
@@ -292,6 +294,12 @@ impl Window {
             workspace,
             initial_position,
         }
+    }
+
+    /// Immutable identity written into recovery images, independent of the
+    /// process-local window number. Persistence occurs at the capture boundary.
+    pub const fn durable_id(&self) -> uuid::Uuid {
+        self.durable_id
     }
 
     fn notify(&mut self, notification: MuxNotification) {
@@ -1569,6 +1577,18 @@ mod tests {
     use frankenterm_term::TerminalSize;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::convert::TryFrom;
+
+    #[test]
+    fn durable_window_identity_survives_metadata_changes_and_numeric_reuse() {
+        let mut window = Window::new(None, None);
+        let identity = window.durable_id();
+        assert!(!identity.is_nil());
+        window.set_title("renamed Ω");
+        assert_eq!(window.durable_id(), identity);
+        let mut other = Window::new(None, None);
+        other.id = window.id;
+        assert_ne!(other.durable_id(), identity);
+    }
 
     #[test]
     fn captured_last_active_identity_does_not_hide_dangling_history() {

@@ -266,6 +266,7 @@ pub struct MuxCapturedWorkspace {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MuxCapturedWindow {
     pub window_id: WindowId,
+    pub durable_window_id: uuid::Uuid,
     pub workspace: String,
     pub title: String,
     pub order_revision: WindowOrderRevision,
@@ -18475,6 +18476,7 @@ impl Mux {
 
                     window_snapshots.push(MuxCapturedWindow {
                         window_id,
+                        durable_window_id: window.durable_id(),
                         workspace: window.get_workspace().to_string(),
                         title: window.get_title().to_string(),
                         order_revision: frozen_order.order_revision(),

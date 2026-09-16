@@ -203,6 +203,7 @@ impl Fixture {
             };
             mux::MuxCapturedTab {
                 tab_id,
+                durable_tab_id: uuid::Uuid::from_u128(100 + tab_id as u128),
                 window_id: if tab_id <= 11 { 1 } else { 2 },
                 title: format!("tab-{tab_id}"),
                 size: tab_size,
@@ -238,6 +239,7 @@ impl Fixture {
             .map(
                 |(window_id, ordered_tab_ids, structural_pane_count)| mux::MuxCapturedWindow {
                     window_id,
+                    durable_window_id: uuid::Uuid::from_u128(200 + window_id as u128),
                     workspace: "default".into(),
                     title: format!("window-{window_id}"),
                     order_revision: mux::window::WindowOrderRevision::new(2),

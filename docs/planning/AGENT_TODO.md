@@ -869,7 +869,8 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Execute the regression-only baseline: strict ovh-a RCH31970 ran the
   named test on `f17a2098a` and failed at successor acquisition with
   `Io(WouldBlock)`, exactly reproducing the defect; no compile failure or skip.
-- [ ] Execute the same test on the fixed source.
+- [x] Execute the same test on fixed `caa7ddc39`: strict ovh-a proof passed
+  exactly one test; the unacquired-guard control also passed exactly one test.
 - [ ] Run all recorder stack integration tests and focused recorder unit
   tests, including initialization failure, buffered repair and fsync faults.
 - [ ] Complete final-source workspace check, Clippy, tests and formatting
@@ -896,6 +897,19 @@ power loss nor migration of those live sessions has been demonstrated.
   creation and reuse after removal.
 - [ ] Independently review and execute the mux tab-stack regressions through
   strict RCH; preserve the distinction from live restored-window publication.
+
+### 2026-09-16 — durable window and tab capture identities
+
+- [x] Replace numeric-counter-derived recovery identities with immutable UUIDs
+  minted on actual window/tab construction and retained through coherent capture.
+- [x] Reject nil captured identities; retain global duplicate-ID validation.
+  Add numeric-reuse and JSON roundtrip regressions, plus real-PTY encrypted
+  publication/reopen assertions against the original live object UUIDs.
+- [x] Obtain independent six-file source review and scoped formatting checks.
+- [ ] Run the new mux and converter tests and extended real-PTY test through
+  strict RCH on the committed source, together with prior metadata regressions.
+- [ ] Bind verified durable IDs to reconstructed successor objects in the
+  atomic whole-topology transaction. UUID capture alone does not restore a mux.
 
 ### 2026-09-16 — BOCPD warmup property boundary
 
