@@ -647,15 +647,15 @@
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 88
+        "test": 89
       },
-      "fork_side_commit_count": 619,
+      "fork_side_commit_count": 620,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-16T06:13:06-04:00",
-        "sha": "a524abff6f630bdff8e69294f83154c3da7f6f01",
-        "subject": "perf(guardian): resume authenticated replay without repeated prefix scans"
+        "classification": "test",
+        "committed_at": "2026-09-16T06:16:06-04:00",
+        "sha": "de58203ef3fe818083c05549d9ca6ab5f9541341",
+        "subject": "test(mux): qualify journal corruption fixture file opener"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2668,
-  "generated_at": "2026-09-16T10:13:46.149832Z",
+  "fork_side_commit_total": 2669,
+  "generated_at": "2026-09-16T10:19:08.185288Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

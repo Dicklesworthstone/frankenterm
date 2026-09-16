@@ -13211,11 +13211,11 @@ mod tests {
         let output = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
         let mut previous = [0; 32];
         for expected in receipts {
-            let (page, actual) =
+            let (replay_page, actual) =
                 guardian_replay_output_page(&output, expected.sequence(), previous, 4, 1)?;
             assert_eq!(actual, expected);
             let mut bytes = Vec::new();
-            for record in page.into_records() {
+            for record in replay_page.into_records() {
                 record.write_all_bounded(&mut bytes, 4)?;
             }
             assert_eq!(bytes, b"page");
