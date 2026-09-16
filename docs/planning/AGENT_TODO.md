@@ -687,7 +687,12 @@ power loss nor migration of those live sessions has been demonstrated.
   The fixture omitted the real scrollback backend installed by production
   startup. `68da4482b` preserves the typed cause, adds a missing-capability
   negative control, and installs real isolated storage; rerun is still required.
-- [ ] Verify production listener admission cannot precede storage initialization.
+- [x] Verify production Unix listener admission cannot precede storage
+  initialization: accepted connections enqueue a handoff and then dispatch
+  behind startup in the same executor FIFO. No startup ordering change needed.
+- [ ] Verify `ft-j3061`: TLS listener was constructing a local task on its
+  listener thread. Transfer the admitted authenticated stream to the main
+  executor before session construction; causal ownership/TCP test added.
 - [ ] Freeze the corrected source, refresh Mac object authority, tag RC26 and
   run DSR's four-target native build, exact-source quality and producer gates.
 - [ ] Execute final built-artifact performance/native selection/resize/font/Dock
