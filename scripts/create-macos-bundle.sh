@@ -570,6 +570,191 @@ cp "$GUARDIAN_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-pty-guardian"
 echo "Installing ft CLI..."
 cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
 
+# Resolve the native link closure before signing. Homebrew's Cairo install name
+# otherwise makes an apparently complete app depend on the packaging host.
+# Only fresh package copies are changed; Cargo artifacts and host libraries
+# remain untouched. Unresolved/ambiguous loader forms fail closed.
+python3 - "$APP_BUNDLE" "$BINARY_DIR" "$TARGET_TRIPLE" <<'PY_NATIVE_DYLIB_CLOSURE'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True, timeout=60)
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def system_library(name):
+    return name.startswith(("/usr/lib/", "/System/Library/")) and ".." not in Path(name).parts
+
+
+def macho(path, architecture):
+    if command("lipo", "-archs", str(path)).split() != [architecture]:
+        raise ValueError(f"native dependency has the wrong architecture: {path}")
+    loads, identities, rpaths = [], [], []
+    load_commands = {
+        "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB",
+        "LC_LOAD_UPWARD_DYLIB", "LC_LAZY_LOAD_DYLIB",
+    }
+    blocks = re.split(r"(?m)^Load command \d+\n", command("otool", "-l", str(path)))[1:]
+    if not blocks:
+        raise ValueError(f"native image has no readable load commands: {path}")
+    for block in blocks:
+        match = re.search(r"(?m)^\s*cmd (LC_\S+)$", block)
+        if not match:
+            raise ValueError(f"unreadable Mach-O load command: {path}")
+        kind = match[1]
+        if kind in load_commands or kind in {"LC_ID_DYLIB", "LC_RPATH"}:
+            field = "path" if kind == "LC_RPATH" else "name"
+            value = re.search(r"(?m)^\s*" + field + r" (.+) \(offset \d+\)$", block)
+            if not value or any(ord(char) < 32 for char in value[1]):
+                raise ValueError(f"unreadable native dependency path: {path}")
+            (rpaths if kind == "LC_RPATH" else identities if kind == "LC_ID_DYLIB" else loads).append(value[1])
+        elif "DYLIB" in kind:
+            raise ValueError(f"unsupported native dependency command {kind}: {path}")
+    if len(identities) > 1:
+        raise ValueError(f"multiple native library identities: {path}")
+    return loads, identities, rpaths
+
+
+def dependency_path(name, source):
+    if name.startswith("@loader_path/"):
+        candidate = source.parent / name[len("@loader_path/"):]
+    elif name.startswith("/"):
+        candidate = Path(name)
+    else:
+        # In particular, do not guess @rpath from the packager's environment.
+        raise ValueError(f"unresolved native dependency {name!r} in {source}")
+    result = candidate.resolve(strict=True)
+    if not result.is_file() or result.suffix != ".dylib":
+        raise ValueError(f"native dependency is not a regular dylib: {result}")
+    return result
+
+
+def bundle_native_dependencies(bundle, binary_dir, architecture):
+    frameworks = bundle / "Contents/Frameworks"
+    metadata = bundle / "Contents/Resources/native-dependencies"
+    roots = [binary_dir / name for name in (
+        "frankenterm-gui", "frankenterm-mux-server", "frankenterm-pty-guardian", "ft",
+    )]
+    destinations = {path: bundle / "Contents/MacOS" / path.name for path in roots}
+    pending, graph, names = list(roots), {}, {}
+    # Inspect the whole graph before changing package bytes. Canonical paths
+    # collapse Cellar/opt aliases and terminate cycles; names never pick a winner.
+    while pending:
+        source = pending.pop(0)
+        if source in graph:
+            continue
+        if len(graph) >= 256:
+            raise ValueError("native dependency closure exceeds 256 images")
+        loads, identities, rpaths = macho(source, architecture)
+        if source not in roots and not identities:
+            raise ValueError(f"native dependency has no LC_ID_DYLIB: {source}")
+        edges = {}
+        for name in loads:
+            if system_library(name):
+                continue
+            dependency = dependency_path(name, source)
+            existing = names.setdefault(dependency.name.casefold(), dependency)
+            if existing != dependency:
+                raise ValueError(f"native dependency basename collision: {existing} and {dependency}")
+            edges[name] = dependency
+            if dependency not in destinations:
+                destinations[dependency] = frameworks / dependency.name
+                pending.append(dependency)
+        graph[source] = (edges, identities, rpaths, digest(source), loads)
+
+    frameworks.mkdir()
+    metadata.mkdir()
+    receipts = []
+    for source in sorted(graph, key=str):
+        edges, identities, rpaths, source_sha256, loads = graph[source]
+        destination = destinations[source]
+        if source not in roots:
+            # Retain the actual package license notices and upstream provenance,
+            # not just the rewritten dylib. Unknown package layouts need an
+            # explicit packaging implementation rather than an unlicensed copy.
+            package = next((parent for parent in source.parents
+                            if (parent / "INSTALL_RECEIPT.json").is_file()), None)
+            if package is None:
+                raise ValueError(f"native dependency package provenance unavailable: {source}")
+            notices = sorted(path for path in package.iterdir() if path.is_file()
+                             and path.name.upper().startswith(("COPYING", "LICENSE", "LICENCE", "NOTICE")))
+            if not notices:
+                raise ValueError(f"native dependency license notices unavailable: {source}")
+            notice_dir = metadata / source.name
+            notice_dir.mkdir()
+            for path in notices + [package / "INSTALL_RECEIPT.json"]:
+                shutil.copyfile(path, notice_dir / path.name)
+            if (package / "sbom.spdx.json").is_file():
+                shutil.copyfile(package / "sbom.spdx.json", notice_dir / "sbom.spdx.json")
+            with source.open("rb") as reader, destination.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+            destination.chmod(0o755)
+        if destination.is_symlink() or not destination.is_file() or digest(destination) != source_sha256:
+            raise ValueError(f"package image differs from its source before relocation: {destination}")
+        changes = []
+        for old, dependency in sorted(edges.items()):
+            relative = os.path.relpath(destinations[dependency], destination.parent)
+            changes.extend(("-change", old, "@loader_path/" + relative))
+        if identities:
+            changes.extend(("-id", "@loader_path/" + destination.name))
+        for rpath in sorted(set(rpaths)):
+            changes.extend(("-delete_rpath", rpath))
+        if changes:
+            command("install_name_tool", *changes, str(destination))
+        receipts.append({"source": str(source), "source_sha256": source_sha256,
+                         "bundled_path": str(destination.relative_to(bundle))})
+
+    for source, destination in destinations.items():
+        loads, identities, rpaths = macho(destination, architecture)
+        edges, original_ids, _, _, original_loads = graph[source]
+        expected_loads = [
+            "@loader_path/" + os.path.relpath(destinations[edges[name]], destination.parent)
+            if name in edges else name for name in original_loads
+        ]
+        expected_ids = ["@loader_path/" + destination.name] if original_ids else []
+        if loads != expected_loads or identities != expected_ids:
+            raise ValueError(f"packaged native load commands differ from the planned closure: {destination}")
+        if rpaths:
+            raise ValueError(f"packaged native image retains a search path: {destination}")
+        for name in loads + identities:
+            if system_library(name):
+                continue
+            if not name.startswith("@loader_path/"):
+                raise ValueError(f"packaged native image retains external dependency {name}: {destination}")
+            resolved = dependency_path(name, destination)
+            if resolved not in destinations.values():
+                raise ValueError(f"packaged native dependency escapes the closure: {name}")
+        if digest(source) != graph[source][3]:
+            raise ValueError(f"native dependency source changed while packaging: {source}")
+    with (metadata / "closure.json").open("x") as handle:
+        json.dump({"schema": "ft.native-dylib-closure.v1", "images": receipts}, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+if __name__ == "__main__":
+    app, binaries, target = sys.argv[1:]
+    try:
+        bundle_native_dependencies(Path(app).resolve(), Path(binaries).resolve(),
+                                   {"aarch64-apple-darwin": "arm64", "x86_64-apple-darwin": "x86_64"}[target])
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"native dependency packaging failed: {error}") from error
+PY_NATIVE_DYLIB_CLOSURE
+
 # --- Guard (GH #70): bundled defaults must be generic/local-only (no live
 #     remote hosts, SSH keys, or proxy commands that auto-connect on first
 #     launch). Fails the bundle if the defaults regress. ---
@@ -714,6 +899,8 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --entry metadata:package-info:Contents/PkgInfo \
     --tree font:bundled-fonts:Contents/Resources/fonts \
     --tree asset:browser-runtime:Contents/Resources/browser-runtime \
+    --optional-tree asset:native-libraries:Contents/Frameworks \
+    --tree metadata:native-dependencies:Contents/Resources/native-dependencies \
     --optional-tree signature:codesign:Contents/_CodeSignature \
     --source-match Contents/Resources/frankenterm.toml=crates/frankenterm-gui/frankenterm.toml \
     --source-match Contents/Resources/frankenterm.lua=crates/frankenterm-gui/frankenterm.lua \
