@@ -12704,11 +12704,14 @@ impl BrokerPaneLeaseJournalV1 {
     ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
         validate_broker_lease_record_fields(fields)?;
         self.require_healthy_for_recovery()?;
-        if self.recovery_append_authority_withheld || self.head_reconciliation_required {
+        if self.head_reconciliation_required {
             return Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable);
         }
         if let Some(existing) = self.records.iter().find(|record| record.fields == *fields) {
             return Ok(existing.receipt);
+        }
+        if self.recovery_append_authority_withheld {
+            return Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable);
         }
         let conflicts_with_generation = self.records.iter().any(|record| {
             record.fields.phase == fields.phase
@@ -24265,7 +24268,21 @@ mod tests {
             _ => panic!("capacity-one worker did not durably apply Spawn"),
         };
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !sentinel.exists() && Instant::now() < deadline {
+        loop {
+            match fs::read(&sentinel) {
+                Ok(bytes) if bytes == b"W" => break,
+                Ok(bytes) => assert!(
+                    bytes.is_empty(),
+                    "unexpected worker Spawn count: {:?}",
+                    bytes
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read worker Spawn count: {}", error),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker child did not write its sentinel"
+            );
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
@@ -24405,6 +24422,11 @@ mod tests {
         assert_eq!(attachment.identity().lease_generation(), 1);
         assert_eq!(pane.kernel_child_identity(), child_identity);
         pane.terminate_and_wait_for_test();
+        assert_eq!(
+            fs::read(&sentinel).expect("read settled worker Spawn count"),
+            b"W",
+            "Spawn or ACK retry created another child"
+        );
     }
 
     #[test]
@@ -26430,19 +26452,15 @@ mod tests {
         );
         assert_eq!(successor_context.lease_generation, 2);
         assert_eq!(successor_context.ack_id, successor_ack_id);
-        let mut other_mux_client = BrokerControlClientV1::connect(
-            &socket_path,
-            &token_path,
-            other_mux_identity,
-            broker_build,
-        )
-        .expect("reconnect wrong-mux client for successor custody negative control");
+        assert_ne!(
+            reconnect.identity.mux_incarnation,
+            successor_context.successor.mux_incarnation
+        );
         assert!(
-            other_mux_client
+            reconnect
                 .acknowledge_successor_claim(successor_custody)
                 .is_err()
         );
-        drop(other_mux_client);
         for stage in [1, 2] {
             let token = custody_store
                 .reopen_successor_custody(&successor_context)
@@ -26453,6 +26471,22 @@ mod tests {
             assert!(successor_client.census().unwrap().entries()[0].effects_disabled);
         }
         if let Some((BrokerPaneLeaseWalPhaseV1::SuccessorRebound, fault)) = lease_scenario {
+            let observer_connection = reconnect.connection_id;
+            drop(reconnect);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while service.inspect(move |service| {
+                service.connections.values().any(|connection| {
+                    connection
+                        .hello
+                        .is_some_and(|hello| hello.connection_id == observer_connection)
+                })
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "predecessor observer socket did not retire"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             let original_connection = successor_client.connection_id;
             let mut fresh = BrokerControlClientV1::connect(
                 &socket_path,
@@ -31285,11 +31319,15 @@ mod tests {
         let mut recovered = catalog
             .scan_all_for_admission(&lease_authenticator)
             .expect("scan WAL-ahead lease catalog");
-        let [journal] = recovered.as_slice() else {
+        let [journal] = recovered.as_mut_slice() else {
             panic!("expected exactly one WAL-ahead lease journal")
         };
         assert!(journal.status().head_reconciliation_required);
         assert!(journal.status().append_authority_withheld);
+        assert!(matches!(
+            journal.fence_predecessor_and_sync(predecessor, 2, identity.initial_recovery_verifier),
+            Err(BrokerPaneLeaseWalErrorV1::RecoveryAuthorityUnavailable)
+        ));
 
         catalog
             .reconcile_recovered_read_only(&mut recovered)
