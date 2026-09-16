@@ -5089,6 +5089,25 @@ mod tests {
 
     #[test]
     fn retired_resize_completion_cannot_notify_replacement_pane() {
+        fn drain_until(
+            executor: &promise::spawn::SimpleExecutor,
+            settled: impl Fn() -> bool,
+        ) -> usize {
+            // Real pane registration/retirement also schedules callbacks. A
+            // single tick is not a completion fence for the resize waiter.
+            for ticks in 0..64 {
+                if settled() {
+                    return ticks;
+                }
+                assert!(
+                    executor.try_tick().unwrap(),
+                    "executor became idle before the expected resize completion"
+                );
+            }
+            assert!(settled(), "resize completion exceeded the bounded drain");
+            64
+        }
+
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -5128,14 +5147,24 @@ mod tests {
         mux.add_pane(&registered).unwrap();
         promise::spawn::block_on(peer.fail_next_resize_with_unknown_outcome(&inner.client))
             .unwrap();
-        executor.try_tick().unwrap();
+        let old_ticks = drain_until(&executor, || old.resize_delivery.lock().failed);
+        eprintln!(
+            "retired resize settled after {} queued callbacks",
+            old_ticks
+        );
         assert!(old.resize_delivery.lock().failed);
         assert!(!replacement.resize_delivery.lock().failed);
         assert!(notices.lock().unwrap().is_empty());
         replacement.resize(size).unwrap();
         promise::spawn::block_on(peer.fail_next_resize_with_unknown_outcome(&inner.client))
             .unwrap();
-        executor.try_tick().unwrap();
+        let replacement_ticks = drain_until(&executor, || {
+            replacement.resize_delivery.lock().failed && !notices.lock().unwrap().is_empty()
+        });
+        eprintln!(
+            "replacement resize notification settled after {} queued callbacks",
+            replacement_ticks
+        );
         assert_eq!(*notices.lock().unwrap(), vec![40]);
     }
 
