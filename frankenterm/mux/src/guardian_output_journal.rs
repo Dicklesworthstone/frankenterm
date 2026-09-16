@@ -5669,7 +5669,7 @@ mod tests {
             writer.write_all(&bytes).unwrap();
             writer.sync_all().unwrap();
             let result = journal.verify_terminal_record(receipts[1], 4);
-            assert!(result.is_err(), "{attack} must not mint delivery authority");
+            assert!(result.is_err(), "{} must not mint delivery authority", attack);
             if attack == "rehashed-ciphertext" {
                 assert!(matches!(
                     result,
