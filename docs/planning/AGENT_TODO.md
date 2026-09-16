@@ -1030,3 +1030,47 @@ power loss nor migration of those live sessions has been demonstrated.
   reply, stale owner, rotated custody and sync-failure controls. This bounded
   slice does not establish new-mux-incarnation recovery, whole-topology startup
   publication, broker restart adoption, or GUI reopen ordering.
+
+### 2026-09-16 — actual focused results and remaining implementation
+
+- [x] Execute c258 image controls: 72 passed, zero failed/ignored, 31,758
+  filtered. Execute authenticated whole-mux restoration: 15 passed, zero
+  failed/ignored, 31,815 filtered, including damaged-root RaptorQ repair.
+  These prove reconstruction behavior, not live startup or process continuity.
+- [ ] Finish the separate real-PTY capture/publication, text-read retry,
+  recovery-image integration and BOCPD regression runs on that source.
+- [x] Prove the ED2 regression fails on da375 at the stale-wrap assertion.
+  Execute fixed a2f3 CSI controls: 17 passed with serde and 17 passed without
+  it; the latter also proves the test-helper feature-gating repair.
+- [x] Execute both a2f3 Cmd-plus binding tests: two passed, zero failed/ignored,
+  730 filtered. Native default-binding acceptance still needs a final artifact.
+- [x] Commit pending native gesture capture and clipboard retention in 06fa,
+  with typed Busy/source-changed/unsupported-anchor outcomes and bounded wakeups.
+  Preserve alternate-screen and nonresident-history basic selection.
+- [x] Commit resident held-anchor preservation over unrelated output in d7fa,
+  after regression-only 7fdd. Mutations within selected rows still invalidate.
+- [ ] Execute the held-anchor negative and fixed terminal/mux/GUI regressions.
+  This implementation covers LocalPane; remote ClientPane remapping remains
+  unsupported and must not be inferred from local results.
+- [x] Execute b7d full guardian library tests: 235 passed, four failed, four
+  ignored. Retain the failures; the subsequent mux tests did not execute.
+- [ ] Fix wrong-mux reconnect rejection in two shared-fixture tests, the
+  capacity-one sentinel readiness race, and exact durable predecessor-fence
+  reopen failure. Re-run guardian and mux tests after independent review.
+- [ ] Finish the first new-mux owner rotation: existing-only encrypted custody
+  bootstrap, old outer-owner retirement, per-pane durable fence, new owner
+  claim, durable custody and acknowledgement, then runtime handle publication.
+- [ ] Prove rotation deadlines, exact outer lost-reply retries, rejected live
+  predecessors, missing/wrong credentials, and unchanged real child identity.
+  Broker connection loss after committed ACK remains a separate unproven case.
+- [ ] Connect image discovery and whole-topology prepare/commit to ordinary
+  startup before default replacement shells or public readiness are emitted.
+- [x] Diagnose repeated identical-source rebuilds: RCH refreshed every source
+  timestamp after all artifacts. Closure-bound freshness-epoch regressions now
+  pass 19 tests, including actual first-party Cargo reuse and changed-byte rebuild.
+- [ ] Complete epoch workspace check, Clippy and format, build and hash-verify
+  its remote client, then adopt it only for future proof invocations.
+- [ ] Complete final-source workspace and six-gate DSR qualification, all
+  native families, native/remote acceptance, required producer evidence,
+  publication, verification, canary and safe upgrade/installation. No release
+  is published and no existing remote mux has been restarted.
