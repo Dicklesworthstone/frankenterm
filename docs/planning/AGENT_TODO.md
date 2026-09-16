@@ -665,3 +665,31 @@ power loss nor migration of those live sessions has been demonstrated.
   provenance failures require the final committed source, not a claim of success.
 - [x] Confirm final RCH storage capacity: approximately 372 GiB durable disk free,
   140 GiB available memory; no deletion or remount needed.
+
+### 2026-09-16 10:44 UTC — executed integration results
+
+- [x] Strict four-package all-target Clippy at `7c9f43123`, RCH31829, passed
+  with warnings denied. Covers guardian, mux, server implementation and server.
+- [x] Full mux library at the same source, RCH31830: 1,190 passed, zero failed,
+  including 53 journal tests and four unpublished guardian publication tests.
+- [x] Four explicitly selected sealed guardian tests, RCH31831: four passed,
+  including actual broker output durability and original-permit retry.
+- [x] Full guardian library at `57af3ef3b`, RCH31833: 236 passed, zero failed,
+  four ignored separately exercised above. Fixed a new assertion that inspected
+  a snapshot after its final ACK had correctly retired it; work bounds remain.
+- [x] Bound within-snapshot replay and whole-request retries with authenticated
+  bookmarks. Actual request tests retain exact 1 historical / 32 interval /
+  18 terminal-frame accounting. Cross-snapshot cold scans and catalog cost remain.
+- [x] Six server reload tests passed at `57af3ef3b`, including guardian default
+  preservation and rejection before conflicting configuration mutation.
+- [ ] Finish main parser/daemon tests and both actual domain lifecycle tests.
+  RCH31835 ran both domain tests and failed activation before publication.
+  The fixture omitted the real scrollback backend installed by production
+  startup. `68da4482b` preserves the typed cause, adds a missing-capability
+  negative control, and installs real isolated storage; rerun is still required.
+- [ ] Verify production listener admission cannot precede storage initialization.
+- [ ] Freeze the corrected source, refresh Mac object authority, tag RC26 and
+  run DSR's four-target native build, exact-source quality and producer gates.
+- [ ] Execute final built-artifact performance/native selection/resize/font/Dock
+  acceptance, then publish and verify. Protected system notification still
+  blocks foreground interaction; no existing GUI or remote mux has been stopped.
