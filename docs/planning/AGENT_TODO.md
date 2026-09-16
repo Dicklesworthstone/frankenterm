@@ -1037,8 +1037,14 @@ power loss nor migration of those live sessions has been demonstrated.
   filtered. Execute authenticated whole-mux restoration: 15 passed, zero
   failed/ignored, 31,815 filtered, including damaged-root RaptorQ repair.
   These prove reconstruction behavior, not live startup or process continuity.
-- [ ] Finish the separate real-PTY capture/publication, text-read retry,
-  recovery-image integration and BOCPD regression runs on that source.
+- [x] Execute c258 real-PTY capture/publication: one passed, zero failed/ignored,
+  31,829 filtered. Execute text-read retry controls: 14 passed, zero
+  failed/ignored, 31,816 filtered, including first-retry yield without a timer.
+- [x] Execute recovery-image integration on c258: 15 passed, zero
+  failed/ignored/filtered, including authenticated repair from disk, hidden
+  stack reconstruction and active-destination refusal. Execute BOCPD: 38
+  passed, zero failed/ignored/filtered. Both ran on vmi1152480 through strict
+  RCH with the verified epoch client; this completes the focused core queue.
 - [x] Prove the ED2 regression fails on da375 at the stale-wrap assertion.
   Execute fixed a2f3 CSI controls: 17 passed with serde and 17 passed without
   it; the latter also proves the test-helper feature-gating repair.
@@ -1049,14 +1055,22 @@ power loss nor migration of those live sessions has been demonstrated.
   Preserve alternate-screen and nonresident-history basic selection.
 - [x] Commit resident held-anchor preservation over unrelated output in d7fa,
   after regression-only 7fdd. Mutations within selected rows still invalidate.
-- [ ] Execute the held-anchor negative and fixed terminal/mux/GUI regressions.
+- [x] Execute the held-anchor negative (one expected failure) and fixed terminal
+  (seven passed) and mux (13 passed) regressions. Fix soft-wrap BeforeZero
+  endpoint whitespace in 475355e16; all seven GUI regressions now pass, including
+  literal Unicode, hard-newline and real-blank-line controls.
   This implementation covers LocalPane; remote ClientPane remapping remains
   unsupported and must not be inferred from local results.
 - [x] Execute b7d full guardian library tests: 235 passed, four failed, four
   ignored. Retain the failures; the subsequent mux tests did not execute.
-- [ ] Fix wrong-mux reconnect rejection in two shared-fixture tests, the
+- [x] Fix wrong-mux reconnect rejection in two shared-fixture tests, the
   capacity-one sentinel readiness race, and exact durable predecessor-fence
-  reopen failure. Re-run guardian and mux tests after independent review.
+  reopen failure. Fix claimant census ownership and connection EOF settlement.
+- [x] Execute full mux tests at 5b21777e2: 1,197 passed, zero failed/ignored,
+  including deterministic terminal-fence-before-cleanup settlement coverage.
+- [ ] Complete guardian rerun after bb3884e3a fixes the last WAL-fault fixture's
+  observer identity. At 5b21777e2, 238 passed, one failed, four ignored; production
+  correctly excluded the predecessor after the successor claimed the pane.
 - [ ] Finish the first new-mux owner rotation: existing-only encrypted custody
   bootstrap, old outer-owner retirement, per-pane durable fence, new owner
   claim, durable custody and acknowledgement, then runtime handle publication.
@@ -1068,8 +1082,10 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Diagnose repeated identical-source rebuilds: RCH refreshed every source
   timestamp after all artifacts. Closure-bound freshness-epoch regressions now
   pass 19 tests, including actual first-party Cargo reuse and changed-byte rebuild.
-- [ ] Complete epoch workspace check, Clippy and format, build and hash-verify
-  its remote client, then adopt it only for future proof invocations.
+- [x] Complete epoch workspace check, Clippy and format, build and hash-verify
+  its remote client, then adopt it only for future proof invocations. RCH commit
+  0812d5b42; delivered client SHA-256
+  eadcd3b749d515699af84d72c0ddaf2b3276c532a9626e47692136378c238740.
 - [ ] Complete final-source workspace and six-gate DSR qualification, all
   native families, native/remote acceptance, required producer evidence,
   publication, verification, canary and safe upgrade/installation. No release
