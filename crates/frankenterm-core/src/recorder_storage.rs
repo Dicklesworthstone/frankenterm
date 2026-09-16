@@ -1082,8 +1082,62 @@ impl RecorderBlockingTestHook {
 }
 
 #[derive(Debug)]
+struct RecorderLeaseFile {
+    file: File,
+    held: bool,
+}
+
+impl RecorderLeaseFile {
+    fn new(file: File) -> Self {
+        Self { file, held: false }
+    }
+
+    fn acquire(&mut self) -> std::io::Result<()> {
+        fs2::FileExt::try_lock_exclusive(&self.file)?;
+        self.held = true;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for RecorderLeaseFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Write for RecorderLeaseFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn write_vectored(&mut self, buffers: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.file.write_vectored(buffers)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for RecorderLeaseFile {
+    fn drop(&mut self) {
+        if self.held {
+            // A forked child can retain this open-file description until exec.
+            // Closing only our descriptor would leave its flock alive. This
+            // guard owns the lease; unacquired contenders must never unlock it.
+            if fs2::FileExt::unlock(&self.file).is_err() {
+                tracing::warn!("recorder lease unlock failed during owner drop");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct AppendLogInner {
-    writer: std::io::BufWriter<File>,
+    // BufWriter flushes before dropping the guard and releasing its lease.
+    writer: std::io::BufWriter<RecorderLeaseFile>,
     writer_failed: bool,
     repair_boundary: Option<AppendRepairBoundary>,
     // Field order keeps state authority alive through the writer's final flush.
@@ -1324,24 +1378,24 @@ impl AppendLogRecorderStorage {
         let (data_dir, data_name) = recorder_parent(&config.data_path)?;
         let mut options = recorder_open_options();
         options.create(true).read(true).append(true);
-        let mut file = data_dir.open_with(&data_name, &options)?.into_std();
+        let mut file = RecorderLeaseFile::new(data_dir.open_with(&data_name, &options)?.into_std());
         if !file.metadata()?.is_file() {
             return Err(invalid_recorder_path("data path is not a regular file"));
         }
 
         // Recovery may truncate a torn tail, so acquire authority before the
-        // scan, not just before appending. BufWriter retains this exact File;
-        // failed initialization or final owner drop releases its lease without
-        // an explicit unlock that could race with a buffered final write.
+        // scan, not just before appending. BufWriter retains this exact guard;
+        // its final flush precedes explicit unlock, even if a concurrent fork
+        // keeps a duplicate descriptor alive. Initialization errors also unlock.
         // Unix flock is advisory and leaves independent indexer reads working.
         // Windows whole-file locks deny those reads; its writer authority needs
         // a separate protocol rather than silently breaking live observation.
         #[cfg(unix)]
-        fs2::FileExt::try_lock_exclusive(&file)?;
+        file.acquire()?;
 
         validate_recorder_paths(&config)?;
         let persisted = state_file.load()?;
-        let scan = scan_valid_prefix(&mut file)?;
+        let scan = scan_valid_prefix(&mut file.file)?;
         let recovered_segment_id = 0;
         let state_matches_scan = scan.matches_persisted_state(&persisted);
 
@@ -1369,7 +1423,7 @@ impl AppendLogRecorderStorage {
             recover_checkpoints_from_scan(persisted.checkpoints, recovered_segment_id, scan)
         };
 
-        file.seek(SeekFrom::End(0))?;
+        file.file.seek(SeekFrom::End(0))?;
 
         let inner = AppendLogInner {
             writer: std::io::BufWriter::new(file),
@@ -3605,7 +3659,7 @@ struct RecorderPathLease {
     parent: CapDir,
     directory: CapDir,
     name: PathBuf,
-    file: File,
+    file: RecorderLeaseFile,
 }
 
 impl RecorderPathLease {
@@ -3671,19 +3725,19 @@ fn acquire_recorder_path_leases(
         // Do not configure different per-directory case-folding policies for it.
         let mut options = recorder_open_options();
         options.create(true).read(true).write(true);
-        let file = directory.open_with(&name, &options)?.into_std();
-        let lease = RecorderPathLease {
+        let file = RecorderLeaseFile::new(directory.open_with(&name, &options)?.into_std());
+        let mut lease = RecorderPathLease {
             parent,
             directory,
             name,
             file,
         };
         lease.check()?;
-        fs2::FileExt::try_lock_exclusive(&lease.file)?;
+        lease.file.acquire()?;
         lease.check()?;
         leases.push(lease);
     }
-    // A failed acquisition drops every earlier descriptor. Sidecars deliberately
+    // A failed acquisition unlocks every earlier lease. Sidecars deliberately
     // remain: unlinking a lock name would permit a second independent inode.
     Ok(leases)
 }
@@ -3790,7 +3844,7 @@ struct AppendLogStateFile {
     state_name: PathBuf,
     temporary_name: PathBuf,
     lock_name: PathBuf,
-    lock: File,
+    lock: RecorderLeaseFile,
     path_leases: Vec<RecorderPathLease>,
     #[cfg(test)]
     fail_after_rename: std::sync::atomic::AtomicBool,
@@ -3806,14 +3860,15 @@ impl AppendLogStateFile {
         let lock_name = recorder_state_lock_path(&state_name);
         let mut options = recorder_open_options();
         options.create(true).read(true).write(true);
-        let lock = directory.open_with(&lock_name, &options)?.into_std();
+        let mut lock =
+            RecorderLeaseFile::new(directory.open_with(&lock_name, &options)?.into_std());
         let metadata = CapMetadata::from_file(&lock)?;
         if !metadata.is_file() || recorder_link_count(&metadata)? != 1 {
             return Err(invalid_recorder_path(
                 "recorder state lock must be a uniquely linked regular file",
             ));
         }
-        fs2::FileExt::try_lock_exclusive(&lock)?;
+        lock.acquire()?;
         let state_file = Self {
             directory,
             directory_sync,
@@ -8095,6 +8150,31 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unacquired_writer_lease_guard_never_unlocks_a_shared_description() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lease");
+        let mut owner = RecorderLeaseFile::new(File::create(&path).unwrap());
+        owner.acquire().unwrap();
+        let inherited = owner.try_clone().unwrap();
+        // Even a duplicate of the actual locked OFD conveys no guard authority.
+        drop(RecorderLeaseFile::new(inherited.try_clone().unwrap()));
+        let mut contender = RecorderLeaseFile::new(File::open(&path).unwrap());
+        assert_eq!(
+            contender.acquire().unwrap_err().raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(contender);
+        let mut successor = RecorderLeaseFile::new(File::open(&path).unwrap());
+        assert!(successor.acquire().is_err());
+        drop(owner);
+        successor.acquire().unwrap();
+        drop(inherited);
+        let mut rejected = RecorderLeaseFile::new(File::open(&path).unwrap());
+        assert!(rejected.acquire().is_err());
+    }
+
     #[test]
     fn owned_repair_preserves_buffered_receipts_and_removes_failed_batch_suffix() {
         run_async_test(async {
@@ -8381,7 +8461,7 @@ recorder_backend = "frankensqlite"
                 // write (capacity 1) or the buffered flush (capacity 8192).
                 storage.inner.lock().await.writer = std::io::BufWriter::with_capacity(
                     capacity,
-                    File::open(&config.data_path).unwrap(),
+                    RecorderLeaseFile::new(File::open(&config.data_path).unwrap()),
                 );
                 assert!(matches!(
                     storage.append_batch(request("failed")).await,

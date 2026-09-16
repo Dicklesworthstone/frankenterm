@@ -853,3 +853,21 @@ power loss nor migration of those live sessions has been demonstrated.
   including stable window/tab identities, titles, tab-stack membership/visible
   member and last-active history. Inert image reconstruction is not live
   successor recovery; preserve that distinction in release claims.
+
+### 2026-09-16 — recorder handoff with inherited descriptors
+
+- [x] Diagnose RCH31929's recorder handoff failure after owner drop. Concurrent
+  process creation can retain duplicated open-file descriptions and their
+  close-only advisory locks across the intended handoff (`ft-jgq83`).
+- [x] Retain an isolated regression-only commit, `f17a2098a`, which holds all
+  six duplicate descriptors open while requiring buffered bytes to flush and
+  the successor to acquire ownership. This is an intentional negative control.
+- [x] Implement acquired-only lease guards for data, state and path locks;
+  preserve final buffered-write ordering and report unlock failures. Add a
+  control proving that an unacquired guard cannot unlock another owner.
+- [ ] Execute the regression-only baseline and require the named test's
+  `WouldBlock` failure, then execute the same test on the fixed source.
+- [ ] Run all recorder stack integration tests and focused recorder unit
+  tests, including initialization failure, buffered repair and fsync faults.
+- [ ] Complete final-source workspace check, Clippy, tests and formatting
+  through strict RCH before tagging or starting another native release build.

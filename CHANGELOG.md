@@ -55,6 +55,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - A failed render batch reports that resynchronization is required instead of silently retrying after discarding partial output. MCP test transports now leave their runtime reactor free to drive real mux operations, matching the production transport path.
 
 - OSC parsing preserves leading empty fields across parsing and rendering.
+- Recorder writer leases release after the final buffered flush, so inherited file descriptors do not keep a completed writer's locks alive. Failed contenders cannot release another writer's lease.
 
 The `0.15.6-rc.29` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
