@@ -248,7 +248,7 @@ fn test_full_first_row_erases_sever_only_destroyed_history_continuations() {
         let predecessor = term.screen().phys_row(0) - 1;
         assert!(term.screen().all_lines()[predecessor].last_cell_was_wrapped());
         term.print(erase);
-        assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        std::assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
         assert!(!term.screen().all_lines()[predecessor].last_cell_was_wrapped());
     }
     for erase in ["\x1b[1;3H\x1b[J", "\x1b[1;2H\x1b[1J"] {
@@ -256,7 +256,7 @@ fn test_full_first_row_erases_sever_only_destroyed_history_continuations() {
         term.print("abcdefghijk");
         let predecessor = term.screen().phys_row(0) - 1;
         term.print(erase);
-        assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        std::assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
         assert!(
             term.screen().all_lines()[predecessor].last_cell_was_wrapped(),
             "partial erase retains the surviving history continuation"
