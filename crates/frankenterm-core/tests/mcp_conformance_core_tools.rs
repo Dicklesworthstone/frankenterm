@@ -351,7 +351,8 @@ fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> Framewo
             .with_env_filter("frankenterm_core::mcp::mcp_tools=debug")
             .with_test_writer()
             .finish();
-        let _trace_guard = tracing::subscriber::set_default(subscriber);
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build MCP test runtime");
@@ -360,9 +361,13 @@ fn spawn_client_with_config(config: Config, db_path: Option<PathBuf>) -> Framewo
             let server = build_server_with_db(&cx, &config, db_path)
                 .await
                 .expect("build MCP server");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join MCP transport worker")
+            .expect("run MCP transport");
         });
     });
 

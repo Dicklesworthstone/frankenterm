@@ -142,9 +142,15 @@ fn spawn_client(config: &Config, db_path: Option<PathBuf>) -> OwnedTestClient {
             let server = build_server_with_db(&cx, &config, db_path)
                 .await
                 .expect("build MCP server");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            // The synchronous transport pump must not occupy the only runtime
+            // driver: live mux operations need that driver's reactor and timers.
+            // Await settlement just as the production stdio server does.
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("MCP transport worker must settle")
+            .expect("run MCP transport");
         });
     });
 
@@ -205,6 +211,11 @@ impl LiveTxFixture {
         use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc};
         use std::sync::Arc;
         use std::time::Duration;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
 
         let layout = config.workspace_layout(None).unwrap();
         assert_eq!(
@@ -326,7 +337,42 @@ impl LiveTxFixture {
                     {
                         break;
                     }
-                    assert!(Instant::now() < deadline, "live pane not ready: {state:?}");
+                    if Instant::now() >= deadline {
+                        // Read only this fixture's real PTY after the readiness
+                        // deadline. Distinguish absent shell output from a
+                        // broken observer without changing the readiness oracle.
+                        let output = self
+                            .mux
+                            .client()
+                            .get_text_with_cx(&cx, pane_id, false)
+                            .await;
+                        let mut direct = frankenterm_core::vendored::DirectMuxClient::connect_with_cx(
+                            &cx,
+                            frankenterm_core::vendored::DirectMuxClientConfig::default()
+                                .with_socket_path(self.mux.socket_path().to_path_buf()),
+                        )
+                        .await
+                        .expect("owned diagnostic render connection");
+                        for poll in 0..3 {
+                            let changes = direct
+                                .get_pane_render_changes_with_cx(&cx, pane_id)
+                                .await
+                                .expect("owned diagnostic render poll");
+                            let (lines, _) = changes.bonus_lines.extract_data();
+                            eprintln!(
+                                "LIVE_TX_RENDER poll={poll} seqno={} dirty_ranges={} bonus_lines={} ready_marker={}",
+                                changes.seqno,
+                                changes.dirty_lines.len(),
+                                lines.len(),
+                                lines.iter().any(|(_, line)| line.as_str().contains("TX_READY"))
+                            );
+                            sleep_with_cx(&cx, Duration::from_millis(25)).await.unwrap();
+                        }
+                        panic!(
+                            "live pane not ready: {state:?}; persisted_segments={}; owned_pty={output:?}",
+                            segments.len()
+                        );
+                    }
                     sleep_with_cx(&cx, Duration::from_millis(25)).await.unwrap();
                 }
             }

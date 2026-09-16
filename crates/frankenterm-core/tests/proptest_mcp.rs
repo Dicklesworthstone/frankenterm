@@ -58,9 +58,12 @@ fn spawn_client(db_path: Option<PathBuf>) -> (ClientHarness, ServerSnapshot) {
                     template_uris: template_uris(server.resource_templates()),
                 })
                 .expect("publish MCP metadata");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join MCP transport worker")
+            .expect("run MCP transport");
         });
     });
     // Own cleanup before receiving metadata so startup failures also join.

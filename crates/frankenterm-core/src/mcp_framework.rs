@@ -1117,7 +1117,11 @@ mod server_compat_tests {
             runtime.block_on(async {
                 let cx = crate::cx::Cx::current().expect("runtime-owned server context");
                 owner_tx.send(cx.clone()).expect("test owner receiver");
-                server.run_transport_returning_with_cx(&cx, transport)
+                crate::runtime_async::spawn_blocking(move || {
+                    server.run_transport_returning_with_cx(&cx, transport)
+                })
+                .await
+                .expect("join server transport worker")
             })
         });
         let cx = owner_rx

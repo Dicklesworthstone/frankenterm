@@ -743,3 +743,59 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Qualify all four attestation producers and create the complete RC26
   retained manifest before the sixth DSR quality gate; its required input
   is currently absent. No release tag or published artifact exists yet.
+
+### 2026-09-16 15:47 UTC — live capture failure blocks release qualification
+
+- [x] Freeze `6821ca353bacda1a771e2f5daa5215620407022b` as local RC26.
+  Guardian 236 tests, proxy 47 tests, four Claim fault cases and two actual
+  Domain cases passed remotely. This does not prove successor recovery or
+  survival of power loss. RC26 has not been published.
+- [x] Run the normal Doctor command family: 31,812 core tests and all 16
+  integration targets passed, plus CLI parity 1, workflow 10 and redaction 1.
+  The three explicitly ignored live-mux tests subsequently failed; the
+  normal suite alone does not qualify Doctor.
+- [x] Execute the real fsync fault test: one passed with all 15 injection
+  controls. Retain the distinction between syscall failure and power loss.
+- [x] Build and collect RC26 native Mac and Linux x86 archives through DSR.
+- [x] Complete the Linux ARM build through DSR.
+- [ ] Complete the running Windows build. These frozen RC26
+  artifacts remain unqualified after the newly diagnosed capture defect.
+- [x] Diagnose `ft-btf5n`: serial-0 initial output precedes a retry-safe
+  correlated snapshot rejection; client error cleanup deletes that output,
+  although the server has already advanced its stream baseline.
+- [x] Verify the FIFO-preserving fix with exact packet-order tests and
+  exhausted retries. RCH31894 passed the new socket regression.
+- [x] Run all three owned live-mux transaction tests after fixing the fixture
+  reactor: RCH31892 passed 3/3 with actual PTY, rollback, persistence and clean
+  shutdown assertions. Final source-family qualification remains separate.
+- [x] Confirm the corrected FIFO path clears the original live readiness
+  failure. RCH31888 reached MCP transaction dispatch, then exposed a separate
+  test-harness reactor starvation; it was cancelled, not counted as a pass.
+- [x] Verify `ft-6hnol`: run synchronous MCP transport pumps on the blocking
+  pool while awaiting settlement on the owning runtime. The sole-thread
+  fixture prevented live socket operations from progressing; production
+  already uses the correct pattern. Preserve every response and EOF assertion.
+- [x] Run the repaired MCP integration targets: RCH31894 passed all 14
+  targets, 105 tests. Its core library ran 31,812 passed and two failed:
+  missing desired-revision setup in the new fallback test and an old batch
+  error expectation. RCH31896 subsequently passed all five exact regression
+  tests, including both corrected controls and the independent batch guard.
+- [x] Verify `ft-dxim8`: preserve polling fallback after a failed stream,
+  enforce source drain, and reject stale predecessor authority.
+- [x] Finish and verify `ft-ga70o`: prevent failed render batches from silently
+  becoming successful retries after discarding admitted output.
+- [ ] Verify `ft-2b10v`: remove Windows-only unused bindings by gating Unix
+  bookmark authority and retaining metadata validation on every platform.
+  Source review passed; final-source tests and native Windows build remain.
+- [ ] Run focused unit suites and Clippy on the combined fixes, then freeze
+  the next candidate. Keep RC26 tags and historical receipts immutable.
+- [ ] Complete current-source panic-profile subprocess proof, manifest
+  completeness and actual Lindley measurement with the final native family.
+- [ ] Qualify four producers and retain the complete 32-slot manifest, then
+  run all six DSR quality gates and sign/verify the final proof bundle.
+- [ ] Validate the final Mac app's selection, resize/reflow, fixed-window
+  font sizing and latency. Foreground automation still requires clearance of
+  the protected notification; never bypass the refusal.
+- [ ] Publish through DSR, verify release/canary/upgrade, and perform the
+  supported session-preserving installation and Dock verification. Existing
+  GUI/local PTYs and remote mux processes must remain protected.

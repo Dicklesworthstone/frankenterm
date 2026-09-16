@@ -51,8 +51,10 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - The guardian broker's Spawn acknowledgment requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Explicit guardian-domain opt-in now connects fresh child creation, durable output, terminal replay and mux pane publication. Cancellation retires the pane lease without terminating the child; an unpublished birth prevents another spawn until reconciled. This does not migrate existing sessions or enable successor attachment, guardian restart recovery, or full mux recovery.
 - Broker output acknowledgements authenticate the exact durable terminal journal record instead of rereading every earlier record. Foreign receipts, corruption, truncation and poisoned storage remain errors.
 - Fenced text replies report the exact captured layout range, so a clamped or rebased history read cannot be accepted as the originally requested range.
+- Capture retains output already received from the mux when a concurrent terminal change rejects the correlated snapshot. Bounded retries no longer lose the initial screen, and failed streaming bindings retain their polling fallback after the old source drains.
+- A failed render batch reports that resynchronization is required instead of silently retrying after discarding partial output. MCP test transports now leave their runtime reactor free to drive real mux operations, matching the production transport path.
 
-The `0.15.6-rc.26` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.27` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.

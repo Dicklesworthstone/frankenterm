@@ -177,9 +177,12 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
                 None => build_server_degraded(&cx, &config).await,
             }
             .expect("build MCP server");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join MCP transport worker")
+            .expect("run MCP transport");
         });
     });
 
