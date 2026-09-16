@@ -2,14 +2,17 @@
 //!
 //! This module owns the mutation-sequence actor, consuming checkpoint/output
 //! replay, the resumable replay-tail reader, and the portable-pty proxy facets.
-//! It still does not claim panes, choose a production guardian, rebuild the
-//! window/tab topology manifest, or publish a [`LocalPane`]. The explicit
-//! production selector therefore remains fail-closed: replay can return only
-//! an off-topology [`ActivatedGuardianProxy`], and mux registration stays a
-//! separate caller-owned commit boundary.
+//! [`GuardianDomain`] explicitly selects a configured guardian for same-session
+//! Genesis births, claims and restores each pane before publication, and fences
+//! further births after an unadopted outcome. It does not reconstruct successor
+//! ownership or window/tab topology after restart. Replay first returns an
+//! off-topology [`ActivatedGuardianProxy`]; registration remains a separate
+//! cancellation-safe mux commit boundary.
 
 use frankenterm_pty_guardian::{GuardianClaimedPaneLease, GuardianClient, GuardianClientError};
-use mux::domain::DomainId;
+use mux::domain::{
+    Domain, DomainId, DomainState, GuardianPanePublicationReceipt, LocalDomain, UnpublishedPane,
+};
 use mux::guardian_checkpoint::LiveParserCheckpointAck;
 use mux::guardian_protocol::{
     GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
@@ -35,6 +38,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -56,6 +60,272 @@ const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Explicit, same-incarnation guardian spawning. This is not a successor or
+/// restart attachment domain: an unadopted birth fences further spawning.
+pub struct GuardianDomain {
+    commands: LocalDomain,
+    owner: std::sync::Weak<mux::Mux>,
+    mux_incarnation: Uuid,
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    admission: Arc<AtomicBool>,
+    state: Arc<Mutex<GuardianDomainState>>,
+}
+
+#[derive(Default)]
+struct GuardianDomainState {
+    census: Option<Arc<GuardianCensusCoordinator>>,
+    unadopted_birth: Option<(Uuid, Uuid, Uuid)>,
+    publication: Option<GuardianPanePublicationReceipt>,
+}
+
+struct GuardianDomainSpawnAdmission(Arc<AtomicBool>);
+
+struct GuardianDomainSpawnCancellation(Arc<AtomicBool>);
+
+impl Drop for GuardianDomainSpawnCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for GuardianDomainSpawnAdmission {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl GuardianDomain {
+    pub fn new(
+        mux: &Arc<mux::Mux>,
+        socket_path: PathBuf,
+        token_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let (session, _) = mux.topology_snapshot_authority()?;
+        Ok(Self {
+            commands: LocalDomain::new("guardian")?,
+            owner: Arc::downgrade(mux),
+            mux_incarnation: Uuid::from_bytes(session.as_bytes()),
+            socket_path,
+            token_path,
+            admission: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(GuardianDomainState::default())),
+        })
+    }
+
+    fn validate_owner(&self, mux: &Arc<mux::Mux>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, mux))
+                && Uuid::from_bytes(mux.topology_snapshot_authority()?.0.as_bytes())
+                    == self.mux_incarnation,
+            "guardian domain belongs to another mux session"
+        );
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Domain for GuardianDomain {
+    async fn spawn_pane(
+        &self,
+        mux: &Arc<mux::Mux>,
+        size: wezterm_term::TerminalSize,
+        command: Option<portable_pty::CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<Arc<dyn mux::pane::Pane>> {
+        self.spawn_unpublished_pane(mux, size, command, command_dir)
+            .await?
+            .publish(mux)
+    }
+
+    async fn spawn_unpublished_pane(
+        &self,
+        mux: &Arc<mux::Mux>,
+        size: wezterm_term::TerminalSize,
+        command: Option<portable_pty::CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<UnpublishedPane> {
+        self.validate_owner(mux)?;
+        anyhow::ensure!(
+            self.admission
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "guardian domain already has a spawn in flight"
+        );
+        let admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
+        {
+            let mut state = self.state.lock();
+            if let Some((pane, request, effect)) = state.unadopted_birth {
+                anyhow::ensure!(
+                    state
+                        .publication
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.was_published()),
+                    "guardian domain retains an unadopted birth: pane={pane} request={request} effect={effect}"
+                );
+                state.unadopted_birth = None;
+                state.publication = None;
+            }
+        }
+        let pane_id = mux::pane::alloc_pane_id()?;
+        let command = self
+            .commands
+            .build_command(mux, command, command_dir, pane_id)
+            .await?;
+        self.validate_owner(mux)?;
+        let domain_id = self.domain_id();
+        let pane = Uuid::new_v4();
+        let request = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let description = "guardian-owned command".to_string();
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(config::TermConfig::new_for_pane(
+            pane_id,
+            domain_id,
+            *pane.as_bytes(),
+            description.clone(),
+        ));
+        let pty_size = PtySize {
+            rows: size.rows.try_into()?,
+            cols: size.cols.try_into()?,
+            pixel_width: size.pixel_width.try_into()?,
+            pixel_height: size.pixel_height.try_into()?,
+        };
+        validate_pty_size(pty_size)?;
+        let socket = self.socket_path.clone();
+        let token = self.token_path.clone();
+        let mux_incarnation = self.mux_incarnation;
+        let state = Arc::clone(&self.state);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = GuardianDomainSpawnCancellation(Arc::clone(&cancelled));
+        let result = promise::spawn::spawn_into_new_thread(move || {
+            let _admission = admission;
+            anyhow::ensure!(
+                !cancelled.load(Ordering::Acquire),
+                "guardian spawn cancelled before connection"
+            );
+            let mut client = GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation)?;
+            // Establish all avoidable connection state before creating a child.
+            let census = {
+                let mut state = state.lock();
+                if let Some(census) = &state.census {
+                    anyhow::ensure!(
+                        census.guardian_incarnation() == client.guardian_incarnation(),
+                        "guardian incarnation changed within this domain"
+                    );
+                    Arc::clone(census)
+                } else {
+                    let census = Arc::new(GuardianCensusCoordinator::connect(
+                        &socket,
+                        &token,
+                        client.guardian_incarnation(),
+                        mux_incarnation,
+                    )?);
+                    state.census = Some(Arc::clone(&census));
+                    census
+                }
+            };
+            let checkpoint = Terminal::new(
+                size,
+                Arc::clone(&config),
+                "FrankenTerm",
+                config::wezterm_version(),
+                Box::new(io::sink()),
+            )
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())?;
+            let descriptor =
+                GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &checkpoint)?;
+            client.stage_genesis_checkpoint(
+                effect,
+                descriptor,
+                checkpoint.canonical_payload(),
+                GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+            )?;
+            anyhow::ensure!(
+                !cancelled.load(Ordering::Acquire),
+                "guardian spawn cancelled before birth"
+            );
+            // From this point a lost response may hide a real child. Keep exact
+            // identities until ownership has reached the cancellation-safe guard.
+            state.lock().unadopted_birth = Some((pane, request, effect));
+            let started = Instant::now();
+            let mut attempts = 0;
+            let reply = loop {
+                attempts += 1;
+                match client.spawn(pane, request, effect, command.clone(), pty_size) {
+                    Ok(reply) => break reply,
+                    Err(GuardianClientError::Io(_))
+                        if attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
+                    {
+                        // Only replay the identical idempotent request after transport
+                        // loss. Each exchange keeps its own transport timeout; this
+                        // elapsed limit admits retries, not a hard total deadline.
+                        thread::sleep(Duration::from_millis(10));
+                        client =
+                            GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation)?;
+                        anyhow::ensure!(
+                            client.guardian_incarnation() == census.guardian_incarnation(),
+                            "guardian incarnation changed during birth reconciliation"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            anyhow::ensure!(
+                reply
+                    == (GuardianReply::Spawned {
+                        pane_id: pane,
+                        generation: 0
+                    }),
+                "guardian returned an unexpected birth receipt"
+            );
+            let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)?
+                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())?
+                .restore_and_activate(config, TerminalCheckpointLimits::default())?;
+            let unpublished = UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
+                pane_id,
+                domain_id,
+                description,
+            ))?;
+            // The read-only receipt can become true only after actual mux
+            // publication. Cancellation keeps it false; successful publication
+            // remains remembered even after a short-lived pane is pruned.
+            state.lock().publication = unpublished.guardian_publication_receipt();
+            Ok(unpublished)
+        })
+        .await;
+        drop(cancellation);
+        result
+    }
+
+    fn domain_id(&self) -> DomainId {
+        self.commands.domain_id()
+    }
+    fn domain_name(&self) -> &str {
+        self.commands.domain_name()
+    }
+    fn detachable(&self) -> bool {
+        false
+    }
+    fn detach(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "guardian domain detach is not implemented; pane lease retirement remains explicit"
+        )
+    }
+    fn state(&self) -> DomainState {
+        DomainState::Attached
+    }
+    async fn attach(
+        &self,
+        mux: &Arc<mux::Mux>,
+        _owner: Option<Arc<mux::client::ClientId>>,
+        _window: Option<mux::window::WindowId>,
+    ) -> anyhow::Result<()> {
+        self.validate_owner(mux)
+    }
+}
 
 /// Maximum age of one guardian-scoped census snapshot used by child facets.
 ///
@@ -4791,6 +5061,257 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
     use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn guardian_domain_real_birth_publishes_output_and_cancellation_retires_only_lease() {
+        use frankenterm_pty_guardian::provision_guardian_token;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct StopOwnedServices {
+            children: Vec<std::process::Child>,
+            release: PathBuf,
+            births: PathBuf,
+            finished: PathBuf,
+        }
+        impl Drop for StopOwnedServices {
+            fn drop(&mut self) {
+                // Both fixture children also self-exit after a finite wait, so
+                // an assertion cannot strand a broker reader on an immortal child.
+                let _ = std::fs::write(&self.release, b"release");
+                let settle = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < settle {
+                    let births = std::fs::metadata(&self.births).map_or(0, |meta| meta.len());
+                    let finished = std::fs::metadata(&self.finished).map_or(0, |meta| meta.len());
+                    if finished >= births {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                for child in &mut self.children {
+                    let _ = child.kill();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+
+        frankenterm_pty_guardian::guardian_runtime_build_identity()
+            .expect("real domain proof requires sealed candidate identity");
+        let executable = std::env::var_os("FT_GUARDIAN_TEST_EXECUTABLE").expect(
+            "set FT_GUARDIAN_TEST_EXECUTABLE to the same-source sealed guardian executable",
+        );
+        let directory = tempfile::Builder::new()
+            .prefix("ft-domain-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let broker_dir = directory.join("broker");
+        let spawn_catalog = broker_dir.join("spawn-catalog");
+        let lease_catalog = broker_dir.join("lease-catalog");
+        for path in [&broker_dir, &spawn_catalog, &lease_catalog] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let token = directory.join("token");
+        let broker_token = broker_dir.join("token");
+        provision_guardian_token(&token).unwrap();
+        provision_guardian_token(&broker_token).unwrap();
+        let socket = directory.join("guardian.sock");
+        let broker_socket = broker_dir.join("broker.sock");
+        let release = directory.join("release-children");
+        let births = directory.join("births");
+        let signaled = directory.join("signaled");
+        let finished = directory.join("finished");
+        let mut services = StopOwnedServices {
+            children: Vec::new(),
+            release: release.clone(),
+            births: births.clone(),
+            finished: finished.clone(),
+        };
+        for (name, command, args) in [
+            (
+                "broker",
+                "broker-serve",
+                vec![
+                    ("--socket-path", &broker_socket),
+                    ("--token-path", &broker_token),
+                    ("--spawn-catalog-path", &spawn_catalog),
+                    ("--lease-catalog-path", &lease_catalog),
+                ],
+            ),
+            (
+                "guardian",
+                "serve",
+                vec![
+                    ("--socket-path", &socket),
+                    ("--token-path", &token),
+                    ("--broker-socket-path", &broker_socket),
+                    ("--broker-token-path", &broker_token),
+                ],
+            ),
+        ] {
+            let mut process = std::process::Command::new(&executable);
+            process.arg(command).args(["--poll-interval-ms", "2"]);
+            for (flag, path) in args {
+                process.arg(flag).arg(path);
+            }
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(format!("{name}.log")))
+                .unwrap();
+            process
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            services.children.push(process.spawn().unwrap());
+        }
+        {
+            let ready_deadline = Instant::now() + Duration::from_secs(5);
+            while !socket.exists() || !broker_socket.exists() {
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "owned services did not create sockets"
+                );
+                assert!(
+                    services
+                        .children
+                        .iter_mut()
+                        .all(|child| child.try_wait().unwrap().is_none())
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let executor = promise::spawn::SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let domain =
+                Arc::new(GuardianDomain::new(&mux, socket.clone(), token.clone()).unwrap());
+            let registered: Arc<dyn Domain> = domain.clone();
+            mux.add_domain(&registered).unwrap();
+            mux.set_default_domain(&registered).unwrap();
+            let command = || {
+                let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_RELEASE\" && test $n -lt 200; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                command.env("FT_BIRTHS", &births);
+                command.env("FT_SIGNALED", &signaled);
+                command.env("FT_RELEASE", &release);
+                command.env("FT_FINISHED", &finished);
+                command
+            };
+            let size = TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            };
+            let foreign_mux = Arc::new(Mux::new(None));
+            assert!(
+                promise::spawn::block_on(domain.spawn_unpublished_pane(
+                    &foreign_mux,
+                    size,
+                    Some(command()),
+                    None,
+                ))
+                .is_err(),
+                "domain accepted another mux's session authority"
+            );
+            assert!(!births.exists());
+            let unpublished = promise::spawn::block_on(domain.spawn_unpublished_pane(
+                &mux,
+                size,
+                Some(command()),
+                None,
+            ))
+            .unwrap();
+            assert!(
+                mux.iter_panes().is_empty(),
+                "Domain birth published before commit"
+            );
+            let pane = unpublished.publish(&mux).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                let (_, lines) = pane.get_lines(0..24);
+                if lines
+                    .iter()
+                    .any(|line| line.as_str().contains("guardian-domain-marker"))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "published pane did not render real child output"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            let unpublished = promise::spawn::block_on(domain.spawn_unpublished_pane(
+                &mux,
+                size,
+                Some(command()),
+                None,
+            ))
+            .unwrap();
+            assert_eq!(mux.iter_panes().len(), 1);
+            drop(unpublished);
+            let mut census =
+                GuardianClient::connect(&socket, &token, domain.mux_incarnation).unwrap();
+            let rows = census.census_snapshot().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.status == GuardianCensusPaneStatus::LiveClaimed)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                std::fs::read(&births).unwrap(),
+                b"BB",
+                "exact replay duplicated a birth"
+            );
+            assert!(
+                !signaled.exists(),
+                "unpublished cancellation signaled an owned child"
+            );
+            assert!(domain.state.lock().unadopted_birth.is_some());
+            assert!(
+                promise::spawn::block_on(domain.spawn_unpublished_pane(
+                    &mux,
+                    size,
+                    Some(command()),
+                    None,
+                ))
+                .is_err(),
+                "cancelled birth must remain fenced, not create a replacement child"
+            );
+            assert_eq!(std::fs::read(&births).unwrap(), b"BB");
+            std::fs::write(&release, b"release").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let rows = census.census_snapshot().unwrap();
+                if rows.iter().all(|row| row.exit_status.is_some()) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "owned fixture children did not exit and reap"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(std::fs::read(&finished).unwrap(), b"DD");
+            assert!(!signaled.exists());
+            println!("GUARDIAN_DOMAIN_REAL_BIRTH_SUCCESS");
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FakeDirective {

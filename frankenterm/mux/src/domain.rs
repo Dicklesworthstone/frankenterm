@@ -7,28 +7,29 @@
 
 use crate::client::ClientId;
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, Pane, PaneId};
+use crate::pane::{Pane, PaneId, alloc_pane_id};
 use crate::tab::{SplitRequest, Tab};
 use crate::window::WindowId;
 use crate::{
     MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
 };
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
-use downcast_rs::{impl_downcast, Downcast};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use config::{ExecDomain, SerialDomain, ValueOrFunc, WslDomain, configuration};
+use downcast_rs::{Downcast, impl_downcast};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{
-    native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
+    CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem, native_pty_system,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type DomainId = usize;
@@ -73,6 +74,21 @@ pub(crate) fn register_spawned_pane_or_rollback(
 pub struct UnpublishedPane {
     pane: Option<Arc<dyn Pane>>,
     rollback: UnpublishedPaneRollback,
+    guardian_publication: Option<Arc<AtomicBool>>,
+}
+
+/// Read-only evidence that a particular guardian pane completed mux publication.
+/// The receipt remains true after the registered pane is removed.
+#[derive(Clone)]
+pub struct GuardianPanePublicationReceipt {
+    published: Arc<AtomicBool>,
+}
+
+impl GuardianPanePublicationReceipt {
+    #[must_use]
+    pub fn was_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
 }
 
 enum UnpublishedPaneRollback {
@@ -85,6 +101,7 @@ impl UnpublishedPane {
         Self {
             pane: Some(pane),
             rollback: UnpublishedPaneRollback::KillNative,
+            guardian_publication: None,
         }
     }
 
@@ -95,7 +112,18 @@ impl UnpublishedPane {
         Ok(Self {
             pane: Some(Arc::new(pane)),
             rollback: UnpublishedPaneRollback::RetireGuardian,
+            guardian_publication: Some(Arc::new(AtomicBool::new(false))),
         })
+    }
+
+    /// Observe publication without acquiring pane ownership or mutation authority.
+    #[must_use]
+    pub fn guardian_publication_receipt(&self) -> Option<GuardianPanePublicationReceipt> {
+        self.guardian_publication
+            .as_ref()
+            .map(|published| GuardianPanePublicationReceipt {
+                published: Arc::clone(published),
+            })
     }
 
     /// Publish into the exact mux, keeping rollback armed until registration
@@ -111,10 +139,17 @@ impl UnpublishedPane {
             .expect("unpublished pane accessed after it was consumed")
     }
 
+    // Call only after the exact registration has committed: publish uses
+    // add_pane, and the tab transaction calls this after its commit guard.
     pub(crate) fn into_pane(mut self) -> Arc<dyn Pane> {
-        self.pane
+        let pane = self
+            .pane
             .take()
-            .expect("unpublished pane consumed more than once")
+            .expect("unpublished pane consumed more than once");
+        if let Some(published) = self.guardian_publication.as_ref() {
+            published.store(true, Ordering::Release);
+        }
+        pane
     }
 }
 
@@ -368,8 +403,9 @@ pub trait Domain: Downcast + Send + Sync {
     /// Construct a pane process/PTY without publishing it in a mux.
     ///
     /// Only domains that can uphold the unpublished reservation contract may
-    /// override this method. The returned guard kills the pane on cancellation
-    /// or any other pre-publication failure until it is consumed by mux code.
+    /// override this method. Until mux publication consumes the guard,
+    /// cancellation or failure kills a native child but only retires a
+    /// guardian-owned pane's lease, preserving its child for reconciliation.
     async fn spawn_unpublished_pane(
         &self,
         _mux: &Arc<Mux>,
@@ -1277,7 +1313,7 @@ impl Domain for LocalDomain {
 mod tests {
     use super::*;
     use portable_pty::{Child, ChildKiller, SlavePty};
-    use std::future::{poll_fn, Future};
+    use std::future::{Future, poll_fn};
     use std::io::{Read, Result as IoResult, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};

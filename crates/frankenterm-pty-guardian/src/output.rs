@@ -2983,10 +2983,12 @@ impl GuardianCheckpointStageStore {
                 CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
             )?
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            let all_chunks_present = inspection.next_index == shape.total_chunks;
+            let all_bytes_present = inspection.committed_bytes == shape.total_bytes;
             if inspection.ack_present
                 || inspection.expiry_present
-                || inspection.next_index != shape.total_chunks
-                || inspection.committed_bytes != shape.total_bytes
+                || !all_chunks_present
+                || !all_bytes_present
             {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }

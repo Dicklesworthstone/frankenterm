@@ -16,6 +16,7 @@ io-uring = ["dep:io-uring", "asupersync/io-uring"]
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+async-trait.workspace = true
 asupersync.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
 base64.workspace = true
@@ -67,7 +68,6 @@ rustix = { workspace = true, features = ["process"] }
 winapi = { workspace=true, features = [ "winuser" ]}
 
 [dev-dependencies]
-async-trait.workspace = true
 criterion = { workspace = true }
 proptest = "1.8.0"
 

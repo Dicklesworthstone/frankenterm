@@ -8851,6 +8851,14 @@ fn validate_requested_default_domain(
         "default_domain"
     };
 
+    #[cfg(unix)]
+    if is_standalone_mux && let Ok(current) = mux.default_domain() {
+        anyhow::ensure!(
+            !current.is::<guardian_proxy::GuardianDomain>() || current.domain_name() == name,
+            "configured {key}={name:?} conflicts with the explicitly selected guardian domain"
+        );
+    }
+
     if desired_client_names.contains(name) {
         anyhow::ensure!(
             !is_standalone_mux,
@@ -15107,6 +15115,46 @@ mod tests {
         update_mux_domains_for_server(&handle)?;
 
         assert_eq!(mux.default_domain()?.domain_name(), "server-default");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_mux_domains_for_server_preserves_explicit_guardian_default_on_reload()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let guardian: Arc<dyn Domain> = Arc::new(guardian_proxy::GuardianDomain::new(
+            &mux,
+            std::path::PathBuf::from("/unused-guardian-reload-test.socket"),
+            std::path::PathBuf::from("/unused-guardian-reload-test.token"),
+        )?);
+        mux.add_domain(&guardian)?;
+        mux.set_default_domain(&guardian)?;
+
+        for default in [None, Some("guardian".to_string())] {
+            let handle = make_test_handle_with(vec![], |config| {
+                config.default_mux_server_domain = default;
+            });
+            update_mux_domains_for_server(&handle)?;
+            assert!(Arc::ptr_eq(&mux.default_domain()?, &guardian));
+        }
+
+        let raw_ssh = SshDomain {
+            name: "unguarded-default".to_string(),
+            remote_address: "server.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let handle = make_test_handle_with(vec![raw_ssh], |config| {
+            config.default_mux_server_domain = Some("unguarded-default".to_string());
+        });
+        let error = update_mux_domains_for_server(&handle)
+            .expect_err("reload must not silently disable explicit guardian spawning");
+        assert!(format!("{error:#}").contains("explicitly selected guardian domain"));
+        assert!(Arc::ptr_eq(&mux.default_domain()?, &guardian));
+        assert!(mux.get_domain_by_name("unguarded-default").is_none());
         Ok(())
     }
 

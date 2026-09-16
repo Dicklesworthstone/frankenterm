@@ -6839,7 +6839,10 @@ mod tests {
         let pane = guardian_lifetime_test_pane(721, identity, control.clone(), Arc::clone(&kills));
         let unpublished = crate::domain::UnpublishedPane::from_guardian_proxy(pane)
             .expect("complete guardian facets admit unpublished ownership");
+        let publication = unpublished.guardian_publication_receipt().unwrap();
+        assert!(!publication.was_published());
         drop(unpublished);
+        assert!(!publication.was_published());
         assert_eq!(control.retirement_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(control.retirement_effects.load(Ordering::SeqCst), 1);
         assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
@@ -6905,7 +6908,9 @@ mod tests {
 
         let kills = Arc::new(AtomicUsize::new(0));
         let pane: Arc<dyn Pane> = Arc::new(native(Arc::clone(&kills)));
-        drop(crate::domain::UnpublishedPane::new(Arc::clone(&pane)));
+        let unpublished = crate::domain::UnpublishedPane::new(Arc::clone(&pane));
+        assert!(unpublished.guardian_publication_receipt().is_none());
+        drop(unpublished);
         assert_eq!(
             kills.load(Ordering::SeqCst),
             1,
@@ -6940,10 +6945,15 @@ mod tests {
         *pane.guardian_live_output_reader.lock() = Some(Box::new(HeldReader(wait)));
         let mux = Arc::new(crate::Mux::new(None));
         assert!(mux.get_pane(724).is_none());
-        let published = crate::domain::UnpublishedPane::from_guardian_proxy(pane)
-            .unwrap()
+        let unpublished = crate::domain::UnpublishedPane::from_guardian_proxy(pane).unwrap();
+        let publication = unpublished.guardian_publication_receipt().unwrap();
+        let publication_clone = publication.clone();
+        assert!(!publication.was_published());
+        let published = unpublished
             .publish(&mux)
             .expect("register guardian pane through consuming mux-owned publication");
+        assert!(publication.was_published());
+        assert!(publication_clone.was_published());
         assert!(mux.get_pane(724).is_some());
         let local = published
             .downcast_ref::<LocalPane>()
@@ -6970,13 +6980,13 @@ mod tests {
             rejected_control.clone(),
             Arc::clone(&rejected_kills),
         );
+        let rejected = crate::domain::UnpublishedPane::from_guardian_proxy(rejected).unwrap();
+        let rejected_publication = rejected.guardian_publication_receipt().unwrap();
         assert!(
-            crate::domain::UnpublishedPane::from_guardian_proxy(rejected)
-                .unwrap()
-                .publish(&mux)
-                .is_err(),
+            rejected.publish(&mux).is_err(),
             "numeric pane collision must fail publication"
         );
+        assert!(!rejected_publication.was_published());
         assert_eq!(
             rejected_control.retirement_attempts.load(Ordering::SeqCst),
             1
@@ -6992,6 +7002,13 @@ mod tests {
         assert_eq!(control.close_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
         drop(release);
+        mux.remove_pane(724);
+        assert!(mux.get_pane(724).is_none());
+        drop(published);
+        drop(mux);
+        assert!(publication.was_published());
+        assert!(publication_clone.was_published());
+        assert!(!rejected_publication.was_published());
     }
 
     #[test]
