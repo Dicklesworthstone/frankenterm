@@ -9,6 +9,7 @@ test_native_dependency_closure() {
   python3 - "${ROOT_DIR}/scripts/create-macos-bundle.sh" <<'PY'
 import json
 from pathlib import Path
+import plistlib
 import shutil
 import sys
 import tempfile
@@ -29,6 +30,7 @@ class NativeDependencyClosure(unittest.TestCase):
         self.bundle = self.root / "FrankenTerm.app"
         (self.bundle / "Contents/MacOS").mkdir(parents=True)
         (self.bundle / "Contents/Resources").mkdir()
+        (self.bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({'LSMinimumSystemVersion': '11.0'}))
         self.images = {}
         self.changed = []
         self.ignore_rewrites = False
@@ -64,9 +66,15 @@ class NativeDependencyClosure(unittest.TestCase):
             records = [('LC_ID_DYLIB', 'name', value) for value in image['ids']]
             records += [('LC_LOAD_DYLIB', 'name', value) for value in image['loads']]
             records += [('LC_RPATH', 'path', value) for value in image['rpaths']]
+            deployment = image.get('deployment', 'LC_BUILD_VERSION')
+            minimum = image.get('minimum', '11.0')
+            platform = image.get('platform', '1')
+            build = (f'Load command {len(records)}\n cmd {deployment}\n platform {platform}\n minos {minimum}\n'
+                     if deployment == 'LC_BUILD_VERSION' else
+                     f'Load command {len(records)}\n cmd {deployment}\n version {minimum}\n')
             return str(path) + ':\n' + ''.join(
                 f'Load command {i}\n cmd {kind}\n {field} {value} (offset 24)\n'
-                for i, (kind, field, value) in enumerate(records))
+                for i, (kind, field, value) in enumerate(records)) + build
         self.assertEqual(tool, 'install_name_tool')
         self.assertTrue(path.is_relative_to(self.bundle))
         self.changed.append(path)
@@ -180,6 +188,44 @@ class NativeDependencyClosure(unittest.TestCase):
     def test_preexisting_frameworks_not_merged(self):
         (self.bundle / 'Contents/Frameworks').mkdir()
         with self.assertRaises(FileExistsError):
+            self.package()
+
+    def test_transitive_dependency_sets_actual_bundle_deployment_floor(self):
+        cairo = self.dylib('cairo', 'libcairo.dylib')
+        png = self.dylib('libpng', 'libpng.dylib')
+        self.images[self.gui]['loads'].append(str(cairo))
+        self.images[cairo]['loads'].append(str(png))
+        self.images[cairo]['minimum'] = '15.0'
+        self.images[png]['minimum'] = '26.0'
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '26.0.0')
+        receipt = json.loads((self.bundle / 'Contents/Resources/native-dependencies/closure.json').read_text())
+        self.assertEqual(receipt['minimum_macos_version'], '26.0.0')
+        self.assertEqual(receipt['bundle_minimum_macos_version'], '26.0.0')
+        record = next(row for row in receipt['images'] if row['source'] == str(png))
+        self.assertEqual(record['minimum_macos_version'], '26.0.0')
+
+    def test_existing_higher_plist_floor_is_not_lowered(self):
+        (self.bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({'LSMinimumSystemVersion': '26.2.1'}))
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '26.2.1')
+
+    def test_legacy_macos_deployment_command_is_supported(self):
+        self.images[self.gui].update(deployment='LC_VERSION_MIN_MACOSX', minimum='12.3')
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '12.3.0')
+
+    def test_ios_image_is_rejected_even_with_correct_cpu(self):
+        self.images[self.gui]['platform'] = '2'
+        with self.assertRaisesRegex(ValueError, 'not built for macOS'):
+            self.package()
+
+    def test_missing_deployment_target_is_rejected(self):
+        self.images[self.gui]['deployment'] = 'LC_UUID'
+        with self.assertRaisesRegex(ValueError, 'one unambiguous macOS deployment target'):
             self.package()
 
 
@@ -510,7 +556,7 @@ printf '%s\n' arm64
 EOF
   cat > "${mock_bin}/otool" <<'EOF'
 #!/bin/bash
-printf '%s\n' "$2:" 'Load command 0' ' cmd LC_LOAD_DYLIB' ' name /usr/lib/libSystem.B.dylib (offset 24)'
+printf '%s\n' "$2:" 'Load command 0' ' cmd LC_LOAD_DYLIB' ' name /usr/lib/libSystem.B.dylib (offset 24)' 'Load command 1' ' cmd LC_BUILD_VERSION' ' platform 1' ' minos 11.0'
 EOF
   chmod +x "${mock_bin}/lipo" "${mock_bin}/otool"
 }

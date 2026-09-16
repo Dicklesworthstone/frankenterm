@@ -570,6 +570,17 @@ cp "$GUARDIAN_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-pty-guardian"
 echo "Installing ft CLI..."
 cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
 
+# Render before resolving native dependencies so the resulting minimum OS can
+# be raised to the actual packaged link closure before any signing occurs.
+PLIST_TEMPLATE="$PROJECT_ROOT/assets/macos/Info.plist"
+if [ ! -f "$PLIST_TEMPLATE" ]; then
+    echo "Error: Info.plist template not found at $PLIST_TEMPLATE"
+    exit 1
+fi
+sed -e "s/__VERSION__/$VERSION/g" \
+    -e "s/__BUILD__/$BUILD_STRING/g" \
+    "$PLIST_TEMPLATE" > "$APP_BUNDLE/Contents/Info.plist"
+
 # Resolve the native link closure before signing. Homebrew's Cairo install name
 # otherwise makes an apparently complete app depend on the packaging host.
 # Only fresh package copies are changed; Cargo artifacts and host libraries
@@ -579,6 +590,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import subprocess
@@ -601,10 +613,18 @@ def system_library(name):
     return name.startswith(("/usr/lib/", "/System/Library/")) and ".." not in Path(name).parts
 
 
+def macos_version(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]*(?:\.[0-9]+){1,2}", value):
+        raise ValueError(f"invalid minimum macOS version: {value!r}")
+    parts = tuple(int(part) for part in value.split("."))
+    return parts + (0,) * (3 - len(parts))
+
+
 def macho(path, architecture):
     if command("lipo", "-archs", str(path)).split() != [architecture]:
         raise ValueError(f"native dependency has the wrong architecture: {path}")
     loads, identities, rpaths = [], [], []
+    minimum_versions = []
     load_commands = {
         "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB",
         "LC_LOAD_UPWARD_DYLIB", "LC_LAZY_LOAD_DYLIB",
@@ -617,7 +637,19 @@ def macho(path, architecture):
         if not match:
             raise ValueError(f"unreadable Mach-O load command: {path}")
         kind = match[1]
-        if kind in load_commands or kind in {"LC_ID_DYLIB", "LC_RPATH"}:
+        if kind in {"LC_BUILD_VERSION", "LC_VERSION_MIN_MACOSX"}:
+            if kind == "LC_BUILD_VERSION":
+                platform = re.search(r"(?m)^\s*platform (\S+)$", block)
+                if not platform or platform[1].lower() not in {"1", "macos"}:
+                    raise ValueError(f"native dependency is not built for macOS: {path}")
+            field = "minos" if kind == "LC_BUILD_VERSION" else "version"
+            version = re.search(r"(?m)^\s*" + field + r" (\S+)$", block)
+            if not version:
+                raise ValueError(f"native dependency has no minimum macOS version: {path}")
+            minimum_versions.append(macos_version(version[1]))
+        elif kind.startswith("LC_VERSION_MIN_"):
+            raise ValueError(f"native dependency is not built for macOS: {path}")
+        elif kind in load_commands or kind in {"LC_ID_DYLIB", "LC_RPATH"}:
             field = "path" if kind == "LC_RPATH" else "name"
             value = re.search(r"(?m)^\s*" + field + r" (.+) \(offset \d+\)$", block)
             if not value or any(ord(char) < 32 for char in value[1]):
@@ -627,7 +659,9 @@ def macho(path, architecture):
             raise ValueError(f"unsupported native dependency command {kind}: {path}")
     if len(identities) > 1:
         raise ValueError(f"multiple native library identities: {path}")
-    return loads, identities, rpaths
+    if len(minimum_versions) != 1:
+        raise ValueError(f"native image requires one unambiguous macOS deployment target: {path}")
+    return loads, identities, rpaths, minimum_versions[0]
 
 
 def dependency_path(name, source):
@@ -660,7 +694,7 @@ def bundle_native_dependencies(bundle, binary_dir, architecture):
             continue
         if len(graph) >= 256:
             raise ValueError("native dependency closure exceeds 256 images")
-        loads, identities, rpaths = macho(source, architecture)
+        loads, identities, rpaths, minimum = macho(source, architecture)
         if source not in roots and not identities:
             raise ValueError(f"native dependency has no LC_ID_DYLIB: {source}")
         edges = {}
@@ -675,13 +709,13 @@ def bundle_native_dependencies(bundle, binary_dir, architecture):
             if dependency not in destinations:
                 destinations[dependency] = frameworks / dependency.name
                 pending.append(dependency)
-        graph[source] = (edges, identities, rpaths, digest(source), loads)
+        graph[source] = (edges, identities, rpaths, digest(source), loads, minimum)
 
     frameworks.mkdir()
     metadata.mkdir()
     receipts = []
     for source in sorted(graph, key=str):
-        edges, identities, rpaths, source_sha256, loads = graph[source]
+        edges, identities, rpaths, source_sha256, loads, minimum = graph[source]
         destination = destinations[source]
         if source not in roots:
             # Retain the actual package license notices and upstream provenance,
@@ -717,17 +751,18 @@ def bundle_native_dependencies(bundle, binary_dir, architecture):
         if changes:
             command("install_name_tool", *changes, str(destination))
         receipts.append({"source": str(source), "source_sha256": source_sha256,
-                         "bundled_path": str(destination.relative_to(bundle))})
+                         "bundled_path": str(destination.relative_to(bundle)),
+                         "minimum_macos_version": ".".join(map(str, minimum))})
 
     for source, destination in destinations.items():
-        loads, identities, rpaths = macho(destination, architecture)
-        edges, original_ids, _, _, original_loads = graph[source]
+        loads, identities, rpaths, minimum = macho(destination, architecture)
+        edges, original_ids, _, _, original_loads, original_minimum = graph[source]
         expected_loads = [
             "@loader_path/" + os.path.relpath(destinations[edges[name]], destination.parent)
             if name in edges else name for name in original_loads
         ]
         expected_ids = ["@loader_path/" + destination.name] if original_ids else []
-        if loads != expected_loads or identities != expected_ids:
+        if loads != expected_loads or identities != expected_ids or minimum != original_minimum:
             raise ValueError(f"packaged native load commands differ from the planned closure: {destination}")
         if rpaths:
             raise ValueError(f"packaged native image retains a search path: {destination}")
@@ -741,8 +776,19 @@ def bundle_native_dependencies(bundle, binary_dir, architecture):
                 raise ValueError(f"packaged native dependency escapes the closure: {name}")
         if digest(source) != graph[source][3]:
             raise ValueError(f"native dependency source changed while packaging: {source}")
+    native_minimum = max(record[5] for record in graph.values())
+    info_path = bundle / "Contents/Info.plist"
+    with info_path.open("rb") as handle:
+        info = plistlib.load(handle)
+    bundle_minimum = max(native_minimum, macos_version(info.get("LSMinimumSystemVersion")))
+    info["LSMinimumSystemVersion"] = ".".join(map(str, bundle_minimum))
+    with info_path.open("wb") as handle:
+        plistlib.dump(info, handle)
     with (metadata / "closure.json").open("x") as handle:
-        json.dump({"schema": "ft.native-dylib-closure.v1", "images": receipts}, handle, indent=2, sort_keys=True)
+        json.dump({"schema": "ft.native-dylib-closure.v1", "images": receipts,
+                   "minimum_macos_version": ".".join(map(str, native_minimum)),
+                   "bundle_minimum_macos_version": info["LSMinimumSystemVersion"]},
+                  handle, indent=2, sort_keys=True)
         handle.write("\n")
 
 
@@ -808,16 +854,6 @@ if [ ! -f "$ICNS" ]; then
     exit 1
 fi
 cp "$ICNS" "$APP_BUNDLE/Contents/Resources/ft.icns"
-
-# --- Write Info.plist from template ---
-PLIST_TEMPLATE="$PROJECT_ROOT/assets/macos/Info.plist"
-if [ ! -f "$PLIST_TEMPLATE" ]; then
-    echo "Error: Info.plist template not found at $PLIST_TEMPLATE"
-    exit 1
-fi
-sed -e "s/__VERSION__/$VERSION/g" \
-    -e "s/__BUILD__/$BUILD_STRING/g" \
-    "$PLIST_TEMPLATE" > "$APP_BUNDLE/Contents/Info.plist"
 
 # --- Write PkgInfo ---
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
