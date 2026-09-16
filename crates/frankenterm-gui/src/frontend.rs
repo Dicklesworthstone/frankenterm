@@ -25,6 +25,12 @@ use wezterm_term::{Alert, ClipboardSelection};
 const MAX_RECONCILE_WAITERS: usize = 4_096;
 const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+fn topology_needs_workspace_reconcile(change: &mux::FrozenWindowTopologyChange) -> bool {
+    !change.created_windows().is_empty()
+        || !change.removed_windows().is_empty()
+        || !change.attached_tabs().is_empty()
+}
+
 /// Close only the newly allocated native view if initialization does not hand
 /// it to the frontend. The cleanup captures the exact platform window handle.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -330,7 +336,8 @@ impl GuiFrontEnd {
                 MuxNotification::WindowWorkspaceChanged { .. }
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::WindowCreated(_)
-                | MuxNotification::WindowRemoved(_) => {
+                | MuxNotification::WindowRemoved(_)
+                | MuxNotification::TabAddedToWindow { .. } => {
                     schedule_frontend_main_thread(
                         MainThreadServiceClass::Topology,
                         FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
@@ -345,8 +352,7 @@ impl GuiFrontEnd {
                     );
                 }
                 MuxNotification::WindowTopologyChanged(change)
-                    if !change.created_windows().is_empty()
-                        || !change.removed_windows().is_empty() =>
+                    if topology_needs_workspace_reconcile(&change) =>
                 {
                     schedule_frontend_main_thread(
                         MainThreadServiceClass::Topology,
@@ -388,7 +394,6 @@ impl GuiFrontEnd {
                 MuxNotification::TabTitleChanged { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
-                MuxNotification::TabAddedToWindow { .. } => {}
                 MuxNotification::WindowInvalidated(_)
                 | MuxNotification::WindowTopologyChanged(_)
                 | MuxNotification::WindowOrderChanged { .. } => {}
@@ -768,6 +773,14 @@ impl GuiFrontEnd {
         let saved_window_state =
             crate::window_state_persist::load_startup_for_workspace(&workspace);
         let mut mux_windows = mux.iter_windows_in_workspace(&workspace);
+        // WindowCreated can precede the first tab's asynchronous spawn. Do not
+        // create or repurpose a view using invented default geometry; the tab
+        // attachment notification will request another reconciliation pass.
+        // Keep existing views while their tabs are being changed.
+        mux_windows.retain(|&id| {
+            self.has_mux_window(id)
+                || crate::termwindow::initial_native_window_size(&mux, id).is_some()
+        });
 
         // First, repurpose existing windows.
         // Note that both iter_windows_in_workspace and self.known_windows have a
@@ -832,6 +845,10 @@ impl GuiFrontEnd {
                         return;
                     }
                     if fe.has_mux_window(mux_window_id) {
+                        continue;
+                    }
+                    if crate::termwindow::initial_native_window_size(&mux, mux_window_id).is_none()
+                    {
                         continue;
                     }
                     let Some(_pending_creation) =
@@ -1062,6 +1079,101 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn native_window_startup_waits_for_attachment_to_an_already_published_window() {
+        use mux::activity::Activity;
+        use mux::tab::Tab;
+        use mux::{Mux, MuxNotification};
+        use std::sync::{Arc, Mutex};
+        use wezterm_term::TerminalSize;
+
+        let mux = Arc::new(Mux::new(None));
+        let activity = Activity::new_for_mux(&mux);
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            observed.lock().unwrap().push(notification);
+            true
+        })
+        .unwrap();
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        assert!(crate::termwindow::initial_native_window_size(&mux, window_id).is_none());
+        drop(window);
+        assert!(
+            notifications.lock().unwrap().iter().any(
+                |event| matches!(event, MuxNotification::WindowCreated(id) if *id == window_id)
+            )
+        );
+        notifications.lock().unwrap().clear();
+
+        let size = TerminalSize {
+            cols: 60,
+            rows: 20,
+            pixel_width: 960,
+            pixel_height: 720,
+            dpi: 144,
+        };
+        let tab = Arc::new(Tab::new(&size));
+        mux.add_tab_no_panes(&tab).unwrap();
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+        assert_eq!(
+            crate::termwindow::initial_native_window_size(&mux, window_id),
+            Some(size)
+        );
+        let events = notifications.lock().unwrap();
+        let change = events
+            .iter()
+            .find_map(|event| match event {
+                MuxNotification::WindowTopologyChanged(change) => Some(change),
+                _ => None,
+            })
+            .expect("attachment must publish a topology transaction");
+        assert!(change.created_windows().is_empty());
+        assert!(change.removed_windows().is_empty());
+        assert_eq!(change.attached_tabs(), &[(tab.tab_id(), window_id)]);
+        assert!(
+            super::topology_needs_workspace_reconcile(change),
+            "a tab arriving after WindowCreated must wake deferred native creation"
+        );
+        drop(events);
+        // No global mux, frontend, native window or event loop is initialized.
+        drop(mux);
+        drop(activity);
+    }
+
+    #[test]
+    fn native_window_startup_has_no_default_geometry_after_tab_removal() {
+        use mux::Mux;
+        use mux::activity::Activity;
+        use mux::tab::Tab;
+        use std::sync::Arc;
+        use wezterm_term::TerminalSize;
+
+        let mux = Arc::new(Mux::new(None));
+        let activity = Activity::new_for_mux(&mux);
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        let size = TerminalSize {
+            cols: 60,
+            rows: 20,
+            ..TerminalSize::default()
+        };
+        let tab = Arc::new(Tab::new(&size));
+        mux.add_tab_no_panes(&tab).unwrap();
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+        assert_eq!(
+            crate::termwindow::initial_native_window_size(&mux, window_id),
+            Some(size)
+        );
+        assert!(mux.remove_tab(tab.tab_id()).is_some());
+        assert!(crate::termwindow::initial_native_window_size(&mux, window_id).is_none());
+        window.cancel();
+        assert!(crate::termwindow::initial_native_window_size(&mux, window_id).is_none());
+        drop(mux);
+        drop(activity);
+    }
 
     #[test]
     fn pending_native_window_closes_only_unpublished_views() {

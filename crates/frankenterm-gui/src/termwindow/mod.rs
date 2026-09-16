@@ -3274,26 +3274,29 @@ where
     })
 }
 
+pub(crate) fn initial_native_window_size(
+    mux: &Mux,
+    mux_window_id: MuxWindowId,
+) -> Option<TerminalSize> {
+    mux.get_active_tab_for_window(mux_window_id)
+        .map(|tab| tab.get_size())
+}
+
 impl TermWindow {
     pub async fn new_window(
         mux_window_id: MuxWindowId,
         saved_workspace: String,
         saved_window_state: Option<crate::window_state_persist::PersistedWindowState>,
     ) -> anyhow::Result<()> {
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow!("cannot create GUI window without an active mux"))?;
+        let size = initial_native_window_size(&mux, mux_window_id)
+            .context("cannot create GUI window before its first tab is attached")?;
         let front_end = try_front_end().context("native window creation requires a frontend")?;
         let config = config_with_accessibility_palette(configuration());
         let dpi = config.dpi.unwrap_or_else(::window::default_dpi) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow!("cannot create GUI window without an active mux"))?;
-        let size = match mux.get_active_tab_for_window(mux_window_id) {
-            Some(tab) => tab.get_size(),
-            None => {
-                log::debug!("new_window has no tabs... yet?");
-                Default::default()
-            }
-        };
         let physical_rows = size.rows as usize;
         let physical_cols = size.cols as usize;
 
