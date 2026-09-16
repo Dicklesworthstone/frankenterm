@@ -950,6 +950,11 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             terminal_checkpoint,
         )
         .expect("test Genesis checkpoint descriptor must be valid");
+        let terminal = TerminalCheckpointV2::decode_canonical_json(
+            terminal_checkpoint.canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("test Genesis canonical model must be valid");
         let identity = GuardianGenesisReservationIdentityV1::from_authenticated_spawn(
             Uuid::from_u128(1),
             spawn_effect_id,
@@ -961,8 +966,8 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             [3; 32],
             u16::try_from(terminal_checkpoint.rows()).expect("test Genesis rows must fit u16"),
             u16::try_from(terminal_checkpoint.cols()).expect("test Genesis columns must fit u16"),
-            0,
-            0,
+            u16::try_from(terminal.pixel_width()).expect("test Genesis pixel width must fit u16"),
+            u16::try_from(terminal.pixel_height()).expect("test Genesis pixel height must fit u16"),
             descriptor
                 .recompute_checkpoint_identity_digest()
                 .expect("test Genesis checkpoint identity must be valid"),
@@ -1352,6 +1357,61 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
             Self {
                 binding: *binding,
                 genesis_upload_id: Some(upload_id),
+            },
+            reservation,
+        ))
+    }
+
+    /// Authorize the authenticated initial model for a not-yet-spawned child
+    /// using its retained Spawn reservation. Canonical JSON does not carry a
+    /// live parser watermark, so decoding it does not manufacture a live
+    /// parser capture. The fresh child's stream starts at zero; its initial
+    /// model may contain configured content. This authority cannot publish a
+    /// record-backed checkpoint for an existing child.
+    pub fn from_staged_genesis_spawn_permit(
+        binding: &GuardianCheckpointStageBindingV1,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+        canonical_payload: &[u8],
+    ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
+        let reservation = permit.into_reservation_identity();
+        if !binding.descriptor.origin.is_genesis() {
+            return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
+        }
+        if binding.descriptor.origin.spawn_effect_id() != Some(reservation.spawn_effect_id()) {
+            return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
+        }
+        let terminal = TerminalCheckpointV2::decode_canonical_json(
+            canonical_payload,
+            TerminalCheckpointLimits::default(),
+        )
+        .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
+        let (terminal_payload_bytes, terminal_payload_digest) =
+            terminal_payload_identity(canonical_payload)?;
+        let descriptor = GuardianCheckpointArtifactDescriptorV1 {
+            origin: GuardianCheckpointOriginV1::from_genesis_effect(reservation.spawn_effect_id())?,
+            parser_stream_bytes: 0,
+            replay_identity_digest: current_replay_identity_digest(),
+            rows: terminal.rows(),
+            cols: terminal.cols(),
+            terminal_payload_bytes,
+            terminal_payload_digest,
+        };
+        if binding.descriptor != descriptor
+            || reservation.checkpoint_identity_digest()
+                != descriptor.recompute_checkpoint_identity_digest()?
+            || reservation.boundary_identity_digest()
+                != descriptor.recompute_boundary_identity_digest()?
+            || u32::from(reservation.rows()) != terminal.rows()
+            || u32::from(reservation.cols()) != terminal.cols()
+            || u64::from(reservation.pixel_width()) != terminal.pixel_width()
+            || u64::from(reservation.pixel_height()) != terminal.pixel_height()
+        {
+            return Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch);
+        }
+        Ok((
+            Self {
+                binding: *binding,
+                genesis_upload_id: Some(reservation.upload_id()),
             },
             reservation,
         ))
@@ -10244,6 +10304,7 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1::context:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
@@ -10490,6 +10551,12 @@ mod tests {
                 "pub",
                 false,
                 "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV2) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
+                "fn from_staged_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, canonical_payload: &[u8]) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointValidatedManifestAuthorityV1",
@@ -11126,6 +11193,7 @@ mod tests {
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding:private:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
@@ -11133,6 +11201,7 @@ mod tests {
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::into_reservation_identity:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointGenesisSpawnPermitV1::reservation_identity:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit:pub:production",
+            "GuardianGenesisReservationIdentityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit:pub:production",
             "GuardianGenesisReservationIdentityV1@GuardianGenesisReservationIdentityV1::from_authenticated_spawn:pub(crate):production",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
@@ -11156,6 +11225,7 @@ mod tests {
             "GuardianCheckpointStageSealIntentV1@GuardianCheckpointStageSealIntentV1::from_binding",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_guardian_runtime_seal_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit",
+            "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit",
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedManifestAuthorityV1::bind_durable_stage_assembly",
@@ -12091,6 +12161,58 @@ mod tests {
         )
         .expect("bind exact Genesis capture generation");
         let genesis_upload_id = Uuid::new_v4();
+        let staged_permit = || {
+            GuardianCheckpointGenesisSpawnPermitV1::issue_for_test(
+                spawn_effect_id,
+                &genesis_terminal,
+                genesis_upload_id,
+            )
+        };
+        let (staged_authority, staged_reservation) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                genesis_terminal.canonical_payload(),
+            )
+            .expect("authenticated staged Genesis retains exact reservation");
+        assert_eq!(staged_authority.binding, genesis_binding);
+        assert_eq!(staged_authority.genesis_upload_id, Some(genesis_upload_id));
+        assert_eq!(staged_reservation.upload_id(), genesis_upload_id);
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                b"{}",
+            ),
+            Err(GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)
+        ));
+        let staged_splice = terminal_checkpoint_with(24, 80, "different staged model");
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                staged_permit(),
+                staged_splice.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        let mut wrong_pixels = staged_permit();
+        wrong_pixels.identity.pixel_width += 1;
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &genesis_binding,
+                wrong_pixels,
+                genesis_terminal.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisCheckpointAuthorityMismatch)
+        ));
+        assert!(matches!(
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &binding,
+                staged_permit(),
+                genesis_terminal.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
+        ));
         assert!(matches!(
             GuardianCheckpointValidatedManifestAuthorityV1::from_genesis_spawn_permit(
                 &genesis_binding,

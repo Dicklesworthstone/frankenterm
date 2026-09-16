@@ -428,3 +428,101 @@ receipts retain their original source identity; none qualifies RC24 by itself.
 Existing remote muxes still perform their old terminal reflow. Client-side
 selection, dispatch and font-policy improvements do not replace that code.
 No existing remote owner has been restarted or updated by this campaign.
+
+### 2026-09-16 07:40 UTC — actual candidate failures and corrective work
+
+- [x] Finish RC25 Linux amd64 DSR build and verify the collected artifact hash.
+- [x] Run the actual built Lindley producer against its isolated mux. It failed
+  with an aligned response mismatch after the first burst; no success claimed.
+- [x] Diagnose a concrete fenced-read contract violation: capture can rebase
+  the requested rows while the reply retains the original layout identity.
+- [x] Commit `826ac0f3e`: reject shifted/truncated fenced captures, preserve
+  worker retirement, and add finite content-free client failure diagnostics.
+- [x] Independently review the server range tests and client connection-reuse
+  and diagnostic tests. Source review does not establish execution success.
+- [ ] Execute the two fenced-range regressions and eight client cases through
+  strict RCH, then repeat the unchanged live measurement on rebuilt binaries.
+- [x] Complete RC25 Mac compilation and all eight real headless smoke steps.
+- [x] Diagnose packaging failure: missing `DSR_SOURCE_REPOSITORY` made the
+  archive-contained assembler incorrectly take its Git-checkout entry path.
+- [x] Verify all 14,769 archived Mac source files against the exact Git commit;
+  prepare the corrected, inactive next-candidate configuration.
+- [x] Execute isolated raw-DSR-GUI startup/font controls: correct 60x20 startup,
+  fixed window dimensions, restored grid and exact Unicode corpus all passed.
+- [ ] Repeat those controls against the final packaged app. Raw binary controls
+  do not establish package quality. Foreground raw-GUI activation was refused
+  before input; selection requires the real bundle and remains unexecuted.
+- [x] Prove Windows NFS whole-range lock failure and replacement NTFS success;
+  transfer and verify the exact SDK, PDB preflight and missing registry archives.
+- [x] Commit DSR failed-target relocation and immutable attempt-log fixes as
+  `3f789b6`; 165 orchestration tests passed, zero failed or skipped.
+- [ ] Build the next immutable candidate on the ready Windows replacement;
+  retain the original failed target and never move an existing release tag.
+- [x] Identify cached-test fixture failures as stale RCH source paths, and
+  panic-build interruption as shared-daemon stale detection, not test passes.
+- [ ] Qualify the existing RCH stable-source and cleanup-observation fixes,
+  settle shared jobs before tool replacement, and repeat affected quality gates.
+- [ ] Finish the existing full-suite failure inventory without concealing its
+  stale-path failures or counting the cancelled panic build as successful.
+- [ ] Complete the remaining attestation, native interaction/performance,
+  publication, Dock activation and full-state recovery tasks listed above.
+
+Current implementation bead: `ft-ycr3m`, in progress. Existing sessions remain
+protected; no release has been published or installed from these partial results.
+
+### 2026-09-16 08:15 UTC — production bridge and full-suite repairs
+
+- [x] Pass both fenced-range regression tests through actual RCH worker 115
+  at `826ac0f3e` (2 passed); client contract test remains in flight.
+- [x] Replace the incoherent approval DTO counter property with real tracker
+  transitions and an independent retained-state oracle (`b55c32291`, `ft-7lyof`).
+- [x] Fix the replay percentage property's fused-rounding oracle with an exact
+  binary64 product check and the retained small-baseline case (`6052995b2`,
+  `ft-rmcb9`). No production arithmetic or tolerance was changed.
+- [x] Pass both complete property integration targets remotely at `1dc877ebf`
+  (RCH 57578): approval 29/29 and replay performance 36/36, zero filtered or
+  ignored. Original failures and seeds retained; `ft-7lyof`/`ft-rmcb9` closed.
+- [x] Commit authenticated broker output reads and the bounded durability
+  worker (`1dc877ebf`), including actual PTY output and journal-failure controls.
+- [ ] Pass guardian tests remotely, including the explicit sealed Genesis test.
+- [ ] Connect canonical downstream output persistence to authenticated broker
+  acknowledgement, including lost-ACK retry without duplicate journal records.
+- [ ] Establish durable Genesis adoption origin before enabling proxy startup;
+  raw checkpoint fields or native Spawn ACKs are not sufficient authority.
+- [x] Build the diagnostic RCH CLI/daemon/worker cohort through DSR successfully;
+  qualify hashes and executable identities before any coordinated replacement.
+- [ ] Drain existing work safely, install qualified RCH tools with backups,
+  enable the prepared durable worker and repeat affected quality gates.
+- [x] Reproduce and fix DSR's source reread after long-running dispatch;
+  166 orchestration checks pass, zero failed/skipped (`ft-sk2dq`).
+- [ ] Finish final-source DSR matrix, live Lindley measurement, attestations,
+  native acceptance, publication and safe Dock activation listed above.
+
+Foreground acceptance awaits the user clearing the protected macOS system
+notification. No alternate automation route is authorized by the tool refusal.
+
+### 2026-09-16 08:44 UTC — staged Genesis and broker continuity
+
+- [x] Pass the client contract regression at `826ac0f3e` on worker 115:
+  one named test executed, covering eight real socket cases; no filtered-test
+  success substituted for execution.
+- [x] Execute guardian library tests at `1dc877ebf`: 228 passed, one failed,
+  one ignored. Preserve the private-directory fixture failure; no suite pass.
+- [x] Execute the separately ignored published-Genesis broker test against
+  that sealed binary, with matching before/after hashes: one passed.
+- [x] Implement bounded terminal-record reauthentication for broker ACKs
+  (`fbad34fac`, deterministic negative followup `7a634c7f1`).
+- [ ] Pass the complete mux journal module remotely at `7a634c7f1`.
+- [x] Implement staged Genesis publication from the exact authenticated
+  initial model and linear Spawn reservation, without fabricating a live
+  parser witness; include exact pixel geometry and substitution negatives.
+- [ ] Independently review and remotely test that new publication entrypoint
+  through the real encrypted-stage/broker fixture on its committed source.
+- [ ] Finish configured runtime startup through publication, broker Spawn,
+  durable custody, output open, downstream persistence and authenticated ACK.
+- [ ] Complete exact-owner child status, resize and bounded nonblocking input
+  under the existing guardian input WAL before declaring a proxy pane Live.
+- [ ] Prove lost replies remain indeterminate and cannot trigger raw input or
+  child-spawn retries; prove query reconciliation and ordinary second Spawn.
+- [ ] Rerun the corrected private-directory fixture and all guardian tests
+  on the integrated source, then freeze a new immutable release candidate.
