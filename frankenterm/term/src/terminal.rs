@@ -1078,6 +1078,7 @@ impl Terminal {
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
     }
 
+    #[cfg(feature = "use_serde")]
     #[doc(hidden)]
     pub fn set_cold_row_fragments_for_test(
         &mut self,
