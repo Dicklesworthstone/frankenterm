@@ -9,6 +9,7 @@
 //! off-topology [`ActivatedGuardianProxy`]; registration remains a separate
 //! cancellation-safe mux commit boundary.
 
+use anyhow::Context as _;
 use frankenterm_pty_guardian::{GuardianClaimedPaneLease, GuardianClient, GuardianClientError};
 use mux::domain::{
     Domain, DomainId, DomainState, GuardianPanePublicationReceipt, LocalDomain, UnpublishedPane,
@@ -203,11 +204,45 @@ impl Domain for GuardianDomain {
         let cancellation = GuardianDomainSpawnCancellation(Arc::clone(&cancelled));
         let result = promise::spawn::spawn_into_new_thread(move || {
             let _admission = admission;
-            anyhow::ensure!(
-                !cancelled.load(Ordering::Acquire),
-                "guardian spawn cancelled before connection"
-            );
-            let mut client = GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation)?;
+            let started = Instant::now();
+            let mut attempts = 0;
+            let connect = |attempts: &mut usize, expected: Option<Uuid>, before_birth: bool| {
+                loop {
+                    anyhow::ensure!(
+                        !before_birth || !cancelled.load(Ordering::Acquire),
+                        "guardian spawn cancelled before connection"
+                    );
+                    anyhow::ensure!(
+                        *attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                        "guardian birth connection retry admission exhausted"
+                    );
+                    *attempts += 1;
+                    match GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation) {
+                        Ok(client) => {
+                            anyhow::ensure!(
+                                expected.is_none_or(
+                                    |identity| identity == client.guardian_incarnation()
+                                ),
+                                "guardian incarnation changed during birth connection"
+                            );
+                            return Ok(client);
+                        }
+                        Err(GuardianClientError::Io(_))
+                            if *attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(anyhow::Error::new(error)),
+                    }
+                }
+            };
+            let expected_guardian = state
+                .lock()
+                .census
+                .as_ref()
+                .map(|census| census.guardian_incarnation());
+            let mut client = connect(&mut attempts, expected_guardian, true)
+                .context("connect guardian for Genesis birth")?;
             // Establish all avoidable connection state before creating a child.
             let census = {
                 let mut state = state.lock();
@@ -218,12 +253,15 @@ impl Domain for GuardianDomain {
                     );
                     Arc::clone(census)
                 } else {
-                    let census = Arc::new(GuardianCensusCoordinator::connect(
-                        &socket,
-                        &token,
-                        client.guardian_incarnation(),
-                        mux_incarnation,
-                    )?);
+                    let census = Arc::new(
+                        GuardianCensusCoordinator::connect(
+                            &socket,
+                            &token,
+                            client.guardian_incarnation(),
+                            mux_incarnation,
+                        )
+                        .context("initialize guardian birth census")?,
+                    );
                     state.census = Some(Arc::clone(&census));
                     census
                 }
@@ -235,25 +273,59 @@ impl Domain for GuardianDomain {
                 config::wezterm_version(),
                 Box::new(io::sink()),
             )
-            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())?;
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .context("capture guardian initial terminal model")?;
             let descriptor =
                 GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &checkpoint)?;
-            client.stage_genesis_checkpoint(
-                effect,
-                descriptor,
-                checkpoint.canonical_payload(),
-                GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
-            )?;
+            loop {
+                anyhow::ensure!(
+                    !cancelled.load(Ordering::Acquire),
+                    "guardian spawn cancelled before checkpoint staging"
+                );
+                anyhow::ensure!(
+                    attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                    "guardian checkpoint staging retry admission exhausted"
+                );
+                match client.stage_genesis_checkpoint(
+                    effect,
+                    descriptor,
+                    checkpoint.canonical_payload(),
+                    GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+                ) {
+                    Ok(_) => break,
+                    Err(GuardianClientError::Io(_))
+                        if attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
+                    {
+                        // Begin authenticates an existing candidate and returns
+                        // its durable prefix. The helper retains the exact upload
+                        // identity, skips that prefix, and ends with Query.
+                        thread::sleep(Duration::from_millis(10));
+                        client = connect(&mut attempts, Some(census.guardian_incarnation()), true)
+                            .context("reconnect guardian for checkpoint staging")?;
+                    }
+                    Err(error) => {
+                        return Err(
+                            anyhow::Error::new(error).context("stage guardian Genesis checkpoint")
+                        );
+                    }
+                }
+            }
             anyhow::ensure!(
                 !cancelled.load(Ordering::Acquire),
                 "guardian spawn cancelled before birth"
             );
+            anyhow::ensure!(
+                attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                "guardian birth retry admission exhausted before Spawn"
+            );
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
-            let started = Instant::now();
-            let mut attempts = 0;
             let reply = loop {
+                anyhow::ensure!(
+                    attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                    "guardian exact birth reconciliation retry admission exhausted"
+                );
                 attempts += 1;
                 match client.spawn(pane, request, effect, command.clone(), pty_size) {
                     Ok(reply) => break reply,
@@ -264,14 +336,16 @@ impl Domain for GuardianDomain {
                         // loss. Each exchange keeps its own transport timeout; this
                         // elapsed limit admits retries, not a hard total deadline.
                         thread::sleep(Duration::from_millis(10));
-                        client =
-                            GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation)?;
+                        client = connect(&mut attempts, Some(census.guardian_incarnation()), false)
+                            .context("reconnect guardian for exact birth reconciliation")?;
                         anyhow::ensure!(
                             client.guardian_incarnation() == census.guardian_incarnation(),
                             "guardian incarnation changed during birth reconciliation"
                         );
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context("submit guardian birth"));
+                    }
                 }
             };
             anyhow::ensure!(
@@ -282,9 +356,12 @@ impl Domain for GuardianDomain {
                     }),
                 "guardian returned an unexpected birth receipt"
             );
-            let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)?
-                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())?
-                .restore_and_activate(config, TerminalCheckpointLimits::default())?;
+            let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
+                .context("prepare guardian birth lease")?
+                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+                .context("claim guardian birth lease")?
+                .restore_and_activate(config, TerminalCheckpointLimits::default())
+                .context("restore and activate guardian birth")?;
             let unpublished = UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
                 pane_id,
                 domain_id,
@@ -712,12 +789,76 @@ struct GuardianCensusCoordinatorState {
 
 struct GuardianRetirementSlot {
     identity: GuardianPaneLeaseIdentity,
-    authority: Arc<Mutex<Option<SharedGuardianPaneLeaseActor>>>,
+    authority: Arc<Mutex<Option<GuardianCleanupAuthority>>>,
     retry_attempts: u32,
     retry_not_before: Instant,
     retry_in_flight: bool,
     retry_blocked: bool,
     order: u64,
+}
+
+enum GuardianCleanupAuthority {
+    Claimed(SharedGuardianPaneLeaseActor),
+    PendingClaim(Box<GuardianPendingClaim>),
+}
+
+/// An unresolved request, not proof that the guardian granted a lease.
+struct GuardianPendingClaim {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+    identity: GuardianPaneLeaseIdentity,
+    observed_generation: u64,
+    request_id: Uuid,
+    effect_id: Uuid,
+    size: PtySize,
+}
+
+impl GuardianPendingClaim {
+    fn connect(&self) -> Result<GuardianClient, GuardianProxyError> {
+        let client = GuardianClient::connect(
+            &self.socket_path,
+            &self.token_path,
+            self.identity.mux_incarnation(),
+        )
+        .map_err(map_replay_client_error)?;
+        if client.guardian_incarnation() != self.identity.guardian_incarnation() {
+            return Err(GuardianProxyError::GuardianIncarnationChanged);
+        }
+        Ok(client)
+    }
+
+    fn claim(
+        &self,
+        client: GuardianClient,
+    ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        client.claim(
+            self.identity.pane_id(),
+            self.observed_generation,
+            self.request_id,
+            self.effect_id,
+        )
+    }
+
+    fn recover(&self) -> Result<SharedGuardianPaneLeaseActor, GuardianProxyError> {
+        let lease = self
+            .claim(self.connect()?)
+            .map_err(map_replay_client_error)?;
+        let next_sequence = lease.next_sequence();
+        let transport = GuardianClientTransport::from_claimed_lease(
+            &self.socket_path,
+            &self.token_path,
+            self.identity,
+            lease,
+        );
+        Ok(Arc::new(Mutex::new(
+            GuardianPaneLeaseActor::with_validated_transport(
+                self.identity,
+                next_sequence,
+                self.size,
+                Box::new(transport),
+            ),
+        )))
+    }
 }
 
 /// Explicitly shared, guardian-scoped child census coordinator.
@@ -908,7 +1049,9 @@ impl GuardianCensusCoordinator {
     ///
     /// The actor preserves the exact pending Retire request, effect, and
     /// mutation sequence. A failed maintenance call leaves the same authority
-    /// in the bounded coordinator slot for a later attempt.
+    /// in the bounded coordinator slot for a later attempt. An unresolved
+    /// Claim first retries its original identity; only the authenticated
+    /// successful reply can supply an actor to retire.
     pub fn retry_retained_lease_cleanup(&self) -> Result<bool, GuardianProxyError> {
         let now = Instant::now();
         let candidate = {
@@ -927,27 +1070,40 @@ impl GuardianCensusCoordinator {
             pane_id.and_then(|pane_id| {
                 let slot = state.retirement_slots.get_mut(&pane_id)?;
                 slot.retry_in_flight = true;
-                Some((
-                    pane_id,
-                    slot.identity,
-                    Arc::clone(slot.authority.lock().as_ref()?),
-                ))
+                Some((pane_id, slot.identity, Arc::clone(&slot.authority)))
             })
         };
-        let Some((pane_id, identity, actor)) = candidate else {
+        let Some((pane_id, identity, authority)) = candidate else {
             return Ok(false);
         };
 
-        let result = actor.lock().retire(identity);
+        let mut unresolved_claim = false;
+        let result = {
+            let mut retained = authority.lock();
+            match retained.as_mut() {
+                Some(GuardianCleanupAuthority::PendingClaim(pending)) => match pending.recover() {
+                    Ok(actor) => {
+                        // Store the genuine lease actor before Retire: a lost
+                        // retirement reply must retain its exact mutation ledger.
+                        *retained = Some(GuardianCleanupAuthority::Claimed(Arc::clone(&actor)));
+                        actor.lock().retire(identity)
+                    }
+                    Err(error) => {
+                        unresolved_claim = true;
+                        Err(error)
+                    }
+                },
+                Some(GuardianCleanupAuthority::Claimed(actor)) => actor.lock().retire(identity),
+                None => Err(GuardianProxyError::InvalidConfiguration(
+                    "retained guardian cleanup authority disappeared",
+                )),
+            }
+        };
         let mut state = self.state.lock();
         let still_exact = state.retirement_slots.get(&pane_id).is_some_and(|slot| {
             slot.identity == identity
                 && slot.retry_in_flight
-                && slot
-                    .authority
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|retained| Arc::ptr_eq(retained, &actor))
+                && Arc::ptr_eq(&slot.authority, &authority)
         });
         if !still_exact {
             return Err(GuardianProxyError::InvalidConfiguration(
@@ -965,7 +1121,7 @@ impl GuardianCensusCoordinator {
                 .increment(1);
                 Ok(true)
             }
-            Err(error) if guardian_retirement_is_resolved(&error) => {
+            Err(error) if !unresolved_claim && guardian_retirement_is_resolved(&error) => {
                 state.retirement_slots.remove(&pane_id);
                 state.cache = None;
                 log::warn!(
@@ -1126,7 +1282,7 @@ impl GuardianCensusCoordinator {
 struct GuardianRetirementReservation {
     coordinator: Arc<GuardianCensusCoordinator>,
     identity: GuardianPaneLeaseIdentity,
-    authority: Arc<Mutex<Option<SharedGuardianPaneLeaseActor>>>,
+    authority: Arc<Mutex<Option<GuardianCleanupAuthority>>>,
     active: bool,
 }
 
@@ -1139,8 +1295,12 @@ impl GuardianRetirementReservation {
         }
     }
 
-    fn retain(mut self, actor: SharedGuardianPaneLeaseActor, retry_blocked: bool) {
-        let replaced = self.authority.lock().replace(actor);
+    fn retain(self, actor: SharedGuardianPaneLeaseActor, retry_blocked: bool) {
+        self.retain_authority(GuardianCleanupAuthority::Claimed(actor), retry_blocked);
+    }
+
+    fn retain_authority(mut self, authority: GuardianCleanupAuthority, retry_blocked: bool) {
+        let replaced = self.authority.lock().replace(authority);
         debug_assert!(replaced.is_none());
         let slot_updated = {
             let mut state = self.coordinator.state.lock();
@@ -4243,6 +4403,9 @@ impl GuardianProxyLeasePlan {
 
     /// Claim one currently unowned pane and immediately install rollback
     /// authority before opening any secondary replay or checkpoint channel.
+    /// Transport failures retry the exact request under a finite attempt and
+    /// retry-admission budget. Exhaustion retains unresolved Claim authority
+    /// in the coordinator for later recovery and retirement.
     pub fn claim(
         self,
         pane_id: Uuid,
@@ -4250,6 +4413,11 @@ impl GuardianProxyLeasePlan {
         request_id: Uuid,
         effect_id: Uuid,
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        if request_id.is_nil() || effect_id.is_nil() {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian Claim request and effect identities must be nonzero",
+            ));
+        }
         let generation = observed_generation
             .checked_add(1)
             .ok_or(GuardianProxyError::Client(GuardianClientError::Protocol(
@@ -4274,9 +4442,59 @@ impl GuardianProxyLeasePlan {
             census,
             client,
         } = self;
-        let claimed_lease = client
-            .claim(pane_id, observed_generation, request_id, effect_id)
-            .map_err(map_replay_client_error)?;
+        let pending = Box::new(GuardianPendingClaim {
+            socket_path: socket_path.clone(),
+            token_path: token_path.clone(),
+            identity,
+            observed_generation,
+            request_id,
+            effect_id,
+            size,
+        });
+        let started = Instant::now();
+        let mut attempts = 0_u32;
+        let mut ambiguous = false;
+        let mut client = Some(client);
+        let claimed_lease = loop {
+            let mut definitive_rejection = false;
+            let connection = client.take().map_or_else(|| pending.connect(), Ok);
+            let result = connection.and_then(|client| {
+                pending.claim(client).map_err(|error| {
+                    definitive_rejection = matches!(&error, GuardianClientError::Rejected(_));
+                    map_replay_client_error(error)
+                })
+            });
+            match result {
+                Ok(lease) => break lease,
+                Err(error) => {
+                    attempts += 1;
+                    let retryable = matches!(
+                        &error,
+                        GuardianProxyError::Client(GuardianClientError::Io(_))
+                    );
+                    // An invalid reply can follow an applied Claim. Only an
+                    // authenticated rejection establishes a definite outcome
+                    // before any earlier ambiguous attempt.
+                    ambiguous |= !definitive_rejection;
+                    if retryable && attempts < 32 && started.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(10));
+                        if started.elapsed() < Duration::from_secs(5) {
+                            continue;
+                        }
+                    }
+                    // A Claim may have applied before any transport failure.
+                    // Preserve the original request even if a later reconnect
+                    // reports a terminal authority error. No lease is invented.
+                    if ambiguous {
+                        retirement_reservation.retain_authority(
+                            GuardianCleanupAuthority::PendingClaim(pending),
+                            !retryable,
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        };
         GuardianProxyStaging::from_planned_lease(
             &socket_path,
             &token_path,
@@ -5347,6 +5565,15 @@ mod tests {
                 assert!(std::future::Future::poll(spawn.as_mut(), &mut context).is_pending());
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while std::fs::read(&births).is_ok_and(|bytes| bytes == b"B") {
+                    match std::future::Future::poll(spawn.as_mut(), &mut context) {
+                        std::task::Poll::Ready(Err(error)) => {
+                            panic!("second birth failed before cancellation barrier: {error:#}");
+                        }
+                        std::task::Poll::Ready(Ok(_)) => {
+                            panic!("second birth passed the held census barrier");
+                        }
+                        std::task::Poll::Pending => {}
+                    }
                     assert!(Instant::now() < deadline, "second real child did not start");
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -5387,11 +5614,44 @@ mod tests {
                 drop(unpublished);
             }
             assert_eq!(mux.iter_panes().len(), 1);
-            let mut census =
-                GuardianClient::connect(&socket, &token, domain.mux_incarnation).unwrap();
+            let expected_guardian = domain
+                .state
+                .lock()
+                .census
+                .as_ref()
+                .unwrap()
+                .guardian_incarnation();
+            let mut census: Option<GuardianClient> = None;
+            let mut snapshot = |deadline: Instant| loop {
+                assert!(Instant::now() < deadline, "census phase deadline expired");
+                if census.is_none() {
+                    match GuardianClient::connect(&socket, &token, domain.mux_incarnation) {
+                        Ok(client) => {
+                            assert_eq!(client.guardian_incarnation(), expected_guardian);
+                            assert_eq!(client.mux_incarnation(), domain.mux_incarnation);
+                            census = Some(client);
+                        }
+                        Err(GuardianClientError::Io(_)) => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("census reconnect refused: {error}"),
+                    }
+                }
+                match census.as_mut().unwrap().census_snapshot() {
+                    Ok(rows) => break rows,
+                    Err(GuardianClientError::Io(_)) => {
+                        // Drop the partial snapshot and reconnect to the same
+                        // guardian. Never combine pages from separate attempts.
+                        census = None;
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("census snapshot refused: {error}"),
+                }
+            };
             let deadline = Instant::now() + Duration::from_secs(5);
             let rows = loop {
-                let rows = census.census_snapshot().unwrap();
+                let rows = snapshot(deadline);
                 if rows
                     .iter()
                     .any(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
@@ -5450,7 +5710,7 @@ mod tests {
             std::fs::write(&release, b"release").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let rows = census.census_snapshot().unwrap();
+                let rows = snapshot(deadline);
                 if rows.iter().all(|row| row.exit_status.is_some()) {
                     break;
                 }
@@ -7067,6 +7327,295 @@ mod tests {
                 "checkpoint pixel geometry does not match the claimed topology manifest"
             )
         ));
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClaimReplyFault {
+        ExhaustThenRecover,
+        RejectFirst,
+        ReplaceAfterLostReply,
+        WrongClaimReply,
+    }
+
+    fn exercise_authenticated_claim_fault(fault: ClaimReplyFault) {
+        use mux::guardian_protocol::{
+            GUARDIAN_MAX_FRAME_BYTES, GuardianEffectOutcome, GuardianOperation,
+            GuardianProtocolState, GuardianRequestEnvelope, GuardianRequestHeader,
+            GuardianResponseEnvelope, GuardianSecret, GuardianSpawnPayload,
+            decode_guardian_request, encode_guardian_request, encode_guardian_response,
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Protocol/transport fault injection only: the canonical ledger owns
+        // the Claim, but this fixture does not create or claim to preserve a PTY.
+        fn receive(stream: &mut UnixStream) -> Vec<u8> {
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).expect("frame prefix");
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length + 4 <= GUARDIAN_MAX_FRAME_BYTES);
+            let mut frame = vec![0; length + 4];
+            frame[..4].copy_from_slice(&prefix);
+            stream.read_exact(&mut frame[4..]).expect("frame body");
+            frame
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("ft-claim-retry-")
+            .tempdir_in(std::fs::canonicalize("/tmp").expect("canonical temporary root"))
+            .expect("private fixture directory")
+            .keep();
+        let socket = directory.join("guardian.sock");
+        let token = directory.join("token");
+        frankenterm_pty_guardian::provision_guardian_token(&token).expect("private token");
+        let token_bytes: [u8; 32] = std::fs::read(&token)
+            .expect("fixture token")
+            .try_into()
+            .expect("fixed token");
+        let listener = UnixListener::bind(&socket).expect("fixture listener");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("private socket mode");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let lease_identity = identity();
+        let request_id = Uuid::new_v4();
+        let effect_id = Uuid::new_v4();
+        let observed_generation = 0;
+        let server = thread::spawn(move || {
+            let secret = GuardianSecret::from_bytes(token_bytes).expect("fixture secret");
+            let mut protocol = GuardianProtocolState::new(lease_identity.guardian_incarnation())
+                .expect("canonical protocol ledger");
+            let payload = GuardianSpawnPayload::new(
+                portable_pty::CommandBuilder::new("/bin/sh"),
+                size(24, 80),
+            )
+            .expect("fixture spawn shape")
+            .encode()
+            .expect("encode fixture spawn");
+            let request = GuardianRequestEnvelope::from_zeroizing_payload(
+                GuardianRequestHeader::new(
+                    GuardianOperation::Spawn,
+                    lease_identity.guardian_incarnation(),
+                    lease_identity.mux_incarnation(),
+                    Uuid::new_v4(),
+                    Some(lease_identity.pane_id()),
+                    0,
+                    0,
+                    Some(Uuid::new_v4()),
+                    &payload,
+                ),
+                payload,
+            );
+            let frame = encode_guardian_request(&secret, &request).expect("encode fixture request");
+            let request = decode_guardian_request(&secret, &frame).expect("authenticate fixture");
+            protocol
+                .apply_effect_transactionally(&request, |_| GuardianEffectOutcome::<()>::Applied)
+                .expect("install protocol-only unclaimed pane");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut applied_claims = 0;
+            let attempts = match fault {
+                ClaimReplyFault::ExhaustThenRecover => 33,
+                ClaimReplyFault::RejectFirst | ClaimReplyFault::WrongClaimReply => 1,
+                ClaimReplyFault::ReplaceAfterLostReply => 2,
+            };
+            for attempt in 0..attempts {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "bounded fixture accept");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read bound");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("write bound");
+                let hello = decode_guardian_request(&secret, &receive(&mut stream)).expect("Hello");
+                let replaced =
+                    matches!(fault, ClaimReplyFault::ReplaceAfterLostReply) && attempt == 1;
+                let reply = if replaced {
+                    GuardianReply::Hello {
+                        guardian_incarnation: Uuid::new_v4(),
+                    }
+                } else {
+                    protocol.apply_observation(&hello).expect("canonical Hello")
+                };
+                let response =
+                    GuardianResponseEnvelope::reply(&hello, &reply).expect("Hello reply");
+                stream
+                    .write_all(&encode_guardian_response(&secret, &response).expect("Hello frame"))
+                    .expect("send Hello");
+                if replaced {
+                    break;
+                }
+                let claim = decode_guardian_request(&secret, &receive(&mut stream)).expect("Claim");
+                assert_eq!(claim.header().operation, GuardianOperation::Claim);
+                assert_eq!(claim.header().request_id, request_id);
+                assert_eq!(claim.header().effect_id, Some(effect_id));
+                assert_eq!(claim.header().lease_generation, observed_generation);
+                if matches!(fault, ClaimReplyFault::RejectFirst) {
+                    let response = GuardianResponseEnvelope::rejection(
+                        &claim,
+                        GuardianRejectionCode::InvalidRequest,
+                    );
+                    stream
+                        .write_all(
+                            &encode_guardian_response(&secret, &response).expect("rejection frame"),
+                        )
+                        .expect("send authenticated rejection");
+                    break;
+                }
+                let reply = protocol
+                    .apply_effect_transactionally(&claim, |_| {
+                        applied_claims += 1;
+                        GuardianEffectOutcome::<()>::Applied
+                    })
+                    .expect("deduplicate exact Claim");
+                if matches!(fault, ClaimReplyFault::WrongClaimReply) {
+                    let other = GuardianRequestEnvelope::new(
+                        GuardianRequestHeader::new(
+                            GuardianOperation::Claim,
+                            lease_identity.guardian_incarnation(),
+                            lease_identity.mux_incarnation(),
+                            Uuid::new_v4(),
+                            Some(lease_identity.pane_id()),
+                            observed_generation,
+                            0,
+                            Some(effect_id),
+                            &[],
+                        ),
+                        Vec::new(),
+                    );
+                    let other = decode_guardian_request(
+                        &secret,
+                        &encode_guardian_request(&secret, &other).expect("other correlation"),
+                    )
+                    .expect("authenticated other request");
+                    let response = GuardianResponseEnvelope::reply(&other, &reply)
+                        .expect("authenticated incorrectly correlated reply");
+                    stream
+                        .write_all(
+                            &encode_guardian_response(&secret, &response)
+                                .expect("wrong reply frame"),
+                        )
+                        .expect("send wrong reply after actual Claim");
+                    break;
+                }
+                if attempt < 32 {
+                    // The real ledger applied Claim, but no response reaches the client.
+                    continue;
+                }
+                let response =
+                    GuardianResponseEnvelope::reply(&claim, &reply).expect("Claim reply");
+                stream
+                    .write_all(&encode_guardian_response(&secret, &response).expect("Claim frame"))
+                    .expect("send Claim");
+                let retire =
+                    decode_guardian_request(&secret, &receive(&mut stream)).expect("Retire");
+                assert_eq!(retire.header().operation, GuardianOperation::RetireLease);
+                assert_eq!(retire.header().lease_generation, 1);
+                let reply = protocol
+                    .apply_effect_transactionally(&retire, |_| GuardianEffectOutcome::<()>::Applied)
+                    .expect("canonical retirement");
+                let response =
+                    GuardianResponseEnvelope::reply(&retire, &reply).expect("Retire reply");
+                stream
+                    .write_all(&encode_guardian_response(&secret, &response).expect("Retire frame"))
+                    .expect("send Retire");
+            }
+            assert_eq!(
+                applied_claims,
+                usize::from(!matches!(fault, ClaimReplyFault::RejectFirst)),
+                "lost replies never repeat Claim effect"
+            );
+        });
+        let (staging, _) = fake_staging([FakeDirective::Auto], 1);
+        let census = Arc::clone(&staging.census);
+        drop(staging);
+        let plan =
+            GuardianProxyLeasePlan::prepare(&socket, &token, size(24, 80), Arc::clone(&census))
+                .expect("authenticated plan");
+        let outcome = plan.claim(
+            lease_identity.pane_id(),
+            observed_generation,
+            request_id,
+            effect_id,
+        );
+        if matches!(fault, ClaimReplyFault::RejectFirst) {
+            assert!(outcome.is_err());
+            assert_eq!(
+                census.retained_lease_cleanup_count(),
+                0,
+                "definitive first rejection releases reservation"
+            );
+            server.join().expect("join rejecting fixture");
+            return;
+        }
+        match fault {
+            ClaimReplyFault::ExhaustThenRecover => assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+            )),
+            ClaimReplyFault::ReplaceAfterLostReply => assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::GuardianIncarnationChanged)
+            )),
+            ClaimReplyFault::RejectFirst => unreachable!(),
+            ClaimReplyFault::WrongClaimReply => assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::Client(GuardianClientError::Protocol(_)))
+            )),
+        }
+        assert_eq!(census.retained_lease_cleanup_count(), 1);
+        assert!(
+            matches!(census.state.lock().retirement_slots[&lease_identity.pane_id()].authority.lock().as_ref(),
+            Some(GuardianCleanupAuthority::PendingClaim(pending)) if pending.request_id == request_id && pending.effect_id == effect_id)
+        );
+        if matches!(
+            fault,
+            ClaimReplyFault::ReplaceAfterLostReply | ClaimReplyFault::WrongClaimReply
+        ) {
+            assert_eq!(census.blocked_retained_lease_cleanup_count(), 1);
+            assert!(
+                !census
+                    .retry_retained_lease_cleanup()
+                    .expect("blocked foreign authority cannot issue cleanup")
+            );
+            assert_eq!(census.retained_lease_cleanup_count(), 1);
+        } else {
+            assert!(
+                census
+                    .retry_retained_lease_cleanup()
+                    .expect("recover genuine Claim then retire")
+            );
+            assert_eq!(census.retained_lease_cleanup_count(), 0);
+        }
+        server.join().expect("join canonical protocol fixture");
+    }
+
+    #[test]
+    fn ambiguous_claim_retains_exact_request_until_authenticated_cleanup() {
+        exercise_authenticated_claim_fault(ClaimReplyFault::ExhaustThenRecover);
+    }
+
+    #[test]
+    fn definitive_claim_rejection_releases_reservation() {
+        exercise_authenticated_claim_fault(ClaimReplyFault::RejectFirst);
+    }
+
+    #[test]
+    fn ambiguous_claim_then_foreign_guardian_retains_blocked_request() {
+        exercise_authenticated_claim_fault(ClaimReplyFault::ReplaceAfterLostReply);
+    }
+
+    #[test]
+    fn applied_claim_with_uncorrelated_reply_retains_blocked_request() {
+        exercise_authenticated_claim_fault(ClaimReplyFault::WrongClaimReply);
     }
 
     #[test]

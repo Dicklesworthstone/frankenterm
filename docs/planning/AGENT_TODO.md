@@ -698,3 +698,29 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Execute final built-artifact performance/native selection/resize/font/Dock
   acceptance, then publish and verify. Protected system notification still
   blocks foreground interaction; no existing GUI or remote mux has been stopped.
+
+### 2026-09-16 11:17 UTC — multi-pane runtime and Claim recovery
+
+- [x] Run main parser/daemon tests: three passed at `57af3ef3b`.
+- [x] Prove `ft-j3061` at `46001b165`: all 25 server binary tests, including
+  TLS thread ownership, handshake timeout and peer rejection, passed. Strict
+  four-package all-target Clippy also passed. Bead closed with these receipts.
+- [x] Run implementation library: 649 passed, four Unix socket fixtures failed
+  from an overlong remote temporary path, three ignored. All eight local socket
+  tests then passed unchanged with explicit `TMPDIR=/tmp` (RCH31845).
+- [x] Preserve inactive RCH fixture residue by atomic non-overwriting rename
+  under its released source lock. No files deleted or permissions changed.
+- [ ] Complete real two-child Domain proof. `46001b165` publishes and renders
+  the first child, then fails the second birth. Normal replay-worker ownership
+  makes sealed Hello/staging retryably close; the new path lacked retries.
+- [ ] Verify bounded prebirth reconnect/staging retries retain identical
+  guardian/mux/effect/descriptor/payload/upload and original admission bounds.
+- [ ] Verify Claim retries preserve original request/effect/generation and
+  preallocated cleanup authority. Lost, malformed or unexpected replies must
+  retain unresolved Claim state; only an authenticated lease can become an
+  actor and issue Retire. Definite rejection must not leak a cleanup slot.
+- [ ] Run authenticated protocol/socket fault tests and real-process Domain
+  cancellation tests on the combined fix. Protocol-only fixtures do not prove
+  PTY survival; the actual guardian/broker/child tests remain required.
+- [ ] Finish final source freeze, DSR native build, six quality gates, four
+  attestation producers, measured performance, foreground acceptance and release.
