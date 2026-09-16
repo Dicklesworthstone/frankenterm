@@ -74,6 +74,15 @@ pub struct GuardianServiceConfig {
     max_output_bytes_per_pane: usize,
     max_total_output_bytes: usize,
     poll_interval: Duration,
+    broker_endpoint: Option<GuardianBrokerEndpoint>,
+}
+
+/// An explicitly configured, separately supervised broker. The connection
+/// still authenticates the running process family before admitting any child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardianBrokerEndpoint {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) token_path: PathBuf,
 }
 
 impl GuardianServiceConfig {
@@ -134,7 +143,31 @@ impl GuardianServiceConfig {
             max_output_bytes_per_pane,
             max_total_output_bytes,
             poll_interval,
+            broker_endpoint: None,
         })
+    }
+
+    pub fn with_broker_endpoint(
+        mut self,
+        socket_path: PathBuf,
+        token_path: PathBuf,
+    ) -> Result<Self, GuardianServiceError> {
+        validate_absolute_path(&socket_path)?;
+        validate_absolute_path(&token_path)?;
+        if socket_path == token_path
+            || socket_path == self.socket_path
+            || socket_path == self.token_path
+            || token_path == self.socket_path
+        {
+            return Err(GuardianServiceError::InvalidConfiguration(
+                "broker endpoint paths overlap an incompatible endpoint role",
+            ));
+        }
+        self.broker_endpoint = Some(GuardianBrokerEndpoint {
+            socket_path,
+            token_path,
+        });
+        Ok(self)
     }
 
     #[must_use]
@@ -950,7 +983,7 @@ impl GuardianService {
         )
         .map_err(|_| GuardianServiceError::OutputInitialization)?;
         token_authority.validate()?;
-        let runtime = GuardianRuntime::new(
+        let mut runtime = GuardianRuntime::new(
             poll.registry()
                 .try_clone()
                 .map_err(|error| GuardianServiceError::io("registry-clone", error))?,
@@ -959,6 +992,11 @@ impl GuardianService {
             output_pipeline,
             output_completion_waker,
         )?;
+        if let Some(endpoint) = config.broker_endpoint.as_ref() {
+            validate_private_parent(&endpoint.socket_path)?;
+            validate_private_parent(&endpoint.token_path)?;
+            runtime.configure_broker(endpoint.clone())?;
+        }
         let endpoint_capacity = config
             .max_connections
             .checked_add(config.max_panes)
@@ -1566,7 +1604,10 @@ impl GuardianService {
                         | GuardianOperation::Checkpoint
                         | GuardianOperation::Replay
                         | GuardianOperation::ReplayAck
-                ) {
+                ) || (request.header().operation == GuardianOperation::Spawn
+                    && connection.genesis_authority.is_some())
+                    || self.runtime.is_broker_control_request(&request)
+                {
                     let Some(route) = GuardianCheckpointRoute::new(
                         token,
                         connection.generation,
@@ -5744,6 +5785,250 @@ mod tests {
             drop(stop_guard);
             worker.join().unwrap();
             println!("GENESIS_DURABLE_STAGING_SUCCESS");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_genesis_service_spawns_once_and_journals_broker_output_before_ack() {
+        use crate::broker::{BrokerControlServiceConfigV1, BrokerControlServiceV1};
+        use mux::guardian_protocol::{
+            GuardianCheckpointDescriptorV1, GuardianCheckpointOutputBoundaryV1,
+            GuardianReplayPageBodyDelivery, GuardianReplaySelectorV1,
+        };
+
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let build = crate::guardian_runtime_build_identity()
+            .expect("positive Genesis runtime proof requires sealed candidate identity");
+        let directory = tempfile::Builder::new()
+            .prefix("ft-genesis-runtime-")
+            .tempdir_in(crate::canonical_test_temp_root())
+            .unwrap()
+            .keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = directory.join("token");
+        provision_guardian_token(&token).unwrap();
+        let socket = directory.join("guardian.sock");
+        let broker_socket = directory.join("broker.sock");
+        let spawn_catalog = directory.join("spawn-catalog");
+        let lease_catalog = directory.join("lease-catalog");
+        for path in [&spawn_catalog, &lease_catalog] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let broker_config = BrokerControlServiceConfigV1::new(
+            broker_socket.clone(),
+            token.clone(),
+            spawn_catalog,
+            lease_catalog,
+            build,
+            4,
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        let guardian_config = GuardianServiceConfig::new(
+            socket.clone(),
+            token.clone(),
+            8,
+            2,
+            65_536,
+            131_072,
+            Duration::from_millis(2),
+        )
+        .unwrap()
+        .with_broker_endpoint(broker_socket, token.clone())
+        .unwrap();
+        let marker = directory.join("child-count");
+        let expected = b"genesis-wire-output";
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop_guard = StopOnDrop(&stop);
+            let (broker_ready_tx, broker_ready_rx) = std::sync::mpsc::sync_channel(1);
+            let broker_stop = &stop;
+            let broker = scope.spawn(move || {
+                let mut service = BrokerControlServiceV1::bind(broker_config).unwrap();
+                broker_ready_tx.send(()).unwrap();
+                service.run_until(broker_stop).unwrap();
+            });
+            broker_ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (proof_tx, proof_rx) = std::sync::mpsc::sync_channel(1);
+            let guardian_stop = &stop;
+            let guardian = scope.spawn(move || {
+                let mut service = GuardianService::bind(guardian_config).unwrap();
+                ready_tx.send(()).unwrap();
+                let mut sent = false;
+                while !guardian_stop.load(Ordering::Acquire) {
+                    service.poll_once().unwrap();
+                    let counters = service.runtime_counters();
+                    if !sent
+                        && counters.broker_output_acknowledgements != 0
+                        && counters.pty_bytes_durably_committed == expected.len() as u64
+                    {
+                        proof_tx.send(counters).unwrap();
+                        sent = true;
+                    }
+                }
+            });
+            ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+            let mux = Uuid::new_v4();
+            let pane = Uuid::new_v4();
+            let effect = Uuid::new_v4();
+            let request = Uuid::new_v4();
+            let size = PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+            };
+            let command = || {
+                let mut command = CommandBuilder::new("/bin/sh");
+                command.args(["-c", "printf C >>\"$FT_GENESIS_TEST_MARKER\"; printf genesis-wire-output; IFS= read -r ignored"]);
+                command.env("FT_GENESIS_TEST_MARKER", &marker);
+                command
+            };
+            let mut client = GuardianClient::connect_for_genesis(&socket, &token, mux).unwrap();
+            assert!(
+                matches!(
+                    client.spawn(pane, request, effect, command(), size),
+                    Err(GuardianClientError::Rejected(_))
+                ),
+                "missing authenticated Begin must refuse before child creation"
+            );
+            assert!(!marker.exists());
+            let terminal = transport_checkpoint();
+            let descriptor =
+                GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal).unwrap();
+            client
+                .stage_genesis_checkpoint(effect, descriptor, terminal.canonical_payload(), 1_024)
+                .unwrap();
+            assert!(!marker.exists(), "staging alone created a child");
+            let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+            loop {
+                match client.spawn(pane, request, effect, command(), size) {
+                    Ok(reply) => {
+                        assert_eq!(
+                            reply,
+                            GuardianReply::Spawned {
+                                pane_id: pane,
+                                generation: 0
+                            }
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "Genesis activation did not finish: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                        client = GuardianClient::connect_for_genesis(&socket, &token, mux).unwrap();
+                    }
+                }
+            }
+            let counters = proof_rx
+                .recv_timeout(CLIENT_IO_TIMEOUT)
+                .expect("real runtime did not durably acknowledge broker output");
+            assert_eq!(counters.broker_starting_panes_adopted, 1);
+            assert_eq!(counters.pty_bytes_durably_committed, expected.len() as u64);
+            assert_eq!(counters.output_commit_failures, 0);
+            assert_eq!(std::fs::read(&marker).unwrap(), b"C");
+            let mut retry = GuardianClient::connect_for_genesis(&socket, &token, mux).unwrap();
+            assert_eq!(
+                retry.spawn(pane, request, effect, command(), size).unwrap(),
+                GuardianReply::Spawned {
+                    pane_id: pane,
+                    generation: 0
+                },
+            );
+            assert_eq!(
+                std::fs::read(&marker).unwrap(),
+                b"C",
+                "retry spawned a second child"
+            );
+            // Preserve one live originating connection while Claim consumes
+            // the other; no disconnect-driven lease retirement is hidden.
+            let lease = retry
+                .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
+                .unwrap();
+            let generation = lease.generation();
+            let mut leased = lease.into_client();
+            let page = leased
+                .replay(
+                    pane,
+                    generation,
+                    Uuid::new_v4(),
+                    GuardianReplayRequestV1::Open {
+                        selector: GuardianReplaySelectorV1::LatestCompatible,
+                        max_plaintext_bytes: 65_536,
+                        max_records: 16,
+                        wait_millis: 0,
+                    },
+                )
+                .unwrap();
+            assert_eq!(page.header().pane_id(), pane);
+            match page.into_body() {
+                GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                    assert_eq!(chunk.offset(), 0);
+                    assert!(matches!(
+                        chunk.descriptor().output_boundary(),
+                        GuardianCheckpointOutputBoundaryV1::Genesis { .. }
+                    ));
+                    let mut recovered = Vec::new();
+                    chunk.write_all_bounded(&mut recovered, 65_536).unwrap();
+                    assert_eq!(recovered, terminal.canonical_payload());
+                }
+                other => {
+                    panic!("Genesis replay did not return its canonical birth model: {other:?}")
+                }
+            }
+            let resized = PtySize {
+                rows: 30,
+                cols: 100,
+                ..size
+            };
+            assert!(matches!(
+                leased
+                    .resize(pane, generation, 1, Uuid::new_v4(), Uuid::new_v4(), resized)
+                    .unwrap(),
+                GuardianReply::MutationApplied { sequence: 1, .. }
+            ));
+            let input_request = Uuid::new_v4();
+            let input_effect = Uuid::new_v4();
+            let input = b"finish\n".to_vec();
+            let applied = leased
+                .input(
+                    pane,
+                    generation,
+                    2,
+                    input_request,
+                    input_effect,
+                    input.clone(),
+                )
+                .unwrap();
+            assert!(matches!(
+                applied,
+                GuardianReply::InputReceipt {
+                    state: InputEffectState::DurableFull,
+                    ..
+                }
+            ));
+            assert_eq!(
+                leased
+                    .input(pane, generation, 2, input_request, input_effect, input)
+                    .unwrap(),
+                applied
+            );
+            drop(stop_guard);
+            guardian.join().unwrap();
+            broker.join().unwrap();
+            println!("GENESIS_RUNTIME_BROKER_OUTPUT_SUCCESS");
         });
     }
 

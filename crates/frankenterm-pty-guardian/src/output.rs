@@ -20,13 +20,13 @@ use mux::guardian_checkpoint::{
     GuardianCheckpointCandidateIdentityV1, GuardianCheckpointCatalogAdoptionBindingV1,
     GuardianCheckpointCatalogAdoptionEvidenceV1, GuardianCheckpointCatalogPredecessorBindingV1,
     GuardianCheckpointCipher, GuardianCheckpointCipherError,
-    GuardianCheckpointOrderedChunkSetBuilderV1, GuardianCheckpointOrderedChunkSetIdentityV1,
-    GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
-    GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
-    GuardianCheckpointStageSealIntentV1, GuardianCheckpointValidatedManifestAuthorityV1,
-    GuardianEncryptedCheckpointStageRecordV1, GuardianGenesisReservationIdentityV1,
-    GuardianSpawnCustodyContextV1, GuardianSpawnCustodyError, GuardianSpawnCustodyScopeV1,
-    current_replay_identity_digest,
+    GuardianCheckpointGenesisSpawnPermitV1, GuardianCheckpointOrderedChunkSetBuilderV1,
+    GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointStageBindingV1,
+    GuardianCheckpointStageRecordContextV1, GuardianCheckpointStageRecordKindV1,
+    GuardianCheckpointStageScopeV1, GuardianCheckpointStageSealIntentV1,
+    GuardianCheckpointValidatedManifestAuthorityV1, GuardianEncryptedCheckpointStageRecordV1,
+    GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1, GuardianSpawnCustodyError,
+    GuardianSpawnCustodyScopeV1, current_replay_identity_digest,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -668,6 +668,18 @@ struct CheckpointCatalogGenesisReservationBinding {
     upload_id: Uuid,
 }
 
+/// Read authority connecting one published initial model to the freshly
+/// prepared output journal of that exact child. Cloning permits independent
+/// immutable replay snapshots; it never grants Spawn or mutation authority.
+#[derive(Clone)]
+pub(crate) struct GuardianGenesisReplayOriginV1 {
+    reservation: CheckpointCatalogGenesisReservationBinding,
+    catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
+    guardian_incarnation: Uuid,
+    initial_segment: GuardianOutputSegmentIdentity,
+    persistence: Arc<PersistentOutputAuthority>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointCatalogFormat {
     LegacyV2,
@@ -847,6 +859,7 @@ struct GuardianReplaySnapshot {
 }
 
 struct GuardianReplayCatalogPin {
+    genesis_origin: Option<GuardianGenesisReplayOriginV1>,
     selected: PublishedCheckpointCatalogMember,
     settled_head_identity: CheckpointCatalogIdentity,
     settled_head_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
@@ -1372,6 +1385,72 @@ struct PaneJournalAuthority {
 }
 
 impl PaneJournalAuthority {
+    fn append_broker_delivery(
+        &mut self,
+        token: &crate::broker::BrokerOutputDeliveryTokenV1,
+        payload: &[u8],
+    ) -> Result<GuardianOutputAppendReceipt, OutputCommitError> {
+        self.validate_path_authority()?;
+        if self.failed
+            || self.manifest.snapshot.durable_pane_id != token.pane_id()
+            || self.manifest.snapshot.guardian_incarnation != token.guardian_incarnation()
+            || !token.matches_payload(payload)
+        {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        let (start, end) = token.range();
+        let current = self.current_journal.cumulative_plaintext_bytes();
+        if current == start {
+            return self.append_and_sync(payload);
+        }
+        // A lost completion/ACK may replay an already committed delivery.
+        // Reauthenticate its exact terminal record instead of appending twice.
+        let receipt = self
+            .current_journal
+            .terminal_receipt()
+            .filter(|receipt| {
+                current == end
+                    && receipt.cumulative_plaintext_bytes() == end
+                    && usize::try_from(receipt.payload_bytes()).ok() == Some(payload.len())
+            })
+            .ok_or(OutputCommitError::PersistenceAuthority)?;
+        self.verify_broker_receipt(token, receipt)?;
+        Ok(receipt)
+    }
+
+    fn verify_broker_receipt(
+        &self,
+        token: &crate::broker::BrokerOutputDeliveryTokenV1,
+        receipt: GuardianOutputAppendReceipt,
+    ) -> Result<(), OutputCommitError> {
+        self.validate_path_authority()?;
+        if self.failed
+            || self.current_journal.is_poisoned()
+            || self.current_journal.tail() != GuardianOutputJournalTail::Clean
+            || self.current_journal.directory_entry_sync_required()
+            || !self.receipt_is_current(receipt)
+            || self.manifest.snapshot.durable_pane_id != token.pane_id()
+            || self.manifest.snapshot.guardian_incarnation != token.guardian_incarnation()
+            || receipt.cumulative_plaintext_bytes() != token.range().1
+        {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        let record = self.current_journal.verify_terminal_record(
+            receipt,
+            u32::try_from(OUTPUT_RECORD_BYTES).map_err(|_| OutputCommitError::Capacity)?,
+        )?;
+        let mut persisted = Zeroizing::new(Vec::new());
+        record.into_authenticated_delivery()?.write_all_bounded(
+            &mut *persisted,
+            u32::try_from(OUTPUT_RECORD_BYTES).map_err(|_| OutputCommitError::Capacity)?,
+        )?;
+        if !token.matches_payload(&persisted) {
+            return Err(OutputCommitError::PersistenceAuthority);
+        }
+        self.validate_path_authority()?;
+        Ok(())
+    }
+
     fn append_and_sync(
         &mut self,
         payload: &[u8],
@@ -1698,6 +1777,18 @@ pub struct GuardianPaneOutputJournal {
 }
 
 impl GuardianPaneOutputJournal {
+    #[cfg(test)]
+    pub(crate) fn current_segment_path_for_test(&self) -> std::path::PathBuf {
+        self.authority
+            .lock()
+            .unwrap()
+            .segments
+            .last()
+            .unwrap()
+            .path
+            .clone()
+    }
+
     pub(crate) fn receipt_is_current(&self, receipt: GuardianOutputAppendReceipt) -> bool {
         self.authority
             .lock()
@@ -2864,6 +2955,63 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// Seal the exact authenticated upload before granting broker admission.
+    /// The Spawn permit is consumed once; stored bytes never become a live
+    /// parser witness. Each durable transition revalidates the upload under
+    /// the store lock, including the final catalog rescan.
+    pub(crate) fn publish_staged_genesis(
+        &self,
+        begin: &GuardianCheckpointStageRequestV1,
+        permit: GuardianCheckpointGenesisSpawnPermitV1,
+    ) -> Result<GuardianPublishedGenesisAdmissionPermitV1, GuardianCheckpointStageStoreError> {
+        if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let shape = CheckpointStageRequestShape::from_request(begin)?;
+        if !matches!(shape.path_scope, CheckpointStagePathScope::Genesis { .. }) {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        if permit.reservation_identity().upload_id() != shape.upload_id {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let payload = self.with_exclusive_directory(|inner| {
+            let census = checkpoint_stage_census(inner)?;
+            let inspection = checkpoint_inspect_upload(
+                inner,
+                &census,
+                &shape,
+                CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+            )?
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if inspection.ack_present
+                || inspection.expiry_present
+                || inspection.next_index != shape.total_chunks
+                || inspection.committed_bytes != shape.total_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            checkpoint_assemble_payload(inner, &census, &shape, inspection.publication_id)
+        })?;
+        let (manifest_authority, reservation) =
+            GuardianCheckpointValidatedManifestAuthorityV1::from_staged_genesis_spawn_permit(
+                &shape.binding,
+                permit,
+                payload.as_slice(),
+            )?;
+        drop(payload);
+        let seal = GuardianCheckpointStageRequestV1::seal(
+            shape.scope,
+            shape.upload_id,
+            shape.descriptor,
+            shape.chunk_bytes,
+        )?;
+        self.apply_seal(
+            seal,
+            GuardianCheckpointOriginAuthority::Genesis { manifest_authority },
+        )?;
+        self.publish_genesis_catalog_admission(reservation)
+    }
+
     /// Consume the exact reservation continuation produced when the nonclone
     /// Spawn permit was split into Genesis-seal authority, publish its already
     /// sealed upload, and return PTY-admission authority only after a candidate
@@ -2945,6 +3093,100 @@ impl GuardianCheckpointStageStore {
         })
     }
 
+    /// Bind publication to a real, still-empty journal before broker Spawn.
+    /// Neither raw pane/effect identifiers nor an arbitrary checkpoint can
+    /// establish this origin. The output chain is revalidated on every replay.
+    pub(crate) fn prepare_genesis_replay_origin(
+        &self,
+        admission: &GuardianPublishedGenesisAdmissionPermitV1,
+        journal: &GuardianPaneOutputJournal,
+    ) -> Result<GuardianGenesisReplayOriginV1, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            let reservation =
+                CheckpointCatalogGenesisReservationBinding::from(&admission.reservation_identity);
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::Genesis {
+                    spawn_effect_id: reservation.spawn_effect_id,
+                },
+            )?;
+            checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+            let [member] = scan.published.as_slice() else {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            };
+            if member.format != CheckpointCatalogFormat::ProtectedV3
+                || member.candidate_checksum != admission.catalog_candidate_checksum
+                || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                    &member.metadata,
+                    reservation,
+                )
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            let authority = journal
+                .authority
+                .lock()
+                .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+            authority
+                .validate_path_authority()
+                .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
+            let [segment] = authority.segments.as_slice() else {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            };
+            if authority.failed
+                || authority.persistence.directory_identity != inner.persistence.directory_identity
+                || authority.persistence.key_identity != inner.persistence.key_identity
+                || authority.current_journal.is_poisoned()
+                || authority.current_journal.tail() != GuardianOutputJournalTail::Clean
+                || authority.current_journal.directory_entry_sync_required()
+                || authority.current_journal.record_count() != 0
+                || authority.current_journal.cumulative_plaintext_bytes() != 0
+                || authority.current_journal.terminal_receipt().is_some()
+                || authority.current_journal.identity() != segment.segment_identity
+                || authority.manifest.snapshot.durable_pane_id != reservation.durable_pane_id
+                || authority.manifest.snapshot.predecessor.is_some()
+                || authority.manifest.snapshot.segments.as_slice() != [segment.segment_identity]
+                || segment.segment_identity.durable_pane_id() != reservation.durable_pane_id
+                || segment.segment_identity.first_sequence() != 1
+                || segment.segment_identity.predecessor().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            validate_replayable_segment_chain(
+                &authority.directory,
+                &authority.directory_path,
+                &authority.segments,
+                &authority.cipher,
+                authority.policy,
+            )?;
+            let file = open_private_file_read_only_at_identity(
+                &authority.directory,
+                &authority.directory_path,
+                &segment.path,
+                segment.file_identity,
+            )?;
+            let initial = GuardianOutputJournalReader::open_existing(
+                file,
+                segment.segment_identity,
+                authority.cipher.clone(),
+                authority.policy.journal_limits,
+            )?;
+            if initial.tail() != GuardianOutputJournalTail::Clean
+                || initial.record_count() != 0
+                || initial.terminal_receipt().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            Ok(GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: admission.catalog_candidate_checksum,
+                guardian_incarnation: authority.manifest.snapshot.guardian_incarnation,
+                initial_segment: segment.segment_identity,
+                persistence: Arc::clone(&authority.persistence),
+            })
+        })
+    }
+
     /// Open or continue one immutable, process-local replay snapshot.
     /// Plaintext is never retained in the ledger: an exact retry reopens and
     /// reauthenticates the pinned encrypted artifacts into a fresh delivery.
@@ -2953,6 +3195,16 @@ impl GuardianCheckpointStageStore {
         request: &AuthenticatedGuardianRequest,
         replay: GuardianReplayRequestV1,
         journal: Option<&GuardianPaneOutputJournal>,
+    ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
+        self.apply_replay_with_genesis(request, replay, journal, None)
+    }
+
+    pub(crate) fn apply_replay_with_genesis(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+        replay: GuardianReplayRequestV1,
+        journal: Option<&GuardianPaneOutputJournal>,
+        genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
     ) -> Result<GuardianReplayPageDelivery, GuardianCheckpointStageStoreError> {
         let fingerprint = guardian_replay_request_fingerprint(request, replay)?;
         let request_id = request.header().request_id;
@@ -2995,6 +3247,7 @@ impl GuardianCheckpointStageStore {
                         max_plaintext_bytes,
                         max_records,
                         journal,
+                        genesis_origin,
                         access_epoch,
                     )
                 })?;
@@ -3589,6 +3842,7 @@ fn guardian_replay_open_snapshot(
     max_plaintext_bytes: u32,
     max_records: u16,
     journal: Option<&GuardianPaneOutputJournal>,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
     access_epoch: u64,
 ) -> Result<GuardianReplaySnapshot, GuardianCheckpointStageStoreError> {
     let pane_id = request
@@ -3596,7 +3850,7 @@ fn guardian_replay_open_snapshot(
         .pane_id
         .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
     let generation = request.header().lease_generation;
-    let scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
+    let mut scan = checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id })?;
     checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
     checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
     let has_evidence = |member: &PublishedCheckpointCatalogMember| {
@@ -3625,14 +3879,61 @@ fn guardian_replay_open_snapshot(
                 has_evidence(member) && member.metadata.checkpoint_id == checkpoint_id.into_bytes()
             })
         }
-    }
-    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    };
+    let mut selected_genesis_origin = None;
+    let selected_index = if let Some(index) = selected_index {
+        index
+    } else {
+        let origin = genesis_origin
+            .filter(|origin| origin.reservation.durable_pane_id == pane_id)
+            .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+        if origin.persistence.directory_identity != inner.persistence.directory_identity
+            || origin.persistence.key_identity != inner.persistence.key_identity
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        scan = checkpoint_catalog_scan(
+            inner,
+            CheckpointCatalogScope::Genesis {
+                spawn_effect_id: origin.reservation.spawn_effect_id,
+            },
+        )?;
+        checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+        let [member] = scan.published.as_slice() else {
+            return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+        };
+        if member.format != CheckpointCatalogFormat::ProtectedV3
+            || member.candidate_checksum != origin.catalog_candidate_checksum
+            || member.metadata.capture_generation > generation
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &member.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        let matches_selector = match selector {
+            GuardianReplaySelectorV1::LatestCompatible => {
+                member.metadata.replay_semantics_id == current_replay_identity_digest()
+            }
+            GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id }
+            | GuardianReplaySelectorV1::Resume { checkpoint_id, .. } => {
+                member.metadata.checkpoint_id == checkpoint_id.into_bytes()
+            }
+        };
+        if !matches_selector {
+            return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+        }
+        selected_genesis_origin = Some(origin.clone());
+        0
+    };
     let selected = scan.published[selected_index].clone();
     let head = scan
         .published
         .last()
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
     let catalog = GuardianReplayCatalogPin {
+        genesis_origin: selected_genesis_origin,
         selected,
         settled_head_identity: head.metadata.identity,
         settled_head_candidate_checksum: head.candidate_checksum,
@@ -3641,18 +3942,28 @@ fn guardian_replay_open_snapshot(
         settled_head_marker_path: head.marker_path.clone(),
         settled_head_marker_file_identity: head.marker_file_identity,
     };
-    let descriptor = guardian_replay_open_catalog_descriptor(inner, &catalog.selected)?;
-    if descriptor.durable_pane_id() != Some(pane_id) || descriptor.capture_generation() > generation
+    let descriptor = guardian_replay_open_catalog_descriptor(
+        inner,
+        &catalog.selected,
+        catalog.genesis_origin.as_ref(),
+    )?;
+    if (catalog.genesis_origin.is_none() && descriptor.durable_pane_id() != Some(pane_id))
+        || descriptor.capture_generation() > generation
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     let (suffix_first_sequence, suffix_previous_record_digest) = descriptor
         .suffix_start()
         .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    if catalog.genesis_origin.is_some() && journal.is_none() {
+        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+    }
     let output = journal
         .map(|journal| {
-            journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
-            guardian_replay_capture_output(journal, descriptor)
+            if catalog.genesis_origin.is_none() {
+                journal.validate_checkpoint_record_origin(&descriptor.canonical_descriptor()?)?;
+            }
+            guardian_replay_capture_output(journal, descriptor, catalog.genesis_origin.as_ref())
         })
         .transpose()?;
     let (initial_phase, initial_next_sequence, initial_previous_record_digest) = match selector {
@@ -3718,12 +4029,14 @@ fn guardian_replay_open_snapshot(
 fn guardian_replay_open_catalog_descriptor(
     inner: &GuardianCheckpointStageStoreInner,
     member: &PublishedCheckpointCatalogMember,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
 ) -> Result<GuardianCheckpointDescriptorV1, GuardianCheckpointStageStoreError> {
     if member.format != CheckpointCatalogFormat::ProtectedV3
-        || !matches!(
-            member.metadata.identity.scope,
-            CheckpointCatalogScope::Pane { .. }
-        )
+        || (genesis_origin.is_none()
+            && !matches!(
+                member.metadata.identity.scope,
+                CheckpointCatalogScope::Pane { .. }
+            ))
     {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
@@ -3741,7 +4054,18 @@ fn guardian_replay_open_catalog_descriptor(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     checkpoint_catalog_validate_candidate_records(inner, &candidate)?;
-    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &candidate)?;
+    if let Some(origin) = genesis_origin {
+        if candidate.checksum != origin.catalog_candidate_checksum
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &candidate.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+    } else {
+        let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &candidate)?;
+    }
     let begin_record = candidate
         .records
         .first()
@@ -3765,6 +4089,7 @@ fn guardian_replay_open_catalog_descriptor(
 fn guardian_replay_capture_output(
     journal: &GuardianPaneOutputJournal,
     descriptor: GuardianCheckpointDescriptorV1,
+    genesis_origin: Option<&GuardianGenesisReplayOriginV1>,
 ) -> Result<GuardianReplayOutputPin, GuardianCheckpointStageStoreError> {
     let authority = journal
         .authority
@@ -3810,20 +4135,54 @@ fn guardian_replay_capture_output(
     let terminal = segments
         .iter()
         .rev()
-        .find_map(|segment| segment.terminal_receipt)
-        .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
-    let GuardianCheckpointOutputBoundaryV1::Record {
-        sequence,
-        record_digest,
-        ..
-    } = descriptor.output_boundary()
-    else {
-        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
-    };
-    if terminal.sequence() < sequence
-        || (terminal.sequence() == sequence && terminal.record_digest() != record_digest)
-    {
-        return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        .find_map(|segment| segment.terminal_receipt);
+    match descriptor.output_boundary() {
+        GuardianCheckpointOutputBoundaryV1::Record {
+            sequence,
+            record_digest,
+            ..
+        } => {
+            let terminal =
+                terminal.ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            if genesis_origin.is_some()
+                || terminal.sequence() < sequence
+                || (terminal.sequence() == sequence && terminal.record_digest() != record_digest)
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+        }
+        GuardianCheckpointOutputBoundaryV1::Genesis {
+            spawn_effect_id,
+            parser_stream_bytes,
+        } => {
+            let origin =
+                genesis_origin.ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            if parser_stream_bytes != 0
+                || spawn_effect_id != origin.reservation.spawn_effect_id
+                || descriptor.checkpoint_id().into_bytes()
+                    != origin.reservation.checkpoint_identity_digest
+                || descriptor.boundary_id().into_bytes()
+                    != origin.reservation.boundary_identity_digest
+                || authority.failed
+                || authority.persistence.directory_identity != origin.persistence.directory_identity
+                || authority.persistence.key_identity != origin.persistence.key_identity
+                || authority.current_journal.is_poisoned()
+                || authority.current_journal.directory_entry_sync_required()
+                || authority.current_journal.tail() != GuardianOutputJournalTail::Clean
+                || authority.manifest.snapshot.guardian_incarnation != origin.guardian_incarnation
+                || authority.manifest.snapshot.durable_pane_id != origin.reservation.durable_pane_id
+                || authority.manifest.snapshot.segments.first() != Some(&origin.initial_segment)
+                || authority
+                    .segments
+                    .first()
+                    .map(|segment| segment.segment_identity)
+                    != Some(origin.initial_segment)
+                || origin.initial_segment.first_sequence() != 1
+                || origin.initial_segment.predecessor().is_some()
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+        }
     }
     Ok(GuardianReplayOutputPin {
         directory: authority.directory.try_clone().map_err(|error| {
@@ -3838,9 +4197,10 @@ fn guardian_replay_capture_output(
         publication_path: authority.manifest.publication_path.clone(),
         publication_file_identity: authority.manifest.publication_file_identity,
         segments,
-        terminal_sequence: terminal.sequence(),
-        terminal_record_digest: terminal.record_digest(),
-        cumulative_plaintext_bytes: terminal.cumulative_plaintext_bytes(),
+        terminal_sequence: terminal.map_or(0, |receipt| receipt.sequence()),
+        terminal_record_digest: terminal.map_or([0; 32], |receipt| receipt.record_digest()),
+        cumulative_plaintext_bytes: terminal
+            .map_or(0, |receipt| receipt.cumulative_plaintext_bytes()),
     })
 }
 
@@ -4115,7 +4475,19 @@ fn guardian_replay_validate_catalog_pin(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
+    if let Some(origin) = pin.genesis_origin.as_ref() {
+        if selected.checksum != origin.catalog_candidate_checksum
+            || !checkpoint_catalog_genesis_metadata_matches_reservation(
+                &selected.metadata,
+                origin.reservation,
+            )
+        {
+            return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+        }
+        checkpoint_catalog_validate_candidate_records(inner, &selected)?;
+    } else {
+        let _adoption = checkpoint_catalog_recover_adoption_evidence(inner, &selected)?;
+    }
 
     let head_bytes = checkpoint_catalog_read_file(
         inner,
@@ -4460,13 +4832,17 @@ fn guardian_replay_build_page(
                 snapshot.max_plaintext_bytes,
                 snapshot.max_records,
             )?;
-            let GuardianCheckpointOutputBoundaryV1::Record {
-                sequence,
-                record_digest,
-                ..
-            } = snapshot.descriptor.output_boundary()
-            else {
-                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            let (sequence, record_digest) = match snapshot.descriptor.output_boundary() {
+                GuardianCheckpointOutputBoundaryV1::Record {
+                    sequence,
+                    record_digest,
+                    ..
+                } => (sequence, record_digest),
+                GuardianCheckpointOutputBoundaryV1::Genesis {
+                    parser_stream_bytes: 0,
+                    ..
+                } if snapshot.catalog.genesis_origin.is_some() => (0, [0; 32]),
+                _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
             };
             (
                 GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
@@ -4509,6 +4885,9 @@ fn guardian_replay_build_page(
                             .checked_add(1)
                             .ok_or(GuardianCheckpointStageStoreError::Capacity)?
                     {
+                        // Even an empty suffix must still own its pinned
+                        // journal when it declares restoration complete.
+                        guardian_replay_validate_output_pin(output)?;
                         (
                             GuardianReplayPageBodyDelivery::Complete {
                                 checkpoint_id: snapshot.descriptor.checkpoint_id(),
@@ -6085,6 +6464,30 @@ struct OutputJob {
     pane_id: Uuid,
     journal: GuardianPaneOutputJournal,
     payload: Zeroizing<Vec<u8>>,
+    broker_delivery: Option<Box<crate::broker::BrokerOutputDeliveryTokenV1>>,
+}
+
+/// Constructor-private proof of canonical guardian journal durability for one
+/// exact authenticated broker delivery. No numeric output prefix can mint it.
+pub struct GuardianDurableBrokerOutputAckV1 {
+    token: Box<crate::broker::BrokerOutputDeliveryTokenV1>,
+    journal: GuardianPaneOutputJournal,
+    receipt: GuardianOutputAppendReceipt,
+}
+
+pub enum GuardianBrokerOutputSubmitError {
+    Rejected(crate::broker::BrokerOutputDeliveryV1),
+    Invariant,
+}
+
+impl GuardianDurableBrokerOutputAckV1 {
+    pub(crate) fn validated_token(&self) -> Option<&crate::broker::BrokerOutputDeliveryTokenV1> {
+        let authority = self.journal.authority.lock().ok()?;
+        authority
+            .verify_broker_receipt(&self.token, self.receipt)
+            .ok()?;
+        Some(self.token.as_ref())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -6107,6 +6510,7 @@ pub struct GuardianOutputCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) payload_bytes: usize,
     pub(crate) result: Result<GuardianOutputAppendReceipt, GuardianOutputCommitFailure>,
+    pub(crate) broker_ack: Option<GuardianDurableBrokerOutputAckV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6235,14 +6639,31 @@ impl OutputQueue {
     }
 }
 
-/// Fixed-size worker pool plus secure per-pane journal factory.
-pub struct GuardianOutputPipeline {
-    directory: File,
+/// Cloneable journal creation authority without worker queues or receivers.
+#[derive(Clone)]
+pub(crate) struct GuardianJournalPreparation {
+    directory: Arc<File>,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
-    checkpoint_store: GuardianCheckpointStageStore,
     policy: OutputSegmentPolicy,
     persistence: Arc<PersistentOutputAuthority>,
+}
+
+/// Fixed-size append workers and their completion receiver. Journal preparation
+/// authority can move independently to the checkpoint worker.
+pub struct GuardianOutputPipeline {
+    #[cfg(test)]
+    directory: File,
+    #[cfg(test)]
+    directory_path: PathBuf,
+    #[cfg(test)]
+    cipher: GuardianOutputCipher,
+    checkpoint_store: GuardianCheckpointStageStore,
+    #[cfg(test)]
+    policy: OutputSegmentPolicy,
+    #[cfg(test)]
+    persistence: Arc<PersistentOutputAuthority>,
+    preparation: GuardianJournalPreparation,
     queue: Arc<OutputQueue>,
     completions: Option<Receiver<GuardianOutputCompletion>>,
     workers: Vec<JoinHandle<()>>,
@@ -6293,6 +6714,16 @@ impl GuardianOutputPipeline {
             Arc::clone(&persistence),
             GuardianCheckpointStagePolicy::production(),
         )?;
+        let preparation =
+            GuardianJournalPreparation {
+                directory: Arc::new(directory.try_clone().map_err(|error| {
+                    GuardianOutputError::io("preparation-directory-clone", error)
+                })?),
+                directory_path: directory_path.clone(),
+                cipher: cipher.clone(),
+                policy,
+                persistence: Arc::clone(&persistence),
+            };
         let max_outstanding = max_panes.clamp(1, OUTPUT_MAX_IN_FLIGHT);
         let queue = Arc::new(OutputQueue::new(max_outstanding)?);
         let (completion_tx, completions) = sync_channel(max_outstanding);
@@ -6324,12 +6755,18 @@ impl GuardianOutputPipeline {
         drop(completion_tx);
 
         Ok(Self {
+            #[cfg(test)]
             directory,
+            #[cfg(test)]
             directory_path,
+            #[cfg(test)]
             cipher,
             checkpoint_store,
+            #[cfg(test)]
             policy,
+            #[cfg(test)]
             persistence,
+            preparation,
             queue,
             completions: Some(completions),
             workers,
@@ -6343,7 +6780,32 @@ impl GuardianOutputPipeline {
         self.checkpoint_store.clone()
     }
 
+    pub(crate) fn journal_preparation(&self) -> GuardianJournalPreparation {
+        self.preparation.clone()
+    }
+
     pub(crate) fn prepare_pane(
+        &self,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneOutputJournal, GuardianOutputError> {
+        self.preparation
+            .prepare_output(guardian_incarnation, pane_id)
+    }
+
+    pub(crate) fn prepare_input(
+        &self,
+        guardian_incarnation: Uuid,
+        pane_id: Uuid,
+    ) -> Result<GuardianPaneInputJournal, GuardianOutputError> {
+        self.preparation
+            .prepare_input(guardian_incarnation, pane_id)
+    }
+}
+
+impl GuardianJournalPreparation {
+    /// Performs cold filesystem work; call only from the owned authority worker.
+    pub(crate) fn prepare_output(
         &self,
         guardian_incarnation: Uuid,
         pane_id: Uuid,
@@ -6454,7 +6916,9 @@ impl GuardianOutputPipeline {
         input.validate_path_authority()?;
         Ok(input)
     }
+}
 
+impl GuardianOutputPipeline {
     #[cfg(test)]
     fn cold_open_pane_for_validation(
         &self,
@@ -6549,6 +7013,7 @@ impl GuardianOutputPipeline {
             pane_id,
             journal,
             payload,
+            broker_delivery: None,
         };
         self.queue.try_push(job).map_err(|error| match error {
             OutputQueuePushError::Saturated(job) => {
@@ -6558,6 +7023,38 @@ impl GuardianOutputPipeline {
                 GuardianOutputSubmitError::Unavailable(job.payload)
             }
         })
+    }
+
+    pub(crate) fn try_submit_broker_output(
+        &self,
+        journal: GuardianPaneOutputJournal,
+        delivery: crate::broker::BrokerOutputDeliveryV1,
+    ) -> Result<(), GuardianBrokerOutputSubmitError> {
+        if delivery.bytes().is_empty() || delivery.bytes().len() > OUTPUT_RECORD_BYTES {
+            return Err(GuardianBrokerOutputSubmitError::Rejected(delivery));
+        }
+        let (token, payload) = delivery.into_parts();
+        let job = OutputJob {
+            pane_id: token.pane_id(),
+            journal,
+            payload,
+            broker_delivery: Some(token),
+        };
+        match self.queue.try_push(job) {
+            Ok(()) => Ok(()),
+            Err(
+                OutputQueuePushError::Saturated(mut job) | OutputQueuePushError::Shutdown(mut job),
+            ) => {
+                // This private path always inserts the nonforgeable token.
+                let token = job
+                    .broker_delivery
+                    .take()
+                    .ok_or(GuardianBrokerOutputSubmitError::Invariant)?;
+                Err(GuardianBrokerOutputSubmitError::Rejected(
+                    crate::broker::BrokerOutputDeliveryV1::from_parts(token, job.payload),
+                ))
+            }
+        }
     }
 
     pub(crate) fn try_completion(&self) -> GuardianOutputCompletionState {
@@ -6590,7 +7087,10 @@ fn output_worker(
     while let Some(mut job) = queue.pop() {
         let payload_bytes = job.payload.len();
         let mut result = match job.journal.authority.lock() {
-            Ok(mut authority) => authority.append_and_sync(job.payload.as_slice()),
+            Ok(mut authority) => match job.broker_delivery.as_deref() {
+                Some(token) => authority.append_broker_delivery(token, job.payload.as_slice()),
+                None => authority.append_and_sync(job.payload.as_slice()),
+            },
             Err(_) => Err(OutputCommitError::JournalLockPoisoned),
         };
         job.payload.zeroize();
@@ -6598,10 +7098,21 @@ fn output_worker(
         if !queue.complete_one() {
             result = Err(OutputCommitError::QueueInvariant);
         }
+        let broker_ack = match (&result, job.broker_delivery) {
+            (Ok(receipt), Some(token)) if job.journal.receipt_is_current(*receipt) => {
+                Some(GuardianDurableBrokerOutputAckV1 {
+                    token,
+                    journal: job.journal,
+                    receipt: *receipt,
+                })
+            }
+            _ => None,
+        };
         let completion = GuardianOutputCompletion {
             pane_id: job.pane_id,
             payload_bytes,
             result: result.map_err(|_| GuardianOutputCommitFailure),
+            broker_ack,
         };
         if completions.send(completion).is_err() {
             return;
@@ -11569,6 +12080,55 @@ mod tests {
         Ok((directory, poll, pipeline))
     }
 
+    #[test]
+    fn journal_preparation_moves_without_pipeline_and_rejects_replaced_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-preparation-worker-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let factory = pipeline.journal_preparation();
+        let worker_factory = factory.clone();
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        drop(pipeline);
+        let worker = thread::spawn(move || {
+            let output = worker_factory.prepare_output(guardian, pane)?;
+            let input = worker_factory.prepare_input(guardian, pane)?;
+            Ok::<_, GuardianOutputError>((output, input))
+        });
+        let (output, input) = worker
+            .join()
+            .expect("journal preparation worker panicked")?;
+        assert_eq!(output.initial_cumulative_plaintext_bytes, 0);
+        assert_eq!(input.journal.record_count(), 0);
+        drop(output);
+        drop(input);
+        assert!(
+            factory.prepare_input(guardian, pane).is_err(),
+            "factory must preserve canonical input reopen refusal"
+        );
+
+        let retained = factory
+            .directory_path
+            .with_file_name(format!("retained-preparation-directory-{}", Uuid::new_v4()));
+        std::fs::rename(&factory.directory_path, &retained)?;
+        std::fs::create_dir(&factory.directory_path)?;
+        std::fs::set_permissions(
+            &factory.directory_path,
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let new_pane = Uuid::new_v4();
+        assert!(factory.prepare_output(guardian, new_pane).is_err());
+        assert!(factory.prepare_input(guardian, new_pane).is_err());
+        assert_eq!(
+            std::fs::read_dir(&factory.directory_path)?.count(),
+            0,
+            "replaced pathname must receive no journal effects"
+        );
+        Ok(())
+    }
+
     fn reopen_pipeline(
         directory: &Path,
         policy: OutputSegmentPolicy,
@@ -12421,6 +12981,77 @@ mod tests {
                 .apply_ack_from_committed_catalog(make_ack(completion)?, mux)?,
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_output_pins_start_at_zero_and_preserve_rollover_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-genesis-output-origin-", tiny_rotation_policy(4))?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let terminal = checkpoint_catalog_test_terminal(b"");
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal)?;
+        let mut reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        reservation.durable_pane_id = pane;
+        reservation.spawn_effect_id = effect;
+        reservation.checkpoint_identity_digest = descriptor.checkpoint_id().into_bytes();
+        reservation.boundary_identity_digest = descriptor.boundary_id().into_bytes();
+        // This unit test isolates output-origin validation. Production origin
+        // issuance is separately exercised through the sealed service fixture.
+        let origin = {
+            let authority = journal.authority.lock().map_err(|_| "poisoned journal")?;
+            GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: [0x57; 32],
+                guardian_incarnation: guardian,
+                initial_segment: authority.current_journal.identity(),
+                persistence: Arc::clone(&authority.persistence),
+            }
+        };
+        assert!(guardian_replay_capture_output(&journal, descriptor, None).is_err());
+        let empty = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(empty.terminal_sequence, 0);
+        assert_eq!(empty.terminal_record_digest, [0; 32]);
+        assert_eq!(empty.cumulative_plaintext_bytes, 0);
+        guardian_replay_validate_resume(&empty, 1, [0; 32], 1, [0; 32])?;
+        assert!(guardian_replay_validate_resume(&empty, 1, [0; 32], 1, [1; 32]).is_err());
+
+        let foreign = pipeline.prepare_pane(guardian, Uuid::new_v4())?;
+        assert!(guardian_replay_capture_output(&foreign, descriptor, Some(&origin)).is_err());
+        let mut wrong_guardian = origin.clone();
+        wrong_guardian.guardian_incarnation = Uuid::new_v4();
+        assert!(
+            guardian_replay_capture_output(&journal, descriptor, Some(&wrong_guardian)).is_err()
+        );
+        let mut wrong_segment = origin.clone();
+        wrong_segment.initial_segment =
+            GuardianOutputSegmentIdentity::new(pane, Uuid::new_v4(), 1, None)?;
+        assert!(
+            guardian_replay_capture_output(&journal, descriptor, Some(&wrong_segment)).is_err()
+        );
+        let (_other_directory, _other_poll, other_pipeline) =
+            pipeline_with_policy("ft-genesis-foreign-store-", tiny_rotation_policy(4))?;
+        let other_journal = other_pipeline.prepare_pane(guardian, pane)?;
+        assert!(guardian_replay_capture_output(&other_journal, descriptor, Some(&origin)).is_err());
+
+        durable_commit(&pipeline, pane, &journal, b"alpha")?;
+        let last = durable_commit(&pipeline, pane, &journal, b"beta")?;
+        let populated = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        assert_eq!(populated.segments.len(), 2);
+        assert_eq!(populated.terminal_sequence, 2);
+        assert_eq!(populated.terminal_record_digest, last.record_digest());
+        assert_eq!(populated.cumulative_plaintext_bytes, 9);
+        let (records, receipt) = guardian_replay_output_page(&populated, 1, [0; 32], 64, 4)?;
+        assert_eq!(receipt, last);
+        let mut text = Vec::new();
+        for record in records.into_records() {
+            record.write_all_bounded(&mut text, 64)?;
+        }
+        assert_eq!(text, b"alphabeta");
         Ok(())
     }
 
@@ -16870,12 +17501,14 @@ mod tests {
             pane_id,
             journal: journal.clone(),
             payload: zeroizing_test_bytes(b"reserved"),
+            broker_delivery: None,
         };
         assert!(queue.try_push(first).is_ok());
         let second = OutputJob {
             pane_id,
             journal,
             payload: zeroizing_test_bytes(b"backpressured"),
+            broker_delivery: None,
         };
         let OutputQueuePushError::Saturated(mut second) = queue
             .try_push(second)
@@ -16895,6 +17528,7 @@ mod tests {
             pane_id,
             journal: retained.journal,
             payload: zeroizing_test_bytes(b"unavailable"),
+            broker_delivery: None,
         };
         let OutputQueuePushError::Shutdown(mut after_shutdown) = queue
             .try_push(after_shutdown)

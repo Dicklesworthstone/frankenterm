@@ -2841,16 +2841,18 @@ fn replay_ack_with_exact_retry(
     ))
 }
 
+struct ValidatedReplayPageIdentity(GuardianPaneLeaseIdentity);
+
 fn validate_replay_page_identity(
     page: &GuardianReplayPageDelivery,
     identity: GuardianPaneLeaseIdentity,
-) -> Result<(), GuardianProxyError> {
+) -> Result<ValidatedReplayPageIdentity, GuardianProxyError> {
     if page.header().pane_id() != identity.pane_id()
         || page.header().generation() != identity.generation()
     {
         Err(GuardianProxyError::LeaseIdentityMismatch)
     } else {
-        Ok(())
+        Ok(ValidatedReplayPageIdentity(identity))
     }
 }
 
@@ -2865,6 +2867,29 @@ impl GuardianReplayBoundary {
     fn from_descriptor(
         descriptor: GuardianCheckpointDescriptorV1,
     ) -> Result<Self, GuardianProxyError> {
+        if let GuardianCheckpointOutputBoundaryV1::Genesis {
+            parser_stream_bytes,
+            ..
+        } = descriptor.output_boundary()
+        {
+            if parser_stream_bytes != 0
+                || descriptor.capture_generation()
+                    != mux::guardian_protocol::GUARDIAN_GENESIS_CAPTURE_GENERATION
+                || descriptor.durable_pane_id().is_some()
+            {
+                return Err(GuardianProxyError::ReplayInvariant(
+                    "genesis replay does not begin at the canonical zero origin",
+                ));
+            }
+            descriptor
+                .canonical_descriptor()
+                .map_err(GuardianProxyError::ReplayProtocol)?;
+            return Ok(Self {
+                next_sequence: 1,
+                previous_record_digest: [0; 32],
+                cumulative_plaintext_bytes: 0,
+            });
+        }
         let GuardianCheckpointOutputBoundaryV1::Record {
             sequence,
             record_digest,
@@ -2940,11 +2965,19 @@ impl fmt::Debug for VerifiedGuardianReplayRestore {
 
 fn validate_checkpoint_descriptor_for_proxy(
     descriptor: GuardianCheckpointDescriptorV1,
-    identity: GuardianPaneLeaseIdentity,
+    page_identity: ValidatedReplayPageIdentity,
     expected_size: PtySize,
     limits: TerminalCheckpointLimits,
 ) -> Result<(), GuardianProxyError> {
-    if descriptor.durable_pane_id() != Some(identity.pane_id()) {
+    let identity = page_identity.0;
+    // Genesis has no pane until the guardian publishes/adopts its Spawn.
+    // Its association is supplied only by the authenticated replay page,
+    // after the guardian reconciles the committed catalog and initial journal.
+    if matches!(
+        descriptor.output_boundary(),
+        GuardianCheckpointOutputBoundaryV1::Record { .. }
+    ) && descriptor.durable_pane_id() != Some(identity.pane_id())
+    {
         return Err(GuardianProxyError::LeaseIdentityMismatch);
     }
     if descriptor.capture_generation() > identity.generation() {
@@ -3080,7 +3113,7 @@ fn consume_one_guardian_replay_snapshot(
 
     for _ in 0..GUARDIAN_RESTORE_MAX_PAGES {
         let page = replay_page_with_exact_retry(transport, Uuid::new_v4(), request)?;
-        validate_replay_page_identity(&page, identity)?;
+        let page_identity = validate_replay_page_identity(&page, identity)?;
         let snapshot_id = page.header().snapshot_id();
         let snapshot_digest = page.header().snapshot_digest();
         let page_index = page.header().page_index();
@@ -3098,7 +3131,7 @@ fn consume_one_guardian_replay_snapshot(
                 let observed_descriptor = chunk.descriptor();
                 validate_checkpoint_descriptor_for_proxy(
                     observed_descriptor,
-                    identity,
+                    page_identity,
                     expected_size,
                     limits,
                 )?;
@@ -5677,6 +5710,14 @@ mod tests {
         descriptor: GuardianCheckpointDescriptorV1,
         checkpoint: Zeroizing<Vec<u8>>,
     ) -> VecDeque<GuardianReplayPageDelivery> {
+        checkpoint_and_complete_pages_for_identity(descriptor, checkpoint, identity())
+    }
+
+    fn checkpoint_and_complete_pages_for_identity(
+        descriptor: GuardianCheckpointDescriptorV1,
+        checkpoint: Zeroizing<Vec<u8>>,
+        page_identity: GuardianPaneLeaseIdentity,
+    ) -> VecDeque<GuardianReplayPageDelivery> {
         let snapshot_id = id(0x600);
         let snapshot_digest = [0x61; 32];
         let (next_sequence, previous_record_digest) = descriptor
@@ -5696,8 +5737,8 @@ mod tests {
         )
         .expect("construct checkpoint fixture continuation cursor");
         let checkpoint_page = GuardianReplayPageDelivery::new(
-            identity().pane_id(),
-            identity().generation(),
+            page_identity.pane_id(),
+            page_identity.generation(),
             snapshot_id,
             snapshot_digest,
             [0; 32],
@@ -5709,18 +5750,11 @@ mod tests {
             ),
         )
         .expect("construct checkpoint fixture page");
-        let GuardianCheckpointOutputBoundaryV1::Record {
-            sequence,
-            record_digest,
-            cumulative_plaintext_bytes,
-            ..
-        } = descriptor.output_boundary()
-        else {
-            panic!("checkpoint fixture must be record-backed");
-        };
+        let base = GuardianReplayBoundary::from_descriptor(descriptor)
+            .expect("fixture has a canonical replay boundary");
         let complete_page = GuardianReplayPageDelivery::new(
-            identity().pane_id(),
-            identity().generation(),
+            page_identity.pane_id(),
+            page_identity.generation(),
             snapshot_id,
             snapshot_digest,
             cursor.digest(),
@@ -5728,9 +5762,9 @@ mod tests {
             None,
             GuardianReplayPageBodyDelivery::Complete {
                 checkpoint_id: descriptor.checkpoint_id(),
-                through_sequence: sequence,
-                terminal_record_digest: record_digest,
-                cumulative_plaintext_bytes,
+                through_sequence: base.through_sequence().unwrap(),
+                terminal_record_digest: base.previous_record_digest,
+                cumulative_plaintext_bytes: base.cumulative_plaintext_bytes,
             },
         )
         .expect("construct checkpoint fixture completion page");
@@ -6039,6 +6073,187 @@ mod tests {
                 .checked_add(3)
                 .expect("bounded mutation call count"),
             "every Stage mutation retains a distinct fixed request identity"
+        );
+    }
+
+    fn genesis_checkpoint_fixture() -> (GuardianCheckpointDescriptorV1, Zeroizing<Vec<u8>>) {
+        let terminal = Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            test_terminal_config(),
+            "FrankenTerm",
+            "guardian-genesis-replay-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let checkpoint = terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .unwrap();
+        let descriptor =
+            GuardianCheckpointDescriptorV1::for_genesis_artifact(id(0x812), &checkpoint).unwrap();
+        (descriptor, checkpoint.into_canonical_payload())
+    }
+
+    #[test]
+    fn genesis_restore_consumes_canonical_zero_origin_after_page_identity_validation() {
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        assert_eq!(descriptor.durable_pane_id(), None);
+        assert_eq!(
+            descriptor.capture_generation(),
+            mux::guardian_protocol::GUARDIAN_GENESIS_CAPTURE_GENERATION
+        );
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages: checkpoint_and_complete_pages(descriptor, checkpoint),
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut transport = FakeReplayTransport {
+            state: Arc::clone(&state),
+        };
+        let restored = consume_one_guardian_replay_snapshot(
+            &mut transport,
+            identity(),
+            size(24, 80),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.boundary,
+            GuardianReplayBoundary {
+                next_sequence: 1,
+                previous_record_digest: [0; 32],
+                cumulative_plaintext_bytes: 0
+            }
+        );
+        assert_eq!(restored.checkpoint_id, descriptor.checkpoint_id());
+        restored.inert_terminal.checkpoint().unwrap();
+        let state = state.lock();
+        assert_eq!(state.acks.len(), 2);
+        assert!(
+            state
+                .acks
+                .iter()
+                .all(|(_, ack)| ack.through_sequence() == 0)
+        );
+    }
+
+    #[test]
+    fn genesis_restore_rejects_foreign_page_identity_geometry_and_forged_terminal_origin() {
+        for wrong_identity in [
+            identity_for(id(0x813), identity().generation()),
+            identity_for(identity().pane_id(), identity().generation() + 1),
+        ] {
+            let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+            let state = Arc::new(Mutex::new(FakeReplayState {
+                pages: checkpoint_and_complete_pages_for_identity(
+                    descriptor,
+                    checkpoint,
+                    wrong_identity,
+                ),
+                replay_io_failures: 0,
+                ack_io_failures: 0,
+                requests: Vec::new(),
+                acks: Vec::new(),
+            }));
+            let mut transport = FakeReplayTransport {
+                state: Arc::clone(&state),
+            };
+            assert!(matches!(
+                consume_one_guardian_replay_snapshot(
+                    &mut transport,
+                    identity(),
+                    size(24, 80),
+                    test_terminal_config(),
+                    TerminalCheckpointLimits::default()
+                ),
+                Err(GuardianProxyError::LeaseIdentityMismatch)
+            ));
+            assert!(
+                state.lock().acks.is_empty(),
+                "foreign page must fail before acknowledgement"
+            );
+        }
+        for expected_size in [
+            size(25, 80),
+            PtySize {
+                pixel_width: 641,
+                ..size(24, 80)
+            },
+        ] {
+            let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+            let state = Arc::new(Mutex::new(FakeReplayState {
+                pages: checkpoint_and_complete_pages(descriptor, checkpoint),
+                replay_io_failures: 0,
+                ack_io_failures: 0,
+                requests: Vec::new(),
+                acks: Vec::new(),
+            }));
+            let mut transport = FakeReplayTransport { state };
+            assert!(matches!(
+                consume_one_guardian_replay_snapshot(
+                    &mut transport,
+                    identity(),
+                    expected_size,
+                    test_terminal_config(),
+                    TerminalCheckpointLimits::default()
+                ),
+                Err(GuardianProxyError::ReplayInvariant(_))
+            ));
+        }
+        let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+        let mut pages = checkpoint_and_complete_pages(descriptor, checkpoint);
+        let original = pages.pop_back().unwrap();
+        pages.push_back(
+            GuardianReplayPageDelivery::new(
+                identity().pane_id(),
+                identity().generation(),
+                original.header().snapshot_id(),
+                original.header().snapshot_digest(),
+                original.header().incoming_cursor_digest(),
+                1,
+                None,
+                GuardianReplayPageBodyDelivery::Complete {
+                    checkpoint_id: descriptor.checkpoint_id(),
+                    through_sequence: 1,
+                    terminal_record_digest: [0x91; 32],
+                    cumulative_plaintext_bytes: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(Mutex::new(FakeReplayState {
+            pages,
+            replay_io_failures: 0,
+            ack_io_failures: 0,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut transport = FakeReplayTransport {
+            state: Arc::clone(&state),
+        };
+        assert!(matches!(
+            consume_one_guardian_replay_snapshot(
+                &mut transport,
+                identity(),
+                size(24, 80),
+                test_terminal_config(),
+                TerminalCheckpointLimits::default()
+            ),
+            Err(GuardianProxyError::ReplayInvariant(
+                "terminal replay witness does not match the consumed checkpoint and suffix"
+            ))
+        ));
+        assert_eq!(
+            state.lock().acks.len(),
+            1,
+            "forged terminal origin is never acknowledged"
         );
     }
 

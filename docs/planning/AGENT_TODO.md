@@ -512,7 +512,10 @@ notification. No alternate automation route is authorized by the tool refusal.
   that sealed binary, with matching before/after hashes: one passed.
 - [x] Implement bounded terminal-record reauthentication for broker ACKs
   (`fbad34fac`, deterministic negative followup `7a634c7f1`).
-- [ ] Pass the complete mux journal module remotely at `7a634c7f1`.
+- [x] Pass the complete mux journal module remotely at `7a634c7f1`
+  (RCH 57580): 51 passed, including all three terminal-record tests.
+  Fix its assertion-format warning in `c2f793277`/`42b21ec0a`; ACK integration
+  still requires guardian proof before `ft-p6ndm` closes.
 - [x] Implement staged Genesis publication from the exact authenticated
   initial model and linear Spawn reservation, without fabricating a live
   parser witness; include exact pixel geometry and substitution negatives.
@@ -526,3 +529,47 @@ notification. No alternate automation route is authorized by the tool refusal.
   child-spawn retries; prove query reconciliation and ordinary second Spawn.
 - [ ] Rerun the corrected private-directory fixture and all guardian tests
   on the integrated source, then freeze a new immutable release candidate.
+- [x] Pass staged authority's full checkpoint module at `42b21ec0a`
+  (RCH 57581): 34/34, no warnings. Later geometry changes still need proof.
+- [x] Commit typed Genesis activation and exact completed-reply replay
+  (`56eebb8e1`), retaining ambiguous/panic outcomes without callback replay.
+  Prevent ordinary Spawn stealing a pending child's reserved capacity slot;
+  count installed panes and permanent fences once.
+- [x] Fix the older live-witness Genesis constructor's missing pixel checks
+  (`287a81a80`) while preserving its real zero-parser-watermark requirement.
+- [x] Remotely execute the new activation/panic/capacity and live-pixel tests:
+  full mux library at `287a81a8021f676881d550a6b38c91c3a7273798`, RCH
+  30023644042231812, 1,184 passed, zero failed/ignored/filtered; all-target
+  Clippy with warnings denied passed in job 30023644042231813.
+- [x] Replace RCH CLI/daemon/worker with DSR-qualified `b4775837` artifacts
+  after empty-queue admission fencing, with backups and no interrupted jobs.
+- [x] Qualify actual jobs and stable source paths on durable worker `ts1`:
+  strict Clippy and two actual five-test fixture runs passed on the same
+  source/target pair after source retirement and rematerialization. The second
+  run recompiled its package in 0.79 seconds; this is not zero-recompile proof.
+
+### 2026-09-16 09:20 UTC — integrated Genesis replay proof preparation
+
+- [x] Bind Genesis replay to the actual published protected catalog and a
+  real empty encrypted journal before broker Spawn; retain exact reservation,
+  physical store/key identity and initial segment as private read authority.
+- [x] Extend producer replay to the authenticated zero-output origin and its
+  actual subsequent journal chain, including rollover. Ordinary record-origin
+  validation remains required for record checkpoints.
+- [x] Revalidate journal pins before empty Complete pages. Independent review
+  found this missing check; the real sealed publication test now corrupts and
+  fsyncs the pinned journal before Complete and requires InvalidFileMagic.
+- [ ] Execute that explicit sealed test and the full guardian suite on the
+  integrated committed runtime source. Formatting/source review is not proof.
+- [ ] Execute the proxy consumer suite and full service path, including real
+  initial Claim, input deduplication, resize, child status and post-exit replay.
+- [ ] Audit compiler/test failures from the combined source, fix them, and
+  rerun the affected causal targets before final release qualification.
+- [x] Prepare private final DSR quality config with one required full source
+  SHA: all six original commands and thresholds preserved, static checks pass.
+- [ ] Freeze the next candidate and execute all six pinned quality gates,
+  native DSR matrix, live performance, attestations and release closeout.
+
+Genesis read authority is currently process-local. This does not establish
+fresh guardian restart recovery, power-loss recovery of arbitrary processes,
+or safe migration of the existing unguarded remote mux sessions.
