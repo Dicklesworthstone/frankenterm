@@ -2805,6 +2805,18 @@ impl ScreenReflowPreparation {
         self.applied
     }
 
+    fn logical_cursor_for(&self, cursor: CursorPosition) -> Option<(usize, usize)> {
+        // The row controls trailing-blank pruning. Same-row cursor movement
+        // changes only the offset, while visibility/style/sequence do not
+        // change wrap geometry. Exact line validation remains mandatory.
+        if cursor.y != self.source_cursor.y || cursor.seqno < self.source_cursor.seqno {
+            return None;
+        }
+        let (group, column) = self.source_logical_cursor?;
+        let prefix = column.checked_sub(self.source_cursor.x)?;
+        Some((group, prefix.checked_add(cursor.x)?))
+    }
+
     pub fn prepare(&mut self, is_cancelled: impl Fn() -> bool) -> bool {
         self.ready = false;
         self.applied = false;
@@ -7077,7 +7089,7 @@ impl Screen {
         let matches = prepared.ready
             && self.allow_scrollback
             && prepared.target == size
-            && prepared.source_cursor == cursor
+            && prepared.logical_cursor_for(cursor).is_some()
             && prepared.source_dpi == self.dpi
             && prepared.snapshot.physical_cols == self.physical_cols
             && prepared.snapshot.physical_rows == self.physical_rows
@@ -7212,7 +7224,7 @@ impl Screen {
                         wrapped,
                         logical_count: cache.logical_lines.len(),
                         cache_entries: cache.wrapped_by_key.len(),
-                        logical_cursor: prepared.source_logical_cursor,
+                        logical_cursor: prepared.logical_cursor_for(cursor),
                     });
             }
             // The preparation owns only new counters, never a stale copy of
@@ -13523,6 +13535,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prepared_reflow_reuses_exact_rows_after_cursor_only_parser_activity() {
+        for action in [
+            b"\x1b[?25l".as_slice(),
+            b"\x1b[5 q".as_slice(),
+            b"\r".as_slice(),
+            b"\x1b[3G".as_slice(),
+        ] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig::default());
+            let mut term = crate::Terminal::new(
+                test_size(4, 20, 96),
+                config,
+                "prepared-cursor",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            term.advance_bytes("界e\u{301} abcdefghijklmnopqrstuvwxyz".as_bytes());
+            let source_cursor = term.cursor_pos();
+            let size = test_size(4, 7, 96);
+            let mut prepared = term
+                .screen()
+                .capture_reflow_preparation(size, source_cursor)
+                .unwrap();
+            assert!(prepared.prepare(|| false));
+            assert!(prepared.source_logical_cursor.unwrap().1 > source_cursor.x);
+            term.advance_bytes(action);
+            let cursor = term.cursor_pos();
+            assert_ne!(cursor, source_cursor, "parser action {action:?}");
+            assert_eq!(cursor.y, source_cursor.y);
+            let seqno = term.current_seqno().checked_add(1).unwrap();
+            let mut synchronous = term.screen().clone();
+            let expected_cursor = synchronous.resize(size, cursor, seqno, false);
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            let actual_cursor = term.screen_mut().resize_with_prepared_reflow(
+                size,
+                cursor,
+                seqno,
+                false,
+                Some(&mut prepared),
+            );
+            assert!(prepared.was_applied(), "parser action {:?}", action);
+            assert_eq!(REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()), 0);
+            assert_eq!(actual_cursor, expected_cursor, "parser action {action:?}");
+            assert_eq!(
+                term.screen().lines,
+                synchronous.lines,
+                "parser action {action:?}"
+            );
+            assert_eq!(actual_cursor.shape, cursor.shape);
+            assert_eq!(actual_cursor.visibility, cursor.visibility);
+        }
+    }
+
+    #[test]
+    fn prepared_reflow_rejects_backwards_cursor_sequence_and_offset_overflow() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.lines[0] = Line::from_text("abcdefgh", &CellAttributes::blank(), 1, None);
+        screen.lines[0].set_last_cell_was_wrapped(true, 1);
+        screen.lines[1] = Line::from_text("ijkl", &CellAttributes::blank(), 1, None);
+        let cursor = test_cursor(2, 1, 2);
+        let size = test_size(3, 4, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        assert!(prepared.prepare(|| false));
+        assert!(screen.matches_reflow_preparation(&prepared, size, cursor));
+        let backwards = CursorPosition { seqno: 1, ..cursor };
+        assert!(prepared.logical_cursor_for(backwards).is_none());
+        assert!(!screen.matches_reflow_preparation(&prepared, size, backwards));
+        let overflow = CursorPosition {
+            x: usize::MAX,
+            ..cursor
+        };
+        assert!(prepared.logical_cursor_for(overflow).is_none());
+        assert!(!screen.matches_reflow_preparation(&prepared, size, overflow));
+    }
+
+    #[test]
     fn prepared_reflow_rejects_changed_source_and_policy() {
         for mutation in 0..8 {
             let mut screen = test_screen(3, 8, 96);
@@ -13555,7 +13642,7 @@ pub(crate) mod tests {
                     screen.resize_wrap_policy.kp_cost_model.lookahead_limit = 1;
                 }
                 5 => {
-                    cursor.x = 1;
+                    cursor.y = 1;
                 }
                 6 => {
                     screen.dpi = 144;
