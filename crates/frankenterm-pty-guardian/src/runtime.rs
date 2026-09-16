@@ -1418,6 +1418,11 @@ impl GuardianRuntime {
             .starting_broker_panes
             .iter()
             .filter(|(pane_id, pane)| {
+                // Retain the exact failed reservation for retry diagnostics,
+                // but no broker call means no child or PTY can be live.
+                if pane.failed_before_spawn {
+                    return false;
+                }
                 let settled = pane.activated
                     && pane.child_exit_observed
                     && pane.terminal
@@ -6229,6 +6234,70 @@ mod tests {
             Some(pane_ids[0])
         );
         Ok(())
+    }
+
+    #[test]
+    fn failed_before_broker_spawn_retains_identity_without_live_occupancy() {
+        let (_directory, _poll, mut runtime) = runtime_for_input_rejection();
+        let pane_id = Uuid::new_v4();
+        runtime.starting_broker_panes.insert(
+            pane_id,
+            StartingBrokerPane {
+                mux_incarnation: Uuid::new_v4(),
+                spawn_request_id: Uuid::new_v4(),
+                spawn_effect_id: Uuid::new_v4(),
+                spawn_payload_digest: [1; 32],
+                custody_ack_id: Uuid::new_v4(),
+                initial_pending: false,
+                failed_before_spawn: false,
+                output: None,
+                handle: None,
+                pending_delivery: None,
+                pending_ack: None,
+                read_reservation: 0,
+                terminal: false,
+                child_exit_observed: false,
+                status_due: true,
+                input_journal: None,
+                activated: false,
+                original_spawn: None,
+                activation: None,
+                replay_origin: None,
+            },
+        );
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "unknown child disposition stays owned"
+        );
+        runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .failed_before_spawn = true;
+        assert_eq!(
+            runtime.pane_count(),
+            0,
+            "no broker call means no live child"
+        );
+        assert!(runtime.starting_broker_panes.contains_key(&pane_id));
+        runtime.indeterminate_effect = true;
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "another ambiguous effect still blocks shutdown"
+        );
+        runtime.indeterminate_effect = false;
+        runtime
+            .starting_broker_panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .failed_before_spawn = false;
+        assert_eq!(
+            runtime.pane_count(),
+            1,
+            "possibly attempted Spawn stays owned"
+        );
     }
 
     #[test]

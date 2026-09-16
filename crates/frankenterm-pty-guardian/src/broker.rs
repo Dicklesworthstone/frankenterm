@@ -23195,6 +23195,34 @@ mod tests {
             max_records: 1,
             wait_millis: 0,
         };
+        let foreign_payload = Zeroizing::new(replay.encode().unwrap());
+        let foreign_header = GuardianRequestHeader::new(
+            GuardianOperation::Replay,
+            id(0x93ff),
+            connection.mux_incarnation,
+            Uuid::new_v4(),
+            Some(pane_id),
+            1,
+            0,
+            None,
+            &foreign_payload,
+        );
+        let foreign_request =
+            GuardianRequestEnvelope::from_zeroizing_payload(foreign_header, foreign_payload);
+        let foreign_frame = encode_guardian_request(&secret, &foreign_request).unwrap();
+        let foreign_request = decode_guardian_request(&secret, &foreign_frame).unwrap();
+        assert!(
+            matches!(
+                store.apply_replay_with_genesis(
+                    &foreign_request,
+                    replay,
+                    Some(&journal),
+                    Some(&origin),
+                ),
+                Err(crate::output::GuardianCheckpointStageStoreError::OriginAuthorityMismatch)
+            ),
+            "signed foreign guardian cannot relabel the initial journal's origin"
+        );
         let mut reached_output = false;
         let mut canonical = Zeroizing::new(Vec::new());
         for _ in 0..256 {

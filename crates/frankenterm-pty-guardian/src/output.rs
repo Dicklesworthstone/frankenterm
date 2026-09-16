@@ -3887,7 +3887,8 @@ fn guardian_replay_open_snapshot(
         let origin = genesis_origin
             .filter(|origin| origin.reservation.durable_pane_id == pane_id)
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
-        if origin.persistence.directory_identity != inner.persistence.directory_identity
+        if origin.guardian_incarnation != request.header().guardian_incarnation
+            || origin.persistence.directory_identity != inner.persistence.directory_identity
             || origin.persistence.key_identity != inner.persistence.key_identity
         {
             return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
