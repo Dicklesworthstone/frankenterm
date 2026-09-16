@@ -712,7 +712,8 @@ fn replay_store_error_response(
         GuardianCheckpointStageStoreError::Capacity
         | GuardianCheckpointStageStoreError::Allocation
         | GuardianCheckpointStageStoreError::NameLimit => GuardianRejectionCode::CapacityExhausted,
-        GuardianCheckpointStageStoreError::Cipher(_)
+        GuardianCheckpointStageStoreError::SpawnCustody(_)
+        | GuardianCheckpointStageStoreError::Cipher(_)
         | GuardianCheckpointStageStoreError::Boundary(_)
         | GuardianCheckpointStageStoreError::Output(_)
         | GuardianCheckpointStageStoreError::Journal(_)

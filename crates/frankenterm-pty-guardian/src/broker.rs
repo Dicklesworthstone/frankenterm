@@ -5939,6 +5939,9 @@ fn evict_one_inactive_hello_receipt(
     Ok(true)
 }
 
+/// Publicly nameable, privately minted post-synchronization custody capability.
+pub use crate::output::GuardianDurableSpawnCustodyV1;
+
 /// Blocking guardian-side client for the production-disabled broker process.
 pub struct BrokerControlClientV1 {
     stream: BlockingUnixStream,
@@ -5946,6 +5949,8 @@ pub struct BrokerControlClientV1 {
     identity: BrokerGuardianConnectionIdentityV1,
     connection_id: Uuid,
     broker_incarnation: Uuid,
+    broker_lineage: Uuid,
+    broker_build: SealedAtomicBuildIdentity,
     recovered_hello: bool,
     poisoned: bool,
 }
@@ -5981,6 +5986,10 @@ pub enum BrokerSpawnEffectQueryV1 {
 /// received it; the broker then drops its plaintext copy and retains only the
 /// verifier.
 pub struct BrokerInitialPaneClaimV1 {
+    broker_incarnation: Uuid,
+    broker_lineage: Uuid,
+    broker_build: SealedAtomicBuildIdentity,
+    origin: BrokerGuardianConnectionIdentityV1,
     durable_pane_id: Uuid,
     spawn_effect_id: Uuid,
     child_identity: BrokerKernelChildIdentityV1,
@@ -6178,6 +6187,8 @@ impl BrokerControlClientV1 {
             identity,
             connection_id,
             broker_incarnation: Uuid::nil(),
+            broker_lineage: expected_lineage,
+            broker_build: expected_broker_build_identity,
             recovered_hello: false,
             poisoned: false,
         };
@@ -6313,6 +6324,91 @@ impl BrokerControlClientV1 {
         }
     }
 
+    pub(crate) fn persist_spawn_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        claim: &BrokerInitialPaneClaimV1,
+        ack_id: Uuid,
+    ) -> Result<GuardianDurableSpawnCustodyV1, crate::output::GuardianCheckpointStageStoreError>
+    {
+        if claim.broker_lineage != self.broker_lineage
+            || claim.broker_build != self.broker_build
+            || claim.origin != self.identity
+        {
+            return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
+        }
+        let context = mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+            broker_incarnation: claim.broker_incarnation,
+            broker_lineage: claim.broker_lineage,
+            guardian_incarnation: claim.origin.guardian_incarnation,
+            mux_incarnation: claim.origin.mux_incarnation,
+            broker_build: claim.broker_build.into_bytes(),
+            guardian_build: claim.origin.guardian_build_identity.into_bytes(),
+            mux_build: claim.origin.mux_build_identity.into_bytes(),
+            pane_id: claim.durable_pane_id,
+            effect_id: claim.spawn_effect_id,
+            ack_id,
+            child_pid: claim.child_identity.process_id,
+            child_nonce: claim.child_identity.broker_child_nonce,
+            child_start_digest: claim.child_identity.kernel_start_identity_digest,
+            wire_ack_generation: 0,
+            secret_lease_generation: 1,
+        };
+        store.persist_spawn_custody(context, claim.recovery_secret.as_wire())
+    }
+
+    /// Recover original ACK/child provenance using only authenticated stable client scope.
+    pub(crate) fn reopen_spawn_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        pane_id: Uuid,
+        effect_id: Uuid,
+    ) -> Result<GuardianDurableSpawnCustodyV1, crate::output::GuardianCheckpointStageStoreError>
+    {
+        store.lookup_spawn_custody(mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+            broker_lineage: self.broker_lineage,
+            guardian_incarnation: self.identity.guardian_incarnation,
+            mux_incarnation: self.identity.mux_incarnation,
+            broker_build: self.broker_build.into_bytes(),
+            guardian_build: self.identity.guardian_build_identity.into_bytes(),
+            mux_build: self.identity.mux_build_identity.into_bytes(),
+            pane_id,
+            effect_id,
+        })
+    }
+
+    /// Consume custody established by encrypted file and directory synchronization.
+    /// The record is reopened, reauthenticated and resynchronized before network I/O.
+    /// Lost replies use the same immutable record and stored acknowledgement ID.
+    pub fn acknowledge_spawn_effect(
+        &mut self,
+        custody: GuardianDurableSpawnCustodyV1,
+    ) -> Result<BrokerSpawnEffectAcknowledgementV1, BrokerControlClientError> {
+        let context = custody.context();
+        // Incarnation is immutable origin provenance; a restarted broker proves
+        // the same stable lineage in Hello and revalidates the exact ACK in WAL.
+        if context.broker_lineage != self.broker_lineage
+            || context.broker_build != self.broker_build.into_bytes()
+            || context.guardian_incarnation != self.identity.guardian_incarnation
+            || context.mux_incarnation != self.identity.mux_incarnation
+            || context.guardian_build != self.identity.guardian_build_identity.into_bytes()
+            || context.mux_build != self.identity.mux_build_identity.into_bytes()
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let secret = custody
+            .into_secret()
+            .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+        let secret = BrokerPaneRecoverySecretV1::from_wire(secret.as_slice())
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        self.acknowledge_spawn_effect_request(
+            context.pane_id,
+            context.effect_id,
+            context.ack_id,
+            &secret,
+        )
+    }
+
     /// Durably acknowledge the exact generation-zero Spawn result without
     /// blocking the client-facing readiness loop on WAL synchronization.
     ///
@@ -6322,7 +6418,7 @@ impl BrokerControlClientV1 {
     /// recovery capability must already be stored durably by the caller: a
     /// successful acknowledgement causes the broker to destroy its plaintext
     /// copy and retain only the authenticated verifier.
-    pub fn acknowledge_spawn_effect(
+    fn acknowledge_spawn_effect_request(
         &mut self,
         durable_pane_id: Uuid,
         spawn_effect_id: Uuid,
@@ -6510,6 +6606,10 @@ impl BrokerControlClientV1 {
                 let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(response.payload())
                     .map_err(|_| BrokerControlClientError::Protocol)?;
                 Ok(BrokerSpawnClaimQueryV1::Claim(BrokerInitialPaneClaimV1 {
+                    broker_incarnation: self.broker_incarnation,
+                    broker_lineage: self.broker_lineage,
+                    broker_build: self.broker_build,
+                    origin: self.identity,
                     durable_pane_id,
                     spawn_effect_id,
                     child_identity: response
@@ -22007,6 +22107,55 @@ mod tests {
             outcome => panic!("control Spawn did not expose its initial claim: {outcome:?}"),
         };
         assert_eq!(initial_claim.child_identity(), child_identity);
+        let custody_poll = Poll::new().expect("custody pipeline poll");
+        let custody_waker =
+            Arc::new(Waker::new(custody_poll.registry(), Token(1)).expect("custody waker"));
+        let custody_pipeline =
+            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+                .expect("open encrypted custody store");
+        let custody_store = custody_pipeline.checkpoint_stage_store();
+        for cut in [1, 2] {
+            custody_store.interrupt_spawn_custody_publication_for_test(cut);
+            assert!(
+                client
+                    .persist_spawn_custody(&custody_store, &initial_claim, id(7_308))
+                    .is_err()
+            );
+            assert!(
+                client
+                    .reopen_spawn_custody(
+                        &custody_store,
+                        binding.durable_pane_id,
+                        binding.spawn_effect_id
+                    )
+                    .is_err(),
+                "interrupted staging must never expose a final custody claim"
+            );
+            let reissued = match client
+                .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("broker must retain the genuine secret until durable custody ACK")
+            {
+                BrokerSpawnClaimQueryV1::Claim(claim) => claim,
+                outcome => {
+                    panic!("interrupted custody publication lost initial secret: {outcome:?}")
+                }
+            };
+            assert_eq!(reissued.child_identity(), child_identity);
+            assert_eq!(
+                reissued.recovery_secret().as_wire(),
+                initial_claim.recovery_secret().as_wire()
+            );
+        }
+        drop(custody_store);
+        drop(custody_pipeline);
+        let custody_pipeline =
+            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+                .expect("reopen persisted key with only interrupted custody staging on disk");
+        let custody_store = custody_pipeline.checkpoint_stage_store();
+        let durable_custody = client
+            .persist_spawn_custody(&custody_store, &initial_claim, id(7_308))
+            .expect("sync and authenticate custody before any ACK");
+        let custody_context = durable_custody.context();
         let other_mux_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_311),
             id(7_312),
@@ -22021,6 +22170,14 @@ mod tests {
             broker_build,
         )
         .expect("connect cross-mux control Spawn client");
+        assert!(matches!(
+            other_mux_client.acknowledge_spawn_effect(
+                custody_store
+                    .reopen_spawn_custody(custody_context)
+                    .expect("reopen genuine custody for wrong mux negative")
+            ),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
         assert_eq!(
             other_mux_client
                 .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
@@ -22029,7 +22186,7 @@ mod tests {
         );
         assert_eq!(
             other_mux_client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_313),
@@ -22039,13 +22196,83 @@ mod tests {
             BrokerSpawnEffectAcknowledgementV1::Absent
         );
         drop(other_mux_client);
+        // A real second Hello authenticates a different token-derived lineage,
+        // even with the same mux/guardian/build identifiers.
+        let foreign_root = private_catalog_directory().keep();
+        let foreign_spawn = foreign_root.join("spawn");
+        fs::create_dir(&foreign_spawn).expect("foreign spawn catalog");
+        fs::set_permissions(&foreign_spawn, fs::Permissions::from_mode(0o700))
+            .expect("private foreign catalog");
+        let foreign_lease = create_private_lease_catalog(&foreign_root);
+        let foreign_socket = foreign_root.join("broker.sock");
+        let foreign_token = foreign_root.join("guardian.token");
+        crate::transport::provision_guardian_token(&foreign_token)
+            .expect("independent foreign token");
+        let foreign_service = BrokerControlServiceV1::bind(
+            BrokerControlServiceConfigV1::new(
+                foreign_socket.clone(),
+                foreign_token.clone(),
+                foreign_spawn,
+                foreign_lease,
+                broker_build,
+                2,
+                Duration::from_millis(2),
+            )
+            .expect("foreign broker config"),
+        )
+        .expect("foreign broker bind");
+        let foreign_service = TestBrokerControlService::start(foreign_service);
+        let mut foreign_client = BrokerControlClientV1::connect(
+            &foreign_socket,
+            &foreign_token,
+            connection_identity,
+            broker_build,
+        )
+        .expect("authenticate actual foreign lineage");
+        assert_ne!(
+            foreign_client.broker_lineage,
+            custody_context.broker_lineage
+        );
+        assert!(matches!(
+            foreign_client.acknowledge_spawn_effect(
+                custody_store
+                    .reopen_spawn_custody(custody_context)
+                    .expect("genuine custody for foreign lineage control")
+            ),
+            Err(BrokerControlClientError::AuthenticationAuthority)
+        ));
+        assert_eq!(
+            foreign_client
+                .query_spawn_effect(binding.durable_pane_id, binding.spawn_effect_id)
+                .expect("foreign connection remains usable"),
+            BrokerSpawnEffectQueryV1::Absent
+        );
+        drop(foreign_client);
+        foreign_service.finish();
+        for failed_stage in [1, 2] {
+            let claim = custody_store
+                .reopen_spawn_custody(custody_context)
+                .expect("reopen before sync-failure control");
+            custody_store.fail_spawn_custody_sync_for_test(failed_stage);
+            assert!(matches!(
+                client.acknowledge_spawn_effect(claim),
+                Err(BrokerControlClientError::AuthenticationAuthority)
+            ));
+            custody_store.fail_spawn_custody_sync_for_test(0);
+            assert!(matches!(
+                client
+                    .query_spawn_claim(binding.durable_pane_id, binding.spawn_effect_id)
+                    .expect("no ACK may reach broker after failed custody sync"),
+                BrokerSpawnClaimQueryV1::Claim(_)
+            ));
+        }
         let ack_id = id(7_308);
         let forged_recovery_secret =
             BrokerPaneRecoverySecretV1::from_wire(&[0xa5; BROKER_PANE_RECOVERY_SECRET_BYTES])
                 .expect("construct nonzero forged recovery capability");
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     ack_id,
@@ -22056,18 +22283,13 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
-                )
+                .acknowledge_spawn_effect(durable_custody)
                 .expect("submit asynchronous Spawn acknowledgement"),
             BrokerSpawnEffectAcknowledgementV1::Pending
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_309),
@@ -22078,7 +22300,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     id(7_314),
                     ack_id,
@@ -22089,7 +22311,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     id(7_315),
                     binding.spawn_effect_id,
                     ack_id,
@@ -22102,10 +22324,9 @@ mod tests {
         loop {
             match client
                 .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
+                    custody_store
+                        .reopen_spawn_custody(custody_context)
+                        .expect("reopen immutable custody for lost reply"),
                 )
                 .expect("recover asynchronous Spawn acknowledgement")
             {
@@ -22119,10 +22340,9 @@ mod tests {
         assert_eq!(
             client
                 .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
+                    custody_store
+                        .reopen_spawn_custody(custody_context)
+                        .expect("reopen custody for exact retry")
                 )
                 .expect("recover a second exact acknowledgement reply"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
@@ -22441,24 +22661,47 @@ mod tests {
             broker_build,
         )
         .expect("connect to restarted acknowledged Spawn service");
+        drop(initial_claim);
+        drop(custody_store);
+        drop(custody_pipeline);
+        let reopened_pipeline =
+            GuardianOutputPipeline::open(&token_path, 1, Arc::clone(&custody_waker))
+                .expect("load persisted encryption key and custody in a fresh store");
+        let custody_store = reopened_pipeline.checkpoint_stage_store();
+        let recovered_custody = restarted_client
+            .reopen_spawn_custody(
+                &custody_store,
+                binding.durable_pane_id,
+                binding.spawn_effect_id,
+            )
+            .expect("discover original ACK and child from encrypted disk using stable scope only");
+        assert_eq!(recovered_custody.context().ack_id, id(7_308));
+        assert_eq!(
+            recovered_custody.context().child_pid,
+            child_identity.process_id()
+        );
+        let custody_context = recovered_custody.context();
         assert_eq!(
             restarted_client
-                .acknowledge_spawn_effect(
-                    binding.durable_pane_id,
-                    binding.spawn_effect_id,
-                    ack_id,
-                    initial_claim.recovery_secret(),
-                )
+                .acknowledge_spawn_effect(recovered_custody)
                 .expect("recover durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Acknowledged
         );
         assert_eq!(
             restarted_client
-                .acknowledge_spawn_effect(
+                .acknowledge_spawn_effect_request(
                     binding.durable_pane_id,
                     binding.spawn_effect_id,
                     id(7_310),
-                    initial_claim.recovery_secret(),
+                    &BrokerPaneRecoverySecretV1::from_wire(
+                        custody_store
+                            .reopen_spawn_custody(custody_context)
+                            .expect("reopen for protocol negative")
+                            .into_secret()
+                            .expect("decrypt persisted capability")
+                            .as_slice()
+                    )
+                    .expect("recover nonzero secret"),
                 )
                 .expect("reject mutated durable acknowledgement after broker restart"),
             BrokerSpawnEffectAcknowledgementV1::Quarantined
