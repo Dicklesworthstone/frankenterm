@@ -2,6 +2,242 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Exercise the exact embedded packager with controlled Mach-O tool responses.
+# These are portable graph/guard tests, not native linker or launch evidence.
+test_native_dependency_closure() {
+  python3 - "${ROOT_DIR}/scripts/create-macos-bundle.sh" <<'PY'
+import json
+from pathlib import Path
+import plistlib
+import shutil
+import sys
+import tempfile
+import unittest
+
+source = Path(sys.argv[1]).read_text()
+body = source.split("<<'PY_NATIVE_DYLIB_CLOSURE'\n", 1)[1].split("\nPY_NATIVE_DYLIB_CLOSURE\n", 1)[0]
+module = {"__name__": "native_dependency_packager_test"}
+exec(compile(body, str(sys.argv[1]) + ":native_dependencies", "exec"), module)
+
+
+class NativeDependencyClosure(unittest.TestCase):
+    def setUp(self):
+        # Retain failed as well as passing fixtures for diagnosis; no deletion.
+        self.root = Path(tempfile.mkdtemp(prefix="ft-native-dependency-test-")).resolve()
+        self.binary_dir = self.root / "build"
+        self.binary_dir.mkdir()
+        self.bundle = self.root / "FrankenTerm.app"
+        (self.bundle / "Contents/MacOS").mkdir(parents=True)
+        (self.bundle / "Contents/Resources").mkdir()
+        (self.bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({'LSMinimumSystemVersion': '11.0'}))
+        self.images = {}
+        self.changed = []
+        self.ignore_rewrites = False
+        for name in ("frankenterm-gui", "frankenterm-mux-server", "frankenterm-pty-guardian", "ft"):
+            path = self.binary_dir / name
+            path.write_bytes(("image:" + name).encode())
+            shutil.copyfile(path, self.bundle / "Contents/MacOS" / name)
+            self.images[path] = {"loads": ["/usr/lib/libSystem.B.dylib"], "ids": [], "rpaths": [], "arch": "arm64"}
+        self.gui = self.binary_dir / "frankenterm-gui"
+        module["command"] = self.command
+
+    def dylib(self, package, name, *, notices=True):
+        root = self.root / "Cellar" / package / "1.0"
+        (root / "lib").mkdir(parents=True, exist_ok=True)
+        (root / "INSTALL_RECEIPT.json").write_text('{}')
+        if notices:
+            (root / "COPYING").write_text('fixture notice')
+        path = root / "lib" / name
+        path.write_bytes(("dylib:" + package + name).encode())
+        self.images[path] = {"loads": ["/usr/lib/libSystem.B.dylib"], "ids": [str(path)], "rpaths": [], "arch": "arm64"}
+        return path
+
+    def command(self, tool, *args):
+        path = Path(args[-1])
+        if path not in self.images:
+            matches = [value for key, value in self.images.items() if key.name == path.name and not key.is_relative_to(self.bundle)]
+            self.assertEqual(len(matches), 1)
+            self.images[path] = json.loads(json.dumps(matches[0]))
+        image = self.images[path]
+        if tool == "lipo":
+            return image['arch'] + '\n'
+        if tool == "otool":
+            records = [('LC_ID_DYLIB', 'name', value) for value in image['ids']]
+            records += [('LC_LOAD_DYLIB', 'name', value) for value in image['loads']]
+            records += [('LC_RPATH', 'path', value) for value in image['rpaths']]
+            deployment = image.get('deployment', 'LC_BUILD_VERSION')
+            minimum = image.get('minimum', '11.0')
+            platform = image.get('platform', '1')
+            build = (f'Load command {len(records)}\n cmd {deployment}\n platform {platform}\n minos {minimum}\n'
+                     if deployment == 'LC_BUILD_VERSION' else
+                     f'Load command {len(records)}\n cmd {deployment}\n version {minimum}\n')
+            return str(path) + ':\n' + ''.join(
+                f'Load command {i}\n cmd {kind}\n {field} {value} (offset 24)\n'
+                for i, (kind, field, value) in enumerate(records)) + build
+        self.assertEqual(tool, 'install_name_tool')
+        self.assertTrue(path.is_relative_to(self.bundle))
+        self.changed.append(path)
+        if self.ignore_rewrites:
+            return ''
+        index = 0
+        while index < len(args) - 1:
+            option, old = args[index:index + 2]
+            if option == '-change':
+                new = args[index + 2]
+                image['loads'] = [new if name == old else name for name in image['loads']]
+                index += 3
+            elif option == '-id':
+                image['ids'] = [old]
+                index += 2
+            elif option == '-delete_rpath':
+                image['rpaths'].remove(old)
+                index += 2
+            else:
+                self.fail(option)
+        with path.open('ab') as handle:
+            handle.write(b':relocated')
+        return ''
+
+    def package(self):
+        module['bundle_native_dependencies'](self.bundle, self.binary_dir, 'arm64')
+
+    def test_transitive_alias_cycle_relocated_with_notices_and_unchanged_sources(self):
+        cairo = self.dylib('cairo', 'libcairo.2.dylib')
+        png = self.dylib('libpng', 'libpng.16.dylib')
+        alias = self.root / 'opt-cairo'
+        alias.symlink_to(cairo.parent, target_is_directory=True)
+        self.images[self.gui]['loads'].append(str(alias / cairo.name))
+        self.images[self.gui]['rpaths'] = ['/opt/homebrew/lib']
+        self.images[cairo]['loads'].append(str(png))
+        self.images[png]['loads'].append(str(cairo))
+        before = {path: path.read_bytes() for path in self.images}
+        self.package()
+        frameworks = self.bundle / 'Contents/Frameworks'
+        self.assertEqual(sorted(path.name for path in frameworks.iterdir()), sorted([cairo.name, png.name]))
+        for path, expected in before.items():
+            self.assertEqual(path.read_bytes(), expected)
+        gui = self.images[self.bundle / 'Contents/MacOS/frankenterm-gui']
+        self.assertEqual(gui['loads'][-1], '@loader_path/../Frameworks/libcairo.2.dylib')
+        self.assertEqual(gui['rpaths'], [])
+        self.assertEqual(self.images[frameworks / png.name]['loads'][-1], '@loader_path/libcairo.2.dylib')
+        metadata = self.bundle / 'Contents/Resources/native-dependencies'
+        self.assertEqual((metadata / cairo.name / 'COPYING').read_text(), 'fixture notice')
+        self.assertEqual(len(json.loads((metadata / 'closure.json').read_text())['images']), 6)
+
+    def test_case_insensitive_collision_refused_before_rewrites(self):
+        one = self.dylib('one', 'libA.dylib')
+        two = self.dylib('two', 'liba.dylib')
+        self.images[self.gui]['loads'] += [str(one), str(two)]
+        with self.assertRaisesRegex(ValueError, 'basename collision'):
+            self.package()
+        self.assertEqual(self.changed, [])
+
+    def test_unresolved_rpath_refused(self):
+        self.images[self.gui]['loads'].append('@rpath/libmissing.dylib')
+        with self.assertRaisesRegex(ValueError, 'unresolved native dependency'):
+            self.package()
+
+    def test_missing_transitive_file_refused(self):
+        cairo = self.dylib('cairo', 'libcairo.dylib')
+        self.images[self.gui]['loads'].append(str(cairo))
+        self.images[cairo]['loads'].append(str(self.root / 'absent.dylib'))
+        with self.assertRaises(FileNotFoundError):
+            self.package()
+        self.assertEqual(self.changed, [])
+
+    def test_wrong_architecture_refused(self):
+        self.images[self.gui]['arch'] = 'x86_64'
+        with self.assertRaisesRegex(ValueError, 'wrong architecture'):
+            self.package()
+
+    def test_missing_license_refused(self):
+        library = self.dylib('no-notices', 'libmissing.dylib', notices=False)
+        self.images[self.gui]['loads'].append(str(library))
+        with self.assertRaisesRegex(ValueError, 'license notices unavailable'):
+            self.package()
+
+    def test_tool_success_without_relocation_is_not_success(self):
+        library = self.dylib('cairo', 'libcairo.dylib')
+        self.images[self.gui]['loads'].append(str(library))
+        self.ignore_rewrites = True
+        with self.assertRaisesRegex(ValueError, 'differ from the planned closure'):
+            self.package()
+
+    def test_successful_tool_must_not_drop_dependencies(self):
+        library = self.dylib('cairo', 'libcairo.dylib')
+        self.images[self.gui]['loads'].append(str(library))
+        normal_command = self.command
+
+        def dropping_command(tool, *args):
+            result = normal_command(tool, *args)
+            if tool == 'install_name_tool':
+                self.images[Path(args[-1])]['loads'] = ['/usr/lib/libSystem.B.dylib']
+            return result
+
+        module['command'] = dropping_command
+        with self.assertRaisesRegex(ValueError, 'differ from the planned closure'):
+            self.package()
+
+    def test_empty_successful_otool_output_is_refused(self):
+        normal_command = self.command
+        module['command'] = lambda tool, *args: '' if tool == 'otool' else normal_command(tool, *args)
+        with self.assertRaisesRegex(ValueError, 'no readable load commands'):
+            self.package()
+
+    def test_preexisting_frameworks_not_merged(self):
+        (self.bundle / 'Contents/Frameworks').mkdir()
+        with self.assertRaises(FileExistsError):
+            self.package()
+
+    def test_transitive_dependency_sets_actual_bundle_deployment_floor(self):
+        cairo = self.dylib('cairo', 'libcairo.dylib')
+        png = self.dylib('libpng', 'libpng.dylib')
+        self.images[self.gui]['loads'].append(str(cairo))
+        self.images[cairo]['loads'].append(str(png))
+        self.images[cairo]['minimum'] = '15.0'
+        self.images[png]['minimum'] = '26.0'
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '26.0.0')
+        receipt = json.loads((self.bundle / 'Contents/Resources/native-dependencies/closure.json').read_text())
+        self.assertEqual(receipt['minimum_macos_version'], '26.0.0')
+        self.assertEqual(receipt['bundle_minimum_macos_version'], '26.0.0')
+        record = next(row for row in receipt['images'] if row['source'] == str(png))
+        self.assertEqual(record['minimum_macos_version'], '26.0.0')
+
+    def test_existing_higher_plist_floor_is_not_lowered(self):
+        (self.bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({'LSMinimumSystemVersion': '26.2.1'}))
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '26.2.1')
+
+    def test_legacy_macos_deployment_command_is_supported(self):
+        self.images[self.gui].update(deployment='LC_VERSION_MIN_MACOSX', minimum='12.3')
+        self.package()
+        info = plistlib.loads((self.bundle / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['LSMinimumSystemVersion'], '12.3.0')
+
+    def test_ios_image_is_rejected_even_with_correct_cpu(self):
+        self.images[self.gui]['platform'] = '2'
+        with self.assertRaisesRegex(ValueError, 'not built for macOS'):
+            self.package()
+
+    def test_missing_deployment_target_is_rejected(self):
+        self.images[self.gui]['deployment'] = 'LC_UUID'
+        with self.assertRaisesRegex(ValueError, 'one unambiguous macOS deployment target'):
+            self.package()
+
+
+unittest.main(argv=['native_dependency_closure'], verbosity=2)
+PY
+}
+
+if [[ "${1:-}" == "--native-dependencies-only" ]]; then
+  test_native_dependency_closure
+  exit "$?"
+fi
+
 LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 RUN_ID="$(date -u +"%Y%m%d_%H%M%S")"
 ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts/gui_bootstrap/${RUN_ID}"
@@ -307,6 +543,22 @@ write_codesign_mock() {
   mkdir -p "${mock_bin}"
   : > "${marker_file}"
   ln -sf /usr/bin/true "${mock_bin}/codesign"
+  write_macho_tools_mock "${mock_bin}"
+}
+
+write_macho_tools_mock() {
+  local mock_bin="$1"
+  # Existing bundle-structure tests use shell stubs, not native artifacts.
+  # Supply an explicit no-external-dependency Mach-O fixture for those tests.
+  cat > "${mock_bin}/lipo" <<'EOF'
+#!/bin/bash
+printf '%s\n' arm64
+EOF
+  cat > "${mock_bin}/otool" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$2:" 'Load command 0' ' cmd LC_LOAD_DYLIB' ' name /usr/lib/libSystem.B.dylib (offset 24)' 'Load command 1' ' cmd LC_BUILD_VERSION' ' platform 1' ' minos 11.0'
+EOF
+  chmod +x "${mock_bin}/lipo" "${mock_bin}/otool"
 }
 
 write_codesign_verification_failure_mock() {
@@ -321,6 +573,7 @@ fi
 exit 0
 EOF
   chmod +x "${mock_bin}/codesign"
+  write_macho_tools_mock "${mock_bin}"
 }
 
 write_stub_binary() {
@@ -911,6 +1164,7 @@ main() {
   require_cmd jq
   require_cmd python3
   require_cmd file
+  test_native_dependency_closure
   prepare_browser_runtime_fixture
 
   scenario_dry_run_skips_rch
