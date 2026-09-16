@@ -964,7 +964,33 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Repair the RCH client heartbeat gap before expensive source validation;
   jobs 32025/32027 were cancelled by the stuck detector before compilation.
   Do not disable detection or count these cancellations as product test results.
-- [ ] Wire durable lease-journal transitions into the live broker asynchronously;
-  preserve fencing during I/O, quarantine failures, and test consecutive handoffs.
-- [ ] Reject malformed, nil and noncanonical durable window/tab UUIDs when
-  validating recovery images, including authenticated-image reconstruction.
+- [x] Implement and independently review asynchronous live broker lease-journal
+  transitions in `b2df40bcd`; preserve fencing during I/O and quarantine failures.
+  Author consecutive-handoff, fault, owner-EOF and exact-child census regressions.
+- [ ] Execute those broker regressions through strict RCH. Source review does
+  not establish ordinary successor startup or fresh-connection recovery.
+- [x] Reject malformed, nil and noncanonical durable window/tab UUIDs in
+  `7d0a5c008`, including authenticated-image reconstruction controls.
+- [ ] Execute image and authenticated reconstruction controls through strict RCH.
+
+### 2026-09-16 — isolated native RC28 acceptance
+
+- [x] Launch the actual DSR RC28 app in a separate process with private home,
+  configuration, sockets and an owned local child; preserve installed RC15
+  process 89046 and all existing remote sessions. Candidate PID 7540 uses source
+  `55baaac56dd0d8ab665164041c8fb0922249c6d2`, not the later RC29 fixes.
+- [x] Drag-select the exact 69-byte Unicode line with native mouse input;
+  verify selection through the GUI's selection API. Initial unfocused drag was
+  empty; the focused drag preserved Chinese, combining accent and emoji bytes.
+- [x] Verify native menu font increase and Command-minus decrease retain the
+  1148 by 774 pixel window while the grid changes 80 by 24 to 69 by 21 and back.
+  Ordinary edge drag changes the window to 844 by 644 and grid to 58 by 19,
+  with visible reflow. These observations are not latency benchmark results.
+- [ ] Resolve the observed history-prefix join after clear-screen/cursor-home
+  followed by reflow; reproduce the stale preceding-row wrap boundary in a
+  terminal regression and verify the repair through strict RCH.
+- [ ] Distinguish synthesized Command-equals behavior from an actual native
+  shortcut defect: automation typed equals, while Command-minus and menu actions
+  worked. Do not claim keyboard font increase has passed.
+- [ ] Repeat native acceptance against the final source and final DSR artifacts,
+  including remote-session reconnect, before release/install claims.
