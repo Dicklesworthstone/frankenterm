@@ -999,3 +999,34 @@ power loss nor migration of those live sessions has been demonstrated.
   verify final native default bindings without the diagnostic Lua override.
 - [ ] Repeat native acceptance against the final source and final DSR artifacts,
   including remote-session reconnect, before release/install claims.
+
+### 2026-09-16 — remote compilation resumed and actual failures repaired
+
+- [x] Repair RCH preflight heartbeat ownership and execute its real Unix-socket
+  regression: job 32060 ran one test successfully. Build the corrected client
+  remotely and verify its SHA-256 on the Linux coordinator before use. No daemon
+  timeout or admission rule was weakened; the installed Mac client is unchanged.
+- [x] Import committed source objects into the existing coordinator repository
+  without changing its HEAD, index, refs, or working files. Focused core and
+  terminal/GUI queues now reach actual remote Cargo compilation.
+- [x] Repair the actual guardian test compile failure and Rust 2018 panic-format
+  warning in `caabcfd5862aec250e941025b291e2c90f024042`. The failed combined
+  attempt ran no tests; it is not a passing guardian receipt.
+- [x] Repair the default-feature terminal test-helper compilation defect in
+  `6163635feb1cf9002431de73ac4c3a49dad236b5`. Feature-matched ED2 baseline and
+  fixed-source execution remain separate from this source correction.
+- [ ] Finish core image/authenticated restore, snapshot retry, BOCPD, CSI,
+  Cmd-plus and guardian runtime queues, retaining actual test counts and source
+  identities. Repeat workspace qualification after the final source settles.
+- [x] Validate the private DSR quality configuration with the checked Linux
+  RCH transport. Preserve all six gates and native DSR build configuration.
+- [ ] Execute that complete DSR quality lane on the final imported source.
+  Static gates passed 29 checks on the earlier metadata checkpoint; this does
+  not qualify subsequent code or substitute for Cargo/native checks.
+- [ ] Verify held selection across native reflow. The isolated app remains
+  visible, but CUA coordinate drags currently fail with `noWindowsAvailable`;
+  its earlier successful Unicode drag does not establish this additional case.
+- [ ] Complete durable pending-Claim fresh-connection rebind, including lost
+  reply, stale owner, rotated custody and sync-failure controls. This bounded
+  slice does not establish new-mux-incarnation recovery, whole-topology startup
+  publication, broker restart adoption, or GUI reopen ordering.
