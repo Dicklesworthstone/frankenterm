@@ -4349,9 +4349,10 @@ impl Screen {
     ) -> Option<[Option<SelectionAnchorCoordinate>; 3]> {
         let entry = self.selection_anchors.0.iter().find(|entry| {
             entry.owner.as_ptr() == Arc::as_ptr(&token.0)
-                && entry.source_sequence == source_sequence
+                && entry.source_sequence <= source_sequence
                 && source_sequence != SequenceNo::MAX
                 && self.matches_coordinate_witness(&entry.witness)
+                && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
         })?;
         self.selection_anchor_points_are_resident(&entry.points)
             .then_some(entry.points)
@@ -4370,6 +4371,38 @@ impl Screen {
                 && (!line.last_cell_was_wrapped()
                     || point.column.is_none_or(|column| column < line.len()))
         })
+    }
+
+    /// The terminal owner supplies the current source sequence. Advancing
+    /// that sequence elsewhere does not invalidate these resident coordinates
+    /// when every row in the selected span is unchanged. Never load cold rows
+    /// or accept pruned endpoints as evidence of an unchanged selection.
+    fn selection_anchor_rows_unchanged_since(
+        &self,
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+        sequence: SequenceNo,
+    ) -> bool {
+        let mut rows = points.iter().flatten().map(|point| point.row);
+        let Some(first) = rows.next() else {
+            return false;
+        };
+        let (start, end) = rows.fold((first, first), |(start, end), row| {
+            (start.min(row), end.max(row))
+        });
+        let Some(start) = self.stable_row_to_phys(start) else {
+            return false;
+        };
+        let Some(end) = self
+            .stable_row_to_phys(end)
+            .and_then(|end| end.checked_add(1))
+        else {
+            return false;
+        };
+        let mut unchanged = true;
+        self.with_phys_lines(start..end, |lines| {
+            unchanged &= lines.iter().all(|line| !line.changed_since(sequence));
+        });
+        unchanged
     }
 
     /// LocalPane finalizes its layout floor after the terminal resize. Only
@@ -4404,9 +4437,12 @@ impl Screen {
         anchors.0.retain(|entry| {
             entry.owner.strong_count() != 0
                 && seqno != SequenceNo::MAX
-                && entry.source_sequence.checked_add(1) == Some(seqno)
+                && seqno
+                    .checked_sub(1)
+                    .is_some_and(|before| entry.source_sequence <= before)
                 && self.matches_coordinate_witness(&entry.witness)
                 && self.selection_anchor_points_are_resident(&entry.points)
+                && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
         });
         anchors
     }
@@ -8848,6 +8884,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn selection_anchor_rejects_mutation_inside_selected_span() {
+        let mut screen = test_screen(3, 12, 96);
+        for row in 0..3 {
+            screen.lines[row] = Line::from_text("selected", &CellAttributes::blank(), 1, None);
+        }
+        let points = [anchor_point(0, 0), anchor_point(0, 0), anchor_point(3, 2)];
+        let token = screen.capture_selection_anchor(1, points).unwrap();
+        assert!(screen.resolve_selection_anchor(&token, 0).is_none());
+        screen.lines[1].set_cell(0, Cell::new('Z', CellAttributes::blank()), 2);
+        assert!(screen.resolve_selection_anchor(&token, 2).is_none());
+        screen.resize(test_size(3, 6, 96), test_cursor(3, 2, 2), 3, false);
+        assert!(screen.resolve_selection_anchor(&token, 3).is_none());
+    }
+
+    #[test]
     fn selection_anchor_projects_actual_wide_rows_and_repeated_widths() {
         let mut screen = test_screen(1, 12, 96);
         screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
@@ -8886,9 +8937,10 @@ pub(crate) mod tests {
                 );
             }
         }
+        screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 5);
         assert!(
             screen.resolve_selection_anchor(&token, 5).is_none(),
-            "later content is not the committed source"
+            "later selected-row content is not the committed source"
         );
     }
 
@@ -8957,6 +9009,7 @@ pub(crate) mod tests {
         assert!(screen
             .capture_selection_anchor(1, [anchor_point(0, -1); 3])
             .is_none());
+        screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 2);
         screen.resize(test_size(3, 5, 96), test_cursor(8, 0, 2), 3, false);
         assert!(
             screen.resolve_selection_anchor(&old, 3).is_none(),
