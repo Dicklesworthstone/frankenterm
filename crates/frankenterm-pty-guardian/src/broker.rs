@@ -72,7 +72,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
-use mux::guardian_checkpoint::GuardianGenesisReservationIdentityV1;
+use mux::guardian_checkpoint::{
+    GuardianGenesisReservationIdentityV1, GuardianSpawnCustodyContextV1,
+};
 use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalTail,
 };
@@ -103,7 +105,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
@@ -4357,6 +4359,14 @@ impl BrokerLiveSpawnV1 {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum BrokerMuxRotationFaultPointV1 {
+    Fence,
+    Claim,
+    Acknowledge,
+}
+
 pub struct BrokerControlServiceV1 {
     poll: Poll,
     events: Events,
@@ -4400,9 +4410,48 @@ pub struct BrokerControlServiceV1 {
     lease_submission_cursor: Option<Uuid>,
     #[cfg(test)]
     lease_job_probe: Option<BrokerSpawnWorkerEffectLeaseProbeV1>,
+    #[cfg(test)]
+    rotation_lease_fault: Option<(Uuid, BrokerPaneLeaseWalPhaseV1)>,
 }
 
 impl BrokerControlServiceV1 {
+    #[cfg(test)]
+    pub(crate) fn rotation_fault_settled_for_test(&mut self, pane_id: Uuid) -> bool {
+        if self.rotation_lease_fault.is_some() {
+            return false;
+        }
+        let Some(live) = self.live_spawns.get_mut(&pane_id) else {
+            return false;
+        };
+        live.lease_transition.is_none()
+            && live.adoption.pane.status().lifecycle == BrokerPaneLifecycleV1::Quarantined
+            && live.adoption.pane.active_attachment_identity().is_none()
+            && matches!(live.adoption.pane.child.try_wait(), Ok(None))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_next_rotation_lease_fault_for_test(
+        &mut self,
+        pane_id: Uuid,
+        point: BrokerMuxRotationFaultPointV1,
+    ) {
+        assert!(self.rotation_lease_fault.is_none());
+        self.rotation_lease_fault = Some((
+            pane_id,
+            match point {
+                BrokerMuxRotationFaultPointV1::Fence => {
+                    BrokerPaneLeaseWalPhaseV1::PredecessorFenced
+                }
+                BrokerMuxRotationFaultPointV1::Claim => {
+                    BrokerPaneLeaseWalPhaseV1::MuxSuccessorClaimed
+                }
+                BrokerMuxRotationFaultPointV1::Acknowledge => {
+                    BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged
+                }
+            },
+        ));
+    }
+
     pub fn bind(config: BrokerControlServiceConfigV1) -> Result<Self, BrokerControlServiceError> {
         let (secret, mut token_authority) =
             load_guardian_secret_with_authority(&config.token_path)?;
@@ -4640,6 +4689,8 @@ impl BrokerControlServiceV1 {
             lease_submission_cursor: None,
             #[cfg(test)]
             lease_job_probe: None,
+            #[cfg(test)]
+            rotation_lease_fault: None,
         })
     }
 
@@ -4834,6 +4885,15 @@ impl BrokerControlServiceV1 {
         };
         let Some(journal) = live.lease_journal.take() else {
             return;
+        };
+        #[cfg(test)]
+        let journal = {
+            let mut journal = journal;
+            if self.rotation_lease_fault == Some((pane_id, fingerprint.phase)) {
+                self.rotation_lease_fault = None;
+                journal.inject_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead);
+            }
+            journal
         };
         let job = BrokerLeaseWorkerJobV1 {
             fingerprint,
@@ -7342,7 +7402,9 @@ pub struct BrokerPaneOutputHandleV1 {
     connection_id: Uuid,
     pane_id: Uuid,
     spawn_effect_id: Uuid,
+    spawn_ack_id: Uuid,
     lease_generation: u64,
+    child_identity: BrokerKernelChildIdentityV1,
 }
 
 impl BrokerPaneOutputHandleV1 {
@@ -8281,7 +8343,13 @@ impl BrokerControlClientV1 {
                     connection_id: self.connection_id,
                     pane_id: context.pane_id,
                     spawn_effect_id: context.effect_id,
+                    spawn_ack_id: context.ack_id,
                     lease_generation: context.secret_lease_generation,
+                    child_identity: BrokerKernelChildIdentityV1 {
+                        process_id: context.child_pid,
+                        broker_child_nonce: context.child_nonce,
+                        kernel_start_identity_digest: context.child_start_digest,
+                    },
                 }))
             }
             BrokerSpawnEffectAcknowledgementV1::Pending => Ok(None),
@@ -8849,7 +8917,7 @@ impl BrokerControlClientV1 {
         }
     }
 
-    /// Establish an authenticated same-build successor control connection.
+    /// Establish a successor connection using the build authenticated by Hello.
     pub(crate) fn connect_mux_successor(
         &self,
         socket_path: &Path,
@@ -8857,9 +8925,7 @@ impl BrokerControlClientV1 {
         mux_incarnation: Uuid,
         mux_build: SealedAtomicBuildIdentity,
     ) -> Result<Self, BrokerControlClientError> {
-        if mux_incarnation == self.identity.mux_incarnation
-            || mux_build != self.identity.mux_build_identity
-        {
+        if mux_incarnation == self.identity.mux_incarnation {
             return Err(BrokerControlClientError::AuthenticationAuthority);
         }
         Self::connect(
@@ -8875,13 +8941,36 @@ impl BrokerControlClientV1 {
         )
     }
 
+    pub(crate) fn matches_mux_identity(
+        &self,
+        mux_incarnation: Uuid,
+        mux_build: SealedAtomicBuildIdentity,
+    ) -> bool {
+        self.identity.mux_incarnation == mux_incarnation
+            && self.identity.mux_build_identity == mux_build
+    }
+
     pub(crate) fn validate_initial_mux_rotation(
         &self,
         successor: &Self,
-        context: GuardianSpawnCustodyContextV1,
+        handle: &BrokerPaneOutputHandleV1,
+        context: &GuardianSpawnCustodyContextV1,
         handoff_id: Uuid,
         ack_id: Uuid,
     ) -> Result<(), BrokerControlClientError> {
+        if handle.broker_incarnation != self.broker_incarnation
+            || handle.connection_id != self.connection_id
+            || handle.pane_id != context.pane_id
+            || handle.spawn_effect_id != context.effect_id
+            || handle.spawn_ack_id != context.ack_id
+            || handle.lease_generation != 1
+            || handle.child_identity.process_id != context.child_pid
+            || handle.child_identity.broker_child_nonce != context.child_nonce
+            || handle.child_identity.kernel_start_identity_digest != context.child_start_digest
+            || context.wire_ack_generation != 0
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
         if context.broker_incarnation != self.broker_incarnation
             || context.broker_lineage != self.broker_lineage
             || context.broker_build != self.broker_build.into_bytes()
@@ -8896,7 +8985,6 @@ impl BrokerControlClientV1 {
             || successor.identity.guardian_incarnation != self.identity.guardian_incarnation
             || successor.identity.mux_incarnation == self.identity.mux_incarnation
             || successor.identity.guardian_build_identity != self.identity.guardian_build_identity
-            || successor.identity.mux_build_identity != self.identity.mux_build_identity
             || handoff_id.is_nil()
             || ack_id.is_nil()
         {
@@ -8912,13 +9000,14 @@ impl BrokerControlClientV1 {
         &mut self,
         successor: &mut Self,
         store: &crate::output::GuardianCheckpointStageStore,
-        context: GuardianSpawnCustodyContextV1,
+        handle: &BrokerPaneOutputHandleV1,
+        context: &GuardianSpawnCustodyContextV1,
         presented: &[u8; 32],
         handoff_id: Uuid,
         ack_id: Uuid,
         deadline: Instant,
     ) -> Result<BrokerPaneOutputHandleV1, BrokerControlClientError> {
-        self.validate_initial_mux_rotation(successor, context, handoff_id, ack_id)?;
+        self.validate_initial_mux_rotation(successor, handle, context, handoff_id, ack_id)?;
         let secret = BrokerPaneRecoverySecretV1::from_wire(presented)
             .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
         let fence = BrokerControlRequestV1::new(
@@ -9006,7 +9095,9 @@ impl BrokerControlClientV1 {
                                     connection_id: successor.connection_id,
                                     pane_id: context.pane_id,
                                     spawn_effect_id: context.effect_id,
+                                    spawn_ack_id: handle.spawn_ack_id,
                                     lease_generation: 2,
+                                    child_identity: handle.child_identity,
                                 });
                             }
                             BrokerSuccessorAcknowledgementV1::Pending => {
@@ -12333,8 +12424,6 @@ fn validate_broker_lease_record_transition(
                 && current.owner.connection_id != previous.owner.connection_id
                 && current.owner.guardian_build_identity_digest
                     == previous.owner.guardian_build_identity_digest
-                && current.owner.mux_build_identity_digest
-                    == previous.owner.mux_build_identity_digest
                 && current.recovery_verifier != previous.recovery_verifier
                 && current.predecessor_attachment_digest == previous.attachment_digest =>
         {
@@ -19800,8 +19889,6 @@ impl BrokerAdoptedPaneV1 {
                                 == predecessor.owner.mux_incarnation
                             || authority.successor.guardian_build_identity_digest
                                 != predecessor.owner.guardian_build_identity_digest
-                            || authority.successor.mux_build_identity_digest
-                                != predecessor.owner.mux_build_identity_digest
                     } else {
                         authority.successor.guardian_incarnation
                             == predecessor.owner.guardian_incarnation
@@ -25241,6 +25328,16 @@ mod tests {
     }
 
     #[test]
+    fn broker_control_mux_build_upgrade_preserves_child_and_authenticated_custody() {
+        broker_control_spawn_with_lease_scenario(
+            false,
+            false,
+            None,
+            Some((BrokerPaneLeaseWalPhaseV1::MuxSuccessorClaimed, None)),
+        );
+    }
+
+    #[test]
     fn broker_control_pending_claim_reconnect_rotates_durable_custody_without_replacing_child() {
         for fault in [
             None,
@@ -25722,6 +25819,200 @@ mod tests {
             .expect("authenticate acknowledged output authority")
             .expect("completed Spawn ACK mints output authority");
         let output_deadline = Instant::now() + Duration::from_secs(5);
+        if matches!(
+            lease_scenario,
+            Some((BrokerPaneLeaseWalPhaseV1::MuxSuccessorClaimed, None))
+        ) {
+            let successor_mux = id(81_100);
+            let successor_build = sealed(0xec);
+            let mut successor = client
+                .connect_mux_successor(&socket_path, &token_path, successor_mux, successor_build)
+                .unwrap();
+            assert!(successor.matches_mux_identity(successor_mux, successor_build));
+            assert!(
+                !successor
+                    .matches_mux_identity(successor_mux, connection_identity.mux_build_identity)
+            );
+            assert!(
+                !successor
+                    .matches_mux_identity(connection_identity.mux_incarnation, successor_build)
+            );
+            let handoff = id(81_101);
+            let rotation_ack = id(81_102);
+            client
+                .validate_initial_mux_rotation(
+                    &successor,
+                    &output_handle,
+                    &custody_context,
+                    handoff,
+                    rotation_ack,
+                )
+                .unwrap();
+            let mutations: [fn(&mut GuardianSpawnCustodyContextV1); 9] = [
+                |context| context.pane_id = id(81_103),
+                |context| context.effect_id = id(81_104),
+                |context| context.ack_id = id(81_106),
+                |context| context.child_pid = context.child_pid.saturating_add(1),
+                |context| context.child_nonce = id(81_105),
+                |context| context.child_start_digest[0] ^= 1,
+                |context| context.wire_ack_generation = 1,
+                |context| context.secret_lease_generation = 2,
+                |context| context.mux_build = [0xed; 32],
+            ];
+            for mutate in mutations {
+                let mut altered = custody_context;
+                mutate(&mut altered);
+                assert!(
+                    client
+                        .validate_initial_mux_rotation(
+                            &successor,
+                            &output_handle,
+                            &altered,
+                            handoff,
+                            rotation_ack,
+                        )
+                        .is_err()
+                );
+            }
+            service.inspect(move |service| {
+                let live = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                assert_eq!(live.lease_status.committed_records, 0);
+                assert_eq!(
+                    live.adoption.pane.status().lifecycle,
+                    BrokerPaneLifecycleV1::Active
+                );
+            });
+            let upgraded = client
+                .rotate_initial_mux_owner(
+                    &mut successor,
+                    &custody_store,
+                    &output_handle,
+                    &custody_context,
+                    initial_claim.recovery_secret().as_wire(),
+                    handoff,
+                    rotation_ack,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap();
+            assert_eq!(upgraded.child_identity, child_identity);
+            assert_eq!(upgraded.lease_generation, 2);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match successor.read_output(&upgraded, 1, deadline).unwrap() {
+                    BrokerPaneOutputV1::Pending if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    BrokerPaneOutputV1::Data(delivery) => {
+                        assert_eq!(delivery.bytes(), b"b");
+                        break;
+                    }
+                    _ => panic!("upgraded owner lost real child output"),
+                }
+            }
+            assert!(
+                client
+                    .read_output(&output_handle, 64, Instant::now() + Duration::from_secs(5))
+                    .is_err()
+            );
+            let census = successor.census().unwrap();
+            assert_eq!(census.entries().len(), 1);
+            assert_eq!(
+                census.entries()[0].owner_mux_incarnation,
+                Some(successor_mux)
+            );
+            assert_eq!(census.entries()[0].child_identity, Some(child_identity));
+            assert_eq!(census.entries()[0].lease_generation, 2);
+            let saved = successor
+                .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff, 2)
+                .unwrap();
+            let saved_context = saved.context();
+            assert_eq!(
+                saved_context.predecessor.mux_build,
+                connection_identity.mux_build_identity.into_bytes()
+            );
+            assert_eq!(
+                saved_context.successor.mux_build,
+                successor_build.into_bytes()
+            );
+            let mut wrong_build = saved_context;
+            wrong_build.successor.mux_build = [0xee; 32];
+            assert!(
+                custody_store
+                    .reopen_successor_custody(&wrong_build)
+                    .is_err()
+            );
+            let (identity, authenticator) = service.inspect(move |service| {
+                let live = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                let journal = live.lease_journal.as_ref().unwrap();
+                assert_eq!(journal.status().committed_records, 3);
+                assert_eq!(
+                    journal.status().owner.unwrap().mux_build_identity_digest,
+                    successor_build.into_bytes()
+                );
+                assert_eq!(journal.identity.child_identity, child_identity);
+                assert_eq!(
+                    journal.identity.initial_recovery_verifier,
+                    initial_claim
+                        .recovery_secret()
+                        .verifier(journal.identity.spawn, 1)
+                        .unwrap()
+                );
+                (journal.identity, journal.authenticator.clone())
+            });
+            service.finish();
+            drop(successor);
+            drop(client);
+            let reopened = reopen_test_lease_journal(
+                &lease_catalog_path
+                    .join(broker_lease_catalog_wal_name(identity.spawn.journal_id())),
+                &lease_catalog_path
+                    .join(broker_lease_catalog_head_name(identity.spawn.journal_id())),
+                &identity,
+                authenticator.clone(),
+            );
+            assert_eq!(
+                reopened.status().phase,
+                Some(BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged)
+            );
+            assert_eq!(
+                reopened.status().owner.unwrap().mux_build_identity_digest,
+                successor_build.into_bytes()
+            );
+            assert_eq!(
+                reopened.status().owner.unwrap().mux_incarnation,
+                successor_mux
+            );
+            assert_eq!(reopened.identity.child_identity, child_identity);
+            drop(reopened);
+            // Alter the persisted Claim's new build, not merely the caller's
+            // expected context: replay must authenticate the original bytes.
+            let wal_path =
+                lease_catalog_path.join(broker_lease_catalog_wal_name(identity.spawn.journal_id()));
+            let head_path = lease_catalog_path
+                .join(broker_lease_catalog_head_name(identity.spawn.journal_id()));
+            let offset = BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64
+                + u64::try_from(BROKER_LEASE_WAL_RECORD_BYTES).unwrap()
+                + 144;
+            let mut tampered = open_existing_test_file(&wal_path);
+            tampered.seek(SeekFrom::Start(offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            tampered.read_exact(&mut byte).unwrap();
+            byte[0] ^= 1;
+            tampered.seek(SeekFrom::Start(offset)).unwrap();
+            tampered.write_all(&byte).unwrap();
+            tampered.sync_all().unwrap();
+            drop(tampered);
+            assert!(matches!(
+                BrokerPaneLeaseJournalV1::open(
+                    open_existing_test_file(&wal_path),
+                    open_existing_test_file(&head_path),
+                    &identity,
+                    authenticator,
+                ),
+                Err(BrokerPaneLeaseWalErrorV1::AuthenticationFailed)
+            ));
+            return;
+        }
         if let Some((phase, fault)) = lease_scenario
             .filter(|(phase, _)| *phase != BrokerPaneLeaseWalPhaseV1::SuccessorRebound)
         {

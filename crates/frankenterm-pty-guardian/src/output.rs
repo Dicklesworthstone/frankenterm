@@ -10,7 +10,7 @@
 //! readiness loop never calls synchronous journal or PTY-write operations.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use mio::Waker;
 use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
@@ -619,6 +619,18 @@ impl GuardianDurableSuccessorCustodyV1 {
 }
 
 impl GuardianDurableSpawnCustodyV1 {
+    #[cfg(test)]
+    pub(crate) fn persist_historical_context_for_test(
+        &self,
+        context: GuardianSpawnCustodyContextV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        // A distinct immutable fixture record models retained authenticated
+        // history. It cannot overwrite the live pane's original custody.
+        assert_ne!(context.effect_id, self.context.effect_id);
+        let secret = self.store.read_spawn_custody(&self.context)?;
+        self.store.persist_spawn_custody(&context, &secret)
+    }
+
     pub(crate) fn into_mux_rotation_payload(
         self,
     ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
@@ -7082,6 +7094,15 @@ struct OutputQueueState {
 struct OutputQueue {
     state: Mutex<OutputQueueState>,
     ready: Condvar,
+    #[cfg(test)]
+    broker_append_pause: Mutex<Option<BrokerAppendPause>>,
+}
+
+#[cfg(test)]
+struct BrokerAppendPause {
+    pane_id: Uuid,
+    entered: SyncSender<()>,
+    release: Receiver<()>,
 }
 
 enum OutputQueuePushError {
@@ -7105,6 +7126,8 @@ impl OutputQueue {
                 shutdown: false,
             }),
             ready: Condvar::new(),
+            #[cfg(test)]
+            broker_append_pause: Mutex::new(None),
         })
     }
 
@@ -7216,6 +7239,25 @@ pub struct GuardianOutputPipeline {
 }
 
 impl GuardianOutputPipeline {
+    #[cfg(test)]
+    pub(crate) fn pause_next_broker_append_for_test(
+        &self,
+        pane_id: Uuid,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    ) {
+        let mut pause = self.queue.broker_append_pause.lock().unwrap();
+        assert!(
+            pause.is_none(),
+            "only one owned append pause may be installed"
+        );
+        *pause = Some(BrokerAppendPause {
+            pane_id,
+            entered,
+            release,
+        });
+    }
+
     pub(crate) fn open(
         token_path: &Path,
         max_panes: usize,
@@ -7630,6 +7672,30 @@ fn output_worker(
     completion_waker: &Waker,
 ) {
     while let Some(mut job) = queue.pop() {
+        #[cfg(test)]
+        if job.broker_delivery.is_some() {
+            let pause = {
+                let mut pause = queue.broker_append_pause.lock().unwrap();
+                if pause
+                    .as_ref()
+                    .is_some_and(|pause| pause.pane_id == job.pane_id)
+                {
+                    pause.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause
+                    .entered
+                    .send(())
+                    .expect("owned append observer remains live");
+                pause
+                    .release
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("owned append pause must be explicitly released");
+            }
+        }
         let payload_bytes = job.payload.len();
         let mut result = match job.journal.authority.lock() {
             Ok(mut authority) => match job.broker_delivery.as_deref() {

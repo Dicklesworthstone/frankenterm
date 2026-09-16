@@ -984,7 +984,6 @@ fn execute_mux_rotation_job(
     let can_rotate = rotation.predecessor_was_retired
         && control.mux_incarnation == context.mux_incarnation
         && context.mux_incarnation != request.header().mux_incarnation
-        && context.mux_build == rotation.mux_build.into_bytes()
         && matches!(
             protocol.pane_state(context.pane_id),
             Some(GuardianPaneState::LiveUnclaimed { generation: 1 })
@@ -1019,16 +1018,20 @@ fn execute_mux_rotation_job(
         };
         // These are pure authenticated provenance checks. A stale retained
         // record cannot quarantine a live pane before any fence was sent.
-        if control
-            .session
+        if !successor
             .client
-            .validate_initial_mux_rotation(
-                &successor.client,
-                context,
-                handoff_id,
-                request.header().request_id,
-            )
-            .is_err()
+            .matches_mux_identity(request.header().mux_incarnation, rotation.mux_build)
+            || control
+                .session
+                .client
+                .validate_initial_mux_rotation(
+                    &successor.client,
+                    &control.handle,
+                    &context,
+                    handoff_id,
+                    request.header().request_id,
+                )
+                .is_err()
         {
             return GuardianEffectOutcome::DefinitelyNotApplied(
                 RuntimeEffectError::InternalInvariant,
@@ -1037,7 +1040,8 @@ fn execute_mux_rotation_job(
         match control.session.client.rotate_initial_mux_owner(
             &mut successor.client,
             store,
-            context,
+            &control.handle,
+            &context,
             &presented,
             handoff_id,
             request.header().request_id,
@@ -1483,6 +1487,24 @@ pub struct GuardianRuntime {
 }
 
 impl GuardianRuntime {
+    #[cfg(test)]
+    pub(crate) fn pause_next_broker_append_for_test(
+        &self,
+        pane_id: Uuid,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.output_pipeline
+            .pause_next_broker_append_for_test(pane_id, entered, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotation_pending_for_test(&self, pane_id: Uuid) -> bool {
+        self.pending_broker_control
+            .as_ref()
+            .is_some_and(|pending| pending.pane_id == pane_id && pending.rotation.is_some())
+    }
+
     pub(crate) fn new(
         registry: Registry,
         config: GuardianRuntimeConfig,

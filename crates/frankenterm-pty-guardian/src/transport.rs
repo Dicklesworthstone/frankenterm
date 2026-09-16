@@ -946,6 +946,8 @@ pub struct GuardianService {
     lifecycle: GuardianLifecycle,
     output_completion_token: Token,
     next_connection_generation: u64,
+    #[cfg(test)]
+    drop_rotation_reply: Option<(Uuid, std::sync::mpsc::SyncSender<()>)>,
 }
 
 impl GuardianService {
@@ -1067,6 +1069,8 @@ impl GuardianService {
             lifecycle: GuardianLifecycle::Running,
             output_completion_token,
             next_connection_generation: 1,
+            #[cfg(test)]
+            drop_rotation_reply: None,
         })
     }
 
@@ -1770,6 +1774,21 @@ impl GuardianService {
             self.finish_connection(token, connection);
             return;
         };
+        #[cfg(test)]
+        if response.header().operation == GuardianOperation::Claim
+            && response.header().status == GuardianResponseStatus::Success
+            && self
+                .drop_rotation_reply
+                .as_ref()
+                .is_some_and(|(request_id, _)| *request_id == response.header().request_id)
+        {
+            let (_, observed) = self.drop_rotation_reply.take().unwrap();
+            self.finish_connection(token, connection);
+            observed
+                .send(())
+                .expect("owned reply-loss observer remains live");
+            return;
+        }
         let Ok(frame) = encode_guardian_response(&self.secret, &response) else {
             self.finish_connection(token, connection);
             return;
@@ -5850,19 +5869,46 @@ mod tests {
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_genesis_service_spawns_once_and_journals_broker_output_before_ack() {
-        run_configured_genesis_service(false, false);
+        run_configured_genesis_service(GenesisServiceScenario::Spawn);
     }
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_genesis_service_retries_original_permit_after_broker_starts() {
-        run_configured_genesis_service(true, false);
+        run_configured_genesis_service(GenesisServiceScenario::MissingBroker);
     }
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn configured_genesis_service_rotates_two_panes_to_new_mux_process() {
-        run_configured_genesis_service(false, true);
+        run_configured_genesis_service(GenesisServiceScenario::Rotate);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_mux_rotation_waits_for_prior_output_append_and_ack() {
+        run_configured_genesis_service(GenesisServiceScenario::DelayedOutput);
+    }
+
+    #[test]
+    #[ignore = "requires two actual distinct sealed executables; run explicitly in strict RCH/DSR"]
+    fn configured_mux_rotation_between_distinct_sealed_builds() {
+        run_configured_genesis_service(GenesisServiceScenario::DistinctBuild);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_mux_rotation_recovers_exact_outer_reply_loss() {
+        run_configured_genesis_service(GenesisServiceScenario::OuterReplyLoss);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn configured_mux_rotation_wal_cuts_quarantine_without_replacing_children() {
+        use crate::broker::BrokerMuxRotationFaultPointV1::{Acknowledge, Claim, Fence};
+        for point in [Fence, Claim, Acknowledge] {
+            run_configured_genesis_service(GenesisServiceScenario::WalFault(point));
+        }
     }
 
     #[test]
@@ -5890,6 +5936,26 @@ mod tests {
         let panes = parse_pair("FT_ROTATION_TEST_PANES");
         let effects = parse_pair("FT_ROTATION_TEST_EFFECTS");
         let build = crate::guardian_runtime_build_identity().expect("sealed child identity");
+        let origin_build = crate::SealedAtomicBuildIdentity::from_lower_hex(
+            &std::env::var("FT_ROTATION_TEST_ORIGIN_BUILD").unwrap(),
+        )
+        .unwrap();
+        let expected_build = crate::SealedAtomicBuildIdentity::from_lower_hex(
+            &std::env::var("FT_ROTATION_TEST_EXPECTED_BUILD").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            build, expected_build,
+            "actual child embedded build differs from requested executable"
+        );
+        if std::env::var_os("FT_ROTATION_TEST_DISTINCT").is_some() {
+            assert_ne!(
+                build, origin_build,
+                "cross-build proof requires two distinct embedded identities"
+            );
+        } else {
+            assert_eq!(build, origin_build);
+        }
         let token = directory.join("token");
         let socket = directory.join("guardian.sock");
         let broker_token = directory.join("broker/token");
@@ -5900,6 +5966,14 @@ mod tests {
             .unwrap()
             .lineage_id();
         let new_mux = Uuid::new_v4();
+        let delayed = std::env::var_os("FT_ROTATION_TEST_DELAYED").is_some();
+        let wal_fault = std::env::var("FT_ROTATION_TEST_WAL_FAULT").ok();
+        let lost_request = std::env::var("FT_ROTATION_TEST_DROP_REQUEST")
+            .ok()
+            .map(|value| Uuid::parse_str(&value).unwrap());
+        // This cut isolates reply loss, not last-owner retirement or inner ACK loss.
+        let _successor_keepalive = lost_request
+            .map(|_| GuardianClient::connect_for_genesis(&socket, &token, new_mux).unwrap());
         assert_ne!(old_mux, new_mux);
         let mut leases = Vec::new();
         let mut contexts = Vec::new();
@@ -5908,37 +5982,133 @@ mod tests {
                 broker_lineage: lineage,
                 guardian_incarnation: guardian,
                 mux_incarnation: old_mux,
-                broker_build: build.into_bytes(),
-                guardian_build: build.into_bytes(),
-                mux_build: build.into_bytes(),
+                broker_build: origin_build.into_bytes(),
+                guardian_build: origin_build.into_bytes(),
+                mux_build: origin_build.into_bytes(),
                 pane_id: panes[index],
                 effect_id: effects[index],
             };
-            let mut wrong_possession = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)
-                .unwrap()
-                .into_mux_rotation_payload()
-                .unwrap();
-            *wrong_possession.last_mut().unwrap() ^= 1;
-            assert!(matches!(
-                GuardianClient::connect_for_genesis(&socket, &token, new_mux)
-                    .unwrap()
-                    .claim_with_payload(
-                        panes[index],
-                        1,
-                        Uuid::new_v4(),
-                        Uuid::new_v4(),
-                        wrong_possession
+            if !delayed || index != 0 {
+                assert!(
+                    matches!(
+                        GuardianClient::connect_for_genesis(&socket, &token, new_mux)
+                            .unwrap()
+                            .claim(panes[index], 1, Uuid::new_v4(), Uuid::new_v4()),
+                        Err(GuardianClientError::Rejected(_))
                     ),
-                Err(GuardianClientError::Rejected(_))
-            ));
+                    "transport authentication alone cannot transfer broker ownership"
+                );
+                let mut wrong_possession =
+                    GuardianDurableSpawnCustodyV1::open_existing(&token, scope)
+                        .unwrap()
+                        .into_mux_rotation_payload()
+                        .unwrap();
+                *wrong_possession.last_mut().unwrap() ^= 1;
+                assert!(matches!(
+                    GuardianClient::connect_for_genesis(&socket, &token, new_mux)
+                        .unwrap()
+                        .claim_with_payload(
+                            panes[index],
+                            1,
+                            Uuid::new_v4(),
+                            Uuid::new_v4(),
+                            wrong_possession
+                        ),
+                    Err(GuardianClientError::Rejected(_))
+                ));
+            }
             let custody = GuardianDurableSpawnCustodyV1::open_existing(&token, scope).unwrap();
+            if !delayed || index != 0 {
+                let mut historical_context = custody.context();
+                historical_context.effect_id = Uuid::new_v4();
+                let historical = custody
+                    .persist_historical_context_for_test(historical_context)
+                    .unwrap();
+                assert!(
+                    matches!(
+                        GuardianClient::connect_for_genesis(&socket, &token, new_mux)
+                            .unwrap()
+                            .claim_mux_successor(historical, Uuid::new_v4(), Uuid::new_v4()),
+                        Err(GuardianClientError::Rejected(_))
+                    ),
+                    "authenticated wrong-effect history with the same broker and child must refuse before any live mutation"
+                );
+            }
             contexts.push(custody.context());
-            let claim_request = Uuid::new_v4();
+            let claim_request = if index == 0 {
+                lost_request.unwrap_or_else(Uuid::new_v4)
+            } else {
+                Uuid::new_v4()
+            };
             let handoff = Uuid::new_v4();
-            let lease = GuardianClient::connect_for_genesis(&socket, &token, new_mux)
+            let first_attempt = GuardianClient::connect_for_genesis(&socket, &token, new_mux)
                 .unwrap()
-                .claim_mux_successor(custody, claim_request, handoff)
+                .claim_mux_successor(custody, claim_request, handoff);
+            if let Some(point) = wal_fault.as_ref() {
+                assert!(
+                    index == 0 && first_attempt.is_err(),
+                    "faulted rotation cannot activate"
+                );
+                let (observer_mux, observer_build) = if point == "fence" {
+                    (old_mux, origin_build)
+                } else {
+                    (new_mux, build)
+                };
+                let identity = BrokerGuardianConnectionIdentityV1::new(
+                    guardian,
+                    observer_mux,
+                    origin_build,
+                    observer_build,
+                )
                 .unwrap();
+                let mut observer = BrokerControlClientV1::connect(
+                    &broker_socket,
+                    &broker_token,
+                    identity,
+                    origin_build,
+                )
+                .unwrap();
+                let census = observer.census().unwrap();
+                let entry = census
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.durable_pane_id == panes[0])
+                    .unwrap();
+                let child = entry.child_identity.unwrap();
+                assert_eq!(child.process_id(), contexts[0].child_pid);
+                assert_eq!(child.broker_child_nonce(), contexts[0].child_nonce);
+                assert_eq!(
+                    child.kernel_start_identity_digest(),
+                    contexts[0].child_start_digest
+                );
+                assert_eq!(
+                    entry.disposition,
+                    crate::broker::BrokerCensusDispositionV1::ReplyAcknowledgedQuarantined
+                );
+                assert!(entry.pty_available && entry.effects_disabled);
+                assert!(!entry.lease_available && !entry.output_replay_available);
+                println!("MUX_ROTATION_WAL_CUT_CHILD_RETAINED={point}");
+                println!("MUX_ROTATION_EMBEDDED_SUCCESSOR_BUILD={build}");
+                return;
+            }
+            let lease = if index == 0 && lost_request.is_some() {
+                assert!(
+                    matches!(first_attempt, Err(GuardianClientError::Io(_))),
+                    "exact committed reply cut must surface as a transport failure"
+                );
+                let recovered = GuardianClient::connect_for_genesis(&socket, &token, new_mux)
+                    .unwrap()
+                    .claim_mux_successor(
+                        GuardianDurableSpawnCustodyV1::open_existing(&token, scope).unwrap(),
+                        claim_request,
+                        handoff,
+                    )
+                    .unwrap();
+                println!("MUX_ROTATION_OUTER_REPLY_RECOVERED");
+                recovered
+            } else {
+                first_attempt.unwrap()
+            };
             assert_eq!(lease.generation(), 2);
             leases.push(lease.into_client());
             let retry = GuardianClient::connect_for_genesis(&socket, &token, new_mux)
@@ -6001,10 +6171,15 @@ mod tests {
                 ));
             }
             let identity =
-                BrokerGuardianConnectionIdentityV1::new(guardian, new_mux, build, build).unwrap();
-            let mut observer =
-                BrokerControlClientV1::connect(&broker_socket, &broker_token, identity, build)
+                BrokerGuardianConnectionIdentityV1::new(guardian, new_mux, origin_build, build)
                     .unwrap();
+            let mut observer = BrokerControlClientV1::connect(
+                &broker_socket,
+                &broker_token,
+                identity,
+                origin_build,
+            )
+            .unwrap();
             let census = observer.census().unwrap();
             assert_eq!(census.entries().len(), index + 1);
             for entry in census.entries() {
@@ -6045,9 +6220,48 @@ mod tests {
             ));
         }
         println!("MUX_ROTATION_TWO_PANES_SUCCESS");
+        println!("MUX_ROTATION_EMBEDDED_SUCCESSOR_BUILD={build}");
     }
 
-    fn run_configured_genesis_service(broker_initially_absent: bool, rotate_mux: bool) {
+    struct OwnedSuccessorProcess(std::process::Child);
+    impl Drop for OwnedSuccessorProcess {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GenesisServiceScenario {
+        Spawn,
+        MissingBroker,
+        Rotate,
+        DelayedOutput,
+        DistinctBuild,
+        OuterReplyLoss,
+        WalFault(crate::broker::BrokerMuxRotationFaultPointV1),
+    }
+
+    fn run_configured_genesis_service(scenario: GenesisServiceScenario) {
+        let broker_initially_absent = matches!(scenario, GenesisServiceScenario::MissingBroker);
+        let rotate_mux = matches!(
+            scenario,
+            GenesisServiceScenario::Rotate
+                | GenesisServiceScenario::DelayedOutput
+                | GenesisServiceScenario::DistinctBuild
+                | GenesisServiceScenario::OuterReplyLoss
+                | GenesisServiceScenario::WalFault(_)
+        );
+        let delay_output = matches!(scenario, GenesisServiceScenario::DelayedOutput);
+        let distinct_build = matches!(scenario, GenesisServiceScenario::DistinctBuild);
+        let lost_reply_request =
+            matches!(scenario, GenesisServiceScenario::OuterReplyLoss).then(Uuid::new_v4);
+        let wal_fault = match scenario {
+            GenesisServiceScenario::WalFault(point) => Some(point),
+            _ => None,
+        };
         use crate::broker::{BrokerControlServiceConfigV1, BrokerControlServiceV1};
         use mux::guardian_protocol::{
             GuardianCheckpointDescriptorV1, GuardianCheckpointOutputBoundaryV1,
@@ -6063,6 +6277,21 @@ mod tests {
 
         let build = crate::guardian_runtime_build_identity()
             .expect("positive Genesis runtime proof requires sealed candidate identity");
+        let (successor_executable, successor_build) = if distinct_build {
+            let executable = PathBuf::from(
+                std::env::var_os("FT_ROTATION_SUCCESSOR_EXE")
+                    .expect("cross-build proof requires an actual second sealed executable"),
+            );
+            assert!(executable.is_absolute() && executable.is_file());
+            let identity = crate::SealedAtomicBuildIdentity::from_lower_hex(
+                &std::env::var("FT_ROTATION_SUCCESSOR_EXPECTED_BUILD").unwrap(),
+            )
+            .unwrap();
+            assert_ne!(identity, build);
+            (executable, identity)
+        } else {
+            (std::env::current_exe().unwrap(), build)
+        };
         let directory = tempfile::Builder::new()
             .prefix("ft-genesis-runtime-")
             .tempdir_in(crate::canonical_test_temp_root())
@@ -6110,11 +6339,13 @@ mod tests {
         let marker = directory.join("child-count");
         let expected = b"genesis-wire-output";
         let mux = Uuid::new_v4();
+        let pane = Uuid::new_v4();
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let stop_guard = StopOnDrop(&stop);
             let (broker_ready_tx, broker_ready_rx) = std::sync::mpsc::sync_channel(1);
             let (broker_start_tx, broker_start_rx) = std::sync::mpsc::sync_channel(1);
+            let (fault_settled_tx, fault_settled_rx) = std::sync::mpsc::sync_channel(1);
             let broker_stop = &stop;
             let broker = scope.spawn(move || {
                 loop {
@@ -6128,8 +6359,21 @@ mod tests {
                     }
                 }
                 let mut service = BrokerControlServiceV1::bind(broker_config).unwrap();
+                if let Some(point) = wal_fault {
+                    service.arm_next_rotation_lease_fault_for_test(pane, point);
+                }
                 broker_ready_tx.send(()).unwrap();
+                while !broker_stop.load(Ordering::Acquire) {
+                    service.poll_once().unwrap();
+                }
+                // Observe survival before run_until performs its existing
+                // test-only termination and wait of all owned broker children.
+                let fault_settled =
+                    wal_fault.is_some() && service.rotation_fault_settled_for_test(pane);
                 service.run_until(broker_stop).unwrap();
+                if wal_fault.is_some() {
+                    fault_settled_tx.send(fault_settled).unwrap();
+                }
             });
             if !broker_initially_absent {
                 broker_start_tx.send(()).unwrap();
@@ -6137,16 +6381,34 @@ mod tests {
             }
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let (proof_tx, proof_rx) = std::sync::mpsc::sync_channel(1);
+            let (reply_cut_tx, reply_cut_rx) = std::sync::mpsc::sync_channel(1);
             let (retire_tx, retire_rx) = std::sync::mpsc::sync_channel(1);
             let (retired_tx, retired_rx) = std::sync::mpsc::sync_channel(1);
+            let (pause_tx, pause_rx) = std::sync::mpsc::sync_channel(1);
+            let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+            let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+            let (pending_result_tx, pending_result_rx) = std::sync::mpsc::sync_channel(1);
             let guardian_stop = &stop;
             let guardian = scope.spawn(move || {
                 let mut service = GuardianService::bind(guardian_config).unwrap();
+                service.drop_rotation_reply =
+                    lost_reply_request.map(|request| (request, reply_cut_tx));
                 ready_tx.send(()).unwrap();
                 let mut sent = false;
                 let mut await_retirement = false;
                 while !guardian_stop.load(Ordering::Acquire) {
                     service.poll_once().unwrap();
+                    if let Ok((pane, entered, release)) = pause_rx.try_recv() {
+                        service
+                            .runtime
+                            .pause_next_broker_append_for_test(pane, entered, release);
+                        paused_tx.send(()).unwrap();
+                    }
+                    if let Ok(pane) = pending_rx.try_recv() {
+                        pending_result_tx
+                            .send(service.runtime.rotation_pending_for_test(pane))
+                            .unwrap();
+                    }
                     await_retirement |= retire_rx.try_recv().is_ok();
                     if await_retirement
                         && !service.mux_connections.has_authenticated_membership(mux)
@@ -6170,7 +6432,6 @@ mod tests {
                 }
             });
             ready_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
-            let pane = Uuid::new_v4();
             let effect = Uuid::new_v4();
             let request = Uuid::new_v4();
             let size = PtySize {
@@ -6288,6 +6549,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(first_lease.generation(), 1);
                 assert_eq!(second_lease.generation(), 1);
+                let mut first_client = first_lease.into_client();
                 let live_scope = mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
                     broker_lineage: load_guardian_secret(&broker_token)
                         .unwrap()
@@ -6318,40 +6580,142 @@ mod tests {
                     ),
                     "a living predecessor must retain ownership even against valid custody possession"
                 );
-                drop(first_lease);
+                let append_release = if delay_output {
+                    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+                    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                    pause_tx.send((pane, entered_tx, release_rx)).unwrap();
+                    paused_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    assert!(matches!(
+                        first_client
+                            .input(
+                                pane,
+                                1,
+                                1,
+                                Uuid::new_v4(),
+                                Uuid::new_v4(),
+                                b"before-rotation\n".to_vec()
+                            )
+                            .unwrap(),
+                        GuardianReply::InputReceipt {
+                            state: InputEffectState::DurableFull,
+                            ..
+                        }
+                    ));
+                    entered_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    Some(release_tx)
+                } else {
+                    None
+                };
+                drop(first_client);
                 drop(second_lease);
                 drop(client);
                 retire_tx.send(()).unwrap();
                 retired_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
                 let stdout_path = directory.join("successor-process.stdout");
                 let stderr_path = directory.join("successor-process.stderr");
-                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "transport::tests::mux_rotation_successor_process",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env("FT_ROTATION_TEST_DIRECTORY", &directory)
-                    .env("FT_ROTATION_TEST_GUARDIAN", guardian_id.to_string())
-                    .env("FT_ROTATION_TEST_OLD_MUX", mux.to_string())
-                    .env("FT_ROTATION_TEST_PANES", format!("{pane},{second_pane}"))
+                let mut child_command = std::process::Command::new(&successor_executable);
+                if distinct_build {
+                    child_command.env("FT_ROTATION_TEST_DISTINCT", "1");
+                } else {
+                    child_command.env_remove("FT_ROTATION_TEST_DISTINCT");
+                }
+                child_command
+                    .env("FT_ROTATION_TEST_ORIGIN_BUILD", build.to_string())
                     .env(
-                        "FT_ROTATION_TEST_EFFECTS",
-                        format!("{effect},{second_effect}"),
+                        "FT_ROTATION_TEST_EXPECTED_BUILD",
+                        successor_build.to_string(),
+                    );
+                if delay_output {
+                    child_command.env("FT_ROTATION_TEST_DELAYED", "1");
+                } else {
+                    child_command.env_remove("FT_ROTATION_TEST_DELAYED");
+                }
+                if let Some(request) = lost_reply_request {
+                    child_command.env("FT_ROTATION_TEST_DROP_REQUEST", request.to_string());
+                } else {
+                    child_command.env_remove("FT_ROTATION_TEST_DROP_REQUEST");
+                }
+                let wal_fault_label = wal_fault.map(|point| match point {
+                    crate::broker::BrokerMuxRotationFaultPointV1::Fence => "fence",
+                    crate::broker::BrokerMuxRotationFaultPointV1::Claim => "claim",
+                    crate::broker::BrokerMuxRotationFaultPointV1::Acknowledge => "ack",
+                });
+                if let Some(point) = wal_fault_label {
+                    child_command.env("FT_ROTATION_TEST_WAL_FAULT", point);
+                } else {
+                    child_command.env_remove("FT_ROTATION_TEST_WAL_FAULT");
+                }
+                let mut child = OwnedSuccessorProcess(
+                    child_command
+                        .args([
+                            "--exact",
+                            "transport::tests::mux_rotation_successor_process",
+                            "--ignored",
+                            "--nocapture",
+                        ])
+                        .env("FT_ROTATION_TEST_DIRECTORY", &directory)
+                        .env("FT_ROTATION_TEST_GUARDIAN", guardian_id.to_string())
+                        .env("FT_ROTATION_TEST_OLD_MUX", mux.to_string())
+                        .env("FT_ROTATION_TEST_PANES", format!("{pane},{second_pane}"))
+                        .env(
+                            "FT_ROTATION_TEST_EFFECTS",
+                            format!("{effect},{second_effect}"),
+                        )
+                        .stdout(File::create(&stdout_path).unwrap())
+                        .stderr(File::create(&stderr_path).unwrap())
+                        .spawn()
+                        .unwrap(),
+                );
+                if let Some(release) = append_release {
+                    let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+                    loop {
+                        pending_tx.send(pane).unwrap();
+                        if pending_result_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap() {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "valid successor never reached the pending output barrier"
+                        );
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    let identity = crate::broker::BrokerGuardianConnectionIdentityV1::new(
+                        guardian_id,
+                        mux,
+                        build,
+                        build,
                     )
-                    .stdout(File::create(&stdout_path).unwrap())
-                    .stderr(File::create(&stderr_path).unwrap())
-                    .spawn()
                     .unwrap();
+                    let mut observer = crate::broker::BrokerControlClientV1::connect(
+                        &broker_socket,
+                        &broker_token,
+                        identity,
+                        build,
+                    )
+                    .unwrap();
+                    let census = observer.census().unwrap();
+                    let entry = census
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.durable_pane_id == pane)
+                        .unwrap();
+                    assert_eq!(entry.owner_mux_incarnation, Some(mux));
+                    assert_eq!(entry.lease_generation, 1);
+                    assert!(
+                        entry.lease_available && !entry.effects_disabled,
+                        "fence must not precede the old canonical append and ACK"
+                    );
+                    drop(observer);
+                    release.send(()).unwrap();
+                }
                 let deadline = std::time::Instant::now() + Duration::from_secs(45);
                 let status = loop {
-                    if let Some(status) = child.try_wait().unwrap() {
+                    if let Some(status) = child.0.try_wait().unwrap() {
                         break status;
                     }
                     if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let settled = child.wait().expect("reap owned successor test process");
+                        let _ = child.0.kill();
+                        let settled = child.0.wait().expect("reap owned successor test process");
                         panic!(
                             "owned successor process exceeded deadline ({settled}); stdout={} stderr={}",
                             std::fs::read_to_string(&stdout_path).unwrap(),
@@ -6368,7 +6732,28 @@ mod tests {
                     stdout,
                     stderr
                 );
+                if let Some(point) = wal_fault_label {
+                    assert!(
+                        stdout.contains(&format!("MUX_ROTATION_WAL_CUT_CHILD_RETAINED={point}"))
+                    );
+                    assert_eq!(std::fs::read(&marker).unwrap(), b"CC");
+                    drop(stop_guard);
+                    guardian.join().unwrap();
+                    broker.join().unwrap();
+                    assert!(
+                        fault_settled_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap(),
+                        "injected WAL fault must retain the actual running child under quarantine"
+                    );
+                    return;
+                }
                 assert!(stdout.contains("MUX_ROTATION_TWO_PANES_SUCCESS"));
+                if lost_reply_request.is_some() {
+                    reply_cut_rx.recv_timeout(CLIENT_IO_TIMEOUT).unwrap();
+                    assert!(stdout.contains("MUX_ROTATION_OUTER_REPLY_RECOVERED"));
+                }
+                assert!(stdout.contains(&format!(
+                    "MUX_ROTATION_EMBEDDED_SUCCESSOR_BUILD={successor_build}"
+                )));
                 let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
                 loop {
                     retire_tx.send(()).unwrap();
