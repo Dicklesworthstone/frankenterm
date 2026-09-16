@@ -4387,9 +4387,10 @@ impl BrokerControlServiceV1 {
             return;
         };
         let pane = &mut live.adoption.pane;
+        let sequence_matches_submission = pane.next_output_sequence == job.sequence;
         if pane.proxy_reader.is_some()
             || pane.output_journal.is_some()
-            || pane.next_output_sequence != job.sequence
+            || !sequence_matches_submission
         {
             self.output_worker.retained = Some(job);
             return;

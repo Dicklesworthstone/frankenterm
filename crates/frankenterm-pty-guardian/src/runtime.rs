@@ -3503,7 +3503,7 @@ impl GuardianRuntime {
                 {
                     Ok(()) => output.in_flight_bytes = bytes,
                     Err(GuardianBrokerOutputSubmitError::Rejected(delivery)) => {
-                        pane.pending_delivery = Some(delivery)
+                        pane.pending_delivery = Some(delivery);
                     }
                     Err(GuardianBrokerOutputSubmitError::Invariant) => {
                         output.failed = true;
@@ -3626,7 +3626,7 @@ impl GuardianRuntime {
                 Err(command) => match *command {
                     BrokerPaneIoCommandV1::OpenInitial { .. } => {}
                     BrokerPaneIoCommandV1::Acknowledge { claim, .. } => {
-                        pane.pending_ack = Some(claim)
+                        pane.pending_ack = Some(claim);
                     }
                     BrokerPaneIoCommandV1::Read { handle, .. } => {
                         pane.handle = Some(handle);

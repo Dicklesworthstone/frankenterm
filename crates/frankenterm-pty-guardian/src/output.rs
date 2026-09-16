@@ -672,7 +672,7 @@ struct CheckpointCatalogGenesisReservationBinding {
 /// prepared output journal of that exact child. Cloning permits independent
 /// immutable replay snapshots; it never grants Spawn or mutation authority.
 #[derive(Clone)]
-pub(crate) struct GuardianGenesisReplayOriginV1 {
+pub struct GuardianGenesisReplayOriginV1 {
     reservation: CheckpointCatalogGenesisReservationBinding,
     catalog_candidate_checksum: [u8; OUTPUT_MANIFEST_CHECKSUM_BYTES],
     guardian_incarnation: Uuid,
@@ -2428,8 +2428,8 @@ impl GuardianCheckpointStageStore {
             )?
             .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if !inspection.seal_present
-                || inspection.next_index != shape.total_chunks
-                || inspection.committed_bytes != shape.total_bytes
+                || (inspection.next_index, inspection.committed_bytes)
+                    != (shape.total_chunks, shape.total_bytes)
             {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
@@ -4848,7 +4848,9 @@ fn guardian_replay_build_page(
                     parser_stream_bytes: 0,
                     ..
                 } if snapshot.catalog.genesis_origin.is_some() => (0, [0; 32]),
-                _ => return Err(GuardianCheckpointStageStoreError::Poisoned),
+                GuardianCheckpointOutputBoundaryV1::Genesis { .. } => {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
             };
             (
                 GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
@@ -6522,6 +6524,10 @@ pub struct GuardianOutputCompletion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianOutputCommitFailure;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transient receive result retains the bounded queue's owned receipt without a heap allocation per output record"
+)]
 pub enum GuardianOutputCompletionState {
     Ready(GuardianOutputCompletion),
     Empty,
@@ -6647,7 +6653,7 @@ impl OutputQueue {
 
 /// Cloneable journal creation authority without worker queues or receivers.
 #[derive(Clone)]
-pub(crate) struct GuardianJournalPreparation {
+pub struct GuardianJournalPreparation {
     directory: Arc<File>,
     directory_path: PathBuf,
     cipher: GuardianOutputCipher,
