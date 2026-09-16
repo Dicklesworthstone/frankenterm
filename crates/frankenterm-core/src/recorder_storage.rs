@@ -8041,6 +8041,60 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn writer_lease_handoff_flushes_before_unlock_with_inherited_descriptors() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = test_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "buffered-before-handoff".to_string(),
+                    events: vec![sample_event("buffered", 1, 0, "retained")],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let (inherited, expected_bytes) = {
+                let inner = storage.inner.lock().await;
+                let mut inherited = vec![
+                    inner.writer.get_ref().try_clone().unwrap(),
+                    inner.state_file.lock.try_clone().unwrap(),
+                ];
+                inherited.extend(
+                    inner
+                        .state_file
+                        .path_leases
+                        .iter()
+                        .map(|lease| lease.file.try_clone().unwrap()),
+                );
+                assert_eq!(inherited.len(), 6);
+                assert!(!inner.writer.buffer().is_empty());
+                assert!(std::fs::read(&config.data_path).unwrap().is_empty());
+                (inherited, inner.writer.buffer().to_vec())
+            };
+            assert_eq!(Arc::strong_count(&storage.inner), 1);
+            drop(storage);
+            assert_eq!(std::fs::read(&config.data_path).unwrap(), expected_bytes);
+            // These descriptors model the OFDs inherited between fork and exec.
+            // They stay open throughout handoff, without sleeps or fork timing.
+            let successor = AppendLogRecorderStorage::open(config.clone()).unwrap();
+            assert_eq!(successor.health().await.latest_offset.unwrap().ordinal, 0);
+            for _ in 0..2 {
+                let error = AppendLogRecorderStorage::open(config.clone()).unwrap_err();
+                assert!(matches!(error, RecorderStorageError::Io(ref io)
+                    if io.raw_os_error() == fs2::lock_contended_error().raw_os_error()));
+            }
+            drop(inherited);
+            // Closing the old OFDs must not release the successor's new lease.
+            assert!(AppendLogRecorderStorage::open(config.clone()).is_err());
+            drop(successor);
+            AppendLogRecorderStorage::open(config).unwrap();
+        });
+    }
+
     #[test]
     fn owned_repair_preserves_buffered_receipts_and_removes_failed_batch_suffix() {
         run_async_test(async {
