@@ -5065,6 +5065,16 @@ mod tests {
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn guardian_domain_real_birth_publishes_output_and_cancellation_retires_only_lease() {
+        run_guardian_domain_real_birth(false);
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn guardian_domain_in_flight_cancellation_finishes_adoption_then_retires_only_lease() {
+        run_guardian_domain_real_birth(true);
+    }
+
+    fn run_guardian_domain_real_birth(cancel_in_flight: bool) {
         use frankenterm_pty_guardian::provision_guardian_token;
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -5248,18 +5258,85 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(2));
             }
-            let unpublished = promise::spawn::block_on(domain.spawn_unpublished_pane(
-                &mux,
-                size,
-                Some(command()),
-                None,
-            ))
-            .unwrap();
+            if cancel_in_flight {
+                let coordinator = Arc::clone(domain.state.lock().census.as_ref().unwrap());
+                // The real lease plan must acquire this shared coordinator
+                // before Claim. Holding it prevents the worker from returning
+                // a completed guard even after the actual child is running.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let held_census = loop {
+                    if let Some(held) = coordinator.state.try_lock() {
+                        break held;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "census coordinator remained busy"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                };
+                let mut spawn =
+                    Box::pin(domain.spawn_unpublished_pane(&mux, size, Some(command()), None));
+                let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                assert!(std::future::Future::poll(spawn.as_mut(), &mut context).is_pending());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while std::fs::read(&births).is_ok_and(|bytes| bytes == b"B") {
+                    assert!(Instant::now() < deadline, "second real child did not start");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(std::fs::read(&births).unwrap(), b"BB");
+                assert!(domain.admission.load(Ordering::Acquire));
+                assert!(domain.state.lock().publication.is_none());
+                drop(spawn);
+                assert!(
+                    domain.admission.load(Ordering::Acquire),
+                    "cancelling the future released admission before its worker settled"
+                );
+                assert!(domain.state.lock().unadopted_birth.is_some());
+                // This guard also releases first during assertion unwinding,
+                // before the fixture waits for or stops any owned processes.
+                drop(held_census);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let state = domain.state.lock();
+                    let adopted = state.publication.is_some();
+                    drop(state);
+                    if adopted && !domain.admission.load(Ordering::Acquire) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancelled birth did not finish adoption"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+            } else {
+                let unpublished = promise::spawn::block_on(domain.spawn_unpublished_pane(
+                    &mux,
+                    size,
+                    Some(command()),
+                    None,
+                ))
+                .unwrap();
+                drop(unpublished);
+            }
             assert_eq!(mux.iter_panes().len(), 1);
-            drop(unpublished);
             let mut census =
                 GuardianClient::connect(&socket, &token, domain.mux_incarnation).unwrap();
-            let rows = census.census_snapshot().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let rows = loop {
+                let rows = census.census_snapshot().unwrap();
+                if rows
+                    .iter()
+                    .any(|row| row.status == GuardianCensusPaneStatus::LiveUnclaimed)
+                {
+                    break rows;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled pane lease was not retired"
+                );
+                thread::sleep(Duration::from_millis(2));
+            };
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 rows.iter()
@@ -5283,6 +5360,15 @@ mod tests {
                 "unpublished cancellation signaled an owned child"
             );
             assert!(domain.state.lock().unadopted_birth.is_some());
+            assert!(
+                !domain
+                    .state
+                    .lock()
+                    .publication
+                    .as_ref()
+                    .unwrap()
+                    .was_published()
+            );
             assert!(
                 promise::spawn::block_on(domain.spawn_unpublished_pane(
                     &mux,
@@ -5310,6 +5396,9 @@ mod tests {
             assert_eq!(std::fs::read(&finished).unwrap(), b"DD");
             assert!(!signaled.exists());
             println!("GUARDIAN_DOMAIN_REAL_BIRTH_SUCCESS");
+            if cancel_in_flight {
+                println!("GUARDIAN_DOMAIN_IN_FLIGHT_CANCELLATION_SUCCESS");
+            }
         }
     }
 

@@ -23979,7 +23979,7 @@ mod tests {
             );
             match operation {
                 BrokerControlOperationV1::ClosePane => {
-                    client.close_pane(&output_handle, output_deadline).unwrap()
+                    client.close_pane(&output_handle, output_deadline).unwrap();
                 }
                 BrokerControlOperationV1::SignalTerminate => client
                     .signal_terminate(&output_handle, output_deadline)
@@ -23993,7 +23993,7 @@ mod tests {
                 {
                     BrokerPaneChildStatusV1::Exited { signaled: true, .. } => break,
                     BrokerPaneChildStatusV1::Running if Instant::now() < output_deadline => {
-                        thread::sleep(Duration::from_millis(1))
+                        thread::sleep(Duration::from_millis(1));
                     }
                     other => {
                         panic!("owned child did not exit from the termination signal: {other:?}")
@@ -24140,7 +24140,7 @@ mod tests {
                 .expect("read real PTY through authenticated broker worker")
             {
                 BrokerPaneOutputV1::Pending if Instant::now() < output_deadline => {
-                    thread::sleep(Duration::from_millis(1))
+                    thread::sleep(Duration::from_millis(1));
                 }
                 BrokerPaneOutputV1::Data(delivery) => break delivery,
                 _ => panic!("real broker output did not become durably readable"),
@@ -24195,7 +24195,7 @@ mod tests {
                     crate::output::GuardianOutputCompletionState::Empty
                         if Instant::now() < deadline =>
                     {
-                        thread::sleep(Duration::from_millis(1))
+                        thread::sleep(Duration::from_millis(1));
                     }
                     _ => panic!("canonical output worker did not settle"),
                 }
@@ -24281,7 +24281,7 @@ mod tests {
                 .unwrap()
             {
                 BrokerPaneOutputV1::Pending if Instant::now() < output_deadline => {
-                    thread::sleep(Duration::from_millis(1))
+                    thread::sleep(Duration::from_millis(1));
                 }
                 BrokerPaneOutputV1::Data(delivery) => {
                     assert_eq!(delivery.sequence_range(), (end, end + 1));
@@ -24428,8 +24428,7 @@ mod tests {
                 claim: ack,
                 deadline: worker_deadline,
             }))
-            .err()
-            .expect("one outstanding command per broker connection");
+            .expect_err("one outstanding command per broker connection");
         assert!(io_worker.try_take_session().unwrap().is_none());
         let output_handle = loop {
             match io_worker.try_completion() {

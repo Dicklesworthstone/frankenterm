@@ -6028,7 +6028,7 @@ mod tests {
                 .unwrap();
             let generation = lease.generation();
             let mut leased = lease.into_client();
-            let page = leased
+            let replay_page = leased
                 .replay(
                     pane,
                     generation,
@@ -6041,8 +6041,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(page.header().pane_id(), pane);
-            match page.into_body() {
+            assert_eq!(replay_page.header().pane_id(), pane);
+            match replay_page.into_body() {
                 GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
                     assert_eq!(chunk.offset(), 0);
                     assert!(matches!(

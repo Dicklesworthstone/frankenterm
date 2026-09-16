@@ -559,7 +559,7 @@ notification. No alternate automation route is authorized by the tool refusal.
 - [x] Revalidate journal pins before empty Complete pages. Independent review
   found this missing check; the real sealed publication test now corrupts and
   fsyncs the pinned journal before Complete and requires InvalidFileMagic.
-- [ ] Execute that explicit sealed test and the full guardian suite on the
+- [x] Execute that explicit sealed test and the full guardian suite on the
   integrated committed runtime source. Formatting/source review is not proof.
 - [ ] Execute the proxy consumer suite and full service path, including real
   initial Claim, input deduplication, resize, child status and post-exit replay.
@@ -586,17 +586,24 @@ or safe migration of the existing unguarded remote mux sessions.
   broker quarantine while retrying. Committed through `b5e97bbbd`.
 - [x] Run proxy tests remotely at `d1baa48c6` (RCH 30023644042231815): 43 passed,
   zero failed/ignored, 610 filtered; canonical Genesis and geometry controls ran.
-- [ ] Pass corrected full guardian and four separately selected sealed tests,
+- [x] Pass corrected full guardian at `b5e97bbbdeae1bfd9f25f56b531337ba09489c0f`,
+  RCH 30023644042231816: 235 passed, zero failures, four ignored. Execute each
+  ignored test explicitly in jobs 31817–31820: four separate one-test passes,
   including real late-broker-start retry and damaged empty replay completion.
 - [ ] Complete strict all-target Clippy on the integrated guardian and proxy.
 - [x] Confirm normal mux startup still always selects LocalDomain; the proxy
   module alone does not make guardian-backed panes available to the product.
-- [ ] Add explicit opt-in GuardianDomain using the real publication/Spawn/
+- [x] Add explicit opt-in GuardianDomain using the real publication/Spawn/
   Claim/replay chain and a bounded off-loop cold transaction.
-- [ ] Validate mux-owned unpublished guardian construction and publication;
+- [x] Validate mux-owned unpublished guardian construction and publication;
   cancellation or failed registration must retire its lease without Close.
 - [ ] Prove the actual Domain path with real guardian/broker services and child
   output, including off-topology staging and normal pane publication.
+- [ ] Eliminate whole-history replay rescans under the existing bounded replay
+  bead `.8.12.4.5`; current wire limits do not bound total disk/CPU work. A safe
+  opaque interval/cursor design must retain requested-byte authentication and
+  distinguish it from a full-history scrub. The duplicate same-page catalog
+  validation was removed in `a7743a28b`; it does not solve the quadratic case.
 - [ ] Keep unknown Spawn outcomes fenced, retain exact identity for recovery,
   and reject cross-mux/domain ownership substitution.
 - [ ] Complete final candidate quality, native/performance acceptance,
@@ -605,3 +612,34 @@ or safe migration of the existing unguarded remote mux sessions.
 The proxy parent bead remains open because its dependency proofs are not yet
 closed. Implementation progress is recorded without overriding that dependency
 state or treating the new opt-in path as existing-session migration.
+
+### 2026-09-16 09:56 UTC — domain integration and release preparation
+
+- [x] Commit actual opt-in domain at `671c1e13333909a5e5cf44989efcc56a5236d077`:
+  exact sealed Genesis birth, shared census, Claim0, replay, and mux publication.
+- [x] Retain an opaque mux publication receipt: cancellation keeps the birth
+  fenced, while publication remains recorded after a short-lived pane is pruned.
+- [x] Reject conflicting configured defaults at startup and before reload
+  mutation; preserve ordinary configuration behavior when guardian is unselected.
+- [x] Run four unpublished guardian tests at `8dfd4c9cd`, RCH job31823:
+  four passed, zero failed/ignored. Updated publication receipt assertions
+  require a new run at the integrated source.
+- [ ] Finish integrated strict Clippy: production passed compilation, seven
+  test-only style diagnostics remain in broker/transport and are being fixed.
+- [ ] Build actual sealed guardian CLI and run real mux-domain lifecycle test.
+- [ ] Add and run deterministic cancellation while the cold worker is in flight,
+  using real birth output and census exclusion rather than timing assumptions.
+- [ ] Run both CLI flag/default tests, six server reconciliation tests, and the
+  updated four mux publication tests on the integrated checkpoint.
+- [ ] Bound replay work within a snapshot using authenticated cursor bookmarks;
+  retain requested-byte validation and separate full-history scrub semantics.
+- [x] Refresh DSR readiness: doctor exit0 with generic act warnings; health
+  reports ten healthy, zero unhealthy, three warnings. Repo resolves this checkout.
+- [x] Back up private native config and activate the reviewed Mac Git-object
+  packaging authority and Windows NTFS host fixes; no build or release started.
+- [ ] Freeze a new candidate, generate exact-source producer evidence, complete
+  all six quality gates and native matrix, then publish and verify through DSR.
+
+The protected macOS notification still prevents foreground acceptance. Existing
+GUI children and remote mux sessions remain untouched; neither recovery across
+power loss nor migration of those live sessions has been demonstrated.
