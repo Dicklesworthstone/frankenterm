@@ -45,6 +45,104 @@ use wezterm_term::{
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Default)]
+struct ResizeDeliveryState {
+    attempt: u64,
+    failed: bool,
+    failure_notified: bool,
+}
+
+impl ResizeDeliveryState {
+    fn begin(&mut self) -> anyhow::Result<u64> {
+        self.attempt = self
+            .attempt
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("remote resize attempt identity exhausted"))?;
+        self.failed = false;
+        Ok(self.attempt)
+    }
+
+    fn settle(&mut self, attempt: u64, success: bool) -> bool {
+        if self.attempt != attempt {
+            return false;
+        }
+        self.failed = !success;
+        if success {
+            self.failure_notified = false;
+            false
+        } else {
+            !std::mem::replace(&mut self.failure_notified, true)
+        }
+    }
+}
+
+/// Own the terminal result even if the scheduled waiter is dropped. No failed
+/// resize is replayed: a reply failure may follow a partially applied effect.
+struct ResizeDelivery {
+    state: Arc<Mutex<ResizeDeliveryState>>,
+    attempt: u64,
+    registration: Option<PaneRegistrationHandle>,
+    settled: bool,
+}
+
+impl ResizeDelivery {
+    fn settle(&mut self, success: bool) {
+        self.settled = true;
+        let notify = self.state.lock().settle(self.attempt, success);
+        metrics::counter!(
+            "mux.client.resize.delivery.total",
+            "outcome" => if success { "completed" } else { "failed_or_unknown" }
+        )
+        .increment(1);
+        if !success {
+            log::error!("remote resize failed or has an unknown outcome; no automatic replay");
+        }
+        if notify {
+            if let Some(registration) = &self.registration {
+                let _ = registration.try_with_current(|current| {
+                    current.dispatch_alert(Alert::ToastNotification {
+                        title: Some("Remote pane resize not confirmed".to_string()),
+                        body: "The remote pane may still have its previous size. Resize the window again to retry.".to_string(),
+                        focus: false,
+                    });
+                });
+            }
+        }
+    }
+}
+
+impl Drop for ResizeDelivery {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(false);
+        }
+    }
+}
+
+fn dispatch_resize_rpc<F>(request: F, mut delivery: ResizeDelivery) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<UnitResponse>> + 'static,
+{
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!("remote resize completion admission rejected: {rejected:?}"),
+    };
+    let Some(request) = admit_interactive_rpc_now(request)? else {
+        delivery.settle(true);
+        return Ok(());
+    };
+    reservation
+        .spawn_local(async move {
+            let result = request.await;
+            delivery.settle(result.is_ok());
+        })
+        .detach();
+    Ok(())
+}
+
 /// Admit latency-critical input into the exact mux transport generation during
 /// the input callback itself.  Awaiting the reply remains asynchronous, so a
 /// slow or disconnected peer can never park the GUI thread.
@@ -2591,6 +2689,7 @@ pub struct ClientPane {
     render_application_limits: ClientRenderApplicationLimits,
     reliable_input_pane_authority: Arc<Mutex<Option<ReliablePaneInputAuthority>>>,
     mux_registration: Arc<PaneRegistrationSlot>,
+    resize_delivery: Arc<Mutex<ResizeDeliveryState>>,
 }
 
 #[allow(
@@ -2946,6 +3045,7 @@ impl ClientPane {
             render_application_limits: ClientRenderApplicationLimits::default(),
             reliable_input_pane_authority,
             mux_registration,
+            resize_delivery: Arc::new(Mutex::new(ResizeDeliveryState::default())),
         }
     }
 
@@ -3857,34 +3957,49 @@ impl Pane for ClientPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        let render = self.renderable.lock();
-        let mut inner = render.inner.borrow_mut();
-
         let cols = size.cols;
         let rows = size.rows;
-
-        if inner.dimensions.cols != cols
-            || inner.dimensions.viewport_rows != rows
-            || inner.dimensions.pixel_width != size.pixel_width
-            || inner.dimensions.pixel_height != size.pixel_height
-        {
+        let unchanged = {
+            let render = self.renderable.lock();
+            let inner = render.inner.borrow();
+            inner.dimensions.cols == cols
+                && inner.dimensions.viewport_rows == rows
+                && inner.dimensions.pixel_width == size.pixel_width
+                && inner.dimensions.pixel_height == size.pixel_height
+                && inner.dimensions.dpi == size.dpi
+        };
+        let attempt = {
+            let mut state = self.resize_delivery.lock();
+            if unchanged && !state.failed {
+                return Ok(());
+            }
+            state.begin()?
+        };
+        let delivery = ResizeDelivery {
+            state: Arc::clone(&self.resize_delivery),
+            attempt,
+            registration: self.mux_registration.load(),
+            settled: false,
+        };
+        let request = self.client.client.resize(Resize {
+            containing_tab_id: self.remote_tab_id,
+            pane_id: self.remote_pane_id,
+            size,
+        });
+        // Preserve synchronous input/resize admission order, and publish no
+        // optimistic geometry when admission fails. Failure notifications run
+        // outside render locks because alert subscribers may re-enter the pane.
+        dispatch_resize_rpc(request, delivery)?;
+        let state = self.resize_delivery.lock();
+        if state.attempt == attempt && !state.failed {
+            let render = self.renderable.lock();
+            let mut inner = render.inner.borrow_mut();
             inner.dimensions.cols = cols;
             inner.dimensions.viewport_rows = rows;
             inner.dimensions.pixel_width = size.pixel_width;
             inner.dimensions.pixel_height = size.pixel_height;
-
-            // Invalidate any cached rows on a resize
+            inner.dimensions.dpi = size.dpi;
             inner.make_all_stale();
-
-            let client = Arc::clone(&self.client);
-            let remote_pane_id = self.remote_pane_id;
-            let remote_tab_id = self.remote_tab_id;
-            let request = client.client.resize(Resize {
-                containing_tab_id: remote_tab_id,
-                pane_id: remote_pane_id,
-                size,
-            });
-            dispatch_interactive_rpc(request, "resize pane")?;
             inner.update_last_send();
         }
         Ok(())
@@ -4825,6 +4940,290 @@ mod tests {
         pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
             .expect("test pane should prepare its committed render connection");
         pane
+    }
+
+    #[test]
+    fn rejected_resize_notifies_exact_pane_once_without_holding_render_lock() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux).unwrap();
+        let notices = Arc::new(StdMutex::new(Vec::new()));
+        let observed = Arc::clone(&notices);
+        let weak_pane = Arc::downgrade(&pane);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert {
+                pane_id,
+                alert: Alert::ToastNotification { title, .. },
+            } = notification
+            {
+                if title.as_deref() == Some("Remote pane resize not confirmed") {
+                    let current = weak_pane.upgrade().unwrap();
+                    assert!(current.renderable.try_lock().is_some());
+                    observed.lock().unwrap().push(pane_id);
+                }
+            }
+            true
+        })
+        .unwrap();
+        let size = TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        pane.resize(size).expect_err("closed transport must reject");
+        pane.resize(size)
+            .expect_err("same-size retry must still reach admission");
+        assert_eq!(*notices.lock().unwrap(), vec![40]);
+        assert_eq!(pane.renderable.lock().inner.borrow().dimensions.cols, 80);
+    }
+
+    #[test]
+    fn rejected_resize_preserves_geometry_and_identical_explicit_retry() {
+        let _scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (client, peer) = Client::new_test_client_with_rpc_peer_and_limits(
+            Some(17),
+            ClientDomainConfig::Unix(UnixDomain::default()),
+            1,
+            usize::MAX,
+        );
+        let inner = Arc::new(ClientInner::new(17, client, None, None, false));
+        let pane = test_client_pane(&inner, 40, 29);
+        let held = admit_interactive_rpc_now(inner.client.ping())
+            .unwrap()
+            .expect("incumbent request must retain the only real outbound slot");
+        let size = TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let error = pane
+            .resize(size)
+            .expect_err("real outbound budget must reject resize");
+        assert!(error
+            .downcast_ref::<ClientOutboundAdmissionError>()
+            .is_some());
+        assert_eq!(pane.renderable.lock().inner.borrow().dimensions.cols, 80);
+        assert!(pane.resize_delivery.lock().failed);
+        drop(held);
+        promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+        assert!(
+            peer.is_empty(),
+            "rejected resize must not enqueue or replay"
+        );
+        pane.resize(size)
+            .expect("explicit identical-size retry must admit");
+        assert_eq!(pane.renderable.lock().inner.borrow().dimensions.cols, 90);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, Pdu::Resize(Resize { size: observed, .. }) if observed == size));
+        executor.try_tick().unwrap();
+        assert!(!pane.resize_delivery.lock().failed);
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn byte_budget_rejected_resize_retries_after_real_lease_release() {
+        let _scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let size = TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let resize = Pdu::Resize(Resize {
+            containing_tab_id: 23,
+            pane_id: 29,
+            size,
+        });
+        let peak = |pdu: Pdu| {
+            pdu.plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .unwrap()
+            .codec_peak_bytes()
+        };
+        let bytes = peak(resize).max(peak(Pdu::Ping(Ping {})));
+        let (client, peer) = Client::new_test_client_with_rpc_peer_and_limits(
+            Some(17),
+            ClientDomainConfig::Unix(UnixDomain::default()),
+            8,
+            bytes,
+        );
+        let inner = Arc::new(ClientInner::new(17, client, None, None, false));
+        let pane = test_client_pane(&inner, 40, 29);
+        let held = admit_interactive_rpc_now(inner.client.ping())
+            .unwrap()
+            .expect("incumbent ping retains codec bytes");
+        let error = pane.resize(size).expect_err("codec bytes must be bounded");
+        assert_eq!(
+            error
+                .downcast_ref::<ClientOutboundAdmissionError>()
+                .unwrap()
+                .limit,
+            crate::client::ClientOutboundBudgetLimit::TotalCodecBytes
+        );
+        assert_eq!(pane.renderable.lock().inner.borrow().dimensions.cols, 80);
+        drop(held);
+        promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+        assert!(peer.is_empty());
+        pane.resize(size)
+            .expect("released byte lease admits exact retry");
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, Pdu::Resize(Resize { size: observed, .. }) if observed == size));
+        executor.try_tick().unwrap();
+        assert!(!pane.resize_delivery.lock().failed);
+    }
+
+    #[test]
+    fn retired_resize_completion_cannot_notify_replacement_pane() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let old = test_client_pane(&inner, 40, 29);
+        let registered: Arc<dyn Pane> = old.clone();
+        mux.add_pane(&registered).unwrap();
+        let notices = Arc::new(StdMutex::new(Vec::new()));
+        let observed = Arc::clone(&notices);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert {
+                pane_id,
+                alert: Alert::ToastNotification { title, .. },
+            } = notification
+            {
+                if title.as_deref() == Some("Remote pane resize not confirmed") {
+                    observed.lock().unwrap().push(pane_id);
+                }
+            }
+            true
+        })
+        .unwrap();
+        let size = TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        old.resize(size).unwrap();
+        // Retire the local view without requesting a remote process kill.
+        *old.ignore_next_kill.lock() = true;
+        mux.remove_pane(40);
+        let replacement = test_client_pane(&inner, 40, 30);
+        let registered: Arc<dyn Pane> = replacement.clone();
+        mux.add_pane(&registered).unwrap();
+        promise::spawn::block_on(peer.fail_next_resize_with_unknown_outcome(&inner.client))
+            .unwrap();
+        executor.try_tick().unwrap();
+        assert!(old.resize_delivery.lock().failed);
+        assert!(!replacement.resize_delivery.lock().failed);
+        assert!(notices.lock().unwrap().is_empty());
+        replacement.resize(size).unwrap();
+        promise::spawn::block_on(peer.fail_next_resize_with_unknown_outcome(&inner.client))
+            .unwrap();
+        executor.try_tick().unwrap();
+        assert_eq!(*notices.lock().unwrap(), vec![40]);
+    }
+
+    #[test]
+    fn unknown_resize_outcome_is_retained_without_automatic_replay() {
+        let _scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let size = TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        pane.resize(size).unwrap();
+        let paste = admit_interactive_rpc_now(inner.client.send_paste(SendPaste {
+            pane_id: 29,
+            data: "ordered input".to_string(),
+            input_serial: InputSerial::from_millis_since_epoch(1),
+        }))
+        .unwrap()
+        .expect("input after resize must remain admitted in callback order");
+        promise::spawn::block_on(peer.fail_next_resize_with_unknown_outcome(&inner.client))
+            .unwrap();
+        let input = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(input, Pdu::SendPaste(SendPaste { data, .. }) if data == "ordered input"));
+        promise::spawn::block_on(paste).unwrap();
+        executor.try_tick().unwrap();
+        assert!(
+            pane.resize_delivery.lock().failed,
+            "late failure must not disappear in detached logging"
+        );
+        assert!(
+            peer.is_empty(),
+            "unknown effects must never be automatically replayed"
+        );
+        pane.resize(size)
+            .expect("explicit resize remains possible after surfaced failure");
+        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        executor.try_tick().unwrap();
+        assert!(!pane.resize_delivery.lock().failed);
+    }
+
+    #[test]
+    fn resize_completion_owner_cancellation_retains_failure_without_replay() {
+        let _scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        pane.resize(TerminalSize {
+            cols: 90,
+            rows: 24,
+            pixel_width: 900,
+            pixel_height: 480,
+            dpi: 96,
+        })
+        .unwrap();
+        assert!(!pane.resize_delivery.lock().failed);
+        drop(executor);
+        assert!(pane.resize_delivery.lock().failed);
+        promise::spawn::block_on(peer.discard_next_queued_rpc()).unwrap();
+        assert!(
+            peer.is_empty(),
+            "cancelled completion must not replay resize"
+        );
+    }
+
+    #[test]
+    fn resize_waiter_cancellation_retains_failure_and_old_completion_cannot_clear_newer() {
+        let state = Arc::new(Mutex::new(ResizeDeliveryState::default()));
+        let first = state.lock().begin().unwrap();
+        let first_delivery = ResizeDelivery {
+            state: Arc::clone(&state),
+            attempt: first,
+            registration: None,
+            settled: false,
+        };
+        drop(first_delivery);
+        assert!(state.lock().failed);
+        let second = state.lock().begin().unwrap();
+        assert!(!state.lock().settle(second, false));
+        assert!(!state.lock().settle(first, true));
+        assert!(
+            state.lock().failed,
+            "old success cannot clear newer failure"
+        );
     }
 
     #[test]

@@ -10438,6 +10438,40 @@ pub(crate) struct TestReliablePaneWriteWireRequest {
 
 #[cfg(test)]
 impl TestRpcPeer {
+    pub(crate) async fn fail_next_resize_with_unknown_outcome(
+        &self,
+        client: &Client,
+    ) -> anyhow::Result<()> {
+        let message = self.receiver.recv().await?;
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
+            bail!("expected queued resize request");
+        };
+        let prepared = lease
+            .claim_for_reader()?
+            .context("resize lease cancelled")?;
+        anyhow::ensure!(matches!(prepared.pdu(), Pdu::Resize(_)), "expected resize");
+        let error = client.rpc_transport.retirement_error(
+            binding,
+            RpcRetirementStage::AwaitingResponse,
+            RpcDeliveryCertainty::OutcomeUnknown,
+            "injected resize reply loss after effect became ambiguous",
+        );
+        promise
+            .try_send(Err(anyhow::Error::new(error)))
+            .map_err(|_| anyhow!("resize caller retired before injected reply failure"))?;
+        Ok(())
+    }
+
+    pub(crate) async fn discard_next_queued_rpc(&self) -> anyhow::Result<()> {
+        drop(self.receiver.recv().await?);
+        Ok(())
+    }
+
     pub(crate) fn activate_reconnect_generation(
         &self,
         client: &Client,
@@ -10591,6 +10625,7 @@ impl TestRpcPeer {
             .claim_for_reader()?
             .ok_or_else(|| anyhow!("test unit-response RPC was cancelled before reader claim"))?;
         let request = match prepared.pdu() {
+            Pdu::Resize(request) => Pdu::Resize(request.clone()),
             Pdu::WriteToPane(request) => Pdu::WriteToPane(request.clone()),
             Pdu::SendPaste(request) => Pdu::SendPaste(request.clone()),
             Pdu::SendPasteTracedV1(request) => Pdu::SendPasteTracedV1(request.clone()),
@@ -10707,8 +10742,30 @@ impl Client {
         local_domain_id: Option<DomainId>,
         client_domain_config: ClientDomainConfig,
     ) -> (Self, TestRpcPeer) {
+        Self::new_test_client_with_rpc_peer_and_limits(
+            local_domain_id,
+            client_domain_config,
+            CLIENT_OUTBOUND_TOTAL_SLOTS,
+            CLIENT_OUTBOUND_TOTAL_CODEC_BYTES,
+        )
+    }
+
+    pub(crate) fn new_test_client_with_rpc_peer_and_limits(
+        local_domain_id: Option<DomainId>,
+        client_domain_config: ClientDomainConfig,
+        slots: usize,
+        codec_bytes: usize,
+    ) -> (Self, TestRpcPeer) {
         let (sender, receiver) = unbounded();
-        let rpc_transport = Arc::new(RpcTransportState::new());
+        let rpc_transport = Arc::new(RpcTransportState::new_with_outbound_budget_limits(
+            ClientOutboundBudgetLimits {
+                total_slots: slots,
+                noninteractive_slots: slots.min(CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS),
+                total_codec_bytes: codec_bytes,
+                noninteractive_codec_bytes: codec_bytes
+                    .min(CLIENT_OUTBOUND_NONINTERACTIVE_CODEC_BYTES),
+            },
+        ));
         rpc_transport.mark_current_generation_ready_for_test();
         rpc_transport
             .bind_render_connection_identity(
