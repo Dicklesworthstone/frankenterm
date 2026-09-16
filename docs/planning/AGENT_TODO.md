@@ -911,6 +911,24 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Bind verified durable IDs to reconstructed successor objects in the
   atomic whole-topology transaction. UUID capture alone does not restore a mux.
 
+### 2026-09-16 — successor capability custody before acknowledgement
+
+- [x] Bind successor claims to authenticated broker lineage/build and both
+  owners; version the changed control payload and reject the old secret-only form.
+- [x] Require an opaque encrypted, synchronized custody token for successor
+  ACK; reopen and resynchronize the record before sending the ACK.
+- [x] Add authenticated scope lookup that recovers saved ACK/predecessor data
+  from disk without retaining the original claim/context in memory.
+- [x] Add real-child sync-failure, wrong-owner, changed-ACK, disk-reopen and
+  exact-retry checks, plus all-byte tamper and all-field binding controls.
+- [x] Independently review the production boundary and scoped formatting.
+- [ ] Execute guardian/mux custody tests, UUID tests and prior metadata tests
+  through strict RCH, then qualify the combined source.
+- [ ] Implement explicitly authenticated fresh-connection recovery. Current
+  successor custody is bound to the retained connection; duplicate ACK replay
+  is not proof of recovery after transport loss or successor-process restart.
+- [ ] Complete ordinary successor startup and atomic whole-topology publication.
+
 ### 2026-09-16 — BOCPD warmup property boundary
 
 - [x] Diagnose the actual `939da9667` workspace failure: the property treated

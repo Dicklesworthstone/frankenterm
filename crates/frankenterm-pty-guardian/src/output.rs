@@ -523,6 +523,25 @@ pub struct GuardianDurableSpawnCustodyV1 {
     context: GuardianSpawnCustodyContextV1,
 }
 
+/// Opaque successor ACK authority, issued only after encrypted durable custody.
+pub struct GuardianDurableSuccessorCustodyV1 {
+    store: GuardianCheckpointStageStore,
+    context: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+}
+
+impl GuardianDurableSuccessorCustodyV1 {
+    pub const fn context(&self) -> mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 {
+        self.context
+    }
+
+    pub(crate) fn into_secret(
+        self,
+    ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
+        self.store
+            .with_exclusive_directory(|inner| read_successor_custody_locked(inner, &self.context))
+    }
+}
+
 impl GuardianDurableSpawnCustodyV1 {
     pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
         self.context
@@ -2131,6 +2150,92 @@ impl GuardianCheckpointStageStore {
         expected: &GuardianSpawnCustodyContextV1,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
+    }
+
+    pub(crate) fn persist_successor_custody(
+        &self,
+        context: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+        secret: &[u8; 32],
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| {
+            match read_successor_custody_locked(inner, context) {
+                Ok(recovered) => {
+                    return if recovered.as_slice() == secret {
+                        Ok(())
+                    } else {
+                        Err(GuardianCheckpointStageStoreError::Conflict)
+                    };
+                }
+                Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                    source,
+                    ..
+                })) if source.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let names = read_directory_names(&inner.directory)?;
+            if names
+                .iter()
+                .filter(|name| name.as_bytes().starts_with(b"successor-custody-v1-"))
+                .count()
+                >= inner.policy.max_stage_files
+            {
+                return Err(GuardianCheckpointStageStoreError::Capacity);
+            }
+            let bytes = inner.cipher.seal_successor_custody(*context, secret)?;
+            let mut attempt = [0; 16];
+            getrandom::fill(&mut attempt).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+            let path = successor_custody_path(inner, context);
+            let staging_name = format!(
+                "successor-custody-v1-{}-{}.pending-{}",
+                context.pane_id,
+                context.handoff_id,
+                Uuid::from_bytes(attempt)
+            );
+            if staging_name.len() > inner.name_max {
+                return Err(GuardianCheckpointStageStoreError::NameLimit);
+            }
+            checkpoint_catalog_publish_file_with_staging(
+                inner,
+                &path,
+                &bytes,
+                "successor-custody-write",
+                "successor-custody-stage-sync",
+                &inner.directory_path.join(staging_name),
+            )?;
+            let recovered = read_successor_custody_locked(inner, context)?;
+            if recovered.as_slice() != secret {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok(())
+        })?;
+        Ok(GuardianDurableSuccessorCustodyV1 {
+            store: self.clone(),
+            context: *context,
+        })
+    }
+
+    pub fn reopen_successor_custody(
+        &self,
+        expected: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        self.with_exclusive_directory(|inner| read_successor_custody_locked(inner, expected))?;
+        Ok(GuardianDurableSuccessorCustodyV1 {
+            store: self.clone(),
+            context: *expected,
+        })
+    }
+
+    pub(crate) fn lookup_successor_custody(
+        &self,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        let (context, secret) = self
+            .with_exclusive_directory(|inner| read_successor_custody_scope_locked(inner, scope))?;
+        drop(secret);
+        Ok(GuardianDurableSuccessorCustodyV1 {
+            store: self.clone(),
+            context,
+        })
     }
 
     fn open(
@@ -5818,11 +5923,68 @@ fn read_spawn_custody_scope_locked(
         "spawn-custody-v1-{}-{}.bin",
         expected.pane_id, expected.effect_id
     ));
-    let mut file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
-    let size = GUARDIAN_SPAWN_CUSTODY_BYTES as u64;
+    let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(inner, &path)?;
+    let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
+    if context.scope() != expected {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok((context, secret))
+}
+
+fn successor_custody_path(
+    inner: &GuardianCheckpointStageStoreInner,
+    context: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+) -> PathBuf {
+    inner.directory_path.join(format!(
+        "successor-custody-v1-{}-{}.bin",
+        context.pane_id, context.handoff_id
+    ))
+}
+
+fn read_successor_custody_locked(
+    inner: &GuardianCheckpointStageStoreInner,
+    expected: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
+    let (context, secret) = read_successor_custody_scope_locked(inner, expected.scope())?;
+    if context != *expected {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok(secret)
+}
+
+fn read_successor_custody_scope_locked(
+    inner: &GuardianCheckpointStageStoreInner,
+    expected: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+) -> Result<
+    (
+        mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+        Zeroizing<[u8; 32]>,
+    ),
+    GuardianCheckpointStageStoreError,
+> {
+    let path = inner.directory_path.join(format!(
+        "successor-custody-v1-{}-{}.bin",
+        expected.pane_id, expected.handoff_id
+    ));
+    let bytes = read_synced_custody_bytes::<
+        { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
+    >(inner, &path)?;
+    let (context, secret) = inner.cipher.open_successor_custody_record(&bytes)?;
+    if context.scope() != expected {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    Ok((context, secret))
+}
+
+fn read_synced_custody_bytes<const N: usize>(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+) -> Result<[u8; N], GuardianCheckpointStageStoreError> {
+    let mut file = open_private_file_at(&inner.directory, &inner.directory_path, path, false)?;
+    let size = N as u64;
     let metadata = file
         .metadata()
-        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-metadata", error))?;
+        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-metadata", error))?;
     validate_private_file_metadata(&metadata, Some(size))?;
     let identity = FileIdentity::capture(&metadata, Some(size));
     #[cfg(test)]
@@ -5832,12 +5994,12 @@ fn read_spawn_custody_scope_locked(
         == 1
     {
         return Err(GuardianCheckpointStageStoreError::io(
-            "spawn-custody-file-sync",
+            "custody-file-sync",
             std::io::Error::other("injected sync failure"),
         ));
     }
     file.sync_all()
-        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-file-sync", error))?;
+        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-file-sync", error))?;
     #[cfg(test)]
     if inner
         .custody_sync_failure
@@ -5845,26 +6007,23 @@ fn read_spawn_custody_scope_locked(
         == 2
     {
         return Err(GuardianCheckpointStageStoreError::io(
-            "spawn-custody-directory-sync",
+            "custody-directory-sync",
             std::io::Error::other("injected sync failure"),
         ));
     }
-    inner.directory.sync_all().map_err(|error| {
-        GuardianCheckpointStageStoreError::io("spawn-custody-directory-sync", error)
-    })?;
-    let mut bytes = [0; GUARDIAN_SPAWN_CUSTODY_BYTES];
+    inner
+        .directory
+        .sync_all()
+        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-directory-sync", error))?;
+    let mut bytes = [0; N];
     file.read_exact(&mut bytes)
-        .map_err(|error| GuardianCheckpointStageStoreError::io("spawn-custody-read", error))?;
-    let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
-    if context.scope() != expected {
-        return Err(GuardianCheckpointStageStoreError::Conflict);
-    }
+        .map_err(|error| GuardianCheckpointStageStoreError::io("custody-read", error))?;
     inner
         .persistence
         .validate(&inner.directory)
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-    validate_file_identity_at(&inner.directory, &inner.directory_path, &path, identity)?;
-    Ok((context, secret))
+    validate_file_identity_at(&inner.directory, &inner.directory_path, path, identity)?;
+    Ok(bytes)
 }
 
 fn checkpoint_write_created_record(

@@ -2685,6 +2685,150 @@ const SPAWN_CUSTODY_HEADER_BYTES: usize = SPAWN_CUSTODY_DOMAIN.len() + 8 * 16 + 
 /// Fixed self-describing authenticated header, nonce, and encrypted capability.
 pub const GUARDIAN_SPAWN_CUSTODY_BYTES: usize = SPAWN_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
 
+/// Exact authenticated owner provenance of one successor handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSuccessorCustodyOwnerV1 {
+    pub guardian_incarnation: Uuid,
+    pub connection_id: Uuid,
+    pub mux_incarnation: Uuid,
+    pub guardian_build: [u8; 32],
+    pub mux_build: [u8; 32],
+}
+
+/// Successor capability custody is distinct from the initial Spawn contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSuccessorCustodyContextV1 {
+    pub broker_incarnation: Uuid,
+    pub broker_lineage: Uuid,
+    pub broker_build: [u8; 32],
+    pub predecessor: GuardianSuccessorCustodyOwnerV1,
+    pub successor: GuardianSuccessorCustodyOwnerV1,
+    pub pane_id: Uuid,
+    pub handoff_id: Uuid,
+    pub ack_id: Uuid,
+    pub lease_generation: u64,
+}
+
+/// Authenticated client scope used to recover ACK and predecessor provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianSuccessorCustodyScopeV1 {
+    pub broker_incarnation: Uuid,
+    pub broker_lineage: Uuid,
+    pub broker_build: [u8; 32],
+    pub successor: GuardianSuccessorCustodyOwnerV1,
+    pub pane_id: Uuid,
+    pub handoff_id: Uuid,
+    pub lease_generation: u64,
+}
+
+const SUCCESSOR_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-successor-secret-custody.v1\0";
+const SUCCESSOR_CUSTODY_HEADER_BYTES: usize = SUCCESSOR_CUSTODY_DOMAIN.len() + 11 * 16 + 5 * 32 + 8;
+pub const GUARDIAN_SUCCESSOR_CUSTODY_BYTES: usize = SUCCESSOR_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
+
+impl GuardianSuccessorCustodyContextV1 {
+    pub const fn scope(self) -> GuardianSuccessorCustodyScopeV1 {
+        GuardianSuccessorCustodyScopeV1 {
+            broker_incarnation: self.broker_incarnation,
+            broker_lineage: self.broker_lineage,
+            broker_build: self.broker_build,
+            successor: self.successor,
+            pane_id: self.pane_id,
+            handoff_id: self.handoff_id,
+            lease_generation: self.lease_generation,
+        }
+    }
+
+    fn authenticated_header(self) -> Result<Vec<u8>, GuardianSpawnCustodyError> {
+        let identities = [
+            self.broker_incarnation,
+            self.broker_lineage,
+            self.predecessor.guardian_incarnation,
+            self.predecessor.connection_id,
+            self.predecessor.mux_incarnation,
+            self.successor.guardian_incarnation,
+            self.successor.connection_id,
+            self.successor.mux_incarnation,
+            self.pane_id,
+            self.handoff_id,
+            self.ack_id,
+        ];
+        let digests = [
+            self.broker_build,
+            self.predecessor.guardian_build,
+            self.predecessor.mux_build,
+            self.successor.guardian_build,
+            self.successor.mux_build,
+        ];
+        if identities.iter().any(Uuid::is_nil)
+            || digests.contains(&[0; 32])
+            || self.lease_generation <= 1
+        {
+            return Err(GuardianSpawnCustodyError::InvalidIdentity);
+        }
+        let mut header = SUCCESSOR_CUSTODY_DOMAIN.to_vec();
+        for identity in identities {
+            header.extend_from_slice(identity.as_bytes());
+        }
+        for digest in digests {
+            header.extend_from_slice(&digest);
+        }
+        header.extend_from_slice(&self.lease_generation.to_le_bytes());
+        Ok(header)
+    }
+
+    fn from_header(header: &[u8]) -> Result<Self, GuardianSpawnCustodyError> {
+        if header.len() != SUCCESSOR_CUSTODY_HEADER_BYTES
+            || !header.starts_with(SUCCESSOR_CUSTODY_DOMAIN)
+        {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        let mut bytes = &header[SUCCESSOR_CUSTODY_DOMAIN.len()..];
+        let mut ids = [Uuid::nil(); 11];
+        for id in &mut ids {
+            *id = Uuid::from_bytes(
+                bytes[..16]
+                    .try_into()
+                    .map_err(|_| GuardianSpawnCustodyError::Authentication)?,
+            );
+            bytes = &bytes[16..];
+        }
+        let mut digests = [[0; 32]; 5];
+        for digest in &mut digests {
+            digest.copy_from_slice(&bytes[..32]);
+            bytes = &bytes[32..];
+        }
+        let context = Self {
+            broker_incarnation: ids[0],
+            broker_lineage: ids[1],
+            broker_build: digests[0],
+            predecessor: GuardianSuccessorCustodyOwnerV1 {
+                guardian_incarnation: ids[2],
+                connection_id: ids[3],
+                mux_incarnation: ids[4],
+                guardian_build: digests[1],
+                mux_build: digests[2],
+            },
+            successor: GuardianSuccessorCustodyOwnerV1 {
+                guardian_incarnation: ids[5],
+                connection_id: ids[6],
+                mux_incarnation: ids[7],
+                guardian_build: digests[3],
+                mux_build: digests[4],
+            },
+            pane_id: ids[8],
+            handoff_id: ids[9],
+            ack_id: ids[10],
+            lease_generation: u64::from_le_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| GuardianSpawnCustodyError::Authentication)?,
+            ),
+        };
+        context.authenticated_header()?;
+        Ok(context)
+    }
+}
+
 /// Typed checkpoint and Spawn-custody encryption backed by the guardian output key.
 /// No key bytes, generic AAD, or caller-selected nonce are exposed. Custody uses
 /// a distinct domain and fresh random nonces; it cannot mint checkpoint receipts.
@@ -2697,6 +2841,49 @@ pub struct GuardianCheckpointCipher {
 }
 
 impl GuardianCheckpointCipher {
+    pub fn seal_successor_custody(
+        &self,
+        context: GuardianSuccessorCustodyContextV1,
+        secret: &[u8; 32],
+    ) -> Result<[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES], GuardianSpawnCustodyError> {
+        let aad = context.authenticated_header()?;
+        if secret == &[0; 32] {
+            return Err(GuardianSpawnCustodyError::InvalidIdentity);
+        }
+        let (nonce, ciphertext) = self
+            .output_cipher
+            .seal_guardian_metadata(secret, &aad)
+            .map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+        let mut bytes = [0; GUARDIAN_SUCCESSOR_CUSTODY_BYTES];
+        bytes[..SUCCESSOR_CUSTODY_HEADER_BYTES].copy_from_slice(&aad);
+        bytes[SUCCESSOR_CUSTODY_HEADER_BYTES..SUCCESSOR_CUSTODY_HEADER_BYTES + 24]
+            .copy_from_slice(&nonce);
+        bytes[SUCCESSOR_CUSTODY_HEADER_BYTES + 24..].copy_from_slice(&ciphertext);
+        Ok(bytes)
+    }
+
+    pub fn open_successor_custody_record(
+        &self,
+        bytes: &[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES],
+    ) -> Result<(GuardianSuccessorCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>
+    {
+        let aad = &bytes[..SUCCESSOR_CUSTODY_HEADER_BYTES];
+        let context = GuardianSuccessorCustodyContextV1::from_header(aad)?;
+        let nonce = bytes[SUCCESSOR_CUSTODY_HEADER_BYTES..SUCCESSOR_CUSTODY_HEADER_BYTES + 24]
+            .try_into()
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        let plaintext = self
+            .output_cipher
+            .open_guardian_metadata(nonce, &bytes[SUCCESSOR_CUSTODY_HEADER_BYTES + 24..], aad)
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        let mut secret = Zeroizing::new([0; 32]);
+        if plaintext.len() != secret.len() || plaintext.iter().all(|byte| *byte == 0) {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        secret.copy_from_slice(&plaintext);
+        Ok((context, secret))
+    }
+
     /// Custody is a separate AEAD domain, never a checkpoint chunk or receipt.
     pub fn seal_spawn_custody(
         &self,
@@ -8923,6 +9110,60 @@ mod tests {
         GuardianCheckpointCipher::from_output_cipher(&output_cipher)
     }
 
+    #[test]
+    fn successor_custody_authenticates_every_owner_and_handoff_byte() {
+        let owner = GuardianSuccessorCustodyOwnerV1 {
+            guardian_incarnation: Uuid::from_bytes([1; 16]),
+            connection_id: Uuid::from_bytes([2; 16]),
+            mux_incarnation: Uuid::from_bytes([3; 16]),
+            guardian_build: [4; 32],
+            mux_build: [5; 32],
+        };
+        let context = GuardianSuccessorCustodyContextV1 {
+            broker_incarnation: Uuid::from_bytes([6; 16]),
+            broker_lineage: Uuid::from_bytes([7; 16]),
+            broker_build: [8; 32],
+            predecessor: owner,
+            successor: GuardianSuccessorCustodyOwnerV1 {
+                mux_incarnation: Uuid::from_bytes([9; 16]),
+                connection_id: Uuid::from_bytes([10; 16]),
+                ..owner
+            },
+            pane_id: Uuid::from_bytes([11; 16]),
+            handoff_id: Uuid::from_bytes([12; 16]),
+            ack_id: Uuid::from_bytes([13; 16]),
+            lease_generation: 2,
+        };
+        let cipher = checkpoint_stage_cipher(0xa3);
+        let bytes = cipher.seal_successor_custody(context, &[0xb4; 32]).unwrap();
+        let (decoded, secret) = cipher.open_successor_custody_record(&bytes).unwrap();
+        assert_eq!(decoded, context);
+        assert_eq!(*secret, [0xb4; 32]);
+        assert!(!bytes.windows(32).any(|window| window == [0xb4; 32]));
+        for offset in 0..bytes.len() {
+            let mut corrupt = bytes;
+            corrupt[offset] ^= 1;
+            assert!(
+                cipher.open_successor_custody_record(&corrupt).is_err(),
+                "offset {offset}"
+            );
+        }
+        assert!(checkpoint_stage_cipher(0xa4)
+            .open_successor_custody_record(&bytes)
+            .is_err());
+        for generation in [0, 1] {
+            assert!(cipher
+                .seal_successor_custody(
+                    GuardianSuccessorCustodyContextV1 {
+                        lease_generation: generation,
+                        ..context
+                    },
+                    &[0xb4; 32],
+                )
+                .is_err());
+        }
+    }
+
     fn catalog_adoption_binding(
         candidate_id: Uuid,
         candidate_checksum: [u8; 32],
@@ -10738,6 +10979,8 @@ mod tests {
 
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
+            "seal_successor_custody:pub:GuardianSuccessorCustodyContextV1,u8",
+            "open_successor_custody_record:pub:u8",
             "open_spawn_custody_record:pub:u8",
             "seal_spawn_custody:pub:GuardianSpawnCustodyContextV1,u8",
             "open_spawn_custody:pub:GuardianSpawnCustodyContextV1,u8",
@@ -10775,6 +11018,14 @@ mod tests {
 
         sort_authority_methods(&mut inventory.cipher_method_surfaces);
         let mut expected_cipher_method_surfaces = vec![
+            expected_authority_method(
+                "GuardianCheckpointCipher", "pub", false,
+                "fn seal_successor_custody(&self, context: GuardianSuccessorCustodyContextV1, secret: &[u8; 32]) -> Result<[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES], GuardianSpawnCustodyError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher", "pub", false,
+                "fn open_successor_custody_record(&self, bytes: &[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES]) -> Result<(GuardianSuccessorCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>",
+            ),
             expected_authority_method(
                 "GuardianCheckpointCipher", "pub", false,
                 "fn open_spawn_custody_record(&self, bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES]) -> Result<(GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>",
