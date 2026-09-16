@@ -1027,6 +1027,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             doc: "Scales the font size larger by 10%".into(),
             keys: vec![
                 (Modifiers::SUPER, "=".into()),
+                // Cmd-plus can arrive as shifted '=' or '+' with or without
+                // SHIFT. The existing permutation logic covers those forms.
+                (Modifiers::SUPER | Modifiers::SHIFT, "=".into()),
                 (Modifiers::CTRL, "=".into()),
             ],
             args: &[ArgType::ActiveWindow],
@@ -2255,6 +2258,32 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn increase_font_size_defaults_accept_all_cmd_plus_event_forms() {
+        let input = InputMap::new(&ConfigHandle::default_config());
+        for (key, mods) in [
+            ('=', Modifiers::SUPER),
+            ('=', Modifiers::SUPER | Modifiers::SHIFT),
+            ('+', Modifiers::SUPER),
+            ('+', Modifiers::SUPER | Modifiers::SHIFT),
+        ] {
+            assert_eq!(
+                input
+                    .lookup_key(&KeyCode::Char(key), mods, None)
+                    .map(|entry| entry.action),
+                Some(KeyAssignment::IncreaseFontSize),
+                "native event form {key:?} {mods:?} must increase the font"
+            );
+        }
+        assert_eq!(
+            input
+                .lookup_key(&KeyCode::Char('='), Modifiers::NONE, None)
+                .map(|entry| entry.action),
+            None,
+            "ordinary '=' must still reach the terminal"
+        );
+    }
 
     fn entry(
         name: &str,
