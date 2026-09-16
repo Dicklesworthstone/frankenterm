@@ -7363,6 +7363,7 @@ mod tests {
         }
         let directory = tempfile::Builder::new()
             .prefix("ft-claim-retry-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(std::fs::canonicalize("/tmp").expect("canonical temporary root"))
             .expect("private fixture directory")
             .keep();

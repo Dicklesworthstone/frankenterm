@@ -724,3 +724,22 @@ power loss nor migration of those live sessions has been demonstrated.
   PTY survival; the actual guardian/broker/child tests remain required.
 - [ ] Finish final source freeze, DSR native build, six quality gates, four
   attestation producers, measured performance, foreground acceptance and release.
+
+### 2026-09-16 11:35 UTC — fix actual broker scheduling starvation
+
+- [x] Checkpoint bounded birth/Claim retries at `2d6c3f389`; static gates
+  passed 29/29. Actual proxy suite ran 43 passed, four new socket fixtures
+  failed before protocol, two ignored. Their directories were mode 0775;
+  create them explicitly as 0700 before provisioning the token, then rerun.
+- [ ] Complete `ft-n9467` (in progress, SandyCanyon): actual Domain tests
+  still failed 0/2 in RCH31848. Broker output completion immediately queued
+  another background read/status operation, leaving no idle session for a
+  second Spawn. Retain bounded authenticated Genesis admission while the
+  current operation drains. Resize/Input already have this scheduling guard.
+- [ ] Rerun the four Claim fault cases, full proxy suite and actual Domain
+  tests on the combined fix, preserving all existing lifecycle assertions.
+- [x] Refresh DSR readiness and Mac object authority through `2d6c3f389`.
+  Ten hosts healthy, none unhealthy. Preparation is not a native build.
+- [ ] Qualify all four attestation producers and create the complete RC26
+  retained manifest before the sixth DSR quality gate; its required input
+  is currently absent. No release tag or published artifact exists yet.

@@ -2215,7 +2215,7 @@ impl GuardianRuntime {
         if self
             .broker_connections
             .get(&mux_incarnation)
-            .is_some_and(|connection| connection.active_pane.is_some() || connection.failed)
+            .is_some_and(|connection| connection.failed)
         {
             return GuardianCheckpointSubmission::CloseRetryably;
         }
@@ -2244,17 +2244,6 @@ impl GuardianRuntime {
                     last_pane: None,
                     failed: false,
                 });
-        if let Some(worker) = broker.worker.as_mut() {
-            match worker.try_take_session() {
-                Ok(Some(session)) => broker.retained_session = Some(session),
-                Ok(None) => return GuardianCheckpointSubmission::CloseRetryably,
-                Err(_) => {
-                    broker.failed = true;
-                    return GuardianCheckpointSubmission::CloseRetryably;
-                }
-            }
-        }
-        drop(broker.worker.take());
         let Some(mut protocol) = self.protocol.take() else {
             return GuardianCheckpointSubmission::CloseRetryably;
         };
@@ -2326,18 +2315,11 @@ impl GuardianRuntime {
             broker_control: None,
             replay_origin: None,
         };
-        match self.checkpoint_pipeline.try_submit(job) {
-            Ok(()) => GuardianCheckpointSubmission::Pending,
-            Err(CheckpointSubmitError::Saturated(job)) => {
-                self.pending_genesis_submission = Some(job);
-                GuardianCheckpointSubmission::CloseRetryably
-            }
-            Err(CheckpointSubmitError::Unavailable(job)) => {
-                self.pending_genesis_submission = Some(job);
-                self.checkpoint_pipeline_failed = true;
-                GuardianCheckpointSubmission::CloseRetryably
-            }
-        }
+        // Retain the authenticated request and its linear permit before
+        // waiting for the shared broker session. This also tells the output
+        // scheduler to drain its current job without immediately replacing it.
+        self.pending_genesis_submission = Some(Box::new(job));
+        GuardianCheckpointSubmission::Pending
     }
 
     fn resubmit_genesis_before_publication(
@@ -2379,20 +2361,9 @@ impl GuardianRuntime {
         };
         // A retained pre-publication request does not own failures that may
         // have arisen on this shared connection while another pane used it.
-        if connection.failed || connection.active_pane.is_some() {
+        if connection.failed {
             return GuardianCheckpointSubmission::CloseRetryably;
         }
-        if let Some(worker) = connection.worker.as_mut() {
-            match worker.try_take_session() {
-                Ok(Some(session)) => connection.retained_session = Some(session),
-                Ok(None) => return GuardianCheckpointSubmission::CloseRetryably,
-                Err(_) => {
-                    connection.failed = true;
-                    return GuardianCheckpointSubmission::CloseRetryably;
-                }
-            }
-        }
-        drop(connection.worker.take());
         let (mut retry, original_request, protocol) = match (
             pane.retry_before_publication.take(),
             pane.original_spawn.take(),
@@ -2408,7 +2379,9 @@ impl GuardianRuntime {
                 return GuardianCheckpointSubmission::CloseRetryably;
             }
         };
-        retry.session = connection.retained_session.take();
+        if retry.session.is_none() {
+            retry.session = connection.retained_session.take();
+        }
         pane.failed_before_spawn = false;
         let job = CheckpointJob {
             route,
@@ -2422,18 +2395,10 @@ impl GuardianRuntime {
             broker_control: None,
             replay_origin: None,
         };
-        match self.checkpoint_pipeline.try_submit(job) {
-            Ok(()) => GuardianCheckpointSubmission::Pending,
-            Err(CheckpointSubmitError::Saturated(job)) => {
-                self.pending_genesis_submission = Some(job);
-                GuardianCheckpointSubmission::CloseRetryably
-            }
-            Err(CheckpointSubmitError::Unavailable(job)) => {
-                self.pending_genesis_submission = Some(job);
-                self.checkpoint_pipeline_failed = true;
-                GuardianCheckpointSubmission::CloseRetryably
-            }
-        }
+        // Exact retries need the same foreground handoff as initial admission:
+        // retain the original permit and request while current broker I/O drains.
+        self.pending_genesis_submission = Some(Box::new(job));
+        GuardianCheckpointSubmission::Pending
     }
 
     fn record_durable_retryable_close(&mut self, operation: GuardianOperation) {
@@ -2821,15 +2786,114 @@ impl GuardianRuntime {
             }
         }
         if !self.checkpoint_pipeline_failed {
-            if let Some(job) = self.pending_genesis_submission.take() {
+            if let Some(mut job) = self.pending_genesis_submission.take() {
+                let mux_incarnation = job.request.header().mux_incarnation;
+                let mut failed = false;
+                if let Some(connection) = self.broker_connections.get_mut(&mux_incarnation) {
+                    if connection.failed {
+                        failed = true;
+                    } else if connection.active_pane.is_some() {
+                        self.pending_genesis_submission = Some(job);
+                        return GuardianRuntimeCheckpointCompletionState::Empty;
+                    } else if let Some(worker) = connection.worker.as_mut() {
+                        match worker.try_take_session() {
+                            Ok(Some(session)) => {
+                                connection.retained_session = Some(session);
+                            }
+                            Ok(None) => {
+                                self.pending_genesis_submission = Some(job);
+                                return GuardianRuntimeCheckpointCompletionState::Empty;
+                            }
+                            Err(_) => {
+                                connection.failed = true;
+                                failed = true;
+                            }
+                        }
+                        drop(connection.worker.take());
+                    }
+                    if !failed {
+                        if let Some(spawn) = job.genesis_spawn.as_mut() {
+                            if spawn.session.is_none() {
+                                spawn.session = connection.retained_session.take();
+                            }
+                        }
+                    }
+                } else {
+                    failed = true;
+                }
+                if failed {
+                    // No Spawn worker has received this job. Retain its exact
+                    // failed reservation metadata without claiming a PTY effect.
+                    let response = GuardianResponseEnvelope::rejection(
+                        &job.request,
+                        GuardianRejectionCode::InternalInvariant,
+                    );
+                    if let Some(pane) = job
+                        .request
+                        .header()
+                        .pane_id
+                        .and_then(|id| self.starting_broker_panes.get_mut(&id))
+                    {
+                        pane.failed_before_spawn = true;
+                        pane.original_spawn = Some(job.request);
+                        pane.retry_before_publication = job.genesis_spawn.map(Box::new);
+                    }
+                    self.protocol = Some(job.protocol);
+                    return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
+                        GuardianRuntimeCheckpointCompletion {
+                            route: job.route,
+                            response: Some(response),
+                        },
+                    ));
+                }
                 match self.checkpoint_pipeline.try_submit(*job) {
                     Ok(()) => {}
                     Err(CheckpointSubmitError::Saturated(job)) => {
                         self.pending_genesis_submission = Some(job);
                     }
-                    Err(CheckpointSubmitError::Unavailable(job)) => {
-                        self.pending_genesis_submission = Some(job);
+                    Err(CheckpointSubmitError::Unavailable(mut job)) => {
                         self.checkpoint_pipeline_failed = true;
+                        self.counters.checkpoint_worker_disconnects = self
+                            .counters
+                            .checkpoint_worker_disconnects
+                            .saturating_add(1);
+                        // Checkpoint-worker failure does not revoke the healthy
+                        // shared broker session from already-live panes.
+                        if let Some(connection) = self
+                            .broker_connections
+                            .get_mut(&job.request.header().mux_incarnation)
+                        {
+                            if !connection.failed
+                                && connection.worker.is_none()
+                                && connection.retained_session.is_none()
+                            {
+                                connection.retained_session = job
+                                    .genesis_spawn
+                                    .as_mut()
+                                    .and_then(|spawn| spawn.session.take());
+                            }
+                        }
+                        // The channel returned the owned job without running
+                        // it. Unblock its exact socket route and retain all
+                        // pre-publication authority/resources in the pane.
+                        let route = job.route;
+                        if let Some(pane) = job
+                            .request
+                            .header()
+                            .pane_id
+                            .and_then(|id| self.starting_broker_panes.get_mut(&id))
+                        {
+                            pane.failed_before_spawn = true;
+                            pane.original_spawn = Some(job.request);
+                            pane.retry_before_publication = job.genesis_spawn.map(Box::new);
+                        }
+                        self.protocol = Some(job.protocol);
+                        return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(
+                            GuardianRuntimeCheckpointCompletion {
+                                route,
+                                response: None,
+                            },
+                        ));
                     }
                 }
             }
@@ -3514,6 +3578,13 @@ impl GuardianRuntime {
             }
         }
         for (mux_incarnation, connection) in &mut self.broker_connections {
+            if self
+                .pending_genesis_submission
+                .as_ref()
+                .is_some_and(|job| job.request.header().mux_incarnation == *mux_incarnation)
+            {
+                continue;
+            }
             if self
                 .pending_broker_control
                 .as_ref()
