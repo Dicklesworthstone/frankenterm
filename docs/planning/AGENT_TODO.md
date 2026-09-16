@@ -573,3 +573,35 @@ notification. No alternate automation route is authorized by the tool refusal.
 Genesis read authority is currently process-local. This does not establish
 fresh guardian restart recovery, power-loss recovery of arbitrary processes,
 or safe migration of the existing unguarded remote mux sessions.
+
+### 2026-09-16 09:34 UTC — actual integrated results and production caller
+
+- [x] Compile integrated guardian `ef840e86a` remotely and run the full library:
+  232 passed, one failed, three ignored. The failure was a real duplicate
+  append-writer collision from broker and receiving guardian sharing a store.
+- [x] Separate fixture stores and reject colliding physical token parents
+  before service artifacts are created. Keep strict append-writer exclusion.
+- [x] Retain the exact unconsumed admission permit, request, Begin and prepared
+  journals across pre-publication connection failure; never clear a shared
+  broker quarantine while retrying. Committed through `b5e97bbbd`.
+- [x] Run proxy tests remotely at `d1baa48c6` (RCH 30023644042231815): 43 passed,
+  zero failed/ignored, 610 filtered; canonical Genesis and geometry controls ran.
+- [ ] Pass corrected full guardian and four separately selected sealed tests,
+  including real late-broker-start retry and damaged empty replay completion.
+- [ ] Complete strict all-target Clippy on the integrated guardian and proxy.
+- [x] Confirm normal mux startup still always selects LocalDomain; the proxy
+  module alone does not make guardian-backed panes available to the product.
+- [ ] Add explicit opt-in GuardianDomain using the real publication/Spawn/
+  Claim/replay chain and a bounded off-loop cold transaction.
+- [ ] Validate mux-owned unpublished guardian construction and publication;
+  cancellation or failed registration must retire its lease without Close.
+- [ ] Prove the actual Domain path with real guardian/broker services and child
+  output, including off-topology staging and normal pane publication.
+- [ ] Keep unknown Spawn outcomes fenced, retain exact identity for recovery,
+  and reject cross-mux/domain ownership substitution.
+- [ ] Complete final candidate quality, native/performance acceptance,
+  attestation producers, DSR release verification and safe Dock activation.
+
+The proxy parent bead remains open because its dependency proofs are not yet
+closed. Implementation progress is recorded without overriding that dependency
+state or treating the new opt-in path as existing-session migration.

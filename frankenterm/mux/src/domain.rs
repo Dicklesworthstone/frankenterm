@@ -65,20 +65,44 @@ pub(crate) fn register_spawned_pane_or_rollback(
 
 /// An exact pane process/PTY that has not yet been published in a mux.
 ///
-/// Construction is crate-private so implementations outside this crate cannot
-/// claim the unpublished-pane invariant without going through a mux-owned
-/// domain implementation. Until `UnpublishedPane::into_pane` consumes the
-/// reservation, dropping it kills the pane exactly once. This makes async
-/// cancellation and every fallible pre-publication step fail closed without
-/// briefly exposing an orphan pane registration.
+/// Native construction remains crate-private. Guardian construction consumes
+/// an owned LocalPane and checks its private lease and replay facets. Dropping
+/// the reservation kills a native child, but retires only a guardian lease;
+/// a failed publication must not close an independently owned guardian child.
 #[must_use = "an unpublished pane must be published or allowed to roll back"]
 pub struct UnpublishedPane {
     pane: Option<Arc<dyn Pane>>,
+    rollback: UnpublishedPaneRollback,
+}
+
+enum UnpublishedPaneRollback {
+    KillNative,
+    RetireGuardian,
 }
 
 impl UnpublishedPane {
     pub(crate) fn new(pane: Arc<dyn Pane>) -> Self {
-        Self { pane: Some(pane) }
+        Self {
+            pane: Some(pane),
+            rollback: UnpublishedPaneRollback::KillNative,
+        }
+    }
+
+    /// Admit an owned, unregistered guardian proxy without exposing a raw
+    /// pane constructor or weakening its lease-only cancellation behavior.
+    pub fn from_guardian_proxy(pane: LocalPane) -> anyhow::Result<Self> {
+        pane.validate_unpublished_guardian_proxy()?;
+        Ok(Self {
+            pane: Some(Arc::new(pane)),
+            rollback: UnpublishedPaneRollback::RetireGuardian,
+        })
+    }
+
+    /// Publish into the exact mux, keeping rollback armed until registration
+    /// succeeds. The registered pane is returned only after that transition.
+    pub fn publish(self, mux: &Arc<Mux>) -> anyhow::Result<Arc<dyn Pane>> {
+        mux.add_pane(self.pane())?;
+        Ok(self.into_pane())
     }
 
     pub(crate) fn pane(&self) -> &Arc<dyn Pane> {
@@ -99,6 +123,12 @@ impl Drop for UnpublishedPane {
         let Some(pane) = self.pane.take() else {
             return;
         };
+        if matches!(self.rollback, UnpublishedPaneRollback::RetireGuardian) {
+            // This Arc is created only from an owned LocalPane, and never
+            // escapes before publication. Its Drop retires the exact lease.
+            drop(pane);
+            return;
+        }
         let rollback = catch_recoverable(
             RecoverablePanicSite::MuxRegistrationRollback,
             std::panic::AssertUnwindSafe(|| pane.kill()),
@@ -828,7 +858,8 @@ impl LocalDomain {
         Ok(())
     }
 
-    async fn build_command(
+    /// Prepare the configured command without creating a PTY or process.
+    pub async fn build_command(
         &self,
         mux: &Arc<Mux>,
         command: Option<CommandBuilder>,
@@ -1031,8 +1062,7 @@ impl Domain for LocalDomain {
         let unpublished = self
             .spawn_unpublished_pane(mux, size, command, command_dir)
             .await?;
-        mux.add_pane(unpublished.pane())?;
-        Ok(unpublished.into_pane())
+        unpublished.publish(mux)
     }
 
     async fn spawn_unpublished_pane(
