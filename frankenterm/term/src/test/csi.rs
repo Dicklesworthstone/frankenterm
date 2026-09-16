@@ -241,6 +241,30 @@ fn test_ed2_severs_scrollback_wrap_before_repaint_and_resize() {
 }
 
 #[test]
+fn test_full_first_row_erases_sever_only_destroyed_history_continuations() {
+    for erase in ["\x1b[H\x1b[J", "\x1b[2;5H\x1b[1J", "\x1b[H\x1b[2K"] {
+        let mut term = TestTerm::new(2, 5, 8);
+        term.print("abcdefghijk");
+        let predecessor = term.screen().phys_row(0) - 1;
+        assert!(term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+        term.print(erase);
+        assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        assert!(!term.screen().all_lines()[predecessor].last_cell_was_wrapped());
+    }
+    for erase in ["\x1b[1;3H\x1b[J", "\x1b[1;2H\x1b[1J"] {
+        let mut term = TestTerm::new(2, 5, 8);
+        term.print("abcdefghijk");
+        let predecessor = term.screen().phys_row(0) - 1;
+        term.print(erase);
+        assert_eq!(term.screen().all_lines()[predecessor].as_str(), "abcde");
+        assert!(
+            term.screen().all_lines()[predecessor].last_cell_was_wrapped(),
+            "partial erase retains the surviving history continuation"
+        );
+    }
+}
+
+#[test]
 fn test_ed_erase_scrollback() {
     let mut term = TestTerm::new(3, 3, 3);
     term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na\x1b[3J");

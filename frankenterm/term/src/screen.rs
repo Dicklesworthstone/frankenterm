@@ -7573,6 +7573,17 @@ impl Screen {
     ) {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
+        if y == 0 && cols.start == 0 && cols.end >= self.physical_cols {
+            // Erasing the entire first viewport row destroys the continuation
+            // of any retained soft-wrapped history. Keep that history's text,
+            // but do not let a later repaint join it during resize/reflow.
+            // Tiered scrollback retains at least one hot history row whenever
+            // history is enabled, so this boundary never needs cold sink I/O.
+            if let Some(previous) = line_idx.checked_sub(1) {
+                self.line_mut(previous)
+                    .set_last_cell_was_wrapped(false, seqno);
+            }
+        }
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
             bidi_mode.apply_to_line(line, seqno);
