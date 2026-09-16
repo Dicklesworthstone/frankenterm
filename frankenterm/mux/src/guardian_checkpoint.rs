@@ -11186,7 +11186,9 @@ mod tests {
                     "use frankenterm_term::{terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID};",
                 ),
                 expected_use("use sha2::{Digest as _, Sha256};"),
-                expected_use("use std::convert::TryFrom;"),
+                // Rust 2018 custody decoding uses TryInto only for fixed-width
+                // header fields and the nonce; it grants no authority constructor.
+                expected_use("use std::convert::{TryFrom, TryInto};"),
                 expected_use("use std::sync::{Arc, Weak};"),
                 expected_use("use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;",),
                 expected_use("use termwiz::escape::{parser::RecoveryGroundBoundary, Action};",),
