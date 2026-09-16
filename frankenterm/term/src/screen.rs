@@ -2805,16 +2805,21 @@ impl ScreenReflowPreparation {
         self.applied
     }
 
-    fn logical_cursor_for(&self, cursor: CursorPosition) -> Option<(usize, usize)> {
+    fn logical_cursor_for(&self, cursor: CursorPosition) -> Option<Option<(usize, usize)>> {
         // The row controls trailing-blank pruning. Same-row cursor movement
         // changes only the offset, while visibility/style/sequence do not
         // change wrap geometry. Exact line validation remains mandatory.
         if cursor.y != self.source_cursor.y || cursor.seqno < self.source_cursor.seqno {
             return None;
         }
-        let (group, column) = self.source_logical_cursor?;
+        // An absent physical-to-logical mapping is valid in the existing
+        // height/ConPTY resize path. Preserve it only for unchanged coordinates;
+        // the outer None instead means this preparation cannot be reused.
+        let Some((group, column)) = self.source_logical_cursor else {
+            return (cursor.x == self.source_cursor.x).then_some(None);
+        };
         let prefix = column.checked_sub(self.source_cursor.x)?;
-        Some((group, prefix.checked_add(cursor.x)?))
+        Some(Some((group, prefix.checked_add(cursor.x)?)))
     }
 
     pub fn prepare(&mut self, is_cancelled: impl Fn() -> bool) -> bool {
@@ -7224,7 +7229,7 @@ impl Screen {
                         wrapped,
                         logical_count: cache.logical_lines.len(),
                         cache_entries: cache.wrapped_by_key.len(),
-                        logical_cursor: prepared.logical_cursor_for(cursor),
+                        logical_cursor: prepared.logical_cursor_for(cursor).flatten(),
                     });
             }
             // The preparation owns only new counters, never a stale copy of
@@ -13536,11 +13541,13 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_reflow_reuses_exact_rows_after_cursor_only_parser_activity() {
-        for action in [
-            b"\x1b[?25l".as_slice(),
-            b"\x1b[5 q".as_slice(),
-            b"\r".as_slice(),
-            b"\x1b[3G".as_slice(),
+        for (action, reuse) in [
+            (b"\x1b[?25l".as_slice(), true),
+            (b"\x1b[5 q".as_slice(), true),
+            // CR deliberately publishes the row dirty; retain that exact
+            // source fence even though its printable contents are unchanged.
+            (b"\r".as_slice(), false),
+            (b"\x1b[3G".as_slice(), true),
         ] {
             let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig::default());
             let mut term = crate::Terminal::new(
@@ -13574,8 +13581,13 @@ pub(crate) mod tests {
                 false,
                 Some(&mut prepared),
             );
-            assert!(prepared.was_applied(), "parser action {:?}", action);
-            assert_eq!(REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get()), 0);
+            assert_eq!(prepared.was_applied(), reuse, "parser action {:?}", action);
+            let scans = REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get());
+            if reuse {
+                assert_eq!(scans, 0);
+            } else {
+                assert!(scans > 0, "CR must retain fresh-source fallback");
+            }
             assert_eq!(actual_cursor, expected_cursor, "parser action {action:?}");
             assert_eq!(
                 term.screen().lines,
