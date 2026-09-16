@@ -25333,6 +25333,13 @@ mod tests {
         if let Some((phase, fault)) = lease_scenario
             .filter(|(phase, _)| *phase != BrokerPaneLeaseWalPhaseV1::SuccessorRebound)
         {
+            let successor_identity = BrokerGuardianConnectionIdentityV1::new(
+                id(81_001),
+                id(81_002),
+                sealed(0xea),
+                sealed(0xeb),
+            )
+            .unwrap();
             let (old_attachment, write_permit, resize_permit) = service.inspect(move |service| {
                 let live = service
                     .live_spawns
@@ -25380,17 +25387,10 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
             if phase != BrokerPaneLeaseWalPhaseV1::PredecessorFenced {
-                let identity = BrokerGuardianConnectionIdentityV1::new(
-                    id(81_001),
-                    id(81_002),
-                    sealed(0xea),
-                    sealed(0xeb),
-                )
-                .unwrap();
                 let mut successor = BrokerControlClientV1::connect(
                     &socket_path,
                     &token_path,
-                    identity,
+                    successor_identity,
                     broker_build,
                 )
                 .unwrap();
@@ -25661,10 +25661,25 @@ mod tests {
                 );
                 live.lease_journal.as_mut().unwrap().identity.child_identity = authentic_child;
             });
+            let observer_identity = if phase == BrokerPaneLeaseWalPhaseV1::PredecessorFenced {
+                connection_identity
+            } else {
+                successor_identity
+            };
+            let excluded_mux = if phase == BrokerPaneLeaseWalPhaseV1::PredecessorFenced {
+                successor_identity.mux_incarnation
+            } else {
+                connection_identity.mux_incarnation
+            };
+            service.inspect(move |service| {
+                let live = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                assert!(live.census_visible_to_mux(observer_identity.mux_incarnation));
+                assert!(!live.census_visible_to_mux(excluded_mux));
+            });
             let mut observer = BrokerControlClientV1::connect(
                 &socket_path,
                 &token_path,
-                connection_identity,
+                observer_identity,
                 broker_build,
             )
             .unwrap();
@@ -25674,6 +25689,10 @@ mod tests {
             let [entry] = census.entries() else {
                 panic!("quarantined real child disappeared from Census")
             };
+            assert_eq!(
+                entry.owner_mux_incarnation,
+                Some(observer_identity.mux_incarnation)
+            );
             assert_eq!(
                 entry.disposition,
                 BrokerCensusDispositionV1::ReplyAcknowledgedQuarantined
