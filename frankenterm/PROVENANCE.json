@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 18,
         "feat": 52,
-        "fix": 85,
+        "fix": 86,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 27
       },
-      "fork_side_commit_count": 215,
+      "fork_side_commit_count": 216,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T23:26:27-04:00",
-        "sha": "653d85a5676e51155047e6c37e33a0c087b42861",
-        "subject": "fix(client): bound optional layout binding before transport bootstrap"
+        "committed_at": "2026-09-15T21:40:16-04:00",
+        "sha": "804ff9f74b8093a4b539214a21772d7a023219ba",
+        "subject": "fix(client): retain and report remote resize delivery failures"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 27,
         "docs": 6,
         "feat": 190,
-        "fix": 221,
+        "fix": 222,
         "other": 43,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 85
       },
-      "fork_side_commit_count": 607,
+      "fork_side_commit_count": 608,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-15T19:11:25-04:00",
-        "sha": "097696a9b02cd6ffe799773e61a3f038d7f95e88",
-        "subject": "test(guardian): preserve consuming chunks and freeze Genesis staging authority"
+        "classification": "fix",
+        "committed_at": "2026-09-15T22:08:44-04:00",
+        "sha": "444d936fa60b4d52bb58e979752e635d42b1d0c1",
+        "subject": "fix(guardian): persist encrypted spawn custody before broker acknowledgment"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -737,15 +737,15 @@
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
-        "test": 15
+        "test": 16
       },
-      "fork_side_commit_count": 56,
+      "fork_side_commit_count": 57,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-12T06:26:00-04:00",
-        "sha": "fef77c06307d92a7a823bf89280496727ebc50b0",
-        "subject": "test(pty): make Unix-only fixture import explicit to coupling gate"
+        "committed_at": "2026-09-15T22:42:02-04:00",
+        "sha": "d8bd1dac462f863d72910f7e4e5731a9a6bd4de5",
+        "subject": "test(pty): separate raw reader readiness and bound child cleanup"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2653,
-  "generated_at": "2026-09-15T23:37:27.576527Z",
+  "fork_side_commit_total": 2656,
+  "generated_at": "2026-09-16T02:42:22.855808Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

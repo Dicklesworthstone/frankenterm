@@ -350,8 +350,18 @@ receipts retain their original source identity; none qualifies RC24 by itself.
 - [x] Complete independent custody publication review, including the final
   fresh-store test after only incomplete staging files have survived.
 - [ ] Execute strict RCH guardian/mux custody tests on the committed source.
-- [ ] Finish the old immutable RC23 full-suite failure inventory; its control
-  loop is stopped so later gates cannot accidentally read the changed checkout.
+- [x] Finish the old immutable RC23 full-suite failure inventory: 69,882 passed,
+  four failed and 59 ignored across 1,318 groups. The old controller terminated
+  at the completed test boundary; it never ran gates four through six.
+- [ ] Resolve the fourth failure, the raw-mode PTY writer-drop test timeout;
+  separate child startup from byte delivery and retain the exact byte oracle.
+- [x] Commit that fixture correction as `d8bd1dac4`, with bounded cleanup of
+  its exact child. Strict RCH 57447 reran the original compiled test five times:
+  all passed. The original timeout's cause remains unproven; corrected execution
+  and the complete final suite are still required.
+- [x] Repair six custody test initializers exposed by RCH 57438 compiler errors
+  in `91f6a3f16`; preserve production authentication and custody behavior.
+- [ ] Run guardian, mux, client and portable-pty libraries on the successor.
 - [ ] Verify the two core corrections, full client library, and two active-tab
   dispatch tests through strict RCH on the final committed candidate.
 - [x] Execute both actual panic-profile subprocess artifacts: RCH job 57436 on
@@ -360,8 +370,19 @@ receipts retain their original source identity; none qualifies RC24 by itself.
   before and after execution. This is not a final RC24 binary qualification.
 - [ ] Finish native default Cmd±, real window resize/tiling, natural wrapping,
   selection variants, and the unchanged visible performance acceptance workload.
-- [ ] Commit coherent RC24 metadata and tracker export, obtain owner freeze
-  acknowledgments, and tag the exact source before DSR admission.
+- [x] Commit and tag RC24, then retain its failed static provenance gate and
+  pre-compilation DSR source-sync failure. The RC24 tag remains immutable.
+- [ ] Commit coherent RC25 metadata, refreshed vendored provenance and tracker
+  export after the PTY correction. Complete every static gate before tagging
+  and admitting the replacement candidate; obtain all owner freeze acknowledgments.
+- [x] Verify the actual default native font actions preserve 1200x800 pixels
+  and reflow 73→64→73 columns with the full Unicode corpus. The explicit true
+  setting preserves the grid and changes window dimensions. These background
+  action controls do not qualify keyboard delivery, pixels or visible latency.
+- [x] Verify real native Cmd+ and Cmd− with the default policy field absent:
+  exact 1200x800 window, 73→64→73 columns and retained Unicode corpus. Receipt
+  `ft-font-policy-4iv2vfor` identifies the RC23 development GUI; repeat against
+  the final packaged candidate. This does not establish visible latency.
 - [ ] Complete all six DSR quality gates on that source, including workspace
   Clippy and exact clean-source formatting with a nonzero named test result.
 - [ ] Build all four DSR target families with the corrected 21,600-second

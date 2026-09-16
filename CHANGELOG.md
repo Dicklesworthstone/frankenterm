@@ -49,7 +49,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - macOS application packaging includes the transitive native library dependencies, relocates their loader paths, and retains their license notices and provenance. Packaging rejects unresolved dependencies and verifies that source binaries remain unchanged.
 - The guardian broker's Spawn acknowledgment now requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Ordinary broker-backed pane activation and full mux recovery remain unfinished.
 
-The `0.15.6-rc.24` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.25` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.
