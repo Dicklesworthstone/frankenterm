@@ -2377,7 +2377,9 @@ impl GuardianRuntime {
         let Some(connection) = self.broker_connections.get_mut(&pane.mux_incarnation) else {
             return GuardianCheckpointSubmission::CloseRetryably;
         };
-        if connection.active_pane.is_some() {
+        // A retained pre-publication request does not own failures that may
+        // have arisen on this shared connection while another pane used it.
+        if connection.failed || connection.active_pane.is_some() {
             return GuardianCheckpointSubmission::CloseRetryably;
         }
         if let Some(worker) = connection.worker.as_mut() {
@@ -2407,7 +2409,6 @@ impl GuardianRuntime {
             }
         };
         retry.session = connection.retained_session.take();
-        connection.failed = false;
         pane.failed_before_spawn = false;
         let job = CheckpointJob {
             route,
@@ -2938,7 +2939,7 @@ impl GuardianRuntime {
                                 }
                             }
                         } else {
-                            connection.failed = !retry_before_publication;
+                            connection.failed |= !retry_before_publication;
                         }
                     }
                     if self
