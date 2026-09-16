@@ -236,7 +236,9 @@ fn test_ed2_severs_scrollback_wrap_before_repaint_and_resize() {
             pixel_height: 32,
             dpi: 0,
         });
-        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ", ""]);
+        // Resize prunes unused blank rows below the cursor and pads only to
+        // the viewport height. Both retained text rows must stay separate.
+        assert_all_contents(&term, file!(), line!(), &["abcde", "XYZ"]);
     }
 }
 
