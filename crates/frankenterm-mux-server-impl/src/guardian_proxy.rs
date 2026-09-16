@@ -181,12 +181,13 @@ impl Domain for GuardianDomain {
         let request = Uuid::new_v4();
         let effect = Uuid::new_v4();
         let description = "guardian-owned command".to_string();
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(config::TermConfig::new_for_pane(
-            pane_id,
-            domain_id,
-            *pane.as_bytes(),
-            description.clone(),
-        ));
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(config::TermConfig::new_for_pane(
+                pane_id,
+                domain_id,
+                *pane.as_bytes(),
+                description.clone(),
+            ));
         let pty_size = PtySize {
             rows: size.rows.try_into()?,
             cols: size.cols.try_into()?,

@@ -624,8 +624,10 @@ state or treating the new opt-in path as existing-session migration.
 - [x] Run four unpublished guardian tests at `8dfd4c9cd`, RCH job31823:
   four passed, zero failed/ignored. Updated publication receipt assertions
   require a new run at the integrated source.
-- [ ] Finish integrated strict Clippy: production passed compilation, seven
-  test-only style diagnostics remain in broker/transport and are being fixed.
+- [ ] Finish integrated strict Clippy: seven broker/transport test-only style
+  diagnostics are fixed. The following real-domain build found three type
+  errors before any tests ran; guarded-domain comparison and Send/Sync fixes
+  must pass the next integrated compilation.
 - [ ] Build actual sealed guardian CLI and run real mux-domain lifecycle test.
 - [ ] Add and run deterministic cancellation while the cold worker is in flight,
   using real birth output and census exclusion rather than timing assumptions.
@@ -643,3 +645,23 @@ state or treating the new opt-in path as existing-session migration.
 The protected macOS notification still prevents foreground acceptance. Existing
 GUI children and remote mux sessions remain untouched; neither recovery across
 power loss nor migration of those live sessions has been demonstrated.
+
+### 2026-09-16 10:12 UTC — candidate RC26 and exact execution blockers
+
+- [x] Preserve guardian flags byte-for-byte through daemon re-exec, including
+  non-UTF-8 paths and flag-like child arguments. Causal parser roundtrip added.
+- [x] Prepare RC26 workspace metadata and all 32 first-party lockfile entries;
+  retain RC25 immutable. No RC26 tag, native build, publication or install yet.
+- [x] Run actual sealed guardian CLI build at `671c1e133`, RCH31825, exit0.
+- [ ] Rerun real domain after RCH31826 failed compilation with three type errors
+  and zero tests executed. Preserve the successful CLI receipt separately.
+- [x] Independent replay review caught predecessor rescans on whole-request
+  retry despite a passing leaf-shaped assertion; add opaque predecessor
+  authority and full authenticated request/retry frame-count assertions.
+- [ ] Execute the bounded replay tests, both real domain lifecycle tests,
+  daemon flag roundtrip, reload guards and publication tests on integrated RC26.
+- [x] Static Unix-coupling gate passes without loosening the baseline. Overall
+  static gate was 26 pass/3 fail/8 cargo skips; remaining source cleanliness and
+  provenance failures require the final committed source, not a claim of success.
+- [x] Confirm final RCH storage capacity: approximately 372 GiB durable disk free,
+  140 GiB available memory; no deletion or remount needed.

@@ -1845,6 +1845,7 @@ pub struct GuardianOutputRecoveryCursor {
     expected_next_sequence: Option<u64>,
     expected_terminal_receipt: Option<GuardianOutputAppendReceipt>,
     expected_authenticated_prefix_digest: [u8; 32],
+    file_header_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
     offset: u64,
     record_count: u64,
@@ -1858,7 +1859,62 @@ pub struct GuardianOutputRecoveryCursor {
     verified_record_count: u64,
 }
 
+/// Opaque, plaintext-free position issued only by an authenticated cursor.
+/// It owns no descriptor and can be resumed only against the same frozen view.
+#[derive(Clone, Copy)]
+pub struct GuardianOutputRecoveryBookmark {
+    identity: GuardianOutputSegmentIdentity,
+    key_id: [u8; KEY_ID_BYTES],
+    committed_bytes: u64,
+    expected_authenticated_prefix_digest: [u8; 32],
+    file_header_digest: [u8; 32],
+    requested_first_sequence: u64,
+    max_record_plaintext_bytes: u32,
+    offset: u64,
+    record_count: u64,
+    cumulative_plaintext_bytes: u64,
+    next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    authenticated_prefix_digest: [u8; 32],
+    exhausted: bool,
+}
+
+impl GuardianOutputRecoveryBookmark {
+    #[must_use]
+    pub const fn next_sequence(&self) -> Option<u64> {
+        self.next_sequence
+    }
+}
+
 impl GuardianOutputRecoveryCursor {
+    pub fn bookmark(&self) -> Result<GuardianOutputRecoveryBookmark, GuardianOutputJournalError> {
+        if self.failed {
+            return Err(GuardianOutputJournalError::RecoveryCursorFailed);
+        }
+        Ok(GuardianOutputRecoveryBookmark {
+            identity: self.identity,
+            key_id: self.cipher.key_id,
+            committed_bytes: self.committed_bytes,
+            expected_authenticated_prefix_digest: self.expected_authenticated_prefix_digest,
+            file_header_digest: self.file_header_digest,
+            requested_first_sequence: self.requested_first_sequence,
+            max_record_plaintext_bytes: self.max_record_plaintext_bytes,
+            offset: self.offset,
+            record_count: self.record_count,
+            cumulative_plaintext_bytes: self.cumulative_plaintext_bytes,
+            next_sequence: self.next_sequence,
+            terminal_receipt: self.terminal_receipt,
+            authenticated_prefix_digest: self.authenticated_prefix_digest,
+            exhausted: self.exhausted,
+        })
+    }
+
+    /// Sequence at this opaque position; no physical seek authority is exposed.
+    #[must_use]
+    pub const fn next_sequence(&self) -> Option<u64> {
+        self.next_sequence
+    }
+
     #[must_use]
     pub const fn segment_identity(&self) -> GuardianOutputSegmentIdentity {
         self.identity
@@ -3023,6 +3079,15 @@ impl GuardianOutputJournal {
         first_sequence: u64,
         max_record_plaintext_bytes: u32,
     ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
+        self.recovery_cursor_with_growth(first_sequence, max_record_plaintext_bytes, false)
+    }
+
+    fn recovery_cursor_with_growth(
+        &self,
+        first_sequence: u64,
+        max_record_plaintext_bytes: u32,
+        allow_append: bool,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
         if self.poisoned {
             return Err(GuardianOutputJournalError::Poisoned);
         }
@@ -3062,7 +3127,9 @@ impl GuardianOutputJournal {
         };
         let file = self.file.try_clone()?;
         let observed_physical_bytes = file.metadata()?.len();
-        if observed_physical_bytes != expected_physical_bytes {
+        if observed_physical_bytes < expected_physical_bytes
+            || (!allow_append && observed_physical_bytes != expected_physical_bytes)
+        {
             return Err(GuardianOutputJournalError::ExternalLengthChange {
                 expected: expected_physical_bytes,
                 observed: observed_physical_bytes,
@@ -3086,6 +3153,7 @@ impl GuardianOutputJournal {
             expected_next_sequence: self.next_sequence,
             expected_terminal_receipt: self.terminal_receipt,
             expected_authenticated_prefix_digest: self.authenticated_prefix_digest,
+            file_header_digest: initial_authenticated_prefix_digest,
             tail: self.tail,
             offset: FILE_HEADER_BYTES_U64,
             record_count: 0,
@@ -3116,6 +3184,15 @@ impl GuardianOutputJournal {
         receipt: GuardianOutputAppendReceipt,
         max_plaintext_bytes: u32,
     ) -> Result<GuardianRecoveredOutputRecord, GuardianOutputJournalError> {
+        self.verify_frozen_terminal_record(receipt, max_plaintext_bytes, false)
+    }
+
+    fn verify_frozen_terminal_record(
+        &self,
+        receipt: GuardianOutputAppendReceipt,
+        max_plaintext_bytes: u32,
+        allow_append: bool,
+    ) -> Result<GuardianRecoveredOutputRecord, GuardianOutputJournalError> {
         if self.terminal_receipt != Some(receipt)
             || self.tail != GuardianOutputJournalTail::Clean
             || receipt.committed_log_bytes != self.committed_bytes
@@ -3125,7 +3202,8 @@ impl GuardianOutputJournal {
         }
         // Reuse the canonical header validation and bounded authenticated frame
         // decoder. This private cursor never escapes as full-prefix authority.
-        let mut cursor = self.recovery_cursor(receipt.sequence, max_plaintext_bytes)?;
+        let mut cursor =
+            self.recovery_cursor_with_growth(receipt.sequence, max_plaintext_bytes, allow_append)?;
         let frame_bytes = RECORD_HEADER_BYTES_U64
             .checked_add(u64::from(AEAD_TAG_BYTES))
             .and_then(|bytes| bytes.checked_add(u64::from(receipt.payload_bytes)))
@@ -3148,8 +3226,10 @@ impl GuardianOutputJournal {
             .next_record()?
             .filter(|record| record.receipt() == receipt)
             .ok_or(GuardianOutputJournalError::RecoveryAuthorityMismatch)?;
+        let physical_bytes = self.file.metadata()?.len();
         if cursor.offset != self.committed_bytes
-            || self.file.metadata()?.len() != self.committed_bytes
+            || physical_bytes < self.committed_bytes
+            || (!allow_append && physical_bytes != self.committed_bytes)
         {
             return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
         }
@@ -3456,6 +3536,88 @@ impl GuardianOutputJournalReader {
     ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
         self.authenticated
             .recovery_cursor(first_sequence, max_record_plaintext_bytes)
+    }
+
+    /// Recheck this frozen prefix's header and exact terminal frame, permitting
+    /// later bytes only when the caller owns an appendable snapshot tail.
+    /// Earlier frames were authenticated at construction; this is not a scrub.
+    /// The caller must revalidate the named path before and after reading.
+    pub fn validate_frozen_prefix(
+        &self,
+        allow_append: bool,
+    ) -> Result<(), GuardianOutputJournalError> {
+        if self.tail() != GuardianOutputJournalTail::Clean {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        if let Some(receipt) = self.terminal_receipt() {
+            self.authenticated.verify_frozen_terminal_record(
+                receipt,
+                self.authenticated.limits.max_record_bytes,
+                allow_append,
+            )?;
+        } else {
+            let _ = self.authenticated.recovery_cursor_with_growth(
+                self.identity().first_sequence(),
+                self.authenticated.limits.max_record_bytes,
+                allow_append,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Start interval replay from a previously authenticated frozen prefix.
+    /// Appended bytes are excluded; seeking past earlier records still verifies
+    /// them once. Save its opaque bookmarks to replay authenticated positions.
+    pub fn frozen_replay_cursor(
+        &self,
+        first_sequence: u64,
+        max_record_plaintext_bytes: u32,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
+        self.authenticated.recovery_cursor_with_growth(
+            first_sequence,
+            max_record_plaintext_bytes,
+            true,
+        )
+    }
+
+    /// Resume only a position minted for this exact authenticated frozen prefix.
+    /// This authenticates the current header; subsequent reads authenticate the
+    /// requested interval. It does not reread history preceding the bookmark.
+    pub fn cursor_from_bookmark(
+        &self,
+        bookmark: &GuardianOutputRecoveryBookmark,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianOutputJournalError> {
+        let mut cursor = self.frozen_replay_cursor(
+            bookmark.requested_first_sequence,
+            bookmark.max_record_plaintext_bytes,
+        )?;
+        if cursor.identity != bookmark.identity
+            || cursor.cipher.key_id != bookmark.key_id
+            || cursor.committed_bytes != bookmark.committed_bytes
+            || cursor.expected_authenticated_prefix_digest
+                != bookmark.expected_authenticated_prefix_digest
+            || cursor.file_header_digest != bookmark.file_header_digest
+        {
+            return Err(GuardianOutputJournalError::RecoveryAuthorityMismatch);
+        }
+        cursor.offset = bookmark.offset;
+        cursor.record_count = bookmark.record_count;
+        cursor.cumulative_plaintext_bytes = bookmark.cumulative_plaintext_bytes;
+        cursor.next_sequence = bookmark.next_sequence;
+        cursor.terminal_receipt = bookmark.terminal_receipt;
+        cursor.authenticated_prefix_digest = bookmark.authenticated_prefix_digest;
+        cursor.exhausted = bookmark.exhausted;
+        Ok(cursor)
+    }
+
+    /// Recover the already-authenticated predecessor of an opaque position.
+    /// Binding and header are rechecked, but that preceding frame is not reread;
+    /// the bookmark's historical authority is the basis for this receipt.
+    pub fn receipt_before_bookmark(
+        &self,
+        bookmark: &GuardianOutputRecoveryBookmark,
+    ) -> Result<Option<GuardianOutputAppendReceipt>, GuardianOutputJournalError> {
+        Ok(self.cursor_from_bookmark(bookmark)?.terminal_receipt)
     }
 
     pub fn recover_committed_range(
@@ -5721,6 +5883,157 @@ mod tests {
             journal.verify_terminal_record(receipts[0], 4),
             Err(GuardianOutputJournalError::ExternalLengthChange { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frozen_reader_bookmarks_replay_one_frame_per_page_and_reject_foreign_views() {
+        let payloads: Vec<&[u8]> = (0..32).map(|_| b"page".as_slice()).collect();
+        let (_directory, path, mut journal, receipts) =
+            real_journal_with_records("bookmarked.ftgout", &payloads);
+        let reader = GuardianOutputJournalReader::open_existing(
+            File::open(&path).unwrap(),
+            journal.identity(),
+            journal.cipher.clone(),
+            journal.limits,
+        )
+        .unwrap();
+        let mut bookmark = reader
+            .frozen_replay_cursor(1, 4)
+            .unwrap()
+            .bookmark()
+            .unwrap();
+        let mut verified = 0;
+        for receipt in &receipts {
+            reader.validate_frozen_prefix(false).unwrap();
+            let mut cursor = reader.cursor_from_bookmark(&bookmark).unwrap();
+            assert_eq!(cursor.next_record().unwrap().unwrap().receipt(), *receipt);
+            assert_eq!(
+                cursor.verified_record_count(),
+                1,
+                "page must not rescan history"
+            );
+            verified += cursor.verified_record_count();
+            // Lost delivery reuses the exact prior position and rereads one frame.
+            let mut retry = reader.cursor_from_bookmark(&bookmark).unwrap();
+            assert_eq!(retry.next_record().unwrap().unwrap().receipt(), *receipt);
+            assert_eq!(retry.verified_record_count(), 1);
+            bookmark = cursor.bookmark().unwrap();
+        }
+        assert_eq!(verified, 32);
+        journal.append_and_sync(b"later").unwrap();
+        reader.validate_frozen_prefix(true).unwrap();
+        assert!(reader.validate_frozen_prefix(false).is_err());
+        let mut ended = reader.cursor_from_bookmark(&bookmark).unwrap();
+        assert!(
+            ended.next_record().unwrap().is_none(),
+            "snapshot excludes appended bytes"
+        );
+        let later = GuardianOutputJournalReader::open_existing(
+            File::open(&path).unwrap(),
+            journal.identity(),
+            journal.cipher.clone(),
+            journal.limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            later.cursor_from_bookmark(&bookmark),
+            Err(GuardianOutputJournalError::RecoveryAuthorityMismatch)
+        ));
+        let (_other_directory, other_path, other, _) =
+            real_journal_with_records("foreign-bookmark.ftgout", &[b"page"]);
+        let foreign = GuardianOutputJournalReader::open_existing(
+            File::open(other_path).unwrap(),
+            other.identity(),
+            other.cipher.clone(),
+            other.limits,
+        )
+        .unwrap();
+        assert!(foreign.cursor_from_bookmark(&bookmark).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frozen_bookmark_authenticates_requested_bytes_while_full_scrub_detects_old_tamper() {
+        let (_directory, path, journal, receipts) =
+            real_journal_with_records("bookmark-tamper.ftgout", &[b"old", b"next", b"tail"]);
+        let reader = GuardianOutputJournalReader::open_existing(
+            File::open(&path).unwrap(),
+            journal.identity(),
+            journal.cipher.clone(),
+            journal.limits,
+        )
+        .unwrap();
+        let mut cursor = reader.frozen_replay_cursor(1, 32).unwrap();
+        assert_eq!(
+            cursor.next_record().unwrap().unwrap().receipt(),
+            receipts[0]
+        );
+        let bookmark = cursor.bookmark().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut tamper = OpenOptions::new().write(true).open(&path).unwrap();
+        tamper
+            .seek(SeekFrom::Start(
+                FILE_HEADER_BYTES_U64 + RECORD_HEADER_BYTES_U64,
+            ))
+            .unwrap();
+        tamper
+            .write_all(&[original[FILE_HEADER_BYTES + RECORD_HEADER_BYTES] ^ 1])
+            .unwrap();
+        tamper.sync_all().unwrap();
+        // The requested interval and terminal remain intact. This explicitly
+        // does not claim historical bytes were reauthenticated on every page.
+        reader.validate_frozen_prefix(false).unwrap();
+        let mut resumed = reader.cursor_from_bookmark(&bookmark).unwrap();
+        assert_eq!(
+            resumed.next_record().unwrap().unwrap().receipt(),
+            receipts[1]
+        );
+        assert_eq!(resumed.verified_record_count(), 1);
+        assert!(GuardianOutputJournalReader::open_existing(
+            File::open(&path).unwrap(),
+            journal.identity(),
+            journal.cipher.clone(),
+            journal.limits,
+        )
+        .is_err());
+        tamper
+            .seek(SeekFrom::Start(
+                receipts[0].committed_log_bytes() + RECORD_HEADER_BYTES_U64,
+            ))
+            .unwrap();
+        tamper
+            .write_all(&[
+                original[usize::try_from(receipts[0].committed_log_bytes()).unwrap()
+                    + RECORD_HEADER_BYTES]
+                    ^ 1,
+            ])
+            .unwrap();
+        tamper.sync_all().unwrap();
+        let mut requested = reader.cursor_from_bookmark(&bookmark).unwrap();
+        assert!(requested.next_record().is_err());
+        assert!(
+            requested.bookmark().is_err(),
+            "failed cursor cannot mint authority"
+        );
+        tamper
+            .seek(SeekFrom::Start(
+                receipts[1].committed_log_bytes() + RECORD_HEADER_BYTES_U64,
+            ))
+            .unwrap();
+        tamper
+            .write_all(&[
+                original[usize::try_from(receipts[1].committed_log_bytes()).unwrap()
+                    + RECORD_HEADER_BYTES]
+                    ^ 1,
+            ])
+            .unwrap();
+        tamper.sync_all().unwrap();
+        assert!(reader.validate_frozen_prefix(false).is_err());
+        tamper.seek(SeekFrom::Start(0)).unwrap();
+        tamper.write_all(b"X").unwrap();
+        tamper.sync_all().unwrap();
+        assert!(reader.cursor_from_bookmark(&bookmark).is_err());
     }
 
     #[cfg(unix)]

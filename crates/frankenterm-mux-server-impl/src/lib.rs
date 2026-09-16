@@ -15138,7 +15138,7 @@ mod tests {
                 config.default_mux_server_domain = default;
             });
             update_mux_domains_for_server(&handle)?;
-            assert!(Arc::ptr_eq(&mux.default_domain()?, &guardian));
+            assert!(mux.default_domain()?.is_same_domain(&guardian));
         }
 
         let raw_ssh = SshDomain {
@@ -15153,7 +15153,7 @@ mod tests {
         let error = update_mux_domains_for_server(&handle)
             .expect_err("reload must not silently disable explicit guardian spawning");
         assert!(format!("{error:#}").contains("explicitly selected guardian domain"));
-        assert!(Arc::ptr_eq(&mux.default_domain()?, &guardian));
+        assert!(mux.default_domain()?.is_same_domain(&guardian));
         assert!(mux.get_domain_by_name("unguarded-default").is_none());
         Ok(())
     }

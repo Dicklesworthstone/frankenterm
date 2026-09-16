@@ -38,7 +38,7 @@ use mux::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputJournal,
     GuardianOutputJournalError, GuardianOutputJournalLimits, GuardianOutputJournalReader,
     GuardianOutputJournalTail, GuardianOutputKey, GuardianOutputPredecessor,
-    GuardianOutputSegmentIdentity,
+    GuardianOutputRecoveryBookmark, GuardianOutputRecoveryCursor, GuardianOutputSegmentIdentity,
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
@@ -872,7 +872,6 @@ struct GuardianReplayCatalogPin {
 struct GuardianReplayOutputPin {
     directory: File,
     directory_path: PathBuf,
-    cipher: GuardianOutputCipher,
     policy: OutputSegmentPolicy,
     manifest: OutputManifestSnapshot,
     manifest_path: PathBuf,
@@ -885,12 +884,85 @@ struct GuardianReplayOutputPin {
     cumulative_plaintext_bytes: u64,
 }
 
-#[derive(Clone)]
 struct GuardianReplayOutputSegmentPin {
     authority: SegmentPathAuthority,
+    reader: GuardianOutputJournalReader,
+    // At most the preceding page boundary and the following boundary. These
+    // retain authenticated cursor state, never delivered plaintext.
+    bookmarks: Mutex<VecDeque<GuardianOutputRecoveryBookmark>>,
     committed_bytes: u64,
     terminal_receipt: Option<GuardianOutputAppendReceipt>,
     was_current: bool,
+    #[cfg(test)]
+    read_work: Mutex<GuardianReplayReadWork>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct GuardianReplayReadWork {
+    historical_frames: u64,
+    interval_frames: u64,
+    terminal_frames: u64,
+}
+
+impl GuardianReplayOutputSegmentPin {
+    fn cursor_at(
+        &self,
+        sequence: u64,
+        max_record_bytes: u32,
+    ) -> Result<GuardianOutputRecoveryCursor, GuardianCheckpointStageStoreError> {
+        let bookmarks = self
+            .bookmarks
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        let cached = bookmarks
+            .iter()
+            .filter(|cursor| cursor.next_sequence().is_some_and(|next| next <= sequence))
+            .max_by_key(|cursor| cursor.next_sequence());
+        let mut cursor = match cached {
+            Some(bookmark) => self.reader.cursor_from_bookmark(bookmark)?,
+            None => self.reader.frozen_replay_cursor(
+                self.authority.segment_identity.first_sequence(),
+                max_record_bytes,
+            )?,
+        };
+        drop(bookmarks);
+        while cursor.next_sequence().is_some_and(|next| next < sequence) {
+            if cursor.next_record()?.is_none() {
+                return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+            }
+            #[cfg(test)]
+            {
+                self.read_work.lock().unwrap().historical_frames += 1;
+            }
+        }
+        if cursor.next_sequence() != Some(sequence) {
+            return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+        }
+        Ok(cursor)
+    }
+
+    fn remember_position(
+        &self,
+        cursor: &GuardianOutputRecoveryCursor,
+    ) -> Result<(), GuardianCheckpointStageStoreError> {
+        let saved = cursor.bookmark()?;
+        let mut bookmarks = self
+            .bookmarks
+            .lock()
+            .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?;
+        if bookmarks
+            .iter()
+            .any(|bookmark| bookmark.next_sequence() == saved.next_sequence())
+        {
+            return Ok(());
+        }
+        if bookmarks.len() == 2 {
+            bookmarks.pop_front();
+        }
+        bookmarks.push_back(saved);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4102,17 +4174,15 @@ fn guardian_replay_capture_output(
     authority
         .validate_path_authority()
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-    validate_replayable_segment_chain(
-        &authority.directory,
-        &authority.directory_path,
-        &authority.segments,
-        &authority.cipher,
-        authority.policy,
-    )?;
+    if authority.segments.is_empty() || authority.segments.len() > authority.policy.max_segments {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
     let mut segments = Vec::new();
     segments
         .try_reserve_exact(authority.segments.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
+    let mut previous_terminal = None;
+    let mut total_committed_bytes = 0_u64;
     for (index, segment) in authority.segments.iter().enumerate() {
         let file = open_private_file_read_only_at_identity(
             &authority.directory,
@@ -4120,6 +4190,10 @@ fn guardian_replay_capture_output(
             &segment.path,
             segment.file_identity,
         )?;
+        let metadata = file.metadata().map_err(|error| {
+            GuardianCheckpointStageStoreError::io("replay-capture-metadata", error)
+        })?;
+        let frozen_identity = FileIdentity::capture(&metadata, Some(metadata.len()));
         let opened = GuardianOutputJournalReader::open_existing(
             file,
             segment.segment_identity,
@@ -4129,11 +4203,38 @@ fn guardian_replay_capture_output(
         if opened.tail() != GuardianOutputJournalTail::Clean {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
+        validate_file_identity_at(
+            &authority.directory,
+            &authority.directory_path,
+            &segment.path,
+            frozen_identity,
+        )?;
+        if segment.segment_identity.predecessor() != previous_terminal {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        previous_terminal = opened.terminal_predecessor();
+        if index + 1 != authority.segments.len() && previous_terminal.is_none() {
+            return Err(GuardianCheckpointStageStoreError::Poisoned);
+        }
+        total_committed_bytes = total_committed_bytes
+            .checked_add(opened.committed_bytes())
+            .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+        if total_committed_bytes > authority.policy.max_durable_pane_bytes {
+            return Err(GuardianCheckpointStageStoreError::Capacity);
+        }
+        let mut bookmarks = VecDeque::new();
+        bookmarks
+            .try_reserve_exact(2)
+            .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
         segments.push(GuardianReplayOutputSegmentPin {
             authority: segment.clone(),
             committed_bytes: opened.committed_bytes(),
             terminal_receipt: opened.terminal_receipt(),
             was_current: index + 1 == authority.segments.len(),
+            reader: opened,
+            bookmarks: Mutex::new(bookmarks),
+            #[cfg(test)]
+            read_work: Mutex::new(GuardianReplayReadWork::default()),
         });
     }
     let terminal = segments
@@ -4193,7 +4294,6 @@ fn guardian_replay_capture_output(
             GuardianCheckpointStageStoreError::io("replay-output-directory-clone", error)
         })?,
         directory_path: authority.directory_path.clone(),
-        cipher: authority.cipher.clone(),
         policy: authority.policy,
         manifest: authority.manifest.snapshot.clone(),
         manifest_path: authority.manifest.path.clone(),
@@ -4278,40 +4378,26 @@ fn guardian_replay_validate_output_pin(
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
     for segment in &output.segments {
-        let file = open_private_file_read_only_at_identity(
+        validate_file_identity_at(
             &output.directory,
             &output.directory_path,
             &segment.authority.path,
             segment.authority.file_identity,
         )?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.authority.segment_identity,
-            output.cipher.clone(),
-            output.policy.journal_limits,
+        // Cold capture authenticated the whole prefix. Each page rechecks its
+        // header and frozen terminal frame, then authenticates every delivered
+        // interval below. Historical bytes outside that interval are not scrubbed.
+        segment.reader.validate_frozen_prefix(segment.was_current)?;
+        #[cfg(test)]
+        if segment.terminal_receipt.is_some() {
+            segment.read_work.lock().unwrap().terminal_frames += 1;
+        }
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
         )?;
-        if journal.tail() != GuardianOutputJournalTail::Clean
-            || journal.committed_bytes() < segment.committed_bytes
-            || (!segment.was_current && journal.committed_bytes() != segment.committed_bytes)
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
-        match segment.terminal_receipt {
-            Some(expected) => {
-                let mut cursor = journal.recovery_cursor(
-                    expected.sequence(),
-                    output.policy.journal_limits.max_record_bytes,
-                )?;
-                let recovered = cursor
-                    .next_record()?
-                    .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
-                if recovered.receipt() != expected {
-                    return Err(GuardianCheckpointStageStoreError::Poisoned);
-                }
-            }
-            None if segment.committed_bytes == OUTPUT_V3_FILE_HEADER_BYTES => {}
-            None => return Err(GuardianCheckpointStageStoreError::Poisoned),
-        }
     }
     Ok(())
 }
@@ -4333,23 +4419,35 @@ fn guardian_replay_recover_receipt(
             first <= sequence && sequence <= last
         })
         .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
-    let file = open_private_file_read_only_at_identity(
-        &output.directory,
-        &output.directory_path,
-        &segment.authority.path,
-        segment.authority.file_identity,
-    )?;
-    let journal = GuardianOutputJournalReader::open_existing(
-        file,
-        segment.authority.segment_identity,
-        output.cipher.clone(),
-        output.policy.journal_limits,
-    )?;
-    let mut cursor =
-        journal.recovery_cursor(sequence, output.policy.journal_limits.max_record_bytes)?;
+    let bookmark = segment
+        .bookmarks
+        .lock()
+        .map_err(|_| GuardianCheckpointStageStoreError::LockPoisoned)?
+        .iter()
+        .find(|bookmark| bookmark.next_sequence() == sequence.checked_add(1))
+        .copied();
+    if let Some(bookmark) = bookmark {
+        let receipt = segment
+            .reader
+            .receipt_before_bookmark(&bookmark)?
+            .filter(|receipt| receipt.sequence() == sequence)
+            .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
+        )?;
+        return Ok(receipt);
+    }
+    let mut cursor = segment.cursor_at(sequence, output.policy.journal_limits.max_record_bytes)?;
     let recovered = cursor
         .next_record()?
         .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?;
+    #[cfg(test)]
+    {
+        segment.read_work.lock().unwrap().historical_frames += 1;
+    }
     if recovered.receipt().sequence() != sequence
         || segment
             .terminal_receipt
@@ -4357,6 +4455,13 @@ fn guardian_replay_recover_receipt(
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
+    validate_file_identity_at(
+        &output.directory,
+        &output.directory_path,
+        &segment.authority.path,
+        segment.authority.file_identity,
+    )?;
+    segment.remember_position(&cursor)?;
     Ok(recovered.receipt())
 }
 
@@ -4663,24 +4768,18 @@ fn guardian_replay_output_page(
         if next_sequence > segment_terminal.sequence() || next_sequence < segment_first {
             continue;
         }
-        let file = open_private_file_read_only_at_identity(
-            &output.directory,
-            &output.directory_path,
-            &segment.authority.path,
-            segment.authority.file_identity,
-        )?;
-        let journal = GuardianOutputJournalReader::open_existing(
-            file,
-            segment.authority.segment_identity,
-            output.cipher.clone(),
-            output.policy.journal_limits,
-        )?;
-        let mut cursor = journal
-            .recovery_cursor(next_sequence, output.policy.journal_limits.max_record_bytes)?;
+        let mut cursor =
+            segment.cursor_at(next_sequence, output.policy.journal_limits.max_record_bytes)?;
+        segment.remember_position(&cursor)?;
         while deliveries.len() < usize::from(max_records) {
+            let before_record = cursor.bookmark()?;
             let Some(recovered) = cursor.next_record()? else {
                 break;
             };
+            #[cfg(test)]
+            {
+                segment.read_work.lock().unwrap().interval_frames += 1;
+            }
             let receipt = recovered.receipt();
             if receipt.sequence() > segment_terminal.sequence() {
                 break;
@@ -4695,6 +4794,7 @@ fn guardian_replay_output_page(
                 if deliveries.is_empty() {
                     return Err(GuardianCheckpointStageStoreError::Capacity);
                 }
+                cursor = segment.reader.cursor_from_bookmark(&before_record)?;
                 break;
             }
             let predecessor = segment
@@ -4735,6 +4835,13 @@ fn guardian_replay_output_page(
                 break;
             }
         }
+        validate_file_identity_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+            segment.authority.file_identity,
+        )?;
+        segment.remember_position(&cursor)?;
         if deliveries.len() >= usize::from(max_records)
             || plaintext_bytes >= max_plaintext_bytes
             || terminal_receipt.is_some_and(|receipt| {
@@ -13070,6 +13177,85 @@ mod tests {
     }
 
     #[test]
+    fn replay_output_pages_reuse_bounded_bookmarks_and_revalidate_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, _poll, pipeline) =
+            pipeline_with_policy("ft-replay-bookmarks-", OutputSegmentPolicy::production())?;
+        let guardian = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let effect = Uuid::new_v4();
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let terminal = checkpoint_catalog_test_terminal(b"");
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &terminal)?;
+        let mut reservation = checkpoint_catalog_test_genesis_reservation_binding();
+        reservation.durable_pane_id = pane;
+        reservation.spawn_effect_id = effect;
+        reservation.checkpoint_identity_digest = descriptor.checkpoint_id().into_bytes();
+        reservation.boundary_identity_digest = descriptor.boundary_id().into_bytes();
+        // Isolate replay interval mechanics; sealed service tests cover the
+        // production-only publication authority that issues this origin.
+        let origin = {
+            let authority = journal.authority.lock().map_err(|_| "poisoned journal")?;
+            GuardianGenesisReplayOriginV1 {
+                reservation,
+                catalog_candidate_checksum: [0x58; 32],
+                guardian_incarnation: guardian,
+                initial_segment: authority.current_journal.identity(),
+                persistence: Arc::clone(&authority.persistence),
+            }
+        };
+        let mut receipts = Vec::new();
+        for _ in 0..16 {
+            receipts.push(durable_commit(&pipeline, pane, &journal, b"page")?);
+        }
+        let output = guardian_replay_capture_output(&journal, descriptor, Some(&origin))?;
+        let mut previous = [0; 32];
+        for expected in receipts {
+            let (page, actual) =
+                guardian_replay_output_page(&output, expected.sequence(), previous, 4, 1)?;
+            assert_eq!(actual, expected);
+            let mut bytes = Vec::new();
+            for record in page.into_records() {
+                record.write_all_bounded(&mut bytes, 4)?;
+            }
+            assert_eq!(bytes, b"page");
+            let bookmarks = output.segments[0]
+                .bookmarks
+                .lock()
+                .map_err(|_| "poisoned bookmarks")?;
+            assert_eq!(bookmarks.len(), 2);
+            assert_eq!(bookmarks[0].next_sequence(), Some(expected.sequence()));
+            assert_eq!(
+                bookmarks[1].next_sequence(),
+                expected.sequence().checked_add(1)
+            );
+            drop(bookmarks);
+            let (_, retry) =
+                guardian_replay_output_page(&output, expected.sequence(), previous, 4, 1)?;
+            assert_eq!(retry, expected);
+            previous = expected.record_digest();
+        }
+        durable_commit(&pipeline, pane, &journal, b"later")?;
+        guardian_replay_validate_output_pin(&output)?;
+        assert!(guardian_replay_output_page(&output, 17, previous, 8, 1).is_err());
+        let segment = &output.segments[0];
+        let retained = segment
+            .authority
+            .path
+            .with_extension("retained-replay-probe");
+        std::fs::rename(&segment.authority.path, &retained)?;
+        let replacement = create_private_file_new_at(
+            &output.directory,
+            &output.directory_path,
+            &segment.authority.path,
+        )?;
+        replacement.sync_all()?;
+        output.directory.sync_all()?;
+        assert!(guardian_replay_output_page(&output, 16, previous, 4, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn replay_snapshot_pages_checkpoint_then_exact_output_and_acks_idempotently()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, _poll, pipeline) = pipeline_with_policy(
@@ -13097,7 +13283,9 @@ mod tests {
             b"checkpoint-boundary",
             b"checkpoint-boundary",
         )?;
-        durable_commit(&pipeline, pane, &journal, b"-durable-suffix")?;
+        for _ in 0..16 {
+            durable_commit(&pipeline, pane, &journal, b"-durable-suffix")?;
+        }
 
         let maximum_plaintext_bytes = 64 * 1024;
         let open = GuardianReplayRequestV1::Open {
@@ -13154,6 +13342,16 @@ mod tests {
         let mut cursor = first.next_cursor.ok_or("checkpoint page cursor")?;
         let mut suffix = Vec::new();
         let mut request_identity = 0xf130_u128;
+        let read_work = || {
+            let replay = store.inner.replay.lock().unwrap();
+            let output = replay.snapshots[&first.snapshot_id]
+                .output
+                .as_ref()
+                .unwrap();
+            assert_eq!(output.segments.len(), 1);
+            let work = *output.segments[0].read_work.lock().unwrap();
+            work
+        };
         loop {
             let continuation = GuardianReplayRequestV1::Continue { cursor };
             let request = checkpoint_catalog_replay_request(
@@ -13168,6 +13366,25 @@ mod tests {
             let replay_outcome =
                 store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
             let observed = observe_replay_page(replay_outcome, maximum_plaintext_bytes)?;
+            let before_retry = read_work();
+            let retry =
+                store.apply_replay(&request, state.preflight_replay(&request)?, Some(&journal))?;
+            let retry = observe_replay_page(retry, maximum_plaintext_bytes)?;
+            let after_retry = read_work();
+            assert_eq!(retry.page_digest, observed.page_digest);
+            assert_eq!(retry.output_plaintext, observed.output_plaintext);
+            assert_eq!(
+                after_retry.historical_frames, before_retry.historical_frames,
+                "full request retry must not rescan the predecessor's history"
+            );
+            assert_eq!(
+                after_retry.interval_frames - before_retry.interval_frames,
+                u64::try_from(observed.output_plaintext.len() / b"-durable-suffix".len())?
+            );
+            assert!(
+                after_retry.terminal_frames - before_retry.terminal_frames <= 2,
+                "one segment's terminal may be checked by resume and page validation"
+            );
             suffix.extend_from_slice(&observed.output_plaintext);
             ack_observed_replay_page(
                 &store,
@@ -13185,7 +13402,20 @@ mod tests {
             }
             cursor = observed.next_cursor.ok_or("nonterminal replay cursor")?;
         }
-        assert_eq!(suffix, b"-durable-suffix");
+        assert_eq!(suffix, b"-durable-suffix".repeat(16));
+        let work = read_work();
+        assert_eq!(
+            work.historical_frames, 1,
+            "initial checkpoint-prefix seek happens once"
+        );
+        assert_eq!(
+            work.interval_frames, 32,
+            "16 delivered frames plus 16 exact retry reads"
+        );
+        assert_eq!(
+            work.terminal_frames, 18,
+            "bounded terminal checks are counted separately"
+        );
         Ok(())
     }
 
