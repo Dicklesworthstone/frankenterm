@@ -5094,7 +5094,7 @@ mod tests {
         // An otherwise valid pristine model still needs the live storage
         // capability when default tiered retention is enabled. Preserve that
         // refusal rather than disabling tiering to make this fixture pass.
-        let missing_storage_config: Arc<dyn TerminalConfiguration> =
+        let missing_storage_config: Arc<dyn TerminalConfiguration + Send + Sync> =
             Arc::new(config::TermConfig::new());
         let pristine = Terminal::new(
             TerminalSize {
@@ -5110,12 +5110,12 @@ mod tests {
             Box::new(io::sink()),
         );
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&pristine, limits).unwrap();
-        let encoded = checkpoint.to_canonical_json(limits).unwrap();
-        let inert = TerminalCheckpointV2::decode_and_validate(&encoded, limits)
-            .unwrap()
-            .restore_inert(missing_storage_config)
-            .unwrap();
+        let checkpoint = pristine.capture_recovery_checkpoint(limits).unwrap();
+        let inert =
+            TerminalCheckpointV2::decode_canonical_json(checkpoint.canonical_payload(), limits)
+                .unwrap()
+                .restore_inert(missing_storage_config)
+                .unwrap();
         let failure = match inert.into_live(Box::new(io::sink())) {
             Ok(_) => panic!("tiered activation accepted a missing storage capability"),
             Err(failure) => failure,
