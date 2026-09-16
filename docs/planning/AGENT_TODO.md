@@ -349,7 +349,9 @@ receipts retain their original source identity; none qualifies RC24 by itself.
   and interrupted-write retry without poisoning the canonical record.
 - [x] Complete independent custody publication review, including the final
   fresh-store test after only incomplete staging files have survived.
-- [ ] Execute strict RCH guardian/mux custody tests on the committed source.
+- [x] Execute strict RCH guardian/mux custody tests on `fdbb5a3f7`:
+  job 57506 passed guardian 229, mux 1,176, client 329 and portable-pty 126.
+  The later lint and repaint corrections require renewed final-source proof.
 - [x] Finish the old immutable RC23 full-suite failure inventory: 69,882 passed,
   four failed and 59 ignored across 1,318 groups. The old controller terminated
   at the completed test boundary; it never ran gates four through six.
@@ -361,20 +363,22 @@ receipts retain their original source identity; none qualifies RC24 by itself.
   and the complete final suite are still required.
 - [x] Repair six custody test initializers exposed by RCH 57438 compiler errors
   in `91f6a3f16`; preserve production authentication and custody behavior.
-- [ ] Run guardian, mux, client and portable-pty libraries on the successor.
+- [x] Run all four successor libraries: 1,860 passed and zero failed in 57506.
 - [x] Execute RCH 57453 on `9db6b2d4`: guardian 229 passed with one explicitly
   sealed test ignored, and portable-pty 126 passed. Client had 328 passes and
   one failure; mux had 1,175 passes and one failure. The aggregate failed.
 - [x] Audit and correct the mux test's stale closed import inventory in
   `6e179e439`; fixed-width Rust 2018 custody decoding requires `TryInto`.
-- [ ] Verify the client retirement test waits for its actual resize completion
-  rather than assuming one executor tick selects that task; retain both oracles.
+- [x] Verify the client retirement test waits for actual resize completion:
+  `37d5eb2d3` preserves both oracles and passes in the complete client library.
 - [x] Commit the native startup geometry fix as `b0620e366` after the real Mac
   trace proved window creation preceded attachment and chose 80×24 incorrectly.
-- [ ] Run both real-mux startup regressions and both active-tab dispatch tests,
-  then verify unprimed native startup uses the configured 60×20 tab dimensions.
-- [ ] Run the one explicitly sealed real-Genesis guardian test; its ignored
-  result in the ordinary library run is not a pass.
+- [x] Run both real-mux startup regressions and both active-tab dispatch tests:
+  RCH 57514 passed all four on `fdbb5a3f7` with zero failures.
+- [ ] Verify final packaged unprimed native startup uses the configured 60×20
+  tab dimensions without a priming resize.
+- [x] Run the explicitly sealed real-Genesis guardian test: RCH 57512 passed
+  exactly one named test on `fdbb5a3f7`, zero failures and zero ignored.
 - [x] Complete all 29 static gates and workspace compiler check on `9db6b2d4`;
   the later startup correction still requires updated source qualification.
 - [ ] Verify the two core corrections, full client library, and two active-tab
@@ -387,9 +391,16 @@ receipts retain their original source identity; none qualifies RC24 by itself.
   selection variants, and the unchanged visible performance acceptance workload.
 - [x] Commit and tag RC24, then retain its failed static provenance gate and
   pre-compilation DSR source-sync failure. The RC24 tag remains immutable.
-- [ ] Commit coherent RC25 metadata, refreshed vendored provenance and tracker
-  export after the PTY correction. Complete every static gate before tagging
-  and admitting the replacement candidate; obtain all owner freeze acknowledgments.
+- [x] Commit coherent RC25 metadata and refreshed vendored provenance in
+  `fdbb5a3f7`; all 29 static gates and workspace check passed on that source.
+- [x] Diagnose all seven final Clippy failures and commit the two-file guardian
+  correction in `c9e70556a`, preserving custody ownership and origin authority.
+- [x] Independently review the timer-before-publication repaint race correction;
+  retain the one-shot early paint budget and backend/surface recovery exclusions.
+- [ ] Execute the six native-frame-readiness regressions on the successor,
+  then measure actual native latency with the unchanged acceptance workload.
+- [ ] Complete final-source static gates, workspace check and Clippy before
+  tagging RC25 and admitting native DSR; obtain all owner freeze acknowledgments.
 - [x] Verify the actual default native font actions preserve 1200x800 pixels
   and reflow 73→64→73 columns with the full Unicode corpus. The explicit true
   setting preserves the grid and changes window dimensions. These background
