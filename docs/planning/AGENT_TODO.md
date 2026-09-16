@@ -896,3 +896,14 @@ power loss nor migration of those live sessions has been demonstrated.
   creation and reuse after removal.
 - [ ] Independently review and execute the mux tab-stack regressions through
   strict RCH; preserve the distinction from live restored-window publication.
+
+### 2026-09-16 — BOCPD warmup property boundary
+
+- [x] Diagnose the actual `939da9667` workspace failure: the property treated
+  observation `min_observations` as warmup, although the production contract
+  and existing unit tests make that observation eligible for detection.
+- [x] Preserve all generated inputs and updates; assert exact post-update count
+  and warmup state. Retain the minimized seven-observation positive control
+  and an eight-observation-minimum suppression control (`ft-cb5l2`).
+- [ ] Run the full `proptest_bocpd` target and deterministic boundary test through
+  strict RCH. No production detector, threshold or generator was changed.

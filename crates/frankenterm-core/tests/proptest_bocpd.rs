@@ -474,6 +474,50 @@ proptest! {
 // Model behavioral properties
 // =============================================================================
 
+#[test]
+fn warmup_boundary_allows_detection_on_minimum_observation() {
+    // Minimized from seed fd8fa24af044061427d7193c514e5cfd19be53e16397ba0fdd3c992ab234665b.
+    let observations = [
+        74.32138885522961,
+        0.0,
+        0.0,
+        0.0,
+        -2.5795841844071714,
+        0.0,
+        -77.60555918968141,
+    ];
+    let config = BocpdConfig {
+        hazard_rate: 0.01,
+        detection_threshold: 0.5,
+        min_observations: 7,
+        max_run_length: 100,
+        ..Default::default()
+    };
+    let mut eligible = BocpdModel::new(config.clone());
+    let mut warming = BocpdModel::new(BocpdConfig {
+        min_observations: 8,
+        ..config
+    });
+    for (i, observation) in observations.into_iter().enumerate() {
+        let count = (i + 1) as u64;
+        let detected = eligible.update(observation);
+        assert_eq!(eligible.observation_count(), count);
+        assert_eq!(eligible.in_warmup(), count < 7);
+        if count < 7 {
+            assert!(detected.is_none(), "premature detection at count {count}");
+        } else {
+            let change = detected.expect("seventh observation is eligible to detect the shift");
+            assert_eq!(change.observation_index, 7);
+            assert!(change.posterior_probability >= 0.5);
+            assert_eq!(eligible.change_point_count(), 1);
+        }
+        assert!(warming.update(observation).is_none());
+        assert_eq!(warming.observation_count(), count);
+        assert!(warming.in_warmup());
+        assert_eq!(warming.change_point_count(), 0);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -493,16 +537,16 @@ proptest! {
         let mut model = BocpdModel::new(config);
 
         for (i, &x) in observations.iter().enumerate() {
-            if i < min_obs {
-                let cp = model.update(x);
+            let cp = model.update(x);
+            let observation_count = i + 1;
+            prop_assert_eq!(model.observation_count(), observation_count as u64);
+            prop_assert_eq!(model.in_warmup(), observation_count < min_obs);
+            if observation_count < min_obs {
                 prop_assert!(
                     cp.is_none(),
-                    "change-point detected during warmup at obs {}",
-                    i,
+                    "change-point detected during warmup at observation count {}",
+                    observation_count,
                 );
-                prop_assert!(model.in_warmup() || i + 1 == min_obs);
-            } else {
-                let _ = model.update(x);
             }
         }
     }
