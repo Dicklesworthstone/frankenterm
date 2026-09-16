@@ -20762,6 +20762,8 @@ mod tests {
                 identity: connection_identity,
                 connection_id,
                 broker_incarnation,
+                broker_lineage: wal_authenticator(authority_byte).lineage_id(),
+                broker_build: sealed(0xc3),
                 recovered_hello: false,
                 poisoned: false,
             };
@@ -20890,6 +20892,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xc6).lineage_id(),
+            broker_build: sealed(0xc9),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21030,6 +21034,8 @@ mod tests {
                 identity: connection_identity,
                 connection_id,
                 broker_incarnation,
+                broker_lineage: wal_authenticator(authority_byte).lineage_id(),
+                broker_build: sealed(0xc9),
                 recovered_hello: false,
                 poisoned: false,
             };
@@ -21083,6 +21089,8 @@ mod tests {
             identity: connection_identity,
             connection_id: id(6_252),
             broker_incarnation: id(6_253),
+            broker_lineage: wal_authenticator(0xcc).lineage_id(),
+            broker_build: sealed(0xcb),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21141,6 +21149,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xcf).lineage_id(),
+            broker_build: sealed(0xd2),
             recovered_hello: false,
             poisoned: false,
         };
@@ -21334,6 +21344,8 @@ mod tests {
             identity: connection_identity,
             connection_id,
             broker_incarnation,
+            broker_lineage: wal_authenticator(0xbc).lineage_id(),
+            broker_build: sealed(0xbf),
             recovered_hello: false,
             poisoned: false,
         };
