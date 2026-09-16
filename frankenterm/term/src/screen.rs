@@ -8795,6 +8795,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn selection_anchor_survives_unrelated_output_but_not_selected_row_mutation() {
+        for change_selected_row in [false, true] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig::default());
+            let mut term = crate::Terminal::new(
+                test_size(4, 12, 96),
+                config,
+                "anchor-source",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            term.advance_bytes("A界BCDEF\r\nother".as_bytes());
+            let sequence = term.current_seqno();
+            let points = [anchor_point(3, 0); 3];
+            let token = term
+                .screen_mut()
+                .capture_selection_anchor(sequence, points)
+                .unwrap();
+            term.advance_bytes(if change_selected_row {
+                b"\x1b[1;1HZ"
+            } else {
+                b"\x1b[2;1HZ"
+            });
+            let after_output = term.current_seqno();
+            assert!(after_output > sequence);
+            assert_eq!(
+                term.screen().resolve_selection_anchor(&token, after_output),
+                (!change_selected_row).then_some(points)
+            );
+            term.resize(test_size(4, 2, 96));
+            let mapped = term
+                .screen()
+                .resolve_selection_anchor(&token, term.current_seqno());
+            if change_selected_row {
+                assert!(
+                    mapped.is_none(),
+                    "selected-row mutation must reject anchor transport"
+                );
+            } else {
+                let point =
+                    mapped.expect("unrelated output must preserve held selection")[0].unwrap();
+                let row = term.screen().stable_row_to_phys(point.row).unwrap();
+                assert_eq!(
+                    term.screen().lines[row]
+                        .get_cell(point.column.unwrap())
+                        .unwrap()
+                        .str(),
+                    "B"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn selection_anchor_projects_actual_wide_rows_and_repeated_widths() {
         let mut screen = test_screen(1, 12, 96);
         screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
