@@ -13352,7 +13352,7 @@ mod tests {
             let work = *output.segments[0].read_work.lock().unwrap();
             work
         };
-        loop {
+        let work = loop {
             let continuation = GuardianReplayRequestV1::Continue { cursor };
             let request = checkpoint_catalog_replay_request(
                 guardian,
@@ -13398,12 +13398,23 @@ mod tests {
             )?;
             request_identity += 1;
             if observed.complete {
-                break;
+                // Terminal ACK releases the snapshot and its owned counters.
+                // Retain the actual final read observation from before ACK.
+                break after_retry;
             }
             cursor = observed.next_cursor.ok_or("nonterminal replay cursor")?;
-        }
+        };
         assert_eq!(suffix, b"-durable-suffix".repeat(16));
-        let work = read_work();
+        assert!(
+            !store
+                .inner
+                .replay
+                .lock()
+                .unwrap()
+                .snapshots
+                .contains_key(&first.snapshot_id),
+            "terminal ACK must release the completed snapshot"
+        );
         assert_eq!(
             work.historical_frames, 1,
             "initial checkpoint-prefix seek happens once"
