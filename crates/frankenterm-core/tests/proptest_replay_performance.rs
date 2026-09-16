@@ -376,18 +376,30 @@ proptest! {
         metric in arb_metric(),
         baseline in arb_positive_f64(),
     ) {
-        let budgets = ReplayPerformanceBudgets::default();
-        let budget_val = budgets.value_for(metric);
-        // Use a value within budget
-        let val = if metric.lower_is_better() {
-            budget_val * 0.5
-        } else {
-            budget_val * 2.0
-        };
-        let result = classify_metric_result(&budgets, metric, val, Some(baseline));
-        if let (Some(frac), Some(pct)) = (result.regression_fraction, result.regression_percent) {
-            prop_assert!(frac.mul_add(-100.0, pct).abs() < 1e-10,
-                "percent {} should equal fraction {} * 100", pct, frac);
+        // Exercise the retained small-baseline failure on every run, alongside
+        // the generated case, through exactly the same assertion.
+        for (metric, baseline) in [
+            (metric, baseline),
+            (ReplayPerformanceMetric::ReplayThroughputEventsPerSec, 0.03),
+            (ReplayPerformanceMetric::ArtifactReadEventsPerSec, 0.03),
+        ] {
+            let budgets = ReplayPerformanceBudgets::default();
+            let budget_val = budgets.value_for(metric);
+            let val = if metric.lower_is_better() {
+                budget_val * 0.5
+            } else {
+                budget_val * 2.0
+            };
+            let result = classify_metric_result(&budgets, metric, val, Some(baseline));
+            prop_assert!(result.regression_fraction.is_some());
+            // The contract is the rounded binary64 product. A fused residual
+            // measures the discarded rounding error instead, which grows with
+            // magnitude even when the percentage is exactly correct.
+            prop_assert_eq!(
+                result.regression_percent.map(f64::to_bits),
+                result.regression_fraction.map(|fraction| (fraction * 100.0).to_bits()),
+                "percentage must equal the correctly rounded fraction times 100"
+            );
         }
     }
 }

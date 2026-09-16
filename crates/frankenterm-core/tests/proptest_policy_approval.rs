@@ -132,29 +132,38 @@ proptest! {
 
     #[test]
     fn approval_tracker_snapshot_coherent_counters(
-        total in 0usize..1000,
-        pending in 0usize..1000,
-        approved in 0usize..1000,
-        rejected in 0usize..1000,
-        expired in 0usize..1000,
-        revoked in 0usize..1000,
-        extra_capacity in 0usize..1000,
+        statuses in prop::collection::vec(arb_approval_status(), 0..128),
+        capacity in 0usize..128,
     ) {
-        let pending = pending.min(total);
-        let approved = approved.min(total.saturating_sub(pending));
-        let rejected = rejected.min(total.saturating_sub(pending + approved));
-        let expired = expired.min(total.saturating_sub(pending + approved + rejected));
-        let revoked = revoked.min(total.saturating_sub(pending + approved + rejected + expired));
-
-        let snap = ApprovalTrackerSnapshot {
-            total,
-            pending,
-            approved,
-            rejected,
-            expired,
-            revoked,
-            max_entries: total + extra_capacity,
-        };
+        // Exercise the producer, not a hand-built DTO with unrelated totals.
+        // Transition immediately so eviction cannot remove a pending decision.
+        let mut tracker = ApprovalTracker::new(capacity);
+        for status in &statuses {
+            let expiry = if *status == ApprovalStatus::Expired { 2 } else { 0 };
+            let id = tracker.submit("action", "actor", "resource", "reason", "rule", 1, expiry);
+            match status {
+                ApprovalStatus::Pending | ApprovalStatus::Expired => {},
+                ApprovalStatus::Approved => prop_assert!(tracker.approve(&id, "op", 1)),
+                ApprovalStatus::Rejected => prop_assert!(tracker.reject(&id, "op", 1)),
+                ApprovalStatus::Revoked => {
+                    prop_assert!(tracker.approve(&id, "op", 1));
+                    prop_assert!(tracker.revoke(&id, "op", 1));
+                },
+            }
+        }
+        tracker.expire_stale(2);
+        // The tracker retains the newest entries and clamps zero capacity to one.
+        let effective_capacity = capacity.max(1);
+        let retained = &statuses[statuses.len().saturating_sub(effective_capacity)..];
+        let count = |status: ApprovalStatus| retained.iter().filter(|s| **s == status).count();
+        let snap = tracker.snapshot();
+        prop_assert_eq!(snap.total, retained.len());
+        prop_assert_eq!(snap.pending, count(ApprovalStatus::Pending));
+        prop_assert_eq!(snap.approved, count(ApprovalStatus::Approved));
+        prop_assert_eq!(snap.rejected, count(ApprovalStatus::Rejected));
+        prop_assert_eq!(snap.expired, count(ApprovalStatus::Expired));
+        prop_assert_eq!(snap.revoked, count(ApprovalStatus::Revoked));
+        prop_assert_eq!(snap.max_entries, effective_capacity);
 
         prop_assert_eq!(
             snap.pending + snap.approved + snap.rejected + snap.expired + snap.revoked,
