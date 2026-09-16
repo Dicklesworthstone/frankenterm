@@ -658,6 +658,44 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    struct OwnedTestChild(Box<dyn Child + Send + Sync>);
+
+    impl OwnedTestChild {
+        fn wait_success(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Some(status) = self.0.try_wait().expect("poll owned PTY child") {
+                    assert!(status.success(), "PTY child failed: {:?}", status);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("owned PTY child did not exit within its deadline");
+        }
+    }
+
+    impl Drop for OwnedTestChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            // Only this test's exact child handle is signalled. Unix Child::kill
+            // escalates from its bounded SIGHUP grace period to SIGKILL.
+            if let Err(error) = self.0.kill() {
+                eprintln!("failed to terminate owned PTY test child: {}", error);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Do not double-panic during assertion unwinding or block forever.
+            eprintln!("owned PTY test child could not be reaped within its deadline");
+        }
+    }
+
     fn read_until(reader: &mut dyn PollablePtyReader, needle: &[u8]) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut output = Vec::new();
@@ -794,24 +832,25 @@ mod tests {
         let writer = master.take_writer().expect("ordinary raw-mode writer");
         let mut command = CommandBuilder::new("/bin/sh");
         command.arg("-c");
-        command.arg("bytes=$(od -An -t u1 -N 2); printf 'bytes:%s:end\\n' \"$bytes\"");
-        let mut child = slave.spawn_command(command).expect("spawn raw-mode reader");
+        // Separate shell readiness from the byte-delivery deadline. `exec`
+        // keeps the byte reader in the owned child, with no command-substitution
+        // subprocess left behind if an assertion fails.
+        command.arg("printf 'raw-reader-ready\\n'; exec od -An -t u1 -N 2");
+        let mut child =
+            OwnedTestChild(slave.spawn_command(command).expect("spawn raw-mode reader"));
         drop(slave);
 
+        let ready = read_until(reader.as_mut(), b"raw-reader-ready\n");
+        assert_eq!(ready, b"raw-reader-ready\n");
         drop(writer);
-        let output = read_until(reader.as_mut(), b":end");
+        let output = read_until(reader.as_mut(), b"\n");
         let output = String::from_utf8_lossy(&output);
-        let encoded_bytes = output
-            .split_once("bytes:")
-            .and_then(|(_, suffix)| suffix.split_once(":end"))
-            .map(|(encoded, _)| encoded)
-            .expect("raw-mode byte report delimiters");
-        let delivered = encoded_bytes
+        let delivered = output
             .split_ascii_whitespace()
             .map(|byte| byte.parse::<u8>().expect("decimal byte from od"))
             .collect::<Vec<_>>();
         assert_eq!(delivered, [b'\n', eot]);
-        assert!(child.wait().expect("wait for raw-mode reader").success());
+        child.wait_success();
     }
 
     #[test]
