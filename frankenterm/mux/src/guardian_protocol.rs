@@ -8357,6 +8357,15 @@ impl std::fmt::Debug for GuardianGenesisReservationRecordV1 {
     }
 }
 
+/// Non-cloneable continuation for installing one reserved Genesis child into
+/// the runtime. It grants no PTY creation authority and cannot be reconstructed
+/// from wire fields. Keep it until the exact backend has been installed or its
+/// activation outcome has been fenced as indeterminate.
+pub struct GuardianGenesisActivationContinuationV1 {
+    guardian_incarnation: Uuid,
+    reservation: GuardianGenesisReservationRecordV1,
+}
+
 /// Authenticated Spawn identity recovered from a broker's durable WAL.
 ///
 /// Installing this value into a fresh protocol state permanently fences the
@@ -8675,7 +8684,12 @@ impl GuardianProtocolState {
             }
         }
 
-        if self.durable_spawn_fences_by_request.len() >= GUARDIAN_MAX_PANES {
+        if self.durable_spawn_fences_by_request.len() >= GUARDIAN_MAX_PANES
+            || (!self
+                .genesis_reservation_panes
+                .contains_key(&candidate.durable_pane_id)
+                && self.occupied_pane_slots()? >= GUARDIAN_MAX_PANES)
+        {
             return Err(GuardianProtocolError::CapacityExhausted);
         }
         self.durable_spawn_fences_by_request
@@ -8768,8 +8782,8 @@ impl GuardianProtocolState {
     /// authenticated Genesis `Begin`, the authenticated connection/successor
     /// authority, or the running guardian's sealed build authority. This
     /// method retains a permanent one-shot fence before returning the linear
-    /// permit. There is intentionally no companion production method that can
-    /// consume the permit and launch a child yet.
+    /// permit. Publication and broker child creation belong to the guardian
+    /// worker; this reservation does not mark the runtime pane ready.
     pub fn reserve_genesis_spawn(
         &mut self,
         spawn_request: &AuthenticatedGuardianRequest,
@@ -8892,6 +8906,157 @@ impl GuardianProtocolState {
         Ok(permit)
     }
 
+    /// Reserve publication and retain a separate, opaque runtime activation
+    /// continuation. The runtime must first publish Genesis, obtain durable
+    /// broker custody, and prepare its replay/input/output backends; this
+    /// continuation alone cannot create a child.
+    pub fn reserve_genesis_spawn_for_activation(
+        &mut self,
+        spawn_request: &AuthenticatedGuardianRequest,
+        genesis_begin_request: &AuthenticatedGuardianRequest,
+        mux_authority: Option<GuardianGenesisMuxAuthorityV1<'_>>,
+        live_guardian_authority: Option<&GuardianLiveBuildAuthorityV1>,
+    ) -> Result<
+        (
+            GuardianCheckpointGenesisSpawnPermitV1,
+            GuardianGenesisActivationContinuationV1,
+        ),
+        GuardianProtocolError,
+    > {
+        let permit = self.reserve_genesis_spawn(
+            spawn_request,
+            genesis_begin_request,
+            mux_authority,
+            live_guardian_authority,
+        )?;
+        let continuation = GuardianGenesisActivationContinuationV1 {
+            guardian_incarnation: self.incarnation,
+            reservation: GuardianGenesisReservationRecordV1::from_identity(
+                permit.reservation_identity(),
+            ),
+        };
+        Ok((permit, continuation))
+    }
+
+    /// Install the already-created, durably owned broker backend, never spawn
+    /// a child. The trusted runtime callback must perform the actual backend
+    /// installation and report its outcome under the same conservative panic
+    /// and ambiguity contract as other effect transactions.
+    ///
+    /// Borrowing the opaque continuation permits retry after a preflight
+    /// capacity refusal. Once applied or indeterminate, exact retries return
+    /// the retained outcome without invoking the callback again. The generic
+    /// Spawn entrypoint remains permanently fenced for this reservation.
+    pub fn finalize_genesis_spawn_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        continuation: &GuardianGenesisActivationContinuationV1,
+        install_backend: impl FnOnce(&GuardianReply) -> GuardianEffectOutcome<E>,
+    ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation
+            || continuation.guardian_incarnation != self.incarnation
+        {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if request.header.operation != GuardianOperation::Spawn {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            }
+            .into());
+        }
+        let reservation = &continuation.reservation;
+        if !reservation.matches_authenticated_spawn(request) {
+            return Err(GuardianProtocolError::RequestIdentityConflict.into());
+        }
+        if self
+            .genesis_reservations_by_request
+            .get(&reservation.origin_request_id)
+            != Some(reservation)
+            || self
+                .genesis_reservation_effects
+                .get(&reservation.spawn_effect_id)
+                != Some(&reservation.origin_request_id)
+            || self
+                .genesis_reservation_panes
+                .get(&reservation.durable_pane_id)
+                != Some(&reservation.origin_request_id)
+        {
+            return Err(GuardianProtocolError::InvalidGenesisReservation.into());
+        }
+        self.apply_effect_transaction_inner(request, install_backend)
+    }
+
+    /// Read an exact completed Genesis Spawn receipt without creating a child,
+    /// installing a backend, adding a request alias, or consuming authority.
+    /// Pending and indeterminate activation are never reported as completed.
+    pub fn completed_genesis_spawn_reply(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<Option<GuardianReply>, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch);
+        }
+        if request.header.operation != GuardianOperation::Spawn {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            });
+        }
+        let Some(reservation) = self
+            .genesis_reservations_by_request
+            .get(&request.header.request_id)
+        else {
+            self.fence_reserved_genesis_spawn(request)?;
+            return Ok(None);
+        };
+        if !reservation.matches_authenticated_spawn(request) {
+            return Err(GuardianProtocolError::RequestIdentityConflict);
+        }
+        let Some(stored) = self.requests.get(&request.header.request_id) else {
+            return Ok(None);
+        };
+        let fingerprint = EffectFingerprint::from_authenticated_request(request)?;
+        if stored.fingerprint != fingerprint || stored.effect_id != reservation.spawn_effect_id {
+            return Err(GuardianProtocolError::RequestIdentityConflict);
+        }
+        let effect = self.effects.get(&stored.effect_id).ok_or(
+            GuardianProtocolError::StateInvariantViolation("genesis-completed-receipt-effect"),
+        )?;
+        if effect.fingerprint != fingerprint || effect.reply != stored.reply {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "genesis-completed-receipt-identity",
+            ));
+        }
+        Ok((effect.state == StoredEffectState::Applied).then(|| stored.reply.clone()))
+    }
+
+    // A pending child reserves its future runtime slot. Permanent reservation
+    // and restart fences can overlap an installed pane and each other, but
+    // their union must count that pane only once.
+    fn occupied_pane_slots(&self) -> Result<usize, GuardianProtocolError> {
+        self.panes
+            .len()
+            .checked_add(
+                self.genesis_reservation_panes
+                    .keys()
+                    .filter(|pane| !self.panes.contains_key(*pane))
+                    .count(),
+            )
+            .and_then(|count| {
+                count.checked_add(
+                    self.durable_spawn_fence_panes
+                        .keys()
+                        .filter(|pane| {
+                            !self.panes.contains_key(*pane)
+                                && !self.genesis_reservation_panes.contains_key(*pane)
+                        })
+                        .count(),
+                )
+            })
+            .ok_or(GuardianProtocolError::CapacityExhausted)
+    }
+
     fn preflight_genesis_reservation_identity(
         &self,
         candidate: &GuardianGenesisReservationRecordV1,
@@ -8994,13 +9159,7 @@ impl GuardianProtocolState {
             ));
         }
 
-        let reserved_panes = self
-            .panes
-            .len()
-            .checked_add(self.genesis_reservation_panes.len())
-            .and_then(|count| count.checked_add(self.durable_spawn_fence_panes.len()))
-            .ok_or(GuardianProtocolError::CapacityExhausted)?;
-        if reserved_panes >= GUARDIAN_MAX_PANES {
+        if self.occupied_pane_slots()? >= GUARDIAN_MAX_PANES {
             return Err(GuardianProtocolError::CapacityExhausted);
         }
         Ok(())
@@ -10956,7 +11115,11 @@ impl GuardianProtocolState {
                 if self.panes.contains_key(&pane_id) {
                     return Err(GuardianProtocolError::PaneAlreadyExists(pane_id));
                 }
-                if self.panes.len() >= GUARDIAN_MAX_PANES {
+                let occupied = self.occupied_pane_slots()?;
+                if occupied > GUARDIAN_MAX_PANES
+                    || (occupied == GUARDIAN_MAX_PANES
+                        && !self.genesis_reservation_panes.contains_key(&pane_id))
+                {
                     return Err(GuardianProtocolError::CapacityExhausted);
                 }
                 Ok((
@@ -12779,6 +12942,221 @@ mod tests {
             state.preflight_genesis_checkpoint_stage(&seal, &owner, &guardian),
             Err(GuardianProtocolError::GenesisAuthorityUnavailable)
         ));
+    }
+
+    fn genesis_activation_fixture() -> (
+        GuardianProtocolState,
+        AuthenticatedGuardianRequest,
+        GuardianGenesisActivationContinuationV1,
+    ) {
+        let mut state = GuardianProtocolState::new(id(1)).unwrap();
+        let spawn = authenticate(&spawn_request(id(1), id(2), id(3)));
+        let begin = authenticate(&genesis_begin_request(
+            id(1),
+            id(2),
+            id(71),
+            id(5),
+            id(72),
+            &terminal_checkpoint(),
+        ));
+        let mux = mux_genesis_authority(&state, id(2), 0x51);
+        let guardian = live_genesis_authority(&state, 0x52);
+        let (_publication, continuation) = state
+            .reserve_genesis_spawn_for_activation(
+                &spawn,
+                &begin,
+                Some(GuardianGenesisMuxAuthorityV1::AuthenticatedConnection(&mux)),
+                Some(&guardian),
+            )
+            .unwrap();
+        (state, spawn, continuation)
+    }
+
+    #[test]
+    fn genesis_activation_commits_once_and_replays_without_callback() {
+        let (mut state, spawn, continuation) = genesis_activation_fixture();
+        assert_eq!(state.completed_genesis_spawn_reply(&spawn).unwrap(), None);
+        assert!(state.pane_state(id(3)).is_none());
+        let mut installations = 0;
+        let reply = state
+            .finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                installations += 1;
+                GuardianEffectOutcome::<()>::Applied
+            })
+            .unwrap();
+        assert_eq!(
+            reply,
+            GuardianReply::Spawned {
+                pane_id: id(3),
+                generation: 0
+            }
+        );
+        assert_eq!(
+            state.completed_genesis_spawn_reply(&spawn).unwrap(),
+            Some(reply.clone())
+        );
+        let replay = state
+            .finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                installations += 1;
+                GuardianEffectOutcome::<()>::Applied
+            })
+            .unwrap();
+        assert_eq!(replay, reply);
+        assert_eq!(installations, 1);
+        assert!(matches!(
+            state.apply_effect_transactionally(&spawn, |_| -> GuardianEffectOutcome<()> {
+                panic!("generic Spawn must not recreate a Genesis child")
+            }),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::GenesisSpawnRequiresPublishedAdmission
+            ))
+        ));
+    }
+
+    #[test]
+    fn genesis_activation_rejects_request_protocol_and_continuation_substitution() {
+        let (mut state, spawn, mut continuation) = genesis_activation_fixture();
+        let altered = authenticate(&spawn_request(id(1), id(9), id(3)));
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(
+                &altered,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("foreign mux must not install a backend")
+                }
+            ),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::RequestIdentityConflict
+            ))
+        ));
+        let mut other = GuardianProtocolState::new(id(9)).unwrap();
+        assert!(matches!(
+            other.finalize_genesis_spawn_transactionally(
+                &spawn,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("foreign guardian must not install a backend")
+                }
+            ),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::GuardianIncarnationMismatch
+            ))
+        ));
+        continuation.reservation.checkpoint_identity_digest[0] ^= 1;
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(
+                &spawn,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("changed initial model must not install a backend")
+                }
+            ),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::InvalidGenesisReservation
+            ))
+        ));
+        assert!(state.pane_state(id(3)).is_none());
+        assert_eq!(state.completed_genesis_spawn_reply(&spawn).unwrap(), None);
+    }
+
+    #[test]
+    fn genesis_activation_retries_definite_refusal_but_fences_unknown_outcome() {
+        let (mut state, spawn, continuation) = genesis_activation_fixture();
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                GuardianEffectOutcome::DefinitelyNotApplied("backend not ready")
+            }),
+            Err(GuardianEffectTransactionError::Effect("backend not ready"))
+        ));
+        assert!(state.pane_state(id(3)).is_none());
+        assert_eq!(state.completed_genesis_spawn_reply(&spawn).unwrap(), None);
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                GuardianEffectOutcome::<()>::OutcomeIndeterminate
+            }),
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+        ));
+        assert_eq!(state.completed_genesis_spawn_reply(&spawn).unwrap(), None);
+        assert!(matches!(
+            state.pane_state(id(3)),
+            Some(GuardianPaneState::Quarantined { .. })
+        ));
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(
+                &spawn,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("unknown activation must never run again")
+                }
+            ),
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+        ));
+    }
+
+    #[test]
+    fn genesis_activation_panic_preserves_unknown_outcome_without_reinstallation() {
+        let (mut state, spawn, continuation) = genesis_activation_fixture();
+        let mut attempts = 0;
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(
+                &spawn,
+                &continuation,
+                |_| -> GuardianEffectOutcome<()> {
+                    attempts += 1;
+                    panic!("activation failed after beginning backend installation")
+                }
+            ),
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+        ));
+        assert_eq!(state.completed_genesis_spawn_reply(&spawn).unwrap(), None);
+        assert!(matches!(
+            state.finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                attempts += 1;
+                GuardianEffectOutcome::<()>::Applied
+            }),
+            Err(GuardianEffectTransactionError::OutcomeIndeterminate(_))
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn genesis_reservation_keeps_one_capacity_slot_through_activation() {
+        let (mut state, spawn, continuation) = genesis_activation_fixture();
+        assert_eq!(state.occupied_pane_slots().unwrap(), 1);
+        state
+            .install_durable_spawn_fence(GuardianDurableSpawnFenceV1::from_genesis_record(
+                &continuation.reservation,
+            ))
+            .unwrap();
+        assert_eq!(state.occupied_pane_slots().unwrap(), 1);
+        for ordinal in 0..GUARDIAN_MAX_PANES - 1 {
+            state.panes.insert(
+                Uuid::from_u128(1_000 + u128::try_from(ordinal).unwrap()),
+                GuardianPaneState::LiveUnclaimed { generation: 0 },
+            );
+        }
+        assert_eq!(state.occupied_pane_slots().unwrap(), GUARDIAN_MAX_PANES);
+        let mut other = spawn_request(id(1), id(2), id(9));
+        other.header.request_id = id(90);
+        other.header.effect_id = Some(id(91));
+        assert!(matches!(
+            state.apply_effect_transactionally(
+                &authenticate(&other),
+                |_| -> GuardianEffectOutcome<()> {
+                    panic!("ordinary Spawn must not steal the reserved child's slot")
+                }
+            ),
+            Err(GuardianEffectTransactionError::Protocol(
+                GuardianProtocolError::CapacityExhausted
+            ))
+        ));
+        state
+            .finalize_genesis_spawn_transactionally(&spawn, &continuation, |_| {
+                GuardianEffectOutcome::<()>::Applied
+            })
+            .unwrap();
+        assert_eq!(state.occupied_pane_slots().unwrap(), GUARDIAN_MAX_PANES);
+        assert_eq!(state.panes.len(), GUARDIAN_MAX_PANES);
     }
 
     #[test]
