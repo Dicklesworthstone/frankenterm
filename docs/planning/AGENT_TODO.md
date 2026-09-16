@@ -315,7 +315,431 @@ CASS query for crash_loop_diagnostics returned stale/misaligned line references;
 it supplies no additional historical proof. Disposition: unfinished and
 unqualified, with the coordination collision disclosed; no done declaration.
 
-Current source handoff: `d895ed512` (health, four tests) and `d8a259a6e`
-(watcher, five tests). Nine authored regressions, zero executed in this batch.
-All remaining compilation, execution, native, and recovery-integration tasks
-above stay open. No existing session or installed application was changed.
+### 2026-09-16 02:03 UTC — current implementation and release checklist
+
+This checkpoint supersedes earlier pending-result statements above. Earlier
+receipts retain their original source identity; none qualifies RC24 by itself.
+
+- [x] Run six real watcher regressions on `3a5c13390`, strict RCH 57397:
+  six passed, including the original symlink/atomic-save failure.
+- [x] Complete RC23 workspace check on `cd561733c`, strict RCH 57398:
+  remote exit zero, no compiler diagnostics.
+- [x] Diagnose three failures in the actual RC23 core suite (31,811 passed):
+  transient snapshot classification and duplicate Drop-based text summaries.
+- [x] Commit both causal fixes as `94a8d1182`; retain original assertions.
+- [x] Commit real resize admission/completion handling and seven causal tests
+  as `804ff9f74`; uncertain operations are not automatically replayed.
+- [x] Commit active-tab-first resize dispatch as `9166fa098`; every hidden
+  tab still receives its resize, in its original relative order.
+- [x] Commit transitive macOS library packaging as `f479938ac`; ten focused
+  dependency graph tests, shell syntax and ShellCheck pass. Actual Mac probe
+  relocated and signed 14 libraries across 18 images and loaded successfully.
+- [x] Run real isolated Linux mux text/input smoke and native Mac headless
+  observation smoke using the RC23 development binaries; owned children settled.
+- [x] Run held Unicode selection through all seven original native phases,
+  including resize and Cmd±, on the exact RC23 GUI. All text/cursor oracles
+  passed. Its explicit fixed-window configuration does not prove the default.
+- [x] Run background 10,000-record resize: exact before/after content, ten
+  applied commits, no cancellation/rejection. This is not visible latency proof.
+- [x] Retain failed RC23 DSR run `cb7517fe-9850-4caa-be22-a21b93dbf690`.
+  Repair its diagnosed timeout, NFS AppleDouble packaging, and nested Windows
+  PowerShell launch causes in the private DSR configuration. No retry is armed.
+- [x] Commit authenticated spawn-capability custody as `444d936fa`: durable
+  self-describing encrypted record, fresh-process lookup, lost-ACK recovery,
+  and interrupted-write retry without poisoning the canonical record.
+- [x] Complete independent custody publication review, including the final
+  fresh-store test after only incomplete staging files have survived.
+- [x] Execute strict RCH guardian/mux custody tests on `fdbb5a3f7`:
+  job 57506 passed guardian 229, mux 1,176, client 329 and portable-pty 126.
+  The later lint and repaint corrections require renewed final-source proof.
+- [x] Finish the old immutable RC23 full-suite failure inventory: 69,882 passed,
+  four failed and 59 ignored across 1,318 groups. The old controller terminated
+  at the completed test boundary; it never ran gates four through six.
+- [ ] Resolve the fourth failure, the raw-mode PTY writer-drop test timeout;
+  separate child startup from byte delivery and retain the exact byte oracle.
+- [x] Commit that fixture correction as `d8bd1dac4`, with bounded cleanup of
+  its exact child. Strict RCH 57447 reran the original compiled test five times:
+  all passed. The original timeout's cause remains unproven; corrected execution
+  and the complete final suite are still required.
+- [x] Repair six custody test initializers exposed by RCH 57438 compiler errors
+  in `91f6a3f16`; preserve production authentication and custody behavior.
+- [x] Run all four successor libraries: 1,860 passed and zero failed in 57506.
+- [x] Execute RCH 57453 on `9db6b2d4`: guardian 229 passed with one explicitly
+  sealed test ignored, and portable-pty 126 passed. Client had 328 passes and
+  one failure; mux had 1,175 passes and one failure. The aggregate failed.
+- [x] Audit and correct the mux test's stale closed import inventory in
+  `6e179e439`; fixed-width Rust 2018 custody decoding requires `TryInto`.
+- [x] Verify the client retirement test waits for actual resize completion:
+  `37d5eb2d3` preserves both oracles and passes in the complete client library.
+- [x] Commit the native startup geometry fix as `b0620e366` after the real Mac
+  trace proved window creation preceded attachment and chose 80×24 incorrectly.
+- [x] Run both real-mux startup regressions and both active-tab dispatch tests:
+  RCH 57514 passed all four on `fdbb5a3f7` with zero failures.
+- [ ] Verify final packaged unprimed native startup uses the configured 60×20
+  tab dimensions without a priming resize.
+- [x] Run the explicitly sealed real-Genesis guardian test: RCH 57512 passed
+  exactly one named test on `fdbb5a3f7`, zero failures and zero ignored.
+- [x] Complete all 29 static gates and workspace compiler check on `9db6b2d4`;
+  the later startup correction still requires updated source qualification.
+- [ ] Verify the two core corrections, full client library, and two active-tab
+  dispatch tests through strict RCH on the final committed candidate.
+- [x] Execute both actual panic-profile subprocess artifacts: RCH job 57436 on
+  hz4 returned zero with `PANIC_CONTRACT_SUBPROCESS_SUCCESS`. Binary source is
+  `cd561733c`; current profile policy and both artifact hashes were checked
+  before and after execution. This is not a final RC24 binary qualification.
+- [ ] Finish native default Cmd±, real window resize/tiling, natural wrapping,
+  selection variants, and the unchanged visible performance acceptance workload.
+- [x] Commit and tag RC24, then retain its failed static provenance gate and
+  pre-compilation DSR source-sync failure. The RC24 tag remains immutable.
+- [x] Commit coherent RC25 metadata and refreshed vendored provenance in
+  `fdbb5a3f7`; all 29 static gates and workspace check passed on that source.
+- [x] Diagnose all seven final Clippy failures and commit the two-file guardian
+  correction in `c9e70556a`, preserving custody ownership and origin authority.
+- [x] Independently review the timer-before-publication repaint race correction;
+  retain the one-shot early paint budget and backend/surface recovery exclusions.
+- [ ] Execute the six native-frame-readiness regressions on the successor,
+  then measure actual native latency with the unchanged acceptance workload.
+- [ ] Complete final-source static gates, workspace check and Clippy before
+  tagging RC25 and admitting native DSR; obtain all owner freeze acknowledgments.
+- [x] Verify the actual default native font actions preserve 1200x800 pixels
+  and reflow 73→64→73 columns with the full Unicode corpus. The explicit true
+  setting preserves the grid and changes window dimensions. These background
+  action controls do not qualify keyboard delivery, pixels or visible latency.
+- [x] Verify real native Cmd+ and Cmd− with the default policy field absent:
+  exact 1200x800 window, 73→64→73 columns and retained Unicode corpus. Receipt
+  `ft-font-policy-4iv2vfor` identifies the RC23 development GUI; repeat against
+  the final packaged candidate. This does not establish visible latency.
+- [ ] Complete all six DSR quality gates on that source, including workspace
+  Clippy and exact clean-source formatting with a nonzero named test result.
+- [ ] Build all four DSR target families with the corrected 21,600-second
+  deadline, native APFS packaging, PS7 launcher, and serialized Linux host lock.
+- [ ] Run the actual completed Lindley producer with the unchanged workload,
+  arrival rate and held-out thresholds; retain failures without weakening them.
+- [ ] Finish the four attestation producers and verify their final source,
+  target, profile and manifest bindings before signing and publication.
+- [ ] Publish through DSR, verify release signatures/assets, canary and upgrade.
+- [ ] Safely activate the verified Mac bundle and prove Dock launches its exact
+  binary while preserving the existing GUI's local children and remote owners.
+- [ ] Complete broker-backed RuntimePane I/O, resize, exit and lease adoption;
+  encrypted custody alone does not enable ordinary guardian-owned sessions.
+- [ ] Complete full mux/parser/image serialization and RaptorQ recovery, then
+  prove disposable detach/restart/reattachment before any existing remote update.
+
+Existing remote muxes still perform their old terminal reflow. Client-side
+selection, dispatch and font-policy improvements do not replace that code.
+No existing remote owner has been restarted or updated by this campaign.
+
+### 2026-09-16 07:40 UTC — actual candidate failures and corrective work
+
+- [x] Finish RC25 Linux amd64 DSR build and verify the collected artifact hash.
+- [x] Run the actual built Lindley producer against its isolated mux. It failed
+  with an aligned response mismatch after the first burst; no success claimed.
+- [x] Diagnose a concrete fenced-read contract violation: capture can rebase
+  the requested rows while the reply retains the original layout identity.
+- [x] Commit `826ac0f3e`: reject shifted/truncated fenced captures, preserve
+  worker retirement, and add finite content-free client failure diagnostics.
+- [x] Independently review the server range tests and client connection-reuse
+  and diagnostic tests. Source review does not establish execution success.
+- [ ] Execute the two fenced-range regressions and eight client cases through
+  strict RCH, then repeat the unchanged live measurement on rebuilt binaries.
+- [x] Complete RC25 Mac compilation and all eight real headless smoke steps.
+- [x] Diagnose packaging failure: missing `DSR_SOURCE_REPOSITORY` made the
+  archive-contained assembler incorrectly take its Git-checkout entry path.
+- [x] Verify all 14,769 archived Mac source files against the exact Git commit;
+  prepare the corrected, inactive next-candidate configuration.
+- [x] Execute isolated raw-DSR-GUI startup/font controls: correct 60x20 startup,
+  fixed window dimensions, restored grid and exact Unicode corpus all passed.
+- [ ] Repeat those controls against the final packaged app. Raw binary controls
+  do not establish package quality. Foreground raw-GUI activation was refused
+  before input; selection requires the real bundle and remains unexecuted.
+- [x] Prove Windows NFS whole-range lock failure and replacement NTFS success;
+  transfer and verify the exact SDK, PDB preflight and missing registry archives.
+- [x] Commit DSR failed-target relocation and immutable attempt-log fixes as
+  `3f789b6`; 165 orchestration tests passed, zero failed or skipped.
+- [ ] Build the next immutable candidate on the ready Windows replacement;
+  retain the original failed target and never move an existing release tag.
+- [x] Identify cached-test fixture failures as stale RCH source paths, and
+  panic-build interruption as shared-daemon stale detection, not test passes.
+- [ ] Qualify the existing RCH stable-source and cleanup-observation fixes,
+  settle shared jobs before tool replacement, and repeat affected quality gates.
+- [ ] Finish the existing full-suite failure inventory without concealing its
+  stale-path failures or counting the cancelled panic build as successful.
+- [ ] Complete the remaining attestation, native interaction/performance,
+  publication, Dock activation and full-state recovery tasks listed above.
+
+Current implementation bead: `ft-ycr3m`, in progress. Existing sessions remain
+protected; no release has been published or installed from these partial results.
+
+### 2026-09-16 08:15 UTC — production bridge and full-suite repairs
+
+- [x] Pass both fenced-range regression tests through actual RCH worker 115
+  at `826ac0f3e` (2 passed); client contract test remains in flight.
+- [x] Replace the incoherent approval DTO counter property with real tracker
+  transitions and an independent retained-state oracle (`b55c32291`, `ft-7lyof`).
+- [x] Fix the replay percentage property's fused-rounding oracle with an exact
+  binary64 product check and the retained small-baseline case (`6052995b2`,
+  `ft-rmcb9`). No production arithmetic or tolerance was changed.
+- [x] Pass both complete property integration targets remotely at `1dc877ebf`
+  (RCH 57578): approval 29/29 and replay performance 36/36, zero filtered or
+  ignored. Original failures and seeds retained; `ft-7lyof`/`ft-rmcb9` closed.
+- [x] Commit authenticated broker output reads and the bounded durability
+  worker (`1dc877ebf`), including actual PTY output and journal-failure controls.
+- [ ] Pass guardian tests remotely, including the explicit sealed Genesis test.
+- [ ] Connect canonical downstream output persistence to authenticated broker
+  acknowledgement, including lost-ACK retry without duplicate journal records.
+- [ ] Establish durable Genesis adoption origin before enabling proxy startup;
+  raw checkpoint fields or native Spawn ACKs are not sufficient authority.
+- [x] Build the diagnostic RCH CLI/daemon/worker cohort through DSR successfully;
+  qualify hashes and executable identities before any coordinated replacement.
+- [ ] Drain existing work safely, install qualified RCH tools with backups,
+  enable the prepared durable worker and repeat affected quality gates.
+- [x] Reproduce and fix DSR's source reread after long-running dispatch;
+  166 orchestration checks pass, zero failed/skipped (`ft-sk2dq`).
+- [ ] Finish final-source DSR matrix, live Lindley measurement, attestations,
+  native acceptance, publication and safe Dock activation listed above.
+
+Foreground acceptance awaits the user clearing the protected macOS system
+notification. No alternate automation route is authorized by the tool refusal.
+
+### 2026-09-16 08:44 UTC — staged Genesis and broker continuity
+
+- [x] Pass the client contract regression at `826ac0f3e` on worker 115:
+  one named test executed, covering eight real socket cases; no filtered-test
+  success substituted for execution.
+- [x] Execute guardian library tests at `1dc877ebf`: 228 passed, one failed,
+  one ignored. Preserve the private-directory fixture failure; no suite pass.
+- [x] Execute the separately ignored published-Genesis broker test against
+  that sealed binary, with matching before/after hashes: one passed.
+- [x] Implement bounded terminal-record reauthentication for broker ACKs
+  (`fbad34fac`, deterministic negative followup `7a634c7f1`).
+- [x] Pass the complete mux journal module remotely at `7a634c7f1`
+  (RCH 57580): 51 passed, including all three terminal-record tests.
+  Fix its assertion-format warning in `c2f793277`/`42b21ec0a`; ACK integration
+  still requires guardian proof before `ft-p6ndm` closes.
+- [x] Implement staged Genesis publication from the exact authenticated
+  initial model and linear Spawn reservation, without fabricating a live
+  parser witness; include exact pixel geometry and substitution negatives.
+- [ ] Independently review and remotely test that new publication entrypoint
+  through the real encrypted-stage/broker fixture on its committed source.
+- [ ] Finish configured runtime startup through publication, broker Spawn,
+  durable custody, output open, downstream persistence and authenticated ACK.
+- [ ] Complete exact-owner child status, resize and bounded nonblocking input
+  under the existing guardian input WAL before declaring a proxy pane Live.
+- [ ] Prove lost replies remain indeterminate and cannot trigger raw input or
+  child-spawn retries; prove query reconciliation and ordinary second Spawn.
+- [ ] Rerun the corrected private-directory fixture and all guardian tests
+  on the integrated source, then freeze a new immutable release candidate.
+- [x] Pass staged authority's full checkpoint module at `42b21ec0a`
+  (RCH 57581): 34/34, no warnings. Later geometry changes still need proof.
+- [x] Commit typed Genesis activation and exact completed-reply replay
+  (`56eebb8e1`), retaining ambiguous/panic outcomes without callback replay.
+  Prevent ordinary Spawn stealing a pending child's reserved capacity slot;
+  count installed panes and permanent fences once.
+- [x] Fix the older live-witness Genesis constructor's missing pixel checks
+  (`287a81a80`) while preserving its real zero-parser-watermark requirement.
+- [x] Remotely execute the new activation/panic/capacity and live-pixel tests:
+  full mux library at `287a81a8021f676881d550a6b38c91c3a7273798`, RCH
+  30023644042231812, 1,184 passed, zero failed/ignored/filtered; all-target
+  Clippy with warnings denied passed in job 30023644042231813.
+- [x] Replace RCH CLI/daemon/worker with DSR-qualified `b4775837` artifacts
+  after empty-queue admission fencing, with backups and no interrupted jobs.
+- [x] Qualify actual jobs and stable source paths on durable worker `ts1`:
+  strict Clippy and two actual five-test fixture runs passed on the same
+  source/target pair after source retirement and rematerialization. The second
+  run recompiled its package in 0.79 seconds; this is not zero-recompile proof.
+
+### 2026-09-16 09:20 UTC — integrated Genesis replay proof preparation
+
+- [x] Bind Genesis replay to the actual published protected catalog and a
+  real empty encrypted journal before broker Spawn; retain exact reservation,
+  physical store/key identity and initial segment as private read authority.
+- [x] Extend producer replay to the authenticated zero-output origin and its
+  actual subsequent journal chain, including rollover. Ordinary record-origin
+  validation remains required for record checkpoints.
+- [x] Revalidate journal pins before empty Complete pages. Independent review
+  found this missing check; the real sealed publication test now corrupts and
+  fsyncs the pinned journal before Complete and requires InvalidFileMagic.
+- [x] Execute that explicit sealed test and the full guardian suite on the
+  integrated committed runtime source. Formatting/source review is not proof.
+- [ ] Execute the proxy consumer suite and full service path, including real
+  initial Claim, input deduplication, resize, child status and post-exit replay.
+- [ ] Audit compiler/test failures from the combined source, fix them, and
+  rerun the affected causal targets before final release qualification.
+- [x] Prepare private final DSR quality config with one required full source
+  SHA: all six original commands and thresholds preserved, static checks pass.
+- [ ] Freeze the next candidate and execute all six pinned quality gates,
+  native DSR matrix, live performance, attestations and release closeout.
+
+Genesis read authority is currently process-local. This does not establish
+fresh guardian restart recovery, power-loss recovery of arbitrary processes,
+or safe migration of the existing unguarded remote mux sessions.
+
+### 2026-09-16 09:34 UTC — actual integrated results and production caller
+
+- [x] Compile integrated guardian `ef840e86a` remotely and run the full library:
+  232 passed, one failed, three ignored. The failure was a real duplicate
+  append-writer collision from broker and receiving guardian sharing a store.
+- [x] Separate fixture stores and reject colliding physical token parents
+  before service artifacts are created. Keep strict append-writer exclusion.
+- [x] Retain the exact unconsumed admission permit, request, Begin and prepared
+  journals across pre-publication connection failure; never clear a shared
+  broker quarantine while retrying. Committed through `b5e97bbbd`.
+- [x] Run proxy tests remotely at `d1baa48c6` (RCH 30023644042231815): 43 passed,
+  zero failed/ignored, 610 filtered; canonical Genesis and geometry controls ran.
+- [x] Pass corrected full guardian at `b5e97bbbdeae1bfd9f25f56b531337ba09489c0f`,
+  RCH 30023644042231816: 235 passed, zero failures, four ignored. Execute each
+  ignored test explicitly in jobs 31817–31820: four separate one-test passes,
+  including real late-broker-start retry and damaged empty replay completion.
+- [ ] Complete strict all-target Clippy on the integrated guardian and proxy.
+- [x] Confirm normal mux startup still always selects LocalDomain; the proxy
+  module alone does not make guardian-backed panes available to the product.
+- [x] Add explicit opt-in GuardianDomain using the real publication/Spawn/
+  Claim/replay chain and a bounded off-loop cold transaction.
+- [x] Validate mux-owned unpublished guardian construction and publication;
+  cancellation or failed registration must retire its lease without Close.
+- [ ] Prove the actual Domain path with real guardian/broker services and child
+  output, including off-topology staging and normal pane publication.
+- [ ] Eliminate whole-history replay rescans under the existing bounded replay
+  bead `.8.12.4.5`; current wire limits do not bound total disk/CPU work. A safe
+  opaque interval/cursor design must retain requested-byte authentication and
+  distinguish it from a full-history scrub. The duplicate same-page catalog
+  validation was removed in `a7743a28b`; it does not solve the quadratic case.
+- [ ] Keep unknown Spawn outcomes fenced, retain exact identity for recovery,
+  and reject cross-mux/domain ownership substitution.
+- [ ] Complete final candidate quality, native/performance acceptance,
+  attestation producers, DSR release verification and safe Dock activation.
+
+The proxy parent bead remains open because its dependency proofs are not yet
+closed. Implementation progress is recorded without overriding that dependency
+state or treating the new opt-in path as existing-session migration.
+
+### 2026-09-16 09:56 UTC — domain integration and release preparation
+
+- [x] Commit actual opt-in domain at `671c1e13333909a5e5cf44989efcc56a5236d077`:
+  exact sealed Genesis birth, shared census, Claim0, replay, and mux publication.
+- [x] Retain an opaque mux publication receipt: cancellation keeps the birth
+  fenced, while publication remains recorded after a short-lived pane is pruned.
+- [x] Reject conflicting configured defaults at startup and before reload
+  mutation; preserve ordinary configuration behavior when guardian is unselected.
+- [x] Run four unpublished guardian tests at `8dfd4c9cd`, RCH job31823:
+  four passed, zero failed/ignored. Updated publication receipt assertions
+  require a new run at the integrated source.
+- [ ] Finish integrated strict Clippy: seven broker/transport test-only style
+  diagnostics are fixed. The following real-domain build found three type
+  errors before any tests ran; guarded-domain comparison and Send/Sync fixes
+  must pass the next integrated compilation.
+- [ ] Build actual sealed guardian CLI and run real mux-domain lifecycle test.
+- [ ] Add and run deterministic cancellation while the cold worker is in flight,
+  using real birth output and census exclusion rather than timing assumptions.
+- [ ] Run both CLI flag/default tests, six server reconciliation tests, and the
+  updated four mux publication tests on the integrated checkpoint.
+- [ ] Bound replay work within a snapshot using authenticated cursor bookmarks;
+  retain requested-byte validation and separate full-history scrub semantics.
+- [x] Refresh DSR readiness: doctor exit0 with generic act warnings; health
+  reports ten healthy, zero unhealthy, three warnings. Repo resolves this checkout.
+- [x] Back up private native config and activate the reviewed Mac Git-object
+  packaging authority and Windows NTFS host fixes; no build or release started.
+- [ ] Freeze a new candidate, generate exact-source producer evidence, complete
+  all six quality gates and native matrix, then publish and verify through DSR.
+
+The protected macOS notification still prevents foreground acceptance. Existing
+GUI children and remote mux sessions remain untouched; neither recovery across
+power loss nor migration of those live sessions has been demonstrated.
+
+### 2026-09-16 10:12 UTC — candidate RC26 and exact execution blockers
+
+- [x] Preserve guardian flags byte-for-byte through daemon re-exec, including
+  non-UTF-8 paths and flag-like child arguments. Causal parser roundtrip added.
+- [x] Prepare RC26 workspace metadata and all 32 first-party lockfile entries;
+  retain RC25 immutable. No RC26 tag, native build, publication or install yet.
+- [x] Run actual sealed guardian CLI build at `671c1e133`, RCH31825, exit0.
+- [ ] Rerun real domain after RCH31826 failed compilation with three type errors
+  and zero tests executed. Preserve the successful CLI receipt separately.
+- [x] Independent replay review caught predecessor rescans on whole-request
+  retry despite a passing leaf-shaped assertion; add opaque predecessor
+  authority and full authenticated request/retry frame-count assertions.
+- [ ] Execute the bounded replay tests, both real domain lifecycle tests,
+  daemon flag roundtrip, reload guards and publication tests on integrated RC26.
+- [x] Static Unix-coupling gate passes without loosening the baseline. Overall
+  static gate was 26 pass/3 fail/8 cargo skips; remaining source cleanliness and
+  provenance failures require the final committed source, not a claim of success.
+- [x] Confirm final RCH storage capacity: approximately 372 GiB durable disk free,
+  140 GiB available memory; no deletion or remount needed.
+
+### 2026-09-16 10:44 UTC — executed integration results
+
+- [x] Strict four-package all-target Clippy at `7c9f43123`, RCH31829, passed
+  with warnings denied. Covers guardian, mux, server implementation and server.
+- [x] Full mux library at the same source, RCH31830: 1,190 passed, zero failed,
+  including 53 journal tests and four unpublished guardian publication tests.
+- [x] Four explicitly selected sealed guardian tests, RCH31831: four passed,
+  including actual broker output durability and original-permit retry.
+- [x] Full guardian library at `57af3ef3b`, RCH31833: 236 passed, zero failed,
+  four ignored separately exercised above. Fixed a new assertion that inspected
+  a snapshot after its final ACK had correctly retired it; work bounds remain.
+- [x] Bound within-snapshot replay and whole-request retries with authenticated
+  bookmarks. Actual request tests retain exact 1 historical / 32 interval /
+  18 terminal-frame accounting. Cross-snapshot cold scans and catalog cost remain.
+- [x] Six server reload tests passed at `57af3ef3b`, including guardian default
+  preservation and rejection before conflicting configuration mutation.
+- [ ] Finish main parser/daemon tests and both actual domain lifecycle tests.
+  RCH31835 ran both domain tests and failed activation before publication.
+  The fixture omitted the real scrollback backend installed by production
+  startup. `68da4482b` preserves the typed cause, adds a missing-capability
+  negative control, and installs real isolated storage; rerun is still required.
+- [x] Verify production Unix listener admission cannot precede storage
+  initialization: accepted connections enqueue a handoff and then dispatch
+  behind startup in the same executor FIFO. No startup ordering change needed.
+- [ ] Verify `ft-j3061`: TLS listener was constructing a local task on its
+  listener thread. Transfer the admitted authenticated stream to the main
+  executor before session construction; causal ownership/TCP test added.
+- [ ] Freeze the corrected source, refresh Mac object authority, tag RC26 and
+  run DSR's four-target native build, exact-source quality and producer gates.
+- [ ] Execute final built-artifact performance/native selection/resize/font/Dock
+  acceptance, then publish and verify. Protected system notification still
+  blocks foreground interaction; no existing GUI or remote mux has been stopped.
+
+### 2026-09-16 11:17 UTC — multi-pane runtime and Claim recovery
+
+- [x] Run main parser/daemon tests: three passed at `57af3ef3b`.
+- [x] Prove `ft-j3061` at `46001b165`: all 25 server binary tests, including
+  TLS thread ownership, handshake timeout and peer rejection, passed. Strict
+  four-package all-target Clippy also passed. Bead closed with these receipts.
+- [x] Run implementation library: 649 passed, four Unix socket fixtures failed
+  from an overlong remote temporary path, three ignored. All eight local socket
+  tests then passed unchanged with explicit `TMPDIR=/tmp` (RCH31845).
+- [x] Preserve inactive RCH fixture residue by atomic non-overwriting rename
+  under its released source lock. No files deleted or permissions changed.
+- [ ] Complete real two-child Domain proof. `46001b165` publishes and renders
+  the first child, then fails the second birth. Normal replay-worker ownership
+  makes sealed Hello/staging retryably close; the new path lacked retries.
+- [ ] Verify bounded prebirth reconnect/staging retries retain identical
+  guardian/mux/effect/descriptor/payload/upload and original admission bounds.
+- [ ] Verify Claim retries preserve original request/effect/generation and
+  preallocated cleanup authority. Lost, malformed or unexpected replies must
+  retain unresolved Claim state; only an authenticated lease can become an
+  actor and issue Retire. Definite rejection must not leak a cleanup slot.
+- [ ] Run authenticated protocol/socket fault tests and real-process Domain
+  cancellation tests on the combined fix. Protocol-only fixtures do not prove
+  PTY survival; the actual guardian/broker/child tests remain required.
+- [ ] Finish final source freeze, DSR native build, six quality gates, four
+  attestation producers, measured performance, foreground acceptance and release.
+
+### 2026-09-16 11:35 UTC — fix actual broker scheduling starvation
+
+- [x] Checkpoint bounded birth/Claim retries at `2d6c3f389`; static gates
+  passed 29/29. Actual proxy suite ran 43 passed, four new socket fixtures
+  failed before protocol, two ignored. Their directories were mode 0775;
+  create them explicitly as 0700 before provisioning the token, then rerun.
+- [ ] Complete `ft-n9467` (in progress, SandyCanyon): actual Domain tests
+  still failed 0/2 in RCH31848. Broker output completion immediately queued
+  another background read/status operation, leaving no idle session for a
+  second Spawn. Retain bounded authenticated Genesis admission while the
+  current operation drains. Resize/Input already have this scheduling guard.
+- [ ] Rerun the four Claim fault cases, full proxy suite and actual Domain
+  tests on the combined fix, preserving all existing lifecycle assertions.
+- [x] Refresh DSR readiness and Mac object authority through `2d6c3f389`.
+  Ten hosts healthy, none unhealthy. Preparation is not a native build.
+- [ ] Qualify all four attestation producers and create the complete RC26
+  retained manifest before the sixth DSR quality gate; its required input
+  is currently absent. No release tag or published artifact exists yet.
