@@ -58,6 +58,12 @@ use crossbeam::queue::ArrayQueue;
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionAnchorCaptureError {
+    Busy,
+    SourceChanged,
+}
+
 type LineLayoutObservation = Mutex<
     Option<(
         frankenterm_term::screen::ScreenCoordinateWitness,
@@ -3026,17 +3032,53 @@ impl LocalPane {
         expected_sequence: SequenceNo,
         expected_dimensions: RenderableDimensions,
         points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
-    ) -> Option<frankenterm_term::screen::ScreenSelectionAnchor> {
-        let mut term = self.terminal.try_lock()?;
-        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
-        if floor != expected_floor
-            || term.current_seqno() != expected_sequence
-            || terminal_get_dimensions(&mut term) != expected_dimensions
-        {
-            return None;
+    ) -> Result<Option<frankenterm_term::screen::ScreenSelectionAnchor>, SelectionAnchorCaptureError>
+    {
+        let mut term = self
+            .terminal
+            .try_lock()
+            .ok_or(SelectionAnchorCaptureError::Busy)?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+            .ok_or(SelectionAnchorCaptureError::Busy)?;
+        if floor != expected_floor || terminal_get_dimensions(&mut term) != expected_dimensions {
+            return Err(SelectionAnchorCaptureError::SourceChanged);
         }
-        term.screen_mut()
-            .capture_selection_anchor(expected_sequence, points)
+        let sequence = term.current_seqno();
+        if sequence != expected_sequence {
+            if sequence < expected_sequence {
+                return Err(SelectionAnchorCaptureError::SourceChanged);
+            }
+            let mut rows = points.iter().flatten().map(|point| point.row);
+            let Some(first) = rows.next() else {
+                return Err(SelectionAnchorCaptureError::SourceChanged);
+            };
+            let (start, end) = rows.fold((first, first), |(start, end), row| {
+                (start.min(row), end.max(row))
+            });
+            let screen = term.screen();
+            let Some(start) = screen.stable_row_to_phys(start) else {
+                return Err(SelectionAnchorCaptureError::SourceChanged);
+            };
+            let Some(end) = screen
+                .stable_row_to_phys(end)
+                .and_then(|end| end.checked_add(1))
+            else {
+                return Err(SelectionAnchorCaptureError::SourceChanged);
+            };
+            let mut changed = false;
+            screen.with_phys_lines(start..end, |lines| {
+                changed |= lines
+                    .iter()
+                    .any(|line| line.changed_since(expected_sequence));
+            });
+            if changed {
+                return Err(SelectionAnchorCaptureError::SourceChanged);
+            }
+        }
+        // A valid source may not support remapping (alternate screen, cold
+        // coordinates, or a full anchor registry). Ordinary selection remains
+        // valid there; callers must not confuse this with a busy acquisition.
+        Ok(term.screen_mut().capture_selection_anchor(sequence, points))
     }
 
     /// Outer None means unavailable; an inner None is an invalid token at the
@@ -6312,9 +6354,10 @@ mod tests {
         }); 3];
         assert!(pane
             .capture_selection_anchor(floor, before, dimensions, points)
-            .is_none());
+            .is_err());
         let anchor = pane
             .capture_selection_anchor(floor, frame.source_sequence, dimensions, points)
+            .unwrap()
             .unwrap();
         // Line retains a weak cache reference; the renderer owns the payload.
         let metadata = Arc::new(42u32);
@@ -6369,20 +6412,22 @@ mod tests {
         }); 3];
         assert!(pane
             .capture_selection_anchor(floor, sequence.saturating_add(1), dimensions, points)
-            .is_none());
+            .is_err());
         let mut wrong_dimensions = dimensions;
         wrong_dimensions.cols += 1;
         assert!(pane
             .capture_selection_anchor(floor, sequence, wrong_dimensions, points)
-            .is_none());
+            .is_err());
         let token = pane
             .capture_selection_anchor(floor, sequence, dimensions, points)
+            .unwrap()
             .unwrap();
         {
             let _busy = pane.terminal.lock();
-            assert!(pane
-                .capture_selection_anchor(floor, sequence, dimensions, points)
-                .is_none());
+            assert_eq!(
+                pane.capture_selection_anchor(floor, sequence, dimensions, points),
+                Err(SelectionAnchorCaptureError::Busy)
+            );
             assert!(pane.selection_anchor_snapshot(&token).is_none());
         }
         assert_eq!(
@@ -6439,6 +6484,86 @@ mod tests {
         assert!(
             pane.selection_anchor_snapshot(&token).unwrap().3.is_none(),
             "an alternate-screen ABA cannot reauthorize the original token"
+        );
+        pane.terminal.lock().advance_bytes(b"\x1b[?1049h");
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        assert_eq!(
+            pane.capture_selection_anchor(floor, sequence, dimensions, points),
+            Ok(None),
+            "current alternate-screen selection is valid but has no reflow anchor"
+        );
+        pane.terminal.lock().advance_bytes(b"\x1b[?1049l");
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let nonresident = [Some(SelectionAnchorCoordinate {
+            row: -1,
+            column: Some(0),
+        }); 3];
+        assert_eq!(
+            pane.capture_selection_anchor(floor, sequence, dimensions, nonresident),
+            Ok(None),
+            "nonresident history cannot produce a hot-row anchor"
+        );
+        drop(token);
+        let retained: Vec<_> = (0..16)
+            .map(|_| {
+                pane.capture_selection_anchor(floor, sequence, dimensions, points)
+                    .unwrap()
+                    .expect("resident point must fill an available registry slot")
+            })
+            .collect();
+        assert_eq!(
+            pane.capture_selection_anchor(floor, sequence, dimensions, points),
+            Ok(None),
+            "registry capacity refuses remapping, not ordinary selection"
+        );
+        assert_eq!(retained.len(), 16);
+    }
+
+    #[test]
+    fn native_selection_capture_accepts_only_proven_unchanged_selected_rows() {
+        use frankenterm_term::screen::SelectionAnchorCoordinate;
+        let pane = LocalPane::new(
+            706,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x76; 16],
+            "selection-source-proof".to_string(),
+        );
+        pane.terminal.lock().advance_bytes(b"selected text");
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let points = [Some(SelectionAnchorCoordinate {
+            row: 0,
+            column: Some(3),
+        }); 3];
+        {
+            let _busy = pane.terminal.lock();
+            assert_eq!(
+                pane.capture_selection_anchor(floor, sequence, dimensions, points),
+                Err(SelectionAnchorCaptureError::Busy)
+            );
+        }
+        pane.terminal
+            .lock()
+            .advance_bytes(b"\x1b[2;1Hunrelated output");
+        let token = pane
+            .capture_selection_anchor(floor, sequence, dimensions, points)
+            .expect("unrelated output must not invalidate unchanged selected rows")
+            .expect("resident unchanged points must receive an anchor");
+        assert_eq!(
+            pane.selection_anchor_snapshot(&token).unwrap().3,
+            Some(points)
+        );
+        pane.terminal
+            .lock()
+            .advance_bytes(b"\x1b[1;1Hchanged selection");
+        assert_eq!(
+            pane.capture_selection_anchor(floor, sequence, dimensions, points),
+            Err(SelectionAnchorCaptureError::SourceChanged)
         );
     }
 

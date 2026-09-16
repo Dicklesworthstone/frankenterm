@@ -488,6 +488,7 @@ pub struct PaneState {
     selection_frame: crate::selection::SelectionFrameState,
     mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
     pending_selection_start: Option<crate::selection::PendingSelectionStart>,
+    pending_native_selection: Option<crate::selection::PendingNativeSelection>,
     suppress_selection_link: bool,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -7145,6 +7146,9 @@ impl TermWindow {
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
                 self.retry_pending_selection_start(pane);
                 self.clear_selection_drag();
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let suppress_link = {
                     let mut state = self.pane_state(pane.pane_id());
                     state.pending_selection_start = None;
@@ -7172,6 +7176,9 @@ impl TermWindow {
             CompleteSelection(dest) => {
                 self.retry_pending_selection_start(pane);
                 self.clear_selection_drag();
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 {
                     let mut state = self.pane_state(pane.pane_id());
                     state.pending_selection_start = None;

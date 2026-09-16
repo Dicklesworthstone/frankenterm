@@ -99,8 +99,8 @@ impl super::TermWindow {
     ) {
         let pane_id = pane.pane_id();
         let current_seqno = pane.get_current_seqno();
+        let mut selection = self.selection(pane_id).clone();
         {
-            let mut selection = self.selection(pane_id);
             update(&mut selection);
             selection.seqno = current_seqno;
             selection.authority = expected;
@@ -110,7 +110,7 @@ impl super::TermWindow {
                 selection.clear();
             }
         }
-        self.remember_native_selection(pane);
+        self.commit_selection_candidate(pane, selection);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -128,33 +128,132 @@ impl super::TermWindow {
             && self.selection(pane.pane_id()).is_invalidated_by(current)
     }
 
-    fn remember_native_selection(&self, pane: &Arc<dyn Pane>) {
+    fn capture_native_selection(
+        pane: &Arc<dyn Pane>,
+        local: &mux::localpane::LocalPane,
+        desired: &Selection,
+    ) -> crate::selection::NativeSelectionCapture {
+        use crate::selection::NativeSelectionCapture;
+        let Some((authority, _, dimensions)) = SelectionAuthority::capture_source(&**pane) else {
+            return NativeSelectionCapture::Busy;
+        };
+        if desired.authority != Some(authority) {
+            return NativeSelectionCapture::Invalidated;
+        }
+        local
+            .capture_selection_anchor(
+                authority.layout_floor(),
+                desired.seqno,
+                dimensions,
+                desired.native_points(),
+            )
+            .into()
+    }
+
+    fn commit_selection_candidate(&self, pane: &Arc<dyn Pane>, desired: Selection) {
+        if pane.downcast_ref::<mux::localpane::LocalPane>().is_none()
+            || desired.rectangular
+            || (desired.origin.is_none() && desired.range.is_none())
+        {
+            let mut state = self.pane_state(pane.pane_id());
+            state.pending_native_selection = None;
+            state.selection = desired;
+            return;
+        }
+        // A newer gesture supersedes any deferred clipboard operation.
+        self.pane_state(pane.pane_id()).pending_native_selection =
+            Some(crate::selection::PendingNativeSelection::new(desired));
+        self.retry_pending_native_selection(pane);
+    }
+
+    pub(super) fn retry_pending_native_selection(&self, pane: &Arc<dyn Pane>) {
         let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
             return;
         };
-        let before = self.selection(pane.pane_id()).clone();
-        if before.rectangular || (before.origin.is_none() && before.range.is_none()) {
-            return;
-        }
-        let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
+        let Some(mut pending) = self
+            .pane_state(pane.pane_id())
+            .pending_native_selection
+            .clone()
         else {
             return;
         };
-        if before.authority != Some(authority) || before.seqno != sequence {
-            return;
+        if pending.committed {
+            self.selection_authority_is_current(pane);
+            let current = self.selection(pane.pane_id()).clone();
+            let same = match (current.native_anchor(), pending.desired.native_anchor()) {
+                (Some(current), Some(expected)) => current == expected,
+                (None, None) => current == pending.desired,
+                _ => false,
+            };
+            if !same {
+                self.pane_state(pane.pane_id()).pending_native_selection = None;
+                return;
+            }
+            pending.desired = current;
         }
-        let Some(token) = local.capture_selection_anchor(
-            authority.layout_floor(),
-            sequence,
-            dimensions,
-            before.native_points(),
-        ) else {
-            return;
+        let capture = Self::capture_native_selection(pane, local, &pending.desired);
+        let result = {
+            let mut state = self.pane_state(pane.pane_id());
+            let result = pending.try_commit(&mut state.selection, capture);
+            if matches!(
+                result,
+                Some(crate::selection::NativeSelectionCommit::Applied { .. })
+            ) && pending.copy.is_some()
+            {
+                pending.committed = true;
+                pending.desired = state.selection.clone();
+                state.pending_native_selection = Some(pending.clone());
+            } else if result.is_some() {
+                state.pending_native_selection = None;
+            }
+            result
         };
-        let mut selection = self.selection(pane.pane_id());
-        if *selection == before {
-            selection.remember_native_anchor(token);
+        if let Some(crate::selection::NativeSelectionCommit::Applied { needs_repaint }) = result {
+            if needs_repaint {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            if let Some(destination) = pending.copy {
+                let text = self.selection_text(pane);
+                // Copy must be retried independently if its source acquisition
+                // loses the same contention race after anchor registration.
+                if text.is_empty() && pending.desired.range.is_some() {
+                    return;
+                }
+                match Self::capture_native_selection(pane, local, &pending.desired) {
+                    crate::selection::NativeSelectionCapture::Busy => return,
+                    crate::selection::NativeSelectionCapture::Invalidated => {
+                        self.pane_state(pane.pane_id()).pending_native_selection = None;
+                        return;
+                    }
+                    _ => {}
+                }
+                self.pane_state(pane.pane_id()).pending_native_selection = None;
+                if !text.is_empty() {
+                    self.copy_to_clipboard(destination, text);
+                }
+            }
         }
+    }
+
+    /// Bind release to the exact pending endpoint; never copy an older anchor.
+    pub(super) fn defer_pending_selection_copy(
+        &self,
+        pane: &Arc<dyn Pane>,
+        destination: config::keyassignment::ClipboardCopyDestination,
+    ) -> bool {
+        let mut state = self.pane_state(pane.pane_id());
+        let Some(pending) = state.pending_native_selection.as_mut() else {
+            return false;
+        };
+        pending.copy = Some(destination);
+        pending.paint_retries_remaining = 3;
+        drop(state);
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+        true
     }
 
     /// Return true only when a potentially valid remap is temporarily
@@ -252,6 +351,7 @@ impl super::TermWindow {
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
         self.clear_selection_drag();
         self.pane_state(pane.pane_id()).pending_selection_start = None;
+        self.pane_state(pane.pane_id()).pending_native_selection = None;
         self.update_selection(pane, None, Selection::clear);
     }
 
@@ -278,13 +378,20 @@ impl super::TermWindow {
             }
             return;
         }
-        if self.selection_authority_has_changed(pane) {
+        self.retry_pending_native_selection(pane);
+        self.selection_authority_is_current(pane);
+        let pending_desired = self
+            .pane_state(pane.pane_id())
+            .pending_native_selection
+            .as_ref()
+            .map(|pending| pending.desired.clone());
+        let mut desired = pending_desired.unwrap_or_else(|| self.selection(pane.pane_id()).clone());
+        let current = SelectionAuthority::capture(&**pane);
+        if desired.is_invalidated_by(current) {
             self.clear_selection(pane);
             return;
         }
-        if !self.selection_authority_is_current(pane)
-            || self.mouse_selection_authority(pane).is_none()
-        {
+        if !desired.is_authorized_by(current) || self.mouse_selection_authority(pane).is_none() {
             // Output/parser contention or autoscroll can outrun presentation.
             // Wait for a usable frame without discarding the drag's anchor.
             if let Some(window) = self.window.as_ref() {
@@ -292,7 +399,7 @@ impl super::TermWindow {
             }
             return;
         }
-        self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
+        desired.seqno = pane.get_current_seqno();
         let (position, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
             Some(coords) => coords,
             None => return,
@@ -302,12 +409,9 @@ impl super::TermWindow {
             SelectionMode::Cell | SelectionMode::Block => {
                 // Origin is the cell in which the selection action started. E.g. the cell
                 // that had the mouse over it when the left mouse button was pressed
-                let origin = self
-                    .selection(pane.pane_id())
-                    .origin
-                    .unwrap_or(SelectionCoordinate::x_y(x, y));
-                self.selection(pane.pane_id()).origin = Some(origin);
-                self.selection(pane.pane_id()).rectangular = mode == SelectionMode::Block;
+                let origin = desired.origin.unwrap_or(SelectionCoordinate::x_y(x, y));
+                desired.origin = Some(origin);
+                desired.rectangular = mode == SelectionMode::Block;
 
                 // Compute the start and end horizontall cell of the selection.
                 // The selection extent depends on the mouse cursor position in relation
@@ -339,32 +443,27 @@ impl super::TermWindow {
                     }
                 };
 
-                self.selection(pane.pane_id()).range =
-                    if mode == SelectionMode::Block && origin.x == x {
-                        // Ignore rectangle selections with a width of zero
-                        None
-                    } else if origin.x != x || origin.y != y {
-                        // Only considers a selection if the cursor moved from the origin point
-                        Some(
-                            SelectionRange::start(SelectionCoordinate {
-                                x: start_x,
-                                y: origin.y,
-                            })
-                            .extend(SelectionCoordinate { x: end_x, y }),
-                        )
-                    } else {
-                        None
-                    };
+                desired.range = if mode == SelectionMode::Block && origin.x == x {
+                    // Ignore rectangle selections with a width of zero
+                    None
+                } else if origin.x != x || origin.y != y {
+                    // Only considers a selection if the cursor moved from the origin point
+                    Some(
+                        SelectionRange::start(SelectionCoordinate {
+                            x: start_x,
+                            y: origin.y,
+                        })
+                        .extend(SelectionCoordinate { x: end_x, y }),
+                    )
+                } else {
+                    None
+                };
             }
             SelectionMode::Word => {
                 let (end_word, end_pick) =
                     SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
-                let start_coord = self
-                    .selection(pane.pane_id())
-                    .origin
-                    .clone()
-                    .unwrap_or(end_word.start);
+                let start_coord = desired.origin.clone().unwrap_or(end_word.start);
                 // Anchor-side pick is intentionally discarded: the
                 // user gets one selection, and the announcement
                 // tracks the cursor (moving endpoint) so screen
@@ -372,50 +471,42 @@ impl super::TermWindow {
                 let (start_word, _) = SelectionRange::smart_or_word_around(start_coord, &**pane);
 
                 let selection_range = start_word.extend_with(end_word);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
                 announce_pick_if_smart(end_pick);
             }
             SelectionMode::Line => {
                 let (end_line, end_pick) =
                     SelectionRange::smart_or_line_around(SelectionCoordinate::x_y(x, y), &**pane);
 
-                let start_coord = self
-                    .selection(pane.pane_id())
-                    .origin
-                    .clone()
-                    .unwrap_or(end_line.start);
+                let start_coord = desired.origin.clone().unwrap_or(end_line.start);
                 // Anchor-side pick is intentionally discarded so a
                 // drag-select doesn't double-fire the announcement;
                 // the cursor (moving endpoint) drives the AT cue.
                 let (start_line, _) = SelectionRange::smart_or_line_around(start_coord, &**pane);
 
                 let selection_range = start_line.extend_with(end_line);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
                 announce_pick_if_smart(end_pick);
             }
             SelectionMode::SemanticZone => {
                 let end_word = SelectionRange::zone_around(SelectionCoordinate::x_y(x, y), &**pane);
 
-                let start_coord = self
-                    .selection(pane.pane_id())
-                    .origin
-                    .clone()
-                    .unwrap_or(end_word.start);
+                let start_coord = desired.origin.clone().unwrap_or(end_word.start);
                 let start_word = SelectionRange::zone_around(start_coord, &**pane);
 
                 let selection_range = start_word.extend_with(end_word);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
             }
         }
 
-        if self.selection_authority_has_changed(pane) {
+        if desired.is_invalidated_by(SelectionAuthority::capture(&**pane)) {
             self.clear_selection(pane);
             return;
         }
-        self.remember_native_selection(pane);
+        self.commit_selection_candidate(pane, desired);
         let dims = pane.get_dimensions();
 
         // Scroll viewport when the mouse moves out of its vertical bounds.
@@ -437,6 +528,7 @@ impl super::TermWindow {
         {
             let mut state = self.pane_state(pane.pane_id());
             state.pending_selection_start = None;
+            state.pending_native_selection = None;
             state.suppress_selection_link = false;
         }
         let expected = self.mouse_selection_authority(pane);
@@ -534,47 +626,47 @@ impl super::TermWindow {
         x: usize,
         y: StableRowIndex,
     ) {
+        let mut desired = Selection::default();
         match mode {
             SelectionMode::Line => {
                 let start = SelectionCoordinate::x_y(x, y);
                 let (selection_range, pick) = SelectionRange::smart_or_line_around(start, &**pane);
 
-                self.selection(pane.pane_id()).origin = Some(start);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.origin = Some(start);
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
                 announce_pick_if_smart(pick);
             }
             SelectionMode::Word => {
                 let (selection_range, pick) =
                     SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
-                self.selection(pane.pane_id()).origin = Some(selection_range.start);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.origin = Some(selection_range.start);
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
                 announce_pick_if_smart(pick);
             }
             SelectionMode::SemanticZone => {
                 let selection_range =
                     SelectionRange::zone_around(SelectionCoordinate::x_y(x, y), &**pane);
 
-                self.selection(pane.pane_id()).origin = Some(selection_range.start);
-                self.selection(pane.pane_id()).range = Some(selection_range);
-                self.selection(pane.pane_id()).rectangular = false;
+                desired.origin = Some(selection_range.start);
+                desired.range = Some(selection_range);
+                desired.rectangular = false;
             }
             SelectionMode::Cell | SelectionMode::Block => {
-                self.selection(pane.pane_id())
-                    .begin(SelectionCoordinate::x_y(x, y));
-                self.selection(pane.pane_id()).rectangular = mode == SelectionMode::Block;
+                desired.begin(SelectionCoordinate::x_y(x, y));
+                desired.rectangular = mode == SelectionMode::Block;
             }
         }
 
-        self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
-        self.selection(pane.pane_id()).authority = expected;
-        if self.selection_authority_has_changed(pane) {
+        desired.seqno = pane.get_current_seqno();
+        desired.authority = expected;
+        if desired.is_invalidated_by(SelectionAuthority::capture(&**pane)) {
             self.clear_selection(pane);
             return;
         }
-        self.remember_native_selection(pane);
+        self.commit_selection_candidate(pane, desired);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }

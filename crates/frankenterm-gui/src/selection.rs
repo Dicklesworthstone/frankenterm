@@ -45,6 +45,98 @@ struct NativeSelectionAnchor {
     range: Option<SelectionRange>,
 }
 
+/// One uncommitted native gesture. Contention must neither replace the last
+/// anchored selection nor discard the final endpoint when the button lifts.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingNativeSelection {
+    pub desired: Selection,
+    pub copy: Option<config::keyassignment::ClipboardCopyDestination>,
+    pub paint_retries_remaining: u8,
+    pub committed: bool,
+}
+
+pub(crate) enum NativeSelectionCapture {
+    Ready(wezterm_term::screen::ScreenSelectionAnchor),
+    Unremappable,
+    Busy,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSelectionCommit {
+    Applied { needs_repaint: bool },
+    Invalidated,
+}
+
+impl
+    From<
+        Result<
+            Option<wezterm_term::screen::ScreenSelectionAnchor>,
+            mux::localpane::SelectionAnchorCaptureError,
+        >,
+    > for NativeSelectionCapture
+{
+    fn from(
+        result: Result<
+            Option<wezterm_term::screen::ScreenSelectionAnchor>,
+            mux::localpane::SelectionAnchorCaptureError,
+        >,
+    ) -> Self {
+        match result {
+            Ok(Some(token)) => Self::Ready(token),
+            Ok(None) => Self::Unremappable,
+            Err(mux::localpane::SelectionAnchorCaptureError::Busy) => Self::Busy,
+            Err(mux::localpane::SelectionAnchorCaptureError::SourceChanged) => Self::Invalidated,
+        }
+    }
+}
+
+impl PendingNativeSelection {
+    pub fn new(desired: Selection) -> Self {
+        Self {
+            desired,
+            copy: None,
+            paint_retries_remaining: 3,
+            committed: false,
+        }
+    }
+
+    /// None retains the intent; Invalidated retires stale coordinates; Applied commits
+    /// only after the source has registered an anchor or explicitly established
+    /// current coordinates that cannot be remapped (such as alternate screen).
+    pub fn try_commit(
+        &self,
+        committed: &mut Selection,
+        capture: NativeSelectionCapture,
+    ) -> Option<NativeSelectionCommit> {
+        let mut next = self.desired.clone();
+        match capture {
+            NativeSelectionCapture::Busy => return None,
+            NativeSelectionCapture::Invalidated => return Some(NativeSelectionCommit::Invalidated),
+            NativeSelectionCapture::Unremappable => {
+                next.native_anchor = None;
+            }
+            NativeSelectionCapture::Ready(token) => {
+                next.remember_native_anchor(token);
+            }
+        }
+        let needs_repaint = committed.origin != next.origin
+            || committed.range != next.range
+            || committed.authority != next.authority
+            || committed.rectangular != next.rectangular;
+        *committed = next;
+        Some(NativeSelectionCommit::Applied { needs_repaint })
+    }
+
+    pub fn take_paint_retry(&mut self) -> bool {
+        let Some(remaining) = self.paint_retries_remaining.checked_sub(1) else {
+            return false;
+        };
+        self.paint_retries_remaining = remaining;
+        true
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct SelectionAuthority {
     source: usize,
@@ -897,6 +989,110 @@ mod tests {
             })
             .collect();
         crate::termwindow::selected_text_from_logical_lines(&lines, selection.range.unwrap(), false)
+    }
+
+    #[test]
+    fn native_selection_commit_retains_released_intent_through_capture_contention() {
+        let (mut term, mut committed, _) = native_anchor_fixture();
+        let previous = committed.clone();
+        let mut desired = committed.clone();
+        desired.range.as_mut().unwrap().end = SelectionCoordinate::x_y(5, 3);
+        let mut pending = PendingNativeSelection::new(desired);
+        // The LocalPane producer test holds the real terminal lock and checks
+        // this typed result. Exercise its actual GUI mapping and transaction.
+        let busy = || Err(mux::localpane::SelectionAnchorCaptureError::Busy).into();
+        {
+            assert_eq!(pending.try_commit(&mut committed, busy()), None);
+            // Mouse release binds the copy to this endpoint, not `previous`.
+            pending.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
+            for _ in 0..3 {
+                assert!(pending.take_paint_retry());
+                assert_eq!(pending.try_commit(&mut committed, busy()), None);
+                assert_eq!(committed, previous);
+            }
+            assert!(!pending.take_paint_retry());
+            assert!(pending.copy.is_some());
+        }
+        let captured = term
+            .screen_mut()
+            .capture_selection_anchor(pending.desired.seqno, pending.desired.native_points());
+        assert!(captured.is_some());
+        assert_eq!(
+            pending.try_commit(&mut committed, Ok(captured).into()),
+            Some(NativeSelectionCommit::Applied {
+                needs_repaint: true
+            })
+        );
+        assert_eq!(committed.range, pending.desired.range);
+        assert!(committed.native_anchor().is_some());
+        let captured_again = term
+            .screen_mut()
+            .capture_selection_anchor(pending.desired.seqno, pending.desired.native_points());
+        assert_eq!(
+            pending.try_commit(&mut committed, Ok(captured_again).into()),
+            Some(NativeSelectionCommit::Applied {
+                needs_repaint: false
+            }),
+            "copy retries with unchanged visible selection must not cause a paint loop"
+        );
+        let expected = live_native_selection_text(&term, &committed);
+        assert_ne!(expected, live_native_selection_text(&term, &previous));
+        let token = committed.native_anchor().unwrap().clone();
+        term.resize(wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 37,
+            dpi: 96,
+            pixel_width: 296,
+            pixel_height: 384,
+        });
+        let sequence = term.current_seqno();
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, sequence)
+            .unwrap();
+        let mut authority = committed.authority.unwrap();
+        authority.sequence = sequence;
+        authority.geometry = (37, 24, 96, 296, 384);
+        assert!(committed.rebase_native_anchor(points, authority, sequence));
+        assert_eq!(live_native_selection_text(&term, &committed), expected);
+    }
+
+    #[test]
+    fn native_selection_commit_rejects_obsolete_intent_without_replacing_anchor() {
+        let (_, mut committed, _) = native_anchor_fixture();
+        let previous = committed.clone();
+        let mut desired = committed.clone();
+        desired.range.as_mut().unwrap().end = SelectionCoordinate::x_y(1, 2);
+        let pending = PendingNativeSelection::new(desired);
+        assert_eq!(
+            pending.try_commit(
+                &mut committed,
+                Err(mux::localpane::SelectionAnchorCaptureError::SourceChanged).into()
+            ),
+            Some(NativeSelectionCommit::Invalidated)
+        );
+        assert_eq!(committed, previous);
+        assert!(committed.native_anchor().is_some());
+    }
+
+    #[test]
+    fn native_selection_commit_preserves_current_unremappable_selection() {
+        let (_, mut committed, _) = native_anchor_fixture();
+        let mut desired = committed.clone();
+        desired.range.as_mut().unwrap().end = SelectionCoordinate::x_y(1, 2);
+        let pending = PendingNativeSelection::new(desired);
+        assert_eq!(
+            pending.try_commit(&mut committed, Ok(None).into()),
+            Some(NativeSelectionCommit::Applied {
+                needs_repaint: true
+            })
+        );
+        assert_eq!(committed.range, pending.desired.range);
+        assert!(committed.native_anchor().is_none());
+        assert!(committed.is_authorized_by(pending.desired.authority));
+        let mut resized = pending.desired.authority.unwrap();
+        resized.geometry.0 += 1;
+        assert!(committed.is_invalidated_by(Some(resized)));
     }
 
     #[test]

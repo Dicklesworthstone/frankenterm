@@ -249,6 +249,19 @@ impl crate::TermWindow {
                 );
             }
         }
+        // Released gestures retain their final endpoint through contention,
+        // so native anchor retries are not limited to an active drag.
+        for pos in self.get_panes_to_render() {
+            self.retry_pending_native_selection(&pos.pane);
+            let retry = self
+                .pane_state(pos.pane.pane_id())
+                .pending_native_selection
+                .as_mut()
+                .is_some_and(|pending| pending.take_paint_retry());
+            if retry {
+                self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
+            }
+        }
         if let Some(pane_id) = self.active_selection_drag_pane {
             if let Some(pos) = self
                 .get_panes_to_render()
