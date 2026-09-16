@@ -6331,10 +6331,10 @@ impl BrokerControlClientV1 {
         ack_id: Uuid,
     ) -> Result<GuardianDurableSpawnCustodyV1, crate::output::GuardianCheckpointStageStoreError>
     {
-        if claim.broker_lineage != self.broker_lineage
-            || claim.broker_build != self.broker_build
-            || claim.origin != self.identity
-        {
+        if claim.origin != self.identity {
+            return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
+        }
+        if claim.broker_lineage != self.broker_lineage || claim.broker_build != self.broker_build {
             return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
         }
         let context = mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
@@ -6354,7 +6354,7 @@ impl BrokerControlClientV1 {
             wire_ack_generation: 0,
             secret_lease_generation: 1,
         };
-        store.persist_spawn_custody(context, claim.recovery_secret.as_wire())
+        store.persist_spawn_custody(&context, claim.recovery_secret.as_wire())
     }
 
     /// Recover original ACK/child provenance using only authenticated stable client scope.
@@ -21969,10 +21969,11 @@ mod tests {
         let broker_incarnation = service.incarnation();
         let service = TestBrokerControlService::start(service);
         let compiled_identity = real_genesis.then(|| {
-            SealedAtomicBuildIdentity::from_lower_hex(
-                option_env!("FT_ATOMIC_BUILD_IDENTITY").expect("sealed candidate identity"),
-            )
-            .expect("canonical sealed candidate identity")
+            let Some(identity) = option_env!("FT_ATOMIC_BUILD_IDENTITY") else {
+                panic!("real Genesis test requires a sealed candidate identity");
+            };
+            SealedAtomicBuildIdentity::from_lower_hex(identity)
+                .expect("canonical sealed candidate identity")
         });
         let connection_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_301),
@@ -22185,7 +22186,7 @@ mod tests {
         assert!(matches!(
             other_mux_client.acknowledge_spawn_effect(
                 custody_store
-                    .reopen_spawn_custody(custody_context)
+                    .reopen_spawn_custody(&custody_context)
                     .expect("reopen genuine custody for wrong mux negative")
             ),
             Err(BrokerControlClientError::AuthenticationAuthority)
@@ -22248,7 +22249,7 @@ mod tests {
         assert!(matches!(
             foreign_client.acknowledge_spawn_effect(
                 custody_store
-                    .reopen_spawn_custody(custody_context)
+                    .reopen_spawn_custody(&custody_context)
                     .expect("genuine custody for foreign lineage control")
             ),
             Err(BrokerControlClientError::AuthenticationAuthority)
@@ -22263,7 +22264,7 @@ mod tests {
         foreign_service.finish();
         for failed_stage in [1, 2] {
             let claim = custody_store
-                .reopen_spawn_custody(custody_context)
+                .reopen_spawn_custody(&custody_context)
                 .expect("reopen before sync-failure control");
             custody_store.fail_spawn_custody_sync_for_test(failed_stage);
             assert!(matches!(
@@ -22337,7 +22338,7 @@ mod tests {
             match client
                 .acknowledge_spawn_effect(
                     custody_store
-                        .reopen_spawn_custody(custody_context)
+                        .reopen_spawn_custody(&custody_context)
                         .expect("reopen immutable custody for lost reply"),
                 )
                 .expect("recover asynchronous Spawn acknowledgement")
@@ -22353,7 +22354,7 @@ mod tests {
             client
                 .acknowledge_spawn_effect(
                     custody_store
-                        .reopen_spawn_custody(custody_context)
+                        .reopen_spawn_custody(&custody_context)
                         .expect("reopen custody for exact retry")
                 )
                 .expect("recover a second exact acknowledgement reply"),
@@ -22707,7 +22708,7 @@ mod tests {
                     id(7_310),
                     &BrokerPaneRecoverySecretV1::from_wire(
                         custody_store
-                            .reopen_spawn_custody(custody_context)
+                            .reopen_spawn_custody(&custody_context)
                             .expect("reopen for protocol negative")
                             .into_secret()
                             .expect("decrypt persisted capability")

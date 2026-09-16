@@ -531,7 +531,7 @@ impl GuardianDurableSpawnCustodyV1 {
     pub(crate) fn into_secret(
         self,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
-        self.store.read_spawn_custody(self.context)
+        self.store.read_spawn_custody(&self.context)
     }
 }
 
@@ -1876,7 +1876,7 @@ impl GuardianCheckpointStageStore {
 
     pub(crate) fn persist_spawn_custody(
         &self,
-        context: GuardianSpawnCustodyContextV1,
+        context: &GuardianSpawnCustodyContextV1,
         secret: &[u8; 32],
     ) -> Result<GuardianDurableSpawnCustodyV1, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| {
@@ -1903,7 +1903,7 @@ impl GuardianCheckpointStageStore {
             if count >= inner.policy.max_stage_files {
                 return Err(GuardianCheckpointStageStoreError::Capacity);
             }
-            let bytes = inner.cipher.seal_spawn_custody(context, secret)?;
+            let bytes = inner.cipher.seal_spawn_custody(*context, secret)?;
             // A fresh nonce cannot reproduce an interrupted ciphertext prefix.
             // Keep each interrupted staging file and retry in a new bounded slot.
             let mut attempt = [0; 16];
@@ -1934,18 +1934,18 @@ impl GuardianCheckpointStageStore {
         })?;
         Ok(GuardianDurableSpawnCustodyV1 {
             store: self.clone(),
-            context,
+            context: *context,
         })
     }
 
     pub(crate) fn reopen_spawn_custody(
         &self,
-        expected: GuardianSpawnCustodyContextV1,
+        expected: &GuardianSpawnCustodyContextV1,
     ) -> Result<GuardianDurableSpawnCustodyV1, GuardianCheckpointStageStoreError> {
         drop(self.read_spawn_custody(expected)?);
         Ok(GuardianDurableSpawnCustodyV1 {
             store: self.clone(),
-            context: expected,
+            context: *expected,
         })
     }
 
@@ -1965,7 +1965,7 @@ impl GuardianCheckpointStageStore {
 
     fn read_spawn_custody(
         &self,
-        expected: GuardianSpawnCustodyContextV1,
+        expected: &GuardianSpawnCustodyContextV1,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
         self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
     }
@@ -5293,7 +5293,7 @@ fn checkpoint_create_record_new(
 
 fn spawn_custody_path(
     inner: &GuardianCheckpointStageStoreInner,
-    context: GuardianSpawnCustodyContextV1,
+    context: &GuardianSpawnCustodyContextV1,
 ) -> PathBuf {
     // One immutable record per initial pane/effect. Changed ACK IDs cannot fork custody.
     inner.directory_path.join(format!(
@@ -5304,10 +5304,10 @@ fn spawn_custody_path(
 
 fn read_spawn_custody_locked(
     inner: &GuardianCheckpointStageStoreInner,
-    expected: GuardianSpawnCustodyContextV1,
+    expected: &GuardianSpawnCustodyContextV1,
 ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
     let (context, secret) = read_spawn_custody_scope_locked(inner, expected.scope())?;
-    if context != expected {
+    if context != *expected {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     Ok(secret)
@@ -11173,8 +11173,8 @@ mod tests {
             let store = pipeline.checkpoint_stage_store();
             let context = spawn_custody_context();
             let secret = Zeroizing::new([0x93; 32]);
-            let claim = store.persist_spawn_custody(context, &secret)?;
-            let path = spawn_custody_path(&store.inner, context);
+            let claim = store.persist_spawn_custody(&context, &secret)?;
+            let path = spawn_custody_path(&store.inner, &context);
             let ciphertext = std::fs::read(&path)?;
             assert_eq!(ciphertext.len(), GUARDIAN_SPAWN_CUSTODY_BYTES);
             assert!(
@@ -11252,7 +11252,7 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                store.reopen_spawn_custody(wrong),
+                store.reopen_spawn_custody(&wrong),
                 Err(GuardianCheckpointStageStoreError::Conflict)
             ));
         }
@@ -11263,7 +11263,7 @@ mod tests {
                 .open_spawn_custody(context, &ciphertext.clone().try_into().unwrap())
                 .is_err()
         );
-        assert!(store.persist_spawn_custody(context, &[0x94; 32]).is_err());
+        assert!(store.persist_spawn_custody(&context, &[0x94; 32]).is_err());
         assert_eq!(std::fs::read(&path)?, ciphertext);
         let ack_offset = ciphertext
             .windows(16)
@@ -11296,15 +11296,15 @@ mod tests {
                 .custody_sync_failure
                 .store(stage, std::sync::atomic::Ordering::SeqCst);
             assert!(matches!(
-                store.persist_spawn_custody(context, &[0x93; 32]),
+                store.persist_spawn_custody(&context, &[0x93; 32]),
                 Err(GuardianCheckpointStageStoreError::Io { .. })
             ));
-            assert!(store.reopen_spawn_custody(context).is_err());
+            assert!(store.reopen_spawn_custody(&context).is_err());
             store
                 .inner
                 .custody_sync_failure
                 .store(0, std::sync::atomic::Ordering::SeqCst);
-            let claim = store.reopen_spawn_custody(context)?;
+            let claim = store.reopen_spawn_custody(&context)?;
             store
                 .inner
                 .custody_sync_failure
@@ -11318,7 +11318,7 @@ mod tests {
                 .custody_sync_failure
                 .store(0, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
-                *store.reopen_spawn_custody(context)?.into_secret()?,
+                *store.reopen_spawn_custody(&context)?.into_secret()?,
                 [0x93; 32]
             );
         }
@@ -11333,11 +11333,11 @@ mod tests {
             pipeline_with_policy("ft-spawn-custody-interrupted-", policy)?;
         let store = pipeline.checkpoint_stage_store();
         let context = spawn_custody_context();
-        let canonical = spawn_custody_path(&store.inner, context);
+        let canonical = spawn_custody_path(&store.inner, &context);
         for cut in [1, 2] {
             store.interrupt_spawn_custody_publication_for_test(cut);
             assert!(matches!(
-                store.persist_spawn_custody(context, &[0x93; 32]),
+                store.persist_spawn_custody(&context, &[0x93; 32]),
                 Err(GuardianCheckpointStageStoreError::Io {
                     site: "spawn-custody-interrupted-publication",
                     ..
@@ -11360,7 +11360,7 @@ mod tests {
         assert_eq!(lengths, vec![0, GUARDIAN_SPAWN_CUSTODY_BYTES / 2]);
         store.interrupt_spawn_custody_publication_for_test(3);
         assert!(matches!(
-            store.persist_spawn_custody(context, &[0x93; 32]),
+            store.persist_spawn_custody(&context, &[0x93; 32]),
             Err(GuardianCheckpointStageStoreError::Io {
                 site: "spawn-custody-interrupted-directory-sync",
                 ..
@@ -11375,7 +11375,7 @@ mod tests {
         drop(poll);
         let (_poll, pipeline) = reopen_pipeline(&directory, policy)?;
         let store = pipeline.checkpoint_stage_store();
-        let claim = store.persist_spawn_custody(context, &[0x93; 32])?;
+        let claim = store.persist_spawn_custody(&context, &[0x93; 32])?;
         assert_eq!(*claim.into_secret()?, [0x93; 32]);
         for (path, bytes) in retained {
             assert_eq!(
@@ -11388,7 +11388,7 @@ mod tests {
         assert!(
             store
                 .persist_spawn_custody(
-                    GuardianSpawnCustodyContextV1 {
+                    &GuardianSpawnCustodyContextV1 {
                         ack_id: Uuid::from_u128(99),
                         ..context
                     },
@@ -11420,7 +11420,7 @@ mod tests {
             .max_stage_files = 3;
         assert!(matches!(
             bounded.persist_spawn_custody(
-                GuardianSpawnCustodyContextV1 {
+                &GuardianSpawnCustodyContextV1 {
                     pane_id: Uuid::from_u128(100),
                     ..context
                 },
@@ -11430,7 +11430,7 @@ mod tests {
         ));
         assert_eq!(
             *bounded
-                .persist_spawn_custody(context, &[0x93; 32])?
+                .persist_spawn_custody(&context, &[0x93; 32])?
                 .into_secret()?,
             [0x93; 32],
             "an existing canonical claim remains retryable at full capacity"
@@ -11456,8 +11456,8 @@ mod tests {
                 pane_id: Uuid::from_u128(100 + u128::try_from(index)?),
                 ..spawn_custody_context()
             };
-            drop(store.persist_spawn_custody(context, &[0x93; 32])?);
-            let path = spawn_custody_path(&store.inner, context);
+            drop(store.persist_spawn_custody(&context, &[0x93; 32])?);
+            let path = spawn_custody_path(&store.inner, &context);
             OpenOptions::new()
                 .write(true)
                 .open(path)?
@@ -11468,8 +11468,8 @@ mod tests {
             ));
         }
         let context = spawn_custody_context();
-        drop(store.persist_spawn_custody(context, &[0x93; 32])?);
-        let path = spawn_custody_path(&store.inner, context);
+        drop(store.persist_spawn_custody(&context, &[0x93; 32])?);
+        let path = spawn_custody_path(&store.inner, &context);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
         assert!(matches!(
             store.lookup_spawn_custody(context.scope()),
@@ -11488,7 +11488,7 @@ mod tests {
             pane_id: Uuid::from_u128(200),
             ..context
         };
-        symlink(&path, spawn_custody_path(&store.inner, symlink_context))?;
+        symlink(&path, spawn_custody_path(&store.inner, &symlink_context))?;
         assert!(matches!(
             store.lookup_spawn_custody(symlink_context.scope()),
             Err(GuardianCheckpointStageStoreError::Output(_))
