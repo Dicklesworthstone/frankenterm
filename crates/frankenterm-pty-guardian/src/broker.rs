@@ -4227,21 +4227,28 @@ impl BrokerLiveSpawnV1 {
             pty_available: true,
             lease_available,
             output_replay_available,
-            owner_mux_incarnation: pane_status
-                .owner_mux_incarnation
-                .or(Some(self.last_lease_mux_incarnation)),
+            owner_mux_incarnation: Some(self.census_owner_mux()),
             lease_generation: pane_status.lease_generation,
         };
         entry.validate()?;
         Ok(entry)
     }
 
+    fn census_owner_mux(&self) -> Uuid {
+        self.adoption
+            .pane
+            .status()
+            .owner_mux_incarnation
+            .or_else(|| {
+                self.pending_successor
+                    .as_ref()
+                    .map(|pending| pending.owner.mux_incarnation)
+            })
+            .unwrap_or(self.last_lease_mux_incarnation)
+    }
+
     fn census_visible_to_mux(&self, mux_incarnation: Uuid) -> bool {
-        self.last_lease_mux_incarnation == mux_incarnation
-            || self
-                .pending_successor
-                .as_ref()
-                .is_some_and(|pending| pending.owner.mux_incarnation == mux_incarnation)
+        self.census_owner_mux() == mux_incarnation
     }
 
     fn observes_owner(
@@ -26649,6 +26656,39 @@ mod tests {
                 assert!(census.entries()[0].effects_disabled);
                 assert!(census.entries()[0].pty_available);
                 assert_eq!(census.entries()[0].child_identity, Some(child_identity));
+                assert_eq!(
+                    census.entries()[0].owner_mux_incarnation,
+                    Some(successor_identity.mux_incarnation)
+                );
+                assert!(!census.entries()[0].lease_available);
+                assert!(!census.entries()[0].output_replay_available);
+                let encoded = census.entries()[0].encode().unwrap();
+                let decoded = BrokerCensusEntryV1::decode(&encoded).unwrap();
+                assert_eq!(decoded, census.entries()[0]);
+                let page = BrokerCensusPageV1 {
+                    snapshot_id: census.snapshot_id(),
+                    entries: vec![decoded],
+                    next_cursor: None,
+                    total_entries: 1,
+                };
+                page.validate_for_mux(successor_identity.mux_incarnation)
+                    .unwrap();
+                assert!(
+                    page.validate_for_mux(connection_identity.mux_incarnation)
+                        .is_err()
+                );
+                let mut predecessor_observer = BrokerControlClientV1::connect(
+                    &socket_path,
+                    &token_path,
+                    connection_identity,
+                    broker_build,
+                )
+                .unwrap();
+                assert!(
+                    predecessor_observer.census().unwrap().entries().is_empty(),
+                    "predecessor must not receive a row owned by the pending claimant"
+                );
+                drop(predecessor_observer);
                 drop(fresh);
                 service.finish();
                 return;
@@ -26927,8 +26967,23 @@ mod tests {
                 .unwrap()
                 .owner
         });
+        let retiring_connections = [reconnect.connection_id, successor_client.connection_id];
         drop(reconnect);
         drop(successor_client);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while service.inspect(move |service| {
+            service.connections.values().any(|connection| {
+                connection
+                    .hello
+                    .is_some_and(|hello| retiring_connections.contains(&hello.connection_id))
+            })
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "prior observer and successor sockets did not retire"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         let final_identity = BrokerGuardianConnectionIdentityV1::new(
             id(7_330),
             id(7_331),
