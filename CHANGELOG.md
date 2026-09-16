@@ -45,6 +45,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 
 - Remote resize admission failures preserve the prior cached geometry. Failed or cancelled completion waits notify the original pane and permit an explicit retry without automatically replaying an uncertain operation.
 - Window resize dispatches the active tab before hidden tabs on shared mux connections, while still resizing every tab and preserving their displayed order.
+- Native window creation waits for the first attached tab and uses its actual geometry. A delayed tab attachment wakes reconciliation instead of leaving the window at an invented 80×24 size until the next resize.
 - Snapshot-change diagnostics agree with the typed transient error while retaining the exhausted retry budget. Text reads emit one transaction summary, including when they fail.
 - macOS application packaging includes the transitive native library dependencies, relocates their loader paths, and retains their license notices and provenance. Packaging rejects unresolved dependencies and verifies that source binaries remain unchanged.
 - The guardian broker's Spawn acknowledgment now requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Ordinary broker-backed pane activation and full mux recovery remain unfinished.

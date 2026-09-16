@@ -362,6 +362,21 @@ receipts retain their original source identity; none qualifies RC24 by itself.
 - [x] Repair six custody test initializers exposed by RCH 57438 compiler errors
   in `91f6a3f16`; preserve production authentication and custody behavior.
 - [ ] Run guardian, mux, client and portable-pty libraries on the successor.
+- [x] Execute RCH 57453 on `9db6b2d4`: guardian 229 passed with one explicitly
+  sealed test ignored, and portable-pty 126 passed. Client had 328 passes and
+  one failure; mux had 1,175 passes and one failure. The aggregate failed.
+- [x] Audit and correct the mux test's stale closed import inventory in
+  `6e179e439`; fixed-width Rust 2018 custody decoding requires `TryInto`.
+- [ ] Verify the client retirement test waits for its actual resize completion
+  rather than assuming one executor tick selects that task; retain both oracles.
+- [x] Commit the native startup geometry fix as `b0620e366` after the real Mac
+  trace proved window creation preceded attachment and chose 80×24 incorrectly.
+- [ ] Run both real-mux startup regressions and both active-tab dispatch tests,
+  then verify unprimed native startup uses the configured 60×20 tab dimensions.
+- [ ] Run the one explicitly sealed real-Genesis guardian test; its ignored
+  result in the ordinary library run is not a pass.
+- [x] Complete all 29 static gates and workspace compiler check on `9db6b2d4`;
+  the later startup correction still requires updated source qualification.
 - [ ] Verify the two core corrections, full client library, and two active-tab
   dispatch tests through strict RCH on the final committed candidate.
 - [x] Execute both actual panic-profile subprocess artifacts: RCH job 57436 on
