@@ -5971,7 +5971,7 @@ mod tests {
         );
         let bookmark = cursor.bookmark().unwrap();
         let original = std::fs::read(&path).unwrap();
-        let mut tamper = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut tamper = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         tamper
             .seek(SeekFrom::Start(
                 FILE_HEADER_BYTES_U64 + RECORD_HEADER_BYTES_U64,
