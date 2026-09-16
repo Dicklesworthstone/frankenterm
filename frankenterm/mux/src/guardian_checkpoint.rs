@@ -2707,6 +2707,8 @@ pub struct GuardianSuccessorCustodyContextV1 {
     pub handoff_id: Uuid,
     pub ack_id: Uuid,
     pub lease_generation: u64,
+    /// Nil for the original Claim; otherwise the authenticated custody parent.
+    pub rebind_from_connection: Uuid,
 }
 
 /// Authenticated client scope used to recover ACK and predecessor provenance.
@@ -2721,8 +2723,8 @@ pub struct GuardianSuccessorCustodyScopeV1 {
     pub lease_generation: u64,
 }
 
-const SUCCESSOR_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-successor-secret-custody.v1\0";
-const SUCCESSOR_CUSTODY_HEADER_BYTES: usize = SUCCESSOR_CUSTODY_DOMAIN.len() + 11 * 16 + 5 * 32 + 8;
+const SUCCESSOR_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-successor-secret-custody.v2\0";
+const SUCCESSOR_CUSTODY_HEADER_BYTES: usize = SUCCESSOR_CUSTODY_DOMAIN.len() + 12 * 16 + 5 * 32 + 8;
 pub const GUARDIAN_SUCCESSOR_CUSTODY_BYTES: usize = SUCCESSOR_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
 
 impl GuardianSuccessorCustodyContextV1 {
@@ -2762,6 +2764,7 @@ impl GuardianSuccessorCustodyContextV1 {
         if identities.iter().any(Uuid::is_nil)
             || digests.contains(&[0; 32])
             || self.lease_generation <= 1
+            || self.rebind_from_connection == self.successor.connection_id
         {
             return Err(GuardianSpawnCustodyError::InvalidIdentity);
         }
@@ -2769,6 +2772,7 @@ impl GuardianSuccessorCustodyContextV1 {
         for identity in identities {
             header.extend_from_slice(identity.as_bytes());
         }
+        header.extend_from_slice(self.rebind_from_connection.as_bytes());
         for digest in digests {
             header.extend_from_slice(&digest);
         }
@@ -2783,7 +2787,7 @@ impl GuardianSuccessorCustodyContextV1 {
             return Err(GuardianSpawnCustodyError::Authentication);
         }
         let mut bytes = &header[SUCCESSOR_CUSTODY_DOMAIN.len()..];
-        let mut ids = [Uuid::nil(); 11];
+        let mut ids = [Uuid::nil(); 12];
         for id in &mut ids {
             *id = Uuid::from_bytes(
                 bytes[..16]
@@ -2818,6 +2822,7 @@ impl GuardianSuccessorCustodyContextV1 {
             pane_id: ids[8],
             handoff_id: ids[9],
             ack_id: ids[10],
+            rebind_from_connection: ids[11],
             lease_generation: u64::from_le_bytes(
                 bytes
                     .try_into()
@@ -9133,6 +9138,7 @@ mod tests {
             handoff_id: Uuid::from_bytes([12; 16]),
             ack_id: Uuid::from_bytes([13; 16]),
             lease_generation: 2,
+            rebind_from_connection: Uuid::nil(),
         };
         let cipher = checkpoint_stage_cipher(0xa3);
         let bytes = cipher.seal_successor_custody(context, &[0xb4; 32]).unwrap();
@@ -9140,6 +9146,27 @@ mod tests {
         assert_eq!(decoded, context);
         assert_eq!(*secret, [0xb4; 32]);
         assert!(!bytes.windows(32).any(|window| window == [0xb4; 32]));
+        let mut old_version = bytes;
+        old_version[SUCCESSOR_CUSTODY_DOMAIN.len() - 2] = b'1';
+        assert!(cipher.open_successor_custody_record(&old_version).is_err());
+        let rebound = GuardianSuccessorCustodyContextV1 {
+            rebind_from_connection: Uuid::from_u128(99),
+            ..context
+        };
+        let sealed = cipher.seal_successor_custody(rebound, &[0xc5; 32]).unwrap();
+        assert_eq!(
+            cipher.open_successor_custody_record(&sealed).unwrap().0,
+            rebound
+        );
+        assert!(cipher
+            .seal_successor_custody(
+                GuardianSuccessorCustodyContextV1 {
+                    rebind_from_connection: context.successor.connection_id,
+                    ..context
+                },
+                &[0xb4; 32]
+            )
+            .is_err());
         for offset in 0..bytes.len() {
             let mut corrupt = bytes;
             corrupt[offset] ^= 1;

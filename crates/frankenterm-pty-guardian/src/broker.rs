@@ -24,8 +24,11 @@
 //! through the explicit guardian domain for fresh births. The surviving broker
 //! durably fences, claims, and acknowledges successor leases on that worker;
 //! only the synchronized ACK can activate the exact live claimant connection.
-//! Fresh-connection claim recovery, ordinary mux restart attachment, and broker
-//! restart PTY adoption remain unavailable. These isolated control transitions
+//! A durable pending Claim can rebind a fresh connection of the same stable
+//! guardian/mux owner through synchronized rotated custody and a new WAL record.
+//! EOF during an in-flight transition remains quarantined. Ordinary mux restart
+//! with a new incarnation and broker restart PTY adoption remain unavailable.
+//! These isolated control transitions
 //! do **not** prove full guardian-`SIGKILL` or power-loss continuity.
 //! Catalog Genesis admission remains durable pre-Spawn intent,
 //! never proof that a child exists, and recovered lifecycle rows explicitly
@@ -161,7 +164,7 @@ const BROKER_LEASE_WAL_FILE_MAGIC: [u8; 8] = *b"FTBLW001";
 const BROKER_LEASE_HEAD_FILE_MAGIC: [u8; 8] = *b"FTBLH001";
 const BROKER_LEASE_WAL_RECORD_MAGIC: [u8; 8] = *b"FTBLR001";
 const BROKER_LEASE_HEAD_RECORD_MAGIC: [u8; 8] = *b"FTBLA001";
-const BROKER_LEASE_WAL_FORMAT_VERSION: u32 = 1;
+const BROKER_LEASE_WAL_FORMAT_VERSION: u32 = 2;
 const BROKER_LEASE_WAL_FILE_HEADER_BYTES: usize = 352;
 const BROKER_LEASE_WAL_FILE_HEADER_BYTES_U32: u32 = 352;
 const BROKER_LEASE_WAL_FILE_HEADER_BYTES_U64: u64 = 352;
@@ -195,7 +198,7 @@ const BROKER_LEASE_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
         + BROKER_LEASE_CREATION_MARKER_BYTES);
 const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
 const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
-const BROKER_CONTROL_VERSION: u16 = 2;
+const BROKER_CONTROL_VERSION: u16 = 3;
 const BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES: usize = 3 * 16 + 2 * 32 + 32;
 const BROKER_CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const BROKER_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
@@ -1343,6 +1346,8 @@ pub(crate) enum BrokerControlOperationV1 {
     ClosePane = 11,
     QueryChildStatus = 12,
     SignalTerminate = 13,
+    RecoverSuccessorClaim = 14,
+    QuerySuccessorRecovery = 15,
 }
 
 impl BrokerControlOperationV1 {
@@ -1361,6 +1366,8 @@ impl BrokerControlOperationV1 {
             11 => Ok(Self::ClosePane),
             12 => Ok(Self::QueryChildStatus),
             13 => Ok(Self::SignalTerminate),
+            14 => Ok(Self::RecoverSuccessorClaim),
+            15 => Ok(Self::QuerySuccessorRecovery),
             _ => Err(BrokerControlProtocolError::InvalidOperation),
         }
     }
@@ -1568,6 +1575,20 @@ impl BrokerControlRequestHeaderV1 {
                     && !self.operation_id.is_nil()
                     && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
             }
+            BrokerControlOperationV1::RecoverSuccessorClaim => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 1
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 192
+            }
+            BrokerControlOperationV1::QuerySuccessorRecovery => {
+                !self.broker_incarnation.is_nil()
+                    && !self.durable_pane_id.is_nil()
+                    && self.lease_generation > 1
+                    && !self.operation_id.is_nil()
+                    && payload_bytes == 0
+            }
             BrokerControlOperationV1::ClosePane
             | BrokerControlOperationV1::QueryChildStatus
             | BrokerControlOperationV1::SignalTerminate => {
@@ -1763,6 +1784,20 @@ impl BrokerControlResponseHeaderV1 {
             }
             BrokerControlOperationV1::AcknowledgeEffect => {
                 pane_scoped && empty_effect && (successful || unsuccessful)
+            }
+            BrokerControlOperationV1::RecoverSuccessorClaim => {
+                pane_scoped
+                    && self.lease_generation > 1
+                    && empty_effect
+                    && (successful || unsuccessful)
+            }
+            BrokerControlOperationV1::QuerySuccessorRecovery => {
+                pane_scoped
+                    && self.lease_generation > 1
+                    && self.child_identity.is_none()
+                    && self.output_sequence_start == 0
+                    && self.output_sequence_end == 0
+                    && ((successful && payload_bytes == 16) || (unsuccessful && payload_bytes == 0))
             }
             BrokerControlOperationV1::Write
             | BrokerControlOperationV1::Resize
@@ -2864,6 +2899,16 @@ impl BrokerSpawnWorkerStateV1 {
                             f.recovery_verifier,
                         )
                     }
+                    BrokerPaneLeaseWalPhaseV1::SuccessorRebound => {
+                        job.journal.rebind_successor_and_sync(
+                            f.handoff_id,
+                            f.ack_id,
+                            f.predecessor,
+                            f.successor
+                                .ok_or(BrokerPaneLeaseWalErrorV1::InvalidIdentity)?,
+                            f.recovery_verifier,
+                        )
+                    }
                 });
                 let authority_valid_after = job.token_effect_lease.validate().is_ok();
                 (result, !authority_valid_before || !authority_valid_after)
@@ -3845,9 +3890,37 @@ struct BrokerPendingSuccessorClaimV1 {
     attachment: BrokerAttachmentIdentityV1,
     recovery_secret: BrokerPaneRecoverySecretV1,
     recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    disconnected: bool,
+    rebind: Option<BrokerSuccessorRebindV1>,
+}
+
+#[derive(Clone, Copy)]
+struct BrokerSuccessorRebindV1 {
+    prior_attachment: BrokerAttachmentIdentityV1,
+    prior_verifier: BrokerPaneRecoveryVerifierV1,
+    ack_id: Uuid,
 }
 
 impl BrokerPendingSuccessorClaimV1 {
+    fn durable_fingerprint(
+        &self,
+        spawn: BrokerSpawnWorkerFingerprintV1,
+    ) -> BrokerLeaseWorkerFingerprintV1 {
+        BrokerLeaseWorkerFingerprintV1 {
+            spawn,
+            phase: if self.rebind.is_some() {
+                BrokerPaneLeaseWalPhaseV1::SuccessorRebound
+            } else {
+                BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+            },
+            handoff_id: self.handoff_id,
+            ack_id: self.rebind.map_or(Uuid::nil(), |rebind| rebind.ack_id),
+            predecessor: self.predecessor,
+            successor: Some(self.attachment),
+            recovery_verifier: self.recovery_verifier,
+        }
+    }
+
     fn payload(&self) -> Zeroizing<Vec<u8>> {
         let mut bytes = Zeroizing::new(Vec::with_capacity(BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES));
         for id in [
@@ -4199,6 +4272,23 @@ impl BrokerLiveSpawnV1 {
             .as_ref()
             .is_some_and(|pending| pending.owner == owner)
         {
+            let pending = self
+                .pending_successor
+                .as_ref()
+                .ok_or(BrokerError::Quarantined)?;
+            if self.lease_transition.is_none()
+                && self.lease_transition_committed(pending.durable_fingerprint(self.fingerprint))
+                && self.adoption.pane.status().lifecycle
+                    == BrokerPaneLifecycleV1::SuccessorClaimPending
+            {
+                // Already effect-fenced: retain a recoverable disconnected Claim.
+                // This never clears an unrelated quarantine or an in-flight ACK.
+                self.pending_successor
+                    .as_mut()
+                    .ok_or(BrokerError::Quarantined)?
+                    .disconnected = true;
+                return Ok(Some(BrokerControlEofOutcomeV1::AlreadyObserved));
+            }
             // A closed claimant connection cannot be reactivated by a later
             // durability completion. Fresh-connection recovery needs its own
             // authenticated journal transition, not an owner-equality shortcut.
@@ -4782,12 +4872,14 @@ impl BrokerControlServiceV1 {
                 }
             }
             BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+            | BrokerPaneLeaseWalPhaseV1::SuccessorRebound
             | BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged => {
                 let exact_pending = live.pending_successor.as_ref().is_some_and(|pending| {
                     pending.handoff_id == fingerprint.handoff_id
                         && pending.predecessor == fingerprint.predecessor
                         && Some(pending.attachment) == fingerprint.successor
                         && pending.recovery_verifier == fingerprint.recovery_verifier
+                        && !pending.disconnected
                         && pane_status.lifecycle == BrokerPaneLifecycleV1::SuccessorClaimPending
                         && pane_status.lease_generation == pending.attachment.lease_generation
                         && self.connections.values().any(|connection| {
@@ -4806,7 +4898,11 @@ impl BrokerControlServiceV1 {
                     live.quarantine_lease_journal();
                     return;
                 }
-                if fingerprint.phase == BrokerPaneLeaseWalPhaseV1::SuccessorClaimed {
+                if matches!(
+                    fingerprint.phase,
+                    BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+                        | BrokerPaneLeaseWalPhaseV1::SuccessorRebound
+                ) {
                     // Retire the preceding ACK only once its replacement claim
                     // is durable. Otherwise generation three can never ACK.
                     live.last_successor_ack = None;
@@ -5254,6 +5350,12 @@ impl BrokerControlServiceV1 {
             }
             BrokerControlOperationV1::AttachSuccessor => {
                 return self.dispatch_successor_claim(owner, request);
+            }
+            BrokerControlOperationV1::RecoverSuccessorClaim => {
+                return self.dispatch_successor_rebind(owner, request);
+            }
+            BrokerControlOperationV1::QuerySuccessorRecovery => {
+                return self.dispatch_successor_recovery_query(owner, request);
             }
             BrokerControlOperationV1::QueryEffect if request.header.lease_generation > 0 => {
                 return self.dispatch_successor_query(owner, request);
@@ -6222,6 +6324,8 @@ impl BrokerControlServiceV1 {
             attachment,
             recovery_secret: successor_secret,
             recovery_verifier: successor_verifier,
+            disconnected: false,
+            rebind: None,
         });
         live.lease_transition = Some(BrokerLeaseWorkerFingerprintV1 {
             spawn: live.fingerprint,
@@ -6239,6 +6343,155 @@ impl BrokerControlServiceV1 {
         .map_err(|_| ())
     }
 
+    fn dispatch_successor_recovery_query(
+        &self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut status = BrokerControlResponseStatusV1::Quarantined;
+        let mut selected = None;
+        if let Some(live) = self.live_spawns.get(&request.header.durable_pane_id) {
+            if let Some(pending) = &live.pending_successor {
+                if pending.owner.same_stable_owner(owner)
+                    && pending.handoff_id == request.header.operation_id
+                    && pending.attachment.lease_generation == request.header.lease_generation
+                    && pending
+                        .rebind
+                        .is_none_or(|r| r.ack_id == request.header.request_id)
+                    && live.adoption.pane.status().lifecycle
+                        == BrokerPaneLifecycleV1::SuccessorClaimPending
+                {
+                    if live.lease_transition.is_some() {
+                        status = BrokerControlResponseStatusV1::Retryable;
+                    } else if live
+                        .lease_transition_committed(pending.durable_fingerprint(live.fingerprint))
+                    {
+                        status = BrokerControlResponseStatusV1::Recovered;
+                        selected = Some(pending.owner.connection_id);
+                    }
+                }
+            }
+        }
+        BrokerControlResponseV1::new(
+            self.response_header(request.header, status),
+            selected.as_ref().map_or(&[], |id| id.as_bytes().as_slice()),
+        )
+        .map_err(|_| ())
+    }
+
+    fn dispatch_successor_rebind(
+        &mut self,
+        owner: BrokerGuardianOwnerIdentity,
+        request: &BrokerControlRequestV1,
+    ) -> Result<BrokerControlResponseV1, ()> {
+        let mut status = BrokerControlResponseStatusV1::Quarantined;
+        let payload = request.payload();
+        if payload.len() != 192 || request.header.request_id.is_nil() {
+            return BrokerControlResponseV1::new(
+                self.response_header(request.header, BrokerControlResponseStatusV1::Rejected),
+                &[],
+            )
+            .map_err(|_| ());
+        }
+        let prior_connection = read_broker_uuid(&payload[..16]);
+        let predecessor_owner = BrokerGuardianOwnerIdentity {
+            guardian_incarnation: read_broker_uuid(&payload[16..32]),
+            connection_id: read_broker_uuid(&payload[32..48]),
+            mux_incarnation: read_broker_uuid(&payload[48..64]),
+            guardian_build_identity_digest: read_broker_array_32(&payload[64..96]),
+            mux_build_identity_digest: read_broker_array_32(&payload[96..128]),
+        };
+        let prior_secret =
+            BrokerPaneRecoverySecretV1::from_wire(&payload[128..160]).map_err(|_| ())?;
+        let rotated_secret =
+            BrokerPaneRecoverySecretV1::from_wire(&payload[160..192]).map_err(|_| ())?;
+        let prior_connected = self.connections.values().any(|connection| {
+            connection
+                .hello
+                .is_some_and(|hello| hello.connection_id == prior_connection)
+        });
+        let Some(live) = self.live_spawns.get_mut(&request.header.durable_pane_id) else {
+            return Err(());
+        };
+        let Some(pending) = live.pending_successor.as_ref() else {
+            return BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+                .map_err(|_| ());
+        };
+        let generation = request.header.lease_generation;
+        let rotated_verifier = rotated_secret
+            .verifier(live.journal.identity(), generation)
+            .map_err(|_| ())?;
+        let common = pending.handoff_id == request.header.operation_id
+            && pending.attachment.lease_generation == generation
+            && pending.predecessor.owner == predecessor_owner
+            && pending.owner.same_stable_owner(owner)
+            && prior_connection != owner.connection_id
+            && !prior_connection.is_nil()
+            && !prior_connected
+            && live.adoption.pane.status().lifecycle
+                == BrokerPaneLifecycleV1::SuccessorClaimPending;
+        let exact_retry = common
+            && pending.owner == owner
+            && !pending.disconnected
+            && pending.recovery_verifier == rotated_verifier
+            && pending.rebind.is_some_and(|rebind| {
+                rebind.ack_id == request.header.request_id
+                    && rebind.prior_attachment.owner.connection_id == prior_connection
+                    && rebind.prior_verifier.verifies(
+                        &prior_secret,
+                        live.journal.identity(),
+                        generation,
+                    )
+            });
+        if exact_retry {
+            let expected = pending.durable_fingerprint(live.fingerprint);
+            status = if live.lease_transition == Some(expected) {
+                BrokerControlResponseStatusV1::Retryable
+            } else if live.lease_transition.is_none() && live.lease_transition_committed(expected) {
+                BrokerControlResponseStatusV1::Recovered
+            } else {
+                BrokerControlResponseStatusV1::Quarantined
+            };
+        } else if common
+            && pending.disconnected
+            && pending.owner.connection_id == prior_connection
+            && pending
+                .rebind
+                .is_none_or(|rebind| rebind.ack_id == request.header.request_id)
+            && pending.recovery_verifier != rotated_verifier
+            && pending.recovery_verifier.verifies(
+                &prior_secret,
+                live.journal.identity(),
+                generation,
+            )
+            && live.lease_transition.is_none()
+            && live.lease_transition_committed(pending.durable_fingerprint(live.fingerprint))
+        {
+            let prior_attachment = pending.attachment;
+            let prior_verifier = pending.recovery_verifier;
+            let attachment = live
+                .adoption
+                .pane
+                .rebind_pending_successor(prior_attachment, owner)
+                .map_err(|_| ())?;
+            let pending = live.pending_successor.as_mut().ok_or(())?;
+            pending.attachment = attachment;
+            pending.owner = owner;
+            pending.recovery_secret = rotated_secret;
+            pending.recovery_verifier = rotated_verifier;
+            pending.disconnected = false;
+            pending.rebind = Some(BrokerSuccessorRebindV1 {
+                prior_attachment,
+                prior_verifier,
+                ack_id: request.header.request_id,
+            });
+            live.lease_transition = Some(pending.durable_fingerprint(live.fingerprint));
+            status = BrokerControlResponseStatusV1::Retryable;
+        }
+        BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
+            .map_err(|_| ())
+    }
+
     fn dispatch_successor_query(
         &self,
         owner: BrokerGuardianOwnerIdentity,
@@ -6254,18 +6507,12 @@ impl BrokerControlServiceV1 {
         if let Some(pending) = live.pending_successor.as_ref() {
             let exact = pending.handoff_id == request.header.operation_id
                 && pending.owner == owner
+                && !pending.disconnected
                 && pending.attachment.lease_generation == request.header.lease_generation
                 && live.adoption.pane.status().lifecycle
                     == BrokerPaneLifecycleV1::SuccessorClaimPending;
-            let durable = live.lease_transition_committed(BrokerLeaseWorkerFingerprintV1 {
-                spawn: live.fingerprint,
-                phase: BrokerPaneLeaseWalPhaseV1::SuccessorClaimed,
-                handoff_id: pending.handoff_id,
-                ack_id: Uuid::nil(),
-                predecessor: pending.predecessor,
-                successor: Some(pending.attachment),
-                recovery_verifier: pending.recovery_verifier,
-            });
+            let durable =
+                live.lease_transition_committed(pending.durable_fingerprint(live.fingerprint));
             let status = if exact && live.lease_transition.is_some() {
                 BrokerControlResponseStatusV1::Retryable
             } else if exact && durable {
@@ -6389,6 +6636,10 @@ impl BrokerControlServiceV1 {
         let pending_is_exact = live.pending_successor.as_ref().is_some_and(|pending| {
             pending.handoff_id == request.header.operation_id
                 && pending.owner == owner
+                && !pending.disconnected
+                && pending
+                    .rebind
+                    .is_none_or(|rebind| rebind.ack_id == request.header.request_id)
                 && pending.attachment.lease_generation == request.header.lease_generation
                 && live.adoption.pane.status().lifecycle
                     == BrokerPaneLifecycleV1::SuccessorClaimPending
@@ -6426,11 +6677,7 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         }
-        let claim = BrokerLeaseWorkerFingerprintV1 {
-            phase: BrokerPaneLeaseWalPhaseV1::SuccessorClaimed,
-            ack_id: Uuid::nil(),
-            ..transition
-        };
+        let claim = pending.durable_fingerprint(live.fingerprint);
         if !live.lease_transition_committed(claim) {
             live.quarantine_lease_journal();
             return BrokerControlResponseV1::new(
@@ -8657,12 +8904,13 @@ impl BrokerControlClientV1 {
             handoff_id: claim.handoff_id,
             ack_id,
             lease_generation: claim.lease_generation,
+            rebind_from_connection: Uuid::nil(),
         };
         store.persist_successor_custody(&context, claim.recovery_secret.as_wire())
     }
 
-    /// Recover ACK/predecessor provenance from disk within this exact connection.
-    /// A fresh connection needs a separate authenticated rebind; it is not inferred.
+    /// Recover authenticated custody for this stable owner. A different saved
+    /// connection is usable only through the synchronized rebind in ACK below.
     pub fn reopen_successor_custody(
         &self,
         store: &crate::output::GuardianCheckpointStageStore,
@@ -8671,21 +8919,23 @@ impl BrokerControlClientV1 {
         lease_generation: u64,
     ) -> Result<GuardianDurableSuccessorCustodyV1, crate::output::GuardianCheckpointStageStoreError>
     {
-        store.lookup_successor_custody(mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1 {
-            broker_incarnation: self.broker_incarnation,
-            broker_lineage: self.broker_lineage,
-            broker_build: self.broker_build.into_bytes(),
-            successor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
-                guardian_incarnation: self.identity.guardian_incarnation,
-                connection_id: self.connection_id,
-                mux_incarnation: self.identity.mux_incarnation,
-                guardian_build: self.identity.guardian_build_identity.into_bytes(),
-                mux_build: self.identity.mux_build_identity.into_bytes(),
+        store.lookup_successor_custody_for_reconnect(
+            mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1 {
+                broker_incarnation: self.broker_incarnation,
+                broker_lineage: self.broker_lineage,
+                broker_build: self.broker_build.into_bytes(),
+                successor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                    guardian_incarnation: self.identity.guardian_incarnation,
+                    connection_id: self.connection_id,
+                    mux_incarnation: self.identity.mux_incarnation,
+                    guardian_build: self.identity.guardian_build_identity.into_bytes(),
+                    mux_build: self.identity.mux_build_identity.into_bytes(),
+                },
+                pane_id,
+                handoff_id,
+                lease_generation,
             },
-            pane_id,
-            handoff_id,
-            lease_generation,
-        })
+        )
     }
 
     /// Reopen and resynchronize custody before any ACK network effect.
@@ -8698,13 +8948,147 @@ impl BrokerControlClientV1 {
             || context.broker_lineage != self.broker_lineage
             || context.broker_build != self.broker_build.into_bytes()
             || context.successor.guardian_incarnation != self.identity.guardian_incarnation
-            || context.successor.connection_id != self.connection_id
             || context.successor.mux_incarnation != self.identity.mux_incarnation
             || context.successor.guardian_build
                 != self.identity.guardian_build_identity.into_bytes()
             || context.successor.mux_build != self.identity.mux_build_identity.into_bytes()
         {
             return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let custody = if context.successor.connection_id != self.connection_id
+            || !context.rebind_from_connection.is_nil()
+        {
+            if context.successor.connection_id == self.connection_id {
+                let (_, _, rotated) = custody
+                    .rebind_secrets()
+                    .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+                let rotated = BrokerPaneRecoverySecretV1::from_wire(rotated.as_slice())
+                    .map_err(|_| BrokerControlClientError::Protocol)?;
+                let ack = self.acknowledge_successor_claim_request(
+                    context.pane_id,
+                    context.handoff_id,
+                    context.ack_id,
+                    context.lease_generation,
+                    &rotated,
+                )?;
+                if ack != BrokerSuccessorAcknowledgementV1::Quarantined {
+                    return Ok(ack);
+                }
+            }
+            let query = BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation: BrokerControlOperationV1::QuerySuccessorRecovery,
+                    request_id: context.ack_id,
+                    broker_incarnation: self.broker_incarnation,
+                    guardian_incarnation: self.identity.guardian_incarnation,
+                    connection_id: self.connection_id,
+                    mux_incarnation: self.identity.mux_incarnation,
+                    guardian_build_identity_digest: self
+                        .identity
+                        .guardian_build_identity
+                        .into_bytes(),
+                    mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                    durable_pane_id: context.pane_id,
+                    lease_generation: context.lease_generation,
+                    operation_id: context.handoff_id,
+                },
+                &[],
+            )
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+            let response = self.exchange(&query)?;
+            let selected = match response.header.status {
+                BrokerControlResponseStatusV1::Recovered
+                    if response.payload().len() == 16
+                        && response.header.child_identity.is_none() =>
+                {
+                    read_broker_uuid(response.payload())
+                }
+                BrokerControlResponseStatusV1::Retryable if response.payload().is_empty() => {
+                    return Ok(BrokerSuccessorAcknowledgementV1::Pending);
+                }
+                BrokerControlResponseStatusV1::Quarantined
+                | BrokerControlResponseStatusV1::Rejected
+                    if response.payload().is_empty() =>
+                {
+                    return Ok(BrokerSuccessorAcknowledgementV1::Quarantined);
+                }
+                _ => return Err(BrokerControlClientError::UnexpectedResponse),
+            };
+            custody
+                .select_rebind_origin(selected)
+                .and_then(|parent| parent.prepare_rebind(self.connection_id))
+                .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?
+        } else {
+            custody
+        };
+        let context = custody.context();
+        if !context.rebind_from_connection.is_nil() {
+            let (parent, prior_secret, rotated_secret) = custody
+                .rebind_secrets()
+                .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+            let rotated = BrokerPaneRecoverySecretV1::from_wire(rotated_secret.as_slice())
+                .map_err(|_| BrokerControlClientError::Protocol)?;
+            // A committed rebind/ACK can be retried with only its rotated key.
+            // Never reuse the old secret for a fresh mutation after activation.
+            let ack = self.acknowledge_successor_claim_request(
+                context.pane_id,
+                context.handoff_id,
+                context.ack_id,
+                context.lease_generation,
+                &rotated,
+            )?;
+            if ack != BrokerSuccessorAcknowledgementV1::Quarantined {
+                return Ok(ack);
+            }
+            let mut payload = Zeroizing::new(Vec::with_capacity(192));
+            payload.extend_from_slice(parent.successor.connection_id.as_bytes());
+            for id in [
+                parent.predecessor.guardian_incarnation,
+                parent.predecessor.connection_id,
+                parent.predecessor.mux_incarnation,
+            ] {
+                payload.extend_from_slice(id.as_bytes());
+            }
+            payload.extend_from_slice(&parent.predecessor.guardian_build);
+            payload.extend_from_slice(&parent.predecessor.mux_build);
+            payload.extend_from_slice(prior_secret.as_slice());
+            payload.extend_from_slice(rotated_secret.as_slice());
+            let request = BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    operation: BrokerControlOperationV1::RecoverSuccessorClaim,
+                    request_id: context.ack_id,
+                    broker_incarnation: self.broker_incarnation,
+                    guardian_incarnation: self.identity.guardian_incarnation,
+                    connection_id: self.connection_id,
+                    mux_incarnation: self.identity.mux_incarnation,
+                    guardian_build_identity_digest: self
+                        .identity
+                        .guardian_build_identity
+                        .into_bytes(),
+                    mux_build_identity_digest: self.identity.mux_build_identity.into_bytes(),
+                    durable_pane_id: context.pane_id,
+                    lease_generation: context.lease_generation,
+                    operation_id: context.handoff_id,
+                },
+                &payload,
+            )
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+            let response = self.exchange(&request)?;
+            if !response.payload().is_empty() || response.header.child_identity.is_some() {
+                self.poisoned = true;
+                return Err(BrokerControlClientError::UnexpectedResponse);
+            }
+            match response.header.status {
+                BrokerControlResponseStatusV1::Retryable => {
+                    return Ok(BrokerSuccessorAcknowledgementV1::Pending);
+                }
+                BrokerControlResponseStatusV1::Quarantined
+                | BrokerControlResponseStatusV1::Rejected => {
+                    return Ok(BrokerSuccessorAcknowledgementV1::Quarantined);
+                }
+                BrokerControlResponseStatusV1::Recovered => {}
+                _ => return Err(BrokerControlClientError::UnexpectedResponse),
+            }
         }
         let secret = custody
             .into_secret()
@@ -11019,6 +11403,7 @@ enum BrokerPaneLeaseWalPhaseV1 {
     PredecessorFenced = 1,
     SuccessorClaimed = 2,
     SuccessorAcknowledged = 3,
+    SuccessorRebound = 4,
 }
 
 impl BrokerPaneLeaseWalPhaseV1 {
@@ -11027,6 +11412,7 @@ impl BrokerPaneLeaseWalPhaseV1 {
             1 => Ok(Self::PredecessorFenced),
             2 => Ok(Self::SuccessorClaimed),
             3 => Ok(Self::SuccessorAcknowledged),
+            4 => Ok(Self::SuccessorRebound),
             observed => Err(BrokerPaneLeaseWalErrorV1::InvalidPhase { observed }),
         }
     }
@@ -11539,6 +11925,7 @@ fn validate_broker_lease_record_fields(
             Ok(())
         }
         BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged
+        | BrokerPaneLeaseWalPhaseV1::SuccessorRebound
             if !fields.handoff_id.is_nil()
                 && !fields.ack_id.is_nil()
                 && !fields.successor_attachment_id.is_nil()
@@ -11591,7 +11978,11 @@ fn validate_broker_lease_record_transition(
             Ok(())
         }
         (Some(previous), BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged)
-            if previous.phase == BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+            if matches!(
+                previous.phase,
+                BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+                    | BrokerPaneLeaseWalPhaseV1::SuccessorRebound
+            ) && (previous.ack_id.is_nil() || current.ack_id == previous.ack_id)
                 && current.handoff_id == previous.handoff_id
                 && current.predecessor_attachment_id == previous.predecessor_attachment_id
                 && current.successor_attachment_id == previous.successor_attachment_id
@@ -11601,6 +11992,25 @@ fn validate_broker_lease_record_transition(
                 && current.attachment_digest == previous.attachment_digest
                 && current.predecessor_attachment_digest
                     == previous.predecessor_attachment_digest =>
+        {
+            Ok(())
+        }
+        (Some(previous), BrokerPaneLeaseWalPhaseV1::SuccessorRebound)
+            if matches!(
+                previous.phase,
+                BrokerPaneLeaseWalPhaseV1::SuccessorClaimed
+                    | BrokerPaneLeaseWalPhaseV1::SuccessorRebound
+            ) && current.handoff_id == previous.handoff_id
+                && (previous.ack_id.is_nil() || current.ack_id == previous.ack_id)
+                && current.predecessor_attachment_id == previous.predecessor_attachment_id
+                && current.predecessor_attachment_digest
+                    == previous.predecessor_attachment_digest
+                && current.lease_generation == previous.lease_generation
+                && current.successor_attachment_id != previous.successor_attachment_id
+                && current.owner.same_stable_owner(previous.owner)
+                && current.owner.connection_id != previous.owner.connection_id
+                && current.recovery_verifier != previous.recovery_verifier
+                && current.attachment_digest != previous.attachment_digest =>
         {
             Ok(())
         }
@@ -12225,6 +12635,33 @@ impl BrokerPaneLeaseJournalV1 {
         self.append_or_recover_exact(&fields)
     }
 
+    fn rebind_successor_and_sync(
+        &mut self,
+        handoff_id: Uuid,
+        ack_id: Uuid,
+        predecessor: BrokerAttachmentIdentityV1,
+        successor: BrokerAttachmentIdentityV1,
+        recovery_verifier: BrokerPaneRecoveryVerifierV1,
+    ) -> Result<BrokerPaneLeaseWalReceiptV1, BrokerPaneLeaseWalErrorV1> {
+        validate_broker_lease_attachment_for_spawn(predecessor, self.identity.spawn)?;
+        validate_broker_lease_attachment_for_spawn(successor, self.identity.spawn)?;
+        if predecessor.lease_generation.checked_add(1) != Some(successor.lease_generation) {
+            return Err(BrokerPaneLeaseWalErrorV1::InvalidIdentity);
+        }
+        self.append_or_recover_exact(&BrokerPaneLeaseWalRecordFieldsV1 {
+            phase: BrokerPaneLeaseWalPhaseV1::SuccessorRebound,
+            handoff_id,
+            ack_id,
+            predecessor_attachment_id: predecessor.attachment_id,
+            successor_attachment_id: successor.attachment_id,
+            lease_generation: successor.lease_generation,
+            owner: successor.owner,
+            recovery_verifier,
+            attachment_digest: broker_lease_attachment_digest(successor)?,
+            predecessor_attachment_digest: broker_lease_attachment_digest(predecessor)?,
+        })
+    }
+
     fn acknowledge_successor_and_sync(
         &mut self,
         handoff_id: Uuid,
@@ -12277,7 +12714,8 @@ impl BrokerPaneLeaseJournalV1 {
             record.fields.phase == fields.phase
                 && record.fields.lease_generation == fields.lease_generation
         });
-        if conflicts_with_generation {
+        if conflicts_with_generation && fields.phase != BrokerPaneLeaseWalPhaseV1::SuccessorRebound
+        {
             return Err(BrokerPaneLeaseWalErrorV1::EffectIdentityConflict);
         }
         self.append_fields_and_head(fields)
@@ -16738,6 +17176,13 @@ impl BrokerAuthenticatedGuardianConnectionV1 {
 }
 
 impl BrokerGuardianOwnerIdentity {
+    fn same_stable_owner(self, other: Self) -> bool {
+        self.guardian_incarnation == other.guardian_incarnation
+            && self.mux_incarnation == other.mux_incarnation
+            && self.mux_build_identity_digest == other.mux_build_identity_digest
+            && self.guardian_build_identity_digest == other.guardian_build_identity_digest
+    }
+
     fn is_valid(self) -> bool {
         !self.guardian_incarnation.is_nil()
             && !self.connection_id.is_nil()
@@ -19008,6 +19453,48 @@ impl BrokerAdoptedPaneV1 {
                 Err(BrokerError::ConflictingSuccessorHandoff)
             }
         }
+    }
+
+    fn rebind_pending_successor(
+        &mut self,
+        prior: BrokerAttachmentIdentityV1,
+        owner: BrokerGuardianOwnerIdentity,
+    ) -> Result<BrokerAttachmentIdentityV1, BrokerError> {
+        let BrokerLeaseState::ClaimedSuccessor {
+            predecessor,
+            attachment,
+        } = self.lease
+        else {
+            return Err(BrokerError::ConflictingSuccessorHandoff);
+        };
+        if attachment != prior
+            || !owner.is_valid()
+            || !owner.same_stable_owner(prior.owner)
+            || owner.connection_id == prior.owner.connection_id
+            || self.fenced_attachments.len() >= self.max_fenced_attachment_tombstones()
+        {
+            self.quarantine(BrokerQuarantineReasonV1::ConflictingSuccessorHandoff, false);
+            return Err(BrokerError::ConflictingSuccessorHandoff);
+        }
+        let handoff = self
+            .applied_handoff
+            .as_mut()
+            .ok_or(BrokerError::ConflictingSuccessorHandoff)?;
+        if handoff.successor != prior || handoff.ack_id.is_some() {
+            return Err(BrokerError::ConflictingSuccessorHandoff);
+        }
+        let next = BrokerAttachmentIdentityV1 {
+            attachment_id: Uuid::new_v4(),
+            owner,
+            ..prior
+        };
+        self.fenced_attachments.push_back(prior);
+        handoff.successor = next;
+        self.lease = BrokerLeaseState::ClaimedSuccessor {
+            predecessor,
+            attachment: next,
+        };
+        Ok(next)
     }
 
     /// Activate one previously claimed successor only after its exact
@@ -24332,6 +24819,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broker_control_pending_claim_reconnect_rotates_durable_custody_without_replacing_child() {
+        for fault in [
+            None,
+            Some(BrokerPaneLeaseWalInjectedFaultV1::BeforeWalWrite),
+            Some(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead),
+            Some(BrokerPaneLeaseWalInjectedFaultV1::BeforeHeadSync),
+            Some(BrokerPaneLeaseWalInjectedFaultV1::PanicAfterWalSyncBeforeHead),
+        ] {
+            broker_control_spawn_with_lease_scenario(
+                false,
+                false,
+                None,
+                Some((BrokerPaneLeaseWalPhaseV1::SuccessorRebound, fault)),
+            );
+        }
+    }
+
     fn broker_control_spawn_with_lease_scenario(
         real_genesis: bool,
         terminal_probe: bool,
@@ -24796,7 +25301,9 @@ mod tests {
             .expect("authenticate acknowledged output authority")
             .expect("completed Spawn ACK mints output authority");
         let output_deadline = Instant::now() + Duration::from_secs(5);
-        if let Some((phase, fault)) = lease_scenario {
+        if let Some((phase, fault)) = lease_scenario
+            .filter(|(phase, _)| *phase != BrokerPaneLeaseWalPhaseV1::SuccessorRebound)
+        {
             let (old_attachment, write_permit, resize_permit) = service.inspect(move |service| {
                 let live = service
                     .live_spawns
@@ -25944,6 +26451,359 @@ mod tests {
             assert!(successor_client.acknowledge_successor_claim(token).is_err());
             custody_store.fail_spawn_custody_sync_for_test(0);
             assert!(successor_client.census().unwrap().entries()[0].effects_disabled);
+        }
+        if let Some((BrokerPaneLeaseWalPhaseV1::SuccessorRebound, fault)) = lease_scenario {
+            let original_connection = successor_client.connection_id;
+            let mut fresh = BrokerControlClientV1::connect(
+                &socket_path,
+                &token_path,
+                successor_identity,
+                broker_build,
+            )
+            .unwrap();
+            let reconnect_connection = fresh.connection_id;
+            assert_ne!(original_connection, reconnect_connection);
+            for stage in [1, 2] {
+                let saved = custody_store
+                    .reopen_successor_custody(&successor_context)
+                    .unwrap();
+                custody_store.fail_spawn_custody_sync_for_test(stage);
+                assert!(fresh.acknowledge_successor_claim(saved).is_err());
+                custody_store.fail_spawn_custody_sync_for_test(0);
+                service.inspect(move |service| {
+                    let live = service
+                        .live_spawns
+                        .get_mut(&binding.durable_pane_id)
+                        .unwrap();
+                    assert_eq!(live.lease_status.committed_records, 2);
+                    assert!(live.adoption.pane.child.try_wait().unwrap().is_none());
+                    assert!(live.adoption.pane.active_attachment_identity().is_none());
+                });
+            }
+            // A genuine durable intent from an abandoned network attempt must
+            // not choose the parent for a later authenticated connection.
+            custody_store
+                .reopen_successor_custody(&successor_context)
+                .unwrap()
+                .prepare_rebind(id(98_701))
+                .unwrap();
+            let saved = fresh
+                .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff_id, 2)
+                .unwrap();
+            assert_eq!(
+                fresh.acknowledge_successor_claim(saved).unwrap(),
+                BrokerSuccessorAcknowledgementV1::Quarantined,
+                "a still-connected claimant cannot be displaced"
+            );
+            let original_attachment = service.inspect(move |service| {
+                let live = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                assert_eq!(live.lease_status.committed_records, 2);
+                assert!(!live.pending_successor.as_ref().unwrap().disconnected);
+                live.pending_successor.as_ref().unwrap().attachment
+            });
+            drop(successor_client);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if service.inspect(move |service| {
+                    service
+                        .live_spawns
+                        .get(&binding.durable_pane_id)
+                        .unwrap()
+                        .pending_successor
+                        .as_ref()
+                        .unwrap()
+                        .disconnected
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pending claimant EOF was not observed"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            if let Some(fault) = fault {
+                service.inspect(move |service| {
+                    service
+                        .live_spawns
+                        .get_mut(&binding.durable_pane_id)
+                        .unwrap()
+                        .lease_journal
+                        .as_mut()
+                        .unwrap()
+                        .inject_fault(fault)
+                });
+            }
+            let saved = fresh
+                .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff_id, 2)
+                .unwrap();
+            assert_eq!(
+                fresh.acknowledge_successor_claim(saved).unwrap(),
+                BrokerSuccessorAcknowledgementV1::Pending
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if service.inspect(move |service| {
+                    service
+                        .live_spawns
+                        .get(&binding.durable_pane_id)
+                        .unwrap()
+                        .lease_transition
+                        .is_none()
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "rebind worker did not settle");
+                thread::sleep(Duration::from_millis(1));
+            }
+            service.inspect(move |service| {
+                let live = service
+                    .live_spawns
+                    .get_mut(&binding.durable_pane_id)
+                    .unwrap();
+                assert_eq!(live.adoption.pane.kernel_child_identity(), child_identity);
+                assert!(live.adoption.pane.child.try_wait().unwrap().is_none());
+                assert!(live.adoption.pane.active_attachment_identity().is_none());
+                let stale = BrokerPtyAttachmentV1 {
+                    identity: original_attachment,
+                };
+                assert!(
+                    live.adoption
+                        .pane
+                        .admit_proxy_write(&stale, b"must-not-write")
+                        .is_err()
+                );
+                assert!(
+                    live.adoption
+                        .pane
+                        .admit_proxy_resize(
+                            &stale,
+                            PtySize {
+                                rows: 42,
+                                cols: 99,
+                                pixel_width: 0,
+                                pixel_height: 0
+                            }
+                        )
+                        .is_err()
+                );
+                if fault.is_some() {
+                    assert!(matches!(
+                        live.adoption.pane.status().lifecycle,
+                        BrokerPaneLifecycleV1::Quarantined(_)
+                    ));
+                } else {
+                    assert_eq!(
+                        live.adoption.pane.status().lifecycle,
+                        BrokerPaneLifecycleV1::SuccessorClaimPending
+                    );
+                    assert_eq!(live.lease_status.committed_records, 3);
+                    assert_eq!(
+                        live.lease_status.phase,
+                        Some(BrokerPaneLeaseWalPhaseV1::SuccessorRebound)
+                    );
+                    assert_eq!(
+                        live.lease_status.owner.unwrap().connection_id,
+                        reconnect_connection
+                    );
+                    assert_eq!(live.lease_status.ack_id, Some(id(7_320)));
+                }
+            });
+            if fault.is_some() {
+                let census = fresh.census().unwrap();
+                assert_eq!(census.entries().len(), 1);
+                assert!(census.entries()[0].effects_disabled);
+                assert!(census.entries()[0].pty_available);
+                assert_eq!(census.entries()[0].child_identity, Some(child_identity));
+                drop(fresh);
+                service.finish();
+                return;
+            }
+            let saved = fresh
+                .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff_id, 2)
+                .unwrap();
+            let rebound_context = saved.context();
+            assert_eq!(rebound_context.rebind_from_connection, original_connection);
+            let (parent, old_secret, new_secret) = saved.rebind_secrets().unwrap();
+            assert_ne!(*old_secret, *new_secret);
+            let mut payload = Zeroizing::new(Vec::new());
+            payload.extend_from_slice(parent.successor.connection_id.as_bytes());
+            for id in [
+                parent.predecessor.guardian_incarnation,
+                parent.predecessor.connection_id,
+                parent.predecessor.mux_incarnation,
+            ] {
+                payload.extend_from_slice(id.as_bytes());
+            }
+            payload.extend_from_slice(&parent.predecessor.guardian_build);
+            payload.extend_from_slice(&parent.predecessor.mux_build);
+            payload.extend_from_slice(old_secret.as_slice());
+            payload.extend_from_slice(new_secret.as_slice());
+            let header = BrokerControlRequestHeaderV1 {
+                operation: BrokerControlOperationV1::RecoverSuccessorClaim,
+                request_id: rebound_context.ack_id,
+                broker_incarnation: fresh.broker_incarnation,
+                guardian_incarnation: fresh.identity.guardian_incarnation,
+                connection_id: fresh.connection_id,
+                mux_incarnation: fresh.identity.mux_incarnation,
+                guardian_build_identity_digest: fresh.identity.guardian_build_identity.into_bytes(),
+                mux_build_identity_digest: fresh.identity.mux_build_identity.into_bytes(),
+                durable_pane_id: binding.durable_pane_id,
+                lease_generation: 2,
+                operation_id: handoff_id,
+            };
+            for offset in [0, 16, 32, 48, 64, 96, 128, 160] {
+                let mut wrong = payload.clone();
+                wrong[offset] ^= 1;
+                let reply = fresh
+                    .exchange(&BrokerControlRequestV1::new(header, &wrong).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    reply.header.status,
+                    BrokerControlResponseStatusV1::Quarantined
+                );
+            }
+            for wrong in [
+                BrokerControlRequestHeaderV1 {
+                    request_id: id(98_702),
+                    ..header
+                },
+                BrokerControlRequestHeaderV1 {
+                    operation_id: id(98_703),
+                    ..header
+                },
+                BrokerControlRequestHeaderV1 {
+                    lease_generation: 3,
+                    ..header
+                },
+            ] {
+                assert_eq!(
+                    fresh
+                        .exchange(&BrokerControlRequestV1::new(wrong, &payload).unwrap())
+                        .unwrap()
+                        .header
+                        .status,
+                    BrokerControlResponseStatusV1::Quarantined
+                );
+            }
+            let exact = BrokerControlRequestV1::new(header, &payload).unwrap();
+            // Discard the first durable response, then recover exactly the
+            // same committed transition without another mutation or activation.
+            drop(fresh.exchange(&exact).unwrap());
+            assert_eq!(
+                fresh.exchange(&exact).unwrap().header.status,
+                BrokerControlResponseStatusV1::Recovered
+            );
+            drop(fresh);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if service.inspect(move |service| {
+                    service
+                        .live_spawns
+                        .get(&binding.durable_pane_id)
+                        .unwrap()
+                        .pending_successor
+                        .as_ref()
+                        .unwrap()
+                        .disconnected
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "rebound claimant EOF was not observed"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            // A second fresh connection must follow the broker-committed
+            // rotated parent, despite the abandoned sibling intent on disk.
+            let mut fresh = BrokerControlClientV1::connect(
+                &socket_path,
+                &token_path,
+                successor_identity,
+                broker_build,
+            )
+            .unwrap();
+            let final_connection = fresh.connection_id;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let saved = fresh
+                    .reopen_successor_custody(
+                        &custody_store,
+                        binding.durable_pane_id,
+                        handoff_id,
+                        2,
+                    )
+                    .unwrap();
+                match fresh.acknowledge_successor_claim(saved).unwrap() {
+                    BrokerSuccessorAcknowledgementV1::Acknowledged => break,
+                    BrokerSuccessorAcknowledgementV1::Pending if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(1))
+                    }
+                    other => panic!("rebound ACK failed: {other:?}"),
+                }
+            }
+            let stale = BrokerControlRequestV1::new(
+                BrokerControlRequestHeaderV1 {
+                    connection_id: final_connection,
+                    ..header
+                },
+                &payload,
+            )
+            .unwrap();
+            assert_eq!(
+                fresh.exchange(&stale).unwrap().header.status,
+                BrokerControlResponseStatusV1::Quarantined,
+                "old recovery proof cannot mutate after ACK"
+            );
+            service.inspect(move |service| {
+                let live = service.live_spawns.get(&binding.durable_pane_id).unwrap();
+                assert_eq!(live.adoption.pane.kernel_child_identity(), child_identity);
+                assert_eq!(live.lease_status.committed_records, 5);
+                let journal = live.lease_journal.as_ref().unwrap();
+                assert_eq!(
+                    journal
+                        .records
+                        .iter()
+                        .map(|record| record.fields.phase)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        BrokerPaneLeaseWalPhaseV1::PredecessorFenced,
+                        BrokerPaneLeaseWalPhaseV1::SuccessorClaimed,
+                        BrokerPaneLeaseWalPhaseV1::SuccessorRebound,
+                        BrokerPaneLeaseWalPhaseV1::SuccessorRebound,
+                        BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged,
+                    ]
+                );
+                let mut old_header = encode_broker_lease_file_header(
+                    BROKER_LEASE_WAL_FILE_MAGIC,
+                    &journal.identity,
+                    &journal.authenticator,
+                )
+                .unwrap();
+                old_header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+                assert!(matches!(
+                    decode_broker_lease_file_header(
+                        &old_header,
+                        BROKER_LEASE_WAL_FILE_MAGIC,
+                        &journal.authenticator
+                    ),
+                    Err(BrokerPaneLeaseWalErrorV1::UnsupportedVersion { observed: 1 })
+                ));
+                assert_eq!(
+                    live.adoption
+                        .pane
+                        .active_attachment_identity()
+                        .unwrap()
+                        .owner
+                        .connection_id,
+                    final_connection
+                );
+            });
+            assert_eq!(fs::read(&sentinel).unwrap(), b"C");
+            drop(fresh);
+            service.finish();
+            return;
         }
         // Neither the claim nor its recovered ACK/context is used by discovery.
         drop(successor_claim);

@@ -534,11 +534,85 @@ impl GuardianDurableSuccessorCustodyV1 {
         self.context
     }
 
+    pub(crate) fn select_rebind_origin(
+        &self,
+        authenticated_connection: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let mut scope = self.context.scope();
+        scope.successor.connection_id = authenticated_connection;
+        let selected = self.store.lookup_successor_custody(scope)?;
+        if selected.context.ack_id != self.context.ack_id
+            || selected.context.predecessor != self.context.predecessor
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        Ok(selected)
+    }
+
     pub(crate) fn into_secret(
         self,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
         self.store
             .with_exclusive_directory(|inner| read_successor_custody_locked(inner, &self.context))
+    }
+
+    pub(crate) fn prepare_rebind(
+        self,
+        connection_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        if connection_id.is_nil() {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        if self.context.successor.connection_id == connection_id {
+            self.store.reopen_successor_custody(&self.context)
+        } else {
+            // Reauthenticate and synchronize the source before minting its child.
+            self.store.reopen_successor_custody(&self.context)?;
+            let mut next = self.context;
+            next.rebind_from_connection = self.context.successor.connection_id;
+            next.successor.connection_id = connection_id;
+            match self.store.reopen_successor_custody(&next) {
+                Ok(existing) => return Ok(existing),
+                Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                    source,
+                    ..
+                })) if source.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut secret = Zeroizing::new([0; 32]);
+            getrandom::fill(secret.as_mut()).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+            self.store.persist_successor_custody(&next, &secret)
+        }
+    }
+
+    pub(crate) fn rebind_secrets(
+        &self,
+    ) -> Result<
+        (
+            mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+            Zeroizing<[u8; 32]>,
+            Zeroizing<[u8; 32]>,
+        ),
+        GuardianCheckpointStageStoreError,
+    > {
+        self.store.with_exclusive_directory(|inner| {
+            if self.context.rebind_from_connection.is_nil() {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let mut scope = self.context.scope();
+            scope.successor.connection_id = self.context.rebind_from_connection;
+            let (parent, prior_secret) = read_successor_custody_scope_locked(inner, scope)?;
+            if parent.predecessor != self.context.predecessor
+                || parent.ack_id != self.context.ack_id
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let secret = read_successor_custody_locked(inner, &self.context)?;
+            if secret == prior_secret {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok((parent, prior_secret, secret))
+        })
     }
 }
 
@@ -2175,7 +2249,7 @@ impl GuardianCheckpointStageStore {
             let names = read_directory_names(&inner.directory)?;
             if names
                 .iter()
-                .filter(|name| name.as_bytes().starts_with(b"successor-custody-v1-"))
+                .filter(|name| name.as_bytes().starts_with(b"successor-custody-"))
                 .count()
                 >= inner.policy.max_stage_files
             {
@@ -2186,7 +2260,7 @@ impl GuardianCheckpointStageStore {
             getrandom::fill(&mut attempt).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
             let path = successor_custody_path(inner, context);
             let staging_name = format!(
-                "successor-custody-v1-{}-{}.pending-{}",
+                "successor-custody-v2-{}-{}.pending-{}",
                 context.pane_id,
                 context.handoff_id,
                 Uuid::from_bytes(attempt)
@@ -2232,6 +2306,108 @@ impl GuardianCheckpointStageStore {
         let (context, secret) = self
             .with_exclusive_directory(|inner| read_successor_custody_scope_locked(inner, scope))?;
         drop(secret);
+        Ok(GuardianDurableSuccessorCustodyV1 {
+            store: self.clone(),
+            context,
+        })
+    }
+
+    pub(crate) fn lookup_successor_custody_for_reconnect(
+        &self,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        match self.lookup_successor_custody(scope) {
+            Ok(custody) => return Ok(custody),
+            Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                source,
+                ..
+            })) if source.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let context = self.with_exclusive_directory(|inner| {
+            let prefix = format!(
+                "successor-custody-v2-{}-{}-",
+                scope.pane_id, scope.handoff_id
+            );
+            let names = read_directory_names(&inner.directory)?;
+            let mut contexts = Vec::new();
+            for name in names {
+                if !name.as_bytes().starts_with(prefix.as_bytes())
+                    || !name.as_bytes().ends_with(b".bin")
+                {
+                    continue;
+                }
+                if contexts.len() >= inner.policy.max_stage_files {
+                    return Err(GuardianCheckpointStageStoreError::Capacity);
+                }
+                let path = inner.directory_path.join(&name);
+                let bytes = read_synced_custody_bytes::<
+                    { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
+                >(inner, &path)?;
+                let (context, secret) = inner.cipher.open_successor_custody_record(&bytes)?;
+                drop(secret);
+                let mut expected = scope;
+                expected.successor.connection_id = context.successor.connection_id;
+                if context.scope() != expected || successor_custody_path(inner, &context) != path {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                contexts.push(context);
+            }
+            let mut by_connection = BTreeMap::new();
+            for (index, context) in contexts.iter().enumerate() {
+                if by_connection
+                    .insert(context.successor.connection_id, index)
+                    .is_some()
+                {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+            }
+            let mut root = None;
+            let mut parents = Vec::with_capacity(contexts.len());
+            for (index, context) in contexts.iter().enumerate() {
+                if context.rebind_from_connection.is_nil() {
+                    if root.replace(index).is_some() {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    parents.push(None);
+                } else {
+                    let parent = *by_connection
+                        .get(&context.rebind_from_connection)
+                        .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+                    if contexts[parent].predecessor != context.predecessor
+                        || contexts[parent].ack_id != context.ack_id
+                    {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    parents.push(Some(parent));
+                }
+            }
+            let root = root.ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+            // Files are prepared intents, not the broker's committed authority.
+            // Allow branches left by failed network attempts, but every node
+            // must reach the one authenticated root. The broker selects the
+            // exact live parent before any rotated capability is submitted.
+            // Each vertex is visited at most once; avoid quadratic ancestor
+            // rescans on long reconnect histories. 1=visiting, 2=rooted.
+            let mut marks = vec![0_u8; contexts.len()];
+            marks[root] = 2;
+            let mut path = Vec::with_capacity(contexts.len());
+            for start in 0..contexts.len() {
+                let mut cursor = start;
+                while marks[cursor] != 2 {
+                    if marks[cursor] == 1 {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    marks[cursor] = 1;
+                    path.push(cursor);
+                    cursor = parents[cursor].ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+                }
+                for visited in path.drain(..) {
+                    marks[visited] = 2;
+                }
+            }
+            Ok(contexts[root])
+        })?;
         Ok(GuardianDurableSuccessorCustodyV1 {
             store: self.clone(),
             context,
@@ -5936,8 +6112,8 @@ fn successor_custody_path(
     context: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
 ) -> PathBuf {
     inner.directory_path.join(format!(
-        "successor-custody-v1-{}-{}.bin",
-        context.pane_id, context.handoff_id
+        "successor-custody-v2-{}-{}-{}.bin",
+        context.pane_id, context.handoff_id, context.successor.connection_id
     ))
 }
 
@@ -5963,8 +6139,8 @@ fn read_successor_custody_scope_locked(
     GuardianCheckpointStageStoreError,
 > {
     let path = inner.directory_path.join(format!(
-        "successor-custody-v1-{}-{}.bin",
-        expected.pane_id, expected.handoff_id
+        "successor-custody-v2-{}-{}-{}.bin",
+        expected.pane_id, expected.handoff_id, expected.successor.connection_id
     ));
     let bytes = read_synced_custody_bytes::<
         { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
@@ -11953,6 +12129,82 @@ mod tests {
             wire_ack_generation: 0,
             secret_lease_generation: 1,
         }
+    }
+
+    #[test]
+    fn successor_custody_reconnect_graph_authenticates_branches_and_rejects_disconnected_cycles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use mux::guardian_checkpoint::{
+            GuardianSuccessorCustodyContextV1, GuardianSuccessorCustodyOwnerV1,
+        };
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-successor-custody-graph-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let owner = GuardianSuccessorCustodyOwnerV1 {
+            guardian_incarnation: Uuid::from_u128(1),
+            connection_id: Uuid::from_u128(2),
+            mux_incarnation: Uuid::from_u128(3),
+            guardian_build: [4; 32],
+            mux_build: [5; 32],
+        };
+        let root = GuardianSuccessorCustodyContextV1 {
+            broker_incarnation: Uuid::from_u128(6),
+            broker_lineage: Uuid::from_u128(7),
+            broker_build: [8; 32],
+            predecessor: owner,
+            successor: GuardianSuccessorCustodyOwnerV1 {
+                connection_id: Uuid::from_u128(9),
+                ..owner
+            },
+            pane_id: Uuid::from_u128(10),
+            handoff_id: Uuid::from_u128(11),
+            ack_id: Uuid::from_u128(12),
+            lease_generation: 2,
+            rebind_from_connection: Uuid::nil(),
+        };
+        store.persist_successor_custody(&root, &[0x21; 32])?;
+        for connection in [20, 21] {
+            store
+                .reopen_successor_custody(&root)?
+                .prepare_rebind(Uuid::from_u128(connection))?;
+        }
+        let mut scope = root.scope();
+        scope.successor.connection_id = Uuid::from_u128(99);
+        let recovered = store.lookup_successor_custody_for_reconnect(scope)?;
+        assert_eq!(
+            recovered.context(),
+            root,
+            "prepared branches do not choose broker authority"
+        );
+        let chosen = recovered.select_rebind_origin(Uuid::from_u128(20))?;
+        assert_eq!(
+            chosen.context().successor.connection_id,
+            Uuid::from_u128(20)
+        );
+        let next = chosen.prepare_rebind(Uuid::from_u128(22))?;
+        let (parent, old, rotated) = next.rebind_secrets()?;
+        assert_eq!(parent.successor.connection_id, Uuid::from_u128(20));
+        assert_ne!(*old, *rotated);
+        // Valid encrypted nodes can still form a disconnected cycle. Root and
+        // tip counts alone would accept this malformed custody graph.
+        for (connection, parent) in [(30, 31), (31, 30)] {
+            let context = GuardianSuccessorCustodyContextV1 {
+                successor: GuardianSuccessorCustodyOwnerV1 {
+                    connection_id: Uuid::from_u128(connection),
+                    ..root.successor
+                },
+                rebind_from_connection: Uuid::from_u128(parent),
+                ..root
+            };
+            store.persist_successor_custody(&context, &[0x44; 32])?;
+        }
+        assert!(matches!(
+            store.lookup_successor_custody_for_reconnect(scope),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        Ok(())
     }
 
     #[test]
