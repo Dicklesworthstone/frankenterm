@@ -799,3 +799,15 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Publish through DSR, verify release/canary/upgrade, and perform the
   supported session-preserving installation and Dock verification. Existing
   GUI/local PTYs and remote mux processes must remain protected.
+
+### 2026-09-16 18:13 UTC — RC28 formatting correction and qualification
+
+- [x] Retain RC27 formatting failure: RCH31927 ran the exact `498d78c5`
+  baseline and failed on eight import reorderings in `mux/src/domain.rs`.
+  Commit `47281d9a0` applies only those reorderings. RC27 remains immutable;
+  its ongoing builds and prior receipts do not qualify RC28.
+- [ ] Freeze RC28 after metadata and derived provenance updates, then rerun
+  the exact-source formatting proof and complete the full workspace tests.
+- [ ] Complete all four native DSR targets and final-family acceptance;
+  qualify the four producers, retain all 32 manifest slots, and pass all six
+  quality gates before signing, publication, or installation.

@@ -638,7 +638,7 @@
       "classification_summary": {
         "chore": 9,
         "cleanup": 3,
-        "cosmetic": 28,
+        "cosmetic": 29,
         "docs": 6,
         "feat": 192,
         "fix": 226,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 89
       },
-      "fork_side_commit_count": 621,
+      "fork_side_commit_count": 622,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-16T12:39:42-04:00",
-        "sha": "a64517361256b53776c1199fbc515cfd8468d378",
-        "subject": "fix(capture): preserve admitted output and polling fallback for rc.27"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-16T14:20:24-04:00",
+        "sha": "47281d9a023fbec00626141a30752407f390c655",
+        "subject": "style(mux): use crate-edition import ordering"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2670,
-  "generated_at": "2026-09-16T16:44:05.529859Z",
+  "fork_side_commit_total": 2671,
+  "generated_at": "2026-09-16T18:20:59.454180Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

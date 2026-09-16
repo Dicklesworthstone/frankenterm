@@ -54,7 +54,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Capture retains output already received from the mux when a concurrent terminal change rejects the correlated snapshot. Bounded retries no longer lose the initial screen, and failed streaming bindings retain their polling fallback after the old source drains.
 - A failed render batch reports that resynchronization is required instead of silently retrying after discarding partial output. MCP test transports now leave their runtime reactor free to drive real mux operations, matching the production transport path.
 
-The `0.15.6-rc.27` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.28` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.
