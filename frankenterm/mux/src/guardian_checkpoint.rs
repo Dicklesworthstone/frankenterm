@@ -547,6 +547,18 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         canonical_terminal_payload: &[u8],
         limits: TerminalCheckpointLimits,
     ) -> Result<(), GuardianCheckpointBoundaryError> {
+        self.decode_canonical_payload(canonical_terminal_payload, limits)
+            .map(drop)
+    }
+
+    pub(crate) fn decode_canonical_payload(
+        &self,
+        canonical_terminal_payload: &[u8],
+        limits: TerminalCheckpointLimits,
+    ) -> Result<
+        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV2,
+        GuardianCheckpointBoundaryError,
+    > {
         self.validate_identity_fields()?;
         if self.replay_identity_digest != current_replay_identity_digest() {
             return Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch);
@@ -557,7 +569,6 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         if validated.rows() != self.rows || validated.cols() != self.cols {
             return Err(GuardianCheckpointBoundaryError::TerminalGeometryMismatch);
         }
-        drop(validated);
         let (observed_payload_bytes, observed_payload_digest) =
             terminal_payload_identity(canonical_terminal_payload)?;
         if observed_payload_bytes != self.terminal_payload_bytes {
@@ -566,7 +577,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         if observed_payload_digest != self.terminal_payload_digest {
             return Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch);
         }
-        Ok(())
+        Ok(validated)
     }
 
     /// Bind a record-backed descriptor to the exact receipt reconstructed by
@@ -4542,7 +4553,7 @@ impl GuardianRestoredTerminal {
     ) -> anyhow::Result<Self> {
         use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
         anyhow::ensure!(!pane_id.is_nil(), "restored guardian pane identity is nil");
-        descriptor.validate_canonical_payload(payload)?;
+        let validated = descriptor.decode_canonical_payload(payload, limits)?;
         let output = descriptor.output_boundary();
         if matches!(output, GuardianCheckpointOutputBoundaryV1::Record { .. }) {
             anyhow::ensure!(
@@ -4550,7 +4561,6 @@ impl GuardianRestoredTerminal {
                 "restored guardian checkpoint belongs to another pane"
             );
         }
-        let validated = TerminalCheckpointV2::decode_canonical_json(payload, limits)?;
         anyhow::ensure!(
             validated.rows() == descriptor.rows() && validated.cols() == descriptor.cols(),
             "restored guardian checkpoint geometry differs from its descriptor"
@@ -8513,6 +8523,37 @@ mod tests {
             .expect("a quiet restored Record has a genuine zero-byte fresh parser");
         descriptor
             .validate_canonical_payload(restored_capture.terminal_checkpoint().canonical_payload())
+            .unwrap();
+        // Resizing the registered model changes its canonical payload without
+        // consuming output. Its next checkpoint must retain the journal prefix
+        // while describing the new geometry and a genuinely fresh parser.
+        terminal.resize(TerminalSize {
+            rows: 20,
+            cols: 60,
+            pixel_width: 480,
+            pixel_height: 320,
+            dpi: 96,
+        });
+        let resized = terminal
+            .capture_recovery_checkpoint_at_external_parser_ground(
+                parser.recovery_ground_boundary().unwrap(),
+                TerminalCheckpointLimits::default(),
+            )
+            .unwrap();
+        let resized_capture = LiveParserCheckpointAck::capture_restored(
+            [2; 16],
+            capture.durable_pane_id(),
+            boundary,
+            resized,
+        )
+        .unwrap();
+        assert_eq!(resized_capture.boundary().rows(), 20);
+        assert_eq!(resized_capture.boundary().cols(), 60);
+        assert_eq!(resized_capture.output_sequence(), capture.output_sequence());
+        assert_eq!(resized_capture.parser_stream_bytes(), 0);
+        GuardianCheckpointDescriptorV1::from_live_capture(&resized_capture, 3)
+            .unwrap()
+            .validate_canonical_payload(resized_capture.terminal_checkpoint().canonical_payload())
             .unwrap();
         terminal.advance_bytes(b"unrelated replacement model");
         assert!(prefix

@@ -4529,6 +4529,21 @@ impl GuardianCheckpointDescriptorV1 {
         self,
         canonical_terminal_payload: &[u8],
     ) -> Result<(), GuardianProtocolError> {
+        self.decode_canonical_payload(
+            canonical_terminal_payload,
+            TerminalCheckpointLimits::default(),
+        )
+        .map(drop)
+    }
+
+    pub(crate) fn decode_canonical_payload(
+        self,
+        canonical_terminal_payload: &[u8],
+        limits: TerminalCheckpointLimits,
+    ) -> Result<
+        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV2,
+        GuardianProtocolError,
+    > {
         self.validate()?;
         // Admission is semantic as well as content-addressed: the terminal
         // codec enforces its bounded current schema, semantic invariants, and
@@ -4539,10 +4554,7 @@ impl GuardianCheckpointDescriptorV1 {
         // store must additionally reconcile the descriptor's exact output
         // boundary against its guardian-owned journal before publication.
         self.canonical_descriptor()?
-            .validate_canonical_payload(
-                canonical_terminal_payload,
-                TerminalCheckpointLimits::default(),
-            )
+            .decode_canonical_payload(canonical_terminal_payload, limits)
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)
     }
 }
