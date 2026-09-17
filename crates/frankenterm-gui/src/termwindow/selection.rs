@@ -383,13 +383,12 @@ impl super::TermWindow {
                 let Some(local) = local else {
                     return;
                 };
-                let text = self.selection_text(pane);
                 // Copy must be retried independently if its source acquisition
                 // loses the same contention race after anchor registration.
-                if text.is_empty() && pending.desired.range.is_some() {
+                let Some(text) = self.try_selection_text(pane) else {
                     self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
                     return;
-                }
+                };
                 match Self::capture_native_selection(pane, local, &pending.desired) {
                     crate::selection::NativeSelectionCapture::Busy => {
                         self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
@@ -571,15 +570,20 @@ impl super::TermWindow {
 
     /// Returns the selection text only
     pub fn selection_text(&self, pane: &Arc<dyn Pane>) -> String {
+        self.try_selection_text(pane).unwrap_or_default()
+    }
+
+    /// An unavailable source requires retry; acquired empty text is complete.
+    fn try_selection_text(&self, pane: &Arc<dyn Pane>) -> Option<String> {
         let expected = SelectionAuthority::capture(&**pane);
         self.synchronize_native_selection(pane, expected);
-        if !self.selection(pane.pane_id()).is_authorized_by(expected) {
-            return String::new();
+        if expected.is_none() || !self.selection(pane.pane_id()).is_authorized_by(expected) {
+            return None;
         }
         let (rectangular, sel) = {
             let selection = self.selection(pane.pane_id());
             let Some(sel) = selection.range.as_ref().map(|r| r.normalize()) else {
-                return String::new();
+                return Some(String::new());
             };
             (selection.rectangular, sel)
         };
@@ -587,9 +591,9 @@ impl super::TermWindow {
         let text =
             selected_text_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular);
         if SelectionAuthority::capture(&**pane) != expected {
-            return String::new();
+            return None;
         }
-        text
+        Some(text)
     }
 
     pub fn clear_selection_drag(&mut self) {
