@@ -162,15 +162,15 @@
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 30
+        "test": 31
       },
-      "fork_side_commit_count": 232,
+      "fork_side_commit_count": 233,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-17T12:35:46-04:00",
-        "sha": "b69f97db17c1a9fa541bb7288bf00a0a3bba8b82",
-        "subject": "perf(client): add opt-in cache invalidation timing"
+        "classification": "test",
+        "committed_at": "2026-09-17T12:55:30-04:00",
+        "sha": "92be000d93cf96cf1cdc47ca2f24af04919f2661",
+        "subject": "test(client): initialize replacement render stream after reconnect readiness"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -647,15 +647,15 @@
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 94
+        "test": 96
       },
-      "fork_side_commit_count": 651,
+      "fork_side_commit_count": 653,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-17T12:19:29-04:00",
-        "sha": "f386a4b3f909476c47eb98a261721ae608b8f91a",
-        "subject": "test(recovery): retire predecessor owner before successor takeover"
+        "committed_at": "2026-09-17T12:54:24-04:00",
+        "sha": "346b7c3253781a71ef25b6b2d30660593c1f16e7",
+        "subject": "test(mux): format focus regression assertion diagnostics on Rust 2018"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2731,
-  "generated_at": "2026-09-17T16:36:26.609221Z",
+  "fork_side_commit_total": 2734,
+  "generated_at": "2026-09-17T16:56:55.036961Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
