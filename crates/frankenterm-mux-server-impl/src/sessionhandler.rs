@@ -2946,6 +2946,24 @@ impl Default for PerPane {
 struct TrackedPane {
     registration: Option<PaneRegistrationHandle>,
     state: Arc<Mutex<PerPane>>,
+    push_state: Arc<AtomicUsize>,
+}
+
+const PANE_PUSH_IDLE: usize = 0;
+const PANE_PUSH_SCHEDULED: usize = 1;
+const PANE_PUSH_DIRTIED: usize = 2;
+
+struct PanePushStateGuard {
+    state: Arc<AtomicUsize>,
+    disarmed: bool,
+}
+
+impl Drop for PanePushStateGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.state.store(PANE_PUSH_IDLE, Ordering::Release);
+        }
+    }
 }
 
 impl TrackedPane {
@@ -2953,6 +2971,7 @@ impl TrackedPane {
         Self {
             registration: Some(registration),
             state: Arc::new(Mutex::new(PerPane::default())),
+            push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
         }
     }
 }
@@ -6721,6 +6740,7 @@ impl SessionHandler {
         let tracked = self.per_pane.entry(pane_id).or_insert_with(|| TrackedPane {
             registration: None,
             state: Arc::new(Mutex::new(PerPane::default())),
+            push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
         });
         Arc::clone(&tracked.state)
     }
@@ -6773,9 +6793,8 @@ impl SessionHandler {
                 return;
             }
         };
-        let sender = self.to_write_tx.clone();
-        let per_pane = self.per_pane_for_registration(&registration);
-        Self::schedule_pane_push_with_state(sender, authority, registration, per_pane);
+        self.per_pane_for_registration(&registration);
+        self.schedule_tracked_pane_push(pane_id);
     }
 
     /// Push cached pane changes only for panes this session already tracks.
@@ -6789,14 +6808,31 @@ impl SessionHandler {
             let Some(registration) = tracked.registration.clone() else {
                 return;
             };
-            let sender = self.to_write_tx.clone();
-            let per_pane = Arc::clone(&tracked.state);
-            Self::schedule_pane_push_with_state(
-                sender,
-                self.owner.authority(),
-                registration,
-                per_pane,
-            );
+            loop {
+                let current = tracked.push_state.load(Ordering::Acquire);
+                let next = match current {
+                    PANE_PUSH_IDLE => PANE_PUSH_SCHEDULED,
+                    PANE_PUSH_SCHEDULED => PANE_PUSH_DIRTIED,
+                    _ => return,
+                };
+                if tracked
+                    .push_state
+                    .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if current == PANE_PUSH_IDLE {
+                    Self::schedule_pane_push_with_state(
+                        self.to_write_tx.clone(),
+                        self.owner.authority(),
+                        registration,
+                        Arc::clone(&tracked.state),
+                        Arc::clone(&tracked.push_state),
+                    );
+                }
+                return;
+            }
         }
     }
 
@@ -6805,34 +6841,83 @@ impl SessionHandler {
         authority: SessionAuthority,
         registration: PaneRegistrationHandle,
         per_pane: Arc<Mutex<PerPane>>,
+        push_state: Arc<AtomicUsize>,
     ) {
         let pane_id = registration.pane_id();
-        match try_reserve_main_thread(
+        // Unsolicited render work must yield to input already admitted on the
+        // high-priority lane. The executor's bounded burst still advances it
+        // while input remains busy.
+        match try_reserve_main_thread_with_low_priority(
             MainThreadServiceClass::Render,
             MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
         ) {
             MainThreadReservationOutcome::Reserved(reservation) => {
+                // Capture before spawning: cancellation before the first poll
+                // must release the producer's claim too.
+                let guard = PanePushStateGuard {
+                    state: Arc::clone(&push_state),
+                    disarmed: false,
+                };
                 reservation
                     .spawn_local(async move {
-                        let result = authority.try_run(|| {
-                            registration
-                                .try_with_current(|pane| {
-                                    maybe_push_pane_changes(&pane, sender, per_pane)
-                                })
-                                .ok_or_else(|| {
-                                    anyhow!("pane registration {} is no longer current", pane_id)
-                                })?
-                        });
-                        match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) | Err(err) => {
-                                log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                        let mut guard = guard;
+                        loop {
+                            // This capture includes notifications that preceded
+                            // it. Only updates during capture require another pass.
+                            push_state.store(PANE_PUSH_SCHEDULED, Ordering::Release);
+                            let result = authority.try_run(|| {
+                                registration
+                                    .try_with_current(|pane| {
+                                        maybe_push_pane_changes(
+                                            &pane,
+                                            sender.clone(),
+                                            Arc::clone(&per_pane),
+                                        )
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow!("pane registration {} is no longer current", pane_id)
+                                    })?
+                            });
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) | Err(err) => {
+                                    log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                                    return;
+                                }
                             }
+                            if push_state
+                                .compare_exchange(
+                                    PANE_PUSH_SCHEDULED,
+                                    PANE_PUSH_IDLE,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                guard.disarmed = true;
+                                return;
+                            }
+
+                            // Keep the admitted permit and yield once between
+                            // captures. Input can run without risking loss of a
+                            // dirty obligation to a second admission failure.
+                            let mut yielded = false;
+                            std::future::poll_fn(|cx| {
+                                if yielded {
+                                    std::task::Poll::Ready(())
+                                } else {
+                                    yielded = true;
+                                    cx.waker().wake_by_ref();
+                                    std::task::Poll::Pending
+                                }
+                            })
+                            .await;
                         }
                     })
                     .detach();
             }
             rejected => {
+                push_state.store(PANE_PUSH_IDLE, Ordering::Release);
                 metrics::counter!(
                     "mux.server.detached_render_admission",
                     "outcome" => "rejected"
@@ -22049,6 +22134,225 @@ mod tests {
             PaneRenderBaseline::default(),
             "an unrepresentable backend cursor span must not advance the baseline"
         );
+    }
+
+    #[test]
+    fn detached_render_push_coalesces_burst_before_capture() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let mut callback_counts = Vec::new();
+        for notifications in [1, 51] {
+            let executor = SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_912, {
+                let callbacks = Arc::clone(&callbacks);
+                Arc::new(move || {
+                    callbacks.fetch_add(1, Ordering::Relaxed);
+                })
+            }));
+            mux.add_pane(&pane).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            callbacks.store(0, Ordering::Relaxed);
+            handler.schedule_pane_push(pane.pane_id());
+            for _ in 1..notifications {
+                handler.schedule_tracked_pane_push(pane.pane_id());
+            }
+            drain_simple_executor(&executor);
+            assert!(captured.lock().unwrap().iter().any(|decoded| matches!(
+                &decoded.pdu,
+                Pdu::GetPaneRenderChangesResponse(response) if response.pane_id == pane.pane_id()
+            )));
+            let count = callbacks.load(Ordering::Relaxed);
+            assert!(count > 0, "a real pane capture must execute");
+            callback_counts.push(count);
+            assert_eq!(
+                handler.per_pane[&pane.pane_id()]
+                    .push_state
+                    .load(Ordering::Acquire),
+                PANE_PUSH_IDLE
+            );
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+        assert_eq!(
+            callback_counts[0], callback_counts[1],
+            "a pre-capture burst must do exactly the same pane work as one notification"
+        );
+    }
+
+    #[test]
+    fn detached_render_push_redirtied_during_capture_yields_to_input() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let handler_slot: Arc<Mutex<Option<SessionHandler>>> = Arc::new(Mutex::new(None));
+        let dirtied = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(FakePane::new_with_id(8_914, None));
+        let input_dyn: Arc<dyn Pane> = input.clone();
+        let render: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_913, {
+            let handler_slot = Arc::downgrade(&handler_slot);
+            let dirtied = Arc::clone(&dirtied);
+            let callbacks = Arc::clone(&callbacks);
+            Arc::new(move || {
+                callbacks.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = handler_slot.upgrade() else {
+                    return;
+                };
+                let mut slot = slot.lock().unwrap();
+                let Some(handler) = slot.as_mut() else {
+                    return;
+                };
+                if dirtied.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                handler.schedule_tracked_pane_push(8_913);
+                handler.process_one(DecodedPdu {
+                    serial: 9_814,
+                    pdu: Pdu::SendKeyDown(SendKeyDown {
+                        pane_id: 8_914,
+                        event: termwiz::input::KeyEvent {
+                            key: KeyCode::Char('x'),
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        input_serial: InputSerial::empty(),
+                    }),
+                });
+            })
+        }));
+        mux.add_pane(&render).unwrap();
+        mux.add_pane(&input_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.schedule_pane_push(render.pane_id());
+        let state = Arc::clone(&handler.per_pane[&render.pane_id()].push_state);
+        *handler_slot.lock().unwrap() = Some(handler);
+        for _ in 0..8 {
+            if dirtied.load(Ordering::Acquire) {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        assert!(dirtied.load(Ordering::Acquire));
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_DIRTIED);
+        let first_capture_callbacks = callbacks.load(Ordering::Relaxed);
+        assert_eq!(input.key_down_count(), 0);
+        for _ in 0..8 {
+            if input.key_down_count() != 0 {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        assert_eq!(input.key_down_count(), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), first_capture_callbacks);
+        drain_simple_executor(&executor);
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+        assert!(callbacks.load(Ordering::Relaxed) > first_capture_callbacks);
+        assert!(captured.lock().unwrap().iter().any(|decoded| {
+            decoded.serial == 9_814 && matches!(&decoded.pdu, Pdu::UnitResponse(_))
+        }));
+        drop(handler_slot.lock().unwrap().take());
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn detached_render_push_releases_claim_when_cancelled_before_poll() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        mux.add_pane(&pane).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        handler.schedule_pane_push(pane.pane_id());
+        let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_SCHEDULED);
+        drop(executor);
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+        assert!(captured.lock().unwrap().is_empty());
+        drop(handler);
+    }
+
+    #[test]
+    fn detached_render_push_yields_to_key_down_and_then_completes() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        for tracked in [false, true] {
+            let executor = SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let render: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_901, {
+                let order = Arc::clone(&order);
+                Arc::new(move || order.lock().unwrap().push("render"))
+            }));
+            let input = Arc::new(FakePane::new_with_key_down_probe(8_902, {
+                let order = Arc::clone(&order);
+                Arc::new(move || {
+                    order.lock().unwrap().push("key");
+                    Ok(())
+                })
+            }));
+            let input_dyn: Arc<dyn Pane> = input.clone();
+            mux.add_pane(&render).unwrap();
+            mux.add_pane(&input_dyn).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+            if tracked {
+                let registration = mux.capture_pane_registration(&render).unwrap();
+                handler.per_pane_for_registration(&registration);
+            }
+            drain_simple_executor(&executor);
+            order.lock().unwrap().clear();
+            if tracked {
+                handler.schedule_tracked_pane_push(render.pane_id());
+            } else {
+                handler.schedule_pane_push(render.pane_id());
+            }
+            handler.process_one(DecodedPdu {
+                serial: 9_801,
+                pdu: Pdu::SendKeyDown(SendKeyDown {
+                    pane_id: input.pane_id(),
+                    event: termwiz::input::KeyEvent {
+                        key: KeyCode::Char('x'),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    input_serial: InputSerial::empty(),
+                }),
+            });
+            assert!(order.lock().unwrap().is_empty());
+            // Local task creation may need a bootstrap tick. Neither that
+            // bootstrap nor the input effect may sit behind the render task.
+            for _ in 0..8 {
+                if input.key_down_count() != 0 {
+                    break;
+                }
+                assert!(order.lock().unwrap().is_empty());
+                assert!(executor.try_tick().unwrap());
+            }
+            assert_eq!(input.key_down_count(), 1);
+            assert_eq!(*order.lock().unwrap(), vec!["key"]);
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+            assert_eq!(executor.queue_snapshot().depth, 0);
+            let events = order.lock().unwrap();
+            assert_eq!(events.first(), Some(&"key"));
+            assert!(events.len() > 1, "deferred render must make progress");
+            assert!(events[1..].iter().all(|event| *event == "render"));
+            let responses = captured.lock().unwrap();
+            assert!(
+                responses
+                    .iter()
+                    .any(|pdu| pdu.serial == 9_801 && matches!(&pdu.pdu, Pdu::UnitResponse(_)))
+            );
+            assert!(responses.iter().any(|pdu| matches!(&pdu.pdu,
+                Pdu::GetPaneRenderChangesResponse(response)
+                    if response.pane_id == render.pane_id())));
+        }
     }
 
     #[test]

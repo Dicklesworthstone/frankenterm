@@ -1774,7 +1774,7 @@ struct ImageParserCapture<'a> {
     registration_wire_identity: [u8; 16],
     durable_pane_id: uuid::Uuid,
     parser_stream_bytes: u64,
-    semantic_generation: Option<u64>,
+    semantic_generation: u64,
     terminal_checkpoint: &'a frankenterm_term::RecoveryTerminalCheckpointV2,
 }
 
@@ -1899,7 +1899,7 @@ impl MuxRecoveryImage {
                             registration_wire_identity: ack.registration_wire_identity,
                             durable_pane_id: ack.durable_pane_id,
                             parser_stream_bytes: ack.parser_stream_bytes,
-                            semantic_generation: Some(ack.semantic_generation),
+                            semantic_generation: ack.semantic_generation,
                             terminal_checkpoint: &ack.terminal_checkpoint,
                         },
                         CheckpointAuthority::ModelOnly {
@@ -1937,7 +1937,7 @@ impl MuxRecoveryImage {
                             registration_wire_identity: ack.registration_wire_identity(),
                             durable_pane_id: ack.durable_pane_id(),
                             parser_stream_bytes: ack.parser_stream_bytes(),
-                            semantic_generation: None,
+                            semantic_generation: ack.semantic_generation(),
                             terminal_checkpoint: checkpoint,
                         },
                         CheckpointAuthority::Guardian {
@@ -1994,10 +1994,7 @@ impl MuxRecoveryImage {
                 frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
             ).map_err(|_| invalid_model("canonical checkpoint validation failed"))?;
             let model = validated.checkpoint();
-            if ack
-                .semantic_generation
-                .is_some_and(|expected| model.semantic_generation() != expected)
-            {
+            if model.semantic_generation() != ack.semantic_generation {
                 return Err(invalid_model("semantic generation differs from ACK"));
             }
             if model.primary_rows() != ack.terminal_checkpoint.rows()

@@ -13747,7 +13747,8 @@ enum RobotPaneTextResult {
 
 #[derive(serde::Serialize)]
 struct TruncationInfo {
-    original_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_bytes: Option<usize>,
     returned_bytes: usize,
     original_lines: usize,
     returned_lines: usize,
@@ -40360,12 +40361,43 @@ fn apply_tail_truncation(text: &str, tail_lines: usize) -> (String, bool, Option
         truncated_text,
         true,
         Some(TruncationInfo {
-            original_bytes,
+            original_bytes: Some(original_bytes),
             returned_bytes,
             original_lines,
             returned_lines,
         }),
     )
+}
+
+fn finalize_pane_text_tail(
+    pane_text: frankenterm_core::wezterm::MuxPaneText,
+    tail_lines: usize,
+) -> (String, bool, Option<TruncationInfo>) {
+    if pane_text.truncated {
+        let lines: Vec<&str> = pane_text.text.lines().collect();
+        let (lines, returned_lines) = if tail_lines > 0 && lines.len() > tail_lines {
+            let start_idx = lines.len().saturating_sub(tail_lines);
+            (&lines[start_idx..], tail_lines)
+        } else {
+            (&lines[..], lines.len())
+        };
+        let text = lines.join("\n");
+        let returned_bytes = text.len();
+        (
+            text,
+            true,
+            Some(TruncationInfo {
+                original_bytes: pane_text.original_bytes,
+                returned_bytes,
+                original_lines: pane_text.original_lines,
+                returned_lines,
+            }),
+        )
+    } else if tail_lines > 0 {
+        apply_tail_truncation(&pane_text.text, tail_lines)
+    } else {
+        (pane_text.text, false, None)
+    }
 }
 
 fn dedupe_pane_ids(pane_ids: Vec<u64>) -> Vec<u64> {
@@ -40802,6 +40834,142 @@ fn capability_context_failure_maps_every_cancel_kind_without_reason_text() {
     ));
 }
 
+#[cfg(test)]
+#[test]
+fn finalize_pane_text_tail_matches_apply_tail_truncation_for_full_buffer() {
+    let test_inputs = [
+        "one\ntwo\nthree",
+        "one\ntwo\nthree\n",
+        "one\ntwo\nthree\n\n",
+        "one\n\nthree\n",
+        "single",
+        "single\n",
+        "",
+        "\n",
+        "\n\n",
+    ];
+
+    for input in test_inputs {
+        let original_lines = input.lines().count();
+        let total_bytes = input.len();
+
+        for tail in [1, 2, 3, 5, 10, usize::MAX] {
+            let (exp_text, exp_trunc, exp_info) = apply_tail_truncation(input, tail);
+            let pane_text = frankenterm_core::wezterm::MuxPaneText {
+                text: input.to_string(),
+                original_lines,
+                original_bytes: Some(total_bytes),
+                truncated: false,
+            };
+            let (act_text, act_trunc, act_info) = finalize_pane_text_tail(pane_text, tail);
+
+            assert_eq!(
+                act_text, exp_text,
+                "text parity failure for input {input:?} with tail {tail}"
+            );
+            assert_eq!(
+                act_trunc, exp_trunc,
+                "truncation bool parity failure for input {input:?} with tail {tail}"
+            );
+            assert_eq!(
+                act_info.is_some(),
+                exp_info.is_some(),
+                "truncation info presence parity failure for input {input:?} with tail {tail}"
+            );
+            if let (Some(act), Some(exp)) = (act_info, exp_info) {
+                assert_eq!(act.original_bytes, exp.original_bytes);
+                assert_eq!(act.returned_bytes, exp.returned_bytes);
+                assert_eq!(act.original_lines, exp.original_lines);
+                assert_eq!(act.returned_lines, exp.returned_lines);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finalize_pane_text_tail_handles_trailing_newlines_and_empty_lines_parity() {
+    // Exact parity on trailing empty lines and newlines when truncated
+    let sample = "row0\nrow1\nrow2\n\n";
+    // lines(): ["row0", "row1", "row2", ""] -> 4 lines
+    let (exp_text, exp_trunc, exp_info) = apply_tail_truncation(sample, 2);
+    assert!(exp_trunc);
+    // last 2 lines are ["row2", ""], joined by '\n' -> "row2\n"
+    assert_eq!(exp_text, "row2\n");
+    let exp_info = exp_info.expect("must have truncation info");
+    assert_eq!(exp_info.returned_lines, 2);
+    assert_eq!(exp_info.original_lines, 4);
+
+    let pane_text = frankenterm_core::wezterm::MuxPaneText {
+        text: sample.to_string(),
+        original_lines: 4,
+        original_bytes: Some(sample.len()),
+        truncated: false,
+    };
+    let (act_text, act_trunc, act_info) = finalize_pane_text_tail(pane_text, 2);
+    assert_eq!(act_text, exp_text);
+    assert_eq!(act_trunc, exp_trunc);
+    let act_info = act_info.expect("must have truncation info");
+    assert_eq!(act_info.original_bytes, exp_info.original_bytes);
+    assert_eq!(act_info.returned_bytes, exp_info.returned_bytes);
+    assert_eq!(act_info.original_lines, exp_info.original_lines);
+    assert_eq!(act_info.returned_lines, exp_info.returned_lines);
+
+    // Wire-truncated chunk with trailing newline
+    let wire_chunk = "row2\n\n";
+    let wire_pane_text = frankenterm_core::wezterm::MuxPaneText {
+        text: wire_chunk.to_string(),
+        original_lines: 4,
+        original_bytes: None,
+        truncated: true,
+    };
+    let (wire_act_text, wire_act_trunc, wire_act_info) = finalize_pane_text_tail(wire_pane_text, 2);
+    assert_eq!(wire_act_text, exp_text);
+    assert!(wire_act_trunc);
+    let wire_info = wire_act_info.expect("wire chunk must have truncation info");
+    assert_eq!(wire_info.original_bytes, None);
+    assert_eq!(wire_info.returned_bytes, exp_info.returned_bytes);
+    assert_eq!(wire_info.original_lines, 4);
+    assert_eq!(wire_info.returned_lines, 2);
+}
+
+#[cfg(test)]
+#[test]
+fn finalize_pane_text_tail_usize_max_does_not_truncate() {
+    let input = "line1\nline2\nline3\n";
+    let pane_text = frankenterm_core::wezterm::MuxPaneText {
+        text: input.to_string(),
+        original_lines: 3,
+        original_bytes: Some(input.len()),
+        truncated: false,
+    };
+    let (text, truncated, info) = finalize_pane_text_tail(pane_text, usize::MAX);
+    assert_eq!(text, input);
+    assert!(!truncated);
+    assert!(info.is_none());
+
+    let (exp_text, exp_trunc, exp_info) = apply_tail_truncation(input, usize::MAX);
+    assert_eq!(text, exp_text);
+    assert_eq!(truncated, exp_trunc);
+    assert_eq!(info.is_some(), exp_info.is_some());
+}
+
+#[cfg(test)]
+#[test]
+fn finalize_pane_text_tail_zero_returns_full_text() {
+    let input = "line1\nline2\nline3\n";
+    let pane_text = frankenterm_core::wezterm::MuxPaneText {
+        text: input.to_string(),
+        original_lines: 3,
+        original_bytes: Some(input.len()),
+        truncated: false,
+    };
+    let (text, truncated, info) = finalize_pane_text_tail(pane_text, 0);
+    assert_eq!(text, input);
+    assert!(!truncated);
+    assert!(info.is_none());
+}
+
 async fn robot_list_panes_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
@@ -40824,7 +40992,8 @@ async fn robot_get_text_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     pane_id: u64,
     escapes: bool,
-) -> frankenterm_core::Result<String> {
+    tail: usize,
+) -> frankenterm_core::Result<frankenterm_core::wezterm::MuxPaneText> {
     let parent_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let task =
@@ -40834,7 +41003,10 @@ async fn robot_get_text_on_runtime_task(
                 &cx,
                 CapabilityContextSite::RobotOperation,
             )?;
-            wezterm.get_text_with_cx(&cx, pane_id, escapes).await
+            let tail_opt = (tail > 0).then_some(tail);
+            wezterm
+                .get_text_tail_with_cx(&cx, pane_id, escapes, tail_opt)
+                .await
         });
     task.await
         .map_err(|error| runtime_task_join_failure("robot.get_text.await_task", error))?
@@ -40925,7 +41097,10 @@ async fn batch_get_pane_text(
                                 error,
                             )
                         })?;
-                wezterm.get_text_with_cx(&child_cx, pane_id, escapes).await
+                let tail_opt = (tail_lines > 0).then_some(tail_lines);
+                wezterm
+                    .get_text_tail_with_cx(&child_cx, pane_id, escapes, tail_opt)
+                    .await
             },
         );
         tasks.push((pane_id, task));
@@ -40942,9 +41117,9 @@ async fn batch_get_pane_text(
         };
 
         match result {
-            Ok(full_text) => {
+            Ok(pane_text) => {
                 let (text, truncated, truncation_info) =
-                    apply_tail_truncation(&full_text, tail_lines);
+                    finalize_pane_text_tail(pane_text, tail_lines);
                 results.insert(
                     pane_id,
                     RobotPaneTextResult::Ok {
@@ -50146,12 +50321,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     wezterm.clone(),
                                     pane_id,
                                     escapes,
+                                    tail,
                                 )
                                 .await
                                 {
-                                    Ok(full_text) => {
+                                    Ok(pane_text) => {
                                         let (text, truncated, truncation_info) =
-                                            apply_tail_truncation(&full_text, tail);
+                                            finalize_pane_text_tail(pane_text, tail);
                                         record_read_search_policy_audit(
                                             storage.as_ref(),
                                             frankenterm_core::policy::ActorKind::Robot,
@@ -61505,14 +61681,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
             // ft-xbnl0.2.3 tick 234: cx-first.
             let cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            match wezterm.get_text_with_cx(&cx, pane_id, escapes).await {
-                Ok(text) => {
-                    let output = if tail == 0 {
-                        text
-                    } else {
-                        let (truncated, _, _) = apply_tail_truncation(&text, tail);
-                        truncated
-                    };
+            let tail_opt = (tail > 0).then_some(tail);
+            match wezterm
+                .get_text_tail_with_cx(&cx, pane_id, escapes, tail_opt)
+                .await
+            {
+                Ok(pane_text) => {
+                    let (output, _, _) = finalize_pane_text_tail(pane_text, tail);
                     record_read_search_policy_audit(
                         storage.as_ref(),
                         frankenterm_core::policy::ActorKind::Human,
@@ -82485,7 +82660,8 @@ enum CompatibleClientPaneTextResult {
 #[serde(deny_unknown_fields)]
 #[cfg(any(unix, test))]
 struct CompatibleClientTruncationInfo {
-    original_bytes: usize,
+    #[serde(default)]
+    original_bytes: Option<usize>,
     returned_bytes: usize,
     original_lines: usize,
     returned_lines: usize,
@@ -87772,20 +87948,20 @@ async fn capture_live_mux_dump(
     for pane in panes {
         let (domain_name, domain_identity_authority) = mux_dump_domain_identity(&pane);
         domains.insert(redactor.redact(&domain_name));
-        let text = match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false).await
-        {
-            Ok(text) => redactor.redact(&text),
-            Err(err) => {
-                let detail =
-                    bounded_terminal_diagnostic(&redactor.redact(&err.to_string()), 240, 1024);
-                errors.push(serde_json::json!({
-                    "pane_id": pane.pane_id,
-                    "code": "pane_text_unavailable",
-                    "detail": detail,
-                }));
-                continue;
-            }
-        };
+        let text =
+            match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false, 0).await {
+                Ok(pane_text) => redactor.redact(&pane_text.text),
+                Err(err) => {
+                    let detail =
+                        bounded_terminal_diagnostic(&redactor.redact(&err.to_string()), 240, 1024);
+                    errors.push(serde_json::json!({
+                        "pane_id": pane.pane_id,
+                        "code": "pane_text_unavailable",
+                        "detail": detail,
+                    }));
+                    continue;
+                }
+            };
 
         let next_total = total_content_bytes.saturating_add(text.len());
         if next_total > max_total_bytes {
@@ -134671,6 +134847,102 @@ A  docs/new-proof.md\n";
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_source_truncated_omits_original_bytes_honestly() {
+        let pane_text = frankenterm_core::wezterm::MuxPaneText {
+            text: "line48\nline49\nline50".to_string(),
+            original_lines: 50,
+            original_bytes: None,
+            truncated: true,
+        };
+        let (text, truncated, info) = finalize_pane_text_tail(pane_text, 3);
+        assert!(truncated);
+        assert_eq!(text, "line48\nline49\nline50");
+        let info = info.expect("truncation_info should be present");
+        assert_eq!(info.original_bytes, None);
+        assert_eq!(info.original_lines, 50);
+        assert_eq!(info.returned_lines, 3);
+        assert_eq!(info.returned_bytes, text.len());
+
+        let json = serde_json::to_value(&info).expect("serialize TruncationInfo");
+        assert!(
+            json.get("original_bytes").is_none(),
+            "original_bytes must be omitted from JSON when None"
+        );
+        assert_eq!(json["returned_lines"], 3);
+        assert_eq!(json["original_lines"], 50);
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_untruncated_source_applies_tail_and_includes_original_bytes() {
+        let pane_text = frankenterm_core::wezterm::MuxPaneText {
+            text: "line1\nline2\nline3\nline4\nline5".to_string(),
+            original_lines: 5,
+            original_bytes: Some(29),
+            truncated: false,
+        };
+        let (text, truncated, info) = finalize_pane_text_tail(pane_text, 2);
+        assert!(truncated);
+        assert_eq!(text, "line4\nline5");
+        let info = info.expect("truncation_info should be present");
+        assert_eq!(info.original_bytes, Some(29));
+        assert_eq!(info.original_lines, 5);
+        assert_eq!(info.returned_lines, 2);
+        assert_eq!(info.returned_bytes, text.len());
+
+        let json = serde_json::to_value(&info).expect("serialize TruncationInfo");
+        assert_eq!(json["original_bytes"], 29);
+        assert_eq!(json["returned_lines"], 2);
+        assert_eq!(json["original_lines"], 5);
+    }
+
+    #[test]
+    fn finalize_pane_text_tail_zero_or_sufficient_tail_leaves_untruncated() {
+        let pane_text = frankenterm_core::wezterm::MuxPaneText {
+            text: "alpha\nbeta".to_string(),
+            original_lines: 2,
+            original_bytes: Some(10),
+            truncated: false,
+        };
+        let (text0, trunc0, info0) = finalize_pane_text_tail(pane_text.clone(), 0);
+        assert!(!trunc0);
+        assert_eq!(text0, "alpha\nbeta");
+        assert!(info0.is_none());
+
+        let (text5, trunc5, info5) = finalize_pane_text_tail(pane_text, 5);
+        assert!(!trunc5);
+        assert_eq!(text5, "alpha\nbeta");
+        assert!(info5.is_none());
+    }
+
+    #[test]
+    fn compatible_client_truncation_info_deserializes_with_and_without_original_bytes() {
+        let json_with_bytes = serde_json::json!({
+            "original_bytes": 1024,
+            "returned_bytes": 512,
+            "original_lines": 50,
+            "returned_lines": 25,
+        });
+        let info_with: CompatibleClientTruncationInfo =
+            serde_json::from_value(json_with_bytes).expect("deserialize with original_bytes");
+        assert_eq!(info_with.original_bytes, Some(1024));
+        assert_eq!(info_with.returned_bytes, 512);
+        assert_eq!(info_with.original_lines, 50);
+        assert_eq!(info_with.returned_lines, 25);
+
+        let json_without_bytes = serde_json::json!({
+            "returned_bytes": 512,
+            "original_lines": 50,
+            "returned_lines": 25,
+        });
+        let info_without: CompatibleClientTruncationInfo =
+            serde_json::from_value(json_without_bytes).expect("deserialize without original_bytes");
+        assert_eq!(info_without.original_bytes, None);
+        assert_eq!(info_without.returned_bytes, 512);
+        assert_eq!(info_without.original_lines, 50);
+        assert_eq!(info_without.returned_lines, 25);
     }
 
     #[test]

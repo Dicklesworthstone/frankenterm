@@ -5446,19 +5446,32 @@ mod tests {
     use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
     use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RealBirthFixtureMode {
+        BirthAndCancellation,
+        InFlightCancellation,
+        SuccessorImageRecovery,
+    }
+
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn guardian_domain_real_birth_publishes_output_and_cancellation_retires_only_lease() {
-        run_guardian_domain_real_birth(false);
+        run_guardian_domain_real_birth(RealBirthFixtureMode::BirthAndCancellation);
     }
 
     #[test]
     #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
     fn guardian_domain_in_flight_cancellation_finishes_adoption_then_retires_only_lease() {
-        run_guardian_domain_real_birth(true);
+        run_guardian_domain_real_birth(RealBirthFixtureMode::InFlightCancellation);
     }
 
-    fn run_guardian_domain_real_birth(cancel_in_flight: bool) {
+    #[test]
+    #[ignore = "requires actual sealed candidate identity; run explicitly in strict RCH/DSR"]
+    fn guardian_domain_successor_image_recovery_and_reopen() {
+        run_guardian_domain_real_birth(RealBirthFixtureMode::SuccessorImageRecovery);
+    }
+
+    fn run_guardian_domain_real_birth(mode: RealBirthFixtureMode) {
         use frankenterm_pty_guardian::provision_guardian_token;
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
@@ -5606,6 +5619,8 @@ mod tests {
         let signaled = directory.join("signaled");
         let finished = directory.join("finished");
         let post_registration = directory.join("post-registration");
+        let post_successor = directory.join("post-successor");
+        let child_pid_path = directory.join("child-pid");
         let mut services = StopOwnedServices {
             children: Vec::new(),
             release: release.clone(),
@@ -5677,12 +5692,14 @@ mod tests {
                 // The release file is normal cleanup. This approximately
                 // 120-second emergency fuse is separate from the unchanged
                 // five-second phase assertions, not an accepted latency bound.
-                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_POST_REGISTRATION\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_REGISTRATION\"; then printf guardian-domain-post-registration-marker; fi; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; echo $$ >>\"$FT_PID\"; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_POST_REGISTRATION\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_REGISTRATION\"; then printf guardian-domain-post-registration-marker; fi; while test ! -e \"$FT_POST_SUCCESSOR\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_SUCCESSOR\"; then printf guardian-domain-post-successor-marker; fi; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                command.env("FT_PID", &child_pid_path);
                 command.env("FT_BIRTHS", &births);
                 command.env("FT_SIGNALED", &signaled);
                 command.env("FT_RELEASE", &release);
                 command.env("FT_FINISHED", &finished);
                 command.env("FT_POST_REGISTRATION", &post_registration);
+                command.env("FT_POST_SUCCESSOR", &post_successor);
                 command
             };
             let size = TerminalSize {
@@ -5732,11 +5749,131 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(2));
             }
-            if !cancel_in_flight {
+            if mode == RealBirthFixtureMode::BirthAndCancellation {
                 assert_real_birth_image_roundtrip(
                     &mux, &pane, &executor, &directory, &socket, &token, size,
                 );
             }
+            if mode == RealBirthFixtureMode::SuccessorImageRecovery {
+                let durable_pane_id = pane.guardian_spawn_custody().unwrap().original.pane_id;
+                let (successor_mux, successor_pane) = assert_real_birth_successor_image_roundtrip(
+                    &mux, pane, &executor, &directory, &socket, &token, size,
+                );
+                let (successor_session, _) = successor_mux
+                    .topology_snapshot_authority()
+                    .expect("derive successor session incarnation for cleanup");
+                let successor_mux_incarnation = Uuid::from_bytes(successor_session.as_bytes());
+                std::fs::write(&release, b"release").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut census: Option<GuardianClient> = None;
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "successor child did not exit cleanly"
+                    );
+                    while executor.try_tick().unwrap() {}
+                    if census.is_none() {
+                        match GuardianClient::connect(&socket, &token, successor_mux_incarnation) {
+                            Ok(client) => census = Some(client),
+                            Err(GuardianClientError::Io(_)) => {
+                                thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(error) => panic!("census connect failed during cleanup: {error}"),
+                        }
+                    }
+                    match census.as_mut().unwrap().census_snapshot() {
+                        Ok(rows) => {
+                            let matching = rows
+                                .iter()
+                                .filter(|row| row.pane_id == durable_pane_id)
+                                .collect::<Vec<_>>();
+                            assert!(
+                                matching.len() <= 1,
+                                "multiple census entries match durable pane id {durable_pane_id}"
+                            );
+                            if matching.len() == 1 {
+                                assert_eq!(matching[0].pane_id, durable_pane_id);
+                                if let Some(exit_status) = matching[0].exit_status {
+                                    assert_eq!(
+                                        exit_status, 0,
+                                        "successor child exited with unexpected non-zero status: {exit_status}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(GuardianClientError::Io(_)) => {
+                            census = None;
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("census snapshot failed during cleanup: {error}"),
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(std::fs::read(&finished).unwrap(), b"D");
+                assert!(!signaled.exists());
+                let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+                while !successor_pane.is_dead() {
+                    assert!(
+                        Instant::now() < cleanup_deadline,
+                        "published successor pane did not observe child exit"
+                    );
+                    while executor.try_tick().unwrap() {}
+                    thread::sleep(Duration::from_millis(2));
+                }
+                while executor.try_tick().unwrap() {}
+                if let Some(registration) = successor_mux.capture_pane_registration(&successor_pane)
+                {
+                    assert!(registration.retire_and_prune_if_current());
+                }
+                for pane in mux.iter_panes() {
+                    if let Some(registration) = mux.capture_pane_registration(&pane) {
+                        assert!(registration.retire_and_prune_if_current());
+                    }
+                }
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    let cleanup_snapshot = successor_mux.pane_removal_cleanup_snapshot();
+                    if cleanup_snapshot.active_fences == 0
+                        && cleanup_snapshot.outstanding_leases == 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < cleanup_deadline,
+                        "successor pane removal cleanup did not settle within deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    let cleanup_snapshot = mux.pane_removal_cleanup_snapshot();
+                    if cleanup_snapshot.active_fences == 0
+                        && cleanup_snapshot.outstanding_leases == 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < cleanup_deadline,
+                        "predecessor pane removal cleanup did not settle within deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                while executor.try_tick().unwrap() {}
+                drop(successor_pane);
+                drop(successor_mux);
+                drop(census);
+                drop(domain);
+                drop(registered);
+                drop(foreign_mux);
+                drop(mux);
+                while executor.try_tick().unwrap() {}
+                drop(executor);
+                println!("GUARDIAN_DOMAIN_SUCCESSOR_IMAGE_RECOVERY_SUCCESS");
+                return;
+            }
+            let cancel_in_flight = mode == RealBirthFixtureMode::InFlightCancellation;
             if cancel_in_flight {
                 let coordinator = Arc::clone(domain.state.lock().census.as_ref().unwrap());
                 // The real lease plan must acquire this shared coordinator
@@ -6637,6 +6774,8 @@ mod tests {
             .env("FT_TEST_IMAGE_REOPEN_TOKEN", token)
             .env_remove("FT_TEST_IMAGE_REOPEN_SCOPE")
             .env_remove("FT_TEST_IMAGE_REOPEN_CHECKPOINT")
+            .env_remove("FT_TEST_IMAGE_EXPECTED_GENERATION")
+            .env_remove("FT_TEST_IMAGE_EXPECTED_MARKER")
             .stdout(child_log)
             .spawn()
             .unwrap();
@@ -6743,6 +6882,1215 @@ mod tests {
         );
     }
 
+    fn assert_real_birth_successor_image_roundtrip(
+        mux: &Arc<Mux>,
+        pane: Arc<dyn mux::pane::Pane>,
+        executor: &promise::spawn::SimpleExecutor,
+        directory: &Path,
+        socket: &Path,
+        token: &Path,
+        size: TerminalSize,
+    ) -> (Arc<Mux>, Arc<dyn mux::pane::Pane>) {
+        use frankenterm_core::mux_recovery_image::{
+            MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
+            RecoveryParserCheckpoint,
+        };
+        use frankenterm_core::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+            reconstruct_whole_mux_image_inert, semantic_object_id_from_str,
+        };
+        use frankenterm_core::snapshot_engine::{
+            WholeMuxPublicationIdentity, capture_and_publish_whole_mux_recovery,
+        };
+        use frankenterm_core::snapshot_publication::{
+            GenerationRootPublishRequest, PredecessorBinding, PublicationError,
+            RecoveryObjectPayload, SnapshotPublicationStore,
+        };
+        use frankenterm_core::snapshot_representation::{
+            ObjectMetadata, RecoveryKey, RecoveryObjectKind, encode_recovery_object,
+        };
+
+        let provenance = pane
+            .guardian_spawn_custody()
+            .expect("real birth retained authenticated provenance");
+        assert_eq!(
+            provenance.original.pane_id.as_bytes(),
+            &pane.durable_pane_id().unwrap()
+        );
+        assert_eq!(provenance.current_lease_generation, 1);
+        assert_eq!(
+            provenance.current_mux_incarnation,
+            provenance.original.mux_incarnation
+        );
+        let original_registration = mux.capture_pane_registration(&pane).unwrap();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(&pane);
+        let registration = mux.add_tab_and_active_pane(&tab).unwrap().unwrap();
+        assert!(registration.same_registration(&original_registration));
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window).unwrap();
+        drop(window);
+
+        let quiet = capture_real_guardian_checkpoint(mux, pane.pane_id(), executor);
+        let quiet_sequence = quiet.capture().output_sequence();
+        let quiet_bytes = quiet.capture().journal_cumulative_plaintext_bytes();
+        let post_registration = directory.join("post-registration");
+        std::fs::write(&post_registration, b"step").unwrap();
+        let post_registration_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let (_, lines) = pane.get_lines(0..24);
+            if lines.iter().any(|line| {
+                line.as_str()
+                    .contains("guardian-domain-post-registration-marker")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < post_registration_deadline,
+                "published pane did not render fresh child output after registration"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let pane_id = pane.pane_id();
+        let published = capture_real_guardian_checkpoint(mux, pane_id, executor);
+        assert!(published.capture().output_sequence() > quiet_sequence);
+        assert!(published.capture().journal_cumulative_plaintext_bytes() > quiet_bytes);
+
+        // Predecessor live stage: common-cut validation before detach
+        assert!(
+            mux.guardian_checkpoint_is_current(pane_id, &published),
+            "fresh live guardian capture must be current before detach"
+        );
+        assert!(
+            !mux.guardian_checkpoint_is_current(pane_id, &quiet),
+            "quiet capture before child output must be stale (detected ABA/mutation)"
+        );
+        drop(quiet);
+        let captured = mux.capture_topology_coherent(Default::default()).unwrap();
+        assert_eq!(captured.pane_bindings.len(), 1);
+        assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
+        let key = Arc::new(RecoveryKey::from_bytes([0x51; 32]).unwrap());
+        let object_id = "real-guardian-terminal";
+        let timestamp = captured.captured_at_epoch_ms;
+        let encode = |payload: &[u8], id, kind| {
+            encode_recovery_object(
+                payload,
+                ObjectMetadata::single(id, kind, 1, None, timestamp),
+                &key,
+                None,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        let ciphertext = encode(
+            published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload(),
+            semantic_object_id_from_str(object_id),
+            RecoveryObjectKind::TerminalCheckpoint,
+        );
+        let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let references = HashMap::from([(
+            pane_id,
+            RecoveryObjectRef {
+                object_id: object_id.into(),
+                byte_length: ciphertext.len() as u64,
+                payload_digest: digest,
+                schema_version: 2,
+            },
+        )]);
+        let parser_checkpoints =
+            HashMap::from([(pane_id, RecoveryParserCheckpoint::Guardian(&published))]);
+        let image = MuxRecoveryImage::from_mux_captured_checkpoints(
+            RecoveryImageGenerationMeta {
+                generation: 1,
+                predecessor_digest: None,
+                created_at_epoch_ms: timestamp,
+                ft_version: config::wezterm_version().to_owned(),
+                session_id: "real-guardian-birth".into(),
+            },
+            &captured,
+            &parser_checkpoints,
+            &references,
+        )
+        .unwrap();
+        let image_bytes = image.to_canonical_json().unwrap();
+
+        let store =
+            SnapshotPublicationStore::open(directory.join("whole-image"), Default::default())
+                .unwrap();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: object_id.into(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: ciphertext,
+            })
+            .unwrap();
+        let root = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "actual-birth".into(),
+            predecessor: None,
+            manifest_bytes: encode(&image_bytes, [0x72; 32], RecoveryObjectKind::WholeMuxImage),
+            created_at_ms: timestamp,
+        };
+        let mut verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        );
+        verifier
+            .register_published_guardian_capture(&published)
+            .unwrap();
+        let root_receipt = store.publish_generation_root(&root, &verifier).unwrap();
+
+        let recovery_store = SnapshotPublicationStore::open(
+            directory.join("whole-image-common-cut"),
+            Default::default(),
+        )
+        .unwrap();
+        let recovery_expected_gen1 = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "real-guardian-birth".into(),
+            mux_incarnation_id: hex::encode(captured.session_incarnation.as_bytes()),
+            root_object_id: [0x72; 32],
+            publisher_id: "actual-birth".into(),
+            ft_version: config::wezterm_version().to_owned(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let recovery_gen1_receipt = {
+            let thread_cx = frankenterm_core::cx::Cx::for_testing();
+            let thread_mux = Arc::clone(mux);
+            let thread_store = SnapshotPublicationStore::open(
+                directory.join("whole-image-common-cut"),
+                Default::default(),
+            )
+            .unwrap();
+            let thread_key = Arc::clone(&key);
+            let thread_expected = recovery_expected_gen1;
+            let handle = thread::spawn(move || {
+                capture_and_publish_whole_mux_recovery(
+                    &thread_cx,
+                    &thread_mux,
+                    &thread_store,
+                    thread_key,
+                    &thread_expected,
+                    Duration::from_secs(5),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if handle.is_finished() {
+                    break handle
+                        .join()
+                        .unwrap()
+                        .expect("seed generation 1 via whole-mux recovery capture before detach");
+                }
+                assert!(Instant::now() < deadline, "gen1 recovery capture timed out");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        assert_eq!(recovery_gen1_receipt.generation, 1);
+        let recovery_gen1_verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        )
+        .with_existing_guardian_custody(token.to_path_buf());
+        let recovery_gen1_selected = recovery_store
+            .select_verified_roots(&recovery_gen1_verifier)
+            .expect("verifier must select verified generation 1 root from common-cut store");
+        let recovery_gen1_validated = recovery_gen1_selected
+            .current
+            .expect("must verify published generation 1 root");
+        let recovery_gen1_image_digest = recovery_gen1_validated.image().image_digest;
+        let recovery_gen1_hash = recovery_gen1_receipt.sha256;
+
+        let child_log_path = directory.join("fresh-image-verifier.stdout");
+        let child_log = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&child_log_path)
+            .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "guardian_proxy::tests::guardian_image_fresh_process_existing_custody",
+                "--nocapture",
+            ])
+            .env("FT_TEST_IMAGE_REOPEN_ROOT", directory.join("whole-image"))
+            .env("FT_TEST_IMAGE_REOPEN_TOKEN", token)
+            .env_remove("FT_TEST_IMAGE_REOPEN_SCOPE")
+            .env_remove("FT_TEST_IMAGE_REOPEN_CHECKPOINT")
+            .env_remove("FT_TEST_IMAGE_EXPECTED_GENERATION")
+            .env_remove("FT_TEST_IMAGE_EXPECTED_MARKER")
+            .stdout(child_log)
+            .spawn()
+            .unwrap();
+        let child_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "fresh process could not authenticate durable image"
+                );
+                break;
+            }
+            if Instant::now() >= child_deadline {
+                child
+                    .kill()
+                    .expect("settle only owned image verifier child");
+                child.wait().unwrap();
+                panic!("fresh process image verifier deadline expired");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let child_log = std::fs::read_to_string(child_log_path).unwrap();
+        assert!(
+            child_log.contains("running 1 test") && child_log.contains("1 passed; 0 failed"),
+            "fresh gen1 verifier did not execute exactly one test: {}",
+            child_log
+        );
+
+        let validated = store
+            .select_verified_roots(&verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        let restored = reconstruct_whole_mux_image_inert(
+            &validated,
+            TerminalCheckpointLimits::default(),
+            None,
+            &std::collections::HashSet::<String>::new(),
+        )
+        .unwrap();
+        let restored_pane = &restored.pane_terminals[&(pane_id as u64)];
+
+        let child_pid_path = directory.join("child-pid");
+        let post_successor = directory.join("post-successor");
+        let births = directory.join("births");
+        let signaled = directory.join("signaled");
+        let child_pid_text = std::fs::read_to_string(&child_pid_path).unwrap();
+        let original_pid: i32 = child_pid_text
+            .lines()
+            .next()
+            .expect("child recorded pid")
+            .trim()
+            .parse()
+            .expect("valid child pid");
+        assert!(original_pid > 0);
+
+        let is_child_alive = |pid: i32| -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        assert!(is_child_alive(original_pid));
+
+        // 1. Detach predecessor registration and verify stale predecessor cannot act
+        assert!(registration.detach_local_if_current());
+        assert!(mux.capture_pane_registration(&pane).is_none());
+        assert!(registration.try_with_current(|_| ()).is_none());
+        assert!(registration.try_with_current_output(|_| ()).is_none());
+        assert!(registration.operation_guard(mux).is_none());
+        drop(registration);
+        drop(original_registration);
+
+        // 2. Remove tab via local-only (non-signaling) lifecycle and release predecessor Arc references
+        let predecessor_domain_id = pane.domain_id();
+        assert!(mux.remove_tab_local_only_if_same(&tab));
+        drop(tab);
+        drop(pane);
+
+        // 3. Tick/drain actual retained operations through the executor
+        while executor.try_tick().unwrap() {}
+
+        // Verify child process survived predecessor drop without signals
+        assert_eq!(std::fs::read(&births).unwrap(), b"B");
+        assert!(!signaled.exists());
+        assert!(is_child_alive(original_pid));
+
+        // 4. Wait census LiveUnclaimed before successor claim
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut predecessor_client: Option<GuardianClient> = None;
+        let post_retire_entry = loop {
+            assert!(
+                Instant::now() < deadline,
+                "predecessor lease was not retired to LiveUnclaimed in census"
+            );
+            while executor.try_tick().unwrap() {}
+            if predecessor_client.is_none() {
+                match GuardianClient::connect(socket, token, provenance.current_mux_incarnation) {
+                    Ok(client) => predecessor_client = Some(client),
+                    Err(GuardianClientError::Io(_)) => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("census connect failed: {error}"),
+                }
+            }
+            match predecessor_client.as_mut().unwrap().census_snapshot() {
+                Ok(entries) => {
+                    if let Some(entry) = entries
+                        .iter()
+                        .find(|entry| entry.pane_id == provenance.original.pane_id)
+                    {
+                        if entry.status
+                            == mux::guardian_protocol::GuardianCensusPaneStatus::LiveUnclaimed
+                        {
+                            break entry.clone();
+                        }
+                    }
+                }
+                Err(GuardianClientError::Io(_)) => {
+                    predecessor_client = None;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("census snapshot failed: {error}"),
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(post_retire_entry.generation, 1);
+
+        // 5. Successor coordinator connection and claim generation 2 on retired lease under successor Mux
+        let successor_mux = Arc::new(Mux::new(None));
+        let (successor_session, _) = successor_mux
+            .topology_snapshot_authority()
+            .expect("derive successor session incarnation from topology authority");
+        let successor_mux_incarnation = Uuid::from_bytes(successor_session.as_bytes());
+        let successor_domain = Arc::new(
+            GuardianDomain::new(&successor_mux, socket.to_path_buf(), token.to_path_buf()).unwrap(),
+        );
+        assert_eq!(
+            successor_mux_incarnation, successor_domain.mux_incarnation,
+            "derived successor mux incarnation must match guardian domain owner identity"
+        );
+        let registered_successor_domain: Arc<dyn Domain> = successor_domain.clone();
+        successor_mux
+            .add_domain(&registered_successor_domain)
+            .unwrap();
+        successor_mux
+            .set_default_domain(&registered_successor_domain)
+            .unwrap();
+
+        let successor_coordinator = Arc::new(
+            GuardianCensusCoordinator::connect(
+                socket,
+                token,
+                provenance.original.guardian_incarnation,
+                successor_mux_incarnation,
+            )
+            .unwrap(),
+        );
+
+        let successor_plan = GuardianProxyLeasePlan::prepare_from_recovery(
+            socket,
+            token,
+            PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: size.pixel_width as u16,
+                pixel_height: size.pixel_height as u16,
+            },
+            Arc::clone(&successor_coordinator),
+            &restored_pane.spawn_custody,
+        )
+        .unwrap();
+        let staging = successor_plan
+            .claim(
+                provenance.original.pane_id,
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .expect("successor claim on retired lease must succeed");
+
+        let successor_term_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(config::TermConfig::new());
+        let activated = staging
+            .restore_and_activate(successor_term_config, TerminalCheckpointLimits::default())
+            .expect("successor restore_and_activate must succeed");
+
+        let successor_pane_id = alloc_pane_id().expect("allocate successor pane id");
+        assert_ne!(
+            successor_pane_id, pane_id,
+            "successor local pane id must be distinct from predecessor local pane id"
+        );
+        let successor_domain_id = registered_successor_domain.domain_id();
+        assert_ne!(
+            successor_domain_id, predecessor_domain_id,
+            "successor domain id must be freshly allocated and distinct from predecessor domain"
+        );
+        let local_pane = activated.into_local_pane(
+            successor_pane_id,
+            successor_domain_id,
+            format!("recovered guardian pane {}", provenance.original.pane_id),
+        );
+        let unpublished = mux::domain::UnpublishedPane::from_guardian_proxy(local_pane)
+            .expect("local pane converts to unpublished pane");
+        let successor_pane = unpublished
+            .publish(&successor_mux)
+            .expect("successor pane publishes to successor mux");
+        assert_eq!(successor_pane.pane_id(), successor_pane_id);
+        assert_ne!(
+            successor_pane.pane_id(),
+            pane_id,
+            "successor local pane id must be distinct from predecessor local pane id"
+        );
+        assert_eq!(successor_pane.domain_id(), successor_domain_id);
+
+        let successor_registration = successor_mux
+            .capture_pane_registration(&successor_pane)
+            .unwrap();
+        let successor_tab = Arc::new(mux::tab::Tab::new(&size));
+        successor_tab.assign_pane(&successor_pane);
+        let bound_successor_registration = successor_mux
+            .add_tab_and_active_pane(&successor_tab)
+            .unwrap()
+            .unwrap();
+        assert!(bound_successor_registration.same_registration(&successor_registration));
+        let successor_window = successor_mux.new_empty_window(None, None);
+        successor_mux
+            .add_tab_to_window(&successor_tab, *successor_window)
+            .unwrap();
+        drop(successor_window);
+
+        assert_eq!(std::fs::read(&births).unwrap(), b"B");
+        assert!(!signaled.exists());
+        assert!(is_child_alive(original_pid));
+
+        // 6. Observe fresh child output from original child
+        std::fs::write(&post_successor, b"step").unwrap();
+        let post_successor_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let (_, lines) = successor_pane.get_lines(0..24);
+            if lines.iter().any(|line| {
+                line.as_str()
+                    .contains("guardian-domain-post-successor-marker")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < post_successor_deadline,
+                "successor pane did not render fresh child output after recovery: {:?}",
+                lines.iter().map(|line| line.as_str()).collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // 7. Capture generation 2 checkpoint and build generation 2 image
+        let gen2_published =
+            capture_real_guardian_checkpoint(&successor_mux, successor_pane.pane_id(), executor);
+        let gen2_provenance = successor_pane
+            .guardian_spawn_custody()
+            .expect("successor pane retains authenticated custody");
+        assert_eq!(gen2_provenance.original, provenance.original);
+        assert_eq!(gen2_provenance.current_lease_generation, 2);
+        assert_eq!(
+            gen2_provenance.current_mux_incarnation,
+            successor_mux_incarnation
+        );
+
+        let gen2_captured = successor_mux
+            .capture_topology_coherent(Default::default())
+            .unwrap();
+        assert_eq!(gen2_captured.pane_bindings.len(), 1);
+        assert_eq!(
+            gen2_captured.pane_bindings[0].spawn_custody,
+            Some(gen2_provenance)
+        );
+
+        // Successor stage: predecessor registration was detached; original mux MUST return false
+        assert!(
+            !mux.guardian_checkpoint_is_current(pane_id, &published),
+            "predecessor registration was detached; must be stale on predecessor mux"
+        );
+
+        assert!(
+            successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
+            "fresh real guardian capture must be current under exact successor registration"
+        );
+
+        let unknown_pane_id = alloc_pane_id().expect("allocate unknown pane id");
+        assert!(
+            !successor_mux.guardian_checkpoint_is_current(unknown_pane_id, &gen2_published),
+            "unknown pane ID must reject guardian checkpoint"
+        );
+
+        // A real model-only capture must not acquire guardian authority merely
+        // by carrying the current pane's registration identity.
+        let model_checkpoint = Terminal::new(
+            size,
+            Arc::new(config::TermConfig::new()),
+            "FrankenTerm",
+            config::wezterm_version(),
+            Box::new(io::sink()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .unwrap();
+        let model_state = TerminalCheckpointV2::decode_canonical_json(
+            model_checkpoint.canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        let dummy_model_ack = mux::ModelParserCheckpointAck {
+            registration_wire_identity: gen2_published.capture().registration_wire_identity(),
+            durable_pane_id: gen2_published.capture().durable_pane_id(),
+            parser_stream_bytes: model_checkpoint.parser_stream_bytes(),
+            semantic_generation: model_state.checkpoint().semantic_generation(),
+            terminal_checkpoint: model_checkpoint,
+        };
+        assert!(
+            !successor_mux.model_checkpoint_is_current(successor_pane.pane_id(), &dummy_model_ack),
+            "model checkpoint query must reject guardian pane"
+        );
+
+        assert!(
+            !successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &published),
+            "predecessor gen1 capture must not be current under successor mux (lease/incarnation mismatch)"
+        );
+
+        // Deterministic cancellation during live guardian wait blocked on live parser
+        {
+            let physical_top = successor_pane.get_dimensions().physical_top;
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let blocking_pane = Arc::clone(&successor_pane);
+            struct HoldTerminalLines {
+                acquired_tx: Option<std::sync::mpsc::SyncSender<()>>,
+                release_rx: std::sync::mpsc::Receiver<()>,
+            }
+            impl mux::pane::WithPaneLines for HoldTerminalLines {
+                fn with_lines_mut(
+                    &mut self,
+                    _first: wezterm_term::StableRowIndex,
+                    _lines: &mut [&mut termwiz::surface::Line],
+                ) {
+                    if let Some(tx) = self.acquired_tx.take() {
+                        tx.send(()).expect("report held terminal lock");
+                    }
+                    self.release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release terminal lock after bounded cancellation");
+                }
+            }
+            let blocker = thread::spawn(move || {
+                blocking_pane.with_lines_mut(
+                    physical_top..physical_top.checked_add(1).unwrap(),
+                    &mut HoldTerminalLines {
+                        acquired_tx: Some(acquired_tx),
+                        release_rx,
+                    },
+                );
+            });
+            acquired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocker acquired the live terminal lock");
+            let started = Instant::now();
+            let cancel_result = successor_mux.capture_pane_guardian_checkpoint(
+                successor_pane.pane_id(),
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+                || started.elapsed() >= Duration::from_millis(250),
+            );
+            let cancel_elapsed = started.elapsed();
+            release_tx.send(()).expect("release owned terminal blocker");
+            blocker.join().expect("owned terminal blocker settled");
+            assert!(
+                cancel_elapsed >= Duration::from_millis(200),
+                "cancellation must enforce elapsed lower-bound while waiting on parser, elapsed: {cancel_elapsed:?}"
+            );
+            assert!(
+                cancel_elapsed < Duration::from_secs(2),
+                "cancellation during wait must abort within bounded duration, elapsed: {cancel_elapsed:?}"
+            );
+            assert!(
+                matches!(
+                    cancel_result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| err.downcast_ref::<mux::LiveParserCheckpointError>()),
+                    Some(mux::LiveParserCheckpointError::Cancelled)
+                ),
+                "expected LiveParserCheckpointError::Cancelled, got {cancel_result:?}"
+            );
+        }
+
+        let gen2_object_id = "real-guardian-terminal-gen2";
+        let gen2_timestamp = gen2_captured.captured_at_epoch_ms;
+        let encode_gen2 = |payload: &[u8], id, kind, predecessor_generation: Option<u64>| {
+            encode_recovery_object(
+                payload,
+                ObjectMetadata::single(id, kind, 2, predecessor_generation, gen2_timestamp),
+                &key,
+                None,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        let gen2_ciphertext = encode_gen2(
+            gen2_published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload(),
+            semantic_object_id_from_str(gen2_object_id),
+            RecoveryObjectKind::TerminalCheckpoint,
+            None,
+        );
+        let gen2_digest: [u8; 32] = Sha256::digest(&gen2_ciphertext).into();
+        let gen2_references = HashMap::from([(
+            successor_pane.pane_id(),
+            RecoveryObjectRef {
+                object_id: gen2_object_id.into(),
+                byte_length: gen2_ciphertext.len() as u64,
+                payload_digest: gen2_digest,
+                schema_version: 2,
+            },
+        )]);
+        let gen2_parser_checkpoints = HashMap::from([(
+            successor_pane.pane_id(),
+            RecoveryParserCheckpoint::Guardian(&gen2_published),
+        )]);
+        let gen2_image = MuxRecoveryImage::from_mux_captured_checkpoints(
+            RecoveryImageGenerationMeta {
+                generation: 2,
+                predecessor_digest: Some(image.image_digest),
+                created_at_epoch_ms: gen2_timestamp,
+                ft_version: config::wezterm_version().to_owned(),
+                session_id: "real-guardian-birth".into(),
+            },
+            &gen2_captured,
+            &gen2_parser_checkpoints,
+            &gen2_references,
+        )
+        .unwrap();
+        let gen2_image_bytes = gen2_image.to_canonical_json().unwrap();
+        assert_eq!(
+            MuxRecoveryImage::from_json_slice(&gen2_image_bytes).unwrap(),
+            gen2_image
+        );
+
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: gen2_object_id.into(),
+                expected_sha256: hex::encode(gen2_digest),
+                ciphertext_bytes: gen2_ciphertext,
+            })
+            .unwrap();
+
+        // Construct a fresh authorized verifier with existing guardian custody
+        // and no volatile registrations so cross-generation checkpoints are authenticated
+        // from durable catalog/ACK rather than triggering duplicate durable pane ID rejection.
+        let authorized_verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        )
+        .with_existing_guardian_custody(token.to_path_buf());
+
+        // Negative control 1: mismatched predecessor generation in manifest must be rejected by authorized verifier
+        let bad_predecessor_root = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "successor-claim".into(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: root_receipt.generation,
+                expected_hash: root_receipt.sha256.clone(),
+            }),
+            manifest_bytes: encode_gen2(
+                &gen2_image_bytes,
+                [0x72; 32],
+                RecoveryObjectKind::WholeMuxImage,
+                None,
+            ),
+            created_at_ms: gen2_timestamp,
+        };
+        match store.publish_generation_root(&bad_predecessor_root, &authorized_verifier) {
+            Err(PublicationError::VerificationRejected { generation, .. }) => {
+                assert_eq!(generation, 2);
+            }
+            other => panic!(
+                "expected VerificationRejected for mismatched predecessor metadata, got {other:?}"
+            ),
+        }
+
+        // Negative control 2: mismatched generation in manifest must be rejected by authorized verifier
+        let bad_generation_manifest = encode_recovery_object(
+            &gen2_image_bytes,
+            ObjectMetadata::single(
+                [0x72; 32],
+                RecoveryObjectKind::WholeMuxImage,
+                1,
+                None,
+                gen2_timestamp,
+            ),
+            &key,
+            None,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let bad_generation_root = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "successor-claim".into(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: root_receipt.generation,
+                expected_hash: root_receipt.sha256.clone(),
+            }),
+            manifest_bytes: bad_generation_manifest,
+            created_at_ms: gen2_timestamp,
+        };
+        match store.publish_generation_root(&bad_generation_root, &authorized_verifier) {
+            Err(PublicationError::VerificationRejected { generation, .. }) => {
+                assert_eq!(generation, 2);
+            }
+            other => panic!(
+                "expected VerificationRejected for mismatched generation metadata, got {other:?}"
+            ),
+        }
+
+        let gen2_root = GenerationRootPublishRequest {
+            generation: 2,
+            publisher_id: "successor-claim".into(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: root_receipt.generation,
+                expected_hash: root_receipt.sha256.clone(),
+            }),
+            manifest_bytes: encode_gen2(
+                &gen2_image_bytes,
+                [0x72; 32],
+                RecoveryObjectKind::WholeMuxImage,
+                Some(1),
+            ),
+            created_at_ms: gen2_timestamp,
+        };
+
+        // Negative control 3: unregistered generation 2 capture rejected by original gen1-only verifier
+        match store.publish_generation_root(&gen2_root, &verifier) {
+            Err(PublicationError::VerificationRejected { generation, .. }) => {
+                assert_eq!(generation, 2);
+            }
+            other => {
+                panic!("expected VerificationRejected for unregistered gen2 capture, got {other:?}")
+            }
+        }
+
+        let gen2_root_receipt = store
+            .publish_generation_root(&gen2_root, &authorized_verifier)
+            .unwrap();
+        assert_eq!(gen2_root_receipt.generation, 2);
+
+        // Successor Gen 2 whole-mux recovery capture in same store with exact predecessor hash & verified image digest
+        {
+            let recovery_expected_gen2 = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: recovery_gen1_hash,
+                }),
+                predecessor_image_digest: Some(recovery_gen1_image_digest),
+                existing_guardian_custody: Some(token.to_path_buf()),
+            };
+            let recovery_gen2_receipt = {
+                let thread_cx = frankenterm_core::cx::Cx::for_testing();
+                let thread_mux = Arc::clone(&successor_mux);
+                let thread_store = SnapshotPublicationStore::open(
+                    directory.join("whole-image-common-cut"),
+                    Default::default(),
+                )
+                .unwrap();
+                let thread_key = Arc::clone(&key);
+                let thread_expected = recovery_expected_gen2;
+                let handle = thread::spawn(move || {
+                    capture_and_publish_whole_mux_recovery(
+                        &thread_cx,
+                        &thread_mux,
+                        &thread_store,
+                        thread_key,
+                        &thread_expected,
+                        Duration::from_secs(5),
+                    )
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    if handle.is_finished() {
+                        break handle.join().unwrap().expect(
+                            "capture and publish successor generation 2 in same recovery store",
+                        );
+                    }
+                    assert!(Instant::now() < deadline, "gen2 recovery capture timed out");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            };
+            assert_eq!(recovery_gen2_receipt.generation, 2);
+
+            let recovery_gen2_selected = recovery_store
+                .select_verified_roots(&authorized_verifier)
+                .expect("authorized verifier must select verified generation 2 root");
+            let recovery_gen2_validated = recovery_gen2_selected
+                .current
+                .expect("must verify published generation 2 root");
+            assert_eq!(recovery_gen2_validated.generation(), 2);
+            assert_eq!(
+                recovery_gen2_validated.image().header.predecessor_digest,
+                Some(recovery_gen1_image_digest)
+            );
+        }
+
+        // 8. Fresh-process verification from disk without volatile per-pane hints
+        let gen2_child_log_path = directory.join("fresh-image-verifier-gen2.stdout");
+        let gen2_child_log = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&gen2_child_log_path)
+            .unwrap();
+        let mut gen2_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "guardian_proxy::tests::guardian_image_fresh_process_existing_custody",
+                "--nocapture",
+            ])
+            .env("FT_TEST_IMAGE_REOPEN_ROOT", directory.join("whole-image"))
+            .env("FT_TEST_IMAGE_REOPEN_TOKEN", token)
+            .env("FT_TEST_IMAGE_EXPECTED_GENERATION", "2")
+            .env(
+                "FT_TEST_IMAGE_EXPECTED_MARKER",
+                "guardian-domain-post-successor-marker",
+            )
+            .env_remove("FT_TEST_IMAGE_REOPEN_SCOPE")
+            .env_remove("FT_TEST_IMAGE_REOPEN_CHECKPOINT")
+            .stdout(gen2_child_log)
+            .spawn()
+            .unwrap();
+        let gen2_child_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = gen2_child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "fresh process could not authenticate durable generation 2 image"
+                );
+                break;
+            }
+            if Instant::now() >= gen2_child_deadline {
+                gen2_child
+                    .kill()
+                    .expect("settle only owned image verifier child");
+                gen2_child.wait().unwrap();
+                panic!("fresh process generation 2 image verifier deadline expired");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let gen2_child_log = std::fs::read_to_string(gen2_child_log_path).unwrap();
+        assert!(
+            gen2_child_log.contains("running 1 test")
+                && gen2_child_log.contains("1 passed; 0 failed"),
+            "fresh gen2 verifier did not execute exactly one test: {}",
+            gen2_child_log
+        );
+
+        let validated_gen2 = store
+            .select_verified_roots(&authorized_verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        assert_eq!(validated_gen2.generation(), 2);
+        assert_eq!(validated_gen2.image().image_digest, gen2_image.image_digest);
+        assert_eq!(
+            validated_gen2.image().header.predecessor_digest,
+            Some(image.image_digest)
+        );
+
+        let restored_gen2 = reconstruct_whole_mux_image_inert(
+            &validated_gen2,
+            TerminalCheckpointLimits::default(),
+            None,
+            &std::collections::HashSet::<String>::new(),
+        )
+        .unwrap();
+        let restored_gen2_pane = &restored_gen2.pane_terminals[&(successor_pane.pane_id() as u64)];
+        assert_eq!(
+            restored_gen2_pane.spawn_custody,
+            gen2_image.panes[0].spawn_custody
+        );
+        let restored_gen2_canonical = restored_gen2_pane
+            .terminal
+            .checkpoint()
+            .unwrap()
+            .to_canonical_json(TerminalCheckpointLimits::default())
+            .unwrap();
+        assert_eq!(
+            restored_gen2_canonical.as_slice(),
+            gen2_published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload()
+        );
+        let gen2_checkpoint_json: serde_json::Value =
+            serde_json::from_slice(&restored_gen2_canonical).unwrap();
+        let restored_gen2_text: String = gen2_checkpoint_json["primary_screen"]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|line| line["cells"].as_array().unwrap())
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            restored_gen2_text.contains("guardian-domain-post-successor-marker"),
+            "generation 2 reconstructed terminal did not contain post-successor child output"
+        );
+
+        assert_eq!(std::fs::read(&births).unwrap(), b"B");
+        assert!(!signaled.exists());
+        assert!(is_child_alive(original_pid));
+
+        // Production whole-mux publisher integration: publish Gen 1 and Gen 2 across real mux replacement.
+        {
+            use frankenterm_core::snapshot_engine::{
+                WholeMuxPanePublication, WholeMuxPublicationError, WholeMuxPublicationIdentity,
+                publish_whole_mux_recovery,
+            };
+            let prod_store = SnapshotPublicationStore::open(
+                directory.join("whole-image-prod-pipeline"),
+                Default::default(),
+            )
+            .unwrap();
+            let prod_cx = frankenterm_core::cx::for_testing();
+            let prod_expected_gen1 = WholeMuxPublicationIdentity {
+                generation: 1,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "actual-birth".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: None,
+                predecessor_image_digest: None,
+                existing_guardian_custody: None,
+            };
+            let prod_pub_gen1 = WholeMuxPanePublication::guardian(
+                pane_id,
+                "prod-guardian-terminal-gen1",
+                &published,
+            );
+            let prod_receipt_gen1 = publish_whole_mux_recovery(
+                &prod_cx,
+                &prod_store,
+                &captured,
+                &[prod_pub_gen1],
+                Arc::clone(&key),
+                &prod_expected_gen1,
+            )
+            .expect("production publisher must publish generation 1 guardian capture");
+            assert_eq!(prod_receipt_gen1.generation, 1);
+            assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 1);
+
+            // Obtain actual production gen1 verified image/digest from production root using exact enrolled verifier.
+            let prod_gen1_selected = prod_store
+                .select_verified_roots(&verifier)
+                .expect("exact enrolled verifier must select verified generation 1 root");
+            let prod_gen1_validated = prod_gen1_selected
+                .current
+                .expect("must verify published generation 1 root");
+            let prod_gen1_image_digest = prod_gen1_validated.image().image_digest;
+
+            let prod_pub_gen2 = WholeMuxPanePublication::guardian(
+                successor_pane.pane_id(),
+                "prod-guardian-terminal-gen2",
+                &gen2_published,
+            );
+
+            // Negative control 1: Gen 2 without predecessor custody token rejects predecessor.
+            let prod_expected_gen2_no_custody = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: prod_receipt_gen1.sha256.clone(),
+                }),
+                predecessor_image_digest: Some(prod_gen1_image_digest),
+                existing_guardian_custody: None,
+            };
+            let prod_pub_gen2_missing = WholeMuxPanePublication::guardian(
+                successor_pane.pane_id(),
+                "prod-guardian-terminal-gen2-missing",
+                &gen2_published,
+            );
+            let err = publish_whole_mux_recovery(
+                &prod_cx,
+                &prod_store,
+                &gen2_captured,
+                &[prod_pub_gen2_missing],
+                Arc::clone(&key),
+                &prod_expected_gen2_no_custody,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
+                        "committed graph rejected"
+                    ))
+                ),
+                "publication without predecessor custody must fail predecessor reconciliation: {err:?}"
+            );
+            assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 1);
+
+            // Negative control 2: Gen 2 with wrong predecessor custody token path rejects predecessor.
+            let prod_expected_gen2_wrong_custody = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: prod_receipt_gen1.sha256.clone(),
+                }),
+                predecessor_image_digest: Some(prod_gen1_image_digest),
+                existing_guardian_custody: Some(directory.join("nonexistent-custody-token")),
+            };
+            let prod_pub_gen2_wrong = WholeMuxPanePublication::guardian(
+                successor_pane.pane_id(),
+                "prod-guardian-terminal-gen2-wrong",
+                &gen2_published,
+            );
+            let err = publish_whole_mux_recovery(
+                &prod_cx,
+                &prod_store,
+                &gen2_captured,
+                &[prod_pub_gen2_wrong],
+                Arc::clone(&key),
+                &prod_expected_gen2_wrong_custody,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
+                        "committed graph rejected"
+                    ))
+                ),
+                "publication with wrong predecessor custody must fail predecessor reconciliation: {err:?}"
+            );
+            assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 1);
+
+            // Negative control 3: Gen 2 with mismatched predecessor image digest rejects predecessor.
+            let mut wrong_digest = prod_gen1_image_digest;
+            wrong_digest[0] ^= 0xff;
+            let prod_expected_gen2_wrong_digest = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: prod_receipt_gen1.sha256.clone(),
+                }),
+                predecessor_image_digest: Some(wrong_digest),
+                existing_guardian_custody: Some(token.to_path_buf()),
+            };
+            let prod_pub_gen2_wrong_digest = WholeMuxPanePublication::guardian(
+                successor_pane.pane_id(),
+                "prod-guardian-terminal-gen2-wrong-digest",
+                &gen2_published,
+            );
+            let err = publish_whole_mux_recovery(
+                &prod_cx,
+                &prod_store,
+                &gen2_captured,
+                &[prod_pub_gen2_wrong_digest],
+                Arc::clone(&key),
+                &prod_expected_gen2_wrong_digest,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WholeMuxPublicationError::Publication(PublicationError::InvalidDiscovery(
+                        "committed graph rejected"
+                    ))
+                ),
+                "publication with wrong predecessor image digest must fail predecessor reconciliation: {err:?}"
+            );
+            assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 1);
+
+            // Successful Gen 2 publication across actual mux replacement with caller-enrolled custody token.
+            let prod_expected_gen2 = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: prod_receipt_gen1.sha256.clone(),
+                }),
+                predecessor_image_digest: Some(prod_gen1_image_digest),
+                existing_guardian_custody: Some(token.to_path_buf()),
+            };
+            let prod_receipt_gen2 = publish_whole_mux_recovery(
+                &prod_cx,
+                &prod_store,
+                &gen2_captured,
+                &[prod_pub_gen2],
+                Arc::clone(&key),
+                &prod_expected_gen2,
+            )
+            .expect("production publication of generation 2 across successor mux must succeed");
+            assert_eq!(prod_receipt_gen2.generation, 2);
+            assert!(
+                prod_store
+                    .has_object("prod-guardian-terminal-gen2")
+                    .unwrap()
+            );
+            assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 2);
+
+            let prod_selected = prod_store
+                .select_verified_roots(&authorized_verifier)
+                .expect("authorized verifier must select verified generation 2 root");
+            let prod_validated_gen2 = prod_selected
+                .current
+                .expect("must verify published generation 2 root");
+            assert_eq!(prod_validated_gen2.generation(), 2);
+            assert_eq!(
+                prod_validated_gen2.image().header.predecessor_digest,
+                Some(prod_gen1_image_digest)
+            );
+            assert_eq!(
+                prod_validated_gen2.image().header.mux_incarnation_id,
+                hex::encode(gen2_captured.session_incarnation.as_bytes())
+            );
+        }
+
+        // Terminal mutation with same stream bytes advances semantic generation; bound capture witness must be rejected
+        successor_pane.perform_actions(vec![termwiz::escape::Action::Print('!')]);
+        assert!(
+            !successor_mux
+                .guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
+            "terminal mutation advanced semantic generation; bound capture witness must be rejected"
+        );
+
+        (successor_mux, successor_pane)
+    }
+
     #[test]
     fn guardian_image_fresh_process_existing_custody() {
         let Some(root) = std::env::var_os("FT_TEST_IMAGE_REOPEN_ROOT") else {
@@ -6793,6 +8141,51 @@ mod tests {
             "durable custody/catalog/ACK did not verify saved image: {:?}",
             selected.torn_or_rejected
         );
+        if let Some(expected) = std::env::var_os("FT_TEST_IMAGE_EXPECTED_GENERATION") {
+            let expected_gen: u64 = expected.to_str().unwrap().parse().unwrap();
+            assert_eq!(
+                selected.current.as_ref().unwrap().generation(),
+                expected_gen,
+                "fresh process verified root generation mismatch"
+            );
+        }
+        if let Some(expected_marker) = std::env::var_os("FT_TEST_IMAGE_EXPECTED_MARKER") {
+            let marker_str = expected_marker.to_str().unwrap();
+            use frankenterm_core::session_restore::reconstruct_whole_mux_image_inert;
+            use wezterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
+            let restored = reconstruct_whole_mux_image_inert(
+                selected.current.as_ref().unwrap(),
+                TerminalCheckpointLimits::default(),
+                None,
+                &std::collections::HashSet::<String>::new(),
+            )
+            .unwrap();
+            let mut found_marker = false;
+            for pane in restored.pane_terminals.values() {
+                let canonical = pane
+                    .terminal
+                    .checkpoint()
+                    .unwrap()
+                    .to_canonical_json(TerminalCheckpointLimits::default())
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+                let text: String = json["primary_screen"]["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|line| line["cells"].as_array().unwrap())
+                    .map(|cell| cell["text"].as_str().unwrap())
+                    .collect();
+                if text.contains(marker_str) {
+                    found_marker = true;
+                    break;
+                }
+            }
+            assert!(
+                found_marker,
+                "fresh process reconstructed terminal did not contain expected marker: {marker_str}"
+            );
+        }
     }
 
     struct RecordCheckpointFixture {

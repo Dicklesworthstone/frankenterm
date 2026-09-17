@@ -62,11 +62,21 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Closing or retiring a guardian lease succeeds when pending-input reconciliation
   confirms that the child has exited and all input was applied. Partial input
   and unknown durability outcomes still return errors.
+- GUI viewport reads use the layout-fenced protocol without being rejected by
+  the client's endpoint guard. Older peers retain their dialect checks.
+- Release packaging retains one process identity per executable when the mux
+  links the guardian library.
+- The recovery publisher accepts authenticated guardian checkpoints and verifies
+  predecessor images from an earlier mux incarnation.
+- Quick-select retains authority for copied remote chunks after those chunks
+  leave the render cache.
+- Text-tail requests fetch the requested suffix without transferring the entire
+  scrollback. Truncation metadata omits the unfetched prefix's byte count.
 
-The `0.15.6-rc.30` candidate includes these changes. The 50 ms resize target,
-100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
-reopen remain unqualified; this entry does not claim those acceptance goals
-are complete.
+The `0.15.6-rc.33` candidate includes these changes. The 50 ms resize target,
+100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
+reopen, and live runtime recovery remain unqualified; this entry does not claim
+tests or runtime behavior are proven.
 
 - Recorder flush, health and lag positions now identify the start of the last record in both storage backends, including after reopening the log.
 - Cold-scrollback reads capture bounded snapshots, hydrate persisted text outside native UI locks, and validate the retained source before publication. Shared cold visual coordinates and codec v65 layout checks prevent delayed line replies from populating a newer layout. Cold invalidation visits cached rows rather than iterating the entire history range.

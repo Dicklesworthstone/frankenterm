@@ -959,6 +959,18 @@ impl MuxPool {
         pane_id: u64,
         max_output_bytes: usize,
     ) -> Result<MuxTextReadResult, MuxPoolError> {
+        self.get_text_tail_with_cx(cx, pane_id, max_output_bytes, None)
+            .await
+    }
+
+    /// Lease one connection for a fenced bounded-tail text transaction.
+    pub async fn get_text_tail_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        max_output_bytes: usize,
+        tail: Option<usize>,
+    ) -> Result<MuxTextReadResult, MuxPoolError> {
         let op_cx = cx.clone();
         self.execute_with_recovery_outcome_with_cx(
             cx,
@@ -967,11 +979,16 @@ impl MuxPool {
                 let op_cx = op_cx.clone();
                 Box::pin(async move {
                     client
-                        .get_text_transaction_with_cx(&op_cx, pane_id, max_output_bytes)
+                        .get_text_tail_transaction_with_cx(&op_cx, pane_id, max_output_bytes, tail)
                         .await
                 })
             },
-            |outcome| matches!(outcome, Ok(MuxTextReadResult::Text(_))),
+            |outcome| {
+                matches!(
+                    outcome,
+                    Ok(MuxTextReadResult::Text(_) | MuxTextReadResult::Bounded { .. })
+                )
+            },
         )
         .await?
         .map_err(|error| MuxPoolError::Mux(DirectMuxError::RemoteRejection(error)))

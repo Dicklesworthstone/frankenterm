@@ -4908,8 +4908,24 @@ mod pane_registration_handle {
             limits: TerminalCheckpointLimits,
             timeout: Duration,
         ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            self.capture_live_parser_checkpoint_source_cancelling(source, limits, timeout, || false)
+        }
+
+        pub(crate) fn capture_live_parser_checkpoint_source_cancelling(
+            &self,
+            source: crate::guardian_checkpoint::LiveParserCheckpointSource,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+            mut cancelled: impl FnMut() -> bool,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
             if timeout.is_zero() || timeout > LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT {
                 return Err(LiveParserCheckpointError::InvalidTimeout);
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or(LiveParserCheckpointError::InvalidTimeout)?;
+            if cancelled() {
+                return Err(LiveParserCheckpointError::Cancelled);
             }
             let pane = Arc::clone(&self.pane);
             let mux = Arc::clone(&self.owner);
@@ -4924,19 +4940,27 @@ mod pane_registration_handle {
                 .generation
                 .live_parser_checkpoint
                 .register_checkpoint(&pane, &self.generation, durable_pane_id, source, limits)?;
-            let result = match completion.recv_timeout(timeout) {
-                Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.generation
-                        .live_parser_checkpoint
-                        .cancel_checkpoint(request_id);
-                    Err(LiveParserCheckpointError::Timeout)
+            struct PendingWait<'a>(&'a crate::LiveParserCheckpointControl, u64);
+            impl Drop for PendingWait<'_> {
+                fn drop(&mut self) {
+                    self.0.cancel_checkpoint(self.1);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.generation
-                        .live_parser_checkpoint
-                        .cancel_checkpoint(request_id);
-                    Err(LiveParserCheckpointError::CompletionDisconnected)
+            }
+            let _pending = PendingWait(&self.generation.live_parser_checkpoint, request_id);
+            let result = loop {
+                if cancelled() {
+                    return Err(LiveParserCheckpointError::Cancelled);
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(LiveParserCheckpointError::Timeout)?;
+                match completion.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(LiveParserCheckpointError::CompletionDisconnected);
+                    }
                 }
             };
             if result.is_ok() {
@@ -4953,6 +4977,12 @@ mod pane_registration_handle {
                 if !remains_current {
                     return Err(LiveParserCheckpointError::StaleRegistration);
                 }
+            }
+            if cancelled() {
+                return Err(LiveParserCheckpointError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(LiveParserCheckpointError::Timeout);
             }
             result
         }
@@ -5070,6 +5100,15 @@ mod pane_registration_handle {
             limits: TerminalCheckpointLimits,
             timeout: Duration,
         ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            self.capture_current_guardian_checkpoint_cancelling(limits, timeout, || false)
+        }
+
+        pub fn capture_current_guardian_checkpoint_cancelling(
+            &self,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+            cancelled: impl FnMut() -> bool,
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
             let source = {
                 let state = self.generation.live_parser_checkpoint.state.lock();
                 if state.dead
@@ -5088,7 +5127,9 @@ mod pane_registration_handle {
                 cursor.source
             };
             let capture = self
-                .capture_live_parser_checkpoint_source(source, limits, timeout)
+                .capture_live_parser_checkpoint_source_cancelling(
+                    source, limits, timeout, cancelled,
+                )
                 .map_err(anyhow::Error::new)?;
             self.pane.publish_guardian_checkpoint(capture)
         }
@@ -5783,6 +5824,22 @@ mod pane_registration_handle {
             self.operation_guard(&owner)
                 .ok_or(LiveParserCheckpointError::StaleRegistration)?
                 .capture_model_parser_checkpoint(limits, timeout, cancelled)
+        }
+
+        pub fn capture_current_guardian_checkpoint(
+            &self,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+            cancelled: impl FnMut() -> bool,
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            let owner = self
+                .generation
+                .owner
+                .upgrade()
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            self.operation_guard(&owner)
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+                .capture_current_guardian_checkpoint_cancelling(limits, timeout, cancelled)
         }
 
         /// Resolve the exact owner for mux-internal topology transactions.
@@ -19067,6 +19124,29 @@ impl Mux {
         registration.capture_model_parser_checkpoint(limits, timeout, cancelled)
     }
 
+    /// Capture one live terminal guardian checkpoint for a pane using authenticated
+    /// guardian authority.
+    pub fn capture_pane_guardian_checkpoint(
+        &self,
+        pane_id: PaneId,
+        limits: TerminalCheckpointLimits,
+        timeout: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+        let pane = {
+            let panes = self.panes.read();
+            panes
+                .get(&pane_id)
+                .map(|reg| Arc::clone(&reg.pane))
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+        };
+        let registration = pane
+            .mux_registration_slot()
+            .load()
+            .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+        registration.capture_current_guardian_checkpoint(limits, timeout, cancelled)
+    }
+
     /// Recheck an exact model contribution without mutating the terminal or
     /// blocking behind terminal I/O. Busy, retired, and exhausted sources retry.
     pub fn model_checkpoint_is_current(
@@ -19096,9 +19176,83 @@ impl Mux {
         {
             return false;
         }
+        let _registration = self.pane_registration.lock();
         self.panes.read().get(&pane_id).is_some_and(|current| {
             Arc::ptr_eq(&current.pane, &registered.0)
                 && Arc::ptr_eq(&current.generation, &registered.1)
+        })
+    }
+
+    /// Recheck an exact guardian checkpoint contribution without mutating the terminal
+    /// or blocking behind terminal I/O.
+    ///
+    /// Validates registration wire identity, durable UUID, lease authority,
+    /// live parser quiescence and watermark equality, and binds the monotonic
+    /// terminal semantic generation witness retained in the immutable capture.
+    pub fn guardian_checkpoint_is_current(
+        &self,
+        pane_id: PaneId,
+        published: &crate::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> bool {
+        let capture = published.capture();
+        let expected_wire = capture.registration_wire_identity();
+        let expected_uuid = capture.durable_pane_id();
+        let expected_owner = published.owner();
+        let expected_semantic_generation = capture.semantic_generation();
+
+        let current = {
+            let panes = self.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                return false;
+            };
+            (
+                Arc::clone(&registered.pane),
+                Arc::clone(&registered.generation),
+            )
+        };
+
+        if current.1.wire_identity != expected_wire {
+            return false;
+        }
+        if current.0.durable_pane_id() != Some(*expected_uuid.as_bytes()) {
+            return false;
+        }
+
+        let local = match current.0.downcast_ref::<crate::localpane::LocalPane>() {
+            Some(l) => l,
+            None => return false,
+        };
+
+        if local.guardian_lease_identity() != Some(expected_owner) {
+            return false;
+        }
+
+        {
+            let state = current.1.live_parser_checkpoint.state.lock();
+            if state.dead || state.poison.is_some() || !state.attached || !state.guardian_mode {
+                return false;
+            }
+            if state.delivery_call_in_flight
+                || state.socket_write_in_flight
+                || state.authorized_delivery.is_some()
+            {
+                return false;
+            }
+            let target_bytes = capture.terminal_checkpoint().parser_stream_bytes();
+            if state.delivered_bytes != target_bytes || state.parsed_bytes != target_bytes {
+                return false;
+            }
+        }
+
+        if local.current_guardian_semantic_generation() != Some(expected_semantic_generation) {
+            return false;
+        }
+
+        let _registration = self.pane_registration.lock();
+        let panes = self.panes.read();
+        panes.get(&pane_id).is_some_and(|registered| {
+            Arc::ptr_eq(&current.0, &registered.pane)
+                && Arc::ptr_eq(&current.1, &registered.generation)
         })
     }
 

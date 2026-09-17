@@ -219,7 +219,7 @@ fn pane_text_result_ok_and_error_variants_match_golden() {
         text: "alpha\nbeta\n".to_string(),
         truncated: true,
         truncation_info: Some(frankenterm_core::robot_types::TruncationInfo {
-            original_bytes: 4096,
+            original_bytes: Some(4096),
             returned_bytes: 512,
             original_lines: 200,
             returned_lines: 20,

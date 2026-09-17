@@ -1434,7 +1434,7 @@ impl IncidentPaneTextSummary {
             truncate_utf8_with_marker(&redacted, max_summary_bytes, "\n[PANE_TEXT_TRUNCATED]");
         let truncated = summary.len() < redacted.len();
         let truncation_info = truncated.then(|| crate::robot_types::TruncationInfo {
-            original_bytes: redacted.len(),
+            original_bytes: Some(redacted.len()),
             returned_bytes: summary.len(),
             original_lines: redacted.lines().count(),
             returned_lines: summary.lines().count(),
@@ -1515,7 +1515,7 @@ fn sanitize_pane_text_summary_for_payload(
             truncate_utf8_with_marker(&pane.summary, max_summary_bytes, "\n[PANE_TEXT_TRUNCATED]");
         pane.truncated = true;
         pane.truncation_info = Some(crate::robot_types::TruncationInfo {
-            original_bytes,
+            original_bytes: Some(original_bytes),
             returned_bytes: pane.summary.len(),
             original_lines,
             returned_lines: pane.summary.lines().count(),

@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 19,
         "feat": 53,
-        "fix": 93,
+        "fix": 94,
         "other": 16,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 30
       },
-      "fork_side_commit_count": 228,
+      "fork_side_commit_count": 229,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-17T02:44:39-04:00",
-        "sha": "e08ea7a65abba6160849d46891fe9467fc4ddf1d",
-        "subject": "style(client): satisfy workspace formatting proof"
+        "classification": "fix",
+        "committed_at": "2026-09-17T09:09:55-04:00",
+        "sha": "cbca0e7c8e3d55baa9a99f16ad418e2c8ca9aa30",
+        "subject": "fix(client): admit layout-fenced viewport reads on the live GUI protocol"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2721,
-  "generated_at": "2026-09-17T11:27:24.447204Z",
+  "fork_side_commit_total": 2722,
+  "generated_at": "2026-09-17T13:41:46.763250Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

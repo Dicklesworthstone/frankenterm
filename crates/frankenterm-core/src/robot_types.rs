@@ -775,9 +775,10 @@ pub enum PaneTextResult {
 }
 
 /// Truncation details when pane output exceeds limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruncationInfo {
-    pub original_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<usize>,
     pub returned_bytes: usize,
     pub original_lines: usize,
     pub returned_lines: usize,
@@ -4211,7 +4212,37 @@ mod tests {
         let data = resp.into_result().unwrap();
         assert!(data.truncated);
         let info = data.truncation_info.unwrap();
-        assert_eq!(info.original_bytes, 10000);
+        assert_eq!(info.original_bytes, Some(10000));
+        assert_eq!(info.returned_lines, 50);
+    }
+
+    #[test]
+    fn parse_get_text_with_truncation_without_original_bytes() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "pane_id": 3,
+                "text": "output...",
+                "tail_lines": 50,
+                "escapes_included": true,
+                "truncated": true,
+                "truncation_info": {
+                    "returned_bytes": 5000,
+                    "original_lines": 200,
+                    "returned_lines": 50
+                }
+            },
+            "elapsed_ms": 12,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
+        let data = resp.into_result().unwrap();
+        assert!(data.truncated);
+        let info = data.truncation_info.unwrap();
+        assert_eq!(info.original_bytes, None);
+        assert_eq!(info.returned_bytes, 5000);
+        assert_eq!(info.original_lines, 200);
         assert_eq!(info.returned_lines, 50);
     }
 
@@ -5782,17 +5813,28 @@ mod tests {
     #[test]
     fn truncation_info_serialize_roundtrip() {
         let info = TruncationInfo {
-            original_bytes: 50000,
+            original_bytes: Some(50000),
             returned_bytes: 8000,
             original_lines: 1000,
             returned_lines: 100,
         };
         let serialized = serde_json::to_string(&info).unwrap();
         let deserialized: TruncationInfo = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.original_bytes, 50000);
+        assert_eq!(deserialized.original_bytes, Some(50000));
         assert_eq!(deserialized.returned_bytes, 8000);
         assert_eq!(deserialized.original_lines, 1000);
         assert_eq!(deserialized.returned_lines, 100);
+
+        let info_none = TruncationInfo {
+            original_bytes: None,
+            returned_bytes: 8000,
+            original_lines: 1000,
+            returned_lines: 100,
+        };
+        let serialized_none = serde_json::to_string(&info_none).unwrap();
+        assert!(!serialized_none.contains("original_bytes"));
+        let deserialized_none: TruncationInfo = serde_json::from_str(&serialized_none).unwrap();
+        assert_eq!(deserialized_none.original_bytes, None);
     }
 
     #[test]

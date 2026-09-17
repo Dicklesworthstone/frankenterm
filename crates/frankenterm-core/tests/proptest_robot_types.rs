@@ -194,7 +194,7 @@ fn arb_get_text_data() -> impl Strategy<Value = GetTextData> {
 
 fn arb_truncation_info() -> impl Strategy<Value = TruncationInfo> {
     (
-        0usize..100_000,
+        proptest::option::of(0usize..100_000),
         0usize..100_000,
         0usize..10_000,
         0usize..10_000,
@@ -3122,7 +3122,7 @@ proptest! {
         text in "[a-zA-Z0-9 \n]{0,80}",
         tail_lines in 0usize..10_000,
         escapes_included in proptest::bool::ANY,
-        original_bytes in 0usize..1_000_000,
+        original_bytes in proptest::option::of(0usize..1_000_000),
         returned_bytes in 0usize..1_000_000,
         original_lines in 0usize..100_000,
         returned_lines in 0usize..100_000,

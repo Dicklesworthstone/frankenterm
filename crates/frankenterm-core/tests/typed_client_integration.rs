@@ -172,6 +172,23 @@ deser_test!(
 );
 
 deser_test!(
+    deser_get_text_truncated_omitted_original_bytes,
+    GetTextData,
+    json!({
+        "pane_id": 1,
+        "text": "truncated...",
+        "tail_lines": 50,
+        "escapes_included": true,
+        "truncated": true,
+        "truncation_info": {
+            "returned_bytes": 5000,
+            "original_lines": 200,
+            "returned_lines": 50
+        }
+    })
+);
+
+deser_test!(
     deser_wait_for,
     WaitForData,
     json!({
@@ -1428,4 +1445,33 @@ fn rule_item_no_workflow() {
     }));
     let resp: RobotResponse<RulesListData> = serde_json::from_value(json).unwrap();
     assert!(resp.into_result().unwrap().rules[0].workflow.is_none());
+}
+
+#[test]
+fn deser_get_text_truncated_omitted_original_bytes_deserializes_as_none() {
+    let raw = json!({
+        "pane_id": 42,
+        "text": "bounded tail output without prefix",
+        "tail_lines": 25,
+        "escapes_included": false,
+        "truncated": true,
+        "truncation_info": {
+            "returned_bytes": 1024,
+            "original_lines": 500,
+            "returned_lines": 25
+        }
+    });
+    let envelope = wrap_envelope(raw);
+    let resp: RobotResponse<GetTextData> = serde_json::from_value(envelope)
+        .expect("bounded tail JSON without original_bytes must deserialize");
+    assert!(resp.ok);
+    let data = resp.data.expect("data must be present");
+    assert!(data.truncated);
+    let info = data
+        .truncation_info
+        .expect("truncation_info must be present");
+    assert_eq!(info.original_bytes, None);
+    assert_eq!(info.returned_bytes, 1024);
+    assert_eq!(info.original_lines, 500);
+    assert_eq!(info.returned_lines, 25);
 }

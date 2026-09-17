@@ -54,7 +54,16 @@ static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, PartialEq, Eq)]
 pub enum MuxTextReadResult {
     Text(String),
-    OutputTooLarge { len: usize, cap: usize },
+    Bounded {
+        text: String,
+        original_lines: usize,
+        original_bytes: Option<usize>,
+        truncated: bool,
+    },
+    OutputTooLarge {
+        len: usize,
+        cap: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -2622,18 +2631,32 @@ impl DirectMuxClient {
         pane_id: u64,
         max_output_bytes: usize,
     ) -> Result<MuxTextReadResult, DirectMuxError> {
-        self.get_text_transaction_with_cx(cx, pane_id, max_output_bytes)
+        self.get_text_tail_with_cx(cx, pane_id, max_output_bytes, None)
+            .await
+    }
+
+    /// Read physical rows from one source/layout on this connection,
+    /// bounded to the trailing `tail` rows when requested.
+    pub async fn get_text_tail_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        max_output_bytes: usize,
+        tail: Option<usize>,
+    ) -> Result<MuxTextReadResult, DirectMuxError> {
+        self.get_text_tail_transaction_with_cx(cx, pane_id, max_output_bytes, tail)
             .await?
             .map_err(DirectMuxError::RemoteRejection)
     }
 
     /// The inner error is a settled transaction rejection. Preserve its wire
     /// authority without granting the pool another transaction retry budget.
-    pub(super) async fn get_text_transaction_with_cx(
+    pub(super) async fn get_text_tail_transaction_with_cx(
         &mut self,
         cx: &Cx,
         pane_id: u64,
         max_output_bytes: usize,
+        tail: Option<usize>,
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
         let mut chunk_rows = 512isize;
@@ -2659,10 +2682,22 @@ impl DirectMuxClient {
             let rows = isize::try_from(layout.dimensions.scrollback_rows).map_err(|_| {
                 mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
             })?;
-            let mut start = layout.dimensions.scrollback_top;
-            let end = start.checked_add(rows).ok_or_else(|| {
+            let scrollback_top = layout.dimensions.scrollback_top;
+            let end = scrollback_top.checked_add(rows).ok_or_else(|| {
                 mux_text_contract_error(MuxTextContractReason::ScrollbackRangeOverflow)
             })?;
+            let total_rows = layout.dimensions.scrollback_rows as usize;
+
+            let (mut start, truncated) = match tail {
+                Some(n) if n > 0 && n < total_rows => {
+                    let tail_rows = isize::try_from(n).map_err(|_| {
+                        mux_text_contract_error(MuxTextContractReason::ScrollbackRowCountOverflow)
+                    })?;
+                    let tail_start = end.saturating_sub(tail_rows).max(scrollback_top);
+                    (tail_start, true)
+                }
+                _ => (scrollback_top, false),
+            };
             let mut out = String::new();
             while start < end {
                 checkpoint_mux_cx(cx, self.connection_id, "text_read_chunk")?;
@@ -2793,7 +2828,19 @@ impl DirectMuxClient {
             let final_state = final_state?;
             checkpoint_mux_cx(cx, self.connection_id, "text_read_complete")?;
             if final_state.seqno == layout.seqno && final_state.dimensions == layout.dimensions {
-                return Ok(Ok(MuxTextReadResult::Text(out)));
+                let result = match tail {
+                    Some(_) => {
+                        let original_bytes = if truncated { None } else { Some(out.len()) };
+                        MuxTextReadResult::Bounded {
+                            text: out,
+                            original_lines: total_rows,
+                            original_bytes,
+                            truncated,
+                        }
+                    }
+                    None => MuxTextReadResult::Text(out),
+                };
+                return Ok(Ok(result));
             }
             if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS {
                 diagnostics.final_source_retries += 1;
@@ -7875,6 +7922,171 @@ mod tests {
             Err(MuxTextReadResult::OutputTooLarge { len: 9, cap: 7 })
         );
         assert_eq!(output, "abc\nde\n", "failed append must not mutate output");
+    }
+
+    #[test]
+    fn text_read_tail_bounds_requested_rows_at_mux_source_and_excludes_prefix() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let ranges = Arc::new(StdMutex::new(Vec::new()));
+            let seen = Arc::clone(&ranges);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                    Pdu::GetLinesAtLayout(request) => {
+                        assert_eq!(request.layout.seqno, 7);
+                        assert_eq!(request.pane_id, 9);
+                        let range = request.lines[0].clone();
+                        seen.lock().unwrap().push(range.clone());
+                        text_read_reply(request, "café 中文 e\u{301} 👩‍💻")
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client
+                .get_text_tail_with_cx(&cx, 9, 100_000, Some(50))
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                MuxTextReadResult::Bounded {
+                    text: text_read_expected(543..593, "café 中文 e\u{301} 👩‍💻"),
+                    original_lines: 600,
+                    original_bytes: None,
+                    truncated: true,
+                }
+            );
+            assert_eq!(
+                *ranges.lock().unwrap(),
+                vec![543..593],
+                "prefix rows -7..543 must never be requested over the wire"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_tail_zero_or_overlarge_reads_full_buffer_honestly() {
+        for tail in [Some(0), Some(600), Some(1000), Some(usize::MAX)] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let ranges = Arc::new(StdMutex::new(Vec::new()));
+                let seen = Arc::clone(&ranges);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, -7, 600),
+                        Pdu::GetLinesAtLayout(request) => {
+                            let range = request.lines[0].clone();
+                            seen.lock().unwrap().push(range.clone());
+                            text_read_reply(request, "stable")
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let result = client
+                    .get_text_tail_with_cx(&cx, 9, 100_000, tail)
+                    .await
+                    .unwrap();
+                let expected_text = text_read_expected(-7..593, "stable");
+                assert_eq!(
+                    result,
+                    MuxTextReadResult::Bounded {
+                        text: expected_text.clone(),
+                        original_lines: 600,
+                        original_bytes: Some(expected_text.len()),
+                        truncated: false,
+                    }
+                );
+                let recorded = ranges.lock().unwrap().clone();
+                assert_eq!(recorded.first().map(|r| r.start), Some(-7));
+                assert_eq!(recorded.last().map(|r| r.end), Some(593));
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_tail_recomputes_suffix_on_source_layout_change() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let ranges = Arc::new(StdMutex::new(Vec::new()));
+            let seen = Arc::clone(&ranges);
+            let first_call = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let first_call_server = Arc::clone(&first_call);
+
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => {
+                        if first_call_server.load(Ordering::SeqCst) {
+                            text_read_state(7, -7, 600)
+                        } else {
+                            text_read_state(8, 3, 600)
+                        }
+                    }
+                    Pdu::GetLinesAtLayout(request) => {
+                        let range = request.lines[0].clone();
+                        seen.lock().unwrap().push(range.clone());
+                        if first_call_server.swap(false, Ordering::SeqCst) {
+                            Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                                GetLinesAtLayout::IDENT,
+                            ))
+                        } else {
+                            assert_eq!(request.layout.seqno, 8);
+                            text_read_reply(request, "new")
+                        }
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client
+                .get_text_tail_with_cx(&cx, 9, 100_000, Some(50))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result,
+                MuxTextReadResult::Bounded {
+                    text: text_read_expected(553..603, "new"),
+                    original_lines: 600,
+                    original_bytes: None,
+                    truncated: true,
+                }
+            );
+
+            assert_eq!(
+                *ranges.lock().unwrap(),
+                vec![543..593, 553..603],
+                "retry must recompute the suffix range against the updated layout"
+            );
+
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[test]
