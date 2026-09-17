@@ -1852,10 +1852,73 @@ impl PendingGuardianCheckpointPublication {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AcknowledgedGuardianCheckpointPublication {
+    receipt: GuardianCheckpointReceipt,
+    scope: GuardianCheckpointScopeV1,
+    upload_id: Uuid,
+    descriptor: GuardianCheckpointDescriptorV1,
+    chunk_bytes: u32,
+    query_request_id: Uuid,
+    completion_id: Uuid,
+}
+
+impl AcknowledgedGuardianCheckpointPublication {
+    fn from_pending(
+        pending: &PendingGuardianCheckpointPublication,
+        receipt: GuardianCheckpointReceipt,
+    ) -> Result<Self, GuardianProxyError> {
+        Ok(Self {
+            receipt,
+            scope: pending.scope,
+            upload_id: pending.upload_id,
+            descriptor: pending.descriptor,
+            chunk_bytes: pending.chunk_bytes,
+            query_request_id: pending.query_request_id,
+            completion_id: pending
+                .completion_id
+                .ok_or(GuardianProxyError::CheckpointStageInvariant)?,
+        })
+    }
+
+    fn confirm_ack(
+        &self,
+        transport: &mut dyn GuardianCheckpointStageTransport,
+    ) -> Result<(), GuardianProxyError> {
+        let request = GuardianCheckpointStageRequestV1::query(
+            self.scope,
+            self.upload_id,
+            self.descriptor,
+            self.chunk_bytes,
+        )
+        .map_err(GuardianProxyError::ReplayProtocol)?;
+        match transport.checkpoint_stage(self.query_request_id, request)? {
+            GuardianCheckpointStageReplyV1::Acked {
+                upload_id,
+                completion_id,
+                checkpoint_id,
+                boundary_id,
+                total_bytes,
+            } if upload_id == self.upload_id
+                && completion_id == self.completion_id
+                && checkpoint_id == self.descriptor.checkpoint_id()
+                && boundary_id == self.descriptor.boundary_id()
+                && total_bytes == self.descriptor.total_bytes() =>
+            {
+                Ok(())
+            }
+            GuardianCheckpointStageReplyV1::Quarantined { .. } => {
+                Err(GuardianProxyError::CheckpointStageQuarantined)
+            }
+            _ => Err(GuardianProxyError::CheckpointStageInvariant),
+        }
+    }
+}
+
 struct GuardianCheckpointPublisherState {
     transport: Box<dyn GuardianCheckpointStageTransport>,
     pending: Option<PendingGuardianCheckpointPublication>,
-    last_acknowledged: Option<GuardianCheckpointReceipt>,
+    last_acknowledged: Option<AcknowledgedGuardianCheckpointPublication>,
 }
 
 /// Serialized mux-side checkpoint publisher for one exact guardian lease.
@@ -1947,10 +2010,9 @@ impl GuardianCheckpointPublisher {
             let existing = pending
                 .as_mut()
                 .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
-            *last_acknowledged = Some(Self::drive_pending(
-                &self.actor,
-                transport.as_mut(),
-                existing,
+            let receipt = Self::drive_pending(&self.actor, transport.as_mut(), existing)?;
+            *last_acknowledged = Some(AcknowledgedGuardianCheckpointPublication::from_pending(
+                existing, receipt,
             )?);
             *pending = None;
         }
@@ -1960,23 +2022,41 @@ impl GuardianCheckpointPublisher {
         // catalog identity under a different effect and correctly be rejected.
         // Rebind the fresh affine parser capture only to a receipt whose Ack
         // this exact publisher has already completed for its unchanged lease.
-        if let Some(receipt) = state.last_acknowledged {
+        if let Some(acknowledged) = state.last_acknowledged {
             let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(
                 &capture,
                 self.identity.generation(),
             )
             .map_err(GuardianProxyError::ReplayProtocol)?;
-            if receipt.intent()
+            if acknowledged.receipt.intent()
                 == GuardianCheckpointIntent::new(
                     descriptor.checkpoint_id(),
                     descriptor.boundary_id(),
                 )
             {
-                let actor = self.actor.lock();
+                let mut actor = self.actor.lock();
                 actor.ensure_identity(self.identity)?;
+                if actor.pending.is_some() {
+                    if let Some(RecoveredPendingMutation::InputApplied {
+                        applied_bytes,
+                        input_bytes,
+                    }) = actor.reconcile_before_new_operation(None)?
+                    {
+                        if applied_bytes != input_bytes {
+                            return Err(GuardianProxyError::PreviousInputPartiallyApplied {
+                                applied_bytes,
+                                input_bytes,
+                            });
+                        }
+                    }
+                }
                 actor.ensure_attached()?;
+                // A local Attached flag alone cannot detect an externally
+                // fenced lease or damaged durable Ack. Revalidate through the
+                // authenticated Stage query without creating another upload.
+                acknowledged.confirm_ack(state.transport.as_mut())?;
                 return capture
-                    .bind_published(receipt, self.identity)
+                    .bind_published(acknowledged.receipt, self.identity)
                     .map_err(|_| GuardianProxyError::CheckpointStageInvariant);
             }
         }
@@ -1992,14 +2072,17 @@ impl GuardianCheckpointPublisher {
             .as_mut()
             .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
         let receipt = Self::drive_pending(&self.actor, transport.as_mut(), current)?;
+        let acknowledged =
+            AcknowledgedGuardianCheckpointPublication::from_pending(current, receipt)?;
         let completed = pending
             .take()
             .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
-        *last_acknowledged = Some(receipt);
-        completed
+        let published = completed
             .capture
             .bind_published(receipt, self.identity)
-            .map_err(|_| GuardianProxyError::CheckpointStageInvariant)
+            .map_err(|_| GuardianProxyError::CheckpointStageInvariant)?;
+        *last_acknowledged = Some(acknowledged);
+        Ok(published)
     }
 }
 
@@ -6630,6 +6713,7 @@ mod tests {
         let quiet = capture_real_guardian_checkpoint(mux, pane.pane_id(), executor);
         let quiet_sequence = quiet.capture().output_sequence();
         let quiet_bytes = quiet.capture().journal_cumulative_plaintext_bytes();
+        let quiet_receipt = quiet.receipt();
         drop(quiet);
         let post_registration = directory.join("post-registration");
         std::fs::write(&post_registration, b"step").unwrap();
@@ -6655,7 +6739,7 @@ mod tests {
         let published = capture_real_guardian_checkpoint(mux, pane_id, executor);
         assert!(published.capture().output_sequence() > quiet_sequence);
         assert!(published.capture().journal_cumulative_plaintext_bytes() > quiet_bytes);
-        assert_ne!(published.receipt(), quiet.receipt());
+        assert_ne!(published.receipt(), quiet_receipt);
         let repeated = capture_real_guardian_checkpoint(mux, pane_id, executor);
         assert_eq!(
             repeated.receipt(),
