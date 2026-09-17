@@ -172,6 +172,27 @@ impl SelectionCopy {
         Ok(())
     }
 
+    fn follow_unchanged_native_selection(
+        &mut self,
+        desired: &Selection,
+        sequence: termwiz::surface::SequenceNo,
+        points: Option<[Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3]>,
+    ) -> Result<(), &'static str> {
+        if sequence == termwiz::surface::SequenceNo::MAX
+            || sequence < self.source_sequence
+            || desired.native_anchor().is_none()
+            || desired.range.map(|range| range.normalize()) != Some(self.selection)
+            || desired.rectangular != self.rectangular
+            || points != Some(desired.native_points())
+        {
+            return Err("The selected text changed while copying. Select it again.");
+        }
+        // The terminal checked every selected row against the original anchor,
+        // including rows copied in earlier chunks. Unrelated output is safe.
+        self.source_sequence = sequence;
+        self.verify_source(sequence)
+    }
+
     fn finish(
         &mut self,
         sequence: termwiz::surface::SequenceNo,
@@ -667,6 +688,9 @@ impl super::TermWindow {
             pending.text_copy = Some(copy);
         }
         let copy = pending.text_copy.as_mut().unwrap();
+        if !Self::refresh_local_copy_source(pane, &pending.desired, copy, authority, sequence)? {
+            return Ok(None);
+        }
         copy.verify_source(sequence)?;
         if copy.next_row < copy.end_row {
             let end = copy
@@ -711,13 +735,50 @@ impl super::TermWindow {
         }
         match SelectionAuthority::capture_source(&**pane) {
             None => Ok(None),
-            Some((current, current_sequence, _))
-                if current == authority && current_sequence == sequence =>
-            {
+            Some((current, current_sequence, _)) if current == authority => {
+                if !Self::refresh_local_copy_source(
+                    pane,
+                    &pending.desired,
+                    copy,
+                    current,
+                    current_sequence,
+                )? {
+                    return Ok(None);
+                }
                 copy.finish(current_sequence)
             }
             Some(_) => Err("The pane changed while copying. Copy the selection again."),
         }
+    }
+
+    fn refresh_local_copy_source(
+        pane: &Arc<dyn Pane>,
+        desired: &Selection,
+        copy: &mut SelectionCopy,
+        authority: SelectionAuthority,
+        sequence: termwiz::surface::SequenceNo,
+    ) -> Result<bool, &'static str> {
+        if copy.source_sequence == sequence {
+            return Ok(true);
+        }
+        let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
+            return copy.verify_source(sequence).map(|()| true);
+        };
+        let Some(anchor) = desired.native_anchor() else {
+            return copy.verify_source(sequence).map(|()| true);
+        };
+        let Some((floor, observed, dimensions, points)) = local.selection_anchor_snapshot(anchor)
+        else {
+            return Ok(false);
+        };
+        if SelectionAuthority::from_native_snapshot(&**pane, floor, dimensions) != Some(authority) {
+            return Err("The pane layout changed while copying. Select the text again.");
+        }
+        if observed != sequence {
+            return Ok(false);
+        }
+        copy.follow_unchanged_native_selection(desired, observed, points)?;
+        Ok(true)
     }
 
     /// Bind release to the exact pending endpoint; never copy an older anchor.
@@ -1459,6 +1520,73 @@ mod tests {
         drop(ready);
         drop(read);
         drop(available_permit());
+    }
+
+    #[test]
+    fn local_selection_copy_tolerates_unrelated_output_but_rejects_selected_row_edits() {
+        #[derive(Debug)]
+        struct ReadConfig;
+        impl wezterm_term::TerminalConfiguration for ReadConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 3,
+                cols: 40,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 48,
+            },
+            Arc::new(ReadConfig),
+            "selection-output-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"selected first\r\nselected second\r\noutside");
+        let sequence = terminal.current_seqno();
+        let mut desired = Selection::default();
+        desired.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(14, 1),
+        });
+        let token = terminal
+            .screen_mut()
+            .capture_selection_anchor(sequence, desired.native_points())
+            .unwrap();
+        desired.remember_native_anchor(token.clone());
+        let mut copy = SelectionCopy::new(&desired, sequence).unwrap();
+        copy.push_chunk(vec![Line::from("selected first")]).unwrap();
+        assert!(copy.finish(sequence).unwrap().is_none());
+        terminal.advance_bytes(b"\x1b[3;1HUNRELATED OUTPUT");
+        let changed = terminal.current_seqno();
+        assert!(changed > sequence);
+        let points = terminal.screen().resolve_selection_anchor(&token, changed);
+        copy.follow_unchanged_native_selection(&desired, changed, points)
+            .unwrap();
+        copy.push_chunk(vec![Line::from("selected second")])
+            .unwrap();
+        assert_eq!(
+            copy.finish(changed).unwrap(),
+            Some("selected first\nselected second".to_owned())
+        );
+
+        // Even an already copied row must remain covered by the original token.
+        let mut stale = SelectionCopy::new(&desired, sequence).unwrap();
+        stale
+            .push_chunk(vec![Line::from("selected first")])
+            .unwrap();
+        terminal.advance_bytes(b"\x1b[1;1HCHANGED");
+        let changed = terminal.current_seqno();
+        let points = terminal.screen().resolve_selection_anchor(&token, changed);
+        assert!(points.is_none());
+        assert!(
+            stale
+                .follow_unchanged_native_selection(&desired, changed, points)
+                .is_err()
+        );
+        assert!(stale.finish(changed).is_err());
     }
 
     #[test]
