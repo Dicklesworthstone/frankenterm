@@ -3141,26 +3141,6 @@ fn check_pane_tree_depth(tree: &Tree, depth: usize, max_depth: usize) -> anyhow:
     }
 }
 
-pub(crate) fn build_from_pane_tree<F>(
-    tree: bintree::Tree<PaneEntry, SplitDirectionAndSize>,
-    active: &mut Option<Arc<dyn Pane>>,
-    zoomed: &mut Option<Arc<dyn Pane>>,
-    make_pane: &mut F,
-) -> anyhow::Result<Tree>
-where
-    F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
-{
-    let mut underlying_active = None;
-    build_from_pane_tree_with_underlying(
-        tree,
-        active,
-        zoomed,
-        None,
-        &mut underlying_active,
-        make_pane,
-    )
-}
-
 pub(crate) fn build_from_pane_tree_with_underlying<F>(
     tree: bintree::Tree<PaneEntry, SplitDirectionAndSize>,
     active: &mut Option<Arc<dyn Pane>>,

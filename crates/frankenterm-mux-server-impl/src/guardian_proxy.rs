@@ -5756,6 +5756,10 @@ mod tests {
             }
             if mode == RealBirthFixtureMode::SuccessorImageRecovery {
                 let durable_pane_id = pane.guardian_spawn_custody().unwrap().original.pane_id;
+                // The successor fixture must release every predecessor-owned
+                // connection, including the domain's shared census transport.
+                drop(domain);
+                drop(registered);
                 let (successor_mux, successor_pane) = assert_real_birth_successor_image_roundtrip(
                     &mux, pane, &executor, &directory, &socket, &token, size,
                 );
@@ -5864,8 +5868,6 @@ mod tests {
                 drop(successor_pane);
                 drop(successor_mux);
                 drop(census);
-                drop(domain);
-                drop(registered);
                 drop(foreign_mux);
                 drop(mux);
                 while executor.try_tick().unwrap() {}
@@ -7204,6 +7206,9 @@ mod tests {
         // 2. Remove tab via local-only (non-signaling) lifecycle and release predecessor Arc references
         let predecessor_domain_id = pane.domain_id();
         assert!(mux.remove_tab_local_only_if_same(&tab));
+        let predecessor_domain = mux.get_domain(predecessor_domain_id).unwrap();
+        assert!(mux.domain_was_detached_if_guard(&predecessor_domain));
+        drop(predecessor_domain);
         drop(tab);
         drop(pane);
 
@@ -7215,18 +7220,25 @@ mod tests {
         assert!(!signaled.exists());
         assert!(is_child_alive(original_pid));
 
-        // 4. Wait census LiveUnclaimed before successor claim
+        let successor_mux = Arc::new(Mux::new(None));
+        let (successor_session, _) = successor_mux
+            .topology_snapshot_authority()
+            .expect("derive successor session incarnation from topology authority");
+        let successor_mux_incarnation = Uuid::from_bytes(successor_session.as_bytes());
+
+        // Observe through the successor identity. Reconnecting as the old mux
+        // would re-enroll its transport ownership and forbid successor rotation.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut predecessor_client: Option<GuardianClient> = None;
+        let mut successor_observer: Option<GuardianClient> = None;
         let post_retire_entry = loop {
             assert!(
                 Instant::now() < deadline,
                 "predecessor lease was not retired to LiveUnclaimed in census"
             );
             while executor.try_tick().unwrap() {}
-            if predecessor_client.is_none() {
-                match GuardianClient::connect(socket, token, provenance.current_mux_incarnation) {
-                    Ok(client) => predecessor_client = Some(client),
+            if successor_observer.is_none() {
+                match GuardianClient::connect(socket, token, successor_mux_incarnation) {
+                    Ok(client) => successor_observer = Some(client),
                     Err(GuardianClientError::Io(_)) => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
@@ -7234,7 +7246,7 @@ mod tests {
                     Err(error) => panic!("census connect failed: {error}"),
                 }
             }
-            match predecessor_client.as_mut().unwrap().census_snapshot() {
+            match successor_observer.as_mut().unwrap().census_snapshot() {
                 Ok(entries) => {
                     if let Some(entry) = entries
                         .iter()
@@ -7248,7 +7260,7 @@ mod tests {
                     }
                 }
                 Err(GuardianClientError::Io(_)) => {
-                    predecessor_client = None;
+                    successor_observer = None;
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => panic!("census snapshot failed: {error}"),
@@ -7258,11 +7270,6 @@ mod tests {
         assert_eq!(post_retire_entry.generation, 1);
 
         // 5. Successor coordinator connection and claim generation 2 on retired lease under successor Mux
-        let successor_mux = Arc::new(Mux::new(None));
-        let (successor_session, _) = successor_mux
-            .topology_snapshot_authority()
-            .expect("derive successor session incarnation from topology authority");
-        let successor_mux_incarnation = Uuid::from_bytes(successor_session.as_bytes());
         let successor_domain = Arc::new(
             GuardianDomain::new(&successor_mux, socket.to_path_buf(), token.to_path_buf()).unwrap(),
         );
@@ -7288,27 +7295,43 @@ mod tests {
             .unwrap(),
         );
 
-        let successor_plan = GuardianProxyLeasePlan::prepare_from_recovery(
-            socket,
-            token,
-            PtySize {
-                rows: size.rows as u16,
-                cols: size.cols as u16,
-                pixel_width: size.pixel_width as u16,
-                pixel_height: size.pixel_height as u16,
-            },
-            Arc::clone(&successor_coordinator),
-            &restored_pane.spawn_custody,
-        )
-        .unwrap();
-        let staging = successor_plan
-            .claim(
+        // Pane retirement can precede the guardian readiness loop observing
+        // the last predecessor transport EOF. A definite rejection admits no
+        // effect; wait for full owner retirement using the same request IDs.
+        // Never retry an ambiguous failure or manufacture a successful lease.
+        let claim_request_id = Uuid::new_v4();
+        let claim_effect_id = Uuid::new_v4();
+        let claim_deadline = Instant::now() + Duration::from_secs(5);
+        let staging = loop {
+            while executor.try_tick().unwrap() {}
+            let successor_plan = GuardianProxyLeasePlan::prepare_from_recovery(
+                socket,
+                token,
+                PtySize {
+                    rows: size.rows as u16,
+                    cols: size.cols as u16,
+                    pixel_width: size.pixel_width as u16,
+                    pixel_height: size.pixel_height as u16,
+                },
+                Arc::clone(&successor_coordinator),
+                &restored_pane.spawn_custody,
+            )
+            .unwrap();
+            match successor_plan.claim(
                 provenance.original.pane_id,
                 1,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-            )
-            .expect("successor claim on retired lease must succeed");
+                claim_request_id,
+                claim_effect_id,
+            ) {
+                Ok(staging) => break staging,
+                Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                    GuardianRejectionCode::InvalidRequest,
+                ))) if Instant::now() < claim_deadline => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("successor claim after owner retirement failed: {error}"),
+            }
+        };
 
         let successor_term_config: Arc<dyn TerminalConfiguration> =
             Arc::new(config::TermConfig::new());
