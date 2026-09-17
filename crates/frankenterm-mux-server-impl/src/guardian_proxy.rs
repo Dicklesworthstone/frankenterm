@@ -6334,7 +6334,9 @@ mod tests {
         );
         let tab = Arc::new(mux::tab::Tab::new(&size));
         tab.assign_pane(pane);
-        mux.add_tab_no_panes(&tab).unwrap();
+        // The domain has already registered this live pane. Bind its populated
+        // tab through the structural-owner path without starting another reader.
+        assert!(mux.add_tab_and_active_pane(&tab).unwrap().is_none());
         let window = mux.new_empty_window(None, None);
         mux.add_tab_to_window(&tab, *window).unwrap();
         drop(window);

@@ -1240,6 +1240,24 @@ power loss nor migration of those live sessions has been demonstrated.
   Build the companion with the same sealed identity/profile before retrying.
 - [x] Fix the remaining guardian alias visibility Clippy error in `d6bdb5ac7`;
   the repeated workspace Clippy result is still pending.
+- [x] Implement smart word/line matching and fallback from one logical
+  snapshot; refine the initial `8151ca310` implementation in `3d7bf5e7` to
+  four private helpers, checked row bounds and saturated endpoints.
+- [x] Pass the broader `selection::tests` GUI module at `568bf385f`:
+  44 passed, zero failed, 710 filtered. Retain
+  `568bf38-gui-selection-fresh-ts1.log`, including actual changed GUI/mux
+  compilation and all seven new snapshot/boundary tests. RCH mapped the
+  requested fresh target to its existing pool; do not call this a cold build.
+- [x] Replace repeated backward context array shifts with reverse-once
+  accumulation in `568bf385f`, preserving bounded context and physical order.
+- [ ] Execute the dedicated logical-context tests. First hz4 attempt failed
+  source preflight on unselected Cargo-home config before Cargo; retry uses
+  an isolated Cargo home and retains the selected-source check.
+- [x] Build the same-source sealed guardian companion for the recovery test
+  on worker114: compilation succeeded, Linux artifact SHA-256
+  `a8e65a4fef6d9693602d71b56dbee7788834fd89da95761b48eba7f5cc05f489`.
+  RCH rejected the downloaded ELF as a Mac executable (E327); use the verified
+  retained Linux artifact only on its Linux worker. Parent rerun is pending.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier
   419-test surface receipt and terminal oracle corrections.
