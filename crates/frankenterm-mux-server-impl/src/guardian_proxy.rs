@@ -6245,6 +6245,55 @@ mod tests {
         }
     }
 
+    fn capture_real_guardian_checkpoint(
+        mux: &Arc<Mux>,
+        pane_id: mux::pane::PaneId,
+        executor: &promise::spawn::SimpleExecutor,
+    ) -> mux::guardian_checkpoint::PublishedGuardianCheckpoint {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let capture_mux = Arc::clone(mux);
+        let capture_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let operation = capture_mux.capture_pane_operation(pane_id).unwrap();
+                let result = operation.capture_current_guardian_checkpoint(
+                    TerminalCheckpointLimits::default(),
+                    Duration::from_secs(5),
+                );
+                if matches!(
+                    result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<mux::LiveParserCheckpointError>()),
+                    Some(
+                        mux::LiveParserCheckpointError::CheckpointBusy
+                            | mux::LiveParserCheckpointError::GuardianDeliveryBusy
+                    )
+                ) && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                tx.send(result).unwrap();
+                break;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let published = loop {
+            while executor.try_tick().unwrap() {}
+            if let Ok(result) = rx.try_recv() {
+                break result.unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real guardian capture did not settle"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        capture_thread.join().unwrap();
+        published
+    }
+
     fn assert_real_birth_image_roundtrip(
         mux: &Arc<Mux>,
         pane: &Arc<dyn mux::pane::Pane>,
@@ -6291,6 +6340,10 @@ mod tests {
         mux.add_tab_to_window(&tab, *window).unwrap();
         drop(window);
 
+        let quiet = capture_real_guardian_checkpoint(mux, pane.pane_id(), executor);
+        let quiet_sequence = quiet.capture().output_sequence();
+        let quiet_bytes = quiet.capture().journal_cumulative_plaintext_bytes();
+        drop(quiet);
         let post_registration = directory.join("post-registration");
         std::fs::write(&post_registration, b"step").unwrap();
         let post_registration_deadline = Instant::now() + Duration::from_secs(5);
@@ -6310,48 +6363,10 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
 
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let capture_mux = Arc::clone(mux);
         let pane_id = pane.pane_id();
-        let capture_thread = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let operation = capture_mux.capture_pane_operation(pane_id).unwrap();
-                let result = operation.capture_current_guardian_checkpoint(
-                    TerminalCheckpointLimits::default(),
-                    Duration::from_secs(5),
-                );
-                if matches!(
-                    result
-                        .as_ref()
-                        .err()
-                        .and_then(|error| error.downcast_ref::<mux::LiveParserCheckpointError>()),
-                    Some(
-                        mux::LiveParserCheckpointError::CheckpointBusy
-                            | mux::LiveParserCheckpointError::GuardianDeliveryBusy
-                    )
-                ) && Instant::now() < deadline
-                {
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-                tx.send(result).unwrap();
-                break;
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let published = loop {
-            while executor.try_tick().unwrap() {}
-            if let Ok(result) = rx.try_recv() {
-                break result.unwrap();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "real guardian capture did not settle"
-            );
-            thread::sleep(Duration::from_millis(2));
-        };
-        capture_thread.join().unwrap();
+        let published = capture_real_guardian_checkpoint(mux, pane_id, executor);
+        assert!(published.capture().output_sequence() > quiet_sequence);
+        assert!(published.capture().journal_cumulative_plaintext_bytes() > quiet_bytes);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
         assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
