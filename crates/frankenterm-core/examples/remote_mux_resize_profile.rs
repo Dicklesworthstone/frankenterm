@@ -30,6 +30,7 @@ mod measured {
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
