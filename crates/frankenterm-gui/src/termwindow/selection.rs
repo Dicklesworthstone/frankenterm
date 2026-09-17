@@ -205,10 +205,7 @@ impl SelectionCopy {
         Ok(Some(std::mem::take(&mut self.text)))
     }
 
-    pub(crate) fn new(
-        selection: &Selection,
-        source_sequence: termwiz::surface::SequenceNo,
-    ) -> Option<Self> {
+    fn new(selection: &Selection, source_sequence: termwiz::surface::SequenceNo) -> Option<Self> {
         let selection_range = selection.range?.normalize();
         let end_row = selection_range.end.y.checked_add(1)?;
         Some(Self {
@@ -227,53 +224,6 @@ impl SelectionCopy {
             local_read: None,
             remote_read_witness: None,
         })
-    }
-
-    /// Advance one bounded remote chunk while retaining authority for earlier
-    /// chunks even when they have been evicted from the render cache.
-    pub(crate) fn advance_remote(
-        &mut self,
-        client: &frankenterm_client::pane::ClientPane,
-        layout: termwiz::surface::SequenceNo,
-        selected_sequence: termwiz::surface::SequenceNo,
-    ) -> Result<Option<String>, &'static str> {
-        use frankenterm_client::pane::SelectionReadError;
-        self.verify_source(self.source_sequence)?;
-        for after_chunk in [false, true] {
-            let observed = client.selection_copy_snapshot(
-                layout,
-                selected_sequence,
-                self.selection.start.y..self.end_row,
-                &mut self.remote_read_witness,
-            );
-            let sequence = match observed {
-                Ok((sequence, _)) if sequence >= self.source_sequence => sequence,
-                Err(SelectionReadError::Busy) => return Ok(None),
-                _ => return Err("The selected text changed or is unavailable."),
-            };
-            self.source_sequence = sequence;
-            self.verify_source(sequence)?;
-            if after_chunk {
-                return self.finish(sequence);
-            }
-            if self.next_row < self.end_row {
-                let end = self.next_row.saturating_add(64).min(self.end_row);
-                match client.selection_lines(
-                    layout,
-                    sequence,
-                    selected_sequence,
-                    self.next_row..end,
-                ) {
-                    Ok(rows) => self.push_chunk(rows)?,
-                    Err(SelectionReadError::Busy) => return Ok(None),
-                    Err(SelectionReadError::TooLarge) => {
-                        return Err("The selected text exceeds the copy limit.");
-                    }
-                    Err(_) => return Err("The selected text changed or is unavailable."),
-                }
-            }
-        }
-        unreachable!("the second observation completes or retains the copy")
     }
 
     fn append_span(
@@ -828,6 +778,7 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         pending: &mut crate::selection::PendingNativeSelection,
     ) -> Result<Option<String>, &'static str> {
+        use frankenterm_client::pane::SelectionReadError;
         let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
         else {
             return Ok(None);
@@ -842,17 +793,6 @@ impl super::TermWindow {
             pending.text_copy = Some(copy);
         }
         let copy = pending.text_copy.as_mut().unwrap();
-        if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
-            let previous_row = copy.next_row;
-            let result =
-                copy.advance_remote(client, authority.layout_floor(), pending.desired.seqno);
-            if matches!(result, Ok(None)) && copy.next_row != previous_row {
-                if let Some(window) = self.window.as_ref() {
-                    window.invalidate();
-                }
-            }
-            return result;
-        }
         let Some((sequence, dimensions)) = Self::refresh_local_copy_source(
             pane,
             &pending.desired,
@@ -871,12 +811,33 @@ impl super::TermWindow {
                 .checked_add(64)
                 .unwrap_or(copy.end_row)
                 .min(copy.end_row);
-            let Some(rows) =
-                self.advance_local_selection_read(pane, copy, sequence, dimensions, end)?
-            else {
-                return Ok(None);
+            let rows = if let Some(client) =
+                pane.downcast_ref::<frankenterm_client::pane::ClientPane>()
+            {
+                client.selection_lines(
+                    authority.layout_floor(),
+                    sequence,
+                    pending.desired.seqno,
+                    copy.next_row..end,
+                )
+            } else {
+                match self.advance_local_selection_read(pane, copy, sequence, dimensions, end)? {
+                    Some(rows) => Ok(rows),
+                    None => return Ok(None),
+                }
             };
-            copy.push_chunk(rows)?;
+            match rows {
+                Ok(rows) => copy.push_chunk(rows)?,
+                Err(SelectionReadError::Busy) => return Ok(None),
+                Err(SelectionReadError::TooLarge) => {
+                    return Err("The selection exceeds the 64 MiB copy limit. Select less text.");
+                }
+                Err(SelectionReadError::SourceChanged | SelectionReadError::InvalidRange) => {
+                    return Err(
+                        "The selected text changed or is unavailable. Select it again to copy it.",
+                    );
+                }
+            }
         }
         if copy.next_row < copy.end_row {
             // Actual bounded progress, not an idle retry: one chunk per frame.

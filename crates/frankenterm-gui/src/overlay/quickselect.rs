@@ -794,7 +794,6 @@ mod alphabet_test {
             dimensions: None,
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             read: Some(read),
-            remote_copy: None,
             retry_abort: Some(abort),
             deadline_abort: Some(deadline_abort),
         };
@@ -1058,7 +1057,6 @@ mod alphabet_test {
             dimensions: None,
             deadline: past,
             read: Some(read),
-            remote_copy: None,
             retry_abort: Some(retry_abort),
             deadline_abort: Some(deadline_abort),
         };
@@ -2184,7 +2182,6 @@ struct PendingAcceptedAction {
     dimensions: Option<mux::renderable::RenderableDimensions>,
     deadline: std::time::Instant,
     read: Option<QuickSelectLineRead>,
-    remote_copy: Option<crate::termwindow::SelectionCopy>,
     retry_abort: Option<AbortHandle>,
     deadline_abort: Option<AbortHandle>,
 }
@@ -2364,89 +2361,6 @@ fn advance_quick_select_accepted_action(
         renderer.action_pending = false;
         drop(renderer);
         restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
-        return;
-    }
-
-    if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
-        let result = (|| {
-            if action.remote_copy.is_none() {
-                let Some(snapshot) = crate::selection::SelectionAuthority::capture_source(&*pane)
-                else {
-                    return Ok(None);
-                };
-                let PreReadSourceDecision::Accept { authority, .. } = evaluate_pre_read_source(
-                    snapshot,
-                    action.selection_authority.as_ref(),
-                    action.validated_source_end,
-                    action.accepted_cols,
-                    &action.source_range,
-                ) else {
-                    return Err("The remote selection source changed.");
-                };
-                action.selection_authority = Some(authority);
-                let mut desired = crate::selection::Selection::default();
-                desired.range = Some(action.accepted_selection);
-                desired.seqno = action.validated_source_end;
-                desired.authority = Some(authority);
-                action.remote_copy = Some(
-                    crate::termwindow::SelectionCopy::new(&desired, action.validated_source_end)
-                        .ok_or("The remote selection range is unavailable.")?,
-                );
-            }
-            action.remote_copy.as_mut().unwrap().advance_remote(
-                client,
-                action.selection_authority.unwrap().layout_floor(),
-                action.validated_source_end,
-            )
-        })();
-        match result {
-            Ok(Some(text)) => {
-                let paste = action.paste;
-                let key_action = action.action.clone();
-                let skip_action_on_paste = action.skip_action_on_paste;
-                renderer.pending_action.take();
-                renderer.action_pending = false;
-                drop(renderer);
-                complete_quick_select_action(
-                    term_window,
-                    &pane,
-                    instance_token,
-                    text,
-                    paste,
-                    key_action,
-                    skip_action_on_paste,
-                );
-            }
-            Ok(None) => {
-                match spawn_action_retry(
-                    term_window,
-                    pane_id,
-                    instance_token,
-                    accepted_run_id,
-                    action.deadline,
-                ) {
-                    Ok(abort) => action.retry_abort = Some(abort),
-                    Err(err) => {
-                        log::warn!("quick-select remote retry failed: {err}");
-                        renderer.pending_action.take();
-                        renderer.action_pending = false;
-                        drop(renderer);
-                        restart_quick_select_after_stale_action(
-                            term_window,
-                            pane_id,
-                            instance_token,
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                log::warn!("quick-select remote read failed: {err}");
-                renderer.pending_action.take();
-                renderer.action_pending = false;
-                drop(renderer);
-                restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
-            }
-        }
         return;
     }
 
@@ -2786,33 +2700,13 @@ fn advance_quick_select_accepted_action(
     renderer.action_pending = false;
     drop(renderer);
 
-    complete_quick_select_action(
-        term_window,
-        &pane,
-        instance_token,
-        text,
-        paste,
-        key_action,
-        skip_action_on_paste,
-    );
-}
-
-fn complete_quick_select_action(
-    term_window: &mut TermWindow,
-    pane: &Arc<dyn Pane>,
-    instance_token: &Arc<()>,
-    text: String,
-    paste: bool,
-    key_action: Option<Box<KeyAssignment>>,
-    skip_action_on_paste: bool,
-) {
     if !text.is_empty() {
         if paste {
             let _ = pane.send_paste(&text);
         }
         if let Some(action) = key_action {
             if !paste || !skip_action_on_paste {
-                let _ = term_window.perform_key_assignment(pane, &action);
+                let _ = term_window.perform_key_assignment(&pane, &action);
             }
         } else {
             term_window
@@ -2820,7 +2714,7 @@ fn complete_quick_select_action(
         }
     }
 
-    close_quick_select_overlay_if_current(term_window, pane.pane_id(), instance_token);
+    close_quick_select_overlay_if_current(term_window, pane_id, instance_token);
 }
 
 #[derive(Debug)]
@@ -4202,7 +4096,6 @@ impl QuickSelectRenderable {
                     dimensions,
                     deadline,
                     read: None,
-                    remote_copy: None,
                     retry_abort: None,
                     deadline_abort,
                 };
