@@ -6493,30 +6493,60 @@ mod tests {
         // A new test process has no in-memory publication witness, capture,
         // or opened store. It must recover authority from existing bytes.
         let child_log_path = directory.join("fresh-image-verifier.stdout");
-        let child_log = std::fs::OpenOptions::new().write(true).create_new(true).open(&child_log_path).unwrap();
+        let child_log = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&child_log_path)
+            .unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "guardian_proxy::tests::guardian_image_fresh_process_existing_custody", "--nocapture"])
+            .args([
+                "--exact",
+                "guardian_proxy::tests::guardian_image_fresh_process_existing_custody",
+                "--nocapture",
+            ])
             .env("FT_TEST_IMAGE_REOPEN_ROOT", directory.join("whole-image"))
             .env("FT_TEST_IMAGE_REOPEN_TOKEN", token)
-            .env("FT_TEST_IMAGE_REOPEN_SCOPE", serde_json::to_string(&provenance.original).unwrap())
-            .env("FT_TEST_IMAGE_REOPEN_CHECKPOINT", hex::encode(published.receipt().intent().checkpoint_identity().into_bytes()))
+            .env(
+                "FT_TEST_IMAGE_REOPEN_SCOPE",
+                serde_json::to_string(&provenance.original).unwrap(),
+            )
+            .env(
+                "FT_TEST_IMAGE_REOPEN_CHECKPOINT",
+                hex::encode(
+                    published
+                        .receipt()
+                        .intent()
+                        .checkpoint_identity()
+                        .into_bytes(),
+                ),
+            )
             .stdout(child_log)
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
         let child_deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "fresh process could not authenticate durable image");
+                assert!(
+                    status.success(),
+                    "fresh process could not authenticate durable image"
+                );
                 break;
             }
             if Instant::now() >= child_deadline {
-                child.kill().expect("settle only owned image verifier child");
+                child
+                    .kill()
+                    .expect("settle only owned image verifier child");
                 child.wait().unwrap();
                 panic!("fresh process image verifier deadline expired");
             }
             thread::sleep(Duration::from_millis(5));
         }
         let child_log = std::fs::read_to_string(child_log_path).unwrap();
-        assert!(child_log.contains("running 1 test") && child_log.contains("1 passed; 0 failed"), "fresh verifier did not execute exactly one test: {}", child_log);
+        assert!(
+            child_log.contains("running 1 test") && child_log.contains("1 passed; 0 failed"),
+            "fresh verifier did not execute exactly one test: {}",
+            child_log
+        );
         let validated = store
             .select_verified_roots(&verifier)
             .unwrap()
@@ -6580,28 +6610,57 @@ mod tests {
 
     #[test]
     fn guardian_image_fresh_process_existing_custody() {
-        let Some(root) = std::env::var_os("FT_TEST_IMAGE_REOPEN_ROOT") else { return; };
-        use frankenterm_core::session_restore::{WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig};
+        let Some(root) = std::env::var_os("FT_TEST_IMAGE_REOPEN_ROOT") else {
+            return;
+        };
+        use frankenterm_core::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+        };
         use frankenterm_core::snapshot_publication::SnapshotPublicationStore;
         use frankenterm_core::snapshot_representation::RecoveryKey;
         let token = PathBuf::from(std::env::var_os("FT_TEST_IMAGE_REOPEN_TOKEN").unwrap());
-        let scope: GuardianSpawnCustodyScopeV1 = serde_json::from_str(&std::env::var("FT_TEST_IMAGE_REOPEN_SCOPE").unwrap()).unwrap();
-        let checkpoint: [u8; 32] = hex::decode(std::env::var("FT_TEST_IMAGE_REOPEN_CHECKPOINT").unwrap()).unwrap().try_into().unwrap();
+        let scope: GuardianSpawnCustodyScopeV1 =
+            serde_json::from_str(&std::env::var("FT_TEST_IMAGE_REOPEN_SCOPE").unwrap()).unwrap();
+        let checkpoint: [u8; 32] =
+            hex::decode(std::env::var("FT_TEST_IMAGE_REOPEN_CHECKPOINT").unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
         let mut wrong_scope = scope;
         wrong_scope.effect_id = Uuid::new_v4();
         assert!(GuardianDurableSpawnCustodyV1::open_existing(&token, wrong_scope).is_err());
-        assert!(GuardianDurableSpawnCustodyV1::open_existing(&token, scope).unwrap().reopen_checkpoint([0x19; 32]).is_err());
-        let witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope).unwrap().reopen_checkpoint(checkpoint).unwrap();
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)
+                .unwrap()
+                .reopen_checkpoint([0x19; 32])
+                .is_err()
+        );
+        let witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)
+            .unwrap()
+            .reopen_checkpoint(checkpoint)
+            .unwrap();
         assert_eq!(witness.scope(), scope);
-        let store = SnapshotPublicationStore::open(PathBuf::from(root), Default::default()).unwrap();
+        let store =
+            SnapshotPublicationStore::open(PathBuf::from(root), Default::default()).unwrap();
         let mut verifier = WholeMuxRecoveryVerifier::new_production(
             Arc::new(RecoveryKey::from_bytes([0x51; 32]).unwrap()),
             WholeMuxTrustedIdentityConfig::new([0x72; 32]),
         );
-        assert!(store.select_verified_roots(&verifier).unwrap().current.is_none());
-        verifier.register_reopened_guardian_capture(witness).unwrap();
+        assert!(
+            store
+                .select_verified_roots(&verifier)
+                .unwrap()
+                .current
+                .is_none()
+        );
+        verifier
+            .register_reopened_guardian_capture(witness)
+            .unwrap();
         let selected = store.select_verified_roots(&verifier).unwrap();
-        assert!(selected.current.is_some(), "durable custody/catalog/ACK did not verify saved image");
+        assert!(
+            selected.current.is_some(),
+            "durable custody/catalog/ACK did not verify saved image"
+        );
     }
 
     struct RecordCheckpointFixture {

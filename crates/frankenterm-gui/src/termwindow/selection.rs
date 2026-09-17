@@ -1462,6 +1462,137 @@ mod tests {
     }
 
     #[test]
+    fn local_selection_copy_reads_large_cold_wrapped_span_from_encrypted_store() {
+        use wezterm_term::config::{ScrollbackSpillSink, ScrollbackTierConfig};
+
+        #[derive(Debug)]
+        struct ColdConfig(Arc<dyn ScrollbackSpillSink>);
+        impl wezterm_term::TerminalConfiguration for ColdConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                4096
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                }
+            }
+            fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let sink = frankenterm_mux_server_impl::open_scrollback_spill_sink(
+            root.path().to_path_buf(),
+            &config::ScrollbackSpillSinkContext {
+                pane_id: 998_302,
+                domain_id: 998_302,
+                durable_pane_id: *uuid::Uuid::new_v4().as_bytes(),
+                command_description: "cold clipboard regression".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 3,
+                cols: 48,
+                dpi: 96,
+                pixel_width: 384,
+                pixel_height: 48,
+            },
+            Arc::new(ColdConfig(Arc::clone(&sink))),
+            "cold-selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // One long logical line: 1,025 complete physical rows followed by END.
+        // Both wide and combining cells cross worker chunk boundaries.
+        let row = "界e\u{301}".repeat(16);
+        for index in 0..1025 {
+            terminal.advance_bytes(row.as_bytes());
+            if index % 64 == 63 {
+                sink.flush_scrollback().unwrap();
+            }
+        }
+        terminal.advance_bytes(b"END");
+        sink.flush_scrollback().unwrap();
+        assert!(sink.retained_scrollback_rows() > 1000);
+        assert!(terminal.screen().in_memory_scrollback_rows() < 8);
+        let expected = format!("{}END", row.repeat(1025));
+        let sequence = terminal.current_seqno();
+        let terminal = parking_lot::Mutex::new(terminal);
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(2, 1025),
+        });
+        let mut copy = SelectionCopy::new(&selection, sequence).unwrap();
+        copy.local = true;
+        let mut chunks = 0;
+        while copy.next_row < copy.end_row {
+            let requested = copy.next_row..(copy.next_row + 64).min(copy.end_row);
+            let read = loop {
+                if let Some(read) = LocalSelectionRead::start(
+                    || {
+                        Some(
+                            terminal
+                                .try_lock()
+                                .unwrap()
+                                .screen()
+                                .capture_line_read_with_budget(
+                                    requested.clone(),
+                                    &mut Default::default(),
+                                ),
+                        )
+                    },
+                    copy.deadline(),
+                    || {},
+                )
+                .unwrap()
+                {
+                    break read;
+                }
+                assert!(
+                    std::time::Instant::now() < copy.deadline(),
+                    "reader admission timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let ready = read
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let plans = ready.plans.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(plans.len(), 1);
+            assert!(terminal.lock().screen().validates_line_read(&plans[0]));
+            let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+            let mut work = 65_536;
+            let (first, rows) = plans[0]
+                .try_clone_viewport_for_snapshot(requested.clone(), &mut bytes, &mut work)
+                .unwrap();
+            assert_eq!(first, requested.start);
+            assert_eq!(rows.len(), (requested.end - requested.start) as usize);
+            copy.push_chunk(rows).unwrap();
+            chunks += 1;
+            if copy.next_row < copy.end_row {
+                assert!(
+                    copy.finish(sequence).unwrap().is_none(),
+                    "partial clipboard text escaped"
+                );
+            }
+            drop(ready);
+            drop(read);
+        }
+        assert_eq!(chunks, 17);
+        assert_eq!(copy.finish(sequence).unwrap(), Some(expected));
+    }
+
+    #[test]
     fn local_selection_copy_completes_a_valid_empty_span() {
         let mut selection = Selection::default();
         selection.range = Some(SelectionRange::start(SelectionCoordinate::x_y(0, 0)));

@@ -8703,18 +8703,23 @@ pub fn default_live_scrollback_dir() -> PathBuf {
     PathBuf::from(".").join(".ft").join("scrollback-lines")
 }
 
+/// Open the production encrypted spill store and bounded parser queue at an
+/// explicit root, without changing the process-wide terminal configuration.
+pub fn open_scrollback_spill_sink(
+    base_dir: PathBuf,
+    context: &config::ScrollbackSpillSinkContext,
+) -> anyhow::Result<Arc<dyn wezterm_term::config::ScrollbackSpillSink>> {
+    let backing = Arc::new(LiveScrollbackSpillSink::new(base_dir, context)?);
+    let sink = deferred_scrollback::DeferredScrollbackSpillSink::new(backing)
+        .context("initialize deferred scrollback metadata")?;
+    Ok(Arc::new(sink))
+}
+
 pub fn install_scrollback_spill_sink_factory() {
     let base_dir = Arc::new(default_live_scrollback_dir());
     config::set_scrollback_spill_sink_factory(Some(Arc::new(move |context| {
-        match LiveScrollbackSpillSink::new((*base_dir).clone(), &context) {
-            Ok(sink) => match deferred_scrollback::DeferredScrollbackSpillSink::new(Arc::new(sink))
-            {
-                Ok(sink) => Some(Arc::new(sink)),
-                Err(error) => {
-                    log::warn!("failed to initialize deferred scrollback metadata: {error}");
-                    None
-                }
-            },
+        match open_scrollback_spill_sink((*base_dir).clone(), &context) {
+            Ok(sink) => Some(sink),
             Err(error) => {
                 log::warn!(
                     "failed to initialize live scrollback spill sink for pane {} domain {}: {}",

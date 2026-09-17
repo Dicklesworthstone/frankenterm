@@ -1126,9 +1126,17 @@ power loss nor migration of those live sessions has been demonstrated.
   250 filtered. Both original children survive the tested ownership handoff.
   Retain the executable independently of the mutable build pool; SHA-256
   `78eddf76ece656a1117161b79e05a6958cb894f2503991b080607d8841510129`.
-- [ ] Build and retain a second sealed source executable, then prove actual
-  A-to-B transfer, delayed output/ACK, exact outer reply loss, and all three
-  lease-journal fault cuts. Same-build success does not close these controls.
+- [x] Retain sealed second-source executable `8e00c3e75`, SHA-256
+  `ad80a6c6be7bcdaa14ecd7aae2569d1e147f033784aa6ed9b84eaaa4d7edc2b2`.
+  Strict RCH job `j-30023605353971986` proves distinct-binary handoff, exact
+  outer reply loss and all three lease-journal cuts: three passed, one failed.
+- [x] Diagnose that remaining delayed-output failure: census mistakes the
+  worker-owned output journal for missing custody. `b3752b0e8` tracks exact
+  pane/sequence transfer, validates returned ownership and keeps the lease
+  census available without exposing uncommitted output. Negative controls
+  reject missing, partial, wrong-pane and wrong-sequence custody.
+- [ ] Execute updated sealed upgrade/fault suite on worker126, retained log
+  `b3752b0-upgrade-and-faults-rch.log`; do not close on compilation alone.
 - [x] Commit actual input delivery gates in `2332b889b`: keyboard protocols,
   composed input, SendKey/SendString, terminal mouse reports, paste and drops.
   Retain local selection/copy and overlay interaction. Delayed paste retains
@@ -1148,9 +1156,17 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Execute fresh-process custody/catalog/ACK reopening through the real
   birth-image parent test. Then connect verified discovery and atomic topology
   publication to ordinary startup before listeners/default shells appear.
-- [ ] Finish clipboard deadline proof: both new retirement tests passed, but
-  the first complete suite was 30 passed/one failed due to two accessibility
-  tests draining one shared recorder. Fix isolation and rerun in parallel.
+- [x] Finish clipboard deadline proof and recorder isolation: strict RCH
+  job `30023644042232225`, 31 passed/zero failed, normal parallel execution.
+  Retain `ruby-selection-deadline-fixed-rch.log`; final test delta `c69137d5c`.
+  Close the narrow valid-empty bead `ft-t5mse`; keep `ft-ffrry` open for large
+  cold-span acquisition and native acceptance.
+- [x] Fix all three errors from completed `8e00c3e75` workspace check:
+  reconnect domain receiver, guard lifetime, and obsolete fake publication
+  test field. Updated locked workspace run is pinned to `c69137d5c`.
+- [x] Fix three GUI `WindowOrderMirror` private-import errors in `b3752b0e8`.
+- [ ] Execute updated GUI layout tests; retain `b3752b0-gui-layout-rch.log`.
+- [ ] Execute exact remote-pane mapping regression in client layout tests.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier
   419-test surface receipt and terminal oracle corrections.
