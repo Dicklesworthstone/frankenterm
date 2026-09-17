@@ -23814,11 +23814,11 @@ mod test {
         let tree = Tree::Node {
             left: Box::new(Tree::Leaf(Arc::clone(&pane10))),
             right: Box::new(Tree::Leaf(Arc::clone(&pane20))),
-            data: SplitDirectionAndSize {
+            data: Some(SplitDirectionAndSize {
                 direction: SplitDirection::Horizontal,
                 first: size,
                 second: size,
-            },
+            }),
         };
 
         let prepared = PreparedPaneTree {
