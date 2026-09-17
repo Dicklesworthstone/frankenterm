@@ -5287,10 +5287,13 @@ mod tests {
         .unwrap();
         old.ignore_next_kill();
         mux.remove_pane(40);
+        // The replacement helper initializes a committed render stream. Publish
+        // readiness first, but leave the retired pane's resize unflushed until
+        // the replacement owns its local pane id.
+        peer.complete_current_bootstrap(&inner.client).unwrap();
         let replacement = test_client_pane(&inner, 40, 30);
         let registered: Arc<dyn Pane> = replacement.clone();
         mux.add_pane(&registered).unwrap();
-        peer.complete_current_bootstrap(&inner.client).unwrap();
         old.flush_resize_after_ready().unwrap();
         ClientDomain::flush_bootstrap_resizes(&mux, &inner);
         assert!(
