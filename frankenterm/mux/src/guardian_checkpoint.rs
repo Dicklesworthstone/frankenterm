@@ -4660,10 +4660,16 @@ impl GuardianRestoredTerminal {
         writer: Box<dyn std::io::Write + Send>,
     ) -> anyhow::Result<(frankenterm_term::Terminal, GuardianRestoredParserPrefix)> {
         use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
-        let checkpoint = self.terminal.checkpoint()?;
-        let payload = Zeroizing::new(checkpoint.to_canonical_json(self.limits)?);
+        let terminal = self.terminal.into_live(writer).map_err(|failure| {
+            let (error, _) = failure.into_parts();
+            anyhow::anyhow!("restored guardian model activation failed: {error}")
+        })?;
+        // Successful activation advances the serialized terminal sequence
+        // number and installs the validated live configuration. Bind the
+        // resulting model, not the pre-activation inert checkpoint.
+        let checkpoint = terminal.capture_recovery_checkpoint(self.limits)?;
         let (terminal_payload_bytes, terminal_payload_digest) =
-            terminal_payload_identity(&payload)?;
+            terminal_payload_identity(checkpoint.canonical_payload())?;
         let boundary = match self.output {
             GuardianCheckpointOutputBoundaryV1::Genesis { .. } => None,
             GuardianCheckpointOutputBoundaryV1::Record {
@@ -4683,16 +4689,12 @@ impl GuardianRestoredTerminal {
                 journal_cumulative_plaintext_bytes: cumulative_plaintext_bytes,
                 parser_stream_bytes: 0,
                 replay_identity_digest: current_replay_identity_digest(),
-                rows: u32::try_from(checkpoint.primary_rows())?,
-                cols: u32::try_from(checkpoint.primary_cols())?,
+                rows: u32::try_from(checkpoint.rows())?,
+                cols: u32::try_from(checkpoint.cols())?,
                 terminal_payload_bytes,
                 terminal_payload_digest,
             }),
         };
-        let terminal = self.terminal.into_live(writer).map_err(|failure| {
-            let (error, _) = failure.into_parts();
-            anyhow::anyhow!("restored guardian model activation failed: {error}")
-        })?;
         Ok((
             terminal,
             GuardianRestoredParserPrefix {
