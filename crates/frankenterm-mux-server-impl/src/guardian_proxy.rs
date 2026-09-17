@@ -7117,7 +7117,7 @@ mod tests {
 
         // 1. Detach predecessor registration and verify stale predecessor cannot act
         assert!(registration.detach_local_if_current());
-        assert!(!registration.is_current(mux));
+        assert!(mux.capture_pane_registration(&pane).is_none());
         assert!(registration.try_with_current(|_| ()).is_none());
         assert!(registration.try_with_current_output(|_| ()).is_none());
         assert!(registration.operation_guard(mux).is_none());
