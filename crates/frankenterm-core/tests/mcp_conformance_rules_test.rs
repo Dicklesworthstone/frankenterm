@@ -57,9 +57,12 @@ fn spawn_client() -> FrameworkTestClient {
             let server = build_server_degraded(&cx, &config)
                 .await
                 .expect("build degraded MCP server");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join MCP transport worker")
+            .expect("run MCP transport");
         });
     });
     let mut client = FrameworkTestClient::new(client_transport);

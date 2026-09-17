@@ -23,7 +23,7 @@ use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{EventMuteRecord, StorageHandle};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -505,15 +505,15 @@ fn dedup_default_constants() {
 #[test]
 fn cooldown_zero_period_always_sends() {
     let mut cd = NotificationCooldown::with_config(Duration::ZERO, 100);
-    match cd.check("k") {
+    let now = Instant::now();
+    match cd.check_at("k", now) {
         CooldownVerdict::Send {
             suppressed_since_last,
         } => assert_eq!(suppressed_since_last, 0),
         CooldownVerdict::Suppress { .. } => panic!("first check should send"),
     }
-    std::thread::sleep(Duration::from_millis(1));
-    // With zero cooldown, the next check after any time should also send
-    match cd.check("k") {
+    // Zero cooldown expires even at the identical instant.
+    match cd.check_at("k", now) {
         CooldownVerdict::Send { .. } => {}
         CooldownVerdict::Suppress { .. } => panic!("zero cooldown should never suppress"),
     }
@@ -562,17 +562,26 @@ fn cooldown_suppressed_count_accumulates() {
 #[test]
 fn cooldown_expired_includes_suppressed_count() {
     let mut cd = NotificationCooldown::with_config(Duration::from_millis(10), 100);
+    let now = Instant::now();
 
-    assert!(matches!(cd.check("k"), CooldownVerdict::Send { .. }));
-    // Suppress 3 times
-    cd.check("k");
-    cd.check("k");
-    cd.check("k");
+    assert_eq!(
+        cd.check_at("k", now),
+        CooldownVerdict::Send {
+            suppressed_since_last: 0
+        }
+    );
+    // Every event before the exact boundary must be suppressed, regardless of
+    // how long the scheduler pauses this test between calls.
+    for (offset, total_suppressed) in [(0, 1), (5_000_000, 2), (9_999_999, 3)] {
+        assert_eq!(
+            cd.check_at("k", now + Duration::from_nanos(offset)),
+            CooldownVerdict::Suppress { total_suppressed }
+        );
+    }
 
-    std::thread::sleep(Duration::from_millis(15));
-
-    // After cooldown expires, send should include suppressed count
-    match cd.check("k") {
+    // At the exact boundary, send includes the full suppressed count.
+    let expired = now + Duration::from_millis(10);
+    match cd.check_at("k", expired) {
         CooldownVerdict::Send {
             suppressed_since_last,
         } => {
@@ -583,6 +592,13 @@ fn cooldown_expired_includes_suppressed_count() {
         }
         CooldownVerdict::Suppress { .. } => panic!("should send after cooldown expires"),
     }
+    assert_eq!(cd.get("k").unwrap().suppressed_since_notify, 0);
+    assert_eq!(
+        cd.check_at("k", expired),
+        CooldownVerdict::Suppress {
+            total_suppressed: 1
+        }
+    );
 }
 
 #[test]

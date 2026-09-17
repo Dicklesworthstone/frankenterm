@@ -491,16 +491,18 @@ fn proxy_routes_calls_to_remote_tools() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("proxy transport runtime");
-        let (server, cx) = runtime.block_on(async {
+        runtime.block_on(async {
             let cx = Cx::current().expect("runtime-owned proxy context");
             let server = frankenterm_core::mcp::build_server_with_db(&cx, &config, Some(db_path))
                 .await
                 .expect("build proxy-enabled server");
-            (server, cx)
-        });
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join proxy transport worker")
             .expect("run proxy transport");
+        });
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -542,17 +544,19 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("proxy transport runtime");
-        let (server, cx) = runtime.block_on(async {
+        runtime.block_on(async {
             let cx = Cx::current().expect("runtime-owned proxy context");
             let server =
                 frankenterm_core::mcp::build_server_with_db(&cx, &config, Some(server_db_path))
                     .await
                     .expect("build proxy-enabled server");
-            (server, cx)
-        });
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join proxy transport worker")
             .expect("run proxy transport");
+        });
     });
 
     let mut client = FrameworkTestClient::new(client_transport);

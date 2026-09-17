@@ -93,6 +93,33 @@ fn tool_definition(annotation: Option<Value>) -> McpClientToolDefinition {
     }
 }
 
+#[test]
+fn duplicate_server_diagnostics_redact_embedded_secret_markers() {
+    // Regression for seed 3fe6be09db45430d0cfc829ed64bf502bc74dd7f5d5f76b96dd68ea5a5d5a627:
+    // "ask-" contains the protected "sk-" marker even though it is a valid name.
+    for name in [
+        "ask-", "mytoken", "asecret", "api_key", "apikey", "password", "bearer",
+    ] {
+        let duplicates = vec![name.to_string(), format!(" {} ", name.to_ascii_uppercase())];
+        let preferred = McpClientConfig {
+            preferred_servers: duplicates.clone(),
+            ..McpClientConfig::default()
+        };
+        let proxy = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_servers: duplicates,
+            ..McpClientConfig::default()
+        };
+        for (config, field) in [(preferred, "preferred_servers"), (proxy, "proxy_servers")] {
+            assert_eq!(
+                config.validate().expect_err("duplicate should fail"),
+                format!("mcp_client.{field} contains duplicate server name: [REDACTED]")
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -115,21 +142,24 @@ proptest! {
 
     #[test]
     fn proptest_mcp_client_boundary_duplicate_servers_are_rejected_case_insensitively(name in non_empty_name()) {
-        let mut upper = name.to_ascii_uppercase();
-        if upper == name {
-            upper = name.to_ascii_lowercase();
-        }
+        let upper = name.to_ascii_uppercase();
         let config = McpClientConfig {
-            preferred_servers: vec![name.clone(), upper],
+            preferred_servers: vec![name.clone(), upper.clone()],
             ..McpClientConfig::default()
         };
 
         let error = config.validate().expect_err("case-insensitive duplicate should fail");
 
-        prop_assert!(error.contains("duplicate server name"));
-        prop_assert!(error
-            .to_ascii_lowercase()
-            .contains(&name.trim().to_ascii_lowercase()));
+        // Rejection must preserve the duplicate diagnostic without echoing a
+        // secret-shaped name. Keep these inputs in the generator's coverage.
+        let secret_shaped = ["sk-", "token", "secret", "api_key", "apikey", "password", "bearer"]
+            .iter()
+            .any(|marker| name.contains(marker));
+        let diagnostic_name = if secret_shaped { "[REDACTED]" } else { upper.as_str() };
+        prop_assert_eq!(
+            error,
+            format!("mcp_client.preferred_servers contains duplicate server name: {diagnostic_name}")
+        );
     }
 
     #[test]

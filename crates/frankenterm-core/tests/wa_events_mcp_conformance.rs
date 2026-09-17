@@ -191,9 +191,12 @@ fn spawn_client(db_path: Option<PathBuf>) -> BoundedTestClient {
             let server = build_server_with_db(&cx, &Config::default(), db_path)
                 .await
                 .expect("build MCP server");
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("run MCP transport");
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(&cx, server_transport)
+            })
+            .await
+            .expect("join MCP transport worker")
+            .expect("run MCP transport");
         });
     });
 
@@ -1386,10 +1389,14 @@ fn assert_await_event_claim_send_failure_releases_lease(
             let server = build_server_with_db(&cx, &Config::default(), Some(server_db_path))
                 .await
                 .expect("build MCP server");
-            server.run_transport_returning_with_cx(
-                &cx,
-                FailResponseTransport::new(server_transport, server_failure_armed),
-            )
+            frankenterm_core::runtime_async::spawn_blocking(move || {
+                server.run_transport_returning_with_cx(
+                    &cx,
+                    FailResponseTransport::new(server_transport, server_failure_armed),
+                )
+            })
+            .await
+            .expect("join MCP transport worker")
         })
     });
     let mut client =
