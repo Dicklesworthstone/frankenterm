@@ -73,6 +73,16 @@ mod measured {
         }
     }
 
+    fn probe_text(text: MuxTextReadResult) -> Result<String> {
+        // A requested tail deliberately excludes the older history and reports
+        // truncated=true. That is valid for nonce/ready-marker observation;
+        // the separate full-corpus oracle must still require complete_text.
+        match text {
+            MuxTextReadResult::Text(text) | MuxTextReadResult::Bounded { text, .. } => Ok(text),
+            MuxTextReadResult::OutputTooLarge { .. } => bail!("probe tail exceeds byte cap"),
+        }
+    }
+
     impl Workload {
         fn parse() -> Result<Self> {
             let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -221,6 +231,10 @@ mod measured {
                     .get_pane_render_changes_with_cx(cx, self.pane)
                     .await?;
                 polls += 1;
+                ensure!(
+                    started.elapsed() < SETTLE,
+                    "terminal geometry response arrived after convergence deadline"
+                );
                 ensure!(render.seqno >= previous_seqno, "render sequence regressed");
                 previous_seqno = render.seqno;
                 if render.dimensions.cols == cols && render.dimensions.viewport_rows == 24 {
@@ -240,12 +254,16 @@ mod measured {
                     started.elapsed() < SETTLE,
                     "PTY echo convergence deadline expired"
                 );
-                let text = complete_text(
+                let text = probe_text(
                     client
                         .get_text_tail_with_cx(cx, self.pane, 65536, Some(20))
                         .await?,
                 )?;
                 polls += 1;
+                ensure!(
+                    started.elapsed() < SETTLE,
+                    "PTY echo response arrived after convergence deadline"
+                );
                 let joined = physical_join(&text);
                 if joined
                     .split_once(&expected_probe)
@@ -300,7 +318,7 @@ mod measured {
                     ingestion.elapsed() < Duration::from_secs(120),
                     "initial corpus parse deadline expired"
                 );
-                let tail = complete_text(
+                let tail = probe_text(
                     client
                         .get_text_tail_with_cx(&cx, self.pane, 65536, Some(20))
                         .await?,
