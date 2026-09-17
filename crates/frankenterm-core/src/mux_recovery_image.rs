@@ -1728,9 +1728,45 @@ impl MuxRecoveryImage {
 // =============================================================================
 
 #[cfg(feature = "frankenterm-deps")]
+#[derive(Clone, Copy, Debug)]
 pub enum RecoveryParserCheckpoint<'a> {
     Model(&'a mux::ModelParserCheckpointAck),
     Guardian(&'a mux::guardian_checkpoint::PublishedGuardianCheckpoint),
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl<'a> RecoveryParserCheckpoint<'a> {
+    #[must_use]
+    pub fn terminal_checkpoint(&self) -> &'a frankenterm_term::RecoveryTerminalCheckpointV2 {
+        match self {
+            Self::Model(ack) => &ack.terminal_checkpoint,
+            Self::Guardian(published) => published.capture().terminal_checkpoint(),
+        }
+    }
+
+    #[must_use]
+    pub fn registration_wire_identity(&self) -> [u8; 16] {
+        match self {
+            Self::Model(ack) => ack.registration_wire_identity,
+            Self::Guardian(published) => published.capture().registration_wire_identity(),
+        }
+    }
+
+    #[must_use]
+    pub fn durable_pane_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Model(ack) => ack.durable_pane_id,
+            Self::Guardian(published) => published.capture().durable_pane_id(),
+        }
+    }
+
+    #[must_use]
+    pub fn parser_stream_bytes(&self) -> u64 {
+        match self {
+            Self::Model(ack) => ack.parser_stream_bytes,
+            Self::Guardian(published) => published.capture().parser_stream_bytes(),
+        }
+    }
 }
 
 #[cfg(feature = "frankenterm-deps")]

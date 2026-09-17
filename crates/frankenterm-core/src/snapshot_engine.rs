@@ -61,16 +61,48 @@ pub struct WholeMuxPublicationIdentity {
     pub predecessor: Option<crate::snapshot_publication::PredecessorBinding>,
     /// Semantic image digest, distinct from the predecessor ciphertext hash.
     pub predecessor_image_digest: Option<[u8; 32]>,
+    /// Caller-enrolled existing guardian custody token for predecessor verification.
+    pub existing_guardian_custody: Option<std::path::PathBuf>,
 }
 
 /// One parser-ground checkpoint and its caller-assigned immutable storage name.
 /// Use a fresh object name for a new encryption attempt; retrying an already
 /// prepared publication requires retaining its exact ciphertext bytes.
 #[cfg(feature = "frankenterm-deps")]
+#[derive(Clone, Copy, Debug)]
 pub struct WholeMuxPanePublication<'a> {
     pub pane_id: usize,
     pub object_id: &'a str,
-    pub ack: &'a mux::ModelParserCheckpointAck,
+    pub checkpoint: crate::mux_recovery_image::RecoveryParserCheckpoint<'a>,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl<'a> WholeMuxPanePublication<'a> {
+    #[must_use]
+    pub fn model(
+        pane_id: usize,
+        object_id: &'a str,
+        ack: &'a mux::ModelParserCheckpointAck,
+    ) -> Self {
+        Self {
+            pane_id,
+            object_id,
+            checkpoint: crate::mux_recovery_image::RecoveryParserCheckpoint::Model(ack),
+        }
+    }
+
+    #[must_use]
+    pub fn guardian(
+        pane_id: usize,
+        object_id: &'a str,
+        published: &'a mux::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> Self {
+        Self {
+            pane_id,
+            object_id,
+            checkpoint: crate::mux_recovery_image::RecoveryParserCheckpoint::Guardian(published),
+        }
+    }
 }
 
 /// Typed failures before or during encrypted whole-mux publication.
@@ -87,6 +119,8 @@ pub enum WholeMuxPublicationError {
     ),
     #[error(transparent)]
     Image(#[from] crate::mux_recovery_image::MuxRecoveryImageError),
+    #[error(transparent)]
+    Recovery(#[from] crate::session_restore::WholeMuxRecoveryError),
     #[error(transparent)]
     Representation(#[from] crate::snapshot_representation::RepresentationError),
     #[error(transparent)]
@@ -321,11 +355,7 @@ fn capture_and_publish_whole_mux_model_at_boundary(
         .iter()
         .zip(&acks)
         .zip(&names)
-        .map(|((pane, ack), name)| WholeMuxPanePublication {
-            pane_id: pane.pane_id,
-            object_id: name,
-            ack,
-        })
+        .map(|((pane, ack), name)| WholeMuxPanePublication::model(pane.pane_id, name, ack))
         .collect();
     attempt
         .handoff_state
@@ -349,7 +379,9 @@ fn capture_and_publish_whole_mux_model_at_boundary(
     }
 }
 
-/// Publish a complete encrypted model-only recovery generation.
+/// Publish a complete encrypted whole-mux recovery generation.
+///
+/// Supports both model-only captures and authenticated guardian captures.
 ///
 /// This synchronous, bounded operation belongs on the caller's blocking worker.
 /// Cancellation is checked between codec and filesystem operations. Failure can
@@ -357,7 +389,8 @@ fn capture_and_publish_whole_mux_model_at_boundary(
 /// root. Once publication commits, its receipt wins over subsequent cancellation.
 /// Each complete encrypted envelope has a durable authenticated repair closure;
 /// success also requires the root's authenticated discovery slot to be durable.
-/// Guardian leases and writer authority are deliberately not manufactured here.
+/// Guardian leases and writer authority are verified against caller inputs,
+/// never manufactured or bypassed here.
 #[cfg(feature = "frankenterm-deps")]
 #[allow(clippy::too_many_lines)] // Keep preflight, object writes, and root commit visibly ordered.
 pub fn publish_whole_mux_recovery(
@@ -398,19 +431,34 @@ pub fn publish_whole_mux_recovery(
                 .is_none_or(|p| p.expected_generation < expected.generation),
         "whole-mux publication predecessor mismatch",
     )?;
-    let trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
+    let candidate_trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
         .with_session_id(expected.session_id.clone())
         .with_mux_incarnation_id(expected.mux_incarnation_id.clone());
-    let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), trusted);
+    let mut current_verifier =
+        WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), candidate_trusted);
+    let predecessor_trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
+        .with_session_id(expected.session_id.clone());
+    let predecessor_verifier =
+        WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), predecessor_trusted);
+    #[cfg(unix)]
+    let predecessor_verifier = match expected.existing_guardian_custody.as_ref() {
+        Some(token_path) => predecessor_verifier.with_existing_guardian_custody(token_path.clone()),
+        None => predecessor_verifier,
+    };
+    #[cfg(not(unix))]
+    validate_whole_mux_publication(
+        expected.existing_guardian_custody.is_none(),
+        "existing guardian custody is unavailable on this platform",
+    )?;
     let repair_key = key.derive_repair_authentication_key()?;
     let repair_namespace = format!("whole-mux-{}", hex::encode(expected.root_object_id));
     validate_whole_mux_publication(
         checkpoints.len() == captured.pane_bindings.len()
-            && checkpoints.len() <= verifier.limits().max_panes,
+            && checkpoints.len() <= current_verifier.limits().max_panes,
         "whole-mux checkpoint set mismatch or limit exceeded",
     )?;
     let mut by_pane = HashMap::new();
-    let mut acks = HashMap::new();
+    let mut parser_checkpoints = HashMap::new();
     let mut object_ids = HashSet::new();
     let mut total_bytes = 0usize;
     for input in checkpoints {
@@ -426,7 +474,8 @@ pub fn publish_whole_mux_recovery(
             !store.has_object(input.object_id)?,
             "new whole-mux encryption attempt requires an unused object name",
         )?;
-        let payload = input.ack.terminal_checkpoint.canonical_payload();
+        let terminal_checkpoint = input.checkpoint.terminal_checkpoint();
+        let payload = terminal_checkpoint.canonical_payload();
         total_bytes =
             total_bytes
                 .checked_add(payload.len())
@@ -434,21 +483,33 @@ pub fn publish_whole_mux_recovery(
                     "whole-mux checkpoint size overflow",
                 ))?;
         validate_whole_mux_publication(
-            payload.len() <= verifier.limits().max_per_pane_checkpoint_bytes
-                && total_bytes <= verifier.limits().max_total_checkpoint_bytes,
+            payload.len() <= current_verifier.limits().max_per_pane_checkpoint_bytes
+                && total_bytes <= current_verifier.limits().max_total_checkpoint_bytes,
             "whole-mux checkpoint byte limit exceeded",
         )?;
         let checkpoint = TerminalCheckpointV2::decode_canonical_json(
             payload,
             TerminalCheckpointLimits::default(),
         )?;
-        validate_whole_mux_publication(
-            input.ack.semantic_generation == checkpoint.checkpoint().semantic_generation()
-                && usize::try_from(input.ack.semantic_generation)
-                    .is_ok_and(|generation| generation != usize::MAX),
-            "whole-mux checkpoint semantic generation mismatch or exhaustion",
-        )?;
-        acks.insert(input.pane_id, input.ack);
+        match input.checkpoint {
+            crate::mux_recovery_image::RecoveryParserCheckpoint::Model(ack) => {
+                validate_whole_mux_publication(
+                    ack.semantic_generation == checkpoint.checkpoint().semantic_generation()
+                        && usize::try_from(ack.semantic_generation)
+                            .is_ok_and(|generation| generation != usize::MAX),
+                    "whole-mux checkpoint semantic generation mismatch or exhaustion",
+                )?;
+            }
+            crate::mux_recovery_image::RecoveryParserCheckpoint::Guardian(published) => {
+                current_verifier.register_published_guardian_capture(published)?;
+                validate_whole_mux_publication(
+                    usize::try_from(checkpoint.checkpoint().semantic_generation())
+                        .is_ok_and(|generation| generation != usize::MAX),
+                    "whole-mux checkpoint semantic generation mismatch or exhaustion",
+                )?;
+            }
+        }
+        parser_checkpoints.insert(input.pane_id, input.checkpoint);
     }
     // Complete identity preflight before the first immutable-object write.
     for pane in &captured.pane_bindings {
@@ -457,16 +518,47 @@ pub fn publish_whole_mux_recovery(
             .ok_or(WholeMuxPublicationError::Validation(
                 "missing whole-mux checkpoint",
             ))?;
+        let durable_pane_id = input.checkpoint.durable_pane_id();
+        let registration_wire_identity = input.checkpoint.registration_wire_identity();
+        let terminal_checkpoint = input.checkpoint.terminal_checkpoint();
+        let parser_stream_bytes = input.checkpoint.parser_stream_bytes();
         validate_whole_mux_publication(
-            pane.pane_uuid == input.ack.durable_pane_id.to_string()
-                && pane.registration_wire_identity == input.ack.registration_wire_identity
-                && input.ack.registration_wire_identity != [0; 16]
-                && pane.size.rows == input.ack.terminal_checkpoint.rows()
-                && pane.size.cols == input.ack.terminal_checkpoint.cols()
-                && input.ack.parser_stream_bytes
-                    == input.ack.terminal_checkpoint.parser_stream_bytes(),
+            pane.pane_uuid == durable_pane_id.to_string()
+                && pane.registration_wire_identity == registration_wire_identity
+                && registration_wire_identity != [0; 16]
+                && pane.size.rows == terminal_checkpoint.rows()
+                && pane.size.cols == terminal_checkpoint.cols()
+                && parser_stream_bytes == terminal_checkpoint.parser_stream_bytes(),
             "whole-mux checkpoint capture binding mismatch",
         )?;
+        match input.checkpoint {
+            crate::mux_recovery_image::RecoveryParserCheckpoint::Model(_) => {
+                validate_whole_mux_publication(
+                    pane.spawn_custody.is_none(),
+                    "guardian provenance requires a published guardian checkpoint",
+                )?;
+            }
+            crate::mux_recovery_image::RecoveryParserCheckpoint::Guardian(published) => {
+                let provenance =
+                    pane.spawn_custody
+                        .as_ref()
+                        .ok_or(WholeMuxPublicationError::Validation(
+                            "guardian capture lacks original Spawn provenance",
+                        ))?;
+                let receipt = published.receipt();
+                validate_whole_mux_publication(
+                    provenance.original.pane_id == receipt.pane_id()
+                        && provenance.original.guardian_incarnation
+                            == published.owner().guardian_incarnation()
+                        && provenance.current_mux_incarnation
+                            == published.owner().mux_incarnation()
+                        && provenance.current_lease_generation == receipt.generation()
+                        && provenance.current_mux_incarnation.as_bytes()
+                            == captured.session_incarnation.as_bytes(),
+                    "published capture differs from captured guardian lease",
+                )?;
+            }
+        }
     }
     let mut prepared_objects = Vec::new();
     let mut refs = HashMap::new();
@@ -474,7 +566,7 @@ pub fn publish_whole_mux_recovery(
     for input in checkpoints {
         snapshot_cx_checkpoint(cx)?;
         let envelope = encode_recovery_object(
-            input.ack.terminal_checkpoint.canonical_payload(),
+            input.checkpoint.terminal_checkpoint().canonical_payload(),
             ObjectMetadata::single(
                 semantic_object_id_from_str(input.object_id),
                 RecoveryObjectKind::TerminalCheckpoint,
@@ -492,7 +584,7 @@ pub fn publish_whole_mux_recovery(
         )?;
         validate_whole_mux_publication(
             envelope.len() as u64 <= store.limits().max_object_bytes
-                && encrypted_bytes <= verifier.limits().max_total_checkpoint_bytes,
+                && encrypted_bytes <= current_verifier.limits().max_total_checkpoint_bytes,
             "whole-mux encrypted byte limit exceeded",
         )?;
         refs.insert(
@@ -511,7 +603,7 @@ pub fn publish_whole_mux_recovery(
         });
     }
     snapshot_cx_checkpoint(cx)?;
-    let image = MuxRecoveryImage::from_mux_captured(
+    let image = MuxRecoveryImage::from_mux_captured_checkpoints(
         RecoveryImageGenerationMeta {
             generation: expected.generation,
             predecessor_digest: expected.predecessor_image_digest,
@@ -520,7 +612,7 @@ pub fn publish_whole_mux_recovery(
             session_id: expected.session_id.clone(),
         },
         captured,
-        &acks,
+        &parser_checkpoints,
         &refs,
     )?;
     let plaintext = zeroize::Zeroizing::new(image.to_canonical_json()?);
@@ -560,22 +652,32 @@ pub fn publish_whole_mux_recovery(
         Context(#[from] SnapshotError),
         #[error("whole-mux graph verification failed")]
         Graph(#[from] crate::session_restore::WholeMuxRecoveryError),
-        #[error("predecessor semantic image digest mismatch")]
+        #[error("predecessor identity or semantic image digest mismatch")]
         Predecessor,
+        #[error("unexpected candidate generation {0}")]
+        UnexpectedRole(u64),
     }
     let verify = |candidate: &crate::snapshot_publication::RootSlotCandidate,
                   store: &crate::snapshot_publication::SnapshotPublicationStore|
      -> Result<_, VerifyPublicationError> {
         snapshot_cx_checkpoint(cx)?;
-        let checked_root = verifier.verify_root_with_cx(cx, candidate, store)?;
-        if expected
-            .predecessor
-            .as_ref()
-            .is_some_and(|p| p.expected_generation == candidate.generation)
-            && Some(checked_root.image().image_digest) != expected.predecessor_image_digest
-        {
-            return Err(VerifyPublicationError::Predecessor);
-        }
+        let checked_root = if candidate.generation == expected.generation {
+            current_verifier.verify_root_with_cx(cx, candidate, store)?
+        } else if let Some(predecessor) = expected.predecessor.as_ref() {
+            if candidate.generation == predecessor.expected_generation {
+                let checked = predecessor_verifier.verify_root_with_cx(cx, candidate, store)?;
+                if candidate.manifest_sha256 != predecessor.expected_hash
+                    || Some(checked.image().image_digest) != expected.predecessor_image_digest
+                {
+                    return Err(VerifyPublicationError::Predecessor);
+                }
+                checked
+            } else {
+                return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
+            }
+        } else {
+            return Err(VerifyPublicationError::UnexpectedRole(candidate.generation));
+        };
         snapshot_cx_checkpoint(cx)?;
         Ok(checked_root)
     };
@@ -12798,6 +12900,7 @@ mod tests {
             ft_version: "test".into(),
             predecessor: None,
             predecessor_image_digest: None,
+            existing_guardian_custody: None,
         };
         let authority = shared_snapshot_authority_state(store.root_path().to_str().unwrap());
         authority.in_progress.store(true, Ordering::Release);
@@ -12937,6 +13040,7 @@ mod tests {
             ft_version: "test".into(),
             predecessor: None,
             predecessor_image_digest: None,
+            existing_guardian_custody: None,
         };
         let cx = crate::cx::Cx::for_testing();
         let mutation_after_ack = std::cell::Cell::new(false);
@@ -13288,16 +13392,19 @@ mod tests {
             ft_version: "test".into(),
             predecessor: None,
             predecessor_image_digest: None,
+            existing_guardian_custody: None,
         };
         let temp = checkpoint_artifact_test_directory();
         let store = SnapshotPublicationStore::open(temp.path(), Default::default()).unwrap();
         let key = Arc::new(RecoveryKey::from_bytes([7; 32]).unwrap());
         let cx = crate::cx::Cx::for_testing();
         let inputs = |swapped: bool| {
-            [0, 1].map(|index| WholeMuxPanePublication {
-                pane_id: index,
-                object_id: if index == 0 { "pane-a" } else { "pane-b" },
-                ack: &acks[if swapped { 1 - index } else { index }],
+            [0, 1].map(|index| {
+                WholeMuxPanePublication::model(
+                    index,
+                    if index == 0 { "pane-a" } else { "pane-b" },
+                    &acks[if swapped { 1 - index } else { index }],
+                )
             })
         };
         let error = publish_whole_mux_recovery(
@@ -13336,7 +13443,7 @@ mod tests {
         let mut wrong_generation = make_ack(1, b"pane-A");
         wrong_generation.semantic_generation += 1;
         let mut wrong_generation_inputs = inputs(false);
-        wrong_generation_inputs[0].ack = &wrong_generation;
+        wrong_generation_inputs[0] = WholeMuxPanePublication::model(0, "pane-a", &wrong_generation);
         let error = publish_whole_mux_recovery(
             &cx,
             &store,
@@ -13347,6 +13454,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("semantic generation mismatch"));
+        assert!(store.list_object_ids().unwrap().is_empty());
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+
+        // Guardian authority preflight rejection: Model checkpoint cannot claim custody.
+        let mut custody_captured = captured.clone();
+        custody_captured.pane_bindings[0].spawn_custody =
+            Some(mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+                original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+                    broker_lineage: uuid::Uuid::from_u128(1),
+                    guardian_incarnation: uuid::Uuid::from_u128(2),
+                    mux_incarnation: uuid::Uuid::from_bytes([3; 16]),
+                    broker_build: [0; 32],
+                    guardian_build: [0; 32],
+                    mux_build: [0; 32],
+                    pane_id: uuid::Uuid::from_u128(1),
+                    effect_id: uuid::Uuid::from_u128(4),
+                },
+                current_mux_incarnation: uuid::Uuid::from_bytes([3; 16]),
+                current_lease_generation: 1,
+            });
+        let custody_error = publish_whole_mux_recovery(
+            &cx,
+            &store,
+            &custody_captured,
+            &inputs(false),
+            Arc::clone(&key),
+            &expected,
+        )
+        .unwrap_err();
+        assert!(
+            custody_error
+                .to_string()
+                .contains("guardian provenance requires a published guardian checkpoint")
+        );
         assert!(store.list_object_ids().unwrap().is_empty());
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
         let receipt =

@@ -303,11 +303,7 @@ impl Fixture {
             .acks
             .iter()
             .enumerate()
-            .map(|(pane_id, ack)| WholeMuxPanePublication {
-                pane_id,
-                object_id: &ids[pane_id],
-                ack,
-            })
+            .map(|(pane_id, ack)| WholeMuxPanePublication::model(pane_id, &ids[pane_id], ack))
             .collect();
         publish_whole_mux_recovery(
             cx,
@@ -328,6 +324,7 @@ impl Fixture {
                 }),
                 predecessor_image_digest: predecessor
                     .map(|(_, verified)| verified.image().image_digest),
+                existing_guardian_custody: None,
             },
         )
         .expect("actual encrypted publisher")
