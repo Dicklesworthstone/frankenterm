@@ -6606,6 +6606,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(91_030);
+        let _domain = register_test_client_domain(&mux, &inner);
         ClientDomain::process_pane_list(
             &mux,
             Arc::clone(&inner),
