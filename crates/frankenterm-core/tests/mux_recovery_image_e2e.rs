@@ -988,7 +988,13 @@ fn test_mux_recovery_e2e_production_verifier_rejects_fake_guardian() {
     let mut image = fixture.current(&cx, &store).image().clone();
     image.panes[1].checkpoint.authority = CheckpointAuthority::Guardian {
         guardian_generation: 1,
-        lease_verifier: "not-a-proof".into(),
+        publication: frankenterm_core::mux_recovery_image::RecoveryGuardianPublication {
+            guardian_incarnation: uuid::Uuid::from_bytes([0x91; 16]),
+            mux_incarnation: uuid::Uuid::from_bytes([0x92; 16]),
+            effect_id: uuid::Uuid::from_bytes([0x93; 16]),
+            checkpoint_identity: [0x94; 32],
+            output_boundary_identity: [0x95; 32],
+        },
         catalog_generation: 1,
     };
     image.image_digest = image.compute_digest().unwrap();
