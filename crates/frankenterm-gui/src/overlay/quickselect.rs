@@ -2135,7 +2135,7 @@ struct PendingAcceptedAction {
     instance_token: Arc<()>,
     accepted_run_id: usize,
     paste: bool,
-    action: Option<KeyAssignment>,
+    action: Option<Box<KeyAssignment>>,
     skip_action_on_paste: bool,
     accepted_cols: usize,
     source_range: Range<StableRowIndex>,
