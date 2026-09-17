@@ -487,6 +487,46 @@ mod alphabet_test {
     use std::ops::Range;
 
     #[test]
+    fn quickselect_accepted_range_does_not_use_deferred_previous_selection() {
+        use crate::selection::{NativeSelectionCapture, PendingNativeSelection, Selection};
+        use crate::termwindow::selected_text_from_logical_lines;
+
+        let logical = LogicalLine {
+            first_row: 0,
+            physical_lines: vec![Line::from("old chosen")],
+            logical: Line::from("old chosen"),
+        };
+        let lines = [logical];
+        let previous = SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(2, 0),
+        };
+        let accepted = SelectionRange {
+            start: SelectionCoordinate::x_y(4, 0),
+            end: SelectionCoordinate::x_y(9, 0),
+        };
+        let mut committed = Selection::default();
+        committed.range = Some(previous);
+        let mut desired = Selection::default();
+        desired.range = Some(accepted);
+        let pending = PendingNativeSelection::new(desired);
+        assert!(
+            pending
+                .try_commit(&mut committed, NativeSelectionCapture::Busy)
+                .is_none()
+        );
+        assert_eq!(committed.range, Some(previous));
+        assert_eq!(
+            selected_text_from_logical_lines(&lines, committed.range.unwrap(), false),
+            "old"
+        );
+        assert_eq!(
+            selected_text_from_logical_lines(&lines, accepted, false),
+            "chosen"
+        );
+    }
+
+    #[test]
     fn simple_alphabet() {
         assert_eq!(compute_labels_for_alphabet("abcd", 3), vec!["a", "b", "c"]);
     }
@@ -2346,6 +2386,16 @@ impl QuickSelectRenderable {
                 // up its label. Fence the exact captured pane once more at
                 // execution time; resolving by numeric PaneId here would
                 // reintroduce an ABA window if a pane were replaced.
+                if selection_authority.is_none()
+                    || crate::selection::SelectionAuthority::capture(&*pane) != selection_authority
+                {
+                    restart_quick_select_after_stale_action(
+                        term_window,
+                        pane_id,
+                        &instance_token,
+                    );
+                    return;
+                }
                 let dims = pane.get_dimensions();
                 let chunk_is_retained = retained_row_range(dims).as_ref().is_some_and(|retained| {
                     retained.start <= source_range.start && source_range.end <= retained.end
@@ -2375,18 +2425,25 @@ impl QuickSelectRenderable {
                     return;
                 };
                 let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
+                let accepted_selection = SelectionRange {
+                    start,
+                    // Search results have an exclusive end; selections are inclusive.
+                    end: SelectionCoordinate::x_y(inclusive_end_x, inclusive_end_y),
+                };
                 term_window.update_selection(&pane, selection_authority, |selection| {
                     selection.origin = Some(start);
-                    selection.range = Some(SelectionRange {
-                        start,
-                        // inclusive range for selection, but the result
-                        // range is exclusive
-                        end: SelectionCoordinate::x_y(inclusive_end_x, inclusive_end_y),
-                    });
+                    selection.range = Some(accepted_selection);
                     selection.rectangular = false;
                 });
 
-                let text = term_window.selection_text(&pane);
+                // Native anchor capture can defer the highlight update while an
+                // older GUI selection remains committed. Extract the accepted
+                // match itself; GUI selection state is not action authority.
+                let text = crate::termwindow::selected_text_from_logical_lines(
+                    &pane.get_logical_lines(accepted_selection.rows()),
+                    accepted_selection,
+                    false,
+                );
                 let extracted_dims = pane.get_dimensions();
                 let extracted_range_is_retained = retained_row_range(extracted_dims)
                     .as_ref()
@@ -2396,6 +2453,7 @@ impl QuickSelectRenderable {
                 let (extracted_source_end, dirty) = pane
                     .get_changed_since_with_source_fence(source_range, validated_source_end);
                 if pane.is_dead()
+                    || crate::selection::SelectionAuthority::capture(&*pane) != selection_authority
                     || extracted_dims.cols != accepted_cols
                     || !extracted_range_is_retained
                     || extracted_source_end < validated_source_end
