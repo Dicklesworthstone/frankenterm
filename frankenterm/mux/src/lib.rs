@@ -4132,6 +4132,22 @@ mod pane_registration_handle {
             self.owner.notify(MuxNotification::PaneOutput(self.pane_id));
         }
 
+        pub(crate) fn notify_resize_completed(&self) {
+            // LocalPane resize admission is asynchronous. The immediate RPC
+            // callback can therefore have rebuilt this tab from old geometry.
+            // Reconcile again after completion, using the exact current owner
+            // index rather than scanning unrelated windows or resolving a
+            // recycled numeric pane ID.
+            if let Some((_, _, tab, PaneStructuralLane::Tiled)) = self.owner.indexed_pane_location(
+                self.pane_id,
+                Some(self.registration),
+                Some(self.pane),
+            ) {
+                tab.rebuild_splits_sizes_from_contained_panes();
+            }
+            self.notify_lines_ready();
+        }
+
         pub fn get_line_layout(
             &self,
         ) -> Option<(
@@ -4319,7 +4335,7 @@ mod pane_registration_handle {
 
         pub fn resize_in_tab(&self, tab_id: TabId, size: TerminalSize) -> anyhow::Result<()> {
             let tab = self.exact_tab(tab_id)?;
-            self.pane.resize(size)?;
+            self.pane.resize_from_remote(size)?;
             tab.rebuild_splits_sizes_from_contained_panes();
             Ok(())
         }

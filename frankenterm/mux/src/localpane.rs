@@ -854,6 +854,10 @@ struct ResizeQueueState {
     pending: Option<PendingResize>,
     next_seq: u64,
     worker_running: bool,
+    /// Only the newest remote pane-size intent may infer its containing tab.
+    /// GUI-owned tab resizes must not be overwritten by partially resized
+    /// siblings while their asynchronous workers are still completing.
+    reconcile_tab_on_completion: bool,
     /// Last PTY geometry whose `MasterPty::resize` call completed successfully.
     ///
     /// Terminal geometry alone is not sufficient no-op authority: an older
@@ -923,6 +927,7 @@ impl ResizeQueueState {
         size: TerminalSize,
         pty_size: PtySize,
         enqueued_at: Instant,
+        reconcile_tab_on_completion: bool,
     ) -> Result<ResizeEnqueueOutcome, ResizeEnqueueError> {
         let seq = self
             .next_seq
@@ -933,6 +938,7 @@ impl ResizeQueueState {
         let queue_depth_hint = if self.worker_running { 2 } else { 1 };
 
         self.next_seq = seq;
+        self.reconcile_tab_on_completion = reconcile_tab_on_completion;
         if spawn_worker {
             self.worker_running = true;
         }
@@ -961,7 +967,7 @@ impl ResizeQueueState {
         pty_size: PtySize,
         enqueued_at: Instant,
     ) -> ResizeEnqueueOutcome {
-        self.try_enqueue(size, pty_size, enqueued_at)
+        self.try_enqueue(size, pty_size, enqueued_at, false)
             .expect("test resize generation must remain below u64::MAX")
     }
 
@@ -1957,7 +1963,11 @@ impl Pane for LocalPane {
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
-        self.enqueue_resize(size)
+        self.enqueue_resize(size, false)
+    }
+
+    fn resize_from_remote(&self, size: TerminalSize) -> Result<(), Error> {
+        self.enqueue_resize(size, true)
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
@@ -3636,7 +3646,7 @@ impl LocalPane {
         f();
     }
 
-    fn enqueue_resize(&self, size: TerminalSize) -> Result<(), Error> {
+    fn enqueue_resize(&self, size: TerminalSize, reconcile_tab: bool) -> Result<(), Error> {
         let pty_size = PtySize {
             rows: size.rows.try_into()?,
             cols: size.cols.try_into()?,
@@ -3647,7 +3657,7 @@ impl LocalPane {
 
         let enqueue_result = {
             let mut queue = self.resize_queue.lock();
-            queue.try_enqueue(size, pty_size, enqueued_at)
+            queue.try_enqueue(size, pty_size, enqueued_at, reconcile_tab)
         };
         let outcome = match enqueue_result {
             Ok(outcome) => outcome,
@@ -4115,11 +4125,20 @@ impl LocalPane {
                 || async move {
                     // Supersession may occur after enqueueing this callback.
                     // Release the queue lock before registration/subscribers.
-                    let current = resize_queue.lock().superseded_by(token).is_none();
-                    if !current {
-                        return;
-                    }
-                    let _ = registration.try_with_current(|pane| pane.notify_lines_ready());
+                    let reconcile_tab = {
+                        let queue = resize_queue.lock();
+                        if queue.superseded_by(token).is_some() {
+                            return;
+                        }
+                        queue.reconcile_tab_on_completion
+                    };
+                    let _ = registration.try_with_current(|pane| {
+                        if reconcile_tab {
+                            pane.notify_resize_completed();
+                        } else {
+                            pane.notify_lines_ready();
+                        }
+                    });
                 },
             );
         }
@@ -5091,6 +5110,8 @@ mod tests {
         term.advance_bytes(b"abcdefgh\r\none\r\n");
         term.resize(term_size(3, 2));
         assert!(term.screen().capture_cold_seam_reflow().unwrap().is_some());
+        let domain: Arc<dyn Domain> =
+            Arc::new(crate::domain::LocalDomain::new("cold-resize-test").unwrap());
         let pane = Arc::new(LocalPane::new(
             719,
             term,
@@ -5099,12 +5120,12 @@ mod tests {
             }),
             Box::new(GuardianLifetimeTestMasterPty),
             Box::new(Vec::<u8>::new()),
-            1,
+            domain.domain_id(),
             [0x79; 16],
             "cold-resize-test".to_string(),
         ));
         let registered: Arc<dyn Pane> = pane.clone();
-        let mux = Arc::new(crate::Mux::new(None));
+        let mux = Arc::new(crate::Mux::new(Some(domain)));
         let generation = crate::PaneRegistrationGeneration::new(
             pane.pane_id(),
             &mux.pane_retirements,
@@ -5205,12 +5226,23 @@ mod tests {
         for case in [
             "no_cold",
             "unavailable",
+            "local_geometry",
             "superseded",
             "retired",
             "late_superseded",
             "late_retired",
         ] {
             let (pane, mux, registration, sink, token) = cold_resize_fixture(false);
+            pane.resize_queue.lock().reconcile_tab_on_completion = case != "local_geometry";
+            // Reproduce the server tab still carrying geometry observed just
+            // after asynchronous resize admission, before the pane committed.
+            let tab = Arc::new(crate::tab::Tab::new(&term_size(4, 2)));
+            mux.add_tab_no_panes(&tab).unwrap();
+            let window = mux.new_empty_window(None, None);
+            mux.add_tab_to_window(&tab, *window).unwrap();
+            let dynamic_pane: Arc<dyn Pane> = pane.clone();
+            tab.assign_pane(&dynamic_pane);
+            assert_eq!(tab.get_size(), term_size(4, 2));
             if case == "no_cold" {
                 let mut term = guardian_lifetime_test_terminal();
                 term.resize(term_size(3, 2));
@@ -5257,8 +5289,20 @@ mod tests {
             }
             assert_eq!(
                 notifications.load(Ordering::Relaxed),
-                usize::from(matches!(case, "no_cold" | "unavailable")),
+                usize::from(matches!(case, "no_cold" | "unavailable" | "local_geometry")),
                 "{case}: primary completion must wake exactly its current pane",
+            );
+            assert_eq!(
+                tab.get_size(),
+                term_size(
+                    if matches!(case, "no_cold" | "unavailable") {
+                        3
+                    } else {
+                        4
+                    },
+                    2,
+                ),
+                "{case}: only current completion may reconcile the containing tab",
             );
         }
     }
@@ -7732,13 +7776,20 @@ mod tests {
             .expect("first request must be available for worker");
         assert_eq!(in_flight.seq, 1);
 
-        let second = queue.enqueue(term_size(100, 30), pty_size(100, 30), now);
+        let second = queue
+            .try_enqueue(term_size(100, 30), pty_size(100, 30), now, true)
+            .unwrap();
+        assert!(queue.reconcile_tab_on_completion);
         assert_eq!(second.seq, 2);
         assert!(!second.spawn_worker);
         assert_eq!(second.replaced_seq, None);
         assert_eq!(second.queue_depth_hint, 2);
 
         let third = queue.enqueue(term_size(120, 40), pty_size(120, 40), now);
+        assert!(
+            !queue.reconcile_tab_on_completion,
+            "a newer GUI-owned layout must revoke remote tab inference",
+        );
         assert_eq!(third.seq, 3);
         assert!(!third.spawn_worker);
         assert_eq!(third.replaced_seq, Some(2));
@@ -7835,7 +7886,7 @@ mod tests {
             .expect("max-generation intent must enter the worker");
 
         assert_eq!(
-            queue.try_enqueue(term_size(120, 40), pty_size(120, 40), now),
+            queue.try_enqueue(term_size(120, 40), pty_size(120, 40), now, false),
             Err(ResizeEnqueueError::SequenceExhausted),
             "generation exhaustion must fail closed rather than alias zero",
         );

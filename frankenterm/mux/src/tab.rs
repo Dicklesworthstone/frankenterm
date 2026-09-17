@@ -13455,8 +13455,21 @@ impl TabInner {
     }
 
     fn rebuild_splits_sizes_from_contained_panes(&mut self) -> bool {
-        if self.zoomed.is_some() {
-            return false;
+        if let Some(pane) = &self.zoomed {
+            // A remote resize changes the visible zoomed pane independently
+            // of the hidden split tree. Preserve that tree and its pre-zoom
+            // dimensions so unzoom can reflow it into the new outer size.
+            let dims = pane.get_dimensions();
+            let size = TerminalSize {
+                cols: dims.cols,
+                rows: dims.viewport_rows,
+                pixel_height: dims.pixel_height,
+                pixel_width: dims.pixel_width,
+                dpi: dims.dpi,
+            };
+            let changed = self.size != size;
+            self.size = size;
+            return changed;
         }
 
         fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
@@ -23325,6 +23338,37 @@ mod test {
         let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
         let all: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
         assert_eq!(all.len(), 3, "All 3 panes should survive zoom + swap");
+    }
+
+    #[test]
+    fn remote_zoom_resize_reconciles_outer_size_without_rewriting_hidden_splits() {
+        let (tab, original_size) = make_tab_with_n_panes(3);
+        let before = tab.iter_splits();
+        tab.set_zoomed(true);
+        let zoomed = tab.get_zoomed_pane().unwrap();
+        let size = TerminalSize {
+            cols: original_size.cols + 20,
+            rows: original_size.rows + 10,
+            pixel_width: original_size.pixel_width + 200,
+            pixel_height: original_size.pixel_height + 250,
+            ..original_size
+        };
+        zoomed.resize(size).unwrap();
+        tab.rebuild_splits_sizes_from_contained_panes();
+        assert_eq!(tab.get_size(), size);
+        assert_eq!(tab.inner.lock().size_before_zoom, original_size);
+        {
+            let mut inner = tab.inner.lock();
+            let zoomed = inner.zoomed.take();
+            assert_eq!(inner.iter_splits(), before, "hidden splits must stay intact");
+            inner.zoomed = zoomed;
+        }
+        tab.set_zoomed(false);
+        assert_eq!(tab.get_size(), size);
+        assert_eq!(tab.iter_panes().len(), 3);
+        assert_eq!(tab.iter_splits().len(), before.len());
+        tab.rebuild_splits_sizes_from_contained_panes();
+        assert_eq!(tab.get_size(), size, "unzoom must reflow all hidden panes");
     }
 
     #[test]
