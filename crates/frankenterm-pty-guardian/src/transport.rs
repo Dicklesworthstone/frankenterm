@@ -6491,6 +6491,8 @@ mod tests {
             let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
             let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
             let (pending_result_tx, pending_result_rx) = std::sync::mpsc::sync_channel(1);
+            let (diagnostic_tx, diagnostic_rx) = std::sync::mpsc::sync_channel(1);
+            let (diagnostic_result_tx, diagnostic_result_rx) = std::sync::mpsc::sync_channel(1);
             let guardian_stop = &stop;
             let guardian = scope.spawn(move || {
                 let mut service = GuardianService::bind(guardian_config).unwrap();
@@ -6501,6 +6503,14 @@ mod tests {
                 let mut await_retirement = false;
                 while !guardian_stop.load(Ordering::Acquire) {
                     service.poll_once().unwrap();
+                    if let Ok(panes) = diagnostic_rx.try_recv() {
+                        diagnostic_result_tx
+                            .send((
+                                service.runtime.genesis_admission_diagnostic_for_test(panes),
+                                service.runtime_counters(),
+                            ))
+                            .unwrap();
+                    }
                     if let Ok((pane, entered, release)) = pause_rx.try_recv() {
                         service
                             .runtime
@@ -6622,6 +6632,11 @@ mod tests {
                     )
                     .unwrap();
                 let second_request = Uuid::new_v4();
+                diagnostic_tx.send([pane, second_pane]).unwrap();
+                let (baseline, mut previous_counters) = diagnostic_result_rx
+                    .recv_timeout(CLIENT_IO_TIMEOUT)
+                    .unwrap();
+                eprintln!("SECOND_SPAWN_BASELINE {baseline}");
                 let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
                 loop {
                     match client.spawn(second_pane, second_request, second_effect, command(), size)
@@ -6631,6 +6646,40 @@ mod tests {
                             generation: 0,
                         }) if pane_id == second_pane => break,
                         result => {
+                            // Observe the first failure before reconnecting; no
+                            // extra authenticated connection changes retirement.
+                            let result_kind = match &result {
+                                Err(GuardianClientError::Io(error)) => {
+                                    format!("io:{:?}", error.kind())
+                                }
+                                Err(_) => "non-io-error".to_string(),
+                                Ok(_) => "unexpected-reply".to_string(),
+                            };
+                            diagnostic_tx.send([pane, second_pane]).unwrap();
+                            let (diagnostic, observed) = diagnostic_result_rx
+                                .recv_timeout(CLIENT_IO_TIMEOUT)
+                                .unwrap();
+                            eprintln!(
+                                "SECOND_SPAWN_FAILURE result={result_kind} checkpoint_completed_delta={} retry_close_delta={} adopted_delta={} protocol_failure_delta={} control_failure_delta={} {diagnostic}",
+                                observed.checkpoint_transactions_completed.saturating_sub(
+                                    previous_counters.checkpoint_transactions_completed
+                                ),
+                                observed
+                                    .checkpoint_retryable_capacity_closes
+                                    .saturating_sub(
+                                        previous_counters.checkpoint_retryable_capacity_closes
+                                    ),
+                                observed.broker_starting_panes_adopted.saturating_sub(
+                                    previous_counters.broker_starting_panes_adopted
+                                ),
+                                observed
+                                    .protocol_transition_failures
+                                    .saturating_sub(previous_counters.protocol_transition_failures),
+                                observed
+                                    .broker_control_failures
+                                    .saturating_sub(previous_counters.broker_control_failures),
+                            );
+                            previous_counters = observed;
                             assert!(
                                 std::time::Instant::now() < deadline,
                                 "second Spawn: {result:?}"

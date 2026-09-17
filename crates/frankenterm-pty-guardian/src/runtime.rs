@@ -1488,6 +1488,49 @@ pub struct GuardianRuntime {
 
 impl GuardianRuntime {
     #[cfg(test)]
+    pub(crate) fn genesis_admission_diagnostic_for_test(&self, panes: [Uuid; 2]) -> String {
+        let mut diagnostic = format!(
+            "protocol={} pending_genesis={} pipeline_failed={} indeterminate={} counters={:?}",
+            self.protocol.is_some(),
+            self.pending_genesis_submission.is_some(),
+            self.checkpoint_pipeline_failed,
+            self.indeterminate_effect,
+            self.counters,
+        );
+        for (index, id) in panes.into_iter().enumerate() {
+            let phase = match self.protocol.as_ref().and_then(|p| p.pane_state(id)) {
+                None => "absent-or-owned-by-worker",
+                Some(GuardianPaneState::LiveUnclaimed { .. }) => "live-unclaimed",
+                Some(GuardianPaneState::LiveClaimed { .. }) => "live-claimed",
+                Some(GuardianPaneState::ExitedUnclaimed { .. }) => "exited-unclaimed",
+                Some(GuardianPaneState::ClosedTerminal { .. }) => "closed",
+                Some(GuardianPaneState::Quarantined { .. }) => "quarantined",
+            };
+            diagnostic.push_str(&format!(" pane{index}.phase={phase}"));
+            if let Some(pane) = self.starting_broker_panes.get(&id) {
+                diagnostic.push_str(&format!(
+                    " activated={} initial_pending={} failed_before_spawn={} retry={} handle={} output={} input={} origin={} delivery={} ack={}",
+                    pane.activated, pane.initial_pending, pane.failed_before_spawn,
+                    pane.retry_before_publication.is_some(), pane.handle.is_some(),
+                    pane.output.is_some(), pane.input_journal.is_some(), pane.replay_origin.is_some(),
+                    pane.pending_delivery.is_some(), pane.pending_ack.is_some(),
+                ));
+                if let Some(connection) = self.broker_connections.get(&pane.mux_incarnation) {
+                    diagnostic.push_str(&format!(
+                        " worker={} session={} active={} failed={} retired={}",
+                        connection.worker.is_some(),
+                        connection.retained_session.is_some(),
+                        connection.active_pane.is_some(),
+                        connection.failed,
+                        connection.fully_retired_outer_owner,
+                    ));
+                }
+            }
+        }
+        diagnostic
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_next_broker_append_for_test(
         &self,
         pane_id: Uuid,
