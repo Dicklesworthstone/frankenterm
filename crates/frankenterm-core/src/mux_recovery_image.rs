@@ -1761,7 +1761,7 @@ impl MuxRecoveryImage {
     ) -> Result<Self, MuxRecoveryImageError> {
         let parser_checkpoints = checkpoint_acks
             .iter()
-            .map(|(pane, ack)| (*pane, RecoveryParserCheckpoint::Model(*ack)))
+            .map(|(pane, ack)| (*pane, RecoveryParserCheckpoint::Model(ack)))
             .collect();
         Self::from_mux_captured_checkpoints(
             meta,

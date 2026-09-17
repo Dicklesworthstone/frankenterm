@@ -26276,7 +26276,7 @@ mod tests {
                             };
                             let rejected = match service.spawn_worker.try_submit_lease(job) {
                                 Err(rejected) => rejected,
-                                Ok(_) => {
+                                Ok(()) => {
                                     panic!("occupied real worker rejects second journal")
                                 }
                             };

@@ -6253,15 +6253,15 @@ mod tests {
                     std::time::Instant::now() < deadline,
                     "rotation replay timed out"
                 );
-                let page = client.replay(pane, 2, Uuid::new_v4(), request).unwrap();
-                assert_eq!(page.header().pane_id(), pane);
-                assert_eq!(page.header().generation(), 2);
-                let snapshot_id = page.header().snapshot_id();
-                let snapshot_digest = page.header().snapshot_digest();
-                let page_index = page.header().page_index();
-                let page_digest = page.header().declassify_page_digest_for_ack();
-                let next = page.header().next_cursor();
-                let (through_sequence, through_digest) = match page.into_body() {
+                let replay = client.replay(pane, 2, Uuid::new_v4(), request).unwrap();
+                assert_eq!(replay.header().pane_id(), pane);
+                assert_eq!(replay.header().generation(), 2);
+                let snapshot_id = replay.header().snapshot_id();
+                let snapshot_digest = replay.header().snapshot_digest();
+                let page_index = replay.header().page_index();
+                let page_digest = replay.header().declassify_page_digest_for_ack();
+                let next = replay.header().next_cursor();
+                let (through_sequence, through_digest) = match replay.into_body() {
                     GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
                         assert!(matches!(
                             chunk.descriptor().output_boundary(),
