@@ -1130,10 +1130,8 @@ impl super::TermWindow {
 
         if (mode == SelectionMode::Word || mode == SelectionMode::Line)
             && pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
+            && current_source.is_some()
         {
-            let Some((_authority, _sequence, _dims)) = current_source else {
-                return false;
-            };
             let (position, y) = match retained
                 .map(|(_, position, row)| (position, row))
                 .or_else(|| self.pane_state(pane.pane_id()).mouse_terminal_coords)
@@ -1142,10 +1140,11 @@ impl super::TermWindow {
                 None => return false,
             };
 
+            let observed_frame = self.pane_state(pane.pane_id()).mouse_selection_frame;
+            // Computing a frame reads viewport state from the same RefCell.
+            // Release the first borrow before using that fallback.
+            let frame = observed_frame.or_else(|| self.selection_frame_stamp(pane));
             let mut state = self.pane_state(pane.pane_id());
-            let frame = state
-                .mouse_selection_frame
-                .or_else(|| self.selection_frame_stamp(pane));
             let button = self
                 .active_selection_drag_button
                 .unwrap_or(window::MousePress::Left);
