@@ -2758,7 +2758,7 @@ impl TermWindow {
 
         let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE)
             .with_context(|| format!("failed to create render state for {render_info}"))?;
-        log::debug!(
+        log::info!(
             "Renderer initialized: {} FrankenTerm version: {}",
             render_info,
             config::wezterm_version(),
