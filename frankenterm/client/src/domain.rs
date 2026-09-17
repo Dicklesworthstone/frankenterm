@@ -2,7 +2,7 @@ use crate::client::{
     with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
     RpcGenerationScope, RpcTopologySnapshot,
 };
-use crate::pane::{ClientPane, ReliableInputQueue};
+use crate::pane::{ClientPane, ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
 use anyhow::{anyhow, bail, ensure, Context};
 use async_trait::async_trait;
 use codec::{FloatingPaneSnapshotEntry, ListPanesResponse, SpawnV2, SplitPane};
@@ -234,6 +234,7 @@ pub struct ClientInner {
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
+    pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
     topology_session: Mutex<ClientTopologySessionState>,
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
@@ -1781,6 +1782,7 @@ impl ClientInner {
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
             reliable_input_queue: ReliableInputQueue::new(),
+            resize_coordinator: ClientResizeCoordinator::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             layout_tab_owners: Mutex::new(HashMap::new()),
@@ -1896,6 +1898,28 @@ impl ClientInner {
     pub(crate) fn mark_detached(&self) {
         self.client.revoke_domain_reconnect();
         self.reliable_input_queue.detach_domain(&self.detached);
+        self.resize_coordinator.detach(&self.detached);
+    }
+
+    pub(crate) fn start_resize_retry_driver(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.resize_coordinator.start(Arc::downgrade(self))
+    }
+
+    pub(crate) fn enqueue_unadmitted_resize(
+        &self,
+        intent: QueuedResizeIntent,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.resize_coordinator.is_started() && !self.is_detached(),
+            "client resize retry driver is not running or domain is detached"
+        );
+        self.resize_coordinator.enqueue(intent)
+    }
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        self.mark_detached();
     }
 }
 
@@ -4536,6 +4560,7 @@ impl ClientDomain {
             threshold,
             overlay_lag_indicator,
         ));
+        inner.start_resize_retry_driver()?;
 
         // Move the non-cloneable exact-domain lease into the rollback guard
         // before any attachment state can become visible.  The cleanup starts

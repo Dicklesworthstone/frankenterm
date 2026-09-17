@@ -858,6 +858,9 @@ struct ResizeQueueState {
     /// GUI-owned tab resizes must not be overwritten by partially resized
     /// siblings while their asynchronous workers are still completing.
     reconcile_tab_on_completion: bool,
+    /// Capacity belongs to `next_seq`, including its bounded worker retries.
+    /// Reserve it before accepting a remote intent, not after changing geometry.
+    completion_reservation: Option<promise::spawn::MainThreadSpawnReservation>,
     /// Last PTY geometry whose `MasterPty::resize` call completed successfully.
     ///
     /// Terminal geometry alone is not sufficient no-op authority: an older
@@ -928,6 +931,7 @@ impl ResizeQueueState {
         pty_size: PtySize,
         enqueued_at: Instant,
         reconcile_tab_on_completion: bool,
+        completion_reservation: Option<promise::spawn::MainThreadSpawnReservation>,
     ) -> Result<ResizeEnqueueOutcome, ResizeEnqueueError> {
         let seq = self
             .next_seq
@@ -939,6 +943,7 @@ impl ResizeQueueState {
 
         self.next_seq = seq;
         self.reconcile_tab_on_completion = reconcile_tab_on_completion;
+        self.completion_reservation = completion_reservation;
         if spawn_worker {
             self.worker_running = true;
         }
@@ -967,7 +972,7 @@ impl ResizeQueueState {
         pty_size: PtySize,
         enqueued_at: Instant,
     ) -> ResizeEnqueueOutcome {
-        self.try_enqueue(size, pty_size, enqueued_at, false)
+        self.try_enqueue(size, pty_size, enqueued_at, false, None)
             .expect("test resize generation must remain below u64::MAX")
     }
 
@@ -977,6 +982,7 @@ impl ResizeQueueState {
         }
 
         self.worker_running = false;
+        self.completion_reservation = None;
         None
     }
 
@@ -1019,6 +1025,7 @@ impl ResizeQueueState {
             let retries = *retries;
             self.pending = Some(intent);
             self.worker_running = false;
+            self.completion_reservation = None;
             ResizeFailureRecovery::ExhaustedRetained { retries }
         }
     }
@@ -3654,10 +3661,36 @@ impl LocalPane {
             pixel_height: size.pixel_height.try_into()?,
         };
         let enqueued_at = Instant::now();
+        let completion_reservation = if reconcile_tab {
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    Some(reservation)
+                }
+                rejected => {
+                    metrics::counter!(
+                        "mux.localpane.resize.intent_rejected",
+                        "reason" => "completion_capacity",
+                    )
+                    .increment(1);
+                    anyhow::bail!("remote resize completion admission rejected: {rejected:?}");
+                }
+            }
+        } else {
+            None
+        };
 
         let enqueue_result = {
             let mut queue = self.resize_queue.lock();
-            queue.try_enqueue(size, pty_size, enqueued_at, reconcile_tab)
+            queue.try_enqueue(
+                size,
+                pty_size,
+                enqueued_at,
+                reconcile_tab,
+                completion_reservation,
+            )
         };
         let outcome = match enqueue_result {
             Ok(outcome) => outcome,
@@ -3795,18 +3828,22 @@ impl LocalPane {
             });
             let settled_apply_result = apply_result
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
-            if allow_cold_preparation
-                && matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled)
-            {
+            if matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled) {
                 if let Some(registration) = pending_registration {
-                    Self::prepare_cold_layout_after_resize(
-                        pane_id,
-                        &terminal,
-                        &line_layout_observation,
-                        &resize_queue,
-                        token,
-                        registration,
-                    );
+                    if allow_cold_preparation {
+                        Self::prepare_cold_layout_after_resize(
+                            pane_id,
+                            &terminal,
+                            &line_layout_observation,
+                            &resize_queue,
+                            token,
+                            registration,
+                        );
+                    } else {
+                        // The inline spawn-failure fallback skips expensive
+                        // history preparation, never the committed-size wakeup.
+                        Self::schedule_resize_completion(&resize_queue, token, registration);
+                    }
                 }
             }
             match settled_apply_result {
@@ -4116,32 +4153,7 @@ impl LocalPane {
         // tier or unavailable history must not suppress its visible-frame
         // wakeup and leave the GUI waiting for the repaint retry timer.
         // This is only a hint: frame capture still validates the exact source.
-        if !cancelled() {
-            let resize_queue = Arc::clone(resize_queue);
-            schedule_local_pane_main_thread(
-                promise::spawn::MainThreadServiceClass::Interactive,
-                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
-                "resize_layout_settled",
-                || async move {
-                    // Supersession may occur after enqueueing this callback.
-                    // Release the queue lock before registration/subscribers.
-                    let reconcile_tab = {
-                        let queue = resize_queue.lock();
-                        if queue.superseded_by(token).is_some() {
-                            return;
-                        }
-                        queue.reconcile_tab_on_completion
-                    };
-                    let _ = registration.try_with_current(|pane| {
-                        if reconcile_tab {
-                            pane.notify_resize_completed();
-                        } else {
-                            pane.notify_lines_ready();
-                        }
-                    });
-                },
-            );
-        }
+        Self::schedule_resize_completion(resize_queue, token, registration);
         metrics::counter!("mux.localpane.resize.cold_layout", "outcome" => match result {
             Ok(Ok(true)) => "installed",
             Ok(Ok(false)) => "not_installed",
@@ -4159,6 +4171,54 @@ impl LocalPane {
                     Err(_) => "recovered_panic",
                     Ok(Ok(true)) => "installed",
                 }
+            );
+        }
+    }
+
+    fn schedule_resize_completion(
+        resize_queue: &Arc<Mutex<ResizeQueueState>>,
+        token: ResizeCancellationToken,
+        registration: PaneRegistrationHandle,
+    ) {
+        let reservation = {
+            let mut queue = resize_queue.lock();
+            if queue.superseded_by(token).is_some() {
+                return;
+            }
+            queue.completion_reservation.take()
+        };
+        // Taking before this check also releases reserved capacity when the
+        // pane retired during preparation. A newer intent retains its permit.
+        if registration.try_with_current(|_| ()).is_none() {
+            return;
+        }
+        let resize_queue = Arc::clone(resize_queue);
+        let make_future = move || async move {
+            // Admission is not commit authority: a newer request can arrive
+            // after this callback was queued. Never notify for that old intent.
+            let reconcile_tab = {
+                let queue = resize_queue.lock();
+                if queue.superseded_by(token).is_some() {
+                    return;
+                }
+                queue.reconcile_tab_on_completion
+            };
+            let _ = registration.try_with_current(|pane| {
+                if reconcile_tab {
+                    pane.notify_resize_completed();
+                } else {
+                    pane.notify_lines_ready();
+                }
+            });
+        };
+        if let Some(reservation) = reservation {
+            reservation.spawn(make_future()).detach();
+        } else {
+            schedule_local_pane_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                "resize_layout_settled",
+                make_future,
             );
         }
     }
@@ -5142,6 +5202,12 @@ mod tests {
             .unwrap();
         }
         let registration = mux.capture_pane_registration(&registered).unwrap();
+        pane.mux_registration
+            .reserve(registration.clone())
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finalize();
         let mut queue = pane.resize_queue.lock();
         let outcome = queue.enqueue(term_size(3, 2), pty_size(3, 2), Instant::now());
         let pending = queue.dequeue_for_worker().unwrap();
@@ -5222,10 +5288,15 @@ mod tests {
             }
         }
 
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(8, 128 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
         for case in [
             "no_cold",
             "unavailable",
+            "saturated",
+            "inline_fallback",
             "local_geometry",
             "superseded",
             "retired",
@@ -5234,12 +5305,28 @@ mod tests {
         ] {
             let (pane, mux, registration, sink, token) = cold_resize_fixture(false);
             pane.resize_queue.lock().reconcile_tab_on_completion = case != "local_geometry";
+            if case != "local_geometry" && case != "inline_fallback" {
+                let reservation = match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                    }
+                    other => panic!("fixture completion admission failed: {:?}", other),
+                };
+                pane.resize_queue.lock().completion_reservation = Some(reservation);
+            }
             // Reproduce the server tab still carrying geometry observed just
             // after asynchronous resize admission, before the pane committed.
             let tab = Arc::new(crate::tab::Tab::new(&term_size(4, 2)));
             mux.add_tab_no_panes(&tab).unwrap();
             let window = mux.new_empty_window(None, None);
             mux.add_tab_to_window(&tab, *window).unwrap();
+            // Publish window creation before measuring resize completion;
+            // the builder otherwise queues its notification when dropped at
+            // the end of this iteration, after the scheduler was drained.
+            drop(window);
             let dynamic_pane: Arc<dyn Pane> = pane.clone();
             tab.assign_pane(&dynamic_pane);
             assert_eq!(tab.get_size(), term_size(4, 2));
@@ -5259,6 +5346,31 @@ mod tests {
                 true
             })
             .unwrap();
+            if case == "inline_fallback" {
+                // The fixture already owns worker admission, so this queues
+                // a real remote intent without creating another OS thread.
+                pane.resize_from_remote(term_size(3, 2)).unwrap();
+            }
+            let mut held_capacity = Vec::new();
+            if matches!(case, "saturated" | "inline_fallback") {
+                loop {
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            held_capacity.push(reservation);
+                        }
+                        promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => break,
+                        other => panic!("unexpected saturation result: {:?}", other),
+                    }
+                    assert!(held_capacity.len() <= 8);
+                }
+                let admitted_seq = pane.resize_queue.lock().next_seq;
+                assert!(pane.resize_from_remote(term_size(5, 2)).is_err());
+                assert_eq!(pane.resize_queue.lock().next_seq, admitted_seq);
+                assert_eq!(pane.get_dimensions().cols, 3);
+            }
             let supersede = || {
                 pane.resize_queue
                     .lock()
@@ -5269,14 +5381,30 @@ mod tests {
             } else if case == "retired" {
                 registration.retire_if_current();
             }
-            LocalPane::prepare_cold_layout_after_resize(
-                pane.pane_id(),
-                &pane.terminal,
-                &pane.line_layout_observation,
-                &pane.resize_queue,
-                token,
-                registration.clone(),
-            );
+            if case == "inline_fallback" {
+                settle_resize_worker_spawn(Err::<(), ()>(()), || {
+                    LocalPane::run_resize_worker(
+                        pane.pane_id(),
+                        Arc::clone(&pane.terminal),
+                        Arc::clone(&pane.line_layout_observation),
+                        #[cfg(feature = "disruptor-pane-io")]
+                        Arc::clone(&pane.action_ring),
+                        Arc::clone(&pane.pty),
+                        Arc::clone(&pane.resize_queue),
+                        Arc::clone(&pane.mux_registration),
+                        false,
+                    );
+                });
+            } else {
+                LocalPane::prepare_cold_layout_after_resize(
+                    pane.pane_id(),
+                    &pane.terminal,
+                    &pane.line_layout_observation,
+                    &pane.resize_queue,
+                    token,
+                    registration.clone(),
+                );
+            }
             if case == "late_superseded" {
                 supersede();
             } else if case == "late_retired" {
@@ -5289,13 +5417,16 @@ mod tests {
             }
             assert_eq!(
                 notifications.load(Ordering::Relaxed),
-                usize::from(matches!(case, "no_cold" | "unavailable" | "local_geometry")),
+                usize::from(matches!(
+                    case,
+                    "no_cold" | "unavailable" | "saturated" | "inline_fallback" | "local_geometry"
+                )),
                 "{case}: primary completion must wake exactly its current pane",
             );
             assert_eq!(
                 tab.get_size(),
                 term_size(
-                    if matches!(case, "no_cold" | "unavailable") {
+                    if matches!(case, "no_cold" | "unavailable" | "saturated" | "inline_fallback") {
                         3
                     } else {
                         4
@@ -5304,6 +5435,48 @@ mod tests {
                 ),
                 "{case}: only current completion may reconcile the containing tab",
             );
+            assert!(pane.resize_queue.lock().completion_reservation.is_none());
+            drop(held_capacity);
+            assert_eq!(executor.admission_snapshot().active_tasks, 0, "{case}");
+        }
+
+        for failure in [
+            ResizeFailureKind::RecoverablePanic,
+            ResizeFailureKind::ApplyError,
+        ] {
+            let reservation = match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                other => panic!("retry fixture admission failed: {:?}", other),
+            };
+            let mut queue = ResizeQueueState::default();
+            queue
+                .try_enqueue(
+                    term_size(3, 2),
+                    pty_size(3, 2),
+                    Instant::now(),
+                    true,
+                    Some(reservation),
+                )
+                .unwrap();
+            let mut pending = queue.dequeue_for_worker().unwrap();
+            for retry in 1..=failure.retry_limit() {
+                assert_eq!(
+                    queue.recover_failed_intent(pending, failure),
+                    ResizeFailureRecovery::Requeued { retry },
+                );
+                assert_eq!(executor.admission_snapshot().active_tasks, 1);
+                pending = queue.dequeue_for_worker().unwrap();
+            }
+            assert!(matches!(
+                queue.recover_failed_intent(pending, failure),
+                ResizeFailureRecovery::ExhaustedRetained { .. },
+            ));
+            assert!(queue.pending.is_some(), "failed target must remain retained");
+            assert!(queue.completion_reservation.is_none());
+            assert_eq!(executor.admission_snapshot().active_tasks, 0);
         }
     }
 
@@ -7777,7 +7950,7 @@ mod tests {
         assert_eq!(in_flight.seq, 1);
 
         let second = queue
-            .try_enqueue(term_size(100, 30), pty_size(100, 30), now, true)
+            .try_enqueue(term_size(100, 30), pty_size(100, 30), now, true, None)
             .unwrap();
         assert!(queue.reconcile_tab_on_completion);
         assert_eq!(second.seq, 2);
@@ -7886,7 +8059,7 @@ mod tests {
             .expect("max-generation intent must enter the worker");
 
         assert_eq!(
-            queue.try_enqueue(term_size(120, 40), pty_size(120, 40), now, false),
+            queue.try_enqueue(term_size(120, 40), pty_size(120, 40), now, false, None),
             Err(ResizeEnqueueError::SequenceExhausted),
             "generation exhaustion must fail closed rather than alias zero",
         );

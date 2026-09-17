@@ -1,4 +1,4 @@
-pub(crate) use clientpane::ReliableInputQueue;
+pub(crate) use clientpane::{ClientResizeCoordinator, QueuedResizeIntent, ReliableInputQueue};
 pub use clientpane::{ClientPane, SelectionReadError};
 pub use renderable::SelectionReadWitness;
 
