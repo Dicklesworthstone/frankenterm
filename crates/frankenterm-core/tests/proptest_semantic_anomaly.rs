@@ -105,10 +105,160 @@ fn arb_semantic_config() -> impl Strategy<Value = SemanticAnomalyConfig> {
 // SIMD math properties
 // =============================================================================
 
+/// Reference oracle in f64 with rigorous forward-error bound.
+/// - Exact f32-product / f64-sum: f32 product significands have <= 48 bits,
+///   fitting exactly into f64's 53-bit significand with zero rounding error.
+///   f64 accumulation of n terms incurs error bounded by gamma_64.
+/// - Gamma error: standard Higham bound gamma_k(u) = ku / (1 - ku). True S_abs
+///   is upper-bounded by dividing computed S_abs by (1 - gamma_64) to guard against
+///   downward rounding in f64 summation.
+/// - Conservative count 2*n + 3: sequential sum depth is n; 4-way SIMD tree depth
+///   is floor(n/4) + (n % 4) + 2 <= n/4 + 5. The count 2*n + 3 conservatively covers
+///   both algorithms while ensuring k*u32 <= 4.6e-5 << 1 for n <= 384.
+/// - Underflow allowance: smallest f32 subnormal eta = 2^-149. Additive rounding in
+///   the subnormal range accumulates with denominator (1 - ku), giving k*eta / (1 - ku).
+fn dot_product_oracle_and_bound(a: &[f32], b: &[f32]) -> (f64, f64) {
+    let n = a.len().min(b.len());
+    assert!(n <= 384, "dimension {n} exceeds bound 384");
+    for &x in a[..n].iter().chain(&b[..n]) {
+        assert!(x.is_finite() && x.abs() <= 1e6, "magnitude {x} exceeds 1e6");
+    }
+
+    let oracle: f64 = a[..n]
+        .iter()
+        .zip(&b[..n])
+        .map(|(&x, &y)| (x as f64) * (y as f64))
+        .sum();
+    let computed_sabs: f64 = a[..n]
+        .iter()
+        .zip(&b[..n])
+        .map(|(&x, &y)| (x as f64).abs() * (y as f64).abs())
+        .sum();
+
+    let u32 = (f32::EPSILON as f64) / 2.0;
+    let u64 = f64::EPSILON / 2.0;
+    let eta_f32 = f32::from_bits(1) as f64;
+
+    let k_oracle = n as f64;
+    let gamma_64 = (k_oracle * u64) / (1.0 - k_oracle * u64);
+    let s_abs = computed_sabs / (1.0 - gamma_64);
+
+    let k_ops = (2 * n + 3) as f64;
+    let ku_32 = k_ops * u32;
+    let gamma_32 = ku_32 / (1.0 - ku_32);
+    let subnormal = (k_ops * eta_f32) / (1.0 - ku_32);
+
+    let bound = (gamma_32 + gamma_64) * s_abs + subnormal;
+    (oracle, bound)
+}
+
+#[test]
+fn test_dot_product_cancellation_and_exact_fixture() {
+    // 1. Catastrophic cancellation fixture: exact sum is 2.0, products reach 10^8.
+    let a_c = [10000.0_f32, 1.0, 10000.0, 1.0];
+    let b_c = [10000.0_f32, 1.0, -10000.0, 1.0];
+    let (oracle_c, bound_c) = dot_product_oracle_and_bound(&a_c, &b_c);
+    let naive_c: f32 = a_c.iter().zip(&b_c).map(|(x, y)| x * y).sum();
+    let simd_c = dot_product_simd(&a_c, &b_c);
+    assert_eq!(oracle_c, 2.0);
+
+    // The previous criterion rejected the observed sequential result 1 and
+    // four-accumulator result 0. Do not require a future implementation to keep
+    // those rounding errors merely to demonstrate the old oracle's defect.
+    let old_tol = (1.0_f32 * 1e-3).max(1e-4);
+    assert!(1.0 > old_tol);
+
+    // Both algorithms satisfy the forward-error bound against f64 oracle:
+    // Portable cross-architecture assertion uses the bound rather than assuming
+    // exact intermediate rounding behavior or specific FMA contraction.
+    assert!(((naive_c as f64) - oracle_c).abs() <= bound_c);
+    assert!(((simd_c as f64) - oracle_c).abs() <= bound_c);
+
+    // 2. Ordinary exact dot product case:
+    let a_e = [1.0_f32, 2.0, 3.0, 4.0];
+    let b_e = [5.0_f32, 6.0, 7.0, 8.0];
+    let (oracle_e, bound_e) = dot_product_oracle_and_bound(&a_e, &b_e);
+    let naive_e: f32 = a_e.iter().zip(&b_e).map(|(x, y)| x * y).sum();
+    let simd_e = dot_product_simd(&a_e, &b_e);
+    assert_eq!(oracle_e, 70.0);
+    assert_eq!(naive_e, 70.0);
+    assert_eq!(simd_e, 70.0);
+    assert!(((naive_e as f64) - oracle_e).abs() <= bound_e);
+    assert!(((simd_e as f64) - oracle_e).abs() <= bound_e);
+
+    // Intentionally wrong result (69.0) lies outside bound: proves oracle rejects
+    // a missing unit despite being cancellation-safe.
+    let wrong_result = 69.0_f64;
+    assert!(
+        (wrong_result - oracle_e).abs() > bound_e,
+        "oracle must reject missing unit: diff={}, bound={}",
+        (wrong_result - oracle_e).abs(),
+        bound_e
+    );
+}
+
+#[test]
+fn test_dot_product_check3_57d_regression() {
+    // Real 57-element counterexample from check-3 quality log (lines 58887-59010):
+    // Seed: 1bfdb59a9d7ed8dce7d5dffb79c1948616d37f14f74b2cd1fc3f990ff2c08810
+    // Failure was: simd=62455810 naive=62316544 diff=139264 tol=62316.547
+    // Demonstrates severe cancellation where sum(|a_i * b_i|) >> |sum(a_i * b_i)|.
+    let a: [f32; 57] = [
+        514947.66, -887763.7, 876251.7, -318867.97, 622597.4, 780810.56, -906302.44, -721769.94,
+        105046.47, 407892.3, 587697.44, 606490.2, 234185.58, 557775.7, -678389.6, -604400.3,
+        306594.34, -302375.38, 902047.7, 633535.5, 354126.94, -733770.9, -764410.9, 372399.22,
+        333133.44, 421777.4, 115402.01, -343850.63, 274404.47, -242574.25, 24714.617, 643809.2,
+        694412.94, -924332.5, -429153.78, 206195.02, 722323.75, -19024.193, 547462.56, -253000.34,
+        301961.47, -118037.03, -749734.4, -73471.35, 421795.44, 125003.37, -11916.544, 901252.94,
+        -186994.02, -755964.44, 763276.75, 325428.3, 368331.75, -315826.4, 529412.3, -769678.6,
+        -32028.684,
+    ];
+    let b: [f32; 57] = [
+        642544.75, 635904.4, 342421.78, 777621.7, -494184.47, 526555.6, -901146.44, -138755.83,
+        552031.4, -741480.9, 720748.44, 356413.88, 537569.2, -358638.8, -658659.9, -773663.2,
+        354939.8, -43066.69, -934986.2, -908694.5, 64785.152, 514649.75, -258472.02, -759131.5,
+        153360.5, -922714.44, 961460.7, -610985.06, 988329.25, 319945.75, -452172.66, 104850.93,
+        -207729.81, -465307.88, 599181.1, 345641.47, -310203.03, 435002.7, 276392.38, 318756.8,
+        -364915.78, -601904.1, 313989.13, 746483.5, 517986.3, 784164.4, -700356.3, -615814.4,
+        -685365.75, 21567.357, -394237.0, 966346.94, 185274.77, 994083.25, 316854.97, 33568.277,
+        -922808.44,
+    ];
+
+    let naive: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    let simd = dot_product_simd(&a, &b);
+    let (oracle, bound) = dot_product_oracle_and_bound(&a, &b);
+
+    // The retained failure proves the old tolerance was unsound. Use its
+    // recorded results here so improved summation is also allowed to pass.
+    let old_tol = (62_316_544.0_f32 * 1e-3).max(1e-4);
+    let old_diff = 139_264.0_f32;
+    assert!(
+        old_diff > old_tol,
+        "old tolerance must fail on check-3 counterexample: diff={old_diff}, tol={old_tol}"
+    );
+
+    // 2. Confirm that both naive and SIMD implementations satisfy the rigorous
+    //    forward-error bound against the f64 reference oracle:
+    //    Portable cross-architecture assertion uses the bound rather than asserting
+    //    brittle exact values.
+    let diff_naive = ((naive as f64) - oracle).abs();
+    let diff_simd = ((simd as f64) - oracle).abs();
+    assert!(
+        diff_naive <= bound,
+        "naive diff {diff_naive} exceeds bound {bound} (naive={naive}, oracle={oracle})"
+    );
+    assert!(
+        diff_simd <= bound,
+        "simd diff {diff_simd} exceeds bound {bound} (simd={simd}, oracle={oracle})"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    // 1. dot_product_simd matches naive dot product
+    // 1. dot_product_simd and naive match f64 oracle separately
+    // Counterexample regression seed (check-3):
+    // 1bfdb59a9d7ed8dce7d5dffb79c1948616d37f14f74b2cd1fc3f990ff2c08810
     #[test]
     fn prop_dot_product_matches_naive(
         a in arb_vector_range(1, 128),
@@ -117,13 +267,17 @@ proptest! {
         let n = a.len().min(b.len());
         let naive: f32 = a[..n].iter().zip(&b[..n]).map(|(x, y)| x * y).sum();
         let simd = dot_product_simd(&a, &b);
-        // Allow f32 summation-order precision differences (4-accumulator SIMD
-        // changes reduction order vs sequential sum, causing larger divergence
-        // on large-magnitude ill-conditioned inputs).
-        let tol = (naive.abs() * 1e-3).max(1e-4);
-        let diff = (simd - naive).abs();
-        let ok = diff < tol;
-        prop_assert!(ok, "simd={} naive={} diff={} tol={}", simd, naive, diff, tol);
+        let (oracle, bound) = dot_product_oracle_and_bound(&a, &b);
+        let diff_naive = ((naive as f64) - oracle).abs();
+        let diff_simd = ((simd as f64) - oracle).abs();
+        prop_assert!(
+            diff_naive <= bound,
+            "naive diff {diff_naive} exceeds bound {bound} (naive={naive}, oracle={oracle})"
+        );
+        prop_assert!(
+            diff_simd <= bound,
+            "simd diff {diff_simd} exceeds bound {bound} (simd={simd}, oracle={oracle})"
+        );
     }
 
     // 2. dot_product_simd is commutative
@@ -962,28 +1116,21 @@ proptest! {
     // 43. SIMD dot product matches naive for 384d vectors (embedding isomorphism)
     #[test]
     fn prop_simd_384d_isomorphism(
-        seed in 0_u64..10000,
+        a in arb_vec(-1.0_f32..=1.0, 384..=384),
+        b in arb_vec(-1.0_f32..=1.0, 384..=384),
     ) {
-        // Deterministic pseudo-random 384d vectors from seed.
-        let a: Vec<f32> = (0..384)
-            .map(|i| ((seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) as f32) / u32::MAX as f32)
-            .collect();
-        let b: Vec<f32> = (0..384)
-            .map(|i| ((seed.wrapping_mul(1442695040888963407).wrapping_add(i as u64 + 384)) as f32) / u32::MAX as f32)
-            .collect();
-
         let simd_result = dot_product_simd(&a, &b);
         let naive_result = naive_dot_product(&a, &b);
-
-        let tol = (naive_result.abs() * 1e-4).max(1e-4);
-        let diff = (simd_result - naive_result).abs();
+        let (oracle, bound) = dot_product_oracle_and_bound(&a, &b);
+        let diff_naive = ((naive_result as f64) - oracle).abs();
+        let diff_simd = ((simd_result as f64) - oracle).abs();
         prop_assert!(
-            diff < tol,
-            "384d isomorphism failed: simd={}, naive={}, diff={}, tol={}",
-            simd_result,
-            naive_result,
-            diff,
-            tol
+            diff_naive <= bound,
+            "384d naive divergence: naive={naive_result} oracle={oracle} diff={diff_naive} bound={bound}"
+        );
+        prop_assert!(
+            diff_simd <= bound,
+            "384d simd divergence: simd={simd_result} oracle={oracle} diff={diff_simd} bound={bound}"
         );
     }
 }
