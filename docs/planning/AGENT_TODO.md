@@ -1182,13 +1182,44 @@ power loss nor migration of those live sessions has been demonstrated.
   consume the same sequence/dimensions observation that validated the anchor,
   and check the anchor even on the first chunk. Add a real LocalPane/PTY
   regression for intervening output and rejection of edited selected rows.
-- [ ] Execute the 34-test selection suite for `0122937ae`; retain
-  `0122937-selection-rch.log`. Independent source review found no further
-  causal defect; it is not execution or native acceptance evidence.
-- [ ] Resolve remote/cold selections cancelling during unrelated output;
-  require a witness covering already copied chunks before accepting a newer
-  sequence. The resident native-anchor fix does not establish this contract.
+- [x] Diagnose the `0122937ae` GUI test compilation failure: the real LocalPane
+  regression lacked its `TermWindow` import. Fix in `055db057a`, then scope
+  that import to Unix in `e8ba62a91`. No 34-test passing receipt yet.
+- [ ] Execute the current-source GUI selection suite, including the new
+  LocalPane race regression. The earlier 33-test result remains narrower.
+- [x] Implement bounded remote selection witnesses in `055db057a`, covering
+  the entire original selection even after copied rows leave the render cache.
+  Preserve selection across unrelated output; reject selected-row mutations,
+  retention loss, layout changes, wrong owners and mismatched ranges.
+- [x] Execute client selection tests at `c2d63e3f7`: strict RCH
+  `j-30023605353972010`, 11 passed, zero failed, 326 filtered. Retain
+  `c2d63e3-client-selection-rch.log`.
+- [x] Fix empty remote damage intervals falsely invalidating a selection in
+  `3055baea8`; extend the witness regression with an empty-interval control.
+- [ ] Prove that latest control and the complete client suite. Initial full
+  client admission on worker122 timed out without compiling; the direct Mac
+  RCH service admitted worker3651 at 05:23 UTC on `e8ba62a91`.
+- [ ] Resolve cold local selections cancelling during unrelated output when
+  no resident native anchor exists. The remote witness does not cover this case.
 - [ ] Execute exact remote-pane mapping regression in client layout tests.
+- [x] Diagnose that mapping test's setup failure: domain91030 was never
+  registered. Reuse the existing registration helper in `baca379ba` before
+  exercising the production layout snapshot path; rerun remains required.
+- [x] Execute workspace check at `f66007801`: strict RCH
+  `j-30023605353971994`, exit zero. This predates the remote-witness changes.
+- [x] Fix workspace Clippy's oversized LocalPane ownership enum in `c2d63e3f7`
+  by boxing guardian-only metadata, preserving compact ordinary panes.
+- [x] Review and integrate guardian Clippy fixes in `e8ba62a91`, including
+  the cross-file historical-context test caller. Scoped formatting passes;
+  repeat workspace Clippy and compilation on current source.
+- [x] Retain RubyFortress's allocation-free resident anchor checks:
+  seven default-feature tests and seven serialization-feature tests passed,
+  plus term library/test Clippy. Scope the getter to its actual caller features.
+- [x] Reuse that exact row-validation helper during LocalPane anchor capture,
+  removing its duplicate full-span pointer allocation when output intervenes.
+  Preserve source, geometry, retention and selected-row mutation checks.
+- [ ] Execute the existing LocalPane native-selection capture regressions
+  against this helper reuse; the earlier term-only receipt is insufficient.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier
   419-test surface receipt and terminal oracle corrections.

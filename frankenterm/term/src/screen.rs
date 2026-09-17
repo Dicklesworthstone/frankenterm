@@ -4394,7 +4394,7 @@ impl Screen {
     /// that sequence elsewhere does not invalidate these resident coordinates
     /// when every row in the selected span is unchanged. Never load cold rows
     /// or accept pruned endpoints as evidence of an unchanged selection.
-    fn selection_anchor_rows_unchanged_since(
+    pub fn selection_anchor_rows_unchanged_since(
         &self,
         points: &[Option<SelectionAnchorCoordinate>; 3],
         sequence: SequenceNo,

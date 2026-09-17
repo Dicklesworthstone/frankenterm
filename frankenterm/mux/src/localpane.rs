@@ -3064,30 +3064,10 @@ impl LocalPane {
             if sequence < expected_sequence {
                 return Err(SelectionAnchorCaptureError::SourceChanged);
             }
-            let mut rows = points.iter().flatten().map(|point| point.row);
-            let Some(first) = rows.next() else {
-                return Err(SelectionAnchorCaptureError::SourceChanged);
-            };
-            let (start, end) = rows.fold((first, first), |(start, end), row| {
-                (start.min(row), end.max(row))
-            });
-            let screen = term.screen();
-            let Some(start) = screen.stable_row_to_phys(start) else {
-                return Err(SelectionAnchorCaptureError::SourceChanged);
-            };
-            let Some(end) = screen
-                .stable_row_to_phys(end)
-                .and_then(|end| end.checked_add(1))
-            else {
-                return Err(SelectionAnchorCaptureError::SourceChanged);
-            };
-            let mut changed = false;
-            screen.with_phys_lines(start..end, |lines| {
-                changed |= lines
-                    .iter()
-                    .any(|line| line.changed_since(expected_sequence));
-            });
-            if changed {
+            if !term
+                .screen()
+                .selection_anchor_rows_unchanged_since(&points, expected_sequence)
+            {
                 return Err(SelectionAnchorCaptureError::SourceChanged);
             }
         }
