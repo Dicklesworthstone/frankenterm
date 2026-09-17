@@ -7308,14 +7308,15 @@ impl WholeMuxRecoveryVerifier {
                                 crate::mux_recovery_image::RecoverySpawnCustody::from(Some(
                                     mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
                                         original: scope,
-                                        current_mux_incarnation: scope.mux_incarnation,
+                                        current_mux_incarnation: witness.capturing_mux_incarnation(),
                                         current_lease_generation: witness.generation(),
                                     },
                                 ));
                                 if pane.spawn_custody != expected_provenance
                                     || scope.guardian_incarnation
                                         != publication.guardian_incarnation
-                                    || scope.mux_incarnation != publication.mux_incarnation
+                                    || witness.capturing_mux_incarnation()
+                                        != publication.mux_incarnation
                                     || witness.generation() != *guardian_generation
                                     || witness.sequence() != *catalog_generation
                                     || witness.effect_id() != publication.effect_id

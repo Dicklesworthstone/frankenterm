@@ -721,11 +721,16 @@ impl GuardianDurableSpawnCustodyV1 {
                 .next()
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             if selected.next().is_some()
-                || member.metadata.capture_generation != 1
-                || member.metadata.adoption_mux_incarnation != self.context.mux_incarnation
+                || member.metadata.capture_generation == 0
+                || (member.metadata.capture_generation == 1
+                    && member.metadata.adoption_mux_incarnation != self.context.mux_incarnation)
             {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
             }
+            // Custody identifies the original birth. A later capture belongs
+            // to its successor lease, whose owner and generation are bound by
+            // the protected adoption evidence and durable ACK below. This
+            // read-only witness never grants that successor a live lease.
             checkpoint_catalog_require_existing_ack(inner, member)?;
             Ok(GuardianReopenedCheckpointV1 {
                 scope: self.context.scope(),
@@ -851,7 +856,7 @@ struct CheckpointCatalogMetadata {
 /// Read-only evidence obtained from an existing private Spawn capability and
 /// one settled ProtectedV3 publication with an authenticated ACK finalizer.
 /// The guardian identity comes from custody under the same pinned key; the
-/// catalog binds the pane, original mux, generation and canonical payload.
+/// catalog binds the pane, capturing mux, generation and canonical payload.
 /// Process-local registration is deliberately not claimed by this witness.
 pub struct GuardianReopenedCheckpointV1 {
     scope: GuardianSpawnCustodyScopeV1,
@@ -864,6 +869,9 @@ impl GuardianReopenedCheckpointV1 {
     }
     pub const fn generation(&self) -> u64 {
         self.metadata.capture_generation
+    }
+    pub const fn capturing_mux_incarnation(&self) -> Uuid {
+        self.metadata.adoption_mux_incarnation
     }
     pub const fn sequence(&self) -> u64 {
         self.metadata.adoption_sequence
@@ -13816,6 +13824,141 @@ mod tests {
         store
             .apply_replay_ack(&request, preflight)
             .map_err(Into::into)
+    }
+
+    #[test]
+    fn successor_checkpoint_reopen_preserves_birth_custody_and_authenticated_capture_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, poll, pipeline) = pipeline_with_policy(
+            "ft-successor-custody-reopen-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let scope = context.scope();
+        let guardian = scope.guardian_incarnation;
+        let original_mux = scope.mux_incarnation;
+        let successor_mux = Uuid::from_u128(0xac201);
+        let pane = scope.pane_id;
+        drop(store.persist_spawn_custody(&context, &Zeroizing::new([0x93; 32]))?);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, original_mux, pane)?;
+        checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            original_mux,
+            pane,
+            1,
+            1,
+            0xac210,
+            b"original",
+            b"original",
+        )?;
+        let claim = checkpoint_catalog_authenticate_request(
+            GuardianOperation::Claim,
+            guardian,
+            successor_mux,
+            Uuid::from_u128(0xac220),
+            Some(pane),
+            1,
+            0,
+            Some(Uuid::from_u128(0xac221)),
+            Zeroizing::new(Vec::new()),
+        )?;
+        state.apply_effect_transactionally(&claim, |_| {
+            GuardianEffectOutcome::<std::convert::Infallible>::Applied
+        })?;
+        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
+            &pipeline,
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            successor_mux,
+            pane,
+            2,
+            1,
+            0xac230,
+            b"-successor",
+            b"original-successor",
+        )?;
+        let token = directory.join("guardian.token");
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(checkpoint_id)
+                .is_err(),
+            "publication without durable ACK cannot authorize offline reopen"
+        );
+        let (begin, completion) = store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            let member = catalog
+                .published
+                .iter()
+                .find(|member| member.metadata.checkpoint_id == checkpoint_id)
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            Ok((
+                GuardianCheckpointStageRequestV1::decode(&plaintext)?,
+                member.metadata.completion_id,
+            ))
+        })?;
+        let ack = || {
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                completion,
+            )
+        };
+        assert!(
+            store
+                .apply_ack_from_committed_catalog(ack()?, original_mux)
+                .is_err(),
+            "the original owner cannot finalize its successor's checkpoint"
+        );
+        store.apply_ack_from_committed_catalog(ack()?, successor_mux)?;
+        drop(journal);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        let witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+            .reopen_checkpoint(checkpoint_id)?;
+        assert_eq!(witness.scope(), scope);
+        assert_eq!(witness.generation(), 2);
+        assert_eq!(witness.capturing_mux_incarnation(), successor_mux);
+        assert_ne!(
+            witness.capturing_mux_incarnation(),
+            witness.scope().mux_incarnation
+        );
+        assert_eq!(witness.checkpoint_id(), checkpoint_id);
+        let mut wrong_scope = scope;
+        wrong_scope.mux_incarnation = successor_mux;
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, wrong_scope).is_err(),
+            "capturing owner cannot be substituted for original birth custody"
+        );
+        Ok(())
     }
 
     #[test]
