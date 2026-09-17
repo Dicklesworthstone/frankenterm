@@ -93,6 +93,19 @@ impl
 }
 
 impl PendingNativeSelection {
+    pub(crate) fn expire_remote_copy(pending: &mut Option<Self>, now: std::time::Instant) -> bool {
+        if pending
+            .as_ref()
+            .and_then(|pending| pending.remote_copy.as_ref())
+            .is_some_and(|copy| now >= copy.deadline())
+        {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn new(desired: Selection) -> Self {
         Self {
             desired,

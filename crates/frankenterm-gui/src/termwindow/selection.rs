@@ -1096,6 +1096,43 @@ mod tests {
     use termwiz::surface::SEQ_ZERO;
 
     #[test]
+    fn remote_selection_copy_expiry_releases_hidden_pane_text_once() {
+        let selection = Selection {
+            range: Some(SelectionRange {
+                start: SelectionCoordinate::x_y(0, 0),
+                end: SelectionCoordinate::x_y(3, 2),
+            }),
+            ..Selection::default()
+        };
+        let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        copy.push_chunk(vec![Line::from("retained"), Line::from("text")])
+            .unwrap();
+        assert!(!copy.text.is_empty());
+        let deadline = copy.deadline();
+        let mut intent = crate::selection::PendingNativeSelection::new(selection);
+        intent.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
+        intent.remote_copy = Some(copy);
+        let mut hidden = Some(intent);
+        assert!(
+            !crate::selection::PendingNativeSelection::expire_remote_copy(
+                &mut hidden,
+                deadline - std::time::Duration::from_nanos(1)
+            )
+        );
+        assert!(hidden.is_some());
+        assert!(
+            crate::selection::PendingNativeSelection::expire_remote_copy(&mut hidden, deadline)
+        );
+        assert!(
+            hidden.is_none(),
+            "hidden pane retains neither text nor clipboard intent after expiry"
+        );
+        assert!(
+            !crate::selection::PendingNativeSelection::expire_remote_copy(&mut hidden, deadline)
+        );
+    }
+
+    #[test]
     fn remote_selection_copy_never_publishes_partial_or_changed_source_text() {
         let selection = Selection {
             range: Some(SelectionRange {

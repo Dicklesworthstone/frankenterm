@@ -230,7 +230,15 @@ impl crate::TermWindow {
     /// swap from bypassing the bounded retry lane via an immediate animation or
     /// frame-budget repaint.
     pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
+        let now = Instant::now();
+        let mut expired_copy = false;
         for (pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
+            // The deadline belongs to the transaction, including panes in
+            // hidden tabs that are not visited by the visible retry loop.
+            expired_copy |= crate::selection::PendingNativeSelection::expire_remote_copy(
+                &mut state.pending_native_selection,
+                now,
+            );
             if let Some(frame) = state.selection_frame.presented() {
                 // This record is emitted only after backend acceptance and uses
                 // the complete frame actually staged for drawing. It is not a
@@ -248,6 +256,12 @@ impl crate::TermWindow {
                     outcome.submission_mach_ns.unwrap_or_default(),
                 );
             }
+        }
+        if expired_copy {
+            frankenterm_toast_notification::persistent_toast_notification(
+                "Selection was not copied",
+                "The remote text did not arrive in time. Copy the selection again.",
+            );
         }
         // Released gestures retain their final endpoint through contention,
         // so native anchor retries are not limited to an active drag.
