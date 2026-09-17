@@ -7217,6 +7217,27 @@ mod tests {
         assert_eq!(pane.get_dimensions().cols, desired.cols);
         assert_eq!(pane.get_dimensions().viewport_rows, desired.rows);
 
+        // A font increase can return to the geometry cached by the stale
+        // topology snapshot while the pane still has the newer, wider grid.
+        // That explicit command must reach the pane even though the tab's
+        // cached size already equals its target.
+        let stale_size = tab.get_size();
+        assert_ne!(stale_size, desired);
+        tab.resize(stale_size);
+        assert!(
+            !peer.is_empty(),
+            "returning to stale tab geometry must resize the divergent pane"
+        );
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == stale_size));
+        while executor.try_tick().unwrap() {}
+        assert_eq!(pane.get_dimensions().cols, stale_size.cols);
+        assert_eq!(pane.get_dimensions().viewport_rows, stale_size.rows);
+        tab.resize(desired);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == desired));
+        while executor.try_tick().unwrap() {}
+
         let mut current_listing = old_listing;
         let PaneNode::Leaf(entry) = &mut current_listing.tabs[0] else {
             panic!("fixture must contain one pane");

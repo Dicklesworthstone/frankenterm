@@ -13266,6 +13266,24 @@ impl TabInner {
             return callbacks;
         }
         if !force_reflow && self.size == size {
+            // The cached topology size is not proof that its panes reached
+            // that geometry. A remote snapshot can install an older tab size
+            // while its resize callbacks are deliberately suppressed, leaving
+            // a newer pane size intact. An explicit resize back to that cached
+            // size must still reach the panes (and retry failed delivery).
+            // Preserve the layout and avoid topology notifications; execute
+            // pane callbacks only after releasing the tab lock as usual.
+            if let Some(zoomed) = &self.zoomed {
+                callbacks.resize_work.push((Arc::clone(zoomed), size));
+            } else if let Some(tree) = self.pane.as_ref() {
+                collect_pane_resize_work(tree, &size, &mut callbacks.resize_work);
+            }
+            for floating in &self.floating_panes {
+                callbacks.resize_work.push((
+                    Arc::clone(&floating.pane),
+                    self.floating_pane_size(floating.rect),
+                ));
+            }
             return callbacks;
         }
 

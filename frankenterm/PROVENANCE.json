@@ -162,15 +162,15 @@
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 33
+        "test": 34
       },
-      "fork_side_commit_count": 236,
+      "fork_side_commit_count": 237,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-17T13:31:53-04:00",
-        "sha": "42a6d49981e84a11b46317371e45d54fce8fd95d",
-        "subject": "test(client): settle palette setup before resize echo assertions"
+        "committed_at": "2026-09-17T15:58:20-04:00",
+        "sha": "079ea2283c73778064a0bbaba2ec13c5335714a1",
+        "subject": "test(client): reproduce font resize back to stale tab geometry"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 196,
-        "fix": 242,
+        "fix": 243,
         "other": 49,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 96
       },
-      "fork_side_commit_count": 653,
+      "fork_side_commit_count": 654,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-17T12:54:24-04:00",
-        "sha": "346b7c3253781a71ef25b6b2d30660593c1f16e7",
-        "subject": "test(mux): format focus regression assertion diagnostics on Rust 2018"
+        "classification": "fix",
+        "committed_at": "2026-09-17T16:00:18-04:00",
+        "sha": "ce9fe6d8f761bb2ccc6af5aee7db0a27d2734cd7",
+        "subject": "fix(mux): deliver explicit resize despite matching cached tab geometry"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2737,
-  "generated_at": "2026-09-17T17:49:04.395690Z",
+  "fork_side_commit_total": 2739,
+  "generated_at": "2026-09-17T20:33:31.170825Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

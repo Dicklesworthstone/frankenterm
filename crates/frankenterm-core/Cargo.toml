@@ -195,6 +195,10 @@ rustix = { workspace = true, features = ["process"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 xattr.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+# Diagnostic examples correlate their phases with same-host perf samples.
+rustix = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 anyhow.workspace = true
 syn = { workspace = true, features = ["full", "visit"] }

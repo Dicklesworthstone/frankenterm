@@ -7,6 +7,13 @@
 //! UnitResponse measures admission; render dimensions plus a nonce-bearing
 //! TIOCGWINSZ reply measure client-observed convergence including observer cost.
 //! This does not measure native rendering, network transport, or display latency.
+//! Set FT_REMOTE_MUX_PROFILE_PHASES=1 only in the instrumentation arm. Phase
+//! intervals use CLOCK_MONOTONIC; the sampler must explicitly use the same clock.
+//! Instrumented timings must not be mixed into the ordinary latency baseline.
+
+// The nested Cx-aware timeout and transport futures require the same trait
+// solver depth as frankenterm-core when Clippy verifies their Send bounds.
+#![recursion_limit = "256"]
 
 #[cfg(not(all(unix, feature = "vendored")))]
 fn main() {
@@ -47,6 +54,7 @@ mod measured {
         ready: String,
         corpus_sha256: String,
         trials: usize,
+        profile_phases: bool,
     }
 
     fn emit(value: Value) -> Result<()> {
@@ -118,12 +126,12 @@ mod measured {
             );
             for (index, line) in lines.iter().enumerate() {
                 ensure!(
-                    line.starts_with(&format!("FT_RECORD_{index:05d} "))
-                        && line.ends_with(&format!("FT_END_{index:05d}")),
+                    line.starts_with(&format!("FT_RECORD_{index:05} "))
+                        && line.ends_with(&format!("FT_END_{index:05}")),
                     "invalid record {index}"
                 );
             }
-            let corpus_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let corpus_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
             let trials = usize::try_from(number(5)?)?;
             ensure!((1..=100).contains(&trials), "trials must be 1..100");
             Ok(Self {
@@ -135,7 +143,36 @@ mod measured {
                 ready: format!("FT_CORPUS_READY {corpus_sha256}"),
                 corpus_sha256,
                 trials,
+                profile_phases: std::env::var("FT_REMOTE_MUX_PROFILE_PHASES").as_deref() == Ok("1"),
             })
+        }
+
+        fn phase_time(&self) -> Result<Option<u128>> {
+            if !self.profile_phases {
+                return Ok(None);
+            }
+            let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            let seconds = u128::try_from(now.tv_sec).context("negative monotonic seconds")?;
+            let nanos = u128::try_from(now.tv_nsec).context("negative monotonic nanoseconds")?;
+            ensure!(nanos < 1_000_000_000, "invalid monotonic nanoseconds");
+            Ok(Some(seconds * 1_000_000_000 + nanos))
+        }
+
+        fn phase(
+            &self,
+            nonce: &str,
+            cols: usize,
+            name: &str,
+            start: Option<u128>,
+            end: Option<u128>,
+        ) -> Result<()> {
+            if let Some((start, end)) = start.zip(end) {
+                ensure!(end >= start, "profiling clock regressed");
+                emit(json!({"event":"phase", "nonce":nonce, "columns":cols,
+                    "phase":name, "clock":"CLOCK_MONOTONIC", "start_ns":start,
+                    "end_ns":end, "instrumented":true}))?;
+            }
+            Ok(())
         }
 
         fn verify_lease(&self) -> Result<()> {
@@ -203,6 +240,7 @@ mod measured {
             let before = client
                 .get_pane_render_changes_with_cx(cx, self.pane)
                 .await?;
+            let request_start = self.phase_time()?;
             let started = Instant::now();
             client
                 .resize_with_cx(
@@ -219,6 +257,7 @@ mod measured {
                 )
                 .await?;
             let admission_us = started.elapsed().as_micros();
+            let admission_end = self.phase_time()?;
             let mut polls = 0usize;
             let terminal_us;
             let mut previous_seqno = before.seqno;
@@ -245,6 +284,7 @@ mod measured {
                     .await
                     .map_err(anyhow::Error::msg)?;
             }
+            let terminal_end = self.phase_time()?;
             client
                 .write_to_pane_with_cx(cx, self.pane, format!("PROBE {nonce}\n").into_bytes())
                 .await?;
@@ -276,9 +316,31 @@ mod measured {
                     .map_err(anyhow::Error::msg)?;
             }
             let convergence_us = started.elapsed().as_micros();
+            let probe_end = self.phase_time()?;
             // Full history correctness is deliberately outside the timed interval.
             self.oracle(client, cx).await?;
+            let oracle_end = self.phase_time()?;
+            // Emit after measurement so stdout serialization cannot enter a
+            // recorded resize interval. Missing intervals after a failure are
+            // intentionally unusable for phase-filtered CPU attribution.
+            self.phase(
+                nonce,
+                cols,
+                "resize_admission",
+                request_start,
+                admission_end,
+            )?;
+            self.phase(
+                nonce,
+                cols,
+                "terminal_convergence",
+                admission_end,
+                terminal_end,
+            )?;
+            self.phase(nonce, cols, "pty_probe", terminal_end, probe_end)?;
+            self.phase(nonce, cols, "full_history_oracle", probe_end, oracle_end)?;
             Ok(json!({"status":"passed", "columns":cols, "rows":24,
+                "instrumented":self.profile_phases,
                 "from_columns":before.dimensions.cols, "admission_us":admission_us,
                 "terminal_observed_us":terminal_us, "pty_echo_convergence_us":convergence_us,
                 "observer_polls":polls, "sequence_before":before.seqno,
@@ -338,6 +400,8 @@ mod measured {
                 "scope":"remote-host-private-Unix-socket; excludes native and network",
                 "boundary":"request start to observed terminal dimensions and real PTY geometry echo",
                 "observer_cost_included":true,"corpus_sha256":self.corpus_sha256,
+                "instrumented":self.profile_phases,
+                "phase_clock":if self.profile_phases {Some("CLOCK_MONOTONIC")} else {None},
                 "socket":self.socket,"server_pid":self.server_pid,"pane_id":self.pane,"tab_id":self.tab,
                 "columns":[120,60,100,80],"rows":24,"settle_deadline_ms":5000}),
             )?;

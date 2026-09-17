@@ -731,8 +731,8 @@ impl super::TermWindow {
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
         // ft-t9l62: consecutive pixel resize events can map to the same terminal
-        // geometry. Tab::resize already returns early for an unchanged size;
-        // this check also avoids repeated window/tab locks and overlay work.
+        // geometry. This check avoids repeated window/tab locks, pane resize
+        // callbacks, and overlay work when the GUI's target is unchanged.
         // Compare the complete TerminalSize, including pixels and DPI. The
         // window pixel dimensions were updated above, so rendering still uses
         // the new window bounds even when the terminal geometry is unchanged.

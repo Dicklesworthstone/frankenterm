@@ -82,7 +82,13 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
   same durable output boundary, including a resize without new process output.
   Checkpoint identities and authenticated adoption history remain distinct.
 
-The `0.15.6-rc.35` candidate includes these changes. The 50 ms resize target,
+- Returning to an earlier font size now resizes remote panes even when a delayed
+  topology snapshot has already restored the tab's cached dimensions. Pane
+  callbacks run after the tab lock is released and preserve the window size.
+- Offline recovery selects the authenticated checkpoint adoption by its complete
+  capture identity, including mux incarnation, generation, effect and sequence.
+
+The `0.15.6-rc.37` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.
