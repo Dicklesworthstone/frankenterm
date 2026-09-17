@@ -1330,12 +1330,23 @@ power loss nor migration of those live sessions has been demonstrated.
     companion, then broader checkpoint authority and registration tests.
     Both exact real-process tests passed against the matching sealed `7a1dc66a6`
     guardian and test executable: real birth/checkpoint/image/fresh reopen in
-    2.34s, and in-flight cancellation in 1.43s. Strict RCH Cargo execution of
-    both tests is active; direct-artifact diagnostics are not its substitute.
+    2.34s, and in-flight cancellation in 1.43s. Strict RCH then executed both:
+    two passed, zero failed/ignored, 662 filtered, 4.53s on worker114. Retain
+    `7a1dc66-realbirth-rch.log`. Broader proxy verification exposed two stale
+    geometry error-wrapper assertions; `052cbe5d1` checks the exact model cause.
   - [ ] Implement and prove successor-generation checkpoint reopen (`ft-7sdcc`):
     the current custody reopen path rejects generation two and later. Preserve
     original spawn custody and authenticate the later owner from durable
     checkpoint/ACK evidence before changing this fence.
+    `4ac65fb80` implements that witness and adds a durable generation-two
+    regression; strict RCH worker2480 is compiling it. The first hz3 attempt
+    refused admission before Cargo, without local fallback.
+  - [ ] Verify manifest-driven witness discovery in `1c6bf143f`: the fresh
+    subprocess now gets root/token paths only, no pane-scope/checkpoint hints.
+    It derives identities from the authenticated manifest and checks existing
+    custody/catalog/ACK records. Missing custody must remain absent. A matching
+    sealed family is building on worker3651; automatic startup/live topology
+    adoption is still separate unfinished work.
   - [ ] Validate reviewed follow-up checks for increasing journal offsets,
     nonzero geometry and the exact private capture authority inventory.
 - [x] Correct Clippy's similar-name error in the recovery-image adapter.
@@ -1348,11 +1359,17 @@ power loss nor migration of those live sessions has been demonstrated.
   in `98213b1b4`. The same error blocked GUI compilation at `61b282364`.
   Worker126 now tests the corrected source through the real `glyphcache_unit`
   harness. Neither failed compilation counts as selection test coverage.
+  That corrected run finished: 48 passed, zero failed/ignored, 711 filtered,
+  21.73s; retain `98213b1-gui-selection-rch.log`. The Clippy pass also found
+  one needless reference in the guardian test, corrected in `1c6bf143f`.
 - [ ] Finish quick-select async acceptance review: remove blocking metadata
   reads, retain Busy without restarting, retire on retry admission failure,
   enforce deadlines while hydration is pending, publish exact read plans before
   dispatch, and release pane-state borrows before overlay mutations. Fuchsia
   owns this file; its initial formatting-only check is not runtime verification.
+  Root took handoff, corrected weak tests and lifetime checks, and committed
+  `f25c205ac`. Its exact quick-select harness is compiling on worker126.
+  Deadline arithmetic/drop coverage does not prove timer admission failure.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
   eight Cargo gates skipped. This is not strict release attestation closure.
 - [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping
@@ -1360,6 +1377,9 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Repeat exact-source formatting proof after that correction.
   Worker126's e08 run hit its remote deadline (exit 137) before executing
   the test; it is not formatting proof. TS1 is independently disk-constrained.
+  `88b7c29b2` subsequently passed the strict whole-workspace formatting test:
+  one passed, zero filtered, exact `WORKSPACE_FORMAT_PROOF_SUCCESS` marker,
+  worker3651. Later source changes still require final-revision proof.
 - [ ] Complete DSR quality: the c733 first check failed remote queue admission
   without local fallback. Four canonical attestation producers remain open:
   Lindley bounds, redaction, operating envelope and Doctor live transactions.

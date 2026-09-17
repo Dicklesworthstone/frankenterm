@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 195,
-        "fix": 237,
+        "fix": 238,
         "other": 49,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 92
       },
-      "fork_side_commit_count": 643,
+      "fork_side_commit_count": 644,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-17T04:38:05-04:00",
-        "sha": "2726d1332e8ecc0e82190ab8fb1d4308b904e3cd",
-        "subject": "fix(recovery): retain live reader across retryable replay exchanges"
+        "committed_at": "2026-09-17T04:53:32-04:00",
+        "sha": "7a1dc66a6dcbece3d74165662c0077f8994c597b",
+        "subject": "fix(recovery): verify durable witnesses in the guardian digest domain"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 55,
-        "fix": 113,
+        "fix": 114,
         "other": 57,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 62
       },
-      "fork_side_commit_count": 320,
+      "fork_side_commit_count": 321,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-17T01:28:06-04:00",
-        "sha": "23df4c138decd94879eba1d4975f6c73c3bf2b0c",
-        "subject": "perf(selection): reuse allocation-free validation during anchor capture"
+        "classification": "fix",
+        "committed_at": "2026-09-17T04:59:59-04:00",
+        "sha": "98213b1b40685bb9956f5cdf11440a628f522409",
+        "subject": "fix(selection): preserve complete context at known history start"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2718,
-  "generated_at": "2026-09-17T08:45:06.660045Z",
+  "fork_side_commit_total": 2720,
+  "generated_at": "2026-09-17T09:28:29.284096Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
