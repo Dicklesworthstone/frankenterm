@@ -1329,20 +1329,27 @@ impl super::TermWindow {
         }
         self.commit_selection_candidate(pane, desired);
 
-        // Scroll viewport when the mouse moves out of its vertical bounds.
-        if position.row == 0 && position.y_pixel_offset < 0 {
-            self.set_viewport(pane.pane_id(), Some(y.saturating_sub(1)), dims);
-        } else if position.row >= dims.viewport_rows as i64 {
-            let top = self
-                .get_viewport(pane.pane_id())
-                .unwrap_or(dims.physical_top);
-            self.set_viewport(pane.pane_id(), Some(top.saturating_add(1)), dims);
-        }
+        self.scroll_selection_viewport(pane.pane_id(), position, y, dims);
 
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
         true
+    }
+
+    fn scroll_selection_viewport(
+        &mut self,
+        pane_id: PaneId,
+        position: wezterm_term::input::ClickPosition,
+        y: wezterm_term::StableRowIndex,
+        dims: mux::renderable::RenderableDimensions,
+    ) {
+        if position.row == 0 && position.y_pixel_offset < 0 {
+            self.set_viewport(pane_id, Some(y.saturating_sub(1)), dims);
+        } else if position.row >= dims.viewport_rows as i64 {
+            let top = self.get_viewport(pane_id).unwrap_or(dims.physical_top);
+            self.set_viewport(pane_id, Some(top.saturating_add(1)), dims);
+        }
     }
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
@@ -1597,6 +1604,12 @@ impl super::TermWindow {
 
             announce_pick_if_smart(payload.pick);
             self.commit_selection_candidate(pane, desired);
+
+            if !pending.released {
+                if let Some((position, row)) = pending.end {
+                    self.scroll_selection_viewport(pane.pane_id(), position, row, dimensions);
+                }
+            }
 
             if let Some(destination) = pending.copy {
                 self.defer_pending_selection_copy(pane, destination);
