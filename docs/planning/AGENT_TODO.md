@@ -1184,9 +1184,11 @@ power loss nor migration of those live sessions has been demonstrated.
   regression for intervening output and rejection of edited selected rows.
 - [x] Diagnose the `0122937ae` GUI test compilation failure: the real LocalPane
   regression lacked its `TermWindow` import. Fix in `055db057a`, then scope
-  that import to Unix in `e8ba62a91`. No 34-test passing receipt yet.
-- [ ] Execute the current-source GUI selection suite, including the new
-  LocalPane race regression. The earlier 33-test result remains narrower.
+  that import to Unix in `e8ba62a91`.
+- [x] Execute the GUI selection suite at `1ee43344b`, including the new
+  LocalPane race regression: strict RCH `j-30023644042232351`, 34 passed,
+  zero failed, 713 filtered; `1ee4334-gui-selection-direct-rch.log`.
+  This is Rust harness evidence, not final native mouse acceptance.
 - [x] Implement bounded remote selection witnesses in `055db057a`, covering
   the entire original selection even after copied rows leave the render cache.
   Preserve selection across unrelated output; reject selected-row mutations,
@@ -1196,15 +1198,17 @@ power loss nor migration of those live sessions has been demonstrated.
   `c2d63e3-client-selection-rch.log`.
 - [x] Fix empty remote damage intervals falsely invalidating a selection in
   `3055baea8`; extend the witness regression with an empty-interval control.
-- [ ] Prove that latest control and the complete client suite. Initial full
-  client admission on worker122 timed out without compiling; the direct Mac
-  RCH service admitted worker3651 at 05:23 UTC on `e8ba62a91`.
+- [x] Prove the empty-interval control and complete client suite: 337 passed
+  at `e8ba62a91`, followed by 338 passed, zero failed/filtered at `1ee43344b`
+  in strict epoch-qualified RCH `j-30023605353972100` on worker122.
+  Retain `1ee4334-client-all-epoch-rch.log`; this includes `685a328e1`'s
+  unknown server revision rejection before and after witness admission.
 - [ ] Resolve cold local selections cancelling during unrelated output when
   no resident native anchor exists. The remote witness does not cover this case.
-- [ ] Execute exact remote-pane mapping regression in client layout tests.
+- [x] Execute exact remote-pane mapping regression in the full client suite.
 - [x] Diagnose that mapping test's setup failure: domain91030 was never
   registered. Reuse the existing registration helper in `baca379ba` before
-  exercising the production layout snapshot path; rerun remains required.
+  exercising the production layout snapshot path; both full-suite runs pass.
 - [x] Execute workspace check at `f66007801`: strict RCH
   `j-30023605353971994`, exit zero. This predates the remote-witness changes.
 - [x] Fix workspace Clippy's oversized LocalPane ownership enum in `c2d63e3f7`

@@ -531,7 +531,7 @@ pub struct GuardianDurableSuccessorCustodyV1 {
     context: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
 }
 
-pub(crate) type GuardianRebindSecrets = (
+type GuardianRebindSecrets = (
     mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
     Zeroizing<[u8; 32]>,
     Zeroizing<[u8; 32]>,
