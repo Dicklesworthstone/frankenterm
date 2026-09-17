@@ -5322,9 +5322,31 @@ impl Child for GuardianProxyChild {
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
+        let mut observation_unavailable = false;
         loop {
-            if let Some(status) = self.try_wait()? {
-                return Ok(status);
+            match self.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => observation_unavailable = false,
+                Err(error) => {
+                    // Checkpoint/replay workers temporarily own the guardian's
+                    // protocol state. Census then closes retryably; this is not
+                    // evidence that the broker-owned child exited. Returning
+                    // that error to LocalPane's waiter would schedule exit
+                    // pruning and explicitly close the still-running child.
+                    // transport_failure fences/quarantines permanent failures;
+                    // only an unchanged attached lease permits another query.
+                    if self.actor.lock().disposition != GuardianLeaseDisposition::Attached {
+                        return Err(error);
+                    }
+                    metrics::counter!("mux.guardian_proxy.child_observation_retry_total")
+                        .increment(1);
+                    if !observation_unavailable {
+                        log::warn!(
+                            "guardian child observation temporarily unavailable; retaining live child and retrying: {error}"
+                        );
+                        observation_unavailable = true;
+                    }
+                }
             }
             thread::sleep(CHILD_STATUS_POLL_INTERVAL);
         }
@@ -9445,6 +9467,42 @@ mod tests {
             .lock()
             .retire(identity())
             .expect("terminal census already proves the live lease absent");
+        assert_eq!(state.lock().calls, vec![FakeCall::Census]);
+    }
+
+    #[test]
+    fn child_wait_retries_busy_census_without_closing_live_child() {
+        let (staging, state) = fake_staging(
+            [
+                FakeDirective::Io,
+                FakeDirective::Observe(ObservedChildState::Exited(23)),
+            ],
+            61,
+        );
+        let actor = staging.shared_actor();
+        let mut child = GuardianProxyChild {
+            actor: Arc::clone(&actor),
+            census: Arc::clone(&staging.census),
+        };
+        assert_eq!(child.wait().unwrap().exit_code(), 23);
+        assert_eq!(actor.lock().next_sequence(), 61);
+        assert_eq!(state.lock().calls, vec![FakeCall::Census, FakeCall::Census]);
+    }
+
+    #[test]
+    fn child_wait_does_not_retry_a_fenced_lease() {
+        let (staging, state) = fake_staging(
+            [FakeDirective::Reject(GuardianRejectionCode::StaleLease)],
+            61,
+        );
+        let actor = staging.shared_actor();
+        let mut child = GuardianProxyChild {
+            actor: Arc::clone(&actor),
+            census: Arc::clone(&staging.census),
+        };
+        assert_eq!(child.wait().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Fenced);
+        assert_eq!(actor.lock().next_sequence(), 61);
         assert_eq!(state.lock().calls, vec![FakeCall::Census]);
     }
 
