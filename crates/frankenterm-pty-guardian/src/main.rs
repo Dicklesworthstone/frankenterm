@@ -2,17 +2,18 @@
 
 #[cfg(unix)]
 use clap::{Args, Parser, Subcommand};
-use frankenterm_pty_guardian::AtomicComponentIdentityError;
 #[cfg(unix)]
 use frankenterm_pty_guardian::{
     BrokerControlServiceConfigV1, BrokerControlServiceV1, GuardianClient, GuardianService,
-    GuardianServiceConfig, ProvisionTokenOutcome, guardian_atomic_component_marker,
-    guardian_runtime_build_identity, provision_guardian_token, run_broker_exec_bootstrap,
+    GuardianServiceConfig, ProvisionTokenOutcome, guardian_runtime_build_identity,
+    provision_guardian_token, run_broker_exec_bootstrap,
 };
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
+
+const GUARDIAN_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
 #[cfg(unix)]
 #[derive(Debug, Parser)]
@@ -203,30 +204,26 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn retain_guardian_atomic_component_identity() -> anyhow::Result<()> {
-    let runtime_identity = match guardian_runtime_build_identity() {
-        Ok(identity) => Some(identity),
-        Err(AtomicComponentIdentityError::UnsealedDevelopmentBuild) => None,
-        Err(error) => return Err(error.into()),
-    };
-    std::hint::black_box(guardian_atomic_component_marker());
-    std::hint::black_box(runtime_identity);
+    let marker_identity = frankenterm_build_identity::parse_atomic_component_marker(
+        GUARDIAN_ATOMIC_COMPONENT_MARKER,
+        frankenterm_build_identity::AtomicComponentRole::FrankenTermPtyGuardian,
+    )?;
+    anyhow::ensure!(
+        marker_identity == frankenterm_pty_guardian::guardian_embedded_build_identity()?,
+        "guardian process marker differs from compiled library build identity"
+    );
+    std::hint::black_box(GUARDIAN_ATOMIC_COMPONENT_MARKER);
+    std::hint::black_box(marker_identity);
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn main() {
-    let runtime_identity = match frankenterm_pty_guardian::guardian_runtime_build_identity() {
-        Ok(identity) => Some(identity),
-        Err(AtomicComponentIdentityError::UnsealedDevelopmentBuild) => None,
-        Err(error) => {
-            eprintln!("invalid embedded guardian atomic component identity: {error}");
-            std::process::exit(2);
-        }
-    };
-    std::hint::black_box(frankenterm_pty_guardian::guardian_atomic_component_marker());
-    std::hint::black_box(runtime_identity);
+    if let Err(error) = retain_guardian_atomic_component_identity() {
+        eprintln!("invalid embedded guardian atomic component identity: {error}");
+        std::process::exit(2);
+    }
     eprintln!("frankenterm-pty-guardian is supported only on Unix");
     std::process::exit(2);
 }
@@ -303,6 +300,13 @@ mod tests {
     #[test]
     fn binary_startup_retains_and_validates_the_component_identity() {
         retain_guardian_atomic_component_identity().unwrap();
-        assert!(guardian_atomic_component_marker().contains(":frankenterm-pty-guardian:"));
+        assert!(GUARDIAN_ATOMIC_COMPONENT_MARKER.contains(":frankenterm-pty-guardian:"));
+        assert!(
+            frankenterm_build_identity::parse_atomic_component_marker(
+                GUARDIAN_ATOMIC_COMPONENT_MARKER,
+                frankenterm_build_identity::AtomicComponentRole::FrankenTermMuxServer,
+            )
+            .is_err()
+        );
     }
 }

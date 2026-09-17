@@ -37,34 +37,24 @@ pub use frankenterm_build_identity::{
     AtomicBuildIdentity, AtomicComponentIdentityError, SealedAtomicBuildIdentity,
 };
 
-use frankenterm_build_identity::{
-    AtomicComponentRole, parse_atomic_component_marker, parse_sealed_atomic_component_marker,
-};
+const GUARDIAN_COMPILED_BUILD_IDENTITY: &str = env!("FT_GUARDIAN_COMPILED_BUILD_IDENTITY");
 
-const GUARDIAN_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
-
-/// Return the exact marker embedded by this guardian binary's build script.
-///
-/// This value is public identity evidence, not a secret or a capability. The
-/// caller must still authenticate the live guardian connection before binding
-/// it into a spawn or adoption transaction.
-#[must_use]
-pub const fn guardian_atomic_component_marker() -> &'static str {
-    GUARDIAN_ATOMIC_COMPONENT_MARKER
-}
-
-/// Validate the embedded guardian marker while preserving explicit development
-/// state. `UnsealedDevelopment` is never interchangeable with a runtime build
-/// authority.
+/// Validate this library's compile-time family identity while preserving
+/// explicit development state. The build script derives this value from the
+/// same validated identity as the guardian executable's process marker.
+/// Linking the library into another process must not embed a guardian process
+/// marker there. `UnsealedDevelopment` never grants runtime build authority.
 pub fn guardian_embedded_build_identity()
 -> Result<AtomicBuildIdentity, AtomicComponentIdentityError> {
-    parse_atomic_component_marker(
-        GUARDIAN_ATOMIC_COMPONENT_MARKER,
-        AtomicComponentRole::FrankenTermPtyGuardian,
-    )
+    if GUARDIAN_COMPILED_BUILD_IDENTITY == frankenterm_build_identity::UNSEALED_BUILD_ID {
+        Ok(AtomicBuildIdentity::UnsealedDevelopment)
+    } else {
+        SealedAtomicBuildIdentity::from_lower_hex(GUARDIAN_COMPILED_BUILD_IDENTITY)
+            .map(AtomicBuildIdentity::Sealed)
+    }
 }
 
-/// Return the exact decoded 32-byte build authority for this running guardian.
+/// Return the exact decoded 32-byte family authority compiled into this library.
 ///
 /// An ordinary development build returns
 /// [`AtomicComponentIdentityError::UnsealedDevelopmentBuild`]. The function
@@ -72,10 +62,7 @@ pub fn guardian_embedded_build_identity()
 /// inode, process ID, or a runtime environment variable.
 pub fn guardian_runtime_build_identity()
 -> Result<SealedAtomicBuildIdentity, AtomicComponentIdentityError> {
-    parse_sealed_atomic_component_marker(
-        GUARDIAN_ATOMIC_COMPONENT_MARKER,
-        AtomicComponentRole::FrankenTermPtyGuardian,
-    )
+    guardian_embedded_build_identity()?.require_sealed()
 }
 
 #[cfg(unix)]
@@ -124,20 +111,6 @@ fn canonical_test_temp_root() -> std::path::PathBuf {
 #[cfg(test)]
 mod build_identity_tests {
     use super::*;
-    use frankenterm_build_identity::{AtomicComponentRole, parse_atomic_component_marker};
-
-    #[test]
-    fn embedded_marker_is_pinned_to_the_guardian_role() {
-        let marker = guardian_atomic_component_marker();
-        assert!(
-            parse_atomic_component_marker(marker, AtomicComponentRole::FrankenTermPtyGuardian)
-                .is_ok()
-        );
-        assert!(
-            parse_atomic_component_marker(marker, AtomicComponentRole::FrankenTermMuxServer)
-                .is_err()
-        );
-    }
 
     #[test]
     fn unsealed_development_marker_cannot_become_runtime_authority() {
