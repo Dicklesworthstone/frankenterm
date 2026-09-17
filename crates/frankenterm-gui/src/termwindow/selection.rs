@@ -1419,7 +1419,20 @@ mod tests {
             .unwrap();
         assert!(mux::pane::LineReadPermit::try_acquire().is_none());
         let cancelled = Arc::clone(&read.cancelled);
-        drop(read);
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange::start(SelectionCoordinate::x_y(0, 0)));
+        let mut copy = SelectionCopy::new(&selection, 12).unwrap();
+        let copy_deadline = copy.deadline();
+        copy.local_read = Some(read);
+        let mut pending = Some(crate::selection::PendingNativeSelection::new(selection));
+        pending.as_mut().unwrap().text_copy = Some(copy);
+        // Exercise deadline retirement without any renderer or successful paint.
+        assert!(expire_selection_copy_deadline(
+            &mut pending,
+            copy_deadline,
+            copy_deadline,
+        ));
+        assert!(pending.is_none());
         assert!(cancelled.load(Ordering::Acquire));
         drop(available_permit());
 
@@ -1999,6 +2012,7 @@ mod tests {
 
     #[test]
     fn announce_pick_if_smart_emits_mouse_selection_announcement() {
+        let _guard = crate::smart_selection_a11y::tests::shared_recorder_test_lock();
         let sentinel = "https://example.com/gui-mouse-selection-sentinel";
         let _ = shared_smart_selection_recorder().take();
 
