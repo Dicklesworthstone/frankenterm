@@ -1509,18 +1509,21 @@ impl GuardianRuntime {
             diagnostic.push_str(&format!(" pane{index}.phase={phase}"));
             if let Some(pane) = self.starting_broker_panes.get(&id) {
                 diagnostic.push_str(&format!(
-                    " activated={} initial_pending={} failed_before_spawn={} retry={} handle={} output={} input={} origin={} delivery={} ack={}",
+                    " activated={} initial_pending={} failed_before_spawn={} retry={} handle={} output={} output_failed={} input={} origin={} delivery={} ack={}",
                     pane.activated, pane.initial_pending, pane.failed_before_spawn,
                     pane.retry_before_publication.is_some(), pane.handle.is_some(),
-                    pane.output.is_some(), pane.input_journal.is_some(), pane.replay_origin.is_some(),
+                    pane.output.is_some(), pane.output.as_ref().is_some_and(|output| output.failed),
+                    pane.input_journal.is_some(), pane.replay_origin.is_some(),
                     pane.pending_delivery.is_some(), pane.pending_ack.is_some(),
                 ));
                 if let Some(connection) = self.broker_connections.get(&pane.mux_incarnation) {
                     diagnostic.push_str(&format!(
-                        " worker={} session={} active={} failed={} retired={}",
+                        " worker={} session={} active={} active_this={} last_this={} failed={} retired={}",
                         connection.worker.is_some(),
                         connection.retained_session.is_some(),
                         connection.active_pane.is_some(),
+                        connection.active_pane == Some(id),
+                        connection.last_pane == Some(id),
                         connection.failed,
                         connection.fully_retired_outer_owner,
                     ));
@@ -3869,7 +3872,32 @@ impl GuardianRuntime {
                                     .saturating_add(1);
                             }
                             Ok(None) => {}
-                            Err(_) => output.failed = true,
+                            Err(_error) => {
+                                #[cfg(test)]
+                                {
+                                    use crate::broker::BrokerControlClientError;
+                                    let label = match &_error {
+                                        BrokerControlClientError::Endpoint(_) => "endpoint",
+                                        BrokerControlClientError::Io(_) => "io",
+                                        BrokerControlClientError::AuthenticationAuthority => "authentication-authority",
+                                        BrokerControlClientError::Protocol => "protocol",
+                                        BrokerControlClientError::UnexpectedResponse => "unexpected-response",
+                                        BrokerControlClientError::BrokerBuildIdentityMismatch => "build-mismatch",
+                                        BrokerControlClientError::BrokerLineageMismatch => "lineage-mismatch",
+                                        BrokerControlClientError::CensusSnapshotUnavailable => "census-snapshot-unavailable",
+                                        BrokerControlClientError::CensusAuthorityConflict => "census-authority-conflict",
+                                        BrokerControlClientError::CensusCapacityUnavailable => "census-capacity-unavailable",
+                                        BrokerControlClientError::CensusCollectionDeadlineExceeded => "census-deadline",
+                                        BrokerControlClientError::CensusCollectionCapacityExhausted => "census-capacity-exhausted",
+                                        BrokerControlClientError::SpawnRejected => "spawn-rejected",
+                                        BrokerControlClientError::SpawnQuarantined => "spawn-quarantined",
+                                        BrokerControlClientError::SpawnPtyAvailable => "spawn-pty-available",
+                                        BrokerControlClientError::ConnectionPoisoned => "connection-poisoned",
+                                    };
+                                    eprintln!("GENESIS_OPEN_INITIAL_FAILED class={label}");
+                                }
+                                output.failed = true;
+                            }
                         },
                         BrokerPaneIoCompletionV1::Read { handle, result } => {
                             pane.handle = Some(handle);
