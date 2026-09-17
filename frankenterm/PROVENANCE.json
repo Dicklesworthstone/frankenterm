@@ -155,22 +155,22 @@
         "chore": 2,
         "cleanup": 2,
         "cosmetic": 18,
-        "feat": 52,
-        "fix": 86,
+        "feat": 53,
+        "fix": 93,
         "other": 16,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 28
+        "test": 30
       },
-      "fork_side_commit_count": 217,
+      "fork_side_commit_count": 227,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-15T23:01:39-04:00",
-        "sha": "37d5eb2d39dea0a8b2c9fafaac5d1463e702bb2b",
-        "subject": "test(client): wait for real resize completion among queued callbacks"
+        "classification": "fix",
+        "committed_at": "2026-09-17T01:32:20-04:00",
+        "sha": "685a328e1b713250ef8b29c64a86c8631471f8de",
+        "subject": "fix(selection): reject unknown remote content revisions after fetching"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 29,
         "docs": 6,
-        "feat": 193,
-        "fix": 230,
-        "other": 46,
+        "feat": 195,
+        "fix": 233,
+        "other": 48,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 90
+        "test": 92
       },
-      "fork_side_commit_count": 629,
+      "fork_side_commit_count": 638,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-16T16:40:01-04:00",
-        "sha": "578bc9fcf6debe82756812d9f5c31705c8986a77",
-        "subject": "fix(guardian): require durable custody before successor acknowledgement"
+        "classification": "other",
+        "committed_at": "2026-09-17T02:03:26-04:00",
+        "sha": "568bf385fdd3e28779f9ee9b9b047435f7e1c08c",
+        "subject": "perf(selection): collect preceding logical rows without repeated shifts"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 55,
-        "fix": 109,
-        "other": 54,
+        "fix": 113,
+        "other": 57,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 59
+        "test": 62
       },
-      "fork_side_commit_count": 310,
+      "fork_side_commit_count": 320,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-16T17:31:07-04:00",
-        "sha": "d9952995747ac76374f40078172bf071615ea6cf",
-        "subject": "fix(term): sever erased viewport wrap from retained history"
+        "classification": "other",
+        "committed_at": "2026-09-17T01:28:06-04:00",
+        "sha": "23df4c138decd94879eba1d4975f6c73c3bf2b0c",
+        "subject": "perf(selection): reuse allocation-free validation during anchor capture"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2683,
-  "generated_at": "2026-09-16T21:41:18.136381Z",
+  "fork_side_commit_total": 2712,
+  "generated_at": "2026-09-17T06:24:46.745625Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
