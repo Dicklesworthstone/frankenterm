@@ -5414,6 +5414,28 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
+        // Reader threads report rejected replay/delivery through `log`. Keep
+        // those errors visible in this real-process regression's transcript;
+        // a missing marker alone cannot identify which boundary rejected it.
+        struct RecoveryTestLogger;
+        impl log::Log for RecoveryTestLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    eprintln!("{} {}: {}", record.level(), record.target(), record.args());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        static LOGGER: RecoveryTestLogger = RecoveryTestLogger;
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+
         let _global_state = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         struct ResetSpillFactory;
         impl Drop for ResetSpillFactory {
@@ -6358,7 +6380,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < post_registration_deadline,
-                "published pane did not render fresh child output after registration"
+                "published pane did not render fresh child output after registration: {:?}",
+                lines.iter().map(|line| line.as_str()).collect::<Vec<_>>()
             );
             thread::sleep(Duration::from_millis(2));
         }
