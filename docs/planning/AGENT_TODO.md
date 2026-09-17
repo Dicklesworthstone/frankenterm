@@ -1068,17 +1068,45 @@ power loss nor migration of those live sessions has been demonstrated.
   reopen failure. Fix claimant census ownership and connection EOF settlement.
 - [x] Execute full mux tests at 5b21777e2: 1,197 passed, zero failed/ignored,
   including deterministic terminal-fence-before-cleanup settlement coverage.
-- [ ] Complete guardian rerun after bb3884e3a fixes the last WAL-fault fixture's
-  observer identity. At 5b21777e2, 238 passed, one failed, four ignored; production
-  correctly excluded the predecessor after the successor claimed the pane.
-- [ ] Finish the first new-mux owner rotation: existing-only encrypted custody
+- [x] Complete guardian rerun at bb3884e3a: 239 passed, zero failed, four
+  ignored. The WAL-fault fixture now queries the actual owner after transfer.
+- [x] Implement the first new-mux owner rotation in 821036d94: existing-only encrypted custody
   bootstrap, old outer-owner retirement, per-pane durable fence, new owner
   claim, durable custody and acknowledgement, then runtime handle publication.
+- [x] Review and commit distinct-build ownership transfer and actual outer
+  lost-reply, delayed-output and three journal-cut fixtures in 8274c5336.
+  This is implementation, not successful execution proof.
+- [x] Retain the sealed 821036 compile failure: seven missing production
+  imports, zero tests executed. Correct those imports in 8274c5336; the workspace
+  check independently found the same defects and continues with keep-going.
+- [ ] Execute sealed 8274c5336 tests and retain its actual executable, then
+  prove transfer to a second genuinely distinct source build. Typed build IDs
+  within one executable do not satisfy this artifact-to-artifact check.
 - [ ] Prove rotation deadlines, exact outer lost-reply retries, rejected live
   predecessors, missing/wrong credentials, and unchanged real child identity.
   Broker connection loss after committed ACK remains a separate unproven case.
 - [ ] Connect image discovery and whole-topology prepare/commit to ordinary
   startup before default replacement shells or public readiness are emitted.
+- [x] Execute prepared-reflow cursor controls at cf30f16b: nine passed, zero
+  failed, 507 filtered. Execute the unchanged-row stale-preparation reuse control:
+  one passed, zero failed, 515 filtered. These are remote correctness tests,
+  not native or remote-session latency measurements.
+- [ ] Finish the newly diagnosed remote ClientPane selection fixes: retain a
+  gesture through cache-lock contention and release without a final Motion;
+  read authoritative fresh text in bounded chunks; preserve original server row
+  revisions separately from fetch repaint damage; retry deferred clipboard work
+  without copying stale, predicted or partially fetched text.
+- [ ] Execute actual remote cache/gesture controls and repeat selection against
+  the final native application and an owned remote session.
+- [x] Diagnose incomplete resize evidence passing as zero latency (ft-n33w8).
+  Require complete nonempty numeric measurements and refuse failed baseline
+  refreshes. Independent review also found unvalidated queue measurements;
+  require actual per-event stages and numeric queue depths. All 59 shell
+  controls pass, including poisoned local-Cargo guards.
+- [x] Complete independent review of ft-n33w8; this gate evaluates
+  simulation evidence and cannot establish actual Mac resize performance.
+- [x] Retain ft-n33w8 shell receipt SHA-256
+  `b1c73f4e910ce19cfd9d3c500aa1b4a51ef1b2cc6daa0588c246b5cae184861b`.
 - [x] Diagnose repeated identical-source rebuilds: RCH refreshed every source
   timestamp after all artifacts. Closure-bound freshness-epoch regressions now
   pass 19 tests, including actual first-party Cargo reuse and changed-byte rebuild.

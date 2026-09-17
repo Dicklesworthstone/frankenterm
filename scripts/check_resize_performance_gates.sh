@@ -365,13 +365,47 @@ for entry in "${SCENARIOS[@]}"; do
         fi
     fi
 
-    if ! jq -e '.mode == "resize_timeline_json"' "$scenario_json" >/dev/null 2>&1; then
+    # Missing measurements must never become a zero-latency success. Validate
+    # the evidence before passing numbers to shell arithmetic or percentiles.
+    if ! jq -e --arg scenario "$scenario_name" '
+        def count: type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
+        .mode == "resize_timeline_json"
+        and .completed == true
+        and .scenario.name == $scenario
+        and (.expectations_failed | count)
+        and (.timeline.executed_resize_events | count and . > 0)
+        and (.timeline.events | type == "array")
+        and (.timeline.events | length) == .timeline.executed_resize_events
+        and all(.timeline.events[];
+            (.total_duration_ns | count)
+            and (.stages | type == "array")
+            and (. as $event | all(
+                ["input_intent", "scheduler_queueing", "logical_reflow", "render_prep", "presentation"][];
+                . as $stage
+                | [$event.stages[] | select(.stage == $stage)]
+                | length == 1 and all(.[];
+                    (.duration_ns | count)
+                    and (if .stage == "scheduler_queueing" then
+                        (.queue_metrics.depth_before | count)
+                        and (.queue_metrics.depth_after | count)
+                    else true end)))))
+        and (.aggregate_event_duration_ns | .p50 <= .p95 and .p95 <= .p99)
+        and all(.aggregate_event_duration_ns | .p50, .p95, .p99; count)
+        and (.stage_summary | type == "array")
+        and (. as $envelope | all(
+            ["input_intent", "scheduler_queueing", "logical_reflow", "render_prep", "presentation"][];
+            . as $stage
+            | [$envelope.stage_summary[] | select(.stage == $stage)]
+            | length == 1 and all(.[];
+                .samples == $envelope.timeline.executed_resize_events
+                and (.p95_duration_ns | count))))
+    ' "$scenario_json" >/dev/null 2>&1; then
         scenario_results_json="$(jq -c --arg scenario "$scenario_name" --arg fixture "$scenario_path" '
             . + [{
                 scenario: $scenario,
                 fixture: $fixture,
                 status: "hard_fail",
-                reasons: ["artifact mode must be resize_timeline_json"],
+                reasons: ["resize evidence must be complete with matching nonempty events and numeric measurements"],
                 warnings: [],
                 metrics: null
             }]
@@ -567,6 +601,10 @@ cat >"$REPORT_FILE" <<EOF
 EOF
 
 if [[ "$WRITE_BASELINE" == "true" ]]; then
+    if [[ "$overall_status" == "hard_fail" ]]; then
+        echo "[resize-gates] ERROR: refusing baseline refresh from failed evidence; report: $REPORT_FILE" >&2
+        exit 1
+    fi
     if [[ -z "$BASELINE_REASON" ]]; then
         echo "[resize-gates] ERROR: FT_RESIZE_GATE_BASELINE_REASON is required with --write-baseline" >&2
         exit 2
