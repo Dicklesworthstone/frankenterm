@@ -64,6 +64,23 @@ const PREDICT_SUPPRESS_COOLDOWN: Duration = Duration::from_secs(2);
 /// speculative state to grow without bound.
 const MAX_PENDING_PREDICTIONS: usize = 4096;
 
+/// Keeps mutations of a complete clipboard range observable after its copied
+/// rows leave the render cache. Only this pane can issue or validate it.
+#[derive(Debug)]
+pub struct SelectionReadWitness(Arc<SelectionReadWitnessState>);
+
+#[derive(Debug)]
+struct SelectionReadWitnessState {
+    owner: Weak<parking_lot::Mutex<RenderableState>>,
+    rows: Range<StableRowIndex>,
+    selected_sequence: SequenceNo,
+    layout: SequenceNo,
+    dimensions: RenderableDimensions,
+    invalid: AtomicBool,
+}
+
+const MAX_SELECTION_READ_WITNESSES: usize = 4;
+
 /// Best-effort heuristic: does this line look like a secret prompt (password /
 /// passphrase) where we must not predict/echo the typed-or-pasted secret? Not a
 /// security boundary -- the confidence model also suppresses prediction after
@@ -409,6 +426,7 @@ pub struct RenderableInner {
     // Server content revisions, separate from the paint-damage revision that
     // put_line assigns on fetch completion. Bounded to the same cache capacity.
     selection_row_sequences: LruCache<StableRowIndex, SequenceNo>,
+    selection_read_witnesses: Vec<Weak<SelectionReadWitnessState>>,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -508,6 +526,7 @@ impl RenderableInner {
             tiered_scrollback_status: None,
             lines: LruCache::new(line_cache_capacity),
             selection_row_sequences: LruCache::new(line_cache_capacity),
+            selection_read_witnesses: Vec::new(),
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
@@ -1115,8 +1134,28 @@ impl RenderableInner {
             || alt_screen_changed
             || !mux::renderable::same_line_layout_geometry(&self.dimensions, &delta.dimensions);
         if reset_layout || cold_layout_invalidated {
-            self.selection_layout_generation = self.selection_layout_generation.saturating_add(1);
+            self.retire_selection_layout();
         }
+        // Observe dirty ranges before eviction. An already copied row may no
+        // longer be in either LRU, but still belongs to an unfinished copy.
+        self.selection_read_witnesses.retain(|weak| {
+            let Some(witness) = weak.upgrade() else {
+                return false;
+            };
+            let retained_end = StableRowIndex::try_from(delta.dimensions.scrollback_rows)
+                .ok()
+                .and_then(|count| delta.dimensions.scrollback_top.checked_add(count));
+            if witness.rows.start < delta.dimensions.scrollback_top
+                || retained_end.is_none_or(|end| witness.rows.end > end)
+                || (delta.seqno > witness.selected_sequence
+                    && delta.dirty_lines.iter().any(|range| {
+                        range.start < witness.rows.end && witness.rows.start < range.end
+                    }))
+            {
+                witness.invalid.store(true, Ordering::Relaxed);
+            }
+            true
+        });
         if reset_layout {
             // Stable row coordinates belong to the active screen epoch. Never
             // combine cached main-screen rows with an alternate-screen delta
@@ -1264,6 +1303,17 @@ impl RenderableInner {
             }
         }
         true
+    }
+
+    pub(crate) fn retire_selection_layout(&mut self) {
+        self.selection_layout_generation = self.selection_layout_generation.saturating_add(1);
+        self.selection_read_witnesses.retain(|weak| {
+            let Some(witness) = weak.upgrade() else {
+                return false;
+            };
+            witness.invalid.store(true, Ordering::Relaxed);
+            true
+        });
     }
 
     pub fn make_all_stale(&mut self) {
@@ -1583,6 +1633,20 @@ impl RenderableInner {
         let capacity = self.lines.cap();
         self.selection_row_sequences.resize(capacity);
         self.selection_row_sequences.put(stable_row, seqno);
+        // Fetched/bonus rows can establish a newer server content revision
+        // without a preceding dirty notification. Ignore fetch paint damage:
+        // `seqno` was saved before update_last_change_seqno above.
+        self.selection_read_witnesses.retain(|weak| {
+            let Some(witness) = weak.upgrade() else {
+                return false;
+            };
+            if witness.rows.contains(&stable_row)
+                && (seqno == SEQ_ZERO || seqno > witness.selected_sequence)
+            {
+                witness.invalid.store(true, Ordering::Relaxed);
+            }
+            true
+        });
         true
     }
 
@@ -3221,6 +3285,64 @@ pub(crate) async fn hydrate_render_application_lines(
 }
 
 impl RenderableState {
+    pub(crate) fn selection_copy_snapshot(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+        witness: &mut Option<SelectionReadWitness>,
+    ) -> Result<(SequenceNo, RenderableDimensions), super::SelectionReadError> {
+        use super::SelectionReadError;
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| SelectionReadError::Busy)?;
+        let retained_end = StableRowIndex::try_from(inner.dimensions.scrollback_rows)
+            .ok()
+            .and_then(|count| inner.dimensions.scrollback_top.checked_add(count))
+            .ok_or(SelectionReadError::SourceChanged)?;
+        if inner.dead
+            || rows.is_empty()
+            || rows.start < inner.dimensions.scrollback_top
+            || rows.end > retained_end
+            || layout == SequenceNo::MAX
+            || layout != inner.selection_layout_generation
+            || inner.seqno == SequenceNo::MAX
+            || inner.seqno < selected_sequence
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        if witness.is_none() {
+            inner
+                .selection_read_witnesses
+                .retain(|weak| weak.strong_count() != 0);
+            if inner.selection_read_witnesses.len() >= MAX_SELECTION_READ_WITNESSES {
+                return Err(SelectionReadError::Busy);
+            }
+            let issued = Arc::new(SelectionReadWitnessState {
+                owner: inner.renderable.clone(),
+                rows: rows.clone(),
+                selected_sequence,
+                layout,
+                dimensions: inner.dimensions,
+                invalid: AtomicBool::new(false),
+            });
+            inner.selection_read_witnesses.push(Arc::downgrade(&issued));
+            *witness = Some(SelectionReadWitness(issued));
+        }
+        let issued = &witness.as_ref().unwrap().0;
+        if !Weak::ptr_eq(&issued.owner, &inner.renderable)
+            || issued.rows != rows
+            || issued.selected_sequence != selected_sequence
+            || issued.layout != layout
+            || !mux::renderable::same_line_layout_geometry(&issued.dimensions, &inner.dimensions)
+            || issued.invalid.load(Ordering::Relaxed)
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        Ok((inner.seqno, inner.dimensions))
+    }
+
     pub(crate) fn selection_source_snapshot(
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
@@ -3302,7 +3424,8 @@ impl RenderableState {
             .try_borrow_mut()
             .map_err(|_| SelectionReadError::Busy)?;
         if inner.dead
-            || inner.seqno != sequence
+            || inner.seqno < sequence
+            || inner.seqno == SequenceNo::MAX
             || inner.selection_layout_generation != layout
             || sequence == SequenceNo::MAX
             || layout == SequenceNo::MAX
@@ -3328,7 +3451,7 @@ impl RenderableState {
         }
         if rows.clone().all(|row| {
             fresh_cached_line(inner.lines.peek(&row))
-                .is_some_and(|line| !line.changed_since(sequence))
+                .is_some_and(|line| !line.changed_since(inner.seqno))
                 && inner.selection_row_sequences.peek(&row).is_some()
         }) {
             if rows.clone().any(|row| {
@@ -3370,7 +3493,7 @@ impl RenderableState {
                         .put(row, LineEntry::LineAndFetching(line, token.clone()));
                 }
                 Some(LineEntry::Line(line))
-                    if line.changed_since(sequence)
+                    if line.changed_since(inner.seqno)
                         || inner.selection_row_sequences.peek(&row).is_none() =>
                 {
                     to_fetch.add(row);
@@ -3837,6 +3960,188 @@ mod tests {
     }
 
     #[test]
+    fn selection_copy_witness_retains_evicted_chunk_invalidation() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 7;
+            inner.dimensions.scrollback_top = 0;
+            inner.dimensions.scrollback_rows = 256;
+            inner.dimensions.physical_top = 0;
+            inner.dimensions.viewport_rows = 256;
+            inner.lines.resize(NonZeroUsize::new(2).unwrap());
+            assert!(inner.put_line(
+                0,
+                Line::from_text("first", &CellAttributes::default(), 7, None),
+                None
+            ));
+        }
+        let (layout, sequence, dimensions, alternate) = state.selection_source_snapshot().unwrap();
+        let mut witness = None;
+        state
+            .selection_copy_snapshot(layout, 7, 0..128, &mut witness)
+            .unwrap();
+        assert_eq!(
+            state.selection_lines(layout, sequence, 7, 0..1).unwrap()[0].as_str(),
+            "first"
+        );
+        {
+            let mut inner = state.inner.borrow_mut();
+            for row in 1..5 {
+                assert!(inner.put_line(
+                    row,
+                    Line::from_text("next", &CellAttributes::default(), 7, None),
+                    None
+                ));
+            }
+            assert!(inner.lines.peek(&0).is_none());
+            assert!(inner.selection_row_sequences.peek(&0).is_none());
+        }
+        let mut delta = codec::GetPaneRenderChangesResponse {
+            pane_id: 743,
+            mouse_grabbed: false,
+            alt_screen_active: alternate,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions,
+            tiered_scrollback_status: None,
+            dirty_lines: std::iter::once(200..201).collect(),
+            title: "selection-copy-witness".to_string(),
+            working_dir: None,
+            bonus_lines: codec::SerializedLines::from(Vec::new()),
+            input_serial: None,
+            seqno: 8,
+        };
+        assert!(state.inner.borrow_mut().apply_changes_to_surface(
+            delta.clone(),
+            vec![(
+                200,
+                Line::from_text("unrelated", &CellAttributes::default(), 8, None)
+            )],
+        ));
+        assert_eq!(
+            state
+                .selection_copy_snapshot(layout, 7, 0..128, &mut witness)
+                .unwrap()
+                .0,
+            8
+        );
+        // A chunk remains readable even if output advanced between metadata
+        // observation and this read; server content revisions still fence it.
+        assert_eq!(
+            state.selection_lines(layout, 7, 7, 4..5).unwrap()[0].as_str(),
+            "next"
+        );
+        delta.seqno = 9;
+        delta.dirty_lines = std::iter::once(0..1).collect();
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta, Vec::new()));
+        // The original chunk is absent from the cache. Its dirty notification
+        // must still prevent publishing the accumulated clipboard text.
+        assert!(matches!(
+            state.selection_copy_snapshot(layout, 7, 0..128, &mut witness),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn selection_copy_witness_distinguishes_server_revision_from_fetch_damage() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        state.inner.borrow_mut().seqno = 7;
+        let (layout, _, _, _) = state.selection_source_snapshot().unwrap();
+        let mut witness = None;
+        state
+            .selection_copy_snapshot(layout, 7, 0..1, &mut witness)
+            .unwrap();
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 8;
+            let fetch = FetchToken::new(Instant::now());
+            inner.lines.put(0, LineEntry::Fetching(fetch.clone()));
+            assert!(inner.put_line(
+                0,
+                Line::from_text("unchanged", &CellAttributes::default(), 7, None),
+                Some(&fetch)
+            ));
+        }
+        assert_eq!(
+            state
+                .selection_copy_snapshot(layout, 7, 0..1, &mut witness)
+                .unwrap()
+                .0,
+            8
+        );
+        assert_eq!(
+            state.selection_lines(layout, 7, 7, 0..1).unwrap()[0].as_str(),
+            "unchanged"
+        );
+        assert!(state.inner.borrow_mut().put_line(
+            0,
+            Line::from_text("edited", &CellAttributes::default(), 8, None),
+            None
+        ));
+        assert!(matches!(
+            state.selection_copy_snapshot(layout, 7, 0..1, &mut witness),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn selection_copy_witness_bounds_admission_and_rejects_owner_range_and_layout_changes() {
+        use super::super::SelectionReadError;
+        let renderable = test_renderable_state();
+        let other = test_renderable_state();
+        let state = renderable.lock();
+        state.inner.borrow_mut().seqno = 7;
+        other.lock().inner.borrow_mut().seqno = 7;
+        let (layout, _, _, _) = state.selection_source_snapshot().unwrap();
+        let mut witnesses = Vec::new();
+        for _ in 0..MAX_SELECTION_READ_WITNESSES {
+            let mut witness = None;
+            state
+                .selection_copy_snapshot(layout, 7, 0..1, &mut witness)
+                .unwrap();
+            witnesses.push(witness);
+        }
+        let mut waiting = None;
+        assert!(matches!(
+            state.selection_copy_snapshot(layout, 7, 0..1, &mut waiting),
+            Err(SelectionReadError::Busy)
+        ));
+        drop(witnesses.pop());
+        state
+            .selection_copy_snapshot(layout, 7, 0..1, &mut waiting)
+            .unwrap();
+        assert!(matches!(
+            other
+                .lock()
+                .selection_copy_snapshot(layout, 7, 0..1, &mut waiting),
+            Err(SelectionReadError::SourceChanged)
+        ));
+        assert!(matches!(
+            state.selection_copy_snapshot(layout, 7, 0..2, &mut waiting),
+            Err(SelectionReadError::SourceChanged)
+        ));
+        {
+            let _held = state.inner.borrow_mut();
+            assert!(matches!(
+                state.selection_copy_snapshot(layout, 7, 0..1, &mut waiting),
+                Err(SelectionReadError::Busy)
+            ));
+        }
+        state.inner.borrow_mut().retire_selection_layout();
+        let new_layout = state.selection_source_snapshot().unwrap().0;
+        assert!(new_layout > layout);
+        assert!(matches!(
+            state.selection_copy_snapshot(new_layout, 7, 0..1, &mut waiting),
+            Err(SelectionReadError::SourceChanged)
+        ));
+    }
+
+    #[test]
     fn selection_copy_uses_remote_content_revision_not_fetch_paint_damage() {
         let renderable = test_renderable_state();
         let state = renderable.lock();
@@ -3955,8 +4260,15 @@ mod tests {
             "界 e\u{301}"
         );
         state.inner.borrow_mut().seqno = sequence + 1;
+        assert_eq!(
+            state
+                .selection_lines(layout, sequence, sequence, 0..1)
+                .unwrap()[0]
+                .as_str(),
+            "界 e\u{301}"
+        );
         assert!(matches!(
-            state.selection_lines(layout, sequence, sequence, 0..1),
+            state.selection_lines(layout, sequence + 2, sequence, 0..1),
             Err(super::super::SelectionReadError::SourceChanged)
         ));
     }

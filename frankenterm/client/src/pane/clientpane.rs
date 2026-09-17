@@ -2963,6 +2963,20 @@ fn validate_render_application_resources(
 }
 
 impl ClientPane {
+    /// Observe an ongoing copy without losing mutations of evicted chunks.
+    pub fn selection_copy_snapshot(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+        witness: &mut Option<super::SelectionReadWitness>,
+    ) -> Result<(SequenceNo, RenderableDimensions), SelectionReadError> {
+        self.renderable
+            .try_lock()
+            .ok_or(SelectionReadError::Busy)?
+            .selection_copy_snapshot(layout, selected_sequence, rows, witness)
+    }
+
     /// Atomically observe cached selection coordinates without blocking the GUI.
     pub fn selection_source_snapshot(
         &self,
@@ -4029,6 +4043,11 @@ impl Pane for ClientPane {
         if state.attempt == attempt && !state.failed {
             let render = self.renderable.lock();
             let mut inner = render.inner.borrow_mut();
+            if !unchanged {
+                // Retire the old coordinates immediately, including a resize
+                // away and back before the remote geometry response arrives.
+                inner.retire_selection_layout();
+            }
             inner.dimensions.cols = cols;
             inner.dimensions.viewport_rows = rows;
             inner.dimensions.pixel_width = size.pixel_width;

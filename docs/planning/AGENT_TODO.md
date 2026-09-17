@@ -1135,14 +1135,19 @@ power loss nor migration of those live sessions has been demonstrated.
   pane/sequence transfer, validates returned ownership and keeps the lease
   census available without exposing uncommitted output. Negative controls
   reject missing, partial, wrong-pane and wrong-sequence custody.
-- [ ] Execute updated sealed upgrade/fault suite on worker126, retained log
-  `b3752b0-upgrade-and-faults-rch.log`; do not close on compilation alone.
+- [x] Execute updated sealed upgrade/fault suite on worker126: strict RCH
+  `j-30023605353971989`, four passed, zero failed/ignored, 247 filtered.
+  Retain `b3752b0-upgrade-and-faults-rch.log`. The broader broker suite also
+  passed nine tests, with one explicitly sealed test ignored, in job
+  `j-30023605353971991`; this does not prove automatic startup recovery.
 - [x] Commit actual input delivery gates in `2332b889b`: keyboard protocols,
   composed input, SendKey/SendString, terminal mouse reports, paste and drops.
   Retain local selection/copy and overlay interaction. Delayed paste retains
   its original pane allocation and verifies current window ownership.
-- [ ] Execute the owned real-PTY pane-move regression and mixed-layout tests;
-  review reconnect delivery and saved-window restoration against native input.
+- [x] Execute the owned real-PTY pane-move regression and mixed-layout tests:
+  strict RCH `j-30023605353971990`, five passed, zero failed/ignored,
+  739 filtered. Retain `b3752b0-gui-layout-rch.log`.
+- [ ] Review reconnect delivery and saved-window restoration against native input.
 - [x] Fix the missing inherited guardian workspace dependency in `f85640a22`.
   Both prior `2332b889b` verification jobs failed before compilation; neither
   is a passing receipt. Scope durable Unix-only witnesses correctly in
@@ -1156,6 +1161,10 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Execute fresh-process custody/catalog/ACK reopening through the real
   birth-image parent test. Then connect verified discovery and atomic topology
   publication to ordinary startup before listeners/default shells appear.
+- [x] Diagnose the first fresh-process parent build refusal: sealed identity
+  rejected unbound Cargo debug-profile environment overrides before tests ran.
+  Keep the guard intact and rerun the committed profile without overrides;
+  retain `018e55c-fresh-process-image-committed-profile-rch.log`.
 - [x] Finish clipboard deadline proof and recorder isolation: strict RCH
   job `30023644042232225`, 31 passed/zero failed, normal parallel execution.
   Retain `ruby-selection-deadline-fixed-rch.log`; final test delta `c69137d5c`.
@@ -1165,7 +1174,20 @@ power loss nor migration of those live sessions has been demonstrated.
   reconnect domain receiver, guard lifetime, and obsolete fake publication
   test field. Updated locked workspace run is pinned to `c69137d5c`.
 - [x] Fix three GUI `WindowOrderMirror` private-import errors in `b3752b0e8`.
-- [ ] Execute updated GUI layout tests; retain `b3752b0-gui-layout-rch.log`.
+- [x] Execute encrypted cold-history clipboard acquisition: strict RCH
+  `j-30023605353971993` at `f66007801`, 33 passed, zero failed/ignored,
+  713 filtered. The real spill-store test reads 1,025 wrapped Unicode rows
+  through 17 worker chunks and compares the complete copied text.
+- [x] Fix split-lock starvation during anchored local copying in `0122937ae`:
+  consume the same sequence/dimensions observation that validated the anchor,
+  and check the anchor even on the first chunk. Add a real LocalPane/PTY
+  regression for intervening output and rejection of edited selected rows.
+- [ ] Execute the 34-test selection suite for `0122937ae`; retain
+  `0122937-selection-rch.log`. Independent source review found no further
+  causal defect; it is not execution or native acceptance evidence.
+- [ ] Resolve remote/cold selections cancelling during unrelated output;
+  require a witness covering already copied chunks before accepting a newer
+  sequence. The resident native-anchor fix does not establish this contract.
 - [ ] Execute exact remote-pane mapping regression in client layout tests.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier

@@ -29,6 +29,7 @@ pub(crate) struct SelectionCopy {
     deadline_wake: Option<SelectionCopyDeadline>,
     local: bool,
     local_read: Option<LocalSelectionRead>,
+    remote_read_witness: Option<frankenterm_client::pane::SelectionReadWitness>,
 }
 
 #[derive(Debug)]
@@ -221,6 +222,7 @@ impl SelectionCopy {
             deadline_wake: None,
             local: false,
             local_read: None,
+            remote_read_witness: None,
         })
     }
 
@@ -775,6 +777,26 @@ impl super::TermWindow {
         )>,
         &'static str,
     > {
+        if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
+            use frankenterm_client::pane::SelectionReadError;
+            let observed = client.selection_copy_snapshot(
+                authority.layout_floor(),
+                desired.seqno,
+                copy.selection.start.y..copy.end_row,
+                &mut copy.remote_read_witness,
+            );
+            return match observed {
+                Ok((observed, dimensions)) if observed >= copy.source_sequence => {
+                    // The witness retains invalidation for the whole range,
+                    // including chunks no longer present in the render cache.
+                    copy.source_sequence = observed;
+                    copy.verify_source(observed)?;
+                    Ok(Some((observed, dimensions)))
+                }
+                Err(SelectionReadError::Busy) => Ok(None),
+                _ => Err("The selected text changed while copying. Select it again."),
+            };
+        }
         let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
             return copy
                 .verify_source(sequence)
@@ -1423,6 +1445,7 @@ fn selected_lines_from_logical_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TermWindow;
     use crate::smart_selection_a11y::shared_smart_selection_recorder;
     use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
     use frankenterm_core::smart_selection::SelectionPatternKind;
