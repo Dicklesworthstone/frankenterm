@@ -13443,6 +13443,7 @@ mod tests {
                 floating_panes: vec![],
                 floating_focus: None,
                 pane_stacks: vec![],
+                underlying_tiled_active_pane_id: Some(index),
             })
             .collect();
         let captured = mux::MuxCapturedTopology {

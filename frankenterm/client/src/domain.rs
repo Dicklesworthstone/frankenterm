@@ -1849,7 +1849,7 @@ impl ClientInner {
         })
     }
 
-    fn should_forward_local_metadata(&self) -> bool {
+    pub(crate) fn should_forward_local_metadata(&self) -> bool {
         let inner_key = self as *const Self as usize;
         REMOTE_METADATA_APPLICATION_DEPTHS
             .try_with(|depths| {
@@ -3086,6 +3086,7 @@ impl ClientDomain {
             .client
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
+        Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
         Ok(())
@@ -3160,6 +3161,19 @@ impl ClientDomain {
             .map_err(anyhow::Error::new)??;
         domain.refresh_layout_snapshot(&mux, &inner);
         Ok(prepared)
+    }
+
+    pub(crate) fn flush_bootstrap_resizes(mux: &Mux, inner: &ClientInner) {
+        for pane in mux.iter_panes() {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner)
+                && client_pane.flush_resize_after_ready().is_err()
+            {
+                log::warn!("initial remote pane geometry could not be admitted after readiness");
+            }
+        }
     }
 
     fn prepare_render_application_bootstrap(
@@ -4647,6 +4661,7 @@ impl ClientDomain {
         }
         .await;
         bootstrap_result?;
+        Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
 
@@ -7134,6 +7149,86 @@ mod tests {
                 Err(ClientTopologySessionError::DialectChanged)
             );
         }
+    }
+
+    #[test]
+    fn stale_topology_snapshot_does_not_echo_resize_over_newer_local_geometry() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_026;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "snapshot-resize-echo-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let apply = |panes: ListPanesResponse| {
+            // Use the same exact-attachment, synchronous suppression scope as
+            // the live initial-attachment and resync consumers.
+            let _remote_application = inner.begin_remote_metadata_application().unwrap();
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
+                    panes,
+                },
+                None,
+            )
+            .unwrap();
+        };
+        let old_listing = sample_remote_tab_listing();
+        apply(old_listing.clone());
+        assert!(peer.is_empty(), "initial snapshot must not issue commands");
+        let tab = mux
+            .get_tab(inner.remote_to_local_tab_id(51).unwrap())
+            .unwrap();
+        let pane = tab.get_active_pane().unwrap();
+        let desired = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        // A font/window command commits before an older ListPanes response is
+        // consumed. The response must not turn observation into a new command.
+        tab.resize(desired);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == desired));
+        executor.try_tick().unwrap();
+        apply(old_listing.clone());
+        assert!(
+            peer.is_empty(),
+            "stale remote geometry was echoed as a resize command"
+        );
+        assert_eq!(pane.get_dimensions().cols, desired.cols);
+        assert_eq!(pane.get_dimensions().viewport_rows, desired.rows);
+
+        let mut current_listing = old_listing;
+        let PaneNode::Leaf(entry) = &mut current_listing.tabs[0] else {
+            panic!("fixture must contain one pane");
+        };
+        entry.size = desired;
+        apply(current_listing);
+        assert_eq!(tab.get_size(), desired);
+        assert!(
+            peer.is_empty(),
+            "current snapshot must remain observational"
+        );
+
+        let next = TerminalSize {
+            cols: 90,
+            pixel_width: 900,
+            ..desired
+        };
+        tab.resize(next);
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == next));
+        executor.try_tick().unwrap();
     }
 
     fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {

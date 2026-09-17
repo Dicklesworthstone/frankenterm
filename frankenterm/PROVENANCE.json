@@ -156,21 +156,21 @@
         "cleanup": 2,
         "cosmetic": 19,
         "feat": 53,
-        "fix": 94,
-        "other": 16,
+        "fix": 96,
+        "other": 17,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 30
+        "test": 31
       },
-      "fork_side_commit_count": 229,
+      "fork_side_commit_count": 233,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-17T09:09:55-04:00",
-        "sha": "cbca0e7c8e3d55baa9a99f16ad418e2c8ca9aa30",
-        "subject": "fix(client): admit layout-fenced viewport reads on the live GUI protocol"
+        "classification": "test",
+        "committed_at": "2026-09-17T12:55:30-04:00",
+        "sha": "92be000d93cf96cf1cdc47ca2f24af04919f2661",
+        "subject": "test(client): initialize replacement render stream after reconnect readiness"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 29,
         "docs": 6,
-        "feat": 195,
-        "fix": 239,
+        "feat": 196,
+        "fix": 242,
         "other": 49,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 92
+        "test": 96
       },
-      "fork_side_commit_count": 645,
+      "fork_side_commit_count": 653,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-17T07:20:53-04:00",
-        "sha": "f0e843a29e70087fdad3e505d851eb94680c8497",
-        "subject": "fix(recovery): settle reconciled terminal leases and inventory checkpoint authority"
+        "classification": "test",
+        "committed_at": "2026-09-17T12:54:24-04:00",
+        "sha": "346b7c3253781a71ef25b6b2d30660593c1f16e7",
+        "subject": "test(mux): format focus regression assertion diagnostics on Rust 2018"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2722,
-  "generated_at": "2026-09-17T13:41:46.763250Z",
+  "fork_side_commit_total": 2734,
+  "generated_at": "2026-09-17T16:56:55.036961Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

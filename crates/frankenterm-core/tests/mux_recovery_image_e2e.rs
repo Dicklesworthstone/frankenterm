@@ -154,7 +154,7 @@ impl Fixture {
                 size: size(),
                 alt_screen_active: id == 2,
                 cursor_pos: cursors[id],
-                is_active_in_tab: !matches!(id, 1 | 4 | 7),
+                is_active_in_tab: !matches!(id, 1 | 2 | 4),
                 is_zoomed_in_tab: false,
             })
             .collect();
@@ -167,7 +167,7 @@ impl Fixture {
                 size: size(),
                 working_dir: None,
                 alt_screen_active: id == 2,
-                is_active_pane: !matches!(id, 1 | 4 | 7),
+                is_active_pane: !matches!(id, 1 | 2 | 4),
                 is_zoomed_pane: false,
                 workspace: "default".into(),
                 cursor_pos: Default::default(),
@@ -209,7 +209,7 @@ impl Fixture {
                 title: format!("tab-{tab_id}"),
                 size: tab_size,
                 size_before_zoom: tab_size,
-                active_pane_id: Some(first),
+                active_pane_id: Some(if tab_id == 11 { 7 } else { first }),
                 zoomed_pane_id: None,
                 split_tree,
                 floating_panes: if tab_id == 11 {
@@ -232,6 +232,7 @@ impl Fixture {
                 },
                 floating_focus: (tab_id == 11).then_some(7),
                 pane_stacks: vec![],
+                underlying_tiled_active_pane_id: Some(first),
             }
         })
         .collect();

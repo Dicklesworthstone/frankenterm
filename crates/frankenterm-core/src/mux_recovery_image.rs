@@ -184,6 +184,14 @@ pub enum MuxRecoveryImageError {
     #[error("tab {tab_id} zoomed pane id {pane_id} not found in tab panes")]
     InvalidZoomedPaneId { tab_id: usize, pane_id: usize },
 
+    #[error(
+        "tab {tab_id} underlying tiled active pane id {pane_id} not found in split tree leaves"
+    )]
+    InvalidUnderlyingTiledActivePaneId { tab_id: usize, pane_id: usize },
+
+    #[error("tab {tab_id} has contradictory active pane state: {reason}")]
+    ContradictoryActivePaneState { tab_id: usize, reason: &'static str },
+
     #[error("tab {tab_id} has duplicate pane stack slot {slot_index}")]
     DuplicateStackSlot { tab_id: usize, slot_index: usize },
 
@@ -711,6 +719,9 @@ pub struct RecoveryTab {
     /// Stacked panes sharing a layout position (first/active pane in split tree, others hidden).
     #[serde(default)]
     pub pane_stacks: Vec<RecoveryPaneStack>,
+    /// Active pane of the underlying tiled split tree when floating focus is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_tiled_active_pane_id: Option<usize>,
 }
 
 impl RecoveryTab {
@@ -1570,6 +1581,18 @@ impl MuxRecoveryImage {
                     });
                 }
 
+                // Underlying tiled active pane if present must exist in split tree carrier leaves
+                // (matching raw_tree_active_pane which only indexes into tree leaves, never hidden stack members)
+                if let Some(tiled_id) = tab.underlying_tiled_active_pane_id {
+                    let is_in_tree = tree_leaves.iter().any(|(id, _)| *id == tiled_id);
+                    if !is_in_tree {
+                        return Err(MuxRecoveryImageError::InvalidUnderlyingTiledActivePaneId {
+                            tab_id: tab.tab_id,
+                            pane_id: tiled_id,
+                        });
+                    }
+                }
+
                 // Floating focus if present must exist in tab.floating_panes
                 if let Some(ff_id) = tab.floating_focus {
                     if !floating_pane_ids.contains(&ff_id) {
@@ -1587,6 +1610,52 @@ impl MuxRecoveryImage {
                             tab_id: tab.tab_id,
                             pane_id: z_id,
                         });
+                    }
+                }
+
+                // Enforce coherence between effective active pane, floating focus, zoom, and tiled active pane
+                if let Some(z_id) = tab.zoomed_pane_id {
+                    if tab.active_pane_id != z_id {
+                        return Err(MuxRecoveryImageError::ContradictoryActivePaneState {
+                            tab_id: tab.tab_id,
+                            reason: "tab active pane id does not match zoomed pane id",
+                        });
+                    }
+                } else if let Some(ff_id) = tab.floating_focus {
+                    if tab.active_pane_id != ff_id {
+                        return Err(MuxRecoveryImageError::ContradictoryActivePaneState {
+                            tab_id: tab.tab_id,
+                            reason: "tab active pane id does not match floating focus pane id",
+                        });
+                    }
+                } else {
+                    // Floating focus is absent and no zoom:
+                    // Active pane cannot be a floating pane
+                    if floating_pane_ids.contains(&tab.active_pane_id) {
+                        return Err(MuxRecoveryImageError::ContradictoryActivePaneState {
+                            tab_id: tab.tab_id,
+                            reason: "tab active pane id is a floating pane but floating focus is absent",
+                        });
+                    }
+                    // If split tree leaves exist, active pane must be a split tree leaf (cannot be hidden stack member)
+                    if !tree_leaves.is_empty()
+                        && !tree_leaves.iter().any(|(id, _)| *id == tab.active_pane_id)
+                    {
+                        return Err(MuxRecoveryImageError::ContradictoryActivePaneState {
+                            tab_id: tab.tab_id,
+                            reason: "tab active pane id must be a split tree leaf when floating focus and zoom are absent",
+                        });
+                    }
+                    // If split tree leaves exist, underlying_tiled_active_pane_id (if specified) must match active_pane_id
+                    if !tree_leaves.is_empty() {
+                        if let Some(tiled_id) = tab.underlying_tiled_active_pane_id {
+                            if tiled_id != tab.active_pane_id {
+                                return Err(MuxRecoveryImageError::ContradictoryActivePaneState {
+                                    tab_id: tab.tab_id,
+                                    reason: "tab underlying tiled active pane id does not match active pane id when floating focus is absent",
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2177,6 +2246,7 @@ impl MuxRecoveryImage {
                         floating_focus: tab.floating_focus,
                         active_pane_id,
                         pane_stacks: tab_stacks,
+                        underlying_tiled_active_pane_id: tab.underlying_tiled_active_pane_id,
                     });
                 }
             }
@@ -2865,9 +2935,10 @@ mod tests {
             zoomed_pane_id: None,
             root_split: Some(split_tree),
             floating_panes: vec![floating_pane],
-            floating_focus: Some(3),
+            floating_focus: None,
             active_pane_id: 1,
             pane_stacks: vec![],
+            underlying_tiled_active_pane_id: Some(1),
         };
 
         let window = RecoveryWindow {
@@ -2980,6 +3051,7 @@ mod tests {
     fn test_positive_floating_pane_active_focus() {
         let mut image = make_valid_test_image();
         image.topology.windows[0].tabs[0].active_pane_id = 3;
+        image.topology.windows[0].tabs[0].floating_focus = Some(3);
         image.image_digest = image.compute_digest().unwrap();
 
         assert!(image.validate().is_ok());
@@ -3536,6 +3608,7 @@ mod tests {
             floating_focus: None,
             active_pane_id: 1,
             pane_stacks: vec![],
+            underlying_tiled_active_pane_id: Some(1),
         };
 
         let mut image = MuxRecoveryImage {
@@ -3819,6 +3892,219 @@ mod tests {
             err,
             MuxRecoveryImageError::InvalidHeader("generation must be greater than zero")
         ));
+    }
+
+    #[test]
+    fn test_recovery_tab_underlying_tiled_active_pane_id_serde_roundtrip() {
+        let tab = RecoveryTab {
+            tab_id: 1,
+            stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            title: "roundtrip".to_string(),
+            working_dir: None,
+            size: TerminalSize::default(),
+            size_before_zoom: TerminalSize::default(),
+            zoomed_pane_id: None,
+            root_split: Some(RecoverySplitNode::Leaf {
+                pane_id: 20,
+                pane_uuid: "uuid-pane-20".to_string(),
+            }),
+            floating_panes: vec![RecoveryFloatingPane::new(
+                99,
+                "uuid-pane-99".to_string(),
+                FloatingPaneRect {
+                    left: 0,
+                    top: 0,
+                    width: 40,
+                    height: 20,
+                },
+                1,
+                true,
+                false,
+                1.0,
+            )],
+            floating_focus: Some(99),
+            active_pane_id: 99,
+            pane_stacks: vec![],
+            underlying_tiled_active_pane_id: Some(20),
+        };
+
+        // Standard serialization roundtrip
+        let serialized = serde_json::to_string(&tab).unwrap();
+        assert!(serialized.contains("\"underlying_tiled_active_pane_id\":20"));
+        let deserialized: RecoveryTab = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, tab);
+        assert_eq!(deserialized.underlying_tiled_active_pane_id, Some(20));
+
+        // When None, field is omitted from serialized JSON
+        let mut tab_none = tab.clone();
+        tab_none.underlying_tiled_active_pane_id = None;
+        let serialized_none = serde_json::to_string(&tab_none).unwrap();
+        assert!(!serialized_none.contains("underlying_tiled_active_pane_id"));
+        let from_none: RecoveryTab = serde_json::from_str(&serialized_none).unwrap();
+        assert_eq!(from_none.underlying_tiled_active_pane_id, None);
+    }
+
+    #[test]
+    fn test_recovery_tab_underlying_tiled_active_pane_id_validation_rejects_nonexistent_pane() {
+        let mut image = make_valid_test_image();
+        // Pane 999 is not in the split tree leaves:
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = Some(999);
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::InvalidUnderlyingTiledActivePaneId {
+                tab_id: 10,
+                pane_id: 999,
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_underlying_tiled_active_pane_id_rejects_hidden_stack_member() {
+        let mut image = make_valid_test_image();
+        // Add pane 4 as hidden stack member sharing slot with pane 1
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        // Pane 4 is a hidden stack member, not the carrier in the split tree.
+        // raw_tree_active_pane only indexes into tree leaves, so hidden stack members must be rejected:
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = Some(4);
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::InvalidUnderlyingTiledActivePaneId {
+                tab_id: 10,
+                pane_id: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_rejects_contradictory_floating_focus_and_active_pane() {
+        let mut image = make_valid_test_image();
+        // Floating focus is set to floating pane 3, but active_pane_id claims tiled pane 1
+        image.topology.windows[0].tabs[0].floating_focus = Some(3);
+        image.topology.windows[0].tabs[0].active_pane_id = 1;
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ContradictoryActivePaneState {
+                tab_id: 10,
+                reason: "tab active pane id does not match floating focus pane id",
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_rejects_floating_active_pane_when_floating_focus_absent() {
+        let mut image = make_valid_test_image();
+        // Floating focus is None, but active_pane_id is set to floating pane 3
+        image.topology.windows[0].tabs[0].floating_focus = None;
+        image.topology.windows[0].tabs[0].active_pane_id = 3;
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ContradictoryActivePaneState {
+                tab_id: 10,
+                reason: "tab active pane id is a floating pane but floating focus is absent",
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_rejects_hidden_stack_active_pane_when_unzoomed_and_unfloating() {
+        let mut image = make_valid_test_image();
+        // Add pane 4 as hidden stack member sharing slot with pane 1
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        // Pane 4 is a hidden stack member. Without zoom or floating focus, active pane MUST be a tree leaf:
+        image.topology.windows[0].tabs[0].active_pane_id = 4;
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = None;
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ContradictoryActivePaneState {
+                tab_id: 10,
+                reason: "tab active pane id must be a split tree leaf when floating focus and zoom are absent",
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_allows_hidden_stack_active_pane_when_zoomed() {
+        let mut image = make_valid_test_image();
+        let pane4 = make_test_pane(4, "uuid-pane-4", &image.header.mux_incarnation_id);
+        image.panes.push(pane4);
+        image.topology.windows[0].tabs[0]
+            .pane_stacks
+            .push(RecoveryPaneStack {
+                slot_index: 0,
+                pane_ids: vec![1, 4],
+                active_index: 0,
+            });
+        // Pane 4 is a hidden stack member, but is explicitly zoomed:
+        image.topology.windows[0].tabs[0].zoomed_pane_id = Some(4);
+        image.topology.windows[0].tabs[0].active_pane_id = 4;
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = Some(1);
+        image.image_digest = image.compute_digest().unwrap();
+        assert!(image.validate().is_ok());
+    }
+
+    #[test]
+    fn test_recovery_tab_allows_zoomed_pane_differing_from_underlying_tiled_active_pane() {
+        let mut image = make_valid_test_image();
+        // Pane 2 is zoomed (and therefore effective active), while pane 1 remains underlying tiled active:
+        image.topology.windows[0].tabs[0].zoomed_pane_id = Some(2);
+        image.topology.windows[0].tabs[0].active_pane_id = 2;
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = Some(1);
+        image.image_digest = image.compute_digest().unwrap();
+        assert!(image.validate().is_ok());
+    }
+
+    #[test]
+    fn test_recovery_tab_rejects_contradictory_underlying_and_effective_active_pane() {
+        let mut image = make_valid_test_image();
+        // Floating focus is None, effective active is pane 1, but underlying tiled active claims pane 2
+        image.topology.windows[0].tabs[0].floating_focus = None;
+        image.topology.windows[0].tabs[0].active_pane_id = 1;
+        image.topology.windows[0].tabs[0].underlying_tiled_active_pane_id = Some(2);
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ContradictoryActivePaneState {
+                tab_id: 10,
+                reason: "tab underlying tiled active pane id does not match active pane id when floating focus is absent",
+            }
+        );
+    }
+
+    #[test]
+    fn test_recovery_tab_rejects_contradictory_zoomed_and_active_pane() {
+        let mut image = make_valid_test_image();
+        // Zoomed pane is pane 2, but active_pane_id claims pane 1
+        image.topology.windows[0].tabs[0].zoomed_pane_id = Some(2);
+        image.topology.windows[0].tabs[0].active_pane_id = 1;
+        let err = image.validate().unwrap_err();
+        assert_eq!(
+            err,
+            MuxRecoveryImageError::ContradictoryActivePaneState {
+                tab_id: 10,
+                reason: "tab active pane id does not match zoomed pane id",
+            }
+        );
     }
 }
 
@@ -4112,6 +4398,7 @@ mod converter_tests {
             floating_panes: vec![],
             floating_focus: None,
             pane_stacks: vec![],
+            underlying_tiled_active_pane_id: Some(101),
         };
 
         let window = mux::MuxCapturedWindow {

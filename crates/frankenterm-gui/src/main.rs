@@ -190,7 +190,7 @@ struct GuiMacosBackendSelection {
 fn frankenterm_bootstrap() {
     // Initialize logging from RUST_LOG env var
     env_logger::init();
-    log_gui_macos_backend_selection();
+    log_gui_macos_backend_policy();
 
     config::assign_version_info(
         concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")),
@@ -229,10 +229,13 @@ fn frankenterm_bootstrap() {
     }
 }
 
-fn log_gui_macos_backend_selection() {
+fn log_gui_macos_backend_policy() {
     let selection = probe_gui_macos_backend_selection();
-    log::info!(
-        "macOS renderer backend selection: backend={:?} reason={:?} override={:?} arch={:?} version={}.{}",
+    // This policy probe does not construct or dispatch a renderer. In
+    // particular, MetalDirect is not a live RenderContext implementation.
+    // TermWindow::created reports the successfully constructed backend.
+    log::debug!(
+        "macOS renderer policy probe (not active backend): preference={:?} reason={:?} override={:?} arch={:?} version={}.{}; actual renderer follows front_end configuration",
         selection.result.backend,
         selection.result.reason,
         selection.override_,
