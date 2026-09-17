@@ -128,6 +128,7 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
+pub(crate) use selection::SelectionCopy;
 #[cfg(test)]
 pub(crate) use selection::selected_text_from_logical_lines;
 pub mod spawn;
@@ -488,6 +489,7 @@ pub struct PaneState {
     selection_frame: crate::selection::SelectionFrameState,
     mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
     pending_selection_start: Option<crate::selection::PendingSelectionStart>,
+    pending_native_selection: Option<crate::selection::PendingNativeSelection>,
     suppress_selection_link: bool,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -3821,7 +3823,9 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                pane.send_paste(text.as_str())?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(text.as_str())?;
+                }
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -3835,7 +3839,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(urls.as_str())?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(urls.as_str())?;
+                }
                 Ok(true)
             }
             WindowEvent::DroppedFile(paths) => {
@@ -3853,7 +3859,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(&paths)?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(&paths)?;
+                }
                 Ok(true)
             }
             WindowEvent::DraggedFile(_) => Ok(true),
@@ -4608,6 +4616,25 @@ impl TermWindow {
         }
     }
 
+    /// Keep local overlays usable while terminal input waits for saved layout
+    /// restoration. A delayed delivery must still belong to this exact window.
+    fn pane_input_ready(&self, pane: &Arc<dyn Pane>) -> bool {
+        let active_overlay = self.get_active_pane_or_overlay().is_some_and(|active| {
+            Arc::ptr_eq(&active, pane)
+                && self.get_active_pane_no_overlay().is_some_and(|underlying| {
+                    !Arc::ptr_eq(&underlying, pane)
+                        && Mux::try_get().is_some_and(|mux| {
+                            crate::frontend::layout_pane_belongs_to_window(
+                                &mux,
+                                self.mux_window_id,
+                                &underlying,
+                            )
+                        })
+                })
+        });
+        active_overlay || crate::frontend::layout_input_ready(self.mux_window_id, pane)
+    }
+
     fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
         let Some(mux) = self.mux_or_log("check pane visibility") else {
             return false;
@@ -5272,25 +5299,50 @@ impl TermWindow {
                 // through the same atomic source fence as render damage so a
                 // reset/regression or saturated source cannot make an old high
                 // selection seqno suppress unrelated replacement content.
-                let selection_dirty = frame.map_or_else(
-                    || {
-                        pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
-                            .1
-                    },
-                    |frame| {
-                        if frame.source_sequence == selection_seqno {
-                            // A successful native remap established this exact
-                            // frame as the selection's new damage baseline.
-                            rangeset::RangeSet::new()
-                        } else {
-                            frame.selection_dirty.clone()
+                let selection_dirty = if let Some(client) =
+                    pane.downcast_ref::<frankenterm_client::pane::ClientPane>()
+                {
+                    match selection_authority.map(|authority| {
+                        client.selection_changed_since(
+                            authority.layout_floor(),
+                            selection_seqno,
+                            visible_range.clone(),
+                        )
+                    }) {
+                        Some(Ok(changed)) => changed,
+                        Some(Err(
+                            frankenterm_client::pane::SelectionReadError::SourceChanged
+                            | frankenterm_client::pane::SelectionReadError::InvalidRange
+                            | frankenterm_client::pane::SelectionReadError::TooLarge,
+                        )) => {
+                            let mut changed = rangeset::RangeSet::new();
+                            changed.add_range(visible_range.clone());
+                            changed
                         }
-                    },
-                );
-                let intersects = selection_rows
-                    .clone()
-                    .into_iter()
-                    .any(|row| selection_dirty.contains(row));
+                        None | Some(Err(frankenterm_client::pane::SelectionReadError::Busy)) => {
+                            rangeset::RangeSet::new()
+                        }
+                    }
+                } else {
+                    frame.map_or_else(
+                        || {
+                            pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
+                                .1
+                        },
+                        |frame| {
+                            if frame.source_sequence == selection_seqno {
+                                // A successful native remap established this exact
+                                // frame as the selection's new damage baseline.
+                                rangeset::RangeSet::new()
+                            } else {
+                                frame.selection_dirty.clone()
+                            }
+                        },
+                    )
+                };
+                let intersects = !selection_dirty
+                    .intersection_with_range(selection_rows.clone())
+                    .is_empty();
                 (
                     intersects,
                     if intersects {
@@ -6996,6 +7048,9 @@ impl TermWindow {
                 }
             }
             CopyTo(dest) => {
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 if self.selection_authority_is_current(pane) {
                     let text = self.selection_text(pane);
                     if self.selection_authority_is_current(pane) {
@@ -7036,8 +7091,15 @@ impl TermWindow {
             ActivateWindowRelativeNoWrap(n) => {
                 self.activate_window_relative(*n, false)?;
             }
-            SendString(s) => pane.writer().write_all(s.as_bytes())?,
+            SendString(s) => {
+                if self.pane_input_ready(pane) {
+                    pane.writer().write_all(s.as_bytes())?;
+                }
+            }
             SendKey(key) => {
+                if !self.pane_input_ready(pane) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 use keyevent::Key;
                 let mods = key.mods;
                 if let Key::Code(key) = self.win_key_code_to_termwiz_key_code(
@@ -7145,6 +7207,9 @@ impl TermWindow {
             CompleteSelectionOrOpenLinkAtMouseCursor(dest) => {
                 self.retry_pending_selection_start(pane);
                 self.clear_selection_drag();
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 let suppress_link = {
                     let mut state = self.pane_state(pane.pane_id());
                     state.pending_selection_start = None;
@@ -7172,6 +7237,9 @@ impl TermWindow {
             CompleteSelection(dest) => {
                 self.retry_pending_selection_start(pane);
                 self.clear_selection_drag();
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 {
                     let mut state = self.pane_state(pane.pane_id());
                     state.pending_selection_start = None;

@@ -117,6 +117,23 @@ fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), 
     Ok(())
 }
 
+async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), DirectMuxError> {
+    if attempt == 0 {
+        // A freshly installed cold layout or completed producer write can
+        // invalidate the first fence even though the next snapshot is ready.
+        // Yield cooperatively without imposing a timer on that normal race.
+        crate::runtime_async::task::yield_now_with_cx(cx)
+            .await
+            .map_err(|error| cancelled_mux_error("text_snapshot_yield", error))
+    } else {
+        // Repeated source churn still backs off within the same three-attempt
+        // budget. Quota refusals have their own unchanged backoff policy.
+        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+            .await
+            .map_err(|error| cancelled_mux_error("text_snapshot_backoff", error))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectMuxClientConfig {
     pub socket_path: Option<PathBuf>,
@@ -2704,12 +2721,15 @@ impl DirectMuxClient {
                                 }
                                 diagnostics.chunk_layout_retries += 1;
                                 let phase_started = diagnostics.start_phase();
-                                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
-                                    .await
-                                    .map_err(|error| {
-                                        cancelled_mux_error("text_snapshot_backoff", error)
-                                    })?;
-                                diagnostics.phase("chunk_layout_wait", phase_started);
+                                text_snapshot_retry_with_cx(cx, attempt).await?;
+                                diagnostics.phase(
+                                    if attempt == 0 {
+                                        "chunk_layout_yield"
+                                    } else {
+                                        "chunk_layout_wait"
+                                    },
+                                    phase_started,
+                                );
                                 continue 'snapshot;
                             }
                         }
@@ -2778,10 +2798,15 @@ impl DirectMuxClient {
             if attempt + 1 < MAX_SNAPSHOT_ATTEMPTS {
                 diagnostics.final_source_retries += 1;
                 let phase_started = diagnostics.start_phase();
-                crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
-                    .await
-                    .map_err(|error| cancelled_mux_error("text_snapshot_backoff", error))?;
-                diagnostics.phase("final_source_wait", phase_started);
+                text_snapshot_retry_with_cx(cx, attempt).await?;
+                diagnostics.phase(
+                    if attempt == 0 {
+                        "final_source_yield"
+                    } else {
+                        "final_source_wait"
+                    },
+                    phase_started,
+                );
             }
         }
         Err(DirectMuxError::TextSnapshotChanged {
@@ -7022,9 +7047,53 @@ mod tests {
     }
 
     #[test]
+    fn text_read_first_snapshot_retry_yields_without_waiting_for_a_timer() {
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct RetryWake(AtomicUsize);
+        impl Wake for RetryWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let cx = crate::cx::for_testing();
+        let wake = Arc::new(RetryWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut context = Context::from_waker(&waker);
+        let mut retry = std::pin::pin!(text_snapshot_retry_with_cx(&cx, 0));
+        // No runtime timer or clock advancement: the retry must schedule one
+        // cooperative turn, then allow the next fully fenced transaction.
+        assert!(retry.as_mut().poll(&mut context).is_pending());
+        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            retry.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+
+        cx.cancel_with(crate::outcome::CancelKind::User, None);
+        let mut cancelled = std::pin::pin!(text_snapshot_retry_with_cx(&cx, 0));
+        assert!(matches!(
+            cancelled.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn text_read_restarts_after_initial_stale_fence_or_final_source_change() {
+        use tracing::instrument::WithSubscriber;
         for stale_first in [true, false] {
-            run_async_test(async move {
+            let diagnostic_log = TextDiagnosticLog::default();
+            let subscriber = diagnostic_log.subscriber();
+            let future = async move {
                 let cx = crate::cx::for_testing();
                 let ranges = Arc::new(StdMutex::new(Vec::new()));
                 let seen = Arc::clone(&ranges);
@@ -7085,12 +7154,23 @@ mod tests {
                     actual, expected,
                     "restart must re-read the new oldest row without mixed text"
                 );
+                let phases = diagnostic_log.retry_phases();
+                assert_eq!(
+                    phases,
+                    vec![if stale_first {
+                        "chunk_layout_yield"
+                    } else {
+                        "final_source_yield"
+                    }],
+                    "one source transition must not impose a timer backoff"
+                );
                 drop(client);
                 timeout(Duration::from_secs(5), server)
                     .await
                     .unwrap()
                     .unwrap();
-            });
+            };
+            run_async_test(future.with_subscriber(subscriber));
         }
     }
 
@@ -7222,6 +7302,20 @@ mod tests {
     }
 
     impl TextDiagnosticLog {
+        fn retry_phases(&self) -> Vec<String> {
+            let bytes = self.0.lock().unwrap();
+            bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                .filter_map(|event| {
+                    let phase = event["fields"]["phase"].as_str()?;
+                    (phase.ends_with("_yield") || phase.ends_with("_wait"))
+                        .then(|| phase.to_owned())
+                })
+                .collect()
+        }
+
         fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
             let output = self.clone();
             tracing_subscriber::fmt()
@@ -7287,6 +7381,7 @@ mod tests {
                     assert_eq!(summaries[0]["attempts"], 1);
                     assert_eq!(summaries[0]["quota_reductions"], 1);
                     assert_eq!(summaries[0]["final_source_retries"], 0);
+                    assert_eq!(diagnostic_log.retry_phases(), vec!["quota_wait"]);
                     assert!(
                         matches!(error, DirectMuxError::RemoteRejection(ref e) if e.code == codec::MuxErrorCode::QUOTA_EXCEEDED)
                     );
@@ -7609,6 +7704,14 @@ mod tests {
                 } else {
                     "final_source"
                 };
+                assert_eq!(
+                    diagnostic_log.retry_phases(),
+                    vec![
+                        format!("{expected_phase}_yield"),
+                        format!("{expected_phase}_wait"),
+                    ],
+                    "repeated churn must retain its second-retry backoff"
+                );
                 assert!(matches!(
                     error,
                     MuxPoolError::Mux(DirectMuxError::TextSnapshotChanged {

@@ -45,6 +45,14 @@ use wezterm_term::{
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionReadError {
+    Busy,
+    SourceChanged,
+    InvalidRange,
+    TooLarge,
+}
+
 #[derive(Default)]
 struct ResizeDeliveryState {
     attempt: u64,
@@ -2962,6 +2970,33 @@ impl ClientPane {
         self.renderable.try_lock()?.selection_source_snapshot()
     }
 
+    /// Read a bounded authoritative selection chunk without renderer overlays.
+    /// Missing cache rows start the existing asynchronous fetch and return Busy.
+    pub fn selection_lines(
+        &self,
+        layout: SequenceNo,
+        sequence: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> Result<Vec<Line>, SelectionReadError> {
+        self.renderable
+            .try_lock()
+            .ok_or(SelectionReadError::Busy)?
+            .selection_lines(layout, sequence, selected_sequence, rows)
+    }
+
+    pub fn selection_changed_since(
+        &self,
+        layout: SequenceNo,
+        sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> Result<RangeSet<StableRowIndex>, SelectionReadError> {
+        self.renderable
+            .try_lock()
+            .ok_or(SelectionReadError::Busy)?
+            .selection_changed_since(layout, sequence, rows)
+    }
+
     pub(crate) fn new(
         client: &Arc<ClientInner>,
         local_pane_id: PaneId,
@@ -4896,6 +4931,14 @@ mod tests {
         {
             let _guard = pane.renderable.lock();
             assert!(pane.selection_source_snapshot().is_none());
+            assert!(matches!(
+                pane.selection_lines(before.0, before.1, before.1, 0..1),
+                Err(SelectionReadError::Busy)
+            ));
+            assert!(matches!(
+                pane.selection_changed_since(before.0, before.1, 0..1),
+                Err(SelectionReadError::Busy)
+            ));
         }
         assert_eq!(pane.selection_source_snapshot(), Some(before));
     }

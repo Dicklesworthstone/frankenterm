@@ -555,6 +555,7 @@ mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-sigpipe = { path = "crates/frankenterm-sigpipe" }
+frankenterm-pty-guardian = { path = "crates/frankenterm-pty-guardian" }
 
 # Notify: upstream used 5.0; FrankenTerm now targets the latest stable API.
 notify = "8.2.0"

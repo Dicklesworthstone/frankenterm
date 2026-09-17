@@ -24,11 +24,484 @@ use wezterm_term::{Alert, ClipboardSelection};
 
 const MAX_RECONCILE_WAITERS: usize = 4_096;
 const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+static LAYOUT_PENDING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Terminal delivery is fenced only during the short queued restore cut.
+/// UI bindings and selection/copy do not call this gate.
+pub(crate) fn layout_input_ready(window_id: MuxWindowId, pane: &Arc<dyn mux::pane::Pane>) -> bool {
+    if LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire) & 2 != 0 {
+        return false;
+    }
+    let Some(mux) = Mux::try_get() else {
+        return false;
+    };
+    if !layout_pane_belongs_to_window(&mux, window_id, pane) {
+        return false;
+    }
+    if let Some(domain) = mux.get_domain(pane.domain_id()) {
+        if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+            return !client.layout_restore_pending();
+        }
+    }
+    true
+}
+
+pub(crate) fn layout_pane_belongs_to_window(
+    mux: &Mux,
+    window_id: MuxWindowId,
+    pane: &Arc<dyn mux::pane::Pane>,
+) -> bool {
+    mux.get_pane(pane.pane_id())
+        .is_some_and(|current| Arc::ptr_eq(&current, pane))
+        && mux
+            .resolve_pane_id(pane.pane_id())
+            .is_some_and(|(_, owner, _)| owner == window_id)
+}
+
+use crate::window_state_persist::{
+    LayoutStateSnapshot, LayoutWindowId, MixedDomainLayoutOverlay, StableLocalSessionId,
+    StableLocalTabId, StableMuxSessionId, StableTabSlot,
+};
+use frankenterm_client::domain::{ClientDomain, RemoteLayoutSnapshot};
+
+struct OwnedLayoutWindow {
+    mux_identity: uuid::Uuid,
+    overlay: MixedDomainLayoutOverlay,
+}
+
+struct LayoutLifecycle {
+    startup: LayoutStateSnapshot,
+    owned: HashMap<MuxWindowId, OwnedLayoutWindow>,
+    restored: std::collections::BTreeSet<LayoutWindowId>,
+}
+
+struct LiveLayout {
+    receipts: Vec<Arc<RemoteLayoutSnapshot>>,
+    slots: HashMap<mux::tab::TabId, StableTabSlot>,
+    unavailable: std::collections::BTreeSet<crate::window_state_persist::DomainBindingId>,
+}
+
+impl LiveLayout {
+    fn capture(mux: &Arc<Mux>, startup: &LayoutStateSnapshot) -> anyhow::Result<Self> {
+        let mut result = Self {
+            receipts: Vec::new(),
+            slots: HashMap::new(),
+            unavailable: startup
+                .domain_bindings
+                .iter()
+                .map(|binding| binding.binding_id())
+                .collect(),
+        };
+        for domain in mux.iter_domains() {
+            let Some(client) = domain.downcast_ref::<ClientDomain>() else {
+                continue;
+            };
+            let Some(receipt) = client.layout_snapshot() else {
+                continue;
+            };
+            receipt.with_current(mux, || {
+                let binding = crate::window_state_persist::DomainBindingId::from_bytes(
+                    receipt.binding().binding_id.as_bytes(),
+                );
+                result.unavailable.remove(&binding);
+                for entry in receipt.tabs() {
+                    anyhow::ensure!(result.slots.len() < 16_384, "live layout exceeds tab bound");
+                    let slot = StableTabSlot::remote(
+                        binding,
+                        StableMuxSessionId::from_bytes(receipt.session().as_bytes()),
+                        u64::try_from(entry.remote_window_id())?,
+                        u64::try_from(entry.remote_tab_id())?,
+                    );
+                    anyhow::ensure!(
+                        result.slots.insert(entry.tab().tab_id(), slot).is_none(),
+                        "multiple attachments claim one local layout tab"
+                    );
+                }
+                Ok(())
+            })?;
+            result.receipts.push(receipt);
+        }
+        let (session, _) = mux.topology_snapshot_authority()?;
+        for window in mux.iter_windows_bounded(4_096)? {
+            let Some(order) = mux.window_order_snapshot(window)? else {
+                continue;
+            };
+            for tab in order.ordered_tabs() {
+                if result.slots.contains_key(&tab.tab_id()) {
+                    continue;
+                }
+                // A client tab without a current receipt is unavailable, not a
+                // local tab. In particular codec46 numeric IDs cannot persist.
+                if tab.iter_panes().iter().any(|pane| {
+                    mux.get_domain(pane.pane.domain_id())
+                        .is_none_or(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+                }) {
+                    continue;
+                }
+                anyhow::ensure!(result.slots.len() < 16_384, "live layout exceeds tab bound");
+                result.slots.insert(
+                    tab.tab_id(),
+                    StableTabSlot::local(
+                        StableLocalSessionId::from_bytes(session.as_bytes()),
+                        StableLocalTabId::from_bytes(*tab.durable_id().as_bytes()),
+                    ),
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    fn with_current<T>(
+        &self,
+        mux: &Arc<Mux>,
+        apply: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        RemoteLayoutSnapshot::with_current_batch(&self.receipts, mux, apply)
+    }
+}
+
+impl LayoutLifecycle {
+    fn capture_changes(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
+        let mut updates = Vec::new();
+        let mut next_owned = Vec::new();
+        for id in mux.iter_windows_bounded(4_096)? {
+            let Some(order) = mux.window_order_snapshot(id)? else {
+                continue;
+            };
+            let Some(window) = mux.get_window(id) else {
+                continue;
+            };
+            let identity = window.durable_id();
+            let workspace = window.get_workspace().to_owned();
+            drop(window);
+            let Some(slots): Option<Vec<_>> = order
+                .ordered_tabs()
+                .iter()
+                .map(|tab| live.slots.get(&tab.tab_id()).copied())
+                .collect()
+            else {
+                continue;
+            };
+            let old = self
+                .owned
+                .get(&id)
+                .filter(|owned| owned.mux_identity == identity);
+            if old.is_none()
+                && self.startup.overlays.iter().any(|overlay| {
+                    !self.restored.contains(&overlay.window_id())
+                        && overlay.slots().iter().any(|saved| {
+                            slots.iter().any(|slot| slot.identity() == saved.identity())
+                        })
+                })
+            {
+                // Startup owns this association. A queued capture must not
+                // persist a competing freshly minted ID before restore runs.
+                continue;
+            }
+            // Pure remote order belongs to its server. This store describes
+            // local/mixed composition only, including retained unavailable slots.
+            let pure_remote = slots.first().is_some_and(|first| match first {
+                StableTabSlot::Remote { binding_id, session_id, remote_window_id, .. } => slots.iter().all(|slot|
+                    matches!(slot, StableTabSlot::Remote { binding_id: b, session_id: s, remote_window_id: w, .. }
+                        if b == binding_id && s == session_id && w == remote_window_id)),
+                _ => false,
+            });
+            if old.is_none() && (pure_remote || slots.is_empty()) {
+                continue;
+            }
+            let active = order
+                .active_tab_id()
+                .and_then(|id| live.slots.get(&id).copied());
+            let mut slots = slots;
+            if let Some(old) = old {
+                for (position, slot) in old.overlay.slots().iter().enumerate() {
+                    if slot
+                        .remote_binding()
+                        .is_some_and(|binding| live.unavailable.contains(&binding))
+                        && !slots.iter().any(|live| live.identity() == slot.identity())
+                    {
+                        slots.insert(position.min(slots.len()), *slot);
+                    }
+                }
+            }
+            if old.is_some_and(|old| {
+                old.overlay.slots() == slots.as_slice()
+                    && old.overlay.active() == active
+                    && old.overlay.workspace() == workspace
+            }) {
+                continue;
+            }
+            let (window_id, revision, base) = match old {
+                Some(old) => (
+                    old.overlay.window_id(),
+                    old.overlay
+                        .local_revision()
+                        .checked_add(1)
+                        .context("layout revision exhausted")?,
+                    Some(old.overlay.local_revision()),
+                ),
+                None => (self.startup.new_layout_window_id()?, 1, None),
+            };
+            let overlay =
+                MixedDomainLayoutOverlay::new(window_id, workspace, revision, slots, active)?;
+            updates.push((base, overlay.clone()));
+            next_owned.push((
+                id,
+                OwnedLayoutWindow {
+                    mux_identity: identity,
+                    overlay,
+                },
+            ));
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        live.with_current(mux, || {
+            crate::window_state_persist::queue_layout_overlays(updates).map_err(Into::into)
+        })?;
+        for (id, owned) in next_owned {
+            // A local edit supersedes the startup placement, including edits
+            // made while another domain is unavailable.
+            if let Some(startup) = self
+                .startup
+                .overlays
+                .iter_mut()
+                .find(|overlay| overlay.window_id() == owned.overlay.window_id())
+            {
+                *startup = owned.overlay.clone();
+            }
+            self.owned.insert(id, owned);
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self, mux: &Arc<Mux>, live: &LiveLayout) -> anyhow::Result<()> {
+        let mut orders = BTreeMap::new();
+        for id in mux.iter_windows_bounded(4_096)? {
+            if let Some(order) = mux.window_order_snapshot(id)? {
+                orders.insert(id, order);
+            }
+        }
+        let mut by_identity = HashMap::new();
+        for order in orders.values() {
+            for tab in order.ordered_tabs() {
+                if let Some(slot) = live.slots.get(&tab.tab_id()) {
+                    anyhow::ensure!(
+                        by_identity
+                            .insert(slot.identity(), Arc::clone(tab))
+                            .is_none(),
+                        "live layout aliases a stable tab identity"
+                    );
+                }
+            }
+        }
+        let mut desired: BTreeMap<_, _> = orders
+            .iter()
+            .map(|(&id, order)| {
+                (
+                    id,
+                    (order.ordered_tabs().to_vec(), order.active_tab().cloned()),
+                )
+            })
+            .collect();
+        let mut claimed_windows = std::collections::BTreeSet::new();
+        let mut assignments = Vec::new();
+        let mut builders = Vec::new();
+        let result = (|| -> anyhow::Result<()> {
+            for overlay in &self.startup.overlays {
+                if self.restored.contains(&overlay.window_id()) {
+                    continue;
+                }
+                let tabs: Vec<_> = overlay
+                    .slots()
+                    .iter()
+                    .filter_map(|slot| by_identity.get(&slot.identity()).cloned())
+                    .collect();
+                let Some(first) = tabs.first() else {
+                    continue;
+                };
+                let existing = self.owned.iter().find_map(|(&id, owned)| {
+                    (owned.overlay.window_id() == overlay.window_id()
+                        && mux
+                            .get_window(id)
+                            .is_some_and(|window| window.durable_id() == owned.mux_identity))
+                    .then_some(id)
+                });
+                let source = orders
+                    .iter()
+                    .find_map(|(&id, order)| {
+                        order
+                            .ordered_tabs()
+                            .iter()
+                            .any(|tab| Arc::ptr_eq(tab, first))
+                            .then_some(id)
+                    })
+                    .context("restored tab lost its parent")?;
+                let mut target = existing.unwrap_or(source);
+                let compatible_workspace = mux
+                    .get_window(target)
+                    .is_some_and(|window| window.get_workspace() == overlay.workspace());
+                let other_owner = self
+                    .owned
+                    .get(&target)
+                    .is_some_and(|owned| owned.overlay.window_id() != overlay.window_id());
+                if !compatible_workspace || other_owner || !claimed_windows.insert(target) {
+                    let builder = mux.new_empty_window(Some(overlay.workspace().to_owned()), None);
+                    target = *builder;
+                    let order = mux
+                        .window_order_snapshot(target)?
+                        .context("new layout window disappeared")?;
+                    orders.insert(target, order);
+                    desired.insert(target, (Vec::new(), None));
+                    builders.push(builder);
+                    claimed_windows.insert(target);
+                }
+                let selected: std::collections::HashSet<_> =
+                    tabs.iter().map(|tab| tab.tab_id()).collect();
+                for (ordered, active) in desired.values_mut() {
+                    ordered.retain(|tab| !selected.contains(&tab.tab_id()));
+                    if active
+                        .as_ref()
+                        .is_some_and(|tab| selected.contains(&tab.tab_id()))
+                    {
+                        *active = ordered.first().cloned();
+                    }
+                }
+                let (ordered, active) = desired
+                    .get_mut(&target)
+                    .context("layout target disappeared")?;
+                let mut next = tabs;
+                next.append(ordered);
+                *active = overlay
+                    .active()
+                    .and_then(|slot| by_identity.get(&slot.identity()).cloned())
+                    .filter(|tab| next.iter().any(|candidate| Arc::ptr_eq(candidate, tab)))
+                    .or_else(|| active.clone())
+                    .or_else(|| next.first().cloned());
+                *ordered = next;
+                assignments.push((target, overlay.clone()));
+            }
+            if assignments.is_empty() {
+                return Ok(());
+            }
+            let mirrors = orders
+                .into_iter()
+                .map(|(id, expected)| {
+                    let (ordered_tabs, active_tab) = desired
+                        .remove(&id)
+                        .expect("every frozen window has a desired state");
+                    mux::window::WindowOrderMirror {
+                        expected,
+                        ordered_tabs,
+                        active_tab,
+                    }
+                })
+                .collect();
+            live.with_current(mux, || mux.apply_window_order_mirrors(mirrors).map(|_| ()))?;
+            for (id, overlay) in assignments {
+                let identity = mux
+                    .get_window(id)
+                    .context("committed layout window disappeared")?
+                    .durable_id();
+                if !overlay.slots().iter().any(|slot| {
+                    slot.remote_binding()
+                        .is_some_and(|binding| live.unavailable.contains(&binding))
+                }) {
+                    self.restored.insert(overlay.window_id());
+                }
+                self.owned.insert(
+                    id,
+                    OwnedLayoutWindow {
+                        mux_identity: identity,
+                        overlay,
+                    },
+                );
+            }
+            Ok(())
+        })();
+        // Empty provisional windows cancel without publication; successfully
+        // populated windows retain their exact sessions on every exit path.
+        for builder in builders {
+            builder.cancel();
+        }
+        result
+    }
+}
 
 fn topology_needs_workspace_reconcile(change: &mux::FrozenWindowTopologyChange) -> bool {
     !change.created_windows().is_empty()
         || !change.removed_windows().is_empty()
         || !change.attached_tabs().is_empty()
+}
+
+fn layout_attachment_ready(_: mux::domain::DomainId) {
+    schedule_layout_reconcile(true);
+}
+
+struct LayoutReconcileAdmission<'a> {
+    pending: &'a std::sync::atomic::AtomicU8,
+    armed: bool,
+}
+
+impl LayoutReconcileAdmission<'_> {
+    fn begin(mut self) -> u8 {
+        self.armed = false;
+        self.pending.swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+impl Drop for LayoutReconcileAdmission<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pending.store(0, std::sync::atomic::Ordering::Release);
+            log::warn!(
+                "layout reconciliation was cancelled before execution; next topology signal may retry"
+            );
+        }
+    }
+}
+
+fn schedule_layout_reconcile(restore: bool) {
+    use std::sync::atomic::Ordering;
+    let flag = if restore { 2 } else { 1 };
+    if LAYOUT_PENDING.fetch_or(flag, Ordering::AcqRel) != 0 {
+        return;
+    }
+    let admission = LayoutReconcileAdmission {
+        pending: &LAYOUT_PENDING,
+        armed: true,
+    };
+    match try_reserve_main_thread(
+        MainThreadServiceClass::Topology,
+        FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+    ) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation
+                .handoff_to_main_thread_local(move |reservation| {
+                    reservation
+                        .spawn_local(async move {
+                            let pending = admission.begin();
+                            if let Some(frontend) = try_front_end() {
+                                if pending & 2 != 0 {
+                                    frontend.reconcile_layout(true);
+                                }
+                                if pending & 1 != 0 {
+                                    frontend.reconcile_layout(false);
+                                }
+                                if pending & 2 != 0 {
+                                    frontend.reconcile_workspace();
+                                }
+                            }
+                        })
+                        .detach();
+                })
+                .detach();
+        }
+        rejected => {
+            drop(admission);
+            log::warn!("layout reconciliation admission refused: {rejected:?}");
+        }
+    }
 }
 
 /// Close only the newly allocated native view if initialization does not hand
@@ -221,6 +694,8 @@ pub struct GuiFrontEnd {
     workspace_reconcile_waiters: Rc<RefCell<WorkspaceReconcileWaiters>>,
     workspace_reconcile_pass: Rc<RefCell<Option<Rc<()>>>>,
     osc52_dispatch_identity: Arc<()>,
+    layout_lifecycle: RefCell<Option<LayoutLifecycle>>,
+    applying_layout: Cell<bool>,
 }
 
 impl Drop for GuiFrontEnd {
@@ -230,6 +705,31 @@ impl Drop for GuiFrontEnd {
 }
 
 impl GuiFrontEnd {
+    fn reconcile_layout(&self, restore: bool) {
+        if self.applying_layout.replace(true) {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let mux = Mux::try_get().context("layout mux is unavailable")?;
+            let mut lifecycle = self.layout_lifecycle.borrow_mut();
+            let Some(lifecycle) = lifecycle.as_mut() else {
+                return Ok(());
+            };
+            let live = LiveLayout::capture(&mux, &lifecycle.startup)?;
+            if restore {
+                lifecycle.restore(&mux, &live)
+            } else {
+                lifecycle.capture_changes(&mux, &live)
+            }
+        })();
+        self.applying_layout.set(false);
+        if let Err(error) = result {
+            log::warn!(
+                "mixed layout reconciliation unavailable; preserving live sessions: {error:#}"
+            );
+        }
+    }
+
     pub fn try_new() -> anyhow::Result<Rc<GuiFrontEnd>> {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
@@ -254,7 +754,18 @@ impl GuiFrontEnd {
             ),
             workspace_reconcile_pass: Rc::new(RefCell::new(None)),
             osc52_dispatch_identity: Arc::new(()),
+            layout_lifecycle: RefCell::new(
+                crate::window_state_persist::startup_layout_state()
+                    .ok()
+                    .map(|startup| LayoutLifecycle {
+                        startup,
+                        owned: HashMap::new(),
+                        restored: Default::default(),
+                    }),
+            ),
+            applying_layout: Cell::new(false),
         });
+        frankenterm_client::domain::install_layout_ready_observer(layout_attachment_ready)?;
 
         let prompt_frontend = Arc::downgrade(&front_end.osc52_dispatch_identity);
         let prompt_mux = Arc::downgrade(&mux);
@@ -312,6 +823,17 @@ impl GuiFrontEnd {
         }));
 
         mux.subscribe(move |n| {
+            if matches!(
+                &n,
+                MuxNotification::WindowOrderChanged { .. }
+                    | MuxNotification::WindowTopologyChanged(_)
+                    | MuxNotification::WindowCreated(_)
+                    | MuxNotification::TabAddedToWindow { .. }
+            ) && !frankenterm_client::domain::remote_layout_application_in_progress()
+                && try_front_end().is_some_and(|frontend| !frontend.applying_layout.get())
+            {
+                schedule_layout_reconcile(false);
+            }
             match n {
                 MuxNotification::WorkspaceRenamed {
                     old_workspace,
@@ -779,7 +1301,22 @@ impl GuiFrontEnd {
         // Keep existing views while their tabs are being changed.
         mux_windows.retain(|&id| {
             self.has_mux_window(id)
-                || crate::termwindow::initial_native_window_size(&mux, id).is_some()
+                || (crate::termwindow::initial_native_window_size(&mux, id).is_some()
+                    && mux
+                        .window_order_snapshot(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|order| {
+                            order.ordered_tabs().iter().all(|tab| {
+                                tab.iter_panes().iter().all(|pane| {
+                                    mux.get_domain(pane.pane.domain_id()).is_some_and(|domain| {
+                                        domain
+                                            .downcast_ref::<ClientDomain>()
+                                            .is_none_or(|client| !client.layout_restore_pending())
+                                    })
+                                })
+                            })
+                        }))
         });
 
         // First, repurpose existing windows.
@@ -1079,6 +1616,207 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn layout_input_target_rejects_a_pane_moved_to_another_window() {
+        use mux::pane::Pane;
+        use std::sync::Arc;
+
+        let owner = Arc::new(mux::Mux::new(None));
+        let _activity = mux::activity::Activity::new_for_mux(&owner);
+        let left = owner.new_empty_window(None, None);
+        let right = owner.new_empty_window(None, None);
+        let size = wezterm_term::TerminalSize::default();
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let terminal = wezterm_term::Terminal::new(
+            size,
+            Arc::new(config::TermConfig::new_for_pane(
+                998_301,
+                998_301,
+                [0x31; 16],
+                "layout input test".to_owned(),
+            )),
+            "FrankenTerm",
+            "layout-input-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_301,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_301,
+            [0x31; 16],
+            "layout input test".to_owned(),
+        ));
+        struct RetireChild(Arc<dyn Pane>);
+        impl Drop for RetireChild {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _child = RetireChild(Arc::clone(&pane));
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(&pane);
+        owner.add_tab_and_active_pane(&tab).unwrap();
+        owner.add_tab_to_window(&tab, *left).unwrap();
+        assert!(super::layout_pane_belongs_to_window(&owner, *left, &pane));
+        assert!(!super::layout_pane_belongs_to_window(&owner, *right, &pane));
+
+        let left_order = owner.window_order_snapshot(*left).unwrap().unwrap();
+        let right_order = owner.window_order_snapshot(*right).unwrap().unwrap();
+        owner
+            .apply_window_order_mirrors(vec![
+                mux::window::WindowOrderMirror {
+                    expected: left_order,
+                    ordered_tabs: Vec::new(),
+                    active_tab: None,
+                },
+                mux::window::WindowOrderMirror {
+                    expected: right_order,
+                    ordered_tabs: vec![Arc::clone(&tab)],
+                    active_tab: Some(Arc::clone(&tab)),
+                },
+            ])
+            .unwrap();
+        assert!(!super::layout_pane_belongs_to_window(&owner, *left, &pane));
+        assert!(super::layout_pane_belongs_to_window(&owner, *right, &pane));
+        left.cancel();
+        right.cancel();
+    }
+
+    #[test]
+    fn mixed_layout_restore_uses_one_atomic_mux_transaction_and_rejects_old_session_slots() {
+        use super::{LayoutLifecycle, LiveLayout, MixedDomainLayoutOverlay};
+        use mux::activity::Activity;
+        use mux::tab::Tab;
+        use mux::{Mux, MuxNotification};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let mux = Arc::new(Mux::new(None));
+        let _activity = Activity::new_for_mux(&mux);
+        let left = mux.new_empty_window(None, None);
+        let right = mux.new_empty_window(None, None);
+        let ids = [*left, *right];
+        let tabs: Vec<_> = (0..4)
+            .map(|_| Arc::new(Tab::new(&Default::default())))
+            .collect();
+        for (index, tab) in tabs.iter().enumerate() {
+            mux.add_tab_no_panes(tab).unwrap();
+            mux.add_tab_to_window(tab, ids[index / 2]).unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut startup =
+            crate::window_state_persist::load_snapshot_at(&temp.path().join("layout.json"))
+                .unwrap();
+        let live = LiveLayout::capture(&mux, &startup).unwrap();
+        let slots: Vec<_> = tabs.iter().map(|tab| live.slots[&tab.tab_id()]).collect();
+        let first_id = startup.new_layout_window_id().unwrap();
+        let second_id = startup.new_layout_window_id().unwrap();
+        startup.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                first_id,
+                "default",
+                1,
+                vec![slots[3], slots[0]],
+                Some(slots[0]),
+            )
+            .unwrap(),
+            MixedDomainLayoutOverlay::new(
+                second_id,
+                "default",
+                1,
+                vec![slots[1], slots[2]],
+                Some(slots[2]),
+            )
+            .unwrap(),
+        ];
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_callback = Arc::clone(&observed);
+        let owner = Arc::downgrade(&mux);
+        mux.subscribe(move |event| {
+            if let MuxNotification::WindowTopologyChanged(change) = event {
+                if change.affects_window(ids[0]) && change.affects_window(ids[1]) {
+                    let mux = owner.upgrade().unwrap();
+                    observed_callback.lock().unwrap().push(ids.map(|id| {
+                        mux.window_order_snapshot(id)
+                            .unwrap()
+                            .unwrap()
+                            .ordered_tab_ids()
+                            .collect::<Vec<_>>()
+                    }));
+                }
+            }
+            true
+        })
+        .unwrap();
+        let mut lifecycle = LayoutLifecycle {
+            startup,
+            owned: HashMap::new(),
+            restored: Default::default(),
+        };
+        lifecycle.restore(&mux, &live).unwrap();
+        let expected = [
+            vec![tabs[1].tab_id(), tabs[2].tab_id()],
+            vec![tabs[3].tab_id(), tabs[0].tab_id()],
+        ];
+        assert_eq!(*observed.lock().unwrap(), vec![expected.clone()]);
+        assert_eq!(
+            mux.window_order_snapshot(ids[0])
+                .unwrap()
+                .unwrap()
+                .active_tab_id(),
+            Some(tabs[2].tab_id())
+        );
+        assert_eq!(
+            mux.window_order_snapshot(ids[1])
+                .unwrap()
+                .unwrap()
+                .active_tab_id(),
+            Some(tabs[0].tab_id())
+        );
+        assert_eq!(lifecycle.owned[&ids[1]].overlay.window_id(), first_id);
+        assert_eq!(lifecycle.owned[&ids[0]].overlay.window_id(), second_id);
+        lifecycle.restored.clear();
+        let old_session = super::StableTabSlot::local(
+            super::StableLocalSessionId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
+            super::StableLocalTabId::from_bytes(*tabs[0].durable_id().as_bytes()),
+        );
+        lifecycle.startup.overlays = vec![
+            MixedDomainLayoutOverlay::new(
+                first_id,
+                "default",
+                2,
+                vec![old_session],
+                Some(old_session),
+            )
+            .unwrap(),
+        ];
+        observed.lock().unwrap().clear();
+        lifecycle.restore(&mux, &live).unwrap();
+        assert!(observed.lock().unwrap().is_empty());
+        for (id, expected) in ids.into_iter().zip(expected) {
+            assert_eq!(
+                mux.window_order_snapshot(id)
+                    .unwrap()
+                    .unwrap()
+                    .ordered_tab_ids()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        left.cancel();
+        right.cancel();
+    }
 
     #[test]
     fn native_window_startup_waits_for_attachment_to_an_already_published_window() {

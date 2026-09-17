@@ -3,7 +3,6 @@ use crate::guardian_checkpoint::{
     LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
 };
 use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity};
-use crate::guardian_protocol::GuardianCheckpointReceipt;
 use crate::renderable::*;
 use crate::ExitBehavior;
 use async_trait::async_trait;
@@ -567,7 +566,7 @@ pub trait GuardianLiveCheckpointPublisher: Send + Sync {
     fn publish_checkpoint(
         &self,
         capture: LiveParserCheckpointAck,
-    ) -> anyhow::Result<GuardianCheckpointReceipt>;
+    ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint>;
 }
 
 /// Terminal metadata used to format titles; never a coordinate or paint authority.
@@ -777,10 +776,17 @@ pub trait Pane: Downcast + Send + Sync {
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
         Ok(None)
     }
+    /// Nonsecret original birth provenance. A restore must still reopen and
+    /// authenticate private custody before it can request any lease effect.
+    fn guardian_spawn_custody(
+        &self,
+    ) -> Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1> {
+        None
+    }
     fn publish_guardian_checkpoint(
         &self,
         _capture: LiveParserCheckpointAck,
-    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+    ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
         anyhow::bail!("pane does not own a guardian checkpoint publisher")
     }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;

@@ -160,18 +160,18 @@ impl super::TermWindow {
                 let ends_selection_drag =
                     release_ends_selection_drag(*press, self.active_selection_drag_button);
                 if ends_selection_drag {
-                    // Resolve the retained press before ending drag protection.
-                    // Doing this in dispatch alone is too late: custom release
-                    // bindings and early returns must also retire pending input.
+                    // Mark release before ending drag protection, but resolve
+                    // only after this event's final coordinates are captured.
                     if let Some(pane_id) = self.active_selection_drag_pane {
-                        if let Some(pos) = self
-                            .get_panes_to_render()
-                            .into_iter()
-                            .find(|pos| pos.pane.pane_id() == pane_id)
+                        if let Some(pending) =
+                            self.pane_state(pane_id).pending_selection_start.as_mut()
                         {
-                            self.retry_pending_selection_start(&pos.pane);
+                            pending.released = true;
+                            pending.paint_retries_remaining = 3;
+                            if let Some(window) = self.window.as_ref() {
+                                window.invalidate();
+                            }
                         }
-                        self.pane_state(pane_id).pending_selection_start = None;
                     }
                 }
                 // An unrelated release must not drop the captured selection
@@ -901,6 +901,24 @@ impl super::TermWindow {
         {
             let mut pane_state = self.pane_state(pane.pane_id());
             pane_state.mouse_selection_frame = mouse_selection_frame;
+            if let Some(pending) = pane_state.pending_selection_start.as_mut() {
+                if let Some((frame, stable_row)) = mouse_selection_frame.zip(stable_row) {
+                    pending.retain_endpoint(
+                        frame,
+                        ClickPosition {
+                            column,
+                            row,
+                            x_pixel_offset,
+                            y_pixel_offset,
+                        },
+                        stable_row,
+                        match &event.kind {
+                            WMEK::Release(button) => Some(*button),
+                            _ => None,
+                        },
+                    );
+                }
+            }
             if let Some(stable_row) = stable_row {
                 pane_state.mouse_terminal_coords.replace((
                     ClickPosition {
@@ -1174,6 +1192,7 @@ impl super::TermWindow {
 
         if allow_action
             && !(self.config.swallow_mouse_click_on_pane_focus && is_click_to_focus_pane)
+            && self.pane_input_ready(&pane)
         {
             pane.mouse_event(mouse_event).ok();
         }

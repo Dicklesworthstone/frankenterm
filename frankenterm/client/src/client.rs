@@ -2001,7 +2001,7 @@ struct RpcTransportState {
     topology_sync: futures::lock::Mutex<()>,
 }
 
-struct RpcGenerationCommitLease {
+pub(crate) struct RpcGenerationCommitLease {
     rpc_transport: Arc<RpcTransportState>,
     consumer: RpcConsumerKind,
 }
@@ -3023,6 +3023,14 @@ impl RpcGenerationScope {
             .rpc_transport
             .begin_consumer_commit(generation, consumer)?;
         Ok(commit())
+    }
+
+    pub(crate) fn retain_consumer_commit(
+        &self,
+        consumer: RpcConsumerKind,
+    ) -> Result<RpcGenerationCommitLease, RpcConsumerCommitError> {
+        let generation = self.generation.ok_or(RpcConsumerCommitError::Unavailable { consumer })?;
+        self.rpc_transport.begin_consumer_commit(generation, consumer)
     }
 
     pub(crate) fn abort_guard(

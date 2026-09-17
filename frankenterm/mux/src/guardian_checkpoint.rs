@@ -2553,7 +2553,7 @@ pub struct GuardianSpawnCustodyContextV1 {
 
 /// Caller-trusted stable lookup scope. ACK ID and child provenance are recovered
 /// from the authenticated record, not supplied from volatile state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GuardianSpawnCustodyScopeV1 {
     pub broker_lineage: Uuid,
     pub guardian_incarnation: Uuid,
@@ -2563,6 +2563,15 @@ pub struct GuardianSpawnCustodyScopeV1 {
     pub mux_build: [u8; 32],
     pub pane_id: Uuid,
     pub effect_id: Uuid,
+}
+
+/// Captured lookup provenance plus the actual current lease. Original Spawn
+/// possession does not authorize repeated rotations after generation two.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GuardianSpawnCaptureProvenanceV1 {
+    pub original: GuardianSpawnCustodyScopeV1,
+    pub current_mux_incarnation: Uuid,
+    pub current_lease_generation: u64,
 }
 
 #[derive(Debug, Error)]
@@ -2707,6 +2716,8 @@ pub struct GuardianSuccessorCustodyContextV1 {
     pub handoff_id: Uuid,
     pub ack_id: Uuid,
     pub lease_generation: u64,
+    /// Nil for the original Claim; otherwise the authenticated custody parent.
+    pub rebind_from_connection: Uuid,
 }
 
 /// Authenticated client scope used to recover ACK and predecessor provenance.
@@ -2721,8 +2732,8 @@ pub struct GuardianSuccessorCustodyScopeV1 {
     pub lease_generation: u64,
 }
 
-const SUCCESSOR_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-successor-secret-custody.v1\0";
-const SUCCESSOR_CUSTODY_HEADER_BYTES: usize = SUCCESSOR_CUSTODY_DOMAIN.len() + 11 * 16 + 5 * 32 + 8;
+const SUCCESSOR_CUSTODY_DOMAIN: &[u8] = b"frankenterm.guardian-successor-secret-custody.v2\0";
+const SUCCESSOR_CUSTODY_HEADER_BYTES: usize = SUCCESSOR_CUSTODY_DOMAIN.len() + 12 * 16 + 5 * 32 + 8;
 pub const GUARDIAN_SUCCESSOR_CUSTODY_BYTES: usize = SUCCESSOR_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
 
 impl GuardianSuccessorCustodyContextV1 {
@@ -2762,6 +2773,7 @@ impl GuardianSuccessorCustodyContextV1 {
         if identities.iter().any(Uuid::is_nil)
             || digests.contains(&[0; 32])
             || self.lease_generation <= 1
+            || self.rebind_from_connection == self.successor.connection_id
         {
             return Err(GuardianSpawnCustodyError::InvalidIdentity);
         }
@@ -2769,6 +2781,7 @@ impl GuardianSuccessorCustodyContextV1 {
         for identity in identities {
             header.extend_from_slice(identity.as_bytes());
         }
+        header.extend_from_slice(self.rebind_from_connection.as_bytes());
         for digest in digests {
             header.extend_from_slice(&digest);
         }
@@ -2783,7 +2796,7 @@ impl GuardianSuccessorCustodyContextV1 {
             return Err(GuardianSpawnCustodyError::Authentication);
         }
         let mut bytes = &header[SUCCESSOR_CUSTODY_DOMAIN.len()..];
-        let mut ids = [Uuid::nil(); 11];
+        let mut ids = [Uuid::nil(); 12];
         for id in &mut ids {
             *id = Uuid::from_bytes(
                 bytes[..16]
@@ -2818,6 +2831,7 @@ impl GuardianSuccessorCustodyContextV1 {
             pane_id: ids[8],
             handoff_id: ids[9],
             ack_id: ids[10],
+            rebind_from_connection: ids[11],
             lease_generation: u64::from_le_bytes(
                 bytes
                     .try_into()
@@ -4809,11 +4823,71 @@ pub struct LiveParserCheckpointAck {
     terminal_checkpoint: RecoveryTerminalCheckpointV2,
 }
 
+/// Exact affine parser capture retained after its durable publication. Only
+/// the original capture can bind a matching authenticated adoption receipt.
+/// The publisher returns this only after the Stage Ack has synchronized.
+pub struct PublishedGuardianCheckpoint {
+    capture: LiveParserCheckpointAck,
+    receipt: crate::guardian_protocol::GuardianCheckpointReceipt,
+    owner: crate::localpane::GuardianPaneLeaseIdentity,
+}
+
+impl std::fmt::Debug for PublishedGuardianCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedGuardianCheckpoint")
+            .field("receipt", &self.receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublishedGuardianCheckpoint {
+    pub const fn owner(&self) -> crate::localpane::GuardianPaneLeaseIdentity {
+        self.owner
+    }
+    pub const fn capture(&self) -> &LiveParserCheckpointAck {
+        &self.capture
+    }
+    pub const fn receipt(&self) -> crate::guardian_protocol::GuardianCheckpointReceipt {
+        self.receipt
+    }
+}
+
 #[allow(
     dead_code,
     reason = "artifact getters are the prepared guardian protocol publication seam"
 )]
 impl LiveParserCheckpointAck {
+    pub fn bind_published(
+        self,
+        receipt: crate::guardian_protocol::GuardianCheckpointReceipt,
+        owner: crate::localpane::GuardianPaneLeaseIdentity,
+    ) -> Result<PublishedGuardianCheckpoint, GuardianCheckpointBoundaryError> {
+        use crate::guardian_protocol::{
+            GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent,
+        };
+        let descriptor =
+            GuardianCheckpointDescriptorV1::from_live_capture(&self, receipt.generation())
+                .map_err(|_| GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch)?;
+        if receipt.pane_id() != self.durable_pane_id()
+            || receipt.authenticated_owner()
+                != Some((owner.guardian_incarnation(), owner.mux_incarnation()))
+            || receipt.pane_id() != owner.pane_id()
+            || receipt.generation() != owner.generation()
+            || receipt.disposition() != GuardianCheckpointDisposition::Committed
+            || receipt.intent()
+                != GuardianCheckpointIntent::new(
+                    descriptor.checkpoint_id(),
+                    descriptor.boundary_id(),
+                )
+        {
+            return Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch);
+        }
+        Ok(PublishedGuardianCheckpoint {
+            capture: self,
+            receipt,
+            owner,
+        })
+    }
     fn capture(
         registration_wire_identity: [u8; 16],
         durable_pane_id: Uuid,
@@ -8099,6 +8173,89 @@ mod tests {
         (descriptor, segment, output, capture)
     }
 
+    #[test]
+    fn published_capture_requires_correlated_receipt_owner_not_equal_wire_bytes() {
+        use crate::guardian_protocol::*;
+        for control in 0..4 {
+            let (_, _, _, capture) = record_descriptor();
+            let pane = capture.durable_pane_id();
+            let guardian = Uuid::new_v4();
+            let mux = Uuid::new_v4();
+            let effect = Uuid::new_v4();
+            let descriptor =
+                GuardianCheckpointDescriptorV1::from_live_capture(&capture, 1).unwrap();
+            let intent =
+                GuardianCheckpointIntent::new(descriptor.checkpoint_id(), descriptor.boundary_id());
+            let payload = intent.encode().to_vec();
+            let request = GuardianRequestEnvelope::new(
+                GuardianRequestHeader::new(
+                    GuardianOperation::Checkpoint,
+                    guardian,
+                    mux,
+                    Uuid::new_v4(),
+                    Some(pane),
+                    1,
+                    1,
+                    Some(effect),
+                    &payload,
+                ),
+                payload,
+            );
+            let secret = GuardianSecret::from_bytes([0x63; 32]).unwrap();
+            let request = decode_guardian_request(
+                &secret,
+                &encode_guardian_request(&secret, &request).unwrap(),
+            )
+            .unwrap();
+            let raw =
+                GuardianCheckpointReceipt::issue_committed_for_test(pane, 1, 1, effect, intent);
+            let response =
+                GuardianResponseEnvelope::reply(&request, &GuardianReply::CheckpointReceipt(raw))
+                    .unwrap();
+            let response = decode_guardian_response(
+                &secret,
+                &encode_guardian_response(&secret, &response).unwrap(),
+            )
+            .unwrap()
+            .correlate(request.header())
+            .unwrap();
+            let GuardianReply::CheckpointReceipt(authenticated) =
+                response.typed_reply(&request).unwrap()
+            else {
+                panic!("checkpoint reply expected")
+            };
+            assert_eq!(
+                raw, authenticated,
+                "wire equality does not grant owner provenance"
+            );
+            assert_eq!(raw.authenticated_owner(), None);
+            assert_eq!(authenticated.authenticated_owner(), Some((guardian, mux)));
+            let copied = authenticated;
+            assert_eq!(copied.authenticated_owner(), Some((guardian, mux)));
+            let owner = crate::localpane::GuardianPaneLeaseIdentity::new(
+                if control == 1 {
+                    Uuid::new_v4()
+                } else {
+                    guardian
+                },
+                if control == 2 { Uuid::new_v4() } else { mux },
+                pane,
+                1,
+            )
+            .unwrap();
+            let result =
+                capture.bind_published(if control == 0 { raw } else { authenticated }, owner);
+            if control == 3 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(GuardianCheckpointBoundaryError::LiveCaptureAuthorityMismatch)
+                ));
+            }
+        }
+    }
+
     fn record_stage_binding(
         descriptor: GuardianCheckpointArtifactDescriptorV1,
         generation: u64,
@@ -9133,6 +9290,7 @@ mod tests {
             handoff_id: Uuid::from_bytes([12; 16]),
             ack_id: Uuid::from_bytes([13; 16]),
             lease_generation: 2,
+            rebind_from_connection: Uuid::nil(),
         };
         let cipher = checkpoint_stage_cipher(0xa3);
         let bytes = cipher.seal_successor_custody(context, &[0xb4; 32]).unwrap();
@@ -9140,12 +9298,34 @@ mod tests {
         assert_eq!(decoded, context);
         assert_eq!(*secret, [0xb4; 32]);
         assert!(!bytes.windows(32).any(|window| window == [0xb4; 32]));
+        let mut old_version = bytes;
+        old_version[SUCCESSOR_CUSTODY_DOMAIN.len() - 2] = b'1';
+        assert!(cipher.open_successor_custody_record(&old_version).is_err());
+        let rebound = GuardianSuccessorCustodyContextV1 {
+            rebind_from_connection: Uuid::from_u128(99),
+            ..context
+        };
+        let sealed = cipher.seal_successor_custody(rebound, &[0xc5; 32]).unwrap();
+        assert_eq!(
+            cipher.open_successor_custody_record(&sealed).unwrap().0,
+            rebound
+        );
+        assert!(cipher
+            .seal_successor_custody(
+                GuardianSuccessorCustodyContextV1 {
+                    rebind_from_connection: context.successor.connection_id,
+                    ..context
+                },
+                &[0xb4; 32]
+            )
+            .is_err());
         for offset in 0..bytes.len() {
             let mut corrupt = bytes;
             corrupt[offset] ^= 1;
             assert!(
                 cipher.open_successor_custody_record(&corrupt).is_err(),
-                "offset {offset}"
+                "offset {}",
+                offset
             );
         }
         assert!(checkpoint_stage_cipher(0xa4)

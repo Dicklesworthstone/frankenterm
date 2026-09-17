@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tempfile.workspace = true
 emojis.workspace = true
 # ft-i2eni.3: production `tokio` dependency removed (the line
@@ -121,6 +122,7 @@ shell-words.workspace = true
 codec = { workspace = true, optional = true, features = ["async-asupersync"] }
 config = { workspace = true, optional = true }
 mux = { workspace = true, optional = true }
+frankenterm-pty-guardian = { workspace = true, optional = true }
 frankenterm-cell = { workspace = true, optional = true }
 frankenterm-term = { workspace = true, optional = true }
 
@@ -195,7 +197,6 @@ xattr.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-uuid.workspace = true
 syn = { workspace = true, features = ["full", "visit"] }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 tokio = { workspace = true, features = ["test-util"] }
@@ -1022,7 +1023,7 @@ cass-export = []
 vc-export = ["subprocess-bridge"]
 
 # Optional heavy integrations - feature-gated (internal)
-frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term"]
+frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term", "dep:frankenterm-pty-guardian"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
 mcp-server = ["dep:fastmcp", "dep:fastmcp-server", "dep:toon_rust"]

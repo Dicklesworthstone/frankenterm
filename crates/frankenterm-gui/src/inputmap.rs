@@ -16,6 +16,28 @@ pub struct InputMap {
     leader: Option<(KeyCode, Modifiers, Duration)>,
 }
 
+fn register_default_keys(config: &ConfigHandle, keys: &mut KeyTables, enabled: bool) {
+    if enabled {
+        for (mods, code, action) in CommandDef::default_key_assignments(config) {
+            // User entries are shift-normalized by Config::key_bindings().
+            // Keep platform event permutations while letting each normalized
+            // custom assignment (including DisableDefaultAssignment) win.
+            let (disable_code, disable_mods) = code.normalize_shift(mods);
+            if keys
+                .default
+                .contains_key(&(disable_code.clone(), disable_mods))
+            {
+                continue;
+            }
+            keys.default
+                .entry((code, mods))
+                .or_insert(KeyTableEntry { action });
+        }
+    }
+    keys.default
+        .retain(|_, entry| entry.action != KeyAssignment::DisableDefaultAssignment);
+}
+
 impl InputMap {
     #[allow(dead_code)]
     pub fn default_input_map() -> Self {
@@ -48,44 +70,7 @@ impl InputMap {
 
         use KeyAssignment::*;
 
-        if !config.disable_default_key_bindings {
-            for (mods, code, action) in CommandDef::default_key_assignments(config) {
-                // If the user configures {key='p', mods='CTRL|SHIFT'} that gets
-                // normalized into {key='P', mods='CTRL'} in Config::key_bindings(),
-                // and that value exists in `keys.default` when we reach this point.
-                //
-                // When we get here with the default assignments for ActivateCommandPalette
-                // we are going to register un-normalized entries that don't match
-                // the existing normalized entry.
-                //
-                // Ideally we'd unconditionally normalize_shift
-                // here and register the result if it isn't already in the map.
-                //
-                // Our default set of assignments deliberately and explicitly emits
-                // variations on SHIFT as a workaround for an issue with
-                // normalization under X11: <https://github.com/wezterm/wezterm/issues/1906>.
-                // Until that is resolved, we need to keep emitting both variants.
-                //
-                // In order for the DisableDefaultAssignment behavior to work with the
-                // least surprises, and for these normalization related workarounds
-                // to continue? to work, the approach we take here is to lookup the
-                // normalized version of what we're about to register, and if we get
-                // a match, skip this key.  Otherwise register the non-normalized
-                // version from default_key_assignments().
-                //
-                // See: <https://github.com/wezterm/wezterm/issues/3262>
-                let (disable_code, disable_mods) = code.normalize_shift(mods);
-                if keys
-                    .default
-                    .contains_key(&(disable_code.clone(), disable_mods))
-                {
-                    continue;
-                }
-                keys.default
-                    .entry((code, mods))
-                    .or_insert(KeyTableEntry { action });
-            }
-        }
+        register_default_keys(config, &mut keys, !config.disable_default_key_bindings);
 
         if !config.disable_default_mouse_bindings {
             m!(
@@ -349,9 +334,6 @@ impl InputMap {
                 ],
             );
         }
-
-        keys.default
-            .retain(|_, v| v.action != KeyAssignment::DisableDefaultAssignment);
 
         mouse.retain(|_, v| *v != KeyAssignment::DisableDefaultAssignment);
         // Expand MouseEventAltScreen::Any to individual True/False entries
@@ -808,5 +790,63 @@ fn show_key_table_as_lua(table: &config::keyassignment::KeyTable, indent: usize)
     for ((key, mods), entry) in ordered {
         let action = &entry.action;
         println!("{pad}{},", lua_key(key, *mods, action));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_plus_default_registration_preserves_disabled_and_custom_bindings() {
+        let handle = ConfigHandle::default_config();
+        let forms = [
+            ('=', Modifiers::SUPER),
+            ('=', Modifiers::SUPER | Modifiers::SHIFT),
+            ('+', Modifiers::SUPER),
+            ('+', Modifiers::SUPER | Modifiers::SHIFT),
+        ];
+        let mut disabled = config::Config::default_config().key_bindings();
+        register_default_keys(&handle, &mut disabled, false);
+        for (key, mods) in forms {
+            assert!(!disabled.default.contains_key(&(KeyCode::Char(key), mods)));
+        }
+
+        for action in [
+            KeyAssignment::ResetFontSize,
+            KeyAssignment::DisableDefaultAssignment,
+        ] {
+            let mut configured = config::Config::default_config();
+            configured.keys = forms
+                .iter()
+                .map(|&(key, mods)| config::Key {
+                    key: config::KeyNoAction {
+                        key: config::DeferredKeyCode::KeyCode(KeyCode::Char(key)),
+                        mods,
+                    },
+                    action: action.clone(),
+                })
+                .collect();
+            let mut keys = configured.key_bindings();
+            register_default_keys(&handle, &mut keys, true);
+            let input = InputMap {
+                keys,
+                mouse: HashMap::new(),
+                leader: None,
+            };
+            for (key, mods) in forms {
+                assert_eq!(
+                    input
+                        .lookup_key(&KeyCode::Char(key), mods, None)
+                        .map(|entry| entry.action),
+                    if action == KeyAssignment::DisableDefaultAssignment {
+                        None
+                    } else {
+                        Some(action.clone())
+                    },
+                    "custom event form {key:?} {mods:?} must override the default"
+                );
+            }
+        }
     }
 }
