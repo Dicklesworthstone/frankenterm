@@ -553,7 +553,7 @@ pub fn publish_whole_mux_recovery(
                         && provenance.current_mux_incarnation
                             == published.owner().mux_incarnation()
                         && provenance.current_lease_generation == receipt.generation()
-                        && provenance.current_mux_incarnation.as_bytes()
+                        && *provenance.current_mux_incarnation.as_bytes()
                             == captured.session_incarnation.as_bytes(),
                     "published capture differs from captured guardian lease",
                 )?;
