@@ -8118,7 +8118,9 @@ mod tests {
             );
             assert_eq!(prod_store.inspect_root_candidates().unwrap().0.len(), 1);
 
-            // Negative control 2: Gen 2 with wrong predecessor custody token path rejects predecessor.
+            // Custody belongs to the authenticated store in the token's parent
+            // directory, so another token basename in the real directory is
+            // still valid custody. A missing store must reject the predecessor.
             let prod_expected_gen2_wrong_custody = WholeMuxPublicationIdentity {
                 generation: 2,
                 session_id: "real-guardian-birth".into(),
@@ -8131,7 +8133,11 @@ mod tests {
                     expected_hash: prod_receipt_gen1.sha256.clone(),
                 }),
                 predecessor_image_digest: Some(prod_gen1_image_digest),
-                existing_guardian_custody: Some(directory.join("nonexistent-custody-token")),
+                existing_guardian_custody: Some(
+                    directory
+                        .join("nonexistent-custody-directory")
+                        .join("guardian.token"),
+                ),
             };
             let prod_pub_gen2_wrong = WholeMuxPanePublication::guardian(
                 successor_pane.pane_id(),

@@ -118,12 +118,12 @@ mod measured {
             );
             for (index, line) in lines.iter().enumerate() {
                 ensure!(
-                    line.starts_with(&format!("FT_RECORD_{index:05d} "))
-                        && line.ends_with(&format!("FT_END_{index:05d}")),
+                    line.starts_with(&format!("FT_RECORD_{index:05} "))
+                        && line.ends_with(&format!("FT_END_{index:05}")),
                     "invalid record {index}"
                 );
             }
-            let corpus_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let corpus_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
             let trials = usize::try_from(number(5)?)?;
             ensure!((1..=100).contains(&trials), "trials must be 1..100");
             Ok(Self {
