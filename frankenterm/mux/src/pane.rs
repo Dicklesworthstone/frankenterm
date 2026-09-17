@@ -547,6 +547,13 @@ impl GuardianLiveOutputDelivery {
 /// a record buffered inside an open replay page from the page-terminal record
 /// whose durable Ack completed before return.
 pub trait GuardianLiveOutputReader: Send {
+    /// True only when the last failure was a transport exchange whose exact
+    /// request remains retained. Parser delivery and authenticated failures
+    /// must never opt into retrying through this boundary.
+    fn has_pending_transport_retry(&self) -> bool {
+        false
+    }
+
     fn deliver_next_record(
         &mut self,
         deliver: &mut dyn FnMut(

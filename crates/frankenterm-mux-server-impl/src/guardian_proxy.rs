@@ -3827,6 +3827,7 @@ struct GuardianReplayTailReader {
     pending_boundary: Option<GuardianReplayBoundary>,
     pending_terminal_error: Option<GuardianReplayDeferredTerminalError>,
     delivery_failed: bool,
+    transport_retry_pending: bool,
     maximum_record_bytes: u32,
     maximum_page_records: u16,
     idle_poll_interval: Duration,
@@ -3848,6 +3849,7 @@ impl fmt::Debug for GuardianReplayTailReader {
                 &self.pending_terminal_error.is_some(),
             )
             .field("delivery_failed", &self.delivery_failed)
+            .field("transport_retry_pending", &self.transport_retry_pending)
             .finish_non_exhaustive()
     }
 }
@@ -3884,10 +3886,18 @@ impl GuardianReplayTailReader {
             pending_boundary: None,
             pending_terminal_error: None,
             delivery_failed: false,
+            transport_retry_pending: false,
             maximum_record_bytes,
             maximum_page_records,
             idle_poll_interval: GUARDIAN_REPLAY_IDLE_POLL_MIN_INTERVAL,
         })
+    }
+
+    fn retain_transport_retry(&mut self, error: GuardianProxyError) -> io::Error {
+        self.transport_retry_pending = !self.delivery_failed
+            && (self.pending_replay.is_some() || self.pending_ack.is_some())
+            && replay_error_is_retryable_io(&error);
+        error.into()
     }
 
     fn request(&self) -> GuardianReplayRequestV1 {
@@ -4184,6 +4194,10 @@ fn guardian_replay_remaining_idle_delay(
 }
 
 impl GuardianLiveOutputReader for GuardianReplayTailReader {
+    fn has_pending_transport_retry(&self) -> bool {
+        self.transport_retry_pending
+    }
+
     fn deliver_next_record(
         &mut self,
         deliver: &mut dyn FnMut(
@@ -4192,6 +4206,7 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
             Arc<[u8]>,
         ) -> io::Result<()>,
     ) -> io::Result<GuardianLiveOutputDelivery> {
+        self.transport_retry_pending = false;
         if self.delivery_failed {
             return Err(io::Error::from(GuardianProxyError::ReplayInvariant(
                 "guardian replay reader is terminal after a failed record delivery",
@@ -4244,7 +4259,8 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
                             "delivered replay records omitted their terminal page boundary",
                         )));
                     }
-                    self.finish_delivered_page().map_err(io::Error::from)?;
+                    self.finish_delivered_page()
+                        .map_err(|error| self.retain_transport_retry(error))?;
                 }
                 return Ok(if completed_replay_page {
                     GuardianLiveOutputDelivery::replay_page_acknowledged()
@@ -4252,11 +4268,13 @@ impl GuardianLiveOutputReader for GuardianReplayTailReader {
                     GuardianLiveOutputDelivery::buffered_within_replay_page()
                 });
             }
-            self.finish_delivered_page().map_err(io::Error::from)?;
+            self.finish_delivered_page()
+                .map_err(|error| self.retain_transport_retry(error))?;
             if let Some(error) = self.pending_terminal_error.take() {
                 return Err(io::Error::from(error.into_proxy_error()));
             }
-            self.load_next_output_page().map_err(io::Error::from)?;
+            self.load_next_output_page()
+                .map_err(|error| self.retain_transport_retry(error))?;
         }
     }
 }
@@ -8448,6 +8466,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost completion Ack replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(reader.has_pending_transport_retry());
         {
             let state = replay_state.lock();
             assert_eq!(state.requests.len(), 1);
@@ -8459,6 +8478,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("fake source ends after the retained Ack succeeds");
         assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
+        assert!(!reader.has_pending_transport_retry());
         let state = replay_state.lock();
         assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
         assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
@@ -8490,6 +8510,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost terminal Ack replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(reader.has_pending_transport_retry());
         {
             let state = replay_state.lock();
             assert_eq!(state.requests.len(), 1);
@@ -8504,6 +8525,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("retained terminal Ack succeeds before Gap is surfaced");
         assert_eq!(gap.kind(), io::ErrorKind::InvalidData);
+        assert!(!reader.has_pending_transport_retry());
         assert!(matches!(
             gap.get_ref()
                 .and_then(|error| error.downcast_ref::<GuardianProxyError>()),
@@ -8545,6 +8567,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("two lost Replay replies remain visible");
         assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(reader.has_pending_transport_retry());
         let mut delivered = None;
         reader
             .deliver_next_record(&mut |_, _, payload| {
@@ -8553,6 +8576,7 @@ mod tests {
             })
             .expect("retry the retained Replay");
         assert_eq!(delivered.as_deref(), Some(b"tail".as_slice()));
+        assert!(!reader.has_pending_transport_retry());
 
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
@@ -8567,6 +8591,52 @@ mod tests {
             1,
             "successful record delivery is acknowledged"
         );
+    }
+
+    #[test]
+    fn tail_transport_retry_after_delivery_never_redelivers_parser_bytes() {
+        let fixture = capture_record_checkpoint_fixture();
+        let boundary = GuardianReplayBoundary::from_descriptor(fixture.descriptor).unwrap();
+        let replay_state = Arc::new(Mutex::new(FakeReplayState {
+            pages: VecDeque::from([tail_output_page(&fixture, b"once")]),
+            replay_io_failures: 0,
+            ack_io_failures: GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS,
+            requests: Vec::new(),
+            acks: Vec::new(),
+        }));
+        let mut reader = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&replay_state),
+            }),
+            identity(),
+            fixture.descriptor.checkpoint_id(),
+            boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        let mut deliveries = 0;
+        let first_error = reader
+            .deliver_next_record(&mut |_, _, payload| {
+                assert_eq!(payload.as_ref(), b"once");
+                deliveries += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(first_error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(reader.has_pending_transport_retry());
+        assert_eq!(deliveries, 1);
+        let second_error = reader
+            .deliver_next_record(&mut |_, _, _| {
+                deliveries += 1;
+                Ok(())
+            })
+            .expect_err("fake source ends after the exact retained Ack succeeds");
+        assert_eq!(second_error.kind(), io::ErrorKind::InvalidData);
+        assert!(!reader.has_pending_transport_retry());
+        assert_eq!(deliveries, 1, "retry must never reapply acknowledged bytes");
+        let state = replay_state.lock();
+        assert_eq!(state.acks.len(), GUARDIAN_REPLAY_EXCHANGE_ATTEMPTS + 1);
+        assert!(state.acks.iter().all(|ack| *ack == state.acks[0]));
     }
 
     #[test]
@@ -8601,6 +8671,7 @@ mod tests {
             })
             .expect_err("parser delivery failure must remain visible");
         assert_eq!(delivery_error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(!reader.has_pending_transport_retry());
         assert_eq!(
             replay_state.lock().acks,
             Vec::new(),
@@ -8611,6 +8682,7 @@ mod tests {
             .deliver_next_record(&mut |_, _, _| Ok(()))
             .expect_err("failed delivery makes this reader terminal");
         assert_eq!(terminal_error.kind(), io::ErrorKind::InvalidData);
+        assert!(!reader.has_pending_transport_retry());
         let state = replay_state.lock();
         assert_eq!(state.requests.len(), 1);
         assert_eq!(state.acks, Vec::new());

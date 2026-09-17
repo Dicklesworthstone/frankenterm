@@ -11185,6 +11185,17 @@ fn read_from_guardian_live_output(
         });
         let delivery = match result {
             Ok(delivery) => delivery,
+            Err(_) if reader.has_pending_transport_retry() => {
+                if generation.try_acquire().is_none() {
+                    break;
+                }
+                metrics::counter!("mux.guardian_output.transport_retry_total").increment(1);
+                // A checkpoint worker can temporarily own the guardian
+                // protocol. The reader retains the exact Replay/Ack request;
+                // retry without retiring the pane or redelivering parser bytes.
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(error) => {
                 log::error!(
                     "guardian record delivery failed before replay acknowledgement: pane {} {:?}",
