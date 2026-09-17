@@ -5423,7 +5423,9 @@ fn validate_output_identity(
     Ok(())
 }
 
-fn terminal_payload_identity(
+/// Canonical length and domain-separated digest of terminal checkpoint bytes.
+/// This computes an identity only; it does not grant checkpoint authority.
+pub fn terminal_payload_identity(
     canonical_terminal_payload: &[u8],
 ) -> Result<(u64, [u8; 32]), GuardianCheckpointBoundaryError> {
     if canonical_terminal_payload.is_empty() {

@@ -6897,13 +6897,7 @@ impl WholeMuxRecoveryVerifier {
                 owner: published.owner(),
                 receipt: published.receipt(),
                 registration: published.capture().registration_wire_identity(),
-                payload_digest: Sha256::digest(
-                    published
-                        .capture()
-                        .terminal_checkpoint()
-                        .canonical_payload(),
-                )
-                .into(),
+                payload_digest: published.capture().terminal_payload_digest(),
             },
         );
         Ok(())
@@ -7459,7 +7453,13 @@ impl WholeMuxRecoveryVerifier {
                         pane_id: pane.pane_id as u64,
                         reason: "published guardian witness disappeared".to_owned(),
                     })?;
-                if <[u8; 32]>::from(Sha256::digest(decoded_json.as_slice())) != payload_digest {
+                let (_, observed_digest) =
+                    mux::guardian_checkpoint::terminal_payload_identity(decoded_json.as_slice())
+                        .map_err(|error| WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                            pane_id: pane.pane_id as u64,
+                            reason: format!("invalid guardian terminal payload identity: {error}"),
+                        })?;
+                if observed_digest != payload_digest {
                     return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                         pane_id: pane.pane_id as u64,
                         reason: "decrypted terminal differs from published guardian capture"

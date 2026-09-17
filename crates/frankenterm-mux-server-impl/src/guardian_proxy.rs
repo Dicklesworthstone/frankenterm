@@ -6540,6 +6540,31 @@ mod tests {
             .register_published_guardian_capture(&published)
             .unwrap();
         store.publish_generation_root(&root, &verifier).unwrap();
+        let reopened = GuardianDurableSpawnCustodyV1::open_existing(&token, provenance.original)
+            .unwrap()
+            .reopen_checkpoint(
+                published
+                    .receipt()
+                    .intent()
+                    .checkpoint_identity()
+                    .into_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.payload_digest(),
+            published.capture().terminal_payload_digest(),
+            "live and durable witnesses must use the same guardian digest domain"
+        );
+        assert_ne!(
+            reopened.payload_digest(),
+            <[u8; 32]>::from(Sha256::digest(
+                published
+                    .capture()
+                    .terminal_checkpoint()
+                    .canonical_payload()
+            )),
+            "plain SHA-256 must not stand in for guardian checkpoint identity"
+        );
         // A new test process has no in-memory publication witness, capture,
         // or opened store. It must recover authority from existing bytes.
         let child_log_path = directory.join("fresh-image-verifier.stdout");
@@ -6727,7 +6752,8 @@ mod tests {
         let selected = store.select_verified_roots(&verifier).unwrap();
         assert!(
             selected.current.is_some(),
-            "durable custody/catalog/ACK did not verify saved image"
+            "durable custody/catalog/ACK did not verify saved image: {:?}",
+            selected.torn_or_rejected
         );
     }
 
