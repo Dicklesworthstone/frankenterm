@@ -406,6 +406,9 @@ pub struct RenderableInner {
     pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
 
     lines: LruCache<StableRowIndex, LineEntry>,
+    // Server content revisions, separate from the paint-damage revision that
+    // put_line assigns on fetch completion. Bounded to the same cache capacity.
+    selection_row_sequences: LruCache<StableRowIndex, SequenceNo>,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -504,6 +507,7 @@ impl RenderableInner {
             dimensions,
             tiered_scrollback_status: None,
             lines: LruCache::new(line_cache_capacity),
+            selection_row_sequences: LruCache::new(line_cache_capacity),
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
@@ -1120,6 +1124,7 @@ impl RenderableInner {
             // into a full-screen application that deliberately suppresses local
             // prediction.
             self.lines.clear();
+            self.selection_row_sequences.clear();
             reset_prediction_state(&mut self.predictions, &mut self.prediction_score);
             self.last_prediction_miss = now;
         } else {
@@ -1137,6 +1142,7 @@ impl RenderableInner {
         for r in delta.dirty_lines {
             dirty.add_range(r.clone());
         }
+        let content_dirty = dirty.clone();
         // Legacy deltas mark cursor rows for an on-demand refetch because they
         // may omit changed row content. A render application is already a
         // complete atomic unit: all content-dirty rows were validated above,
@@ -1234,6 +1240,9 @@ impl RenderableInner {
                     entry.kind()
                 );
                 self.lines.put(stable_row, entry);
+                if content_dirty.contains(stable_row) {
+                    self.selection_row_sequences.put(stable_row, delta.seqno);
+                }
             }
         }
         if !to_fetch.is_empty() {
@@ -1261,6 +1270,7 @@ impl RenderableInner {
         let config = configuration();
         let capacity = render_line_cache_capacity(&config, &self.dimensions);
         rebuild_cache_as_stale(&mut self.lines, capacity);
+        self.selection_row_sequences.resize(capacity);
     }
 
     fn make_stale(&mut self, stable_row: StableRowIndex) {
@@ -1294,6 +1304,7 @@ impl RenderableInner {
             .collect();
         for row in evicted {
             self.lines.pop(&row);
+            self.selection_row_sequences.pop(&row);
         }
     }
 
@@ -1569,6 +1580,9 @@ impl RenderableInner {
             LineEntry::Line(line)
         };
         self.lines.put(stable_row, entry);
+        let capacity = self.lines.cap();
+        self.selection_row_sequences.resize(capacity);
+        self.selection_row_sequences.put(stable_row, seqno);
         true
     }
 
@@ -3275,6 +3289,137 @@ impl RenderableState {
         }
     }
 
+    pub(crate) fn selection_lines(
+        &self,
+        layout: SequenceNo,
+        sequence: SequenceNo,
+        selected_sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> Result<Vec<Line>, super::SelectionReadError> {
+        use super::SelectionReadError;
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| SelectionReadError::Busy)?;
+        if inner.dead
+            || inner.seqno != sequence
+            || inner.selection_layout_generation != layout
+            || sequence == SequenceNo::MAX
+            || layout == SequenceNo::MAX
+            || sequence < selected_sequence
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        let count = rows
+            .end
+            .checked_sub(rows.start)
+            .filter(|count| *count > 0 && *count <= 64)
+            .ok_or(SelectionReadError::InvalidRange)?;
+        let retained_end = inner
+            .dimensions
+            .scrollback_top
+            .checked_add(
+                StableRowIndex::try_from(inner.dimensions.scrollback_rows)
+                    .map_err(|_| SelectionReadError::InvalidRange)?,
+            )
+            .ok_or(SelectionReadError::InvalidRange)?;
+        if rows.start < inner.dimensions.scrollback_top || rows.end > retained_end {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        if rows.clone().all(|row| {
+            fresh_cached_line(inner.lines.peek(&row))
+                .is_some_and(|line| !line.changed_since(sequence))
+                && inner.selection_row_sequences.peek(&row).is_some()
+        }) {
+            if rows.clone().any(|row| {
+                inner
+                    .selection_row_sequences
+                    .peek(&row)
+                    .is_some_and(|revision| *revision > selected_sequence)
+            }) {
+                return Err(SelectionReadError::SourceChanged);
+            }
+            let mut bytes = 0usize;
+            for row in rows.clone() {
+                for cell in fresh_cached_line(inner.lines.peek(&row))
+                    .unwrap()
+                    .visible_cells()
+                {
+                    bytes = bytes
+                        .checked_add(cell.str().len())
+                        .filter(|bytes| *bytes <= 64 * 1024 * 1024)
+                        .ok_or(SelectionReadError::TooLarge)?;
+                }
+            }
+            let mut result = Vec::with_capacity(
+                usize::try_from(count).map_err(|_| SelectionReadError::InvalidRange)?,
+            );
+            for row in rows {
+                result.push(fresh_cached_line(inner.lines.peek(&row)).unwrap().clone());
+            }
+            return Ok(result);
+        }
+        let token = FetchToken::new(Instant::now());
+        let mut to_fetch = RangeSet::new();
+        for row in rows {
+            match inner.lines.pop(&row) {
+                Some(LineEntry::Stale(line)) => {
+                    to_fetch.add(row);
+                    inner
+                        .lines
+                        .put(row, LineEntry::LineAndFetching(line, token.clone()));
+                }
+                Some(LineEntry::Line(line))
+                    if line.changed_since(sequence)
+                        || inner.selection_row_sequences.peek(&row).is_none() =>
+                {
+                    to_fetch.add(row);
+                    inner
+                        .lines
+                        .put(row, LineEntry::LineAndFetching(line, token.clone()));
+                }
+                None => {
+                    to_fetch.add(row);
+                    inner.lines.put(row, LineEntry::Fetching(token.clone()));
+                }
+                Some(entry) => {
+                    inner.lines.put(row, entry);
+                }
+            }
+        }
+        inner.schedule_fetch_lines(to_fetch, token);
+        Err(SelectionReadError::Busy)
+    }
+
+    pub(crate) fn selection_changed_since(
+        &self,
+        layout: SequenceNo,
+        sequence: SequenceNo,
+        rows: Range<StableRowIndex>,
+    ) -> Result<RangeSet<StableRowIndex>, super::SelectionReadError> {
+        use super::SelectionReadError;
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| SelectionReadError::Busy)?;
+        if inner.dead
+            || inner.selection_layout_generation != layout
+            || layout == SequenceNo::MAX
+            || inner.seqno == SequenceNo::MAX
+            || inner.seqno < sequence
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        let mut changed = RangeSet::new();
+        // Work is bounded by cache capacity, not the selected history length.
+        for (row, revision) in inner.selection_row_sequences.iter() {
+            if rows.contains(row) && *revision > sequence {
+                changed.add(*row);
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let mut inner = self.inner.borrow_mut();
         let mut result = vec![];
@@ -3571,10 +3716,10 @@ impl RenderableState {
 mod tests {
     use super::{
         apply_prediction_reconciliation_to_score, base_poll_interval,
-        cache_and_admit_ordinary_image, expire_predictions, get_cached_validated_image,
-        initial_last_poll, mark_predictions_dispatched, paste_fits_prediction_budget,
-        push_bounded_prediction, push_image_locator, rebuild_cache_as_stale,
-        reconcile_predictions_after_cached_terminal_change,
+        cache_and_admit_ordinary_image, expire_predictions, fresh_cached_line,
+        get_cached_validated_image, initial_last_poll, mark_predictions_dispatched,
+        paste_fits_prediction_budget, push_bounded_prediction, push_image_locator,
+        rebuild_cache_as_stale, reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, rows_requiring_image_retry, should_apply_unilateral_delta,
         try_release_atomic, try_reserve_bounded_atomic, CachedImageFailure, FetchToken, ImageLru,
@@ -3692,6 +3837,206 @@ mod tests {
     }
 
     #[test]
+    fn selection_copy_uses_remote_content_revision_not_fetch_paint_damage() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let token = FetchToken::new(Instant::now());
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 12;
+            inner.dimensions.scrollback_top = 0;
+            inner.dimensions.scrollback_rows = 24;
+            inner.lines.put(0, LineEntry::Fetching(token.clone()));
+            assert!(inner.put_line(
+                0,
+                Line::from_text("界 e\u{301}", &CellAttributes::default(), 7, None),
+                Some(&token)
+            ));
+            assert_eq!(
+                fresh_cached_line(inner.lines.peek(&0))
+                    .unwrap()
+                    .current_seqno(),
+                12
+            );
+            assert_eq!(inner.selection_row_sequences.peek(&0), Some(&7));
+            assert!(inner.put_line(
+                1,
+                Line::from_text("unrelated output", &CellAttributes::default(), 12, None),
+                None
+            ));
+        }
+        let (layout, sequence, _, _) = state.selection_source_snapshot().unwrap();
+        let copied = state.selection_lines(layout, sequence, 7, 0..1).unwrap();
+        assert_eq!(copied[0].as_str(), "界 e\u{301}");
+        assert!(state
+            .selection_changed_since(layout, 7, 0..1)
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .selection_changed_since(layout, 7, 0..2)
+            .unwrap()
+            .contains(1));
+        {
+            let mut inner = state.inner.borrow_mut();
+            assert!(inner.put_line(
+                0,
+                Line::from_text("changed", &CellAttributes::default(), 12, None),
+                None
+            ));
+        }
+        assert!(matches!(
+            state.selection_lines(layout, sequence, 7, 0..1),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
+        assert!(state
+            .selection_changed_since(layout, 7, 0..1)
+            .unwrap()
+            .contains(0));
+    }
+
+    #[test]
+    fn selection_copy_refuses_busy_stale_and_changed_source_without_renderer_fallback() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let (layout, sequence, _, _) = state.selection_source_snapshot().unwrap();
+        {
+            let _busy = state.inner.borrow_mut();
+            assert!(matches!(
+                state.selection_lines(layout, sequence, sequence, 0..1),
+                Err(super::super::SelectionReadError::Busy)
+            ));
+        }
+        for entry in [
+            LineEntry::Fetching(FetchToken::new(Instant::now())),
+            LineEntry::LineAndFetching(
+                Line::from("stale text must not copy"),
+                FetchToken::new(Instant::now()),
+            ),
+            LineEntry::Stale(Line::from("stale text must not copy")),
+        ] {
+            state.inner.borrow_mut().lines.put(0, entry);
+            assert!(matches!(
+                state.selection_lines(layout, sequence, sequence, 0..1),
+                Err(super::super::SelectionReadError::Busy)
+            ));
+        }
+        state.inner.borrow_mut().lines.pop(&0);
+        assert!(matches!(
+            state.selection_lines(layout, sequence, sequence, 0..1),
+            Err(super::super::SelectionReadError::Busy)
+        ));
+        assert!(state.inner.borrow_mut().put_line(
+            0,
+            Line::from_text("界 e\u{301}", &CellAttributes::default(), sequence, None),
+            None
+        ));
+        assert_eq!(
+            state
+                .selection_lines(layout, sequence, sequence, 0..1)
+                .unwrap()[0]
+                .as_str(),
+            "界 e\u{301}"
+        );
+        state.inner.borrow_mut().seqno = sequence + 1;
+        assert!(matches!(
+            state.selection_lines(layout, sequence, sequence, 0..1),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn selection_source_revision_cannot_survive_replacement_as_old_fetch_authority() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let token = FetchToken::new(Instant::now());
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.lines.resize(NonZeroUsize::new(2).unwrap());
+            inner.seqno = 13;
+            for row in 0..3 {
+                assert!(inner.put_line(
+                    row,
+                    Line::from_text("old", &CellAttributes::default(), 7, None),
+                    None
+                ));
+            }
+            assert!(inner.lines.peek(&0).is_none());
+            assert!(inner.selection_row_sequences.len() <= 2);
+            inner.lines.put(0, LineEntry::Fetching(token.clone()));
+            assert!(inner.put_line(
+                0,
+                Line::from_text("replacement", &CellAttributes::default(), 13, None),
+                None
+            ));
+            assert!(!inner.put_line(
+                0,
+                Line::from_text("late old reply", &CellAttributes::default(), 7, None),
+                Some(&token)
+            ));
+            assert_eq!(inner.selection_row_sequences.peek(&0), Some(&13));
+            assert_eq!(
+                fresh_cached_line(inner.lines.peek(&0)).unwrap().as_str(),
+                "replacement"
+            );
+            let mut dirty = rangeset::RangeSet::new();
+            dirty.add(0);
+            inner.evict_dirty_outside_viewport(&dirty, &(1..2));
+            assert!(inner.lines.peek(&0).is_none());
+            assert!(inner.selection_row_sequences.peek(&0).is_none());
+            assert!(inner.put_line(
+                0,
+                Line::from_text("new incarnation row", &CellAttributes::default(), 13, None),
+                None
+            ));
+        }
+        let (layout, sequence, _, _) = state.selection_source_snapshot().unwrap();
+        assert!(matches!(
+            state.selection_lines(layout, sequence, 7, 0..1),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn selection_copy_reads_more_than_cache_capacity_in_fresh_bounded_chunks() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 12;
+            inner.dimensions.scrollback_top = 0;
+            inner.dimensions.scrollback_rows = 256;
+            inner.lines.resize(NonZeroUsize::new(128).unwrap());
+        }
+        let (layout, sequence, _, _) = state.selection_source_snapshot().unwrap();
+        let mut received = String::new();
+        for start in (0..256).step_by(64) {
+            let token = FetchToken::new(Instant::now());
+            {
+                let mut inner = state.inner.borrow_mut();
+                for row in start..start + 64 {
+                    inner.lines.put(row, LineEntry::Fetching(token.clone()));
+                    assert!(inner.put_line(
+                        row,
+                        Line::from_text("界", &CellAttributes::default(), 7, None),
+                        Some(&token)
+                    ));
+                }
+                assert!(inner.lines.len() <= 128);
+                assert!(inner.selection_row_sequences.len() <= 128);
+            }
+            let lines = state
+                .selection_lines(layout, sequence, 7, start..start + 64)
+                .unwrap();
+            assert_eq!(lines.len(), 64);
+            for line in lines {
+                received.push_str(&line.as_str());
+            }
+        }
+        assert_eq!(received, "界".repeat(256));
+        assert!(state.inner.borrow().lines.peek(&0).is_none());
+    }
+
+    #[test]
     fn selection_snapshot_preserves_content_epoch_and_retires_replaced_layouts() {
         let renderable = test_renderable_state();
         let state = renderable.lock();
@@ -3718,6 +4063,16 @@ mod tests {
         assert_eq!(content.0, initial.0);
         assert_eq!(content.1, delta.seqno);
 
+        assert!(state.inner.borrow_mut().put_line(
+            0,
+            Line::from_text("old screen", &CellAttributes::default(), content.1, None),
+            None
+        ));
+        assert_eq!(
+            state.inner.borrow().selection_row_sequences.peek(&0),
+            Some(&content.1)
+        );
+
         // A replacement can reuse the exact remote sequence and geometry.
         assert!(state
             .inner
@@ -3731,6 +4086,11 @@ mod tests {
         assert_eq!(replacement.0, content.0 + 1);
         assert_eq!(replacement.1, content.1);
         assert_eq!(replacement.2, content.2);
+        assert!(state.inner.borrow().selection_row_sequences.is_empty());
+        assert!(matches!(
+            state.selection_lines(content.0, content.1, content.1, 0..1),
+            Err(super::super::SelectionReadError::SourceChanged)
+        ));
 
         delta.alt_screen_active = !delta.alt_screen_active;
         assert!(state

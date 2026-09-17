@@ -128,6 +128,7 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
+pub(crate) use selection::RemoteSelectionCopy;
 #[cfg(test)]
 pub(crate) use selection::selected_text_from_logical_lines;
 pub mod spawn;
@@ -5273,25 +5274,50 @@ impl TermWindow {
                 // through the same atomic source fence as render damage so a
                 // reset/regression or saturated source cannot make an old high
                 // selection seqno suppress unrelated replacement content.
-                let selection_dirty = frame.map_or_else(
-                    || {
-                        pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
-                            .1
-                    },
-                    |frame| {
-                        if frame.source_sequence == selection_seqno {
-                            // A successful native remap established this exact
-                            // frame as the selection's new damage baseline.
-                            rangeset::RangeSet::new()
-                        } else {
-                            frame.selection_dirty.clone()
+                let selection_dirty = if let Some(client) =
+                    pane.downcast_ref::<frankenterm_client::pane::ClientPane>()
+                {
+                    match selection_authority.map(|authority| {
+                        client.selection_changed_since(
+                            authority.layout_floor(),
+                            selection_seqno,
+                            visible_range.clone(),
+                        )
+                    }) {
+                        Some(Ok(changed)) => changed,
+                        Some(Err(
+                            frankenterm_client::pane::SelectionReadError::SourceChanged
+                            | frankenterm_client::pane::SelectionReadError::InvalidRange
+                            | frankenterm_client::pane::SelectionReadError::TooLarge,
+                        )) => {
+                            let mut changed = rangeset::RangeSet::new();
+                            changed.add_range(visible_range.clone());
+                            changed
                         }
-                    },
-                );
-                let intersects = selection_rows
-                    .clone()
-                    .into_iter()
-                    .any(|row| selection_dirty.contains(row));
+                        None | Some(Err(frankenterm_client::pane::SelectionReadError::Busy)) => {
+                            rangeset::RangeSet::new()
+                        }
+                    }
+                } else {
+                    frame.map_or_else(
+                        || {
+                            pane.get_changed_since_with_source_fence(visible_range, selection_seqno)
+                                .1
+                        },
+                        |frame| {
+                            if frame.source_sequence == selection_seqno {
+                                // A successful native remap established this exact
+                                // frame as the selection's new damage baseline.
+                                rangeset::RangeSet::new()
+                            } else {
+                                frame.selection_dirty.clone()
+                            }
+                        },
+                    )
+                };
+                let intersects = !selection_dirty
+                    .intersection_with_range(selection_rows.clone())
+                    .is_empty();
                 (
                     intersects,
                     if intersects {
@@ -6997,6 +7023,9 @@ impl TermWindow {
                 }
             }
             CopyTo(dest) => {
+                if self.defer_pending_selection_copy(pane, *dest) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 if self.selection_authority_is_current(pane) {
                     let text = self.selection_text(pane);
                     if self.selection_authority_is_current(pane) {

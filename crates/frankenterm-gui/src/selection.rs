@@ -53,6 +53,7 @@ pub(crate) struct PendingNativeSelection {
     pub copy: Option<config::keyassignment::ClipboardCopyDestination>,
     pub paint_retries_remaining: u8,
     pub committed: bool,
+    pub remote_copy: Option<crate::termwindow::RemoteSelectionCopy>,
 }
 
 pub(crate) enum NativeSelectionCapture {
@@ -98,6 +99,7 @@ impl PendingNativeSelection {
             copy: None,
             paint_retries_remaining: 3,
             committed: false,
+            remote_copy: None,
         }
     }
 
@@ -254,9 +256,28 @@ pub struct PendingSelectionStart {
     pub mode: SelectionMode,
     pub button: window::MousePress,
     pub paint_retries_remaining: u8,
+    pub released: bool,
+    pub end: Option<(wezterm_term::input::ClickPosition, StableRowIndex)>,
+    pub copy: Option<config::keyassignment::ClipboardCopyDestination>,
 }
 
 impl PendingSelectionStart {
+    pub fn retain_endpoint(
+        &mut self,
+        frame: SelectionFrameStamp,
+        position: wezterm_term::input::ClickPosition,
+        row: StableRowIndex,
+        release: Option<window::MousePress>,
+    ) {
+        let final_release = release == Some(self.button);
+        if (!self.released || final_release) && frame.same_coordinates(self.frame) {
+            self.end = Some((position, row));
+        }
+        if final_release {
+            self.released = true;
+        }
+    }
+
     pub fn take_paint_retry(&mut self) -> bool {
         let Some(remaining) = self.paint_retries_remaining.checked_sub(1) else {
             return false;
@@ -1382,6 +1403,9 @@ mod tests {
             mode: SelectionMode::Cell,
             button: window::MousePress::Left,
             paint_retries_remaining: 3,
+            released: false,
+            end: None,
+            copy: None,
         };
         let mut retries = pending;
         for _ in 0..3 {
@@ -1405,6 +1429,49 @@ mod tests {
         ));
         assert_eq!(pending.coordinate, anchor);
         assert_eq!(pending.mode, SelectionMode::Cell);
+        // No motion event arrived while the source was busy. The release
+        // position itself must become the final endpoint, even if release was
+        // marked before coordinate conversion in the native event handler.
+        let mut released = pending;
+        released.released = true;
+        released.retain_endpoint(
+            frame,
+            wezterm_term::input::ClickPosition {
+                column: 9,
+                row: 2,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+            },
+            anchor.y + 2,
+            Some(window::MousePress::Left),
+        );
+        assert_eq!(released.end.unwrap().0.column, 9);
+        assert_eq!(released.end.unwrap().1, anchor.y + 2);
+        assert_eq!(released.coordinate, anchor);
+        released.retain_endpoint(
+            frame,
+            wezterm_term::input::ClickPosition {
+                column: 18,
+                row: 4,
+                x_pixel_offset: 0,
+                y_pixel_offset: 0,
+            },
+            anchor.y + 4,
+            None,
+        );
+        assert_eq!(
+            released.end.unwrap().0.column,
+            9,
+            "later motion cannot alter a released gesture"
+        );
+        assert!(matches!(
+            released.resolve(None, &state),
+            PendingSelectionResolution::Wait
+        ));
+        assert!(matches!(
+            released.resolve(Some(frame), &state),
+            PendingSelectionResolution::Ready
+        ));
         let mut different_geometry = frame.geometry;
         different_geometry[0] += 1;
         assert!(state.displayed_for_geometry(different_geometry).is_none());

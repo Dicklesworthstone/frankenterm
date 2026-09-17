@@ -252,6 +252,7 @@ impl crate::TermWindow {
         // Released gestures retain their final endpoint through contention,
         // so native anchor retries are not limited to an active drag.
         for pos in self.get_panes_to_render() {
+            self.retry_pending_selection_start(&pos.pane);
             self.retry_pending_native_selection(&pos.pane);
             let retry = self
                 .pane_state(pos.pane.pane_id())
@@ -261,22 +262,21 @@ impl crate::TermWindow {
             if retry {
                 self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }
-        }
-        if let Some(pane_id) = self.active_selection_drag_pane {
-            if let Some(pos) = self
-                .get_panes_to_render()
-                .into_iter()
-                .find(|pos| pos.pane.pane_id() == pane_id)
-            {
-                self.retry_pending_selection_start(&pos.pane);
-                let retry = self
-                    .pane_state(pane_id)
-                    .pending_selection_start
-                    .as_mut()
-                    .is_some_and(|pending| pending.take_paint_retry());
-                if retry {
-                    self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
-                }
+            let copy_deadline = self
+                .pane_state(pos.pane.pane_id())
+                .pending_native_selection
+                .as_ref()
+                .and_then(|pending| pending.remote_copy.as_ref().map(|copy| copy.deadline()));
+            if let Some(deadline) = copy_deadline {
+                self.schedule_animation_wake(deadline);
+            }
+            let retry = self
+                .pane_state(pos.pane.pane_id())
+                .pending_selection_start
+                .as_mut()
+                .is_some_and(|pending| pending.take_paint_retry());
+            if retry {
+                self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }
         }
         if outcome.post_present.should_force_frame_budget_paint {

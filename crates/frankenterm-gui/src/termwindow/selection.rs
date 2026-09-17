@@ -10,6 +10,133 @@ use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 use window::WindowOps;
 
+/// One bounded clipboard transaction, independent of renderer cache capacity.
+/// The 64 MiB text cap and fixed deadline never reset as chunks arrive.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSelectionCopy {
+    source_sequence: termwiz::surface::SequenceNo,
+    next_row: StableRowIndex,
+    end_row: StableRowIndex,
+    selection: SelectionRange,
+    rectangular: bool,
+    pending_line: Option<(StableRowIndex, Line)>,
+    text: String,
+    join_previous: bool,
+    has_line: bool,
+    deadline: std::time::Instant,
+}
+
+impl RemoteSelectionCopy {
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(crate) fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+
+    fn verify_source(&self, sequence: termwiz::surface::SequenceNo) -> Result<(), &'static str> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err("The remote text did not arrive in time. Copy the selection again.");
+        }
+        if sequence != self.source_sequence {
+            return Err("The pane changed while copying. Copy the selection again.");
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        sequence: termwiz::surface::SequenceNo,
+    ) -> Result<Option<String>, &'static str> {
+        self.verify_source(sequence)?;
+        if self.next_row != self.end_row {
+            return Ok(None);
+        }
+        Ok(Some(std::mem::take(&mut self.text)))
+    }
+
+    fn new(selection: &Selection, source_sequence: termwiz::surface::SequenceNo) -> Option<Self> {
+        let selection_range = selection.range?.normalize();
+        let end_row = selection_range.end.y.checked_add(1)?;
+        Some(Self {
+            source_sequence,
+            next_row: selection_range.start.y,
+            end_row,
+            selection: selection_range,
+            rectangular: selection.rectangular,
+            pending_line: None,
+            text: String::new(),
+            join_previous: false,
+            has_line: false,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        })
+    }
+
+    fn append_span(
+        &mut self,
+        row: StableRowIndex,
+        line: Line,
+        next: Option<StableRowIndex>,
+    ) -> Result<bool, &'static str> {
+        // Refuse before materializing a second copy of an oversized row.
+        line.visible_cells()
+            .try_fold(0usize, |bytes, cell| {
+                bytes
+                    .checked_add(cell.str().len())
+                    .filter(|bytes| *bytes <= Self::MAX_BYTES)
+            })
+            .ok_or("selection exceeds the 64 MiB copy limit")?;
+        let (span, continues, ends_before) =
+            selected_line_span(&line, row, next, self.selection, self.rectangular);
+        let text = span.as_str();
+        let newline = self.has_line && !self.join_previous;
+        let additional = text
+            .len()
+            .checked_add(usize::from(newline))
+            .ok_or("selection exceeds the copy limit")?;
+        let total = self
+            .text
+            .len()
+            .checked_add(additional)
+            .filter(|total| *total <= Self::MAX_BYTES)
+            .ok_or("selection exceeds the 64 MiB copy limit")?;
+        if total > self.text.capacity() {
+            let capacity = total
+                .max(self.text.capacity().saturating_mul(2))
+                .min(Self::MAX_BYTES);
+            self.text
+                .try_reserve_exact(capacity - self.text.len())
+                .map_err(|_| "selection copy allocation failed")?;
+        }
+        if newline {
+            self.text.push('\n');
+        }
+        self.text.push_str(&text);
+        self.has_line = true;
+        self.join_previous = continues;
+        Ok(ends_before)
+    }
+
+    fn push_chunk(&mut self, rows: Vec<Line>) -> Result<(), &'static str> {
+        for line in rows {
+            let row = self.next_row;
+            self.next_row = row.checked_add(1).ok_or("selection row overflow")?;
+            if let Some((previous_row, previous)) = self.pending_line.take() {
+                if self.append_span(previous_row, previous, Some(row))? {
+                    // This was the empty BeforeZero endpoint, not another line.
+                    continue;
+                }
+            }
+            self.pending_line = Some((row, line));
+        }
+        if self.next_row == self.end_row {
+            if let Some((row, line)) = self.pending_line.take() {
+                self.append_span(row, line, None)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Emit the AT-tree announcement for a picked smart-selection span.
 /// Called from the `SelectionMode::Word` and `SelectionMode::Line`
 /// mouse-handler branches after `smart_or_word_around` /
@@ -167,16 +294,24 @@ impl super::TermWindow {
     }
 
     pub(super) fn retry_pending_native_selection(&self, pane: &Arc<dyn Pane>) {
-        let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
-            return;
-        };
         let Some(mut pending) = self
             .pane_state(pane.pane_id())
             .pending_native_selection
-            .clone()
+            .take()
         else {
             return;
         };
+        if pending
+            .remote_copy
+            .as_ref()
+            .is_some_and(|copy| std::time::Instant::now() >= copy.deadline())
+        {
+            frankenterm_toast_notification::persistent_toast_notification(
+                "Selection was not copied",
+                "The remote text did not arrive in time. Copy the selection again.",
+            );
+            return;
+        }
         if pending.committed {
             self.selection_authority_is_current(pane);
             let current = self.selection(pane.pane_id()).clone();
@@ -191,7 +326,18 @@ impl super::TermWindow {
             }
             pending.desired = current;
         }
-        let capture = Self::capture_native_selection(pane, local, &pending.desired);
+        let local = pane.downcast_ref::<mux::localpane::LocalPane>();
+        let capture = if let Some(local) = local {
+            Self::capture_native_selection(pane, local, &pending.desired)
+        } else {
+            match SelectionAuthority::capture(&**pane) {
+                None => crate::selection::NativeSelectionCapture::Busy,
+                Some(authority) if pending.desired.authority == Some(authority) => {
+                    crate::selection::NativeSelectionCapture::Unremappable
+                }
+                Some(_) => crate::selection::NativeSelectionCapture::Invalidated,
+            }
+        };
         let result = {
             let mut state = self.pane_state(pane.pane_id());
             let result = pending.try_commit(&mut state.selection, capture);
@@ -202,12 +348,15 @@ impl super::TermWindow {
             {
                 pending.committed = true;
                 pending.desired = state.selection.clone();
-                state.pending_native_selection = Some(pending.clone());
             } else if result.is_some() {
                 state.pending_native_selection = None;
             }
             result
         };
+        if result.is_none() {
+            self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
+            return;
+        }
         if let Some(crate::selection::NativeSelectionCommit::Applied { needs_repaint }) = result {
             if needs_repaint {
                 if let Some(window) = self.window.as_ref() {
@@ -215,14 +364,37 @@ impl super::TermWindow {
                 }
             }
             if let Some(destination) = pending.copy {
+                if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
+                    match self.advance_remote_selection_copy(pane, client, &mut pending) {
+                        Ok(Some(text)) => self.copy_to_clipboard(destination, text),
+                        Ok(None) => {
+                            self.pane_state(pane.pane_id()).pending_native_selection =
+                                Some(pending);
+                        }
+                        Err(reason) => {
+                            frankenterm_toast_notification::persistent_toast_notification(
+                                "Selection was not copied",
+                                reason,
+                            )
+                        }
+                    }
+                    return;
+                }
+                let Some(local) = local else {
+                    return;
+                };
                 let text = self.selection_text(pane);
                 // Copy must be retried independently if its source acquisition
                 // loses the same contention race after anchor registration.
                 if text.is_empty() && pending.desired.range.is_some() {
+                    self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
                     return;
                 }
                 match Self::capture_native_selection(pane, local, &pending.desired) {
-                    crate::selection::NativeSelectionCapture::Busy => return,
+                    crate::selection::NativeSelectionCapture::Busy => {
+                        self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
+                        return;
+                    }
                     crate::selection::NativeSelectionCapture::Invalidated => {
                         self.pane_state(pane.pane_id()).pending_native_selection = None;
                         return;
@@ -237,6 +409,69 @@ impl super::TermWindow {
         }
     }
 
+    fn advance_remote_selection_copy(
+        &self,
+        pane: &Arc<dyn Pane>,
+        client: &frankenterm_client::pane::ClientPane,
+        pending: &mut crate::selection::PendingNativeSelection,
+    ) -> Result<Option<String>, &'static str> {
+        use frankenterm_client::pane::SelectionReadError;
+        let Some((authority, sequence, _)) = SelectionAuthority::capture_source(&**pane) else {
+            return Ok(None);
+        };
+        if pending.desired.authority != Some(authority) {
+            return Err("The pane changed. Select the text again to copy it.");
+        }
+        if pending.remote_copy.is_none() {
+            pending.remote_copy = Some(
+                RemoteSelectionCopy::new(&pending.desired, sequence)
+                    .ok_or("The selection range is unavailable. Select the text again.")?,
+            );
+        }
+        let copy = pending.remote_copy.as_mut().unwrap();
+        copy.verify_source(sequence)?;
+        if copy.next_row < copy.end_row {
+            let end = copy
+                .next_row
+                .checked_add(64)
+                .unwrap_or(copy.end_row)
+                .min(copy.end_row);
+            match client.selection_lines(
+                authority.layout_floor(),
+                sequence,
+                pending.desired.seqno,
+                copy.next_row..end,
+            ) {
+                Ok(rows) => copy.push_chunk(rows)?,
+                Err(SelectionReadError::Busy) => return Ok(None),
+                Err(SelectionReadError::TooLarge) => {
+                    return Err("The selection exceeds the 64 MiB copy limit. Select less text.");
+                }
+                Err(SelectionReadError::SourceChanged | SelectionReadError::InvalidRange) => {
+                    return Err(
+                        "The selected text changed or is unavailable. Select it again to copy it.",
+                    );
+                }
+            }
+        }
+        if copy.next_row < copy.end_row {
+            // Actual bounded progress, not an idle retry: one chunk per frame.
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+            return Ok(None);
+        }
+        match SelectionAuthority::capture_source(&**pane) {
+            None => Ok(None),
+            Some((current, current_sequence, _))
+                if current == authority && current_sequence == sequence =>
+            {
+                copy.finish(current_sequence)
+            }
+            Some(_) => Err("The pane changed while copying. Copy the selection again."),
+        }
+    }
+
     /// Bind release to the exact pending endpoint; never copy an older anchor.
     pub(super) fn defer_pending_selection_copy(
         &self,
@@ -244,6 +479,27 @@ impl super::TermWindow {
         destination: config::keyassignment::ClipboardCopyDestination,
     ) -> bool {
         let mut state = self.pane_state(pane.pane_id());
+        if let Some(pending) = state.pending_selection_start.as_mut() {
+            pending.released = true;
+            pending.copy = Some(destination);
+            pending.paint_retries_remaining = 3;
+            drop(state);
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+            return true;
+        }
+        if state.pending_native_selection.is_none()
+            && pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_some()
+            && state.selection.range.is_some()
+        {
+            let mut pending =
+                crate::selection::PendingNativeSelection::new(state.selection.clone());
+            pending.committed = true;
+            state.pending_native_selection = Some(pending);
+        }
         let Some(pending) = state.pending_native_selection.as_mut() else {
             return false;
         };
@@ -356,6 +612,19 @@ impl super::TermWindow {
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
+        self.extend_selection_at_position(mode, pane, None);
+    }
+
+    fn extend_selection_at_position(
+        &mut self,
+        mode: SelectionMode,
+        pane: &Arc<dyn Pane>,
+        retained: Option<(
+            SelectionAuthority,
+            wezterm_term::input::ClickPosition,
+            StableRowIndex,
+        )>,
+    ) -> bool {
         // Even a deferred first motion is a drag, not a hyperlink click.
         self.pane_state(pane.pane_id()).suppress_selection_link = true;
         let had_pending_start = self
@@ -376,7 +645,7 @@ impl super::TermWindow {
                     window.invalidate();
                 }
             }
-            return;
+            return false;
         }
         self.retry_pending_native_selection(pane);
         self.selection_authority_is_current(pane);
@@ -389,20 +658,51 @@ impl super::TermWindow {
         let current = SelectionAuthority::capture(&**pane);
         if desired.is_invalidated_by(current) {
             self.clear_selection(pane);
-            return;
+            return false;
         }
-        if !desired.is_authorized_by(current) || self.mouse_selection_authority(pane).is_none() {
+        if !desired.is_authorized_by(current)
+            || retained
+                .map(|r| r.0)
+                .or_else(|| self.mouse_selection_authority(pane))
+                .is_none()
+        {
             // Output/parser contention or autoscroll can outrun presentation.
             // Wait for a usable frame without discarding the drag's anchor.
+            if retained.is_none() {
+                let mut state = self.pane_state(pane.pane_id());
+                if let (Some(frame), Some(coordinate), Some(end), Some(button)) = (
+                    state.mouse_selection_frame,
+                    desired.origin,
+                    state.mouse_terminal_coords,
+                    self.active_selection_drag_button,
+                ) {
+                    if desired.authority == Some(frame.authority) {
+                        state.pending_selection_start =
+                            Some(crate::selection::PendingSelectionStart {
+                                frame,
+                                coordinate,
+                                mode,
+                                button,
+                                paint_retries_remaining: 3,
+                                released: false,
+                                end: Some(end),
+                                copy: None,
+                            });
+                    }
+                }
+            }
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
-            return;
+            return false;
         }
         desired.seqno = pane.get_current_seqno();
-        let (position, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
+        let (position, y) = match retained
+            .map(|(_, position, row)| (position, row))
+            .or(self.pane_state(pane.pane_id()).mouse_terminal_coords)
+        {
             Some(coords) => coords,
-            None => return,
+            None => return false,
         };
         let x = position.column;
         match mode {
@@ -504,7 +804,7 @@ impl super::TermWindow {
 
         if desired.is_invalidated_by(SelectionAuthority::capture(&**pane)) {
             self.clear_selection(pane);
-            return;
+            return false;
         }
         self.commit_selection_candidate(pane, desired);
         let dims = pane.get_dimensions();
@@ -522,6 +822,7 @@ impl super::TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+        true
     }
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
@@ -546,6 +847,9 @@ impl super::TermWindow {
                             mode,
                             button,
                             paint_retries_remaining: 3,
+                            released: false,
+                            end: None,
+                            copy: None,
                         }
                     })
             };
@@ -569,9 +873,10 @@ impl super::TermWindow {
         let Some(pending) = self.pane_state(pane.pane_id()).pending_selection_start else {
             return;
         };
-        if self.active_selection_drag_pane != Some(pane.pane_id())
-            || self.active_selection_drag_button != Some(pending.button)
-            || !self.current_mouse_buttons.contains(&pending.button)
+        if !pending.released
+            && (self.active_selection_drag_pane != Some(pane.pane_id())
+                || self.active_selection_drag_button != Some(pending.button)
+                || !self.current_mouse_buttons.contains(&pending.button))
         {
             self.pane_state(pane.pane_id()).pending_selection_start = None;
             return;
@@ -597,24 +902,35 @@ impl super::TermWindow {
             x,
             pending.coordinate.y,
         );
-        // Motion may have arrived while the press was waiting. Its endpoint
-        // is reusable only if it was measured against the same displayed map.
-        let extend = {
-            let mut state = self.pane_state(pane.pane_id());
-            if state
-                .mouse_selection_frame
-                .is_some_and(|frame| frame.same_coordinates(pending.frame))
+        // The retained endpoint belongs to this exact displayed gesture;
+        // later motion after release must not change a deferred copy.
+        if let Some((position, row)) = pending.end {
+            if (position.column != x || row != pending.coordinate.y)
+                && !self.extend_selection_at_position(
+                    pending.mode,
+                    pane,
+                    Some((pending.frame.authority, position, row)),
+                )
             {
-                state.mouse_selection_frame = state.selection_frame.for_mouse(current);
-                state.mouse_terminal_coords.is_some_and(|(position, row)| {
-                    position.column != x || row != pending.coordinate.y
-                })
-            } else {
-                false
+                if !self
+                    .selection(pane.pane_id())
+                    .is_invalidated_by(SelectionAuthority::capture(&**pane))
+                {
+                    self.pane_state(pane.pane_id()).pending_selection_start = Some(pending);
+                }
+                return;
             }
-        };
-        if extend {
-            self.extend_selection_at_mouse_cursor(pending.mode, pane);
+        }
+        if pane
+            .downcast_ref::<frankenterm_client::pane::ClientPane>()
+            .is_some()
+        {
+            // Copy starts at the current coherent source, but selected-row
+            // mutation is judged against the frame where the gesture began.
+            self.selection(pane.pane_id()).seqno = pending.frame.source_sequence;
+        }
+        if let Some(destination) = pending.copy {
+            self.defer_pending_selection_copy(pane, destination);
         }
     }
 
@@ -685,6 +1001,35 @@ pub(crate) fn selected_text_from_logical_lines(
         .join("\n")
 }
 
+fn selected_line_span(
+    line: &Line,
+    row: StableRowIndex,
+    next: Option<StableRowIndex>,
+    sel: SelectionRange,
+    rectangular: bool,
+) -> (Line, bool, bool) {
+    let cols = sel.cols_for_row(row, rectangular);
+    let ends_before = !rectangular
+        && line.last_cell_was_wrapped()
+        && next.is_some_and(|next| {
+            row.checked_add(1) == Some(next) && sel.cols_for_row(next, false).is_empty()
+        });
+    let continues = !rectangular
+        && !ends_before
+        && cols.end >= line.len()
+        && line.last_cell_was_wrapped()
+        && next.is_some_and(|next| {
+            row.checked_add(1) == Some(next) && sel.cols_for_row(next, false).start == 0
+        });
+    let mut span = line.columns_as_line(cols);
+    if !continues {
+        let seqno = span.current_seqno();
+        span.set_last_cell_was_wrapped(false, seqno);
+        span.prune_trailing_blanks(seqno);
+    }
+    (span, continues, ends_before)
+}
+
 fn selected_lines_from_logical_lines(
     logical_lines: &[LogicalLine],
     sel: SelectionRange,
@@ -711,33 +1056,20 @@ fn selected_lines_from_logical_lines(
     let mut result: Vec<Line> = Vec::new();
     let mut join_previous = false;
     while let Some((row, line)) = rows.next() {
-        let cols = sel.cols_for_row(row, rectangular);
         // BeforeZero on the next soft-wrapped row selects no cells there.
         // It is an endpoint, not a continuation that makes trailing blanks
         // significant. A hard line break still belongs to the selection.
-        let ends_before_wrapped_row = !rectangular
-            && line.last_cell_was_wrapped()
-            && rows.peek().is_some_and(|(next, _)| {
-                row.checked_add(1) == Some(*next) && sel.cols_for_row(*next, false).is_empty()
-            });
         // Container boundaries may be synthetic budget cuts. Only the actual
         // selected contiguous wrapped cells determine continuation. Rectangles
         // remain separate physical rows even across terminal soft wraps.
-        let continues = !rectangular
-            && !ends_before_wrapped_row
-            && cols.end >= line.len()
-            && line.last_cell_was_wrapped()
-            && rows.peek().is_some_and(|(next, _)| {
-                row.checked_add(1) == Some(*next) && sel.cols_for_row(*next, false).start == 0
-            });
-        let mut span = line.columns_as_line(cols);
+        let (span, continues, ends_before_wrapped_row) = selected_line_span(
+            line,
+            row,
+            rows.peek().map(|(next, _)| *next),
+            sel,
+            rectangular,
+        );
         let seqno = span.current_seqno();
-        if !continues {
-            // This is a selected endpoint, even if the source row wraps.
-            // WRAPPED alone must not make an otherwise blank tail significant.
-            span.set_last_cell_was_wrapped(false, seqno);
-            span.prune_trailing_blanks(seqno);
-        }
         if join_previous {
             if let Some(previous) = result.last_mut() {
                 previous.append_line(span, seqno);
@@ -762,6 +1094,94 @@ mod tests {
     use proptest::prelude::*;
     use termwiz::cell::{CellAttributes, unicode_column_width};
     use termwiz::surface::SEQ_ZERO;
+
+    #[test]
+    fn remote_selection_copy_never_publishes_partial_or_changed_source_text() {
+        let selection = Selection {
+            range: Some(SelectionRange {
+                start: SelectionCoordinate::x_y(0, 0),
+                end: SelectionCoordinate::x_y(3, 1),
+            }),
+            ..Selection::default()
+        };
+        let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        copy.push_chunk(vec![Line::from("界 e\u{301}")]).unwrap();
+        assert_eq!(copy.finish(12).unwrap(), None);
+        assert!(copy.finish(13).is_err());
+        copy.push_chunk(vec![Line::from("tail")]).unwrap();
+        assert!(
+            copy.finish(13).is_err(),
+            "completion cannot publish after the source changed"
+        );
+        assert_eq!(
+            copy.finish(12).unwrap(),
+            Some("界 e\u{301}\ntail".to_string())
+        );
+        let mut expired = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        expired.deadline = std::time::Instant::now();
+        assert!(expired.finish(12).is_err());
+    }
+
+    #[test]
+    fn remote_selection_copy_chunks_preserve_unicode_wrap_and_endpoint_semantics() {
+        for rectangular in [false, true] {
+            for before_zero in [false, true] {
+                let mut physical = (0..66)
+                    .map(|_| Line::from_text("", &CellAttributes::default(), 7, None))
+                    .collect::<Vec<_>>();
+                physical[63] = Line::from_text("界 e\u{301} ", &CellAttributes::default(), 7, None);
+                physical[63].set_last_cell_was_wrapped(true, 7);
+                physical[64] = Line::from_text("tail ", &CellAttributes::default(), 7, None);
+                physical[65] = Line::from_text("last", &CellAttributes::default(), 7, None);
+                let range = SelectionRange {
+                    start: SelectionCoordinate::x_y(0, 0),
+                    end: SelectionCoordinate {
+                        x: if before_zero {
+                            SelectionX::BeforeZero
+                        } else {
+                            SelectionX::Cell(3)
+                        },
+                        y: if before_zero { 64 } else { 65 },
+                    },
+                };
+                let selection = Selection {
+                    range: Some(range),
+                    rectangular,
+                    ..Selection::default()
+                };
+                let expected = selected_text_from_logical_lines(
+                    &[logical_line_from_physical(physical.clone())],
+                    range,
+                    rectangular,
+                );
+                if !rectangular {
+                    assert_eq!(
+                        expected,
+                        format!(
+                            "{}{}",
+                            "\n".repeat(63),
+                            if before_zero {
+                                "界 e\u{301}"
+                            } else {
+                                "界 e\u{301} tail\nlast"
+                            }
+                        )
+                    );
+                }
+                for chunk_size in [1, 64] {
+                    let mut copy = RemoteSelectionCopy::new(&selection, 9).unwrap();
+                    let end = usize::try_from(copy.end_row).unwrap();
+                    let deadline = copy.deadline;
+                    for chunk in physical[..end].chunks(chunk_size) {
+                        copy.push_chunk(chunk.to_vec()).unwrap();
+                        assert_eq!(copy.deadline, deadline);
+                    }
+                    assert_eq!(copy.next_row, copy.end_row);
+                    assert_eq!(copy.text, expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn native_selection_before_zero_endpoint_trims_soft_wrap_tail_but_preserves_hard_newline() {
