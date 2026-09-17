@@ -3141,7 +3141,7 @@ fn check_pane_tree_depth(tree: &Tree, depth: usize, max_depth: usize) -> anyhow:
     }
 }
 
-fn build_from_pane_tree<F>(
+pub(crate) fn build_from_pane_tree<F>(
     tree: bintree::Tree<PaneEntry, SplitDirectionAndSize>,
     active: &mut Option<Arc<dyn Pane>>,
     zoomed: &mut Option<Arc<dyn Pane>>,
@@ -3150,22 +3150,62 @@ fn build_from_pane_tree<F>(
 where
     F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
 {
+    let mut underlying_active = None;
+    build_from_pane_tree_with_underlying(
+        tree,
+        active,
+        zoomed,
+        None,
+        &mut underlying_active,
+        make_pane,
+    )
+}
+
+pub(crate) fn build_from_pane_tree_with_underlying<F>(
+    tree: bintree::Tree<PaneEntry, SplitDirectionAndSize>,
+    active: &mut Option<Arc<dyn Pane>>,
+    zoomed: &mut Option<Arc<dyn Pane>>,
+    underlying_active_id: Option<PaneId>,
+    underlying_active: &mut Option<Arc<dyn Pane>>,
+    make_pane: &mut F,
+) -> anyhow::Result<Tree>
+where
+    F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+{
     Ok(match tree {
         bintree::Tree::Empty => Tree::Empty,
         bintree::Tree::Node { left, right, data } => Tree::Node {
-            left: Box::new(build_from_pane_tree(*left, active, zoomed, make_pane)?),
-            right: Box::new(build_from_pane_tree(*right, active, zoomed, make_pane)?),
+            left: Box::new(build_from_pane_tree_with_underlying(
+                *left,
+                active,
+                zoomed,
+                underlying_active_id,
+                underlying_active,
+                make_pane,
+            )?),
+            right: Box::new(build_from_pane_tree_with_underlying(
+                *right,
+                active,
+                zoomed,
+                underlying_active_id,
+                underlying_active,
+                make_pane,
+            )?),
             data,
         },
         bintree::Tree::Leaf(entry) => {
             let is_zoomed_pane = entry.is_zoomed_pane;
             let is_active_pane = entry.is_active_pane;
+            let is_underlying = underlying_active_id == Some(entry.pane_id);
             let pane = make_pane(entry)?;
             if is_zoomed_pane {
                 zoomed.replace(Arc::clone(&pane));
             }
             if is_active_pane {
                 active.replace(Arc::clone(&pane));
+            }
+            if is_underlying {
+                underlying_active.replace(Arc::clone(&pane));
             }
             Tree::Leaf(pane)
         }
@@ -3307,6 +3347,7 @@ pub struct PreparedPaneTree {
     tree: Tree,
     active: Option<Arc<dyn Pane>>,
     zoomed: Option<Arc<dyn Pane>>,
+    underlying_active: Option<Arc<dyn Pane>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3331,12 +3372,43 @@ impl PreparedPaneTree {
             tree,
             active,
             zoomed,
+            underlying_active,
         } = self;
-        let active_index = active.as_ref().and_then(|active| {
-            panes
-                .iter()
-                .position(|candidate| Arc::ptr_eq(candidate, active))
-        });
+        if zoomed.is_none() {
+            if let (Some(a), Some(u)) = (&active, &underlying_active) {
+                if !Arc::ptr_eq(a, u) {
+                    anyhow::bail!(
+                        "contradictory active pane state: tree leaf marks active pane {} while underlying tiled active is {}",
+                        a.pane_id(),
+                        u.pane_id()
+                    );
+                }
+            }
+        }
+        if let Some(ref u) = underlying_active {
+            if !panes.iter().any(|candidate| Arc::ptr_eq(candidate, u)) {
+                anyhow::bail!(
+                    "underlying tiled active pane {} not found in prepared tree leaves",
+                    u.pane_id()
+                );
+            }
+        }
+        if let Some(ref a) = active {
+            if !panes.iter().any(|candidate| Arc::ptr_eq(candidate, a)) {
+                anyhow::bail!(
+                    "active pane {} not found in prepared tree leaves",
+                    a.pane_id()
+                );
+            }
+        }
+        let active_index = underlying_active
+            .as_ref()
+            .or(active.as_ref())
+            .and_then(|target| {
+                panes
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, target))
+            });
         let mut resize_work = Vec::new();
         resize_work
             .try_reserve_exact(panes.len().max(usize::from(zoomed.is_some())))
@@ -3351,7 +3423,7 @@ impl PreparedPaneTree {
         Ok(PreparedPaneTreeInstall {
             tree,
             active_index: active_index.unwrap_or(0),
-            tag_active: active_index.is_some(),
+            tag_active: underlying_active.is_some() || active.is_some(),
             zoomed,
             size,
             resize_work,
@@ -3543,6 +3615,7 @@ where
             tree: Tree::Empty,
             active: None,
             zoomed: None,
+            underlying_active: None,
         });
     }
     let arena_end = arena.len();
@@ -3802,6 +3875,7 @@ where
         tree,
         active,
         zoomed,
+        underlying_active: None,
     })
 }
 
@@ -4915,6 +4989,7 @@ impl Tab {
         self.sync_with_pane_tree_policy(
             size,
             root,
+            None,
             PreparedPaneTreeFloatingPolicy::Replace,
             &mut make_pane,
         )
@@ -4941,7 +5016,36 @@ impl Tab {
         self.sync_with_pane_tree_policy(
             size,
             root,
+            None,
             PreparedPaneTreeFloatingPolicy::PreserveUnmentioned,
+            &mut make_pane,
+        )
+    }
+
+    /// Sync the tiled tree directly from a captured tab snapshot, preserving
+    /// the underlying tiled active pane identity when floating focus was active.
+    pub fn sync_with_captured_tab<F>(
+        &self,
+        captured: &MuxCapturedTab,
+        mut make_pane: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
+    {
+        if let Some(ff_id) = captured.floating_focus {
+            if let Some(active_id) = captured.active_pane_id {
+                if captured.zoomed_pane_id.is_none() && active_id != ff_id {
+                    anyhow::bail!(
+                        "contradictory captured tab metadata: floating focus is {ff_id} but active pane is {active_id}"
+                    );
+                }
+            }
+        }
+        self.sync_with_pane_tree_policy(
+            captured.size,
+            captured.split_tree.clone(),
+            captured.underlying_tiled_active_pane_id,
+            PreparedPaneTreeFloatingPolicy::Replace,
             &mut make_pane,
         )
     }
@@ -4950,6 +5054,7 @@ impl Tab {
         &self,
         size: TerminalSize,
         root: PaneNode,
+        underlying_active_id: Option<PaneId>,
         floating_policy: PreparedPaneTreeFloatingPolicy,
         make_pane: &mut F,
     ) -> anyhow::Result<()>
@@ -4958,16 +5063,32 @@ impl Tab {
     {
         let mut active = None;
         let mut zoomed = None;
+        let mut underlying_active = None;
         log::debug!("sync_with_pane_tree with size {:?}", size);
         // `make_pane` is caller-supplied and may re-enter the mux. Build the
         // complete replacement tree before acquiring the tab topology lock.
-        let tree = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, make_pane)?;
+        let tree = build_from_pane_tree_with_underlying(
+            root.into_tree(),
+            &mut active,
+            &mut zoomed,
+            underlying_active_id,
+            &mut underlying_active,
+            make_pane,
+        )?;
+        if let Some(id) = underlying_active_id {
+            if underlying_active.is_none() {
+                anyhow::bail!(
+                    "underlying tiled active pane id {id} not found in split tree leaves"
+                );
+            }
+        }
         self.sync_with_prepared_pane_tree_policy(
             size,
             PreparedPaneTree {
                 tree,
                 active,
                 zoomed,
+                underlying_active,
             },
             floating_policy,
         )?;
@@ -5367,6 +5488,7 @@ impl Tab {
                         .collect::<anyhow::Result<_>>()?;
                     pane_stacks.sort_by_key(|stack| stack.slot_index);
 
+                    let underlying_tiled_active = inner.raw_tree_active_pane();
                     Some((
                         inner.pane.clone(),
                         inner.raw_active_pane_callback_free(&pane_ids),
@@ -5377,6 +5499,7 @@ impl Tab {
                         floating_panes,
                         inner.floating_focus,
                         pane_stacks,
+                        underlying_tiled_active,
                     ))
                 }
             };
@@ -5390,6 +5513,7 @@ impl Tab {
                 floating_panes,
                 floating_focus,
                 pane_stacks,
+                underlying_tiled_active,
             )) = snapshot
             else {
                 continue;
@@ -5403,6 +5527,9 @@ impl Tab {
                 .as_ref()
                 .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
             let zoomed_pane_id = zoomed
+                .as_ref()
+                .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+            let underlying_tiled_active_pane_id = underlying_tiled_active
                 .as_ref()
                 .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
 
@@ -5433,6 +5560,7 @@ impl Tab {
                 floating_panes,
                 floating_focus,
                 pane_stacks,
+                underlying_tiled_active_pane_id,
             });
         }
 
@@ -14479,6 +14607,8 @@ pub struct MuxCapturedTab {
     pub floating_panes: Vec<MuxCapturedFloatingPane>,
     pub floating_focus: Option<PaneId>,
     pub pane_stacks: Vec<MuxCapturedPaneStack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_tiled_active_pane_id: Option<PaneId>,
 }
 
 #[derive(Deserialize, Clone, PartialEq, Debug)]
@@ -21304,6 +21434,7 @@ mod test {
             tree: Tree::Leaf(Arc::clone(&pane)),
             active: Some(Arc::clone(&pane)),
             zoomed: None,
+            underlying_active: None,
         };
         armed.store(true, std::sync::atomic::Ordering::Release);
 
@@ -23401,6 +23532,7 @@ mod test {
         // Floating pane 99 was added last, so it has floating focus and is active
         assert_eq!(captured.floating_focus, Some(99));
         assert_eq!(captured.active_pane_id, Some(99));
+        assert_eq!(captured.underlying_tiled_active_pane_id, Some(3));
         assert_eq!(captured.floating_panes.len(), 1);
         let fp = &captured.floating_panes[0];
         assert_eq!(fp.pane_id, 99);
@@ -23468,6 +23600,7 @@ mod test {
         assert_eq!(stack.slot_index, 0);
         assert_eq!(stack.active_index, 0);
         assert_eq!(stack.pane_ids, vec![501, 502]);
+        assert_eq!(captured.underlying_tiled_active_pane_id, Some(501));
 
         // Split tree leaf only has the active visible pane
         match &captured.split_tree {
@@ -23476,5 +23609,260 @@ mod test {
             }
             _ => panic!("expected leaf split tree with active pane"),
         }
+    }
+
+    #[test]
+    fn capture_tab_topology_preserves_underlying_tiled_focus_with_floating_active_roundtrip() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.set_title("roundtrip-focus-test");
+        tab.assign_pane(&FakePane::new(10, size));
+
+        // Create horizontal split: Pane 10 at index 0, Pane 20 at index 1
+        let req_h = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(50),
+        };
+        tab.split_and_insert(0, req_h, FakePane::new(20, size))
+            .expect("split and insert pane 20");
+
+        // Explicitly focus the non-first tiled pane (Pane 20 at index 1)
+        tab.set_active_idx(1);
+        assert_eq!(tab.get_active_idx(), 1);
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 20);
+
+        // Add a floating pane and focus it
+        let floating_rect = FloatingPaneRect {
+            left: 10,
+            top: 5,
+            width: 40,
+            height: 15,
+        };
+        tab.add_floating_pane(FakePane::new(99, size), floating_rect)
+            .expect("add floating pane 99");
+
+        // Floating pane 99 has active effective focus
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 99);
+        // Underlying tiled active index remains index 1 (Pane 20)
+        assert_eq!(tab.get_active_idx(), 1);
+
+        // Capture tab topology
+        let captured = tab
+            .capture_tab_topology(42, "roundtrip-workspace")
+            .expect("capture tab topology");
+
+        // Verify captured descriptor fields:
+        // 1. Effective active is the floating pane (99)
+        assert_eq!(captured.active_pane_id, Some(99));
+        assert_eq!(captured.floating_focus, Some(99));
+        // 2. Underlying tiled active pane is preserved as Pane 20!
+        assert_eq!(captured.underlying_tiled_active_pane_id, Some(20));
+
+        // 3. Split tree tiled leaves MUST NOT fake is_active_pane = true
+        //    (effective active focus belongs to the floating pane)
+        match &captured.split_tree {
+            PaneNode::Split { left, right, .. } => match (&**left, &**right) {
+                (PaneNode::Leaf(l), PaneNode::Leaf(r)) => {
+                    assert_eq!(l.pane_id, 10);
+                    assert!(!l.is_active_pane, "tiled pane 10 must not fake active");
+                    assert_eq!(r.pane_id, 20);
+                    assert!(!r.is_active_pane, "tiled pane 20 must not fake active");
+                }
+                _ => panic!("expected two leaf children"),
+            },
+            _ => panic!("expected split tree"),
+        }
+
+        // 4. Test serialization roundtrip
+        let serialized = serde_json::to_string(&captured).expect("serialize MuxCapturedTab");
+        assert!(
+            serialized.contains("\"underlying_tiled_active_pane_id\":20"),
+            "serialized JSON must contain underlying_tiled_active_pane_id"
+        );
+        let deserialized: MuxCapturedTab =
+            serde_json::from_str(&serialized).expect("deserialize MuxCapturedTab");
+        assert_eq!(deserialized.underlying_tiled_active_pane_id, Some(20));
+        assert_eq!(deserialized.active_pane_id, Some(99));
+
+        // 5. Restore into a fresh Tab (simulating recovery image / restore path)
+        let restored_tab = Tab::new(&deserialized.size);
+        restored_tab.set_title(&deserialized.title);
+
+        // Sync tiled tree using the captured descriptor preserving underlying tiled active
+        restored_tab
+            .sync_with_captured_tab(&deserialized, |entry| {
+                Ok(FakePane::new(entry.pane_id, entry.size))
+            })
+            .expect("sync with captured tab");
+
+        // Underlying active index in the restored tiled tree MUST be 1 (Pane 20), NOT defaulted to 0!
+        assert_eq!(restored_tab.get_active_idx(), 1);
+
+        // Restore floating panes
+        for fp in &deserialized.floating_panes {
+            restored_tab
+                .add_floating_pane(FakePane::new(fp.pane_id, size), fp.rect)
+                .expect("restore floating pane");
+        }
+        if let Some(ff) = deserialized.floating_focus {
+            restored_tab.set_floating_pane_focus(ff);
+        }
+
+        // While floating pane is focused, effective active pane is 99
+        assert_eq!(restored_tab.get_active_pane().unwrap().pane_id(), 99);
+        assert_eq!(restored_tab.get_active_idx(), 1);
+
+        // 6. Hide the floating pane
+        let hidden = restored_tab.set_floating_pane_visible(99, false);
+        assert!(hidden, "floating pane 99 should be hidden");
+
+        // CRITICAL REGRESSION ASSERTION:
+        // Focus MUST revert to Pane 20 (index 1), NEVER falling back to index 0 (Pane 10)!
+        assert_eq!(
+            restored_tab.get_active_idx(),
+            1,
+            "underlying active index must remain 1 after hiding floating pane"
+        );
+        assert_eq!(
+            restored_tab.get_active_pane().unwrap().pane_id(),
+            20,
+            "active pane must revert to Pane 20, not Pane 10"
+        );
+    }
+
+    fn make_test_captured_tab() -> (Tab, MuxCapturedTab) {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.set_title("captured-fixture-tab");
+        tab.assign_pane(&FakePane::new(10, size));
+
+        let req_h = SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(50),
+        };
+        tab.split_and_insert(0, req_h, FakePane::new(20, size))
+            .expect("split and insert pane 20");
+        tab.set_active_idx(1);
+
+        let floating_rect = FloatingPaneRect {
+            left: 10,
+            top: 5,
+            width: 40,
+            height: 15,
+        };
+        tab.add_floating_pane(FakePane::new(99, size), floating_rect)
+            .expect("add floating pane 99");
+
+        let captured = tab
+            .capture_tab_topology(42, "test-workspace")
+            .expect("capture tab topology");
+        (tab, captured)
+    }
+
+    #[test]
+    fn sync_with_captured_tab_rejects_contradictory_floating_focus_and_active_pane() {
+        let (_tab, mut captured) = make_test_captured_tab();
+        // Mutate active_pane_id so it contradicts floating_focus:
+        // floating_focus is Some(99), but active_pane_id claims tiled pane 10
+        captured.active_pane_id = Some(10);
+
+        let target_tab = Tab::new(&captured.size);
+        let err = target_tab
+            .sync_with_captured_tab(&captured, |entry| {
+                Ok(FakePane::new(entry.pane_id, entry.size))
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contradictory captured tab metadata"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn sync_with_captured_tab_rejects_missing_underlying_active_pane_id() {
+        let (_tab, mut captured) = make_test_captured_tab();
+        // Mutate underlying_tiled_active_pane_id to a pane ID absent from the split tree leaves
+        captured.underlying_tiled_active_pane_id = Some(999);
+
+        let target_tab = Tab::new(&captured.size);
+        let err = target_tab
+            .sync_with_captured_tab(&captured, |entry| {
+                Ok(FakePane::new(entry.pane_id, entry.size))
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("underlying tiled active pane id 999 not found in split tree leaves"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn prepared_pane_tree_allows_zoomed_pane_differing_from_underlying_tiled_focus() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let pane10 = FakePane::new(10, size);
+        let pane20 = FakePane::new(20, size);
+
+        // Prepare a tree with pane 10 and pane 20.
+        // Pane 20 is zoomed (and effective active focus), while pane 10 is the underlying tiled focus.
+        let tree = Tree::Node {
+            left: Box::new(Tree::Leaf(Arc::clone(&pane10))),
+            right: Box::new(Tree::Leaf(Arc::clone(&pane20))),
+            data: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: size,
+                second: size,
+            },
+        };
+
+        let prepared = PreparedPaneTree {
+            tree,
+            active: Some(Arc::clone(&pane20)),
+            zoomed: Some(Arc::clone(&pane20)),
+            underlying_active: Some(Arc::clone(&pane10)),
+        };
+
+        let tab = Tab::new(&size);
+        tab.sync_with_prepared_pane_tree(size, prepared)
+            .expect("install prepared tree with zoomed pane differing from underlying focus");
+
+        // The underlying tiled active index must be 0 (pane 10, not defaulted or corrupted)
+        assert_eq!(tab.get_active_idx(), 0);
+        // The zoomed pane is pane 20
+        assert_eq!(tab.get_zoomed_pane().map(|p| p.pane_id()), Some(20));
+        // Effective active focus resolves to the zoomed pane (pane 20)
+        assert_eq!(tab.get_active_pane().map(|p| p.pane_id()), Some(20));
+
+        // When zoom is toggled off, focus reverts to pane 10
+        tab.set_zoomed(false);
+        assert!(tab.get_zoomed_pane().is_none());
+        assert_eq!(tab.get_active_idx(), 0);
+        assert_eq!(tab.get_active_pane().map(|p| p.pane_id()), Some(10));
     }
 }
