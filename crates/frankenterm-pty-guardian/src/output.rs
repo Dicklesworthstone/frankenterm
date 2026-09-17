@@ -722,6 +722,7 @@ impl GuardianDurableSpawnCustodyV1 {
             persistence,
             GuardianCheckpointStagePolicy::production(),
         )
+        .map_err(Into::into)
     }
 
     pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
