@@ -77,8 +77,7 @@ def run(args):
                 "started_monotonic_ns": time.monotonic_ns()}
     proc_stat = pathlib.Path("/proc/self/stat")
     if proc_stat.exists():
-        # comm may contain spaces and parentheses; starttime is field 22.
-        identity["linux_start_ticks"] = proc_stat.read_text().rsplit(")", 1)[1].split()[19]
+        identity["linux_start_ticks"] = process_identity(os.getpid())["start_ticks"]
     write_new(args.owner, json.dumps(identity, sort_keys=True) + "\n")
     original = termios.tcgetattr(0)
     original_blocking = os.get_blocking(1)
@@ -125,10 +124,205 @@ def run(args):
 
 def process_identity(pid):
     try:
-        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        return {"pid": pid, "parent_pid": int(fields[1]), "start_ticks": fields[19], "state": fields[0]}
-    except FileNotFoundError:
+        # Linux comm is arbitrary bytes and may contain spaces or parentheses.
+        fields = pathlib.Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+        return {"pid": pid, "parent_pid": int(fields[1]),
+                "start_ticks": str(int(fields[19])), "state": fields[0].decode("ascii")}
+    except (FileNotFoundError, ProcessLookupError):
         return None
+
+
+class OwnedProcesses:
+    """Retain kernel handles while ancestry is live, before any timed workload."""
+
+    def __init__(self):
+        self.identities = {}
+        self.pidfds = {}
+
+    def retain(self, identity, parent=None):
+        pid = identity["pid"]
+        if pid in self.identities:
+            if self.identities[pid]["start_ticks"] != identity["start_ticks"]:
+                raise RuntimeError("owned PID identity changed")
+            return
+        pidfd = os.pidfd_open(pid)
+        try:
+            current = process_identity(pid)
+            if (not current or current["start_ticks"] != identity["start_ticks"]
+                    or select.select([pidfd], [], [], 0)[0]):
+                raise RuntimeError("process exited or changed before pidfd capture")
+            if parent is not None:
+                if parent not in self.pidfds or select.select([self.pidfds[parent]], [], [], 0)[0]:
+                    raise RuntimeError("owned parent exited before descendant admission")
+                live_parent = process_identity(parent)
+                if (not live_parent or current["parent_pid"] != parent
+                        or live_parent["start_ticks"] != self.identities[parent]["start_ticks"]):
+                    raise RuntimeError("descendant lost its owned ancestry")
+            self.identities[pid] = current
+            self.pidfds[pid] = pidfd
+        except BaseException:
+            os.close(pidfd)
+            raise
+
+    def remember_descendants(self):
+        candidates = []
+        for entry in pathlib.Path("/proc").glob("[0-9]*"):
+            identity = process_identity(int(entry.name))
+            if identity:
+                candidates.append(identity)
+        changed = True
+        while changed:
+            changed = False
+            for identity in candidates:
+                if identity["pid"] in self.identities or identity["parent_pid"] not in self.identities:
+                    continue
+                try:
+                    self.retain(identity, identity["parent_pid"])
+                except ProcessLookupError:
+                    continue
+                changed = True
+
+    def require_fixture(self, owner, server_pid, guardian_path):
+        pid = owner["pid"]
+        identity = process_identity(pid)
+        if not identity or identity["start_ticks"] != str(owner["linux_start_ticks"]):
+            raise RuntimeError("fixture receipt does not name a live exact process")
+        chain = [identity]
+        seen = {pid}
+        while chain[-1]["pid"] != server_pid:
+            parent = process_identity(chain[-1]["parent_pid"])
+            if not parent or parent["pid"] in seen or len(chain) >= 16:
+                raise RuntimeError("fixture custody does not reach the owned mux")
+            seen.add(parent["pid"])
+            chain.append(parent)
+        # The supported direct-exec fixture has only guardian processes between
+        # Python and the mux. Refuse a different model instead of claiming a tree.
+        for ancestor in chain[1:-1]:
+            if pathlib.Path(os.readlink(f'/proc/{ancestor["pid"]}/exe')).resolve() != guardian_path:
+                raise RuntimeError("unrecognized process in fixture guardian custody")
+        for member in reversed(chain[:-1]):
+            self.retain(member, member["parent_pid"])
+        for member in chain:
+            current = process_identity(member["pid"])
+            if (not current or current["start_ticks"] != member["start_ticks"]
+                    or select.select([self.pidfds[member["pid"]]], [], [], 0)[0]
+                    or (member["pid"] != server_pid and current["parent_pid"] != member["parent_pid"])):
+                raise RuntimeError("fixture custody changed before measurement")
+        return chain
+
+    def cleanup(self, server, timeout=10):
+        errors = []
+        def failed(stage, error, pid=None):
+            errors.append({"stage": stage, "pid": pid,
+                           "error": f"{type(error).__name__}: {error}"})
+        try:
+            try:
+                self.remember_descendants()
+            except Exception as error:
+                failed("final_discovery", error)
+            for pid, pidfd in reversed(list(self.pidfds.items())):
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    failed("signal", error, pid)
+            # Popen retains child custody when initial pidfd acquisition fails.
+            if server is not None and server.pid not in self.pidfds:
+                try:
+                    server.terminate()
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    failed("server_fallback_terminate", error, server.pid)
+            deadline = time.monotonic() + timeout
+            pending = dict(self.pidfds)
+            while pending and time.monotonic() < deadline:
+                try:
+                    ready = select.select(list(pending.values()), [], [],
+                                          max(0, min(0.1, deadline - time.monotonic())))[0]
+                except Exception as error:
+                    failed("wait_pidfds", error)
+                    break
+                pending = {pid: fd for pid, fd in pending.items() if fd not in ready}
+            for pid in pending:
+                failed("settlement", TimeoutError("owned process did not exit within cleanup budget"), pid)
+            if server is not None:
+                try:
+                    server.wait(timeout=max(0, deadline - time.monotonic()))
+                except Exception as error:
+                    failed("reap_server", error, server.pid)
+        finally:
+            for pid, pidfd in self.pidfds.items():
+                try:
+                    os.close(pidfd)
+                except Exception as error:
+                    failed("close_pidfd", error, pid)
+            self.pidfds.clear()
+        return errors
+
+
+def finish_measurement(root, receipt, owned, server):
+    prior_status = receipt["status"]
+    receipt["status"] = "failed"
+    receipt["cleanup_errors"] = []
+    try:
+        receipt["cleanup_errors"] = owned.cleanup(server)
+        if not receipt["cleanup_errors"]:
+            receipt["status"] = prior_status
+    except Exception as error:
+        receipt["cleanup_errors"].append({"stage": "cleanup", "error": f"{type(error).__name__}: {error}"})
+    finally:
+        receipt["owned_process_identities"] = list(owned.identities.values())
+        write_new(root / "receipt.json", json.dumps(receipt, indent=2) + "\n")
+
+
+def validate_measurements(rows, instrumented):
+    """Require the exact workload and complete, same-clock phase coverage."""
+    expected_count = 83 + (324 if instrumented else 0)
+    if len(rows) != expected_count:
+        raise ValueError("missing, duplicate or unexpected measurement events")
+    contract = rows[0]
+    if (contract.get("event") != "contract" or contract.get("instrumented") is not instrumented
+            or contract.get("trials") != 20 or contract.get("rows") != 24
+            or contract.get("columns") != [120, 60, 100, 80]
+            or contract.get("phase_clock") != ("CLOCK_MONOTONIC" if instrumented else None)):
+        raise ValueError("helper contract does not match requested measurement arm")
+    phases = ("resize_admission", "terminal_convergence", "pty_probe", "full_history_oracle")
+    cells = [(None, 80, "warmup")]
+    cells.extend((trial, cols, f"trial_{trial:03}_cols_{cols}")
+                 for trial in range(20) for cols in (120, 60, 100, 80))
+    index, previous_end = 1, 0
+    for trial, cols, nonce in cells:
+        if instrumented:
+            for phase_index, name in enumerate(phases):
+                phase = rows[index]
+                index += 1
+                start, end = phase.get("start_ns"), phase.get("end_ns")
+                if (phase.get("event") != "phase" or phase.get("instrumented") is not True
+                        or phase.get("nonce") != nonce or phase.get("columns") != cols
+                        or phase.get("phase") != name or phase.get("clock") != "CLOCK_MONOTONIC"
+                        or type(start) is not int or type(end) is not int
+                        or start <= 0 or end <= 0 or end < start
+                        or start < previous_end or (phase_index and start != previous_end)):
+                    raise ValueError(f"invalid or overlapping phase coverage for {nonce}/{name}")
+                previous_end = end
+        row = rows[index]
+        index += 1
+        if trial is None:
+            if row.get("event") != "warmup":
+                raise ValueError("missing ordered warmup event")
+            measurement = row.get("measurement", {})
+        else:
+            if row.get("event") != "trial" or type(row.get("trial")) is not int or row["trial"] != trial:
+                raise ValueError("missing, duplicate or out-of-order trial")
+            measurement = row
+        if (measurement.get("status") != "passed" or measurement.get("instrumented") is not instrumented
+                or measurement.get("columns") != cols or measurement.get("rows") != 24
+                or measurement.get("exact_corpus_preserved") is not True):
+            raise ValueError("sample does not match requested arm, geometry or correctness contract")
+    if rows[index] != {"event": "complete", "status": "passed", "trials_per_geometry": 20, "samples": 80}:
+        raise ValueError("incomplete or mismatched terminal measurement event")
 
 
 def measure(args):
@@ -137,6 +331,12 @@ def measure(args):
         raise RuntimeError("remote measurement requires the Linux /proc identity contract")
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("owned-process cleanup requires Linux pidfd support")
+    # API presence does not establish kernel support or permission.
+    pidfd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(pidfd, 0)
+    finally:
+        os.close(pidfd)
     binary_dir = pathlib.Path(args.bin_dir).resolve(strict=True)
     client = pathlib.Path(args.client).resolve(strict=True)
     root = pathlib.Path(args.artifact_dir).absolute()
@@ -153,7 +353,7 @@ def measure(args):
     # Compilation and idle-CPU admission are separate from successful build admission.
     for proc in pathlib.Path("/proc").glob("[0-9]*/comm"):
         try:
-            if proc.read_text().strip() in {"cargo", "rustc", "cc1", "cc1plus"}:
+            if proc.read_bytes().strip() in {b"cargo", b"rustc", b"cc1", b"cc1plus"}:
                 raise RuntimeError(f"measurement host is compiling: {proc.parent.name}")
         except FileNotFoundError:
             pass
@@ -185,6 +385,8 @@ def measure(args):
            "FRANKENTERM_CONFIG_FILE": str(config_path), "FT_WORKSPACE": str(root),
            "FT_WEZTERM_CLI": str(root / "external-cli-disabled"),
            "FT_REMOTE_MUX_PROFILE_WATCHDOG_SECONDS": "600"}
+    if args.profile_phases:
+        env["FT_REMOTE_MUX_PROFILE_PHASES"] = "1"
     for kind in ("CONFIG", "CACHE", "DATA", "STATE", "RUNTIME"):
         env[f"XDG_{kind}_HOME" if kind != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(root / kind.lower())
     script = pathlib.Path(__file__).resolve()
@@ -192,34 +394,16 @@ def measure(args):
             "--cwd", str(root), "--", sys.executable, str(script), "run",
             "--corpus", str(corpus_path), "--owner", str(root / "pane-owner.json"),
             "--timeout-seconds", "900"]
-    identities = {}
+    owned = OwnedProcesses()
     server = None
     receipt = {"status": "failed", "scope": "private remote-host Unix socket only",
+               "instrumented": args.profile_phases,
                "native_or_network_latency_proven": False, "environment": env,
                "mux_argv": argv, "cpu_idle_admission_fraction": idle / total,
                "binary_sha256": {str(p): file_sha256(p)
                                   for p in [*binaries, client]},
                "fixture_sha256": file_sha256(script)}
     write_new(root / "env.json", json.dumps(receipt, indent=2) + "\n")
-    def remember_descendants():
-        if server is None:
-            return
-        candidates = []
-        for entry in pathlib.Path("/proc").glob("[0-9]*"):
-            identity = process_identity(int(entry.name))
-            if identity:
-                candidates.append(identity)
-        changed = True
-        while changed:
-            changed = False
-            for identity in candidates:
-                parent = identities.get(identity["parent_pid"])
-                if identity["pid"] in identities or parent is None:
-                    continue
-                live_parent = process_identity(parent["pid"])
-                if live_parent and live_parent["start_ticks"] == parent["start_ticks"]:
-                    identities[identity["pid"]] = identity
-                    changed = True
     try:
         with (root / "mux.stdout").open("xb") as stdout, (root / "mux.stderr").open("xb") as stderr:
             server = subprocess.Popen(argv, cwd=root, env=env, stdout=stdout, stderr=stderr,
@@ -227,14 +411,14 @@ def measure(args):
         identity = process_identity(server.pid)
         if identity is None:
             raise RuntimeError("owned mux exited before identity capture")
-        identities[server.pid] = identity
+        owned.retain(identity)
         receipt["server_identity"] = identity
         deadline = time.monotonic() + 120
         panes = None
         while time.monotonic() < deadline:
             if server.poll() is not None:
                 raise RuntimeError(f"owned mux exited during startup: {server.returncode}")
-            remember_descendants()
+            owned.remember_descendants()
             lease = pathlib.Path(str(socket) + ".lock")
             if socket.exists() and lease.exists() and f"pid={server.pid}" in lease.read_text().split():
                 query = subprocess.run([str(binaries[0]), "-c", str(ft_config), "list", "--json"],
@@ -250,6 +434,15 @@ def measure(args):
             time.sleep(0.1)
         else:
             raise TimeoutError("owned mux and corpus startup deadline expired")
+        owner = json.loads((root / "pane-owner.json").read_text())
+        ready = json.loads((root / "pane-owner.json.ready").read_text())
+        expected_digest = file_sha256(corpus_path)
+        if owner.get("corpus_sha256") != expected_digest or ready.get("corpus_sha256") != expected_digest:
+            raise RuntimeError("fixture readiness/corpus receipt mismatch")
+        owned.remember_descendants()
+        receipt["fixture_custody"] = owned.require_fixture(owner, server.pid, binaries[2].resolve())
+        receipt["owned_process_identities"] = list(owned.identities.values())
+        write_new(root / "custody.json", json.dumps(receipt["fixture_custody"], indent=2) + "\n")
         write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
         client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
                        str(panes[0]["tab_id"]), str(corpus_path), "20"]
@@ -257,51 +450,21 @@ def measure(args):
         with (root / "trials.jsonl").open("xb") as stdout, (root / "client.stderr").open("xb") as stderr:
             trial = subprocess.run(client_argv, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=600)
         receipt["client_exit_code"] = trial.returncode
-        rows = [json.loads(line) for line in (root / "trials.jsonl").read_text().splitlines()]
-        samples = [row for row in rows if row.get("event") == "trial"]
-        if (trial.returncode != 0 or len(samples) != 80
-                or any(row.get("status") != "passed" for row in samples)
-                or not rows or rows[-1].get("event") != "complete"):
-            raise RuntimeError("incomplete or failed 20-trial real mux baseline")
+        with (root / "trials.jsonl").open("rb") as trace:
+            trace_bytes = trace.read(2 * 1024 * 1024 + 1)
+        if len(trace_bytes) > 2 * 1024 * 1024:
+            raise ValueError("measurement trace exceeds 2 MiB receipt cap")
+        rows = [json.loads(line) for line in trace_bytes.splitlines()]
+        if trial.returncode != 0:
+            raise RuntimeError("real mux baseline client failed")
+        validate_measurements(rows, args.profile_phases)
         receipt["status"] = "passed"
         receipt["samples"] = 80
     except Exception as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
-        remember_descendants()
-        receipt["owned_process_identities"] = list(identities.values())
-        # Address only exact descendant identities of this newly launched server.
-        for identity in reversed(list(identities.values())):
-            try:
-                pidfd = os.pidfd_open(identity["pid"])
-            except ProcessLookupError:
-                continue
-            try:
-                current = process_identity(identity["pid"])
-                if current and current["start_ticks"] == identity["start_ticks"]:
-                    try:
-                        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            finally:
-                os.close(pidfd)
-        if server is not None:
-            try:
-                server.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                receipt["cleanup_error"] = "owned mux did not exit after SIGTERM; no force kill attempted"
-                receipt["status"] = "failed"
-        survivors = []
-        for identity in identities.values():
-            current = process_identity(identity["pid"])
-            if (current and current["start_ticks"] == identity["start_ticks"]
-                    and current["state"] != "Z"):
-                survivors.append(current)
-        if survivors:
-            receipt["cleanup_survivors"] = survivors
-            receipt["status"] = "failed"
-        write_new(root / "receipt.json", json.dumps(receipt, indent=2) + "\n")
+        finish_measurement(root, receipt, owned, server)
     if receipt["status"] != "passed":
         raise RuntimeError("baseline or owned-process cleanup failed")
 
@@ -314,6 +477,8 @@ def main():
     parser.add_argument("--bin-dir")
     parser.add_argument("--client")
     parser.add_argument("--artifact-dir")
+    parser.add_argument("--profile-phases", action="store_true",
+                        help="instrumentation arm only; emit sampler-clock phase intervals")
     parser.add_argument("--records", type=int, default=10000)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     args = parser.parse_args()
