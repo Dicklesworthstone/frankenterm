@@ -6807,7 +6807,7 @@ pub struct WholeMuxRecoveryVerifier {
     admission: Option<Arc<RepairAdmissionController>>,
     #[cfg(feature = "frankenterm-deps")]
     published_guardian_captures: HashMap<uuid::Uuid, PublishedGuardianCaptureWitness>,
-    #[cfg(feature = "frankenterm-deps")]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
     reopened_guardian_captures:
         HashMap<uuid::Uuid, frankenterm_pty_guardian::GuardianReopenedCheckpointV1>,
 }
@@ -6859,7 +6859,7 @@ impl WholeMuxRecoveryVerifier {
             admission: None,
             #[cfg(feature = "frankenterm-deps")]
             published_guardian_captures: HashMap::new(),
-            #[cfg(feature = "frankenterm-deps")]
+            #[cfg(all(unix, feature = "frankenterm-deps"))]
             reopened_guardian_captures: HashMap::new(),
         }
     }
@@ -6879,11 +6879,13 @@ impl WholeMuxRecoveryVerifier {
         published: &mux::guardian_checkpoint::PublishedGuardianCheckpoint,
     ) -> Result<(), WholeMuxRecoveryError> {
         let pane = published.capture().durable_pane_id();
-        if self.published_guardian_captures.len() + self.reopened_guardian_captures.len()
-            >= self.limits.max_panes
-            || self.published_guardian_captures.contains_key(&pane)
-            || self.reopened_guardian_captures.contains_key(&pane)
-        {
+        let count = self.published_guardian_captures.len();
+        let duplicate = self.published_guardian_captures.contains_key(&pane);
+        #[cfg(unix)]
+        let count = count + self.reopened_guardian_captures.len();
+        #[cfg(unix)]
+        let duplicate = duplicate || self.reopened_guardian_captures.contains_key(&pane);
+        if count >= self.limits.max_panes || duplicate {
             return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                 pane_id: 0,
                 reason: "duplicate or over-budget published guardian witness".to_owned(),
@@ -6910,7 +6912,7 @@ impl WholeMuxRecoveryVerifier {
     /// Install only guardian-owned evidence reopened from existing custody,
     /// a settled protected catalog, and its durable ACK. This authorizes
     /// offline decoding of an authenticated image, never live pane activation.
-    #[cfg(feature = "frankenterm-deps")]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
     pub fn register_reopened_guardian_capture(
         &mut self,
         witness: frankenterm_pty_guardian::GuardianReopenedCheckpointV1,
@@ -7288,11 +7290,27 @@ impl WholeMuxRecoveryVerifier {
                                         .to_owned(),
                                 });
                             }
-                        } else if let Some(witness) =
-                            pane_uuid.and_then(|id| self.reopened_guardian_captures.get(&id))
-                        {
-                            let scope = witness.scope();
-                            let expected_provenance =
+                        } else {
+                            #[cfg(not(unix))]
+                            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                pane_id: pane.pane_id as u64,
+                                reason: "no authenticated published guardian witness is installed"
+                                    .to_owned(),
+                            });
+                            #[cfg(unix)]
+                            {
+                                let witness = pane_uuid
+                                    .and_then(|id| self.reopened_guardian_captures.get(&id))
+                                    .ok_or_else(|| {
+                                        WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                            pane_id: pane.pane_id as u64,
+                                            reason:
+                                                "no authenticated guardian witness is installed"
+                                                    .to_owned(),
+                                        }
+                                    })?;
+                                let scope = witness.scope();
+                                let expected_provenance =
                                 crate::mux_recovery_image::RecoverySpawnCustody::from(Some(
                                     mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
                                         original: scope,
@@ -7300,29 +7318,25 @@ impl WholeMuxRecoveryVerifier {
                                         current_lease_generation: witness.generation(),
                                     },
                                 ));
-                            if pane.spawn_custody != expected_provenance
-                                || scope.guardian_incarnation != publication.guardian_incarnation
-                                || scope.mux_incarnation != publication.mux_incarnation
-                                || witness.generation() != *guardian_generation
-                                || witness.sequence() != *catalog_generation
-                                || witness.effect_id() != publication.effect_id
-                                || witness.checkpoint_id() != publication.checkpoint_identity
-                                || witness.boundary_id() != publication.output_boundary_identity
-                            {
-                                return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
-                                    pane_id: pane.pane_id as u64,
-                                    reason: "reopened guardian witness does not match image"
-                                        .to_owned(),
-                                });
+                                if pane.spawn_custody != expected_provenance
+                                    || scope.guardian_incarnation
+                                        != publication.guardian_incarnation
+                                    || scope.mux_incarnation != publication.mux_incarnation
+                                    || witness.generation() != *guardian_generation
+                                    || witness.sequence() != *catalog_generation
+                                    || witness.effect_id() != publication.effect_id
+                                    || witness.checkpoint_id() != publication.checkpoint_identity
+                                    || witness.boundary_id() != publication.output_boundary_identity
+                                {
+                                    return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                        pane_id: pane.pane_id as u64,
+                                        reason: "reopened guardian witness does not match image"
+                                            .to_owned(),
+                                    });
+                                }
+                                // Registration belongs to the authenticated whole-image
+                                // envelope and its bijection, not the durable catalog.
                             }
-                            // Registration belongs to the authenticated whole-image
-                            // envelope and its bijection, not the durable catalog.
-                        } else {
-                            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
-                                pane_id: pane.pane_id as u64,
-                                reason: "no authenticated published guardian witness is installed"
-                                    .to_owned(),
-                            });
                         }
                     }
                     #[cfg(not(feature = "frankenterm-deps"))]
@@ -7429,9 +7443,16 @@ impl WholeMuxRecoveryVerifier {
                             .get(&id)
                             .map(|witness| witness.payload_digest)
                             .or_else(|| {
-                                self.reopened_guardian_captures
-                                    .get(&id)
-                                    .map(|witness| witness.payload_digest())
+                                #[cfg(unix)]
+                                {
+                                    self.reopened_guardian_captures
+                                        .get(&id)
+                                        .map(|witness| witness.payload_digest())
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    None
+                                }
                             })
                     })
                     .ok_or_else(|| WholeMuxRecoveryError::UnprovedGuardianAuthority {
