@@ -1,13 +1,15 @@
 use crate::selection::{SelectionCoordinate, SelectionRange};
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use config::ConfigHandle;
-use config::keyassignment::{ClipboardCopyDestination, QuickSelectArguments, ScrollbackEraseMode};
+use config::keyassignment::{
+    ClipboardCopyDestination, KeyAssignment, QuickSelectArguments, ScrollbackEraseMode,
+};
 use futures::channel::oneshot;
 use futures::future::{AbortHandle, Abortable};
 use mux::domain::DomainId;
 use mux::pane::{
-    CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern, SearchResult,
-    WithPaneLines,
+    CachePolicy, ForEachPaneLogicalLine, LineReadPermit, LogicalLine, Pane, PaneId, Pattern,
+    SearchResult, WithPaneLines,
 };
 use mux::renderable::*;
 use parking_lot::{MappedMutexGuard, Mutex};
@@ -18,12 +20,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::time::Duration;
 use termwiz::cell::{Cell, CellAttributes};
 use termwiz::color::AnsiColor;
 use termwiz::surface::{SEQ_ZERO, SequenceNo};
 use url::Url;
 use wezterm_term::color::ColorPalette;
+use wezterm_term::screen::ScreenLineRead;
 use wezterm_term::{
     Clipboard, Intensity, KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex, TerminalSize,
 };
@@ -523,6 +527,727 @@ mod alphabet_test {
         assert_eq!(
             selected_text_from_logical_lines(&lines, accepted, false),
             "chosen"
+        );
+    }
+
+    struct TestPaneFixture {
+        pane: Arc<dyn Pane>,
+    }
+
+    impl Drop for TestPaneFixture {
+        fn drop(&mut self) {
+            self.pane.kill();
+        }
+    }
+
+    impl TestPaneFixture {
+        fn new(initial_text: &[u8], pane_id: PaneId) -> Self {
+            #[derive(Debug)]
+            struct TestConfig;
+            impl wezterm_term::TerminalConfiguration for TestConfig {
+                fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                    Default::default()
+                }
+            }
+            let mut terminal = wezterm_term::Terminal::new(
+                wezterm_term::TerminalSize {
+                    rows: 4,
+                    cols: 40,
+                    dpi: 96,
+                    pixel_width: 320,
+                    pixel_height: 64,
+                },
+                Arc::new(TestConfig),
+                "quick-select-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            terminal.advance_bytes(initial_text);
+
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+                pane_id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                pane_id,
+                [0x36; 16],
+                "quick select test".to_owned(),
+            ));
+            Self { pane }
+        }
+
+        fn mutate(&self, text: &str) {
+            self.pane
+                .perform_actions(vec![termwiz::escape::Action::PrintString(text.into())]);
+        }
+
+        fn with_locked_terminal<R>(&self, f: impl FnOnce() -> R) -> R {
+            struct BusyRunner<R, F: FnOnce() -> R> {
+                f: Option<F>,
+                result: Option<R>,
+            }
+            impl<R, F: FnOnce() -> R> mux::pane::WithPaneLines for BusyRunner<R, F> {
+                fn with_lines_mut(
+                    &mut self,
+                    _first: wezterm_term::StableRowIndex,
+                    _lines: &mut [&mut wezterm_term::Line],
+                ) {
+                    if let Some(f) = self.f.take() {
+                        self.result = Some(f());
+                    }
+                }
+            }
+            let mut runner = BusyRunner {
+                f: Some(f),
+                result: None,
+            };
+            self.pane.with_lines_mut(0..1, &mut runner);
+            runner
+                .result
+                .expect("with_lines_mut must execute runner under terminal lock")
+        }
+    }
+
+    #[test]
+    fn quickselect_async_read_worker_exact_content_and_retirement() {
+        let fixture = TestPaneFixture::new(
+            b"first line https://example.com/target third\r\nsecond row\r\n",
+            998_402,
+        );
+        let accepted = SelectionRange {
+            start: SelectionCoordinate::x_y(11, 0),
+            end: SelectionCoordinate::x_y(36, 0),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (woke, wake) = sync_channel(1);
+
+        let mut read = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, move || {
+            let _ = woke.send(());
+        })
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake.recv_timeout(Duration::from_secs(5))
+            .expect("worker must complete and wake");
+
+        assert_eq!(read.poll_ready(deadline), Ok(true));
+        let ready = read.ready.take().expect("ready payload must be present");
+        assert_eq!(ready.text.as_deref().unwrap(), "https://example.com/target");
+
+        // Off-thread retirement: dropping ready sends plans back to worker thread,
+        // which unblocks the worker and drops the permit.
+        drop(ready);
+        drop(read);
+    }
+
+    #[test]
+    fn quickselect_async_read_never_reads_committed_gui_selection() {
+        use crate::selection::Selection;
+
+        let fixture =
+            TestPaneFixture::new(b"stale_gui_word correct_accepted_match extra\r\n", 998_403);
+
+        // Stale committed GUI selection covers "stale_gui_word" (0..14)
+        let old_selection = SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(13, 0),
+        };
+        let mut committed = Selection::default();
+        committed.range = Some(old_selection);
+
+        // Accepted quickselect range covers "correct_accepted_match" (15..36)
+        let accepted = SelectionRange {
+            start: SelectionCoordinate::x_y(15, 0),
+            end: SelectionCoordinate::x_y(36, 0),
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (woke, wake) = sync_channel(1);
+
+        let mut read = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, move || {
+            let _ = woke.send(());
+        })
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake.recv_timeout(Duration::from_secs(5))
+            .expect("worker must complete");
+
+        assert_eq!(read.poll_ready(deadline), Ok(true));
+        let ready = read.ready.take().expect("ready payload");
+        let extracted = ready.text.as_deref().unwrap();
+
+        // Extracted text MUST be the accepted match, NEVER the committed GUI selection!
+        assert_eq!(extracted, "correct_accepted_match");
+        assert_ne!(extracted, "stale_gui_word");
+        drop(ready);
+        drop(read);
+    }
+
+    #[test]
+    fn quickselect_permit_saturation_busy_retains_action() {
+        let fixture = TestPaneFixture::new(b"content for busy test\r\n", 998_404);
+
+        let accepted = SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(6, 0),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        // Saturate the 4-worker permit pool
+        let p1 = LineReadPermit::try_acquire().expect("permit 1");
+        let p2 = LineReadPermit::try_acquire().expect("permit 2");
+        let p3 = LineReadPermit::try_acquire().expect("permit 3");
+        let p4 = LineReadPermit::try_acquire().expect("permit 4");
+        assert!(LineReadPermit::try_acquire().is_none());
+
+        // QuickSelectLineRead::start must return Ok(None) representing Busy retention
+        let busy_result = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, || {});
+        assert!(
+            matches!(busy_result, Ok(None)),
+            "Permit saturation must yield Ok(None) to retain pending action"
+        );
+
+        // Release one permit
+        drop(p1);
+
+        // Now start must succeed and acquire the released permit
+        let (woke, wake) = sync_channel(1);
+        let read = QuickSelectLineRead::start(&fixture.pane, accepted, deadline, move || {
+            let _ = woke.send(());
+        });
+        assert!(
+            matches!(read, Ok(Some(_))),
+            "After permit release, start must succeed"
+        );
+
+        wake.recv_timeout(Duration::from_secs(5))
+            .expect("worker wake");
+        drop(read);
+        drop(p2);
+        drop(p3);
+        drop(p4);
+    }
+
+    #[test]
+    fn quickselect_deadline_expiration_rejects_read() {
+        let fixture = TestPaneFixture::new(b"content\r\n", 998_405);
+
+        let accepted = SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(5, 0),
+        };
+        // Already expired deadline
+        let expired = std::time::Instant::now() - Duration::from_millis(10);
+        let result = QuickSelectLineRead::start(&fixture.pane, accepted, expired, || {});
+        assert_eq!(result.err(), Some("The selection deadline expired."));
+    }
+
+    #[test]
+    fn quickselect_pending_accepted_action_drop_cancels_worker() {
+        let (abort, _reg) = AbortHandle::new_pair();
+        let (deadline_abort, _reg2) = AbortHandle::new_pair();
+        let observed_retry = abort.clone();
+        let observed_deadline = deadline_abort.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let read = QuickSelectLineRead {
+            receiver: sync_channel(1).1,
+            ready: None,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let action = PendingAcceptedAction {
+            accepted_selection: SelectionRange {
+                start: SelectionCoordinate::x_y(0, 0),
+                end: SelectionCoordinate::x_y(1, 0),
+            },
+            instance_token: Arc::new(()),
+            accepted_run_id: 1,
+            paste: false,
+            action: None,
+            skip_action_on_paste: false,
+            accepted_cols: 80,
+            source_range: 0..1,
+            validated_source_end: 1,
+            selection_authority: None,
+            dimensions: None,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            read: Some(read),
+            retry_abort: Some(abort),
+            deadline_abort: Some(deadline_abort),
+        };
+        assert!(!cancelled.load(Ordering::Acquire));
+        drop(action);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(observed_retry.is_aborted());
+        assert!(observed_deadline.is_aborted());
+    }
+
+    #[test]
+    fn quickselect_poll_ready_detects_deadline_expiration() {
+        let (_sender, receiver) = sync_channel(1);
+        let mut read = QuickSelectLineRead {
+            receiver,
+            ready: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let past = std::time::Instant::now() - Duration::from_millis(5);
+        assert_eq!(
+            read.poll_ready(past),
+            Err("The selection deadline expired.")
+        );
+        assert!(read.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn quickselect_extract_text_from_multiline_wrapped_plan() {
+        #[derive(Debug)]
+        struct TestConfig;
+        impl wezterm_term::TerminalConfiguration for TestConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 10,
+                dpi: 96,
+                pixel_width: 80,
+                pixel_height: 64,
+            },
+            Arc::new(TestConfig),
+            "wrapped-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // Writing 25 chars into 10 cols causes wrapping across lines 0, 1, 2
+        terminal.advance_bytes(b"abcdefghijklmnopqrstuvwxy");
+        let plan = terminal.screen().capture_line_read(0..3).unwrap();
+        let plans = Ok(vec![plan]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let sel = SelectionRange {
+            start: SelectionCoordinate::x_y(2, 0),
+            end: SelectionCoordinate::x_y(4, 2),
+        };
+        let text = extract_text_from_read_plans(&plans, sel, &cancelled).unwrap();
+        assert_eq!(text, "cdefghijklmnopqrstuvw");
+    }
+
+    #[test]
+    fn quickselect_source_mutation_fence_detects_dirty_rows() {
+        let fixture = TestPaneFixture::new(b"initial line\r\n", 998_406);
+        let source_range = 0..2;
+        let baseline_seq = fixture.pane.get_current_seqno();
+        let (extracted_seq, dirty) = fixture
+            .pane
+            .get_changed_since_with_source_fence(source_range.clone(), baseline_seq);
+        assert_eq!(extracted_seq, baseline_seq);
+        assert!(dirty.iter().next().is_none());
+
+        // Real mutation via perform_actions synchronously advances terminal model and sequence
+        fixture.mutate("mutation line\r\n");
+
+        let (mutated_seq, mutated_dirty) = fixture
+            .pane
+            .get_changed_since_with_source_fence(source_range, baseline_seq);
+        assert!(
+            mutated_seq > baseline_seq || mutated_dirty.iter().next().is_some(),
+            "Source fence must detect real mutation from pane action"
+        );
+    }
+
+    #[test]
+    fn quickselect_capture_source_busy_under_terminal_lock_retains_action() {
+        let fixture = TestPaneFixture::new(b"quick select test\r\n", 998_407);
+        let pane = &fixture.pane;
+
+        // Baseline: when terminal lock is not held, capture_source succeeds
+        let initial_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+        assert!(initial_snapshot.is_some());
+        let (authority, seqno, dims) = initial_snapshot.unwrap();
+
+        // Hold terminal lock using with_locked_terminal (via public with_lines_mut trait)
+        fixture.with_locked_terminal(|| {
+            // Under lock, nonblocking capture_source MUST return None (Busy)
+            let busy_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+            assert!(
+                busy_snapshot.is_none(),
+                "Nonblocking capture_source must return None when terminal is locked"
+            );
+
+            // Crucial: SelectionAuthority::capture(&**pane) being None is Busy, NOT invalidation!
+            let mut selection = crate::selection::Selection::default();
+            selection.authority = Some(authority);
+            assert!(
+                !selection
+                    .is_invalidated_by(crate::selection::SelectionAuthority::capture(&**pane)),
+                "Busy snapshot (None) must not invalidate selection"
+            );
+        });
+
+        // Once lock is released, capture_source succeeds again
+        let after_unlock = crate::selection::SelectionAuthority::capture_source(&**pane);
+        assert!(after_unlock.is_some());
+        let (after_auth, after_seq, after_dims) = after_unlock.unwrap();
+        assert_eq!(after_auth, authority);
+        assert_eq!(after_seq, seqno);
+        assert_eq!(after_dims.cols, dims.cols);
+    }
+
+    #[test]
+    fn quickselect_publish_line_reads_at_layout_rejects_mutated_screen() {
+        let fixture = TestPaneFixture::new(b"initial baseline text\r\n", 998_408);
+        let pane = &fixture.pane;
+
+        let (_auth, seqno, dims) =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        let mut budget = Default::default();
+        let plan = pane
+            .capture_line_read(0..1, &mut budget)
+            .expect("capture must be supported")
+            .expect("capture must succeed");
+
+        // Mutate screen before publication synchronously via perform_actions
+        fixture.mutate("mutation lines\r\n");
+
+        // Publication of the old plan MUST fail because screen line generation changed
+        let mut published = false;
+        let plans = [plan];
+        let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+            published = true;
+        });
+
+        assert!(
+            !ok || !published,
+            "publish_line_reads_at_layout must reject read when screen was mutated"
+        );
+        assert!(!published);
+    }
+
+    #[test]
+    fn quickselect_publish_line_reads_at_layout_validates_exact_snapshot() {
+        let fixture = TestPaneFixture::new(b"authoritative content\r\n", 998_409);
+        let pane = &fixture.pane;
+
+        let (_auth, seqno, dims) =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        let mut budget = Default::default();
+        let plan = pane
+            .capture_line_read(0..1, &mut budget)
+            .expect("capture must be supported")
+            .expect("capture must succeed");
+
+        let plans = [plan];
+        let mut published = false;
+        let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+            published = true;
+        });
+
+        assert!(
+            ok && published,
+            "publish_line_reads_at_layout must accept valid unmutated snapshot"
+        );
+    }
+
+    #[test]
+    fn quickselect_hung_hydration_poll_deadline_expiration() {
+        let (_sender, receiver) = sync_channel(1);
+        let mut read = QuickSelectLineRead {
+            receiver,
+            ready: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let future = std::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(read.poll_ready(future), Ok(false));
+        assert!(!read.cancelled.load(Ordering::Acquire));
+
+        let past = std::time::Instant::now() - Duration::from_millis(10);
+        assert_eq!(
+            read.poll_ready(past),
+            Err("The selection deadline expired.")
+        );
+        assert!(read.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn quickselect_deadline_decision_preserves_fixed_expiry() {
+        let now = std::time::Instant::now();
+
+        // 1. Expired deadline: evaluate_action_deadline MUST return Expired
+        let past = now - Duration::from_millis(10);
+        let expired_decision = evaluate_action_deadline(past, now);
+        assert_eq!(
+            expired_decision,
+            ActionDeadlineDecision::Expired,
+            "Expired deadline must evaluate to ActionDeadlineDecision::Expired"
+        );
+
+        // 2. Future deadline: evaluate_action_deadline MUST return ArmTimer with positive delay
+        let future = now + Duration::from_millis(500);
+        let arm_decision = evaluate_action_deadline(future, now);
+        match arm_decision {
+            ActionDeadlineDecision::ArmTimer { delay } => {
+                assert!(delay > Duration::ZERO && delay <= Duration::from_millis(500));
+            }
+            ActionDeadlineDecision::Expired => {
+                panic!("Future deadline must not evaluate to Expired");
+            }
+        }
+
+        // 3. Settlement drops PendingAcceptedAction: abort handles fire, worker cancelled
+        let (retry_abort, _reg1) = AbortHandle::new_pair();
+        let (deadline_abort, _reg2) = AbortHandle::new_pair();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let read = QuickSelectLineRead {
+            receiver: sync_channel(1).1,
+            ready: None,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let action = PendingAcceptedAction {
+            accepted_selection: SelectionRange {
+                start: SelectionCoordinate::x_y(0, 0),
+                end: SelectionCoordinate::x_y(1, 0),
+            },
+            instance_token: Arc::new(()),
+            accepted_run_id: 1,
+            paste: false,
+            action: None,
+            skip_action_on_paste: false,
+            accepted_cols: 80,
+            source_range: 0..1,
+            validated_source_end: 1,
+            selection_authority: None,
+            dimensions: None,
+            deadline: past,
+            read: Some(read),
+            retry_abort: Some(retry_abort),
+            deadline_abort: Some(deadline_abort),
+        };
+
+        drop(action);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn quickselect_publish_failure_retains_plans_across_lock_release_when_unmutated() {
+        let fixture =
+            TestPaneFixture::new(b"content to retain across lock contention\r\n", 998_410);
+        let pane = &fixture.pane;
+
+        let (authority, seqno, dims) =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        let mut budget = Default::default();
+        let plan = pane
+            .capture_line_read(0..1, &mut budget)
+            .expect("capture must be supported")
+            .expect("capture must succeed");
+        let plans = [plan];
+
+        // 1. Publication under lock fails without executing callback
+        let mut published = false;
+        fixture.with_locked_terminal(|| {
+            let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                published = true;
+            });
+            assert!(
+                !ok || !published,
+                "Publication must fail while terminal lock is held"
+            );
+            assert!(!published);
+        });
+
+        // 2. Lock released between publish failure and capture_source (snapshot is Some)
+        let unmutated_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+        assert!(unmutated_snapshot.is_some());
+        let (cur_auth, cur_seq, cur_dims) = unmutated_snapshot.unwrap();
+        assert_eq!(cur_auth, authority);
+        assert_eq!(cur_seq, seqno);
+        assert!(mux::renderable::same_line_layout_geometry(&cur_dims, &dims));
+
+        // 3. evaluate_failed_publication_source must decide RetryPaced (NOT RejectMutated)
+        // when authority, sequence, and geometry match. (Old code unconditionally declared mutation!)
+        let decision_unmutated = evaluate_failed_publication_source(
+            Some((cur_auth, cur_seq, cur_dims)),
+            Some(&authority),
+            seqno,
+            &dims,
+        );
+        assert_eq!(
+            decision_unmutated,
+            FailedPublicationDecision::RetryPaced,
+            "Unmutated source after lock release must retain plans and retry paced"
+        );
+
+        // 4. If content actually mutates, evaluate_failed_publication_source rejects
+        fixture.mutate("mutation advancing sequence\r\n");
+        let mutated_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+        assert!(mutated_snapshot.is_some());
+        let (m_auth, m_seq, m_dims) = mutated_snapshot.unwrap();
+        assert!(m_seq > seqno);
+        let decision_mutated = evaluate_failed_publication_source(
+            Some((m_auth, m_seq, m_dims)),
+            Some(&authority),
+            seqno,
+            &dims,
+        );
+        assert_eq!(
+            decision_mutated,
+            FailedPublicationDecision::RejectMutated,
+            "Actual content mutation must declare RejectMutated"
+        );
+
+        // 5. If terminal is locked (None snapshot), evaluate_failed_publication_source returns RetryPaced
+        let decision_busy =
+            evaluate_failed_publication_source(None, Some(&authority), seqno, &dims);
+        assert_eq!(
+            decision_busy,
+            FailedPublicationDecision::RetryPaced,
+            "Busy snapshot under lock must retain plans and retry paced"
+        );
+    }
+
+    #[test]
+    fn quickselect_source_sequence_change_before_read_start_rejects_and_prevents_rebase() {
+        let fixture = TestPaneFixture::new(b"initial accepted content\r\n", 998_411);
+        let pane = &fixture.pane;
+
+        let (initial_auth, accepted_source_end, dims) =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        let source_range = 0..1;
+        let accepted_cols = dims.cols;
+
+        // Simulate search acceptance where authority was None (Busy under lock),
+        // preserving validated_source_end = accepted_source_end.
+        // Terminal content mutates BEFORE read starts:
+        fixture.mutate("advancing sequence\r\n");
+
+        let mutated_snapshot =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        assert!(
+            mutated_snapshot.1 > accepted_source_end,
+            "Sequence must have advanced due to mutation"
+        );
+
+        // Production decision check: evaluate_pre_read_source must reject stale sequence!
+        // Old buggy code checked only if existing_authority was Some, and if None,
+        // it silently adopted the mutated sequence and rebased validated_source_end!
+        let stale_decision = evaluate_pre_read_source(
+            mutated_snapshot,
+            None, // authority was None at acceptance
+            accepted_source_end,
+            accepted_cols,
+            &source_range,
+        );
+        assert_eq!(
+            stale_decision,
+            PreReadSourceDecision::RejectStale,
+            "evaluate_pre_read_source must reject when sequence advanced past accepted_source_end"
+        );
+
+        // When sequence matches accepted_source_end, evaluate_pre_read_source accepts
+        // and signals adopt_authority: true so authority is adopted without changing source_end
+        let valid_decision = evaluate_pre_read_source(
+            (initial_auth, accepted_source_end, dims),
+            None,
+            accepted_source_end,
+            accepted_cols,
+            &source_range,
+        );
+        assert_eq!(
+            valid_decision,
+            PreReadSourceDecision::Accept {
+                authority: initial_auth,
+                dimensions: dims,
+                adopt_authority: true,
+            }
+        );
+    }
+
+    #[test]
+    fn quickselect_acceptance_callback_rejects_stale_source_before_selection_or_pending() {
+        let fixture = TestPaneFixture::new(b"target word at col 0..6\r\n", 998_412);
+        let pane = &fixture.pane;
+
+        // 1. Search finishes and records acceptance fence source_end
+        let (initial_auth, search_fence_source_end, dims) =
+            crate::selection::SelectionAuthority::capture_source(&**pane).unwrap();
+        let source_range = 0..1;
+        let accepted_cols = dims.cols;
+
+        // 2. Terminal content mutates BEFORE acceptance callback executes
+        fixture.mutate("new incoming line shifting rows\r\n");
+
+        // 3. Acceptance callback runs: capture_source succeeds with new seqno
+        let mutated_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+        assert!(mutated_snapshot.is_some());
+        let (_new_auth, new_seq, _new_dims) = mutated_snapshot.unwrap();
+        assert!(
+            new_seq > search_fence_source_end,
+            "Sequence must have advanced past the search fence"
+        );
+
+        // 4. Production decision check: evaluate_acceptance_source must return StaleOrInvalid!
+        // Old buggy code around line 3760 used whatever seqno capture_source returned,
+        // updating GUI selection with coordinates that belonged to pre-mutation text!
+        let stale_decision = evaluate_acceptance_source(
+            mutated_snapshot,
+            search_fence_source_end,
+            &source_range,
+            accepted_cols,
+        );
+        assert_eq!(
+            stale_decision,
+            AcceptanceSourceDecision::StaleOrInvalid,
+            "evaluate_acceptance_source must reject when sequence changed before acceptance callback"
+        );
+
+        // 5. Test Busy branch under terminal lock preserves search acceptance identity
+        fixture.with_locked_terminal(|| {
+            let busy_snapshot = crate::selection::SelectionAuthority::capture_source(&**pane);
+            assert!(
+                busy_snapshot.is_none(),
+                "capture_source under lock must return None"
+            );
+
+            let busy_decision = evaluate_acceptance_source(
+                busy_snapshot,
+                search_fence_source_end,
+                &source_range,
+                accepted_cols,
+            );
+            assert_eq!(
+                busy_decision,
+                AcceptanceSourceDecision::Busy {
+                    validated_source_end: search_fence_source_end,
+                },
+                "Busy snapshot must preserve search_fence_source_end and not create Ready authority"
+            );
+        });
+
+        // 6. Test valid unmutated source produces Ready
+        let valid_decision = evaluate_acceptance_source(
+            Some((initial_auth, search_fence_source_end, dims)),
+            search_fence_source_end,
+            &source_range,
+            accepted_cols,
+        );
+        assert_eq!(
+            valid_decision,
+            AcceptanceSourceDecision::Ready {
+                authority: initial_auth,
+                validated_source_end: search_fence_source_end,
+                dimensions: dims,
+            }
         );
     }
 
@@ -1026,17 +1751,21 @@ fn quick_select_action_is_current(
     instance_token: &Arc<()>,
     accepted_run_id: usize,
 ) -> bool {
-    term_window
+    let overlay_pane = term_window
         .pane_state(pane_id)
         .overlay
         .as_ref()
-        .and_then(|overlay| overlay.pane.downcast_ref::<QuickSelectOverlay>())
-        .is_some_and(|search_overlay| {
-            let renderer = search_overlay.renderer.lock();
-            Arc::ptr_eq(&renderer.instance_token, instance_token)
-                && renderer.accepted_run_id == Some(accepted_run_id)
-                && renderer.action_pending
-        })
+        .map(|overlay| Arc::clone(&overlay.pane));
+    let Some(overlay_pane) = overlay_pane else {
+        return false;
+    };
+    let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>() else {
+        return false;
+    };
+    let renderer = search_overlay.renderer.lock();
+    Arc::ptr_eq(&renderer.instance_token, instance_token)
+        && renderer.accepted_run_id == Some(accepted_run_id)
+        && renderer.action_pending
 }
 
 fn close_quick_select_overlay_if_current(
@@ -1044,26 +1773,24 @@ fn close_quick_select_overlay_if_current(
     pane_id: PaneId,
     instance_token: &Arc<()>,
 ) {
-    let removed = {
+    let overlay_pane = term_window
+        .pane_state(pane_id)
+        .overlay
+        .as_ref()
+        .map(|overlay| Arc::clone(&overlay.pane));
+    let is_current = overlay_pane
+        .as_ref()
+        .and_then(|pane| pane.downcast_ref::<QuickSelectOverlay>())
+        .is_some_and(|search_overlay| {
+            Arc::ptr_eq(
+                &search_overlay.renderer.lock().instance_token,
+                instance_token,
+            )
+        });
+    if is_current {
         let mut state = term_window.pane_state(pane_id);
-        let is_current = state
-            .overlay
-            .as_ref()
-            .and_then(|overlay| overlay.pane.downcast_ref::<QuickSelectOverlay>())
-            .is_some_and(|search_overlay| {
-                Arc::ptr_eq(
-                    &search_overlay.renderer.lock().instance_token,
-                    instance_token,
-                )
-            });
-        if is_current {
-            state.overlay.take();
-            true
-        } else {
-            false
-        }
-    };
-    if removed {
+        state.overlay.take();
+        drop(state);
         if let Some(window) = term_window.window.as_ref() {
             window.invalidate();
         }
@@ -1075,17 +1802,876 @@ fn restart_quick_select_after_stale_action(
     pane_id: PaneId,
     instance_token: &Arc<()>,
 ) {
-    let state = term_window.pane_state(pane_id);
-    if let Some(overlay) = state.overlay.as_ref() {
-        if let Some(search_overlay) = overlay.pane.downcast_ref::<QuickSelectOverlay>() {
+    let overlay_pane = term_window
+        .pane_state(pane_id)
+        .overlay
+        .as_ref()
+        .map(|overlay| Arc::clone(&overlay.pane));
+    if let Some(overlay_pane) = overlay_pane {
+        if let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>() {
             let mut renderer = search_overlay.renderer.lock();
             if Arc::ptr_eq(&renderer.instance_token, instance_token) {
+                renderer.pending_action.take();
                 renderer.action_pending = false;
                 renderer.selection.clear();
                 renderer.restart_search(false, true, 0);
             }
         }
     }
+}
+
+type QuickSelectReadPlans = anyhow::Result<Vec<ScreenLineRead>>;
+
+/// Return hydrated rows to the admitted worker for destruction, including
+/// cancellation while the result is queued. The worker retains its permit.
+struct QuickSelectLineReadReady {
+    text: anyhow::Result<String>,
+    plans: Option<QuickSelectReadPlans>,
+    retire: SyncSender<QuickSelectReadPlans>,
+}
+
+impl Drop for QuickSelectLineReadReady {
+    fn drop(&mut self) {
+        if let Some(plans) = self.plans.take() {
+            let _ = self.retire.send(plans);
+        }
+    }
+}
+
+struct QuickSelectLineRead {
+    receiver: Receiver<QuickSelectLineReadReady>,
+    ready: Option<QuickSelectLineReadReady>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for QuickSelectLineRead {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl QuickSelectLineRead {
+    fn start(
+        pane: &Arc<dyn Pane>,
+        accepted_selection: SelectionRange,
+        deadline: std::time::Instant,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Self>, &'static str> {
+        if std::time::Instant::now() >= deadline {
+            return Err("The selection deadline expired.");
+        }
+        let Some(permit) = LineReadPermit::try_acquire() else {
+            return Ok(None);
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let is_cancelled = Arc::clone(&cancelled);
+        let exec_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = sync_channel(1);
+
+        // Reserve and start before capturing any source allocations.
+        let worker = permit
+            .start(
+                move || {
+                    is_cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
+                },
+                move |plans, permit| {
+                    let (retire, retired) = sync_channel(1);
+                    let text =
+                        extract_text_from_read_plans(&plans, accepted_selection, &exec_cancelled);
+                    let ready = QuickSelectLineReadReady {
+                        text,
+                        plans: Some(plans),
+                        retire,
+                    };
+                    if sender.send(ready).is_ok() {
+                        wake();
+                        let _ = retired.recv();
+                    }
+                    drop(permit);
+                },
+            )
+            .map_err(|_| "The text reader could not start.")?;
+
+        let rows = accepted_selection.rows();
+        let mut capture_budget = Default::default();
+        let capture = pane.capture_line_read(rows, &mut capture_budget);
+        let Some(plan) = capture else {
+            cancelled.store(true, Ordering::Release);
+            worker.submit(vec![]);
+            return Err("This pane cannot provide a bounded text read.");
+        };
+        let Ok(plan) = plan else {
+            cancelled.store(true, Ordering::Release);
+            worker.submit(vec![]);
+            return Ok(None);
+        };
+
+        worker.submit(vec![plan]);
+        Ok(Some(Self {
+            receiver,
+            ready: None,
+            cancelled,
+        }))
+    }
+
+    fn poll_ready(&mut self, deadline: std::time::Instant) -> Result<bool, &'static str> {
+        if std::time::Instant::now() >= deadline {
+            self.cancelled.store(true, Ordering::Release);
+            return Err("The selection deadline expired.");
+        }
+        if self.ready.is_some() {
+            return Ok(true);
+        }
+        match self.receiver.try_recv() {
+            Ok(ready) => {
+                self.ready = Some(ready);
+                Ok(true)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => Err("The text reader stopped unexpectedly."),
+        }
+    }
+}
+
+fn extract_text_from_read_plans(
+    plans: &anyhow::Result<Vec<ScreenLineRead>>,
+    accepted_selection: SelectionRange,
+    cancelled: &Arc<AtomicBool>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !cancelled.load(Ordering::Acquire),
+        "selection read cancelled"
+    );
+    let plans = plans
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("line read failed: {e}"))?;
+    anyhow::ensure!(!plans.is_empty(), "missing line read plans");
+    let plan = &plans[0];
+    let row_count = plan.row_count();
+    anyhow::ensure!(row_count > 0, "empty line read snapshot");
+    let first_row = plan.first_row();
+
+    let mut logical_lines = Vec::new();
+    for (idx, line) in plan.lines().enumerate() {
+        if cancelled.load(Ordering::Acquire) {
+            anyhow::bail!("selection read cancelled");
+        }
+        let row = first_row
+            .checked_add(idx as StableRowIndex)
+            .ok_or_else(|| anyhow::anyhow!("row overflow"))?;
+        match logical_lines.last_mut() {
+            None => {
+                logical_lines.push(LogicalLine {
+                    physical_lines: vec![line.clone()],
+                    logical: line.clone(),
+                    first_row: row,
+                });
+            }
+            Some(prior)
+                if prior.logical.last_cell_was_wrapped()
+                    && !prior
+                        .logical
+                        .len()
+                        .checked_add(line.len())
+                        .map_or(true, |n| n > mux::pane::MAX_LOGICAL_LINE_LEN) =>
+            {
+                let seqno = prior.logical.current_seqno().max(line.current_seqno());
+                prior.logical.set_last_cell_was_wrapped(false, seqno);
+                prior.logical.append_line(line.clone(), seqno);
+                prior.physical_lines.push(line.clone());
+            }
+            Some(_) => {
+                logical_lines.push(LogicalLine {
+                    physical_lines: vec![line.clone()],
+                    logical: line.clone(),
+                    first_row: row,
+                });
+            }
+        }
+    }
+
+    Ok(crate::termwindow::selected_text_from_logical_lines(
+        &logical_lines,
+        accepted_selection,
+        false,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptanceSourceDecision {
+    Ready {
+        authority: crate::selection::SelectionAuthority,
+        validated_source_end: SequenceNo,
+        dimensions: mux::renderable::RenderableDimensions,
+    },
+    Busy {
+        validated_source_end: SequenceNo,
+    },
+    StaleOrInvalid,
+}
+
+fn evaluate_acceptance_source(
+    snapshot: Option<(
+        crate::selection::SelectionAuthority,
+        SequenceNo,
+        mux::renderable::RenderableDimensions,
+    )>,
+    source_end: SequenceNo,
+    source_range: &Range<StableRowIndex>,
+    accepted_cols: usize,
+) -> AcceptanceSourceDecision {
+    match snapshot {
+        Some((auth, seqno, dims)) => {
+            let chunk_is_retained = retained_row_range(dims).as_ref().is_some_and(|retained| {
+                retained.start <= source_range.start && source_range.end <= retained.end
+            });
+            if seqno != source_end || dims.cols != accepted_cols || !chunk_is_retained {
+                return AcceptanceSourceDecision::StaleOrInvalid;
+            }
+            AcceptanceSourceDecision::Ready {
+                authority: auth,
+                validated_source_end: source_end,
+                dimensions: dims,
+            }
+        }
+        None => AcceptanceSourceDecision::Busy {
+            validated_source_end: source_end,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreReadSourceDecision {
+    Accept {
+        authority: crate::selection::SelectionAuthority,
+        dimensions: mux::renderable::RenderableDimensions,
+        adopt_authority: bool,
+    },
+    RejectStale,
+}
+
+fn evaluate_pre_read_source(
+    snapshot: (
+        crate::selection::SelectionAuthority,
+        SequenceNo,
+        mux::renderable::RenderableDimensions,
+    ),
+    existing_authority: Option<&crate::selection::SelectionAuthority>,
+    validated_source_end: SequenceNo,
+    accepted_cols: usize,
+    source_range: &Range<StableRowIndex>,
+) -> PreReadSourceDecision {
+    let (authority, seqno, dims) = snapshot;
+    if seqno != validated_source_end {
+        return PreReadSourceDecision::RejectStale;
+    }
+    if let Some(existing) = existing_authority {
+        if *existing != authority {
+            return PreReadSourceDecision::RejectStale;
+        }
+    }
+    let chunk_is_retained = retained_row_range(dims).as_ref().is_some_and(|retained| {
+        retained.start <= source_range.start && source_range.end <= retained.end
+    });
+    if dims.cols != accepted_cols || !chunk_is_retained {
+        return PreReadSourceDecision::RejectStale;
+    }
+    PreReadSourceDecision::Accept {
+        authority,
+        dimensions: dims,
+        adopt_authority: existing_authority.is_none(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedPublicationDecision {
+    RetryPaced,
+    RejectMutated,
+}
+
+fn evaluate_failed_publication_source(
+    snapshot: Option<(
+        crate::selection::SelectionAuthority,
+        SequenceNo,
+        mux::renderable::RenderableDimensions,
+    )>,
+    expected_authority: Option<&crate::selection::SelectionAuthority>,
+    expected_sequence: SequenceNo,
+    expected_dimensions: &mux::renderable::RenderableDimensions,
+) -> FailedPublicationDecision {
+    if let Some((current_auth, current_seq, current_dims)) = snapshot {
+        if expected_authority != Some(&current_auth)
+            || current_seq != expected_sequence
+            || !mux::renderable::same_line_layout_geometry(&current_dims, expected_dimensions)
+        {
+            return FailedPublicationDecision::RejectMutated;
+        }
+    }
+    FailedPublicationDecision::RetryPaced
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionDeadlineDecision {
+    ArmTimer { delay: Duration },
+    Expired,
+}
+
+fn evaluate_action_deadline(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> ActionDeadlineDecision {
+    if now >= deadline {
+        ActionDeadlineDecision::Expired
+    } else {
+        ActionDeadlineDecision::ArmTimer {
+            delay: deadline.saturating_duration_since(now),
+        }
+    }
+}
+
+struct PendingAcceptedAction {
+    accepted_selection: SelectionRange,
+    instance_token: Arc<()>,
+    accepted_run_id: usize,
+    paste: bool,
+    action: Option<KeyAssignment>,
+    skip_action_on_paste: bool,
+    accepted_cols: usize,
+    source_range: Range<StableRowIndex>,
+    validated_source_end: SequenceNo,
+    selection_authority: Option<crate::selection::SelectionAuthority>,
+    dimensions: Option<mux::renderable::RenderableDimensions>,
+    deadline: std::time::Instant,
+    read: Option<QuickSelectLineRead>,
+    retry_abort: Option<AbortHandle>,
+    deadline_abort: Option<AbortHandle>,
+}
+
+impl PendingAcceptedAction {
+    const FIXED_DEADLINE: Duration = Duration::from_secs(5);
+}
+
+impl Drop for PendingAcceptedAction {
+    fn drop(&mut self) {
+        if let Some(abort) = self.retry_abort.take() {
+            abort.abort();
+        }
+        if let Some(abort) = self.deadline_abort.take() {
+            abort.abort();
+        }
+        self.read.take();
+    }
+}
+
+fn arm_accepted_action_deadline(
+    term_window: &TermWindow,
+    pane_id: PaneId,
+    instance_token: &Arc<()>,
+    accepted_run_id: usize,
+    deadline: std::time::Instant,
+) -> Result<AbortHandle, &'static str> {
+    let now = std::time::Instant::now();
+    let duration = match evaluate_action_deadline(deadline, now) {
+        ActionDeadlineDecision::ArmTimer { delay } => delay,
+        ActionDeadlineDecision::Expired => {
+            return Err("The selection deadline expired.");
+        }
+    };
+    let reservation = match super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Render,
+        4 * 1024,
+        "quick-select action deadline",
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            log::warn!(
+                "{err:#}; unable to reserve main thread for quick-select action deadline timer"
+            );
+            return Err("Unable to reserve main thread for quick-select action deadline.");
+        }
+    };
+    let instance_token = Arc::clone(instance_token);
+    let window = term_window.window.clone();
+    let (abort, registration) = AbortHandle::new_pair();
+    reservation
+        .spawn_local(async move {
+            if Abortable::new(sleep(duration), registration).await.is_err() {
+                return anyhow::Result::<()>::Ok(());
+            }
+            if let Some(window) = window {
+                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                    advance_quick_select_accepted_action(
+                        tw,
+                        pane_id,
+                        &instance_token,
+                        accepted_run_id,
+                    );
+                })));
+            }
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+    Ok(abort)
+}
+
+fn spawn_action_retry(
+    term_window: &TermWindow,
+    pane_id: PaneId,
+    instance_token: &Arc<()>,
+    accepted_run_id: usize,
+    deadline: std::time::Instant,
+) -> Result<AbortHandle, &'static str> {
+    let now = std::time::Instant::now();
+    let remaining = match evaluate_action_deadline(deadline, now) {
+        ActionDeadlineDecision::ArmTimer { delay } => delay,
+        ActionDeadlineDecision::Expired => {
+            return Err("The selection deadline expired.");
+        }
+    };
+    let delay = Duration::from_millis(20).min(remaining);
+    let reservation = match super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Render,
+        4 * 1024,
+        "quick-select action retry",
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            log::warn!("{err:#}; unable to reserve main thread for quick-select action retry");
+            return Err("Unable to schedule quick-select retry.");
+        }
+    };
+    let instance_token = Arc::clone(instance_token);
+    let window = term_window.window.clone();
+    let (abort, registration) = AbortHandle::new_pair();
+    reservation
+        .spawn_local(async move {
+            if Abortable::new(sleep(delay), registration).await.is_err() {
+                return anyhow::Result::<()>::Ok(());
+            }
+            if let Some(window) = window {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    advance_quick_select_accepted_action(
+                        term_window,
+                        pane_id,
+                        &instance_token,
+                        accepted_run_id,
+                    );
+                })));
+            }
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+    Ok(abort)
+}
+
+fn advance_quick_select_accepted_action(
+    term_window: &TermWindow,
+    pane_id: PaneId,
+    instance_token: &Arc<()>,
+    accepted_run_id: usize,
+) {
+    if !quick_select_action_is_current(term_window, pane_id, instance_token, accepted_run_id) {
+        return;
+    }
+    let overlay_pane = term_window
+        .pane_state(pane_id)
+        .overlay
+        .as_ref()
+        .map(|overlay| Arc::clone(&overlay.pane));
+    let Some(overlay_pane) = overlay_pane else {
+        return;
+    };
+    let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>() else {
+        return;
+    };
+    let mut renderer = search_overlay.renderer.lock();
+    if !Arc::ptr_eq(&renderer.instance_token, instance_token)
+        || renderer.accepted_run_id != Some(accepted_run_id)
+        || !renderer.action_pending
+    {
+        return;
+    }
+    let pane = Arc::clone(&renderer.delegate);
+    if pane.is_dead() {
+        log::debug!("quick-select pane {pane_id} closed before action completion");
+        drop(renderer);
+        close_quick_select_overlay_if_current(term_window, pane_id, instance_token);
+        return;
+    }
+    let Some(action) = renderer.pending_action.as_mut() else {
+        return;
+    };
+    if !Arc::ptr_eq(&action.instance_token, instance_token)
+        || action.accepted_run_id != accepted_run_id
+    {
+        renderer.pending_action.take();
+        renderer.action_pending = false;
+        drop(renderer);
+        restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+        return;
+    }
+
+    if let Some(prev) = action.retry_abort.take() {
+        prev.abort();
+    }
+
+    let now = std::time::Instant::now();
+    if now >= action.deadline {
+        log::warn!("quick-select accepted action timed out for pane {pane_id}");
+        renderer.pending_action.take();
+        renderer.action_pending = false;
+        drop(renderer);
+        restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+        return;
+    }
+
+    if action.read.is_none() {
+        let source_snapshot = crate::selection::SelectionAuthority::capture_source(&*pane);
+        let (authority, seqno, dims) = match source_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                // Terminal is busy under lock. Retain Busy on fixed deadline; DO NOT restart!
+                let deadline = action.deadline;
+                match spawn_action_retry(
+                    term_window,
+                    pane_id,
+                    instance_token,
+                    accepted_run_id,
+                    deadline,
+                ) {
+                    Ok(abort) => {
+                        if let Some(prev) = action.retry_abort.replace(abort) {
+                            prev.abort();
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("{err}; settling stranded quick-select action");
+                        renderer.pending_action.take();
+                        renderer.action_pending = false;
+                        drop(renderer);
+                        restart_quick_select_after_stale_action(
+                            term_window,
+                            pane_id,
+                            instance_token,
+                        );
+                    }
+                }
+                return;
+            }
+        };
+
+        let decision = evaluate_pre_read_source(
+            (authority, seqno, dims),
+            action.selection_authority.as_ref(),
+            action.validated_source_end,
+            action.accepted_cols,
+            &action.source_range,
+        );
+        match decision {
+            PreReadSourceDecision::RejectStale => {
+                log::debug!(
+                    "quick-select source mutated before read start: seqno={seqno} != accepted={}",
+                    action.validated_source_end
+                );
+                renderer.pending_action.take();
+                renderer.action_pending = false;
+                drop(renderer);
+                restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+                return;
+            }
+            PreReadSourceDecision::Accept {
+                authority,
+                dimensions,
+                adopt_authority,
+            } => {
+                if adopt_authority {
+                    action.selection_authority = Some(authority);
+                    let accepted_selection = action.accepted_selection;
+                    term_window.update_selection(&pane, Some(authority), |selection| {
+                        selection.origin = Some(accepted_selection.start);
+                        selection.range = Some(accepted_selection);
+                        selection.rectangular = false;
+                    });
+                }
+                action.dimensions = Some(dimensions);
+            }
+        }
+
+        let wake_token = Arc::clone(instance_token);
+        let window = term_window.window.clone();
+        let wake = move || {
+            if let Some(window) = window {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    advance_quick_select_accepted_action(
+                        term_window,
+                        pane_id,
+                        &wake_token,
+                        accepted_run_id,
+                    );
+                })));
+            }
+        };
+
+        match QuickSelectLineRead::start(&pane, action.accepted_selection, action.deadline, wake) {
+            Ok(Some(read)) => {
+                action.read = Some(read);
+                if action.deadline_abort.is_none() {
+                    match arm_accepted_action_deadline(
+                        term_window,
+                        pane_id,
+                        instance_token,
+                        accepted_run_id,
+                        action.deadline,
+                    ) {
+                        Ok(abort) => {
+                            action.deadline_abort = Some(abort);
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "{err}; settling quick-select action on deadline timer failure"
+                            );
+                            renderer.pending_action.take();
+                            renderer.action_pending = false;
+                            drop(renderer);
+                            restart_quick_select_after_stale_action(
+                                term_window,
+                                pane_id,
+                                instance_token,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                let deadline = action.deadline;
+                match spawn_action_retry(
+                    term_window,
+                    pane_id,
+                    instance_token,
+                    accepted_run_id,
+                    deadline,
+                ) {
+                    Ok(abort) => {
+                        if let Some(prev) = action.retry_abort.replace(abort) {
+                            prev.abort();
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("{err}; settling stranded quick-select action");
+                        renderer.pending_action.take();
+                        renderer.action_pending = false;
+                        drop(renderer);
+                        restart_quick_select_after_stale_action(
+                            term_window,
+                            pane_id,
+                            instance_token,
+                        );
+                    }
+                }
+                return;
+            }
+            Err(err) => {
+                log::warn!("quick-select line read could not start: {err}");
+                renderer.pending_action.take();
+                renderer.action_pending = false;
+                drop(renderer);
+                restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+                return;
+            }
+        }
+    }
+
+    let deadline = action.deadline;
+    let poll_result = action.read.as_mut().unwrap().poll_ready(deadline);
+    match poll_result {
+        Ok(false) => {
+            // Reader executing on background thread. Ensure fixed deadline timer is armed
+            // so hung hydration cannot retain pending forever.
+            if action.deadline_abort.is_none() {
+                match arm_accepted_action_deadline(
+                    term_window,
+                    pane_id,
+                    instance_token,
+                    accepted_run_id,
+                    deadline,
+                ) {
+                    Ok(abort) => {
+                        action.deadline_abort = Some(abort);
+                    }
+                    Err(err) => {
+                        log::error!(
+                            "{err}; settling quick-select action on deadline timer failure"
+                        );
+                        renderer.pending_action.take();
+                        renderer.action_pending = false;
+                        drop(renderer);
+                        restart_quick_select_after_stale_action(
+                            term_window,
+                            pane_id,
+                            instance_token,
+                        );
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        Err(err) => {
+            log::warn!("quick-select line read error during poll: {err}");
+            renderer.pending_action.take();
+            renderer.action_pending = false;
+            drop(renderer);
+            restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            return;
+        }
+        Ok(true) => {}
+    }
+
+    let mut read = action.read.take().unwrap();
+    let ready = match read.ready.take() {
+        Some(ready) => ready,
+        None => {
+            renderer.pending_action.take();
+            renderer.action_pending = false;
+            drop(renderer);
+            restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            return;
+        }
+    };
+
+    let plans_result = ready.plans.as_ref();
+    let Some(Ok(plans)) = plans_result else {
+        log::warn!("quick-select line read plans unavailable");
+        drop(ready);
+        renderer.pending_action.take();
+        renderer.action_pending = false;
+        drop(renderer);
+        restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+        return;
+    };
+
+    let sequence = action.validated_source_end;
+    let dimensions = match action.dimensions {
+        Some(dims) => dims,
+        None => {
+            log::warn!("quick-select dimensions missing for publication");
+            drop(ready);
+            renderer.pending_action.take();
+            renderer.action_pending = false;
+            drop(renderer);
+            restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            return;
+        }
+    };
+
+    let mut published = false;
+    let ok = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+        published = true;
+    });
+
+    if !ok || !published {
+        if now >= action.deadline {
+            log::warn!("quick-select publication deadline expired for pane {pane_id}");
+            drop(ready);
+            renderer.pending_action.take();
+            renderer.action_pending = false;
+            drop(renderer);
+            restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            return;
+        }
+
+        read.ready = Some(ready);
+        action.read = Some(read);
+
+        let current_snapshot = crate::selection::SelectionAuthority::capture_source(&*pane);
+        match evaluate_failed_publication_source(
+            current_snapshot,
+            action.selection_authority.as_ref(),
+            sequence,
+            &dimensions,
+        ) {
+            FailedPublicationDecision::RejectMutated => {
+                log::debug!(
+                    "quick-select authority, sequence, or layout changed before publication: expected={sequence}"
+                );
+                renderer.pending_action.take();
+                renderer.action_pending = false;
+                drop(renderer);
+                restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+                return;
+            }
+            FailedPublicationDecision::RetryPaced => {
+                // Authority, sequence, and dimensions are all unchanged (or still busy).
+                // Retain exact ready plans and retry publication below.
+            }
+        }
+
+        // Terminal is still locked (capture_source returned None) or unlocked between calls with
+        // matching authority/sequence/layout.
+        // Transient Busy: retain exact ready plans and retry publication on paced timer.
+        let deadline = action.deadline;
+        match spawn_action_retry(
+            term_window,
+            pane_id,
+            instance_token,
+            accepted_run_id,
+            deadline,
+        ) {
+            Ok(abort) => {
+                if let Some(prev) = action.retry_abort.replace(abort) {
+                    prev.abort();
+                }
+            }
+            Err(err) => {
+                log::error!("{err}; settling stranded quick-select action");
+                renderer.pending_action.take();
+                renderer.action_pending = false;
+                drop(renderer);
+                restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            }
+        }
+        return;
+    }
+
+    let text = match ready.text.as_ref() {
+        Ok(text) => text.clone(),
+        Err(err) => {
+            log::warn!("quick-select text extraction failed: {err}");
+            drop(ready);
+            renderer.pending_action.take();
+            renderer.action_pending = false;
+            drop(renderer);
+            restart_quick_select_after_stale_action(term_window, pane_id, instance_token);
+            return;
+        }
+    };
+
+    let paste = action.paste;
+    let key_action = action.action.clone();
+    let skip_action_on_paste = action.skip_action_on_paste;
+
+    drop(ready);
+    renderer.pending_action.take();
+    renderer.action_pending = false;
+    drop(renderer);
+
+    if !text.is_empty() {
+        if paste {
+            let _ = pane.send_paste(&text);
+        }
+        if let Some(action) = key_action {
+            if !paste || !skip_action_on_paste {
+                let _ = term_window.perform_key_assignment(&pane, &action);
+            }
+        } else {
+            term_window
+                .copy_to_clipboard(ClipboardCopyDestination::ClipboardAndPrimarySelection, text);
+        }
+    }
+
+    close_quick_select_overlay_if_current(term_window, pane_id, instance_token);
 }
 
 #[derive(Debug)]
@@ -1233,6 +2819,7 @@ struct QuickSelectRenderable {
     by_label: HashMap<String, usize>,
     selection: String,
     action_pending: bool,
+    pending_action: Option<PendingAcceptedAction>,
 
     viewport: Option<StableRowIndex>,
     last_bar_pos: Option<StableRowIndex>,
@@ -1314,6 +2901,7 @@ impl QuickSelectOverlay {
             pattern,
             selection: "".to_string(),
             action_pending: false,
+            pending_action: None,
             results: vec![],
             by_line: HashMap::new(),
             by_label: HashMap::new(),
@@ -1980,6 +3568,7 @@ impl QuickSelectRenderable {
         // across generations could act on a target the user never saw.
         self.selection.clear();
         self.action_pending = false;
+        self.pending_action.take();
         if preserve_result && self.desired_result.is_none() {
             self.desired_result_ordinal = self.result_pos;
             self.desired_result = self
@@ -2286,7 +3875,9 @@ impl QuickSelectRenderable {
         let retry_token = Arc::new(());
         self.retry_token = Some(Arc::clone(&retry_token));
         let (abort, registration) = AbortHandle::new_pair();
-        self.retry_abort = Some(abort);
+        if let Some(prev) = self.retry_abort.replace(abort) {
+            prev.abort();
+        }
         self.mark_search_ui_dirty();
         reservation
             .spawn_local(async move {
@@ -2359,7 +3950,6 @@ impl QuickSelectRenderable {
         let pane_id = self.delegate.pane_id();
         let pane = Arc::clone(&self.delegate);
         let accepted_cols = self.width;
-        let selection_authority = crate::selection::SelectionAuthority::capture(&*pane);
         let instance_token = Arc::clone(&self.instance_token);
         let action = self.args.action.clone();
         let skip_action_on_paste = self.args.skip_action_on_paste;
@@ -2375,53 +3965,42 @@ impl QuickSelectRenderable {
                 }
                 if pane.is_dead() {
                     log::debug!("quick-select pane {pane_id} closed before action");
-                    close_quick_select_overlay_if_current(
-                        term_window,
-                        pane_id,
-                        &instance_token,
-                    );
+                    close_quick_select_overlay_if_current(term_window, pane_id, &instance_token);
                     return;
                 }
-                // The key handler fenced the accepted result before looking
-                // up its label. Fence the exact captured pane once more at
-                // execution time; resolving by numeric PaneId here would
-                // reintroduce an ABA window if a pane were replaced.
-                if selection_authority.is_none()
-                    || crate::selection::SelectionAuthority::capture(&*pane) != selection_authority
-                {
-                    restart_quick_select_after_stale_action(
-                        term_window,
-                        pane_id,
-                        &instance_token,
-                    );
-                    return;
-                }
-                let dims = pane.get_dimensions();
-                let chunk_is_retained = retained_row_range(dims).as_ref().is_some_and(|retained| {
-                    retained.start <= source_range.start && source_range.end <= retained.end
-                });
-                let inclusive_end = inclusive_search_result_end(&result, accepted_cols);
-                let geometry_changed = dims.cols != accepted_cols
-                    || !chunk_is_retained
-                    || inclusive_end.is_none();
-                let validated_source_end = if geometry_changed {
-                    None
-                } else {
-                    let (next_source_end, dirty) = pane
-                        .get_changed_since_with_source_fence(source_range.clone(), source_end);
-                    (next_source_end >= source_end && dirty.iter().next().is_none())
-                        .then_some(next_source_end)
+
+                let source_snapshot = crate::selection::SelectionAuthority::capture_source(&*pane);
+                let (selection_authority, validated_source_end, dimensions) = match evaluate_acceptance_source(
+                    source_snapshot,
+                    source_end,
+                    &source_range,
+                    accepted_cols,
+                ) {
+                    AcceptanceSourceDecision::Ready {
+                        authority,
+                        validated_source_end,
+                        dimensions,
+                    } => (Some(authority), validated_source_end, Some(dimensions)),
+                    AcceptanceSourceDecision::Busy {
+                        validated_source_end,
+                    } => (None, validated_source_end, None),
+                    AcceptanceSourceDecision::StaleOrInvalid => {
+                        log::debug!(
+                            "quick-select source mutated or layout invalid before action for pane {pane_id}"
+                        );
+                        restart_quick_select_after_stale_action(
+                            term_window,
+                            pane_id,
+                            &instance_token,
+                        );
+                        return;
+                    }
                 };
-                let Some(validated_source_end) = validated_source_end else {
-                    log::debug!("quick-select result for pane {pane_id} changed before action");
-                    restart_quick_select_after_stale_action(
-                        term_window,
-                        pane_id,
-                        &instance_token,
-                    );
-                    return;
-                };
-                let Some((inclusive_end_x, inclusive_end_y)) = inclusive_end else {
+
+                let Some((inclusive_end_x, inclusive_end_y)) =
+                    inclusive_search_result_end(&result, accepted_cols)
+                else {
+                    restart_quick_select_after_stale_action(term_window, pane_id, &instance_token);
                     return;
                 };
                 let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
@@ -2430,69 +4009,83 @@ impl QuickSelectRenderable {
                     // Search results have an exclusive end; selections are inclusive.
                     end: SelectionCoordinate::x_y(inclusive_end_x, inclusive_end_y),
                 };
-                term_window.update_selection(&pane, selection_authority, |selection| {
-                    selection.origin = Some(start);
-                    selection.range = Some(accepted_selection);
-                    selection.rectangular = false;
-                });
-
-                // Native anchor capture can defer the highlight update while an
-                // older GUI selection remains committed. Extract the accepted
-                // match itself; GUI selection state is not action authority.
-                let text = crate::termwindow::selected_text_from_logical_lines(
-                    &pane.get_logical_lines(accepted_selection.rows()),
-                    accepted_selection,
-                    false,
-                );
-                let extracted_dims = pane.get_dimensions();
-                let extracted_range_is_retained = retained_row_range(extracted_dims)
-                    .as_ref()
-                    .is_some_and(|retained| {
-                        retained.start <= source_range.start && source_range.end <= retained.end
+                if let Some(selection_authority) = selection_authority {
+                    term_window.update_selection(&pane, Some(selection_authority), |selection| {
+                        selection.origin = Some(start);
+                        selection.range = Some(accepted_selection);
+                        selection.rectangular = false;
                     });
-                let (extracted_source_end, dirty) = pane
-                    .get_changed_since_with_source_fence(source_range, validated_source_end);
-                if pane.is_dead()
-                    || crate::selection::SelectionAuthority::capture(&*pane) != selection_authority
-                    || extracted_dims.cols != accepted_cols
-                    || !extracted_range_is_retained
-                    || extracted_source_end < validated_source_end
-                    || dirty.iter().next().is_some()
-                {
-                    log::debug!(
-                        "quick-select result for pane {pane_id} changed or was trimmed during extraction"
-                    );
-                    restart_quick_select_after_stale_action(
-                        term_window,
-                        pane_id,
-                        &instance_token,
-                    );
-                    return;
                 }
-                if !text.is_empty() {
-                    if paste {
-                        let _ = pane.send_paste(&text);
-                    }
-                    if let Some(action) = action {
-                        if !paste || !skip_action_on_paste {
-                            let _ = term_window.perform_key_assignment(&pane, &action);
-                        }
-                    } else {
-                        term_window.copy_to_clipboard(
-                            ClipboardCopyDestination::ClipboardAndPrimarySelection,
-                            text,
-                        );
-                    }
-                }
-                close_quick_select_overlay_if_current(
+
+                let deadline = std::time::Instant::now() + PendingAcceptedAction::FIXED_DEADLINE;
+                let deadline_abort = match arm_accepted_action_deadline(
                     term_window,
                     pane_id,
                     &instance_token,
+                    accepted_run_id,
+                    deadline,
+                ) {
+                    Ok(abort) => Some(abort),
+                    Err(err) => {
+                        log::error!(
+                            "{err}; settling quick-select action on deadline timer failure"
+                        );
+                        restart_quick_select_after_stale_action(
+                            term_window,
+                            pane_id,
+                            &instance_token,
+                        );
+                        return;
+                    }
+                };
+
+                let pending = PendingAcceptedAction {
+                    accepted_selection,
+                    instance_token: Arc::clone(&instance_token),
+                    accepted_run_id,
+                    paste,
+                    action,
+                    skip_action_on_paste,
+                    accepted_cols,
+                    source_range,
+                    validated_source_end,
+                    selection_authority,
+                    dimensions,
+                    deadline,
+                    read: None,
+                    retry_abort: None,
+                    deadline_abort,
+                };
+
+                let overlay_pane = term_window
+                    .pane_state(pane_id)
+                    .overlay
+                    .as_ref()
+                    .map(|overlay| Arc::clone(&overlay.pane));
+                if let Some(overlay_pane) = overlay_pane {
+                    if let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>()
+                    {
+                        let mut renderer = search_overlay.renderer.lock();
+                        if Arc::ptr_eq(&renderer.instance_token, &instance_token)
+                            && renderer.accepted_run_id == Some(accepted_run_id)
+                        {
+                            renderer.pending_action = Some(pending);
+                        }
+                    }
+                }
+                advance_quick_select_accepted_action(
+                    term_window,
+                    pane_id,
+                    &instance_token,
+                    accepted_run_id,
                 );
             })));
     }
 
     fn activate_match_number(&mut self, n: usize) {
+        if self.action_pending {
+            return;
+        }
         if let Some(result) = self.results.get(n) {
             self.result_pos.replace(n);
             let start_y = result.start_y;
