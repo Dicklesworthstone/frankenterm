@@ -59,7 +59,11 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Whole-mux recovery images preserve window titles, ordered tab stacks and their visible members, and previous-active-tab history. Schema 2 requires these fields and rejects older images; restoring an image into a live successor mux remains unfinished.
 - Creating a tab stack with an existing ID now fails before changing its members or visible tab, preventing stale reverse mappings and lost groups.
 
-The `0.15.6-rc.29` candidate includes these changes. The 50 ms resize target,
+- Closing or retiring a guardian lease succeeds when pending-input reconciliation
+  confirms that the child has exited and all input was applied. Partial input
+  and unknown durability outcomes still return errors.
+
+The `0.15.6-rc.30` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.

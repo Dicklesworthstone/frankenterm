@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 195,
-        "fix": 238,
+        "fix": 239,
         "other": 49,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 92
       },
-      "fork_side_commit_count": 644,
+      "fork_side_commit_count": 645,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-17T04:53:32-04:00",
-        "sha": "7a1dc66a6dcbece3d74165662c0077f8994c597b",
-        "subject": "fix(recovery): verify durable witnesses in the guardian digest domain"
+        "committed_at": "2026-09-17T07:20:53-04:00",
+        "sha": "f0e843a29e70087fdad3e505d851eb94680c8497",
+        "subject": "fix(recovery): settle reconciled terminal leases and inventory checkpoint authority"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2720,
-  "generated_at": "2026-09-17T09:28:29.284096Z",
+  "fork_side_commit_total": 2721,
+  "generated_at": "2026-09-17T11:27:24.447204Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

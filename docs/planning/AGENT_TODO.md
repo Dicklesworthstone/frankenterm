@@ -1399,3 +1399,41 @@ power loss nor migration of those live sessions has been demonstrated.
   DSR quality, native builds, native/remote acceptance, signed producer
   artifacts, DSR publication/verification/canary/upgrade and Dock installation.
   Existing user sessions remain untouched until their preservation is proved.
+
+## 2026-09-17 — StormyWillow: RC30 qualification
+
+- [x] Qualify RC29 source `640b586e8`: strict remote workspace check and
+  Clippy with supported feature union; exact-source formatting (one test,
+  zero filtered); selection/quick-select 122 passed; static gates 29 passed.
+  Native selection, resize latency and font resizing remain unqualified.
+- [x] Complete mission scalability regression suite: all 26 passed on remote
+  worker126, source `640b586e8`, retained `640b586-mission-scalability-rch.log`.
+  Close `ft-bkib8`; measured latency remains independently checked.
+- [x] Complete recovery library suite at `1c6bf143f`: 661 passed, three ignored.
+  Run the ignored tests explicitly: fresh guardian birth/discovery two passed;
+  recovered-stage fsync fault injection one passed on the same hashed binary.
+- [x] Commit post-reconciliation lease settlement and checkpoint-authority
+  inventory in `f0e843a29`; commit floating-point oracle and real 57-element
+  counterexample in `05a192cfe`. These are implementation results, not test passes.
+- [ ] Finish strict RCH regression runs for those commits: authority inventory
+  on worker114; terminal observation on worker3651; semantic properties on2480.
+  Worker122 refused semantic admission with RCH-I003; no local fallback ran.
+- [x] Retain failed native RC29 DSR run `ff45cf7e`. The host rebooted during
+  compilation; the retained watchdog panic reports low swap space. No artifact
+  was produced, and external build volumes were absent after reboot.
+- [ ] Qualify RC30 native DSR build on this Mac's internal APFS with one Cargo
+  job, explicit source identity and package-space reserve. Keep the RC29 tag
+  immutable. The native build is separate from the remote development tests.
+- [ ] Run the prepared isolated 10,000-line Unicode fixture through actual
+  mouse selection/copy, resize, tiling and default Cmd-plus/minus; verify fixed
+  window pixels, readable reflow and latency. CUA drag failures on the older
+  owned RC28 app provided no selection proof.
+- [ ] Complete the four deferred attestation producers, final DSR quality,
+  publishable platform builds, release verification, canary and upgrade checks.
+  Windows native storage qualification is still unresolved.
+- [ ] Install the verified app at the Dock target while preserving local and
+  remote sessions. Existing user muxes have not been restarted or updated.
+- [ ] Complete successor generation-two durable image/fresh-process recovery,
+  ordinary startup admission, durable tab/window identities and atomic topology
+  restoration. The first successor fixture drafts failed source review and
+  were not integrated; successful round-trip tests alone do not close this gap.
