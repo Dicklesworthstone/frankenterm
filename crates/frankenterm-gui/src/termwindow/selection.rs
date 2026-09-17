@@ -526,8 +526,21 @@ impl super::TermWindow {
         expected: Option<SelectionAuthority>,
         update: impl FnOnce(&mut Selection),
     ) {
-        let pane_id = pane.pane_id();
         let current_seqno = pane.get_current_seqno();
+        self.update_selection_with_seqno(pane, expected, current_seqno, update);
+    }
+
+    /// Use the sequence from an already captured source snapshot. Async
+    /// selection must not reacquire a blocking terminal lock for metadata.
+    /// Candidate publication below still validates the selection authority.
+    pub(crate) fn update_selection_with_seqno(
+        &self,
+        pane: &Arc<dyn Pane>,
+        expected: Option<SelectionAuthority>,
+        current_seqno: termwiz::surface::SequenceNo,
+        update: impl FnOnce(&mut Selection),
+    ) {
+        let pane_id = pane.pane_id();
         let mut selection = self.selection(pane_id).clone();
         {
             update(&mut selection);

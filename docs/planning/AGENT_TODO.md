@@ -1339,8 +1339,11 @@ power loss nor migration of those live sessions has been demonstrated.
     original spawn custody and authenticate the later owner from durable
     checkpoint/ACK evidence before changing this fence.
     `4ac65fb80` implements that witness and adds a durable generation-two
-    regression; strict RCH worker2480 is compiling it. The first hz3 attempt
-    refused admission before Cargo, without local fallback.
+    regression; strict RCH worker2480 passed the exact test: one passed, zero
+    failed/ignored, 251 filtered, 2.97s. Retain
+    `4ac65fb-successor-reopen-worker2480-rch.log`. Full successor image and
+    live-process restart remain unproved. The first hz3 attempt refused
+    admission before Cargo, without local fallback.
   - [ ] Verify manifest-driven witness discovery in `1c6bf143f`: the fresh
     subprocess now gets root/token paths only, no pane-scope/checkpoint hints.
     It derives identities from the authenticated manifest and checks existing
@@ -1369,6 +1372,10 @@ power loss nor migration of those live sessions has been demonstrated.
   owns this file; its initial formatting-only check is not runtime verification.
   Root took handoff, corrected weak tests and lifetime checks, and committed
   `f25c205ac`. Its exact quick-select harness is compiling on worker126.
+  Follow-up source review found `update_selection` reacquiring a blocking
+  terminal sequence read after the nonblocking snapshot; quick-select now
+  passes that captured sequence into candidate publication instead. Corrected
+  its continuation to accept mutable window access for key assignments.
   Deadline arithmetic/drop coverage does not prove timer admission failure.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
   eight Cargo gates skipped. This is not strict release attestation closure.

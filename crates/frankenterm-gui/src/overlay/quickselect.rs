@@ -2266,7 +2266,7 @@ fn spawn_action_retry(
 }
 
 fn advance_quick_select_accepted_action(
-    term_window: &TermWindow,
+    term_window: &mut TermWindow,
     pane_id: PaneId,
     instance_token: &Arc<()>,
     accepted_run_id: usize,
@@ -2388,11 +2388,16 @@ fn advance_quick_select_accepted_action(
                 if adopt_authority {
                     action.selection_authority = Some(authority);
                     let accepted_selection = action.accepted_selection;
-                    term_window.update_selection(&pane, Some(authority), |selection| {
-                        selection.origin = Some(accepted_selection.start);
-                        selection.range = Some(accepted_selection);
-                        selection.rectangular = false;
-                    });
+                    term_window.update_selection_with_seqno(
+                        &pane,
+                        Some(authority),
+                        seqno,
+                        |selection| {
+                            selection.origin = Some(accepted_selection.start);
+                            selection.range = Some(accepted_selection);
+                            selection.rectangular = false;
+                        },
+                    );
                 }
                 action.dimensions = Some(dimensions);
             }
@@ -4010,7 +4015,7 @@ impl QuickSelectRenderable {
                     end: SelectionCoordinate::x_y(inclusive_end_x, inclusive_end_y),
                 };
                 if let Some(selection_authority) = selection_authority {
-                    term_window.update_selection(&pane, Some(selection_authority), |selection| {
+                    term_window.update_selection_with_seqno(&pane, Some(selection_authority), validated_source_end, |selection| {
                         selection.origin = Some(start);
                         selection.range = Some(accepted_selection);
                         selection.rectangular = false;
