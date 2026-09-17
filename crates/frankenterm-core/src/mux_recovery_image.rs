@@ -1327,7 +1327,11 @@ impl MuxRecoveryImage {
                         .iter()
                         .any(|build| **build == [0; 32])
                     || pane_id.to_string() != pane.pane_uuid
-                    || current_mux_incarnation.to_string() != self.header.mux_incarnation_id
+                    // Captured topology encodes the incarnation as compact hex,
+                    // whereas UUID Display inserts hyphens. Compare using the
+                    // topology encoding so a valid live owner is not rejected.
+                    || hex::encode(current_mux_incarnation.as_bytes())
+                        != self.header.mux_incarnation_id
                     || *current_lease_generation == 0
                     || (*current_lease_generation == 1
                         && current_mux_incarnation != original_mux_incarnation)
@@ -2468,6 +2472,63 @@ mod tests {
             checkpoint_identity: [4; 32],
             output_boundary_identity: [5; 32],
         }
+    }
+
+    #[test]
+    fn original_spawn_authority_uses_captured_compact_mux_identity() {
+        let mut image = make_valid_test_image();
+        let publication = test_guardian_publication();
+        let incarnation = hex::encode(publication.mux_incarnation.as_bytes());
+        image.header.mux_incarnation_id = incarnation.clone();
+        for pane in &mut image.panes {
+            pane.checkpoint.topology_incarnation_id = incarnation.clone();
+        }
+        let durable_id = uuid::Uuid::from_u128(9);
+        let pane = &mut image.panes[0];
+        pane.pane_uuid = durable_id.to_string();
+        pane.checkpoint.pane_uuid = durable_id.to_string();
+        pane.spawn_custody = RecoverySpawnCustody::Original {
+            broker_lineage: uuid::Uuid::from_u128(10),
+            guardian_incarnation: publication.guardian_incarnation,
+            original_mux_incarnation: publication.mux_incarnation,
+            broker_build: [1; 32],
+            guardian_build: [2; 32],
+            original_mux_build: [3; 32],
+            pane_id: durable_id,
+            spawn_effect_id: uuid::Uuid::from_u128(11),
+            current_mux_incarnation: publication.mux_incarnation,
+            current_lease_generation: 1,
+        };
+        pane.checkpoint.authority = CheckpointAuthority::Guardian {
+            guardian_generation: 1,
+            publication,
+            catalog_generation: 1,
+        };
+        let Some(RecoverySplitNode::Split { left, .. }) =
+            image.topology.windows[0].tabs[0].root_split.as_mut()
+        else {
+            panic!("fixture must contain the first pane in a split");
+        };
+        let RecoverySplitNode::Leaf { pane_uuid, .. } = left.as_mut() else {
+            panic!("fixture must contain a leaf");
+        };
+        *pane_uuid = durable_id.to_string();
+        image.image_digest = image.compute_digest().unwrap();
+        let bytes = image.to_canonical_json().unwrap();
+        assert_eq!(MuxRecoveryImage::from_json_slice(&bytes).unwrap(), image);
+
+        if let RecoverySpawnCustody::Original {
+            current_mux_incarnation,
+            ..
+        } = &mut image.panes[0].spawn_custody
+        {
+            *current_mux_incarnation = uuid::Uuid::from_u128(12);
+        }
+        image.image_digest = image.compute_digest().unwrap();
+        assert!(matches!(
+            image.validate(),
+            Err(MuxRecoveryImageError::InvalidAuthority { pane_id: 1, .. })
+        ));
     }
 
     #[test]

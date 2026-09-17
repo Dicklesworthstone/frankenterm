@@ -6447,7 +6447,8 @@ mod tests {
                 schema_version: 2,
             },
         )]);
-        let captures = HashMap::from([(pane_id, RecoveryParserCheckpoint::Guardian(&published))]);
+        let parser_checkpoints =
+            HashMap::from([(pane_id, RecoveryParserCheckpoint::Guardian(&published))]);
         let image = MuxRecoveryImage::from_mux_captured_checkpoints(
             RecoveryImageGenerationMeta {
                 generation: 1,
@@ -6457,7 +6458,7 @@ mod tests {
                 session_id: "real-guardian-birth".into(),
             },
             &captured,
-            &captures,
+            &parser_checkpoints,
             &references,
         )
         .unwrap();
