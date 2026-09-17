@@ -3784,14 +3784,25 @@ impl ClientPane {
         if !ready.is_available() {
             return Ok(());
         }
-        let pending = self.resize_delivery.lock().before_ready.take();
+        // Retain the pending marker until admission consumes its attempt. An
+        // explicit resize back to the current geometry must still revoke it
+        // if it races this handoff to readiness.
+        let pending = self.resize_delivery.lock().before_ready.clone();
         let Some((bootstrap, size, attempt)) = pending else {
             return Ok(());
         };
         if !bootstrap.same_generation(&ready) {
+            let mut state = self.resize_delivery.lock();
+            if state.attempt == attempt {
+                state.before_ready = None;
+            }
             return Ok(());
         }
         let Some(registration) = self.mux_registration.load() else {
+            let mut state = self.resize_delivery.lock();
+            if state.attempt == attempt {
+                state.before_ready = None;
+            }
             return Ok(());
         };
         registration
@@ -3824,8 +3835,12 @@ impl ClientPane {
             }
             if unchanged && !state.failed {
                 // An explicit return to the current geometry supersedes an
-                // older request still waiting for bootstrap readiness.
-                state.begin()?;
+                // older request still waiting for bootstrap readiness. Keep
+                // the identity of an admitted resize: its outstanding reply
+                // must still be able to report failure for this geometry.
+                if state.before_ready.is_some() {
+                    state.begin()?;
+                }
                 return Ok(());
             }
             state.begin()?
@@ -5226,6 +5241,29 @@ mod tests {
             peer.is_empty(),
             "returning to current size supersedes pending resize"
         );
+
+        peer.activate_reconnect_generation(&inner.client).unwrap();
+        pane.resize(size).unwrap();
+        peer.complete_current_bootstrap(&inner.client).unwrap();
+        // Pause the readiness handoff after sampling its pending identity.
+        // A concurrent return to the displayed geometry must invalidate it.
+        let (_, sampled_size, sampled_attempt) =
+            pane.resize_delivery.lock().before_ready.clone().unwrap();
+        let ready = inner.client.rpc_scope();
+        pane.resize(TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        })
+        .unwrap();
+        pane.resize_with_readiness(sampled_size, Some((sampled_attempt, &ready)))
+            .unwrap();
+        assert!(
+            peer.is_empty(),
+            "superseded readiness handoff sent a resize"
+        );
     }
 
     #[test]
@@ -5418,6 +5456,13 @@ mod tests {
             dpi: 96,
         };
         pane.resize(size).unwrap();
+        let admitted_attempt = pane.resize_delivery.lock().attempt;
+        pane.resize(size).unwrap();
+        assert_eq!(
+            pane.resize_delivery.lock().attempt,
+            admitted_attempt,
+            "an unchanged size must retain the outstanding resize outcome"
+        );
         let paste = admit_interactive_rpc_now(inner.client.send_paste(SendPaste {
             pane_id: 29,
             data: "ordered input".to_string(),
