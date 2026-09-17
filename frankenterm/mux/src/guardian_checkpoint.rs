@@ -4618,7 +4618,15 @@ impl GuardianRestoredTerminal {
                     "restored guardian rollover differs from the exact prefix"
                 );
             }
-            GuardianCheckpointOutputBoundaryV1::Record { .. } => {}
+            GuardianCheckpointOutputBoundaryV1::Record {
+                committed_log_bytes,
+                ..
+            } => {
+                anyhow::ensure!(
+                    receipt.committed_log_bytes() > committed_log_bytes,
+                    "restored guardian record does not advance its segment endpoint"
+                );
+            }
         }
         self.terminal.replay_bytes(payload.as_ref())?;
         self.output = GuardianCheckpointOutputBoundaryV1::Record {
@@ -5147,6 +5155,9 @@ impl LiveParserCheckpointAck {
         if durable_pane_id != restored.durable_pane_id {
             return Err(GuardianCheckpointBoundaryError::ExpectedPaneIdentityMismatch);
         }
+        if durable_pane_id.is_nil() {
+            return Err(GuardianCheckpointBoundaryError::NilPaneIdentity);
+        }
         // A restored source is available only before the first new delivery.
         // Its model was installed before this external parser was constructed.
         if terminal_checkpoint.parser_stream_bytes() != 0 || restored.parser_stream_bytes != 0 {
@@ -5154,11 +5165,19 @@ impl LiveParserCheckpointAck {
         }
         let (terminal_payload_bytes, terminal_payload_digest) =
             terminal_payload_identity(terminal_checkpoint.canonical_payload())?;
+        let rows = u32::try_from(terminal_checkpoint.rows())
+            .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?;
+        let cols = u32::try_from(terminal_checkpoint.cols())
+            .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?;
+        if rows == 0 || cols == 0 {
+            return Err(GuardianCheckpointBoundaryError::ZeroGeometry);
+        }
+        // The registration validated the initial model before starting its
+        // reader. A later live barrier may capture a legitimate resize even
+        // when no additional output has reached the new parser.
         let boundary = GuardianCheckpointBoundary {
-            rows: u32::try_from(terminal_checkpoint.rows())
-                .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?,
-            cols: u32::try_from(terminal_checkpoint.cols())
-                .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?,
+            rows,
+            cols,
             terminal_payload_bytes,
             terminal_payload_digest,
             ..restored
@@ -11059,6 +11078,7 @@ mod tests {
             "LiveParserCheckpointAck::boundary:pub:production",
             "LiveParserCheckpointAck::boundary_digest:pub:production",
             "LiveParserCheckpointAck::capture:private:production",
+            "LiveParserCheckpointAck::capture_restored:private:production",
             "LiveParserCheckpointAck::checkpoint_artifact_identity_digest:pub:production",
             "LiveParserCheckpointAck::durable_pane_id:pub:production",
             "LiveParserCheckpointAck::into_parts:pub:production",
@@ -11369,6 +11389,12 @@ mod tests {
                 "private",
                 false,
                 "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "private",
+                false,
+                "fn capture_restored(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, restored: GuardianCheckpointBoundary, terminal_checkpoint: RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -11944,6 +11970,7 @@ mod tests {
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue:private:production",
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
+            "LiveParserCheckpointAck@LiveParserCheckpointAck::capture_restored:private:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -11969,6 +11996,7 @@ mod tests {
             "GuardianGenesisReservationIdentityV1@GuardianGenesisReservationIdentityV1::from_authenticated_spawn",
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
+            "LiveParserCheckpointAck@LiveParserCheckpointAck::capture_restored",
         ]
         .into_iter()
         .map(str::to_owned)

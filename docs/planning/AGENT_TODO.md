@@ -1277,6 +1277,18 @@ power loss nor migration of those live sessions has been demonstrated.
   carry a model-bound authenticated replay prefix through activation and
   registration, including Record checkpoints without a replay suffix.
   Do not manufacture an append receipt or seed raw caller-supplied watermarks.
+  - [x] Commit model-bound restoration, single-use registration prefix and
+    quiet Record checkpoint support in `6b346f2a6`.
+  - [x] Require new child output after registration in the real-process test;
+    verify it survives the checkpoint round trip as actual terminal cells.
+  - [x] Add prefix/model mismatch and pristine/duplicate registration tests.
+  - [ ] Pass focused mux tests and same-source sealed guardian/server build
+    (`6b346f2-restored-prefix-mux-rch.log` and
+    `6b346f2-sealed-family-build-rch.log`).
+  - [ ] Pass the real child birth/checkpoint/image/reopen test with the new
+    companion, then broader checkpoint authority and registration tests.
+  - [ ] Validate reviewed follow-up checks for increasing journal offsets,
+    nonzero geometry and the exact private capture authority inventory.
 - [x] Correct Clippy's similar-name error in the recovery-image adapter.
   Repeat current-source Clippy after the ongoing workspace pass settles.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
@@ -1284,6 +1296,8 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping
   difference in client consumer-commit code. Apply the exact formatter diff.
 - [ ] Repeat exact-source formatting proof after that correction.
+  Worker126's e08 run hit its remote deadline (exit 137) before executing
+  the test; it is not formatting proof. TS1 is independently disk-constrained.
 - [ ] Complete DSR quality: the c733 first check failed remote queue admission
   without local fallback. Four canonical attestation producers remain open:
   Lindley bounds, redaction, operating envelope and Doctor live transactions.
