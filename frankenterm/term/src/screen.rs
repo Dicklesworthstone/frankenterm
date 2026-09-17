@@ -4415,11 +4415,12 @@ impl Screen {
         else {
             return false;
         };
-        let mut unchanged = true;
-        self.with_phys_lines(start..end, |lines| {
-            unchanged &= lines.iter().all(|line| !line.changed_since(sequence));
-        });
-        unchanged
+        // Validate directly across both deque slices. Materializing a pointer
+        // vector here allocates for the entire selection on every observation,
+        // including each clipboard chunk and resize preparation.
+        self.lines
+            .range(start..end)
+            .all(|line| !line.changed_since(sequence))
     }
 
     /// LocalPane finalizes its layout floor after the terminal resize. Only
