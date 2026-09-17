@@ -4266,8 +4266,12 @@ impl TermWindow {
                                 || size.pixel_height != self.terminal_size.pixel_height
                             {
                                 self.set_window_size(size, window)?;
-                            } else if tab_size.dpi == 0 {
-                                log::debug!("fixup dpi in newly added tab");
+                            } else if tab_size != self.terminal_size {
+                                // A remote tab can already have a valid DPI
+                                // while retaining a smaller grid than this
+                                // native window. Reconcile all geometry, not
+                                // only the uninitialized-DPI case.
+                                log::debug!("align newly added tab to window geometry");
                                 tab.resize(self.terminal_size);
                             }
                         }
@@ -4305,9 +4309,9 @@ impl TermWindow {
                                     continue;
                                 }
                                 if let Some(tab) = notification_owner.get_tab(tab_id)
-                                    && tab.get_size().dpi == 0
+                                    && tab.get_size() != self.terminal_size
                                 {
-                                    log::debug!("fixup dpi in newly attached tab");
+                                    log::debug!("align newly attached tab to window geometry");
                                     tab.resize(self.terminal_size);
                                 }
                             }

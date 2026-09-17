@@ -10524,6 +10524,21 @@ impl TestRpcPeer {
         Ok(generation)
     }
 
+    pub(crate) fn complete_current_bootstrap(&self, client: &Client) -> anyhow::Result<()> {
+        anyhow::ensure!(self.receiver.is_empty(), "bootstrap has queued requests");
+        let generation = client
+            .rpc_transport
+            .active_generation()
+            .ok_or_else(|| anyhow!("bootstrap generation is not live"))?;
+        client
+            .rpc_transport
+            .mark_current_generation_ready_for_test();
+        client
+            .rpc_transport
+            .bind_render_connection_identity(generation, TEST_RENDER_CONNECTION_IDENTITY)?;
+        Ok(())
+    }
+
     pub(crate) async fn respond_next_reliable_applied(
         &self,
     ) -> anyhow::Result<TestReliableWireRequest> {

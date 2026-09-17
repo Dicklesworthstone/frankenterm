@@ -3086,6 +3086,7 @@ impl ClientDomain {
             .client
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
+        Self::flush_bootstrap_resizes(&mux, &expected);
         client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
         Ok(())
@@ -3160,6 +3161,19 @@ impl ClientDomain {
             .map_err(anyhow::Error::new)??;
         domain.refresh_layout_snapshot(&mux, &inner);
         Ok(prepared)
+    }
+
+    pub(crate) fn flush_bootstrap_resizes(mux: &Mux, inner: &ClientInner) {
+        for pane in mux.iter_panes() {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner)
+                && client_pane.flush_resize_after_ready().is_err()
+            {
+                log::warn!("initial remote pane geometry could not be admitted after readiness");
+            }
+        }
     }
 
     fn prepare_render_application_bootstrap(
@@ -4647,6 +4661,7 @@ impl ClientDomain {
         }
         .await;
         bootstrap_result?;
+        Self::flush_bootstrap_resizes(mux, &inner);
         domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
 
