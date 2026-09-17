@@ -99,7 +99,7 @@ pub use broker::{
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
-pub use output::GuardianDurableSpawnCustodyV1;
+pub use output::{GuardianDurableSpawnCustodyV1, GuardianReopenedCheckpointV1};
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]

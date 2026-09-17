@@ -26,8 +26,34 @@ pub(crate) struct SelectionCopy {
     join_previous: bool,
     has_line: bool,
     deadline: std::time::Instant,
+    deadline_wake: Option<SelectionCopyDeadline>,
     local: bool,
     local_read: Option<LocalSelectionRead>,
+}
+
+#[derive(Debug)]
+struct SelectionCopyDeadline(futures::future::AbortHandle);
+
+impl Drop for SelectionCopyDeadline {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn expire_selection_copy_deadline(
+    pending: &mut Option<crate::selection::PendingNativeSelection>,
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    if pending
+        .as_ref()
+        .and_then(|pending| pending.text_copy.as_ref())
+        .is_some_and(|copy| copy.deadline() == deadline)
+    {
+        crate::selection::PendingNativeSelection::expire_text_copy(pending, now)
+    } else {
+        false
+    }
 }
 
 type SelectionReadPlans = anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>;
@@ -171,6 +197,7 @@ impl SelectionCopy {
             join_previous: false,
             has_line: false,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline_wake: None,
             local: false,
             local_read: None,
         })
@@ -256,6 +283,63 @@ fn announce_pick_if_smart(pick: Option<SmartSelectionPick>) {
 }
 
 impl super::TermWindow {
+    /// Clipboard ownership must expire even when a hidden or failed surface
+    /// never presents another frame. One cancellable wake belongs to each copy.
+    fn arm_selection_copy_deadline(
+        &self,
+        pane_id: PaneId,
+        copy: &mut SelectionCopy,
+    ) -> Result<(), &'static str> {
+        let window = self
+            .window
+            .clone()
+            .ok_or("The window closed before copying could complete.")?;
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            _ => return Err("The copy deadline could not be scheduled. Copy the selection again."),
+        };
+        let deadline = copy.deadline();
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        copy.deadline_wake = Some(SelectionCopyDeadline(abort));
+        reservation
+            .spawn_local(async move {
+                let _ = futures::future::Abortable::new(
+                    async move {
+                        promise::spawn::sleep(
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        )
+                        .await;
+                        window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+                            let expired = tw
+                                .pane_state
+                                .borrow_mut()
+                                .get_mut(&pane_id)
+                                .is_some_and(|state| {
+                                    expire_selection_copy_deadline(
+                                        &mut state.pending_native_selection,
+                                        deadline,
+                                        std::time::Instant::now(),
+                                    )
+                                });
+                            if expired {
+                                frankenterm_toast_notification::persistent_toast_notification(
+                                    "Selection was not copied",
+                                    "The selected text did not arrive in time. Copy the selection again.",
+                                );
+                            }
+                        })));
+                    },
+                    registration,
+                )
+                .await;
+            })
+            .detach();
+        Ok(())
+    }
+
     pub fn selection_frame_stamp(
         &self,
         pane: &Arc<dyn Pane>,
@@ -577,10 +661,10 @@ impl super::TermWindow {
             return Err("The pane changed. Select the text again to copy it.");
         }
         if pending.text_copy.is_none() {
-            pending.text_copy = Some(
-                SelectionCopy::new(&pending.desired, sequence)
-                    .ok_or("The selection range is unavailable. Select the text again.")?,
-            );
+            let mut copy = SelectionCopy::new(&pending.desired, sequence)
+                .ok_or("The selection range is unavailable. Select the text again.")?;
+            self.arm_selection_copy_deadline(pane.pane_id(), &mut copy)?;
+            pending.text_copy = Some(copy);
         }
         let copy = pending.text_copy.as_mut().unwrap();
         copy.verify_source(sequence)?;
@@ -1372,6 +1456,56 @@ mod tests {
         copy.local = true;
         copy.push_chunk(vec![Line::from("")]).unwrap();
         assert_eq!(copy.finish(12).unwrap(), Some(String::new()));
+    }
+
+    #[test]
+    fn selection_copy_deadline_retires_hidden_read_without_presentation() {
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange::start(SelectionCoordinate::x_y(0, 0)));
+        let mut copy = SelectionCopy::new(&selection, 12).unwrap();
+        let deadline = copy.deadline();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = sync_channel(1);
+        let (retire, retired) = sync_channel(1);
+        sender
+            .send(LocalSelectionReadReady {
+                plans: Some(Ok(Vec::new())),
+                retire,
+            })
+            .unwrap_or_else(|_| panic!("read receiver must be alive"));
+        copy.local_read = Some(LocalSelectionRead {
+            receiver,
+            ready: None,
+            cancelled: Arc::clone(&cancelled),
+        });
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        copy.deadline_wake = Some(SelectionCopyDeadline(abort.clone()));
+        let mut pending = Some(crate::selection::PendingNativeSelection::new(selection));
+        pending.as_mut().unwrap().text_copy = Some(copy);
+
+        // An old notification must not retire a newer transaction, even if
+        // dispatch was delayed beyond both deadlines.
+        assert!(!expire_selection_copy_deadline(
+            &mut pending,
+            deadline - std::time::Duration::from_secs(1),
+            deadline,
+        ));
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert!(!expire_selection_copy_deadline(
+            &mut pending,
+            deadline,
+            deadline - std::time::Duration::from_nanos(1),
+        ));
+        assert!(expire_selection_copy_deadline(
+            &mut pending,
+            deadline,
+            deadline,
+        ));
+        assert!(pending.is_none());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(abort.is_aborted());
+        assert!(retired.try_recv().unwrap().unwrap().is_empty());
+        drop(registration);
     }
 
     #[test]

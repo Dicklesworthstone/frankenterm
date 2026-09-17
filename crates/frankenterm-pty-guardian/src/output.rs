@@ -697,6 +697,44 @@ impl GuardianDurableSpawnCustodyV1 {
         self.context.scope()
     }
 
+    /// Reopen an acknowledged, protected checkpoint using existing private
+    /// custody and catalog bytes only. This grants offline verification, never
+    /// a writer lease or permission to rotate a later successor generation.
+    pub fn reopen_checkpoint(
+        self,
+        checkpoint_id: [u8; 32],
+    ) -> Result<GuardianReopenedCheckpointV1, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::Pane {
+                    pane_id: self.context.pane_id,
+                },
+            )?;
+            checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+            checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
+            let mut selected = scan.published.iter().filter(|member| {
+                member.format == CheckpointCatalogFormat::ProtectedV3
+                    && member.metadata.checkpoint_id == checkpoint_id
+            });
+            let member = selected
+                .next()
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if selected.next().is_some()
+                || member.metadata.capture_generation != 1
+                || member.metadata.adoption_mux_incarnation != self.context.mux_incarnation
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            checkpoint_catalog_require_existing_ack(inner, member)?;
+            Ok(GuardianReopenedCheckpointV1 {
+                scope: self.context.scope(),
+                metadata: member.metadata,
+            })
+        })
+    }
+
     fn open_existing_store(
         token_path: &Path,
     ) -> Result<GuardianCheckpointStageStore, GuardianCheckpointStageStoreError> {
@@ -809,6 +847,40 @@ struct CheckpointCatalogMetadata {
     genesis_live_guardian_build_identity_digest: [u8; 32],
     genesis_pixel_width: u16,
     genesis_pixel_height: u16,
+}
+
+/// Read-only evidence obtained from an existing private Spawn capability and
+/// one settled ProtectedV3 publication with an authenticated ACK finalizer.
+/// The guardian identity comes from custody under the same pinned key; the
+/// catalog binds the pane, original mux, generation and canonical payload.
+/// Process-local registration is deliberately not claimed by this witness.
+pub struct GuardianReopenedCheckpointV1 {
+    scope: GuardianSpawnCustodyScopeV1,
+    metadata: CheckpointCatalogMetadata,
+}
+
+impl GuardianReopenedCheckpointV1 {
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.scope
+    }
+    pub const fn generation(&self) -> u64 {
+        self.metadata.capture_generation
+    }
+    pub const fn sequence(&self) -> u64 {
+        self.metadata.adoption_sequence
+    }
+    pub const fn effect_id(&self) -> Uuid {
+        self.metadata.adoption_effect_id
+    }
+    pub const fn checkpoint_id(&self) -> [u8; 32] {
+        self.metadata.checkpoint_id
+    }
+    pub const fn boundary_id(&self) -> [u8; 32] {
+        self.metadata.boundary_id
+    }
+    pub const fn payload_digest(&self) -> [u8; 32] {
+        self.metadata.terminal_payload_digest
+    }
 }
 
 /// Guardian-private proof that one exact Genesis reservation is represented by
@@ -10919,6 +10991,140 @@ fn checkpoint_catalog_adoption_binding(
         metadata.cols,
     )
     .map_err(Into::into)
+}
+
+fn checkpoint_catalog_require_existing_ack(
+    inner: &GuardianCheckpointStageStoreInner,
+    member: &PublishedCheckpointCatalogMember,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let census = checkpoint_stage_census(inner)?;
+    let metadata = member.metadata;
+    let CheckpointCatalogScope::Pane { pane_id } = metadata.identity.scope else {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    };
+    let mut candidates = census.entries.iter().filter(|entry| {
+        entry.key.scope
+            == (CheckpointStagePathScope::Pane {
+                pane_id,
+                generation: metadata.capture_generation,
+            })
+            && entry.key.upload_id == metadata.upload_id
+            && entry.role == CheckpointStageFileRole::Candidate
+    });
+    let entry = candidates
+        .next()
+        .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    if candidates.next().is_some() {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let (_, plaintext) = checkpoint_open_record(
+        inner,
+        entry,
+        CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES as u32,
+    )?;
+    let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+    if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let shape = CheckpointStageRequestShape::from_request(&begin)?;
+    if shape.key() != entry.key
+        || shape.descriptor.checkpoint_id().into_bytes() != metadata.checkpoint_id
+        || shape.descriptor.boundary_id().into_bytes() != metadata.boundary_id
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let inspection = checkpoint_inspect_upload(
+        inner,
+        &census,
+        &shape,
+        CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+    )?
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    if !inspection.ack_present
+        || !inspection.seal_present
+        || inspection.expiry_present
+        || inspection.publication_id != metadata.completion_id
+        || (inspection.next_index, inspection.committed_bytes)
+            != (shape.total_chunks, shape.total_bytes)
+    {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let seal = census
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == shape.key()
+                && entry.role
+                    == (CheckpointStageFileRole::Seal {
+                        publication_id: metadata.completion_id,
+                    })
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, seal_record, _) =
+        checkpoint_read_record(inner, seal, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
+    let seal_request = GuardianCheckpointStageRequestV1::seal(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+    )?;
+    let completion = inner.cipher.inspect_durable_manifest_receipt(
+        &shape.binding,
+        seal_request,
+        metadata.completion_id,
+        inspection.candidate_identity,
+        inspection
+            .ordered_chunk_set_identity
+            .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?,
+        &seal_record,
+    )?;
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        &member.candidate_path,
+        member.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+    if candidate.format != CheckpointCatalogFormat::ProtectedV3
+        || candidate.metadata != metadata
+        || candidate.checksum != member.candidate_checksum
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let binding = checkpoint_catalog_adoption_binding(&candidate)?;
+    let evidence = candidate
+        .adoption_evidence
+        .as_ref()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let ack = census
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == shape.key()
+                && entry.role
+                    == (CheckpointStageFileRole::Ack {
+                        publication_id: metadata.completion_id,
+                    })
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, ack_record, _) =
+        checkpoint_read_record(inner, ack, CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES as u32)?;
+    let ack_request = GuardianCheckpointStageRequestV1::ack(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+        metadata.completion_id,
+    )?;
+    inner.cipher.inspect_ack_finalizer_from_catalog(
+        &completion,
+        &ack_request,
+        &binding,
+        evidence,
+        metadata.adoption_mux_incarnation,
+        &ack_record,
+    )?;
+    Ok(())
 }
 
 fn checkpoint_catalog_recover_adoption_evidence(

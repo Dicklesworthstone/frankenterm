@@ -6807,6 +6807,9 @@ pub struct WholeMuxRecoveryVerifier {
     admission: Option<Arc<RepairAdmissionController>>,
     #[cfg(feature = "frankenterm-deps")]
     published_guardian_captures: HashMap<uuid::Uuid, PublishedGuardianCaptureWitness>,
+    #[cfg(feature = "frankenterm-deps")]
+    reopened_guardian_captures:
+        HashMap<uuid::Uuid, frankenterm_pty_guardian::GuardianReopenedCheckpointV1>,
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -6856,6 +6859,8 @@ impl WholeMuxRecoveryVerifier {
             admission: None,
             #[cfg(feature = "frankenterm-deps")]
             published_guardian_captures: HashMap::new(),
+            #[cfg(feature = "frankenterm-deps")]
+            reopened_guardian_captures: HashMap::new(),
         }
     }
 
@@ -6874,8 +6879,10 @@ impl WholeMuxRecoveryVerifier {
         published: &mux::guardian_checkpoint::PublishedGuardianCheckpoint,
     ) -> Result<(), WholeMuxRecoveryError> {
         let pane = published.capture().durable_pane_id();
-        if self.published_guardian_captures.len() >= self.limits.max_panes
+        if self.published_guardian_captures.len() + self.reopened_guardian_captures.len()
+            >= self.limits.max_panes
             || self.published_guardian_captures.contains_key(&pane)
+            || self.reopened_guardian_captures.contains_key(&pane)
         {
             return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                 pane_id: 0,
@@ -6897,6 +6904,29 @@ impl WholeMuxRecoveryVerifier {
                 .into(),
             },
         );
+        Ok(())
+    }
+
+    /// Install only guardian-owned evidence reopened from existing custody,
+    /// a settled protected catalog, and its durable ACK. This authorizes
+    /// offline decoding of an authenticated image, never live pane activation.
+    #[cfg(feature = "frankenterm-deps")]
+    pub fn register_reopened_guardian_capture(
+        &mut self,
+        witness: frankenterm_pty_guardian::GuardianReopenedCheckpointV1,
+    ) -> Result<(), WholeMuxRecoveryError> {
+        let pane = witness.scope().pane_id;
+        if self.published_guardian_captures.len() + self.reopened_guardian_captures.len()
+            >= self.limits.max_panes
+            || self.published_guardian_captures.contains_key(&pane)
+            || self.reopened_guardian_captures.contains_key(&pane)
+        {
+            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                pane_id: 0,
+                reason: "duplicate or over-budget reopened guardian witness".to_owned(),
+            });
+        }
+        self.reopened_guardian_captures.insert(pane, witness);
         Ok(())
     }
 
@@ -7258,6 +7288,35 @@ impl WholeMuxRecoveryVerifier {
                                         .to_owned(),
                                 });
                             }
+                        } else if let Some(witness) =
+                            pane_uuid.and_then(|id| self.reopened_guardian_captures.get(&id))
+                        {
+                            let scope = witness.scope();
+                            let expected_provenance =
+                                crate::mux_recovery_image::RecoverySpawnCustody::from(Some(
+                                    mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+                                        original: scope,
+                                        current_mux_incarnation: scope.mux_incarnation,
+                                        current_lease_generation: witness.generation(),
+                                    },
+                                ));
+                            if pane.spawn_custody != expected_provenance
+                                || scope.guardian_incarnation != publication.guardian_incarnation
+                                || scope.mux_incarnation != publication.mux_incarnation
+                                || witness.generation() != *guardian_generation
+                                || witness.sequence() != *catalog_generation
+                                || witness.effect_id() != publication.effect_id
+                                || witness.checkpoint_id() != publication.checkpoint_identity
+                                || witness.boundary_id() != publication.output_boundary_identity
+                            {
+                                return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                    pane_id: pane.pane_id as u64,
+                                    reason: "reopened guardian witness does not match image"
+                                        .to_owned(),
+                                });
+                            }
+                            // Registration belongs to the authenticated whole-image
+                            // envelope and its bijection, not the durable catalog.
                         } else {
                             return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                                 pane_id: pane.pane_id as u64,
@@ -7363,16 +7422,23 @@ impl WholeMuxRecoveryVerifier {
                 &pane.checkpoint.authority,
                 CheckpointAuthority::Guardian { .. }
             ) {
-                let witness = uuid::Uuid::parse_str(&pane.pane_uuid)
+                let payload_digest = uuid::Uuid::parse_str(&pane.pane_uuid)
                     .ok()
-                    .and_then(|id| self.published_guardian_captures.get(&id))
+                    .and_then(|id| {
+                        self.published_guardian_captures
+                            .get(&id)
+                            .map(|witness| witness.payload_digest)
+                            .or_else(|| {
+                                self.reopened_guardian_captures
+                                    .get(&id)
+                                    .map(|witness| witness.payload_digest())
+                            })
+                    })
                     .ok_or_else(|| WholeMuxRecoveryError::UnprovedGuardianAuthority {
                         pane_id: pane.pane_id as u64,
                         reason: "published guardian witness disappeared".to_owned(),
                     })?;
-                if <[u8; 32]>::from(Sha256::digest(decoded_json.as_slice()))
-                    != witness.payload_digest
-                {
+                if <[u8; 32]>::from(Sha256::digest(decoded_json.as_slice())) != payload_digest {
                     return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                         pane_id: pane.pane_id as u64,
                         reason: "decrypted terminal differs from published guardian capture"
