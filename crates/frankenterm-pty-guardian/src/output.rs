@@ -11194,7 +11194,6 @@ fn checkpoint_catalog_validate_chain(
         .first()
         .map(|member| member.metadata.identity.scope);
     let mut previous: Option<&PublishedCheckpointCatalogMember> = None;
-    let mut boundaries = BTreeMap::new();
     let mut checkpoints = BTreeSet::new();
     let mut adoption_effects = BTreeSet::new();
     for member in published.iter() {
@@ -11230,12 +11229,10 @@ fn checkpoint_catalog_validate_chain(
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        if let Some(existing_checkpoint) =
-            boundaries.insert(member.metadata.boundary_id, member.metadata.checkpoint_id)
-            && existing_checkpoint != member.metadata.checkpoint_id
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
+        // An output boundary identifies the consumed journal prefix, not the
+        // entire terminal model. A resize can publish another authenticated
+        // checkpoint at that prefix. The predecessor chain and unique
+        // checkpoint/effect identities still determine publication order.
         previous = Some(member);
     }
     Ok(())
@@ -12297,7 +12294,6 @@ fn checkpoint_catalog_publish_sealed_stage(
     let scan = checkpoint_catalog_scan(inner, scope)?;
     if let Some(existing) = scan.published.iter().find(|member| {
         member.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
-            || member.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
     }) {
         if existing.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
             && existing.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
@@ -13271,7 +13267,7 @@ mod tests {
         }
     }
 
-    fn checkpoint_catalog_test_terminal(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+    fn checkpoint_catalog_test_terminal_instance(content: &[u8]) -> Terminal {
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -13287,6 +13283,10 @@ mod tests {
         );
         terminal.advance_bytes(content);
         terminal
+    }
+
+    fn checkpoint_catalog_test_terminal(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+        checkpoint_catalog_test_terminal_instance(content)
             .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
             .expect("capture canonical catalog checkpoint fixture")
     }
@@ -13489,6 +13489,10 @@ mod tests {
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let total_chunks = u32::try_from(total_bytes.div_ceil(u64::from(chunk_bytes)))
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let rows = u32::try_from(terminal.rows())
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let cols = u32::try_from(terminal.cols())
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let parser_stream_bytes = terminal.parser_stream_bytes();
         let replay_identity = mux::guardian_checkpoint::current_replay_identity_digest();
 
@@ -13509,8 +13513,8 @@ mod tests {
         checkpoint_hasher.update(boundary_digest);
         checkpoint_hasher.update(parser_stream_bytes.to_le_bytes());
         checkpoint_hasher.update(replay_identity);
-        checkpoint_hasher.update(24_u32.to_le_bytes());
-        checkpoint_hasher.update(80_u32.to_le_bytes());
+        checkpoint_hasher.update(rows.to_le_bytes());
+        checkpoint_hasher.update(cols.to_le_bytes());
         checkpoint_hasher.update(total_bytes.to_le_bytes());
         checkpoint_hasher.update(terminal_digest);
         let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
@@ -13543,8 +13547,8 @@ mod tests {
         wire[88..120].copy_from_slice(&boundary_digest);
         wire[120..128].copy_from_slice(&generation.to_be_bytes());
         wire[128..160].copy_from_slice(&replay_identity);
-        wire[160..164].copy_from_slice(&24_u32.to_be_bytes());
-        wire[164..168].copy_from_slice(&80_u32.to_be_bytes());
+        wire[160..164].copy_from_slice(&rows.to_be_bytes());
+        wire[164..168].copy_from_slice(&cols.to_be_bytes());
         wire[168..176].copy_from_slice(&total_bytes.to_be_bytes());
         wire[176..208].copy_from_slice(&terminal_digest);
         wire[208..224].copy_from_slice(pane_id.as_bytes());
@@ -13576,8 +13580,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn checkpoint_catalog_stage_and_publish(
-        pipeline: &GuardianOutputPipeline,
+    fn checkpoint_catalog_stage_and_publish_checkpoint(
         store: &GuardianCheckpointStageStore,
         journal: &GuardianPaneOutputJournal,
         state: &mut GuardianProtocolState,
@@ -13587,11 +13590,9 @@ mod tests {
         generation: u64,
         sequence: u64,
         identity_base: u128,
-        appended_output: &[u8],
-        complete_terminal_output: &[u8],
+        receipt: GuardianOutputAppendReceipt,
+        terminal: &RecoveryTerminalCheckpointV2,
     ) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
-        let receipt = durable_commit(pipeline, pane_id, journal, appended_output)?;
-        let terminal = checkpoint_catalog_test_terminal(complete_terminal_output);
         if terminal.parser_stream_bytes() != receipt.cumulative_plaintext_bytes() {
             return Err("catalog fixture parser/output watermark mismatch".into());
         }
@@ -13602,7 +13603,7 @@ mod tests {
             pane_id,
             generation,
             upload_id,
-            &terminal,
+            terminal,
             receipt,
             chunk_bytes,
             None,
@@ -13620,7 +13621,7 @@ mod tests {
                 pane_id,
                 generation,
                 upload_id,
-                &terminal,
+                terminal,
                 receipt,
                 chunk_bytes,
                 Some((u32::try_from(index)?, bytes)),
@@ -13632,7 +13633,7 @@ mod tests {
             pane_id,
             generation,
             upload_id,
-            &terminal,
+            terminal,
             receipt,
             chunk_bytes,
             None,
@@ -13665,10 +13666,51 @@ mod tests {
             Some(Uuid::from_u128(identity_base + 3)),
             adoption_payload,
         )?;
-        state.apply_checkpoint_transactionally(&adoption, |permit| {
-            store.publish_checkpoint_catalog_adoption(permit)
+        let adoption_receipt = state.apply_checkpoint_transactionally(&adoption, |permit| {
+            let result = store.publish_checkpoint_catalog_adoption(permit);
+            if let Err(ref err) = result {
+                eprintln!("stage_and_publish_checkpoint adoption error: {err:?}");
+            }
+            result
         })?;
+        if adoption_receipt.disposition()
+            != mux::guardian_protocol::GuardianCheckpointDisposition::Committed
+        {
+            return Err("test catalog adoption publication did not commit".into());
+        }
         Ok((checkpoint_id, replay_semantics_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_catalog_stage_and_publish(
+        pipeline: &GuardianOutputPipeline,
+        store: &GuardianCheckpointStageStore,
+        journal: &GuardianPaneOutputJournal,
+        state: &mut GuardianProtocolState,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+        generation: u64,
+        sequence: u64,
+        identity_base: u128,
+        appended_output: &[u8],
+        complete_terminal_output: &[u8],
+    ) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
+        let receipt = durable_commit(pipeline, pane_id, journal, appended_output)?;
+        let terminal = checkpoint_catalog_test_terminal(complete_terminal_output);
+        checkpoint_catalog_stage_and_publish_checkpoint(
+            store,
+            journal,
+            state,
+            guardian_incarnation,
+            mux_incarnation,
+            pane_id,
+            generation,
+            sequence,
+            identity_base,
+            receipt,
+            &terminal,
+        )
     }
 
     fn checkpoint_catalog_replay_request(
@@ -14184,6 +14226,230 @@ mod tests {
                 .apply_ack_from_committed_catalog(make_ack(completion)?, mux)?,
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_catalog_resize_at_same_durable_output_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, poll, pipeline) = pipeline_with_policy(
+            "ft-guardian-catalog-resize-same-boundary-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let guardian = Uuid::from_u128(0xaf100);
+        let mux = Uuid::from_u128(0xaf101);
+        let pane = Uuid::from_u128(0xaf102);
+        let journal = pipeline.prepare_pane(guardian, pane)?;
+        let mut state = checkpoint_catalog_claimed_protocol_state(guardian, mux, pane)?;
+
+        // 1. Commit genuine durable output ONCE.
+        let receipt = durable_commit(&pipeline, pane, &journal, b"durable-content-for-resize")?;
+
+        // 2. Construct real Terminal and capture initial checkpoint at (24, 80).
+        let mut terminal = checkpoint_catalog_test_terminal_instance(b"durable-content-for-resize");
+        let terminal_1 = terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("capture initial terminal checkpoint");
+        assert_eq!(terminal_1.rows(), 24);
+        assert_eq!(terminal_1.cols(), 80);
+        assert_eq!(
+            terminal_1.parser_stream_bytes(),
+            receipt.cumulative_plaintext_bytes()
+        );
+
+        // 3. Publish first checkpoint.
+        let (checkpoint_id_1, _) = checkpoint_catalog_stage_and_publish_checkpoint(
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            mux,
+            pane,
+            1,
+            1,
+            0xaf110,
+            receipt,
+            &terminal_1,
+        )?;
+
+        // 4. Complete real Ack for first publication.
+        let (begin1, completion1) = store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(catalog.published.len(), 1);
+            let member = &catalog.published[0];
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            Ok((
+                GuardianCheckpointStageRequestV1::decode(&plaintext)?,
+                member.metadata.completion_id,
+            ))
+        })?;
+        let ack1 = GuardianCheckpointStageRequestV1::ack(
+            begin1.scope(),
+            begin1.upload_id(),
+            begin1.descriptor(),
+            begin1.chunk_bytes(),
+            completion1,
+        )?;
+        let expected_reply1 = GuardianCheckpointStageReplyV1::Acked {
+            upload_id: begin1.upload_id(),
+            completion_id: completion1,
+            checkpoint_id: begin1.descriptor().checkpoint_id(),
+            boundary_id: begin1.descriptor().boundary_id(),
+            total_bytes: begin1.total_bytes(),
+        };
+        let reply1 = store.apply_ack_from_committed_catalog(ack1, mux)?;
+        assert_eq!(reply1, expected_reply1);
+
+        // 5. Resize same Terminal without advance_bytes.
+        terminal.resize(TerminalSize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        });
+        let terminal_2 = terminal
+            .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+            .expect("capture resized terminal checkpoint");
+        assert_eq!(terminal_2.rows(), 40);
+        assert_eq!(terminal_2.cols(), 100);
+        assert_eq!(
+            terminal_2.parser_stream_bytes(),
+            receipt.cumulative_plaintext_bytes()
+        );
+
+        // 6. Publish second via authenticated state mutation seq2 using SAME genuine durable receipt.
+        let (checkpoint_id_2, _) = checkpoint_catalog_stage_and_publish_checkpoint(
+            &store,
+            &journal,
+            &mut state,
+            guardian,
+            mux,
+            pane,
+            1,
+            2,
+            0xaf220,
+            receipt,
+            &terminal_2,
+        )?;
+        assert_ne!(checkpoint_id_1, checkpoint_id_2);
+
+        // 7. Preserve ALL catalog files and scan two published members.
+        let (begin2, completion2) = store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(catalog.published.len(), 2);
+            assert_eq!(catalog.published[0].metadata.checkpoint_id, checkpoint_id_1);
+            assert_eq!(catalog.published[1].metadata.checkpoint_id, checkpoint_id_2);
+            assert_eq!(
+                catalog.published[0].metadata.boundary_id,
+                catalog.published[1].metadata.boundary_id
+            );
+            let member = &catalog.published[1];
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            Ok((
+                GuardianCheckpointStageRequestV1::decode(&plaintext)?,
+                member.metadata.completion_id,
+            ))
+        })?;
+
+        // 8. Ack second publication.
+        let ack2 = GuardianCheckpointStageRequestV1::ack(
+            begin2.scope(),
+            begin2.upload_id(),
+            begin2.descriptor(),
+            begin2.chunk_bytes(),
+            completion2,
+        )?;
+        let expected_reply2 = GuardianCheckpointStageReplyV1::Acked {
+            upload_id: begin2.upload_id(),
+            completion_id: completion2,
+            checkpoint_id: begin2.descriptor().checkpoint_id(),
+            boundary_id: begin2.descriptor().boundary_id(),
+            total_bytes: begin2.total_bytes(),
+        };
+        let reply2 = store.apply_ack_from_committed_catalog(ack2, mux)?;
+        assert_eq!(reply2, expected_reply2);
+
+        // 9. Reopen pipeline and verify catalog and Ack replay on exact historical and latest.
+        drop(state);
+        drop(journal);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+
+        let (_reopened_poll, reopened_pipeline) =
+            reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let reopened_store = reopened_pipeline.checkpoint_stage_store();
+        reopened_store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(catalog.published.len(), 2);
+            assert_eq!(catalog.published[0].metadata.checkpoint_id, checkpoint_id_1);
+            assert_eq!(catalog.published[1].metadata.checkpoint_id, checkpoint_id_2);
+            assert_eq!(
+                catalog.published[0].metadata.boundary_id,
+                catalog.published[1].metadata.boundary_id
+            );
+            Ok(())
+        })?;
+        let make_ack1 = GuardianCheckpointStageRequestV1::ack(
+            begin1.scope(),
+            begin1.upload_id(),
+            begin1.descriptor(),
+            begin1.chunk_bytes(),
+            completion1,
+        )?;
+        assert_eq!(
+            reopened_store.apply_ack_from_committed_catalog(make_ack1, mux)?,
+            expected_reply1
+        );
+        let make_ack2 = GuardianCheckpointStageRequestV1::ack(
+            begin2.scope(),
+            begin2.upload_id(),
+            begin2.descriptor(),
+            begin2.chunk_bytes(),
+            completion2,
+        )?;
+        assert_eq!(
+            reopened_store.apply_ack_from_committed_catalog(make_ack2, mux)?,
+            expected_reply2
+        );
+
         Ok(())
     }
 
@@ -17164,10 +17430,11 @@ mod tests {
         let mut mixed_scope = vec![first.clone(), mixed];
         assert!(checkpoint_catalog_validate_chain(&mut mixed_scope).is_err());
 
-        let mut divergent_boundary = second.clone();
-        divergent_boundary.metadata.boundary_id = first.metadata.boundary_id;
-        let mut boundary_splice = vec![first.clone(), divergent_boundary];
-        assert!(checkpoint_catalog_validate_chain(&mut boundary_splice).is_err());
+        let mut resized_at_same_boundary = second.clone();
+        resized_at_same_boundary.metadata.boundary_id = first.metadata.boundary_id;
+        let mut same_output_prefix = vec![first.clone(), resized_at_same_boundary];
+        checkpoint_catalog_validate_chain(&mut same_output_prefix)
+            .expect("distinct terminal checkpoints may share a durable output prefix");
 
         let mut duplicate_checkpoint = second;
         duplicate_checkpoint.metadata.checkpoint_id = first.metadata.checkpoint_id;

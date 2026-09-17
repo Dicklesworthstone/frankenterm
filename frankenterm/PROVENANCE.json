@@ -156,21 +156,21 @@
         "cleanup": 2,
         "cosmetic": 19,
         "feat": 53,
-        "fix": 96,
+        "fix": 97,
         "other": 17,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 31
+        "test": 33
       },
-      "fork_side_commit_count": 233,
+      "fork_side_commit_count": 236,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-17T12:55:30-04:00",
-        "sha": "92be000d93cf96cf1cdc47ca2f24af04919f2661",
-        "subject": "test(client): initialize replacement render stream after reconnect readiness"
+        "committed_at": "2026-09-17T13:31:53-04:00",
+        "sha": "42a6d49981e84a11b46317371e45d54fce8fd95d",
+        "subject": "test(client): settle palette setup before resize echo assertions"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2734,
-  "generated_at": "2026-09-17T16:56:55.036961Z",
+  "fork_side_commit_total": 2737,
+  "generated_at": "2026-09-17T17:49:04.395690Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

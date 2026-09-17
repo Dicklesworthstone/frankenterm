@@ -73,7 +73,16 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Text-tail requests fetch the requested suffix without transferring the entire
   scrollback. Truncation metadata omits the unfetched prefix's byte count.
 
-The `0.15.6-rc.34` candidate includes these changes. The 50 ms resize target,
+- Applying a remote topology snapshot no longer sends its observed dimensions
+  back as a new resize command that could undo a newer font or window resize.
+- Repeated unchanged guardian captures reuse the fully acknowledged publication
+  within the same live lease instead of uploading an identical checkpoint under
+  a conflicting adoption identity.
+- Guardian checkpoint catalogs retain distinct terminal states captured at the
+  same durable output boundary, including a resize without new process output.
+  Checkpoint identities and authenticated adoption history remain distinct.
+
+The `0.15.6-rc.35` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.

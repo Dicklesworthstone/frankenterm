@@ -6875,13 +6875,18 @@ impl SessionHandler {
                                         )
                                     })
                                     .ok_or_else(|| {
-                                        anyhow!("pane registration {} is no longer current", pane_id)
+                                        anyhow!(
+                                            "pane registration {} is no longer current",
+                                            pane_id
+                                        )
                                     })?
                             });
                             match result {
                                 Ok(Ok(())) => {}
                                 Ok(Err(err)) | Err(err) => {
-                                    log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                                    log::error!(
+                                        "scheduled pane {pane_id} render push failed: {err:#}"
+                                    );
                                     return;
                                 }
                             }
