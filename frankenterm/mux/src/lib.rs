@@ -19176,6 +19176,7 @@ impl Mux {
         {
             return false;
         }
+        let _registration = self.pane_registration.lock();
         self.panes.read().get(&pane_id).is_some_and(|current| {
             Arc::ptr_eq(&current.pane, &registered.0)
                 && Arc::ptr_eq(&current.generation, &registered.1)

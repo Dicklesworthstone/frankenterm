@@ -592,8 +592,10 @@ pub fn publish_whole_mux_recovery(
             crate::mux_recovery_image::RecoveryParserCheckpoint::Guardian(published) => {
                 current_verifier.register_published_guardian_capture(published)?;
                 validate_whole_mux_publication(
-                    usize::try_from(checkpoint.checkpoint().semantic_generation())
-                        .is_ok_and(|generation| generation != usize::MAX),
+                    published.capture().semantic_generation()
+                        == checkpoint.checkpoint().semantic_generation()
+                        && usize::try_from(checkpoint.checkpoint().semantic_generation())
+                            .is_ok_and(|generation| generation != usize::MAX),
                     "whole-mux checkpoint semantic generation mismatch or exhaustion",
                 )?;
             }
