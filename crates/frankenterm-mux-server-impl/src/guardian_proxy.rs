@@ -3080,6 +3080,15 @@ impl GuardianPaneLeaseActor {
                 | None => {}
             }
         }
+        if (kind == GenericMutation::Close && self.disposition == GuardianLeaseDisposition::Closed)
+            || (kind == GenericMutation::Retire
+                && matches!(
+                    self.disposition,
+                    GuardianLeaseDisposition::Closed | GuardianLeaseDisposition::Retired
+                ))
+        {
+            return Ok(());
+        }
         self.begin_generic(kind)?;
         match self.retry_pending(None)? {
             RecoveredPendingMutation::Generic => Ok(()),
@@ -9665,6 +9674,216 @@ mod tests {
                 FakeCall::QueryInput { .. }
             ]
         ));
+    }
+
+    #[test]
+    fn terminal_observation_permits_retire_and_close_after_full_input_recovery() {
+        for mutation in ["retire", "close"] {
+            let (staging, state) = fake_staging(
+                [
+                    FakeDirective::Io,
+                    FakeDirective::Observe(ObservedChildState::Exited(24)),
+                    FakeDirective::Query(InputEffectState::DurableFull),
+                ],
+                64,
+            );
+            let actor = staging.shared_actor();
+            assert!(matches!(
+                actor.lock().write_input(b"abcdef"),
+                Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+            ));
+            let mut child = GuardianProxyChild {
+                actor: Arc::clone(&actor),
+                census: Arc::clone(&staging.census),
+            };
+            assert_eq!(
+                child
+                    .try_wait()
+                    .expect("terminal census remains observable")
+                    .expect("pane exited")
+                    .exit_code(),
+                24
+            );
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::TerminalObserved
+            );
+            if mutation == "retire" {
+                assert!(actor.lock().retire(identity()).is_ok());
+            } else {
+                assert!(actor.lock().close(identity()).is_ok());
+            }
+            assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Closed);
+            assert_eq!(actor.lock().next_sequence(), 65);
+            assert!(matches!(
+                actor.lock().resize(size(25, 80)),
+                Err(GuardianProxyError::LeaseNotAttached)
+            ));
+            assert!(actor.lock().close(identity()).is_ok());
+            assert!(actor.lock().retire(identity()).is_ok());
+            assert!(matches!(
+                state.lock().calls.as_slice(),
+                [
+                    FakeCall::Input { .. },
+                    FakeCall::Census,
+                    FakeCall::QueryInput { .. },
+                ]
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_observation_rejects_retire_and_close_on_partial_input_recovery() {
+        for mutation in ["retire", "close"] {
+            let (staging, state) = fake_staging(
+                [
+                    FakeDirective::Io,
+                    FakeDirective::Observe(ObservedChildState::Exited(24)),
+                    FakeDirective::Query(InputEffectState::DurablePrefix { applied_bytes: 3 }),
+                ],
+                64,
+            );
+            let actor = staging.shared_actor();
+            assert!(matches!(
+                actor.lock().write_input(b"abcdef"),
+                Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+            ));
+            let mut child = GuardianProxyChild {
+                actor: Arc::clone(&actor),
+                census: Arc::clone(&staging.census),
+            };
+            assert_eq!(
+                child
+                    .try_wait()
+                    .expect("terminal census remains observable")
+                    .expect("pane exited")
+                    .exit_code(),
+                24
+            );
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::TerminalObserved
+            );
+            let outcome = if mutation == "retire" {
+                actor.lock().retire(identity())
+            } else {
+                actor.lock().close(identity())
+            };
+            assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::PreviousInputPartiallyApplied {
+                    applied_bytes: 3,
+                    input_bytes: 6,
+                })
+            ));
+            assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Closed);
+            assert_eq!(actor.lock().next_sequence(), 65);
+            if mutation == "retire" {
+                assert!(actor.lock().retire(identity()).is_ok());
+            } else {
+                assert!(actor.lock().close(identity()).is_ok());
+            }
+            assert!(matches!(
+                state.lock().calls.as_slice(),
+                [
+                    FakeCall::Input { .. },
+                    FakeCall::Census,
+                    FakeCall::QueryInput { .. },
+                ]
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_observation_rejects_retire_and_close_on_unknown_input_recovery() {
+        for mutation in ["retire", "close"] {
+            let (staging, _state) = fake_staging(
+                [
+                    FakeDirective::Io,
+                    FakeDirective::Observe(ObservedChildState::Exited(24)),
+                    FakeDirective::Query(InputEffectState::DispositionUnavailable),
+                ],
+                64,
+            );
+            let actor = staging.shared_actor();
+            assert!(matches!(
+                actor.lock().write_input(b"abcdef"),
+                Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+            ));
+            let mut child = GuardianProxyChild {
+                actor: Arc::clone(&actor),
+                census: Arc::clone(&staging.census),
+            };
+            assert_eq!(
+                child
+                    .try_wait()
+                    .expect("terminal census remains observable")
+                    .expect("pane exited")
+                    .exit_code(),
+                24
+            );
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::TerminalObserved
+            );
+            let outcome = if mutation == "retire" {
+                actor.lock().retire(identity())
+            } else {
+                actor.lock().close(identity())
+            };
+            assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::InputDispositionUnavailable)
+            ));
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::Quarantined
+            );
+            assert!(matches!(
+                actor.lock().close(identity()),
+                Err(GuardianProxyError::PaneQuarantined)
+            ));
+            assert!(matches!(
+                actor.lock().retire(identity()),
+                Err(GuardianProxyError::PaneQuarantined)
+            ));
+
+            let (staging, _state) = fake_staging(
+                [
+                    FakeDirective::Io,
+                    FakeDirective::Observe(ObservedChildState::Exited(24)),
+                    FakeDirective::Query(InputEffectState::AcceptedNotDurable),
+                ],
+                64,
+            );
+            let actor = staging.shared_actor();
+            assert!(matches!(
+                actor.lock().write_input(b"abcdef"),
+                Err(GuardianProxyError::Client(GuardianClientError::Io(_)))
+            ));
+            let mut child = GuardianProxyChild {
+                actor: Arc::clone(&actor),
+                census: Arc::clone(&staging.census),
+            };
+            assert_eq!(child.try_wait().unwrap().unwrap().exit_code(), 24);
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::TerminalObserved
+            );
+            let outcome = if mutation == "retire" {
+                actor.lock().retire(identity())
+            } else {
+                actor.lock().close(identity())
+            };
+            assert!(matches!(
+                outcome,
+                Err(GuardianProxyError::InputDurabilityPending)
+            ));
+            assert_eq!(
+                actor.lock().disposition,
+                GuardianLeaseDisposition::TerminalObserved
+            );
+        }
     }
 
     #[test]

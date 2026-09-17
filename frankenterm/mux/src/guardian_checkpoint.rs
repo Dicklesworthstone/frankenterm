@@ -5615,6 +5615,12 @@ mod tests {
         "GuardianCheckpointManifestSealCapabilitiesV1",
         "LiveParserCaptureAuthority",
         "LiveParserCheckpointAck",
+        "PublishedGuardianCheckpoint",
+    ];
+
+    const PERSISTED_RECORD_TYPES: &[&str] = &[
+        "GuardianSpawnCustodyScopeV1",
+        "GuardianSpawnCaptureProvenanceV1",
     ];
 
     #[derive(Clone, Debug, PartialEq)]
@@ -5758,6 +5764,8 @@ mod tests {
         projection_sites: Vec<String>,
         unexpected_attributes: Vec<String>,
         unexpected_derives: Vec<String>,
+        persisted_record_derives: Vec<String>,
+        current_struct: Option<String>,
         current_impl_owner: Option<String>,
         current_impl_is_inherent: bool,
         current_function: Option<String>,
@@ -6038,10 +6046,29 @@ mod tests {
                 self.unexpected_attributes.push(name.clone());
             }
             if name == "derive" {
-                const EXPECTED_DERIVES: &[&str] =
+                const BASE_EXPECTED_DERIVES: &[&str] =
                     &["Clone", "Copy", "Debug", "Eq", "Error", "PartialEq"];
+                const PERSISTED_RECORD_DERIVES: &[&str] = &[
+                    "Clone",
+                    "Copy",
+                    "Debug",
+                    "Eq",
+                    "Error",
+                    "PartialEq",
+                    "Serialize",
+                    "Deserialize",
+                ];
+                let is_persisted = match self.current_struct.as_deref() {
+                    Some(s) => PERSISTED_RECORD_TYPES.contains(&s),
+                    None => false,
+                };
+                let allowed = if is_persisted {
+                    PERSISTED_RECORD_DERIVES
+                } else {
+                    BASE_EXPECTED_DERIVES
+                };
                 for derived in Self::derive_names(std::slice::from_ref(attribute)) {
-                    if !EXPECTED_DERIVES.contains(&derived.as_str()) {
+                    if !allowed.contains(&derived.as_str()) {
                         self.unexpected_derives.push(derived);
                     }
                 }
@@ -6073,6 +6100,12 @@ mod tests {
                     });
                 }
             } else {
+                if PERSISTED_RECORD_TYPES.contains(&target.as_str()) {
+                    for derived in Self::derive_names(&item.attrs) {
+                        self.persisted_record_derives
+                            .push(format!("{target}:{derived}"));
+                    }
+                }
                 for field in &item.fields {
                     for protected in Self::protected_names_in_type(&field.ty, Some(&target)) {
                         self.external_storage_sites.push(format!(
@@ -6085,7 +6118,9 @@ mod tests {
                     }
                 }
             }
+            let previous_struct = self.current_struct.replace(target);
             visit::visit_item_struct(self, item);
+            self.current_struct = previous_struct;
         }
 
         fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
@@ -10714,6 +10749,7 @@ mod tests {
             GuardianCheckpointOrderedChunkSetBuilderV1,
         >());
         assert!(std::mem::needs_drop::<LiveParserCheckpointAck>());
+        assert!(std::mem::needs_drop::<PublishedGuardianCheckpoint>());
 
         let syntax = syn::parse_file(include_str!("guardian_checkpoint.rs"))
             .expect("parse the complete checkpoint module as Rust syntax");
@@ -10778,6 +10814,9 @@ mod tests {
             "LiveParserCheckpointAck:boundary_digest:private",
             "LiveParserCheckpointAck:registration_wire_identity:private",
             "LiveParserCheckpointAck:terminal_checkpoint:private",
+            "PublishedGuardianCheckpoint:capture:private",
+            "PublishedGuardianCheckpoint:owner:private",
+            "PublishedGuardianCheckpoint:receipt:private",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -11024,6 +11063,21 @@ mod tests {
                 "terminal_checkpoint",
                 "RecoveryTerminalCheckpointV2",
             ),
+            expected_authority_field(
+                "PublishedGuardianCheckpoint",
+                "capture",
+                "LiveParserCheckpointAck",
+            ),
+            expected_authority_field(
+                "PublishedGuardianCheckpoint",
+                "owner",
+                "crate::localpane::GuardianPaneLeaseIdentity",
+            ),
+            expected_authority_field(
+                "PublishedGuardianCheckpoint",
+                "receipt",
+                "crate::guardian_protocol::GuardianCheckpointReceipt",
+            ),
         ];
         sort_authority_fields(&mut expected_field_surfaces);
         assert_eq!(inventory.field_surfaces, expected_field_surfaces);
@@ -11064,6 +11118,8 @@ mod tests {
             "LiveParserCaptureAuthority:<inherent>",
             "LiveParserCheckpointAck:<inherent>",
             "LiveParserCheckpointAck:Debug",
+            "PublishedGuardianCheckpoint:<inherent>",
+            "PublishedGuardianCheckpoint:Debug",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -11138,6 +11194,10 @@ mod tests {
             "LiveParserCheckpointAck::terminal_checkpoint:pub:production",
             "LiveParserCheckpointAck::terminal_payload_bytes:pub:production",
             "LiveParserCheckpointAck::terminal_payload_digest:pub:production",
+            "LiveParserCheckpointAck::bind_published:pub:production",
+            "PublishedGuardianCheckpoint::capture:pub:production",
+            "PublishedGuardianCheckpoint::owner:pub:production",
+            "PublishedGuardianCheckpoint::receipt:pub:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -11537,6 +11597,30 @@ mod tests {
                 false,
                 "fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2)",
             ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "fn bind_published(self, receipt: crate::guardian_protocol::GuardianCheckpointReceipt, owner: crate::localpane::GuardianPaneLeaseIdentity) -> Result<PublishedGuardianCheckpoint, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "PublishedGuardianCheckpoint",
+                "pub",
+                false,
+                "const fn owner(&self) -> crate::localpane::GuardianPaneLeaseIdentity",
+            ),
+            expected_authority_method(
+                "PublishedGuardianCheckpoint",
+                "pub",
+                false,
+                "const fn capture(&self) -> &LiveParserCheckpointAck",
+            ),
+            expected_authority_method(
+                "PublishedGuardianCheckpoint",
+                "pub",
+                false,
+                "const fn receipt(&self) -> crate::guardian_protocol::GuardianCheckpointReceipt",
+            ),
         ];
         sort_authority_methods(&mut expected_method_surfaces);
         if inventory.method_surfaces != expected_method_surfaces {
@@ -11804,6 +11888,12 @@ mod tests {
                 "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
             ));
         }
+        expected_authority_signatures.push(expected_authority_method(
+            "PublishedGuardianCheckpoint",
+            "private",
+            false,
+            "fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+        ));
         for owner in [
             "GuardianCheckpointCandidateIdentityV1",
             "GuardianCheckpointOrderedChunkSetIdentityV1",
@@ -12016,6 +12106,8 @@ mod tests {
             "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture_restored:private:production",
+            "LiveParserCheckpointAck@PublishedGuardianCheckpoint::capture:pub:production",
+            "PublishedGuardianCheckpoint@LiveParserCheckpointAck::bind_published:pub:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -12042,6 +12134,7 @@ mod tests {
             "LiveParserCaptureAuthority@LiveParserCaptureAuthority::issue",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
             "LiveParserCheckpointAck@LiveParserCheckpointAck::capture_restored",
+            "PublishedGuardianCheckpoint@LiveParserCheckpointAck::bind_published",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -12075,6 +12168,18 @@ mod tests {
                 expected_use("use thiserror::Error;"),
                 expected_use("use uuid::Uuid;"),
                 expected_use("use zeroize::{Zeroize, Zeroizing};"),
+                expected_use(
+                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
+                ),
+                expected_use(
+                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
+                ),
+                expected_use(
+                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
+                ),
+                expected_use(
+                    "use crate::guardian_protocol::{GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent};",
+                ),
             ]
         );
 
@@ -12106,6 +12211,71 @@ mod tests {
                 "GuardianCheckpointStageSealIntentV1",
                 "from_binding",
                 "matches!(kind, GuardianCheckpointStageRecordKindV1::SealManifest | GuardianCheckpointStageRecordKindV1::Finalizer | GuardianCheckpointStageRecordKindV1::CatalogAdoptionEvidence)",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredParserPrefix",
+                "validate_model",
+                "anyhow::ensure!(self.pane_id == pane_id, \"restored guardian prefix belongs to another pane\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredParserPrefix",
+                "validate_model",
+                "anyhow::ensure!(digest == self.model_digest, \"restored guardian model changed before parser registration\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "activate",
+                "anyhow::anyhow!(\"restored guardian model activation failed: {error}\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "from_checkpoint",
+                "anyhow::ensure!(!pane_id.is_nil(), \"restored guardian pane identity is nil\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "from_checkpoint",
+                "matches!(output, GuardianCheckpointOutputBoundaryV1::Record { .. })",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "from_checkpoint",
+                "anyhow::ensure!(descriptor.durable_pane_id() == Some(pane_id), \"restored guardian checkpoint belongs to another pane\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "from_checkpoint",
+                "anyhow::ensure!(validated.rows() == descriptor.rows() && validated.cols() == descriptor.cols(), \"restored guardian checkpoint geometry differs from its descriptor\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "from_checkpoint",
+                "anyhow::ensure!((validated.pixel_width(), validated.pixel_height()) == expected_pixel_size, \"checkpoint pixel geometry does not match the claimed topology manifest\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "replay_record",
+                "anyhow::ensure!(previous_sequence.checked_add(1) == Some(metadata.sequence()) && previous_bytes.checked_add(u64::from(metadata.payload_bytes())) == Some(metadata.cumulative_plaintext_bytes()) && usize::try_from(metadata.payload_bytes())? <= self.limits.max_replay_record_bytes, \"restored guardian record does not extend the exact prefix\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "replay_record",
+                "anyhow::ensure!(segment.first_sequence() == 1 && segment.predecessor().is_none(), \"restored guardian Genesis suffix has a predecessor\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "replay_record",
+                "anyhow::anyhow!(\"restored guardian rollover has no predecessor\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "replay_record",
+                "anyhow::ensure!(predecessor.segment_id() == segment_id && predecessor.last_sequence() == sequence && predecessor.terminal_record_digest() == record_digest && predecessor.committed_log_bytes() == committed_log_bytes && predecessor.cumulative_plaintext_bytes() == cumulative_plaintext_bytes && segment.first_sequence() == receipt.sequence(), \"restored guardian rollover differs from the exact prefix\")",
+            ),
+            expected_authority_macro(
+                "GuardianRestoredTerminal",
+                "replay_record",
+                "anyhow::ensure!(receipt.committed_log_bytes() > committed_log_bytes, \"restored guardian record does not advance its segment endpoint\")",
             ),
         ];
         expected_expression_macros.sort_by(|left, right| {
@@ -12210,6 +12380,73 @@ mod tests {
         );
         assert_eq!(inventory.unexpected_attributes, Vec::<String>::new());
         assert_eq!(inventory.unexpected_derives, Vec::<String>::new());
+        inventory.persisted_record_derives.sort();
+        assert_eq!(
+            inventory.persisted_record_derives,
+            vec![
+                "GuardianSpawnCaptureProvenanceV1:Clone".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:Copy".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:Debug".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:Deserialize".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:Eq".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:PartialEq".to_owned(),
+                "GuardianSpawnCaptureProvenanceV1:Serialize".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Clone".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Copy".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Debug".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Deserialize".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Eq".to_owned(),
+                "GuardianSpawnCustodyScopeV1:PartialEq".to_owned(),
+                "GuardianSpawnCustodyScopeV1:Serialize".to_owned(),
+            ]
+        );
+
+        let published_mutation = syn::parse_file(
+            r#"
+                #[derive(Clone)]
+                pub struct PublishedGuardianCheckpoint {
+                    pub capture: LiveParserCheckpointAck,
+                    receipt: crate::guardian_protocol::GuardianCheckpointReceipt,
+                    owner: crate::localpane::GuardianPaneLeaseIdentity,
+                }
+            "#,
+        )
+        .expect("parse PublishedGuardianCheckpoint mutation");
+        let mut published_mutation_inventory = AuthoritySurfaceAstInventory::default();
+        published_mutation_inventory.visit_file(&published_mutation);
+        published_mutation_inventory.derives.sort();
+        assert_eq!(
+            published_mutation_inventory.derives,
+            vec!["PublishedGuardianCheckpoint:Clone".to_owned()]
+        );
+        published_mutation_inventory.fields.sort();
+        assert_eq!(
+            published_mutation_inventory.fields,
+            vec![
+                "PublishedGuardianCheckpoint:capture:pub".to_owned(),
+                "PublishedGuardianCheckpoint:owner:private".to_owned(),
+                "PublishedGuardianCheckpoint:receipt:private".to_owned(),
+            ]
+        );
+
+        let persisted_record_authority_storage_mutation = syn::parse_file(
+            r#"
+                #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+                pub struct GuardianSpawnCustodyScopeV1 {
+                    pub leaked_authority: LiveParserCaptureAuthority,
+                }
+            "#,
+        )
+        .expect("parse persisted record authority storage mutation");
+        let mut persisted_mutation_inventory = AuthoritySurfaceAstInventory::default();
+        persisted_mutation_inventory.visit_file(&persisted_record_authority_storage_mutation);
+        assert_eq!(
+            persisted_mutation_inventory.external_storage_sites,
+            vec![
+                "struct:GuardianSpawnCustodyScopeV1:leaked_authority:LiveParserCaptureAuthority"
+                    .to_owned()
+            ]
+        );
 
         let cfg_attr_clone_copy_mutation = syn::parse_file(
             r#"
