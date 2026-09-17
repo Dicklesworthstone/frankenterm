@@ -1282,15 +1282,34 @@ power loss nor migration of those live sessions has been demonstrated.
   - [x] Require new child output after registration in the real-process test;
     verify it survives the checkpoint round trip as actual terminal cells.
   - [x] Add prefix/model mismatch and pristine/duplicate registration tests.
-  - [ ] Pass focused mux tests and same-source sealed guardian/server build
-    (`6b346f2-restored-prefix-mux-rch.log` and
-    `6b346f2-sealed-family-build-rch.log`).
+  - [x] Pass focused mux restored-prefix tests at `b9b46eff2`: three passed,
+    zero failed, 1201 filtered; strict remote worker3651, retained
+    `b9b46ef-restored-prefix-mux-rch.log`. Earlier 6b run actually failed the
+    activation model check; `aa0e30459` binds the post-activation model because
+    activation increments the serialized terminal sequence number.
+  - [x] Build the same-source sealed guardian/server family at `b9b46eff2`
+    through strict RCH on worker114. This is compilation, not runtime closure.
+  - [x] Trace the next real-process failure: quiet checkpoint succeeds, but
+    child-exit pruning sends an explicit Close to the still-running shell.
+    Linux strace records broker SIGHUP before the fresh-output signal; GDB
+    traces retirement back to ChildExitPruneDispatch during quiet capture.
+    Guardian busy census closes are transient, yet `GuardianProxyChild::wait`
+    returned the error and LocalPane interpreted it as child exit.
+  - [x] Commit `7f0b0bb8e`: retry observation errors only while the lease
+    remains attached; add transient census and permanent fenced-lease tests.
+  - [ ] Execute both child-wait regressions and the real-process test at
+    `7f0b0bb8e`, retaining matching guardian/server artifact identities.
   - [ ] Pass the real child birth/checkpoint/image/reopen test with the new
     companion, then broader checkpoint authority and registration tests.
   - [ ] Validate reviewed follow-up checks for increasing journal offsets,
     nonzero geometry and the exact private capture authority inventory.
 - [x] Correct Clippy's similar-name error in the recovery-image adapter.
   Repeat current-source Clippy after the ongoing workspace pass settles.
+- [x] Complete strict remote workspace/all-targets check with supported
+  feature union at `aa0e30459`, worker2480; retained
+  `aa0e304-workspace-check-rch.log`. Newer waiter changes still require checks.
+- [ ] Finish the current strict workspace Clippy run at `b9b46eff2` on
+  worker2480, then incorporate any later source changes into final proof.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
   eight Cargo gates skipped. This is not strict release attestation closure.
 - [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping
