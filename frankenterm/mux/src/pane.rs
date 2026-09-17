@@ -1045,6 +1045,7 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
 
     // Look backwards to find the start of the first logical line
     let oldest = pane.get_dimensions().scrollback_top;
+    let mut preceding = Vec::new();
     while first > oldest && context_len < MAX_LOGICAL_LINE_LEN {
         let Some(previous) = first.checked_sub(1) else {
             break;
@@ -1061,9 +1062,14 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
         }
         context_len += back[0].len().max(1);
         first = prior;
-        for (idx, line) in back.into_iter().enumerate() {
-            phys.insert(idx, line);
-        }
+        preceding.extend(back);
+    }
+    if !preceding.is_empty() {
+        // Backward discovery visits newest first. Reverse once rather than
+        // shifting the entire requested span for every discovered row.
+        preceding.reverse();
+        preceding.append(&mut phys);
+        phys = preceding;
     }
 
     // Look forwards to find the end of the last logical line
@@ -1888,6 +1894,30 @@ mod test {
     ),
 ]
 "
+        );
+    }
+
+    #[test]
+    fn get_logical_lines_preserves_backward_and_forward_context_order() {
+        let pane = FakePane::new(vec![
+            line("alpha ", true),
+            line("beta ", true),
+            line("gamma ", true),
+            line("delta", false),
+            line("separate", false),
+        ]);
+        let lines = pane.get_logical_lines(2..3);
+        assert_eq!(
+            summarize_logical_lines(&lines),
+            vec![(0, Cow::Borrowed("alpha beta gamma delta"))]
+        );
+        assert_eq!(
+            lines[0]
+                .physical_lines
+                .iter()
+                .map(|line| line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha ", "beta ", "gamma ", "delta"]
         );
     }
 
