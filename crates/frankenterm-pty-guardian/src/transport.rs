@@ -6135,6 +6135,10 @@ mod tests {
             // pane's connection must remain usable when the second joins it.
             for (pane_index, client) in leases.iter_mut().enumerate() {
                 let sequence = if index == pane_index { 1 } else { 3 };
+                let output_marker = format!(
+                    "rotation-generation-2-pane-{}-transfer-{index}",
+                    panes[pane_index]
+                );
                 assert!(matches!(
                     client
                         .resize(
@@ -6161,7 +6165,7 @@ mod tests {
                             sequence + 1,
                             Uuid::new_v4(),
                             Uuid::new_v4(),
-                            b"rotation-output\n".to_vec()
+                            format!("{output_marker}\n").into_bytes()
                         )
                         .unwrap(),
                     GuardianReply::InputReceipt {
@@ -6169,6 +6173,11 @@ mod tests {
                         ..
                     }
                 ));
+                assert_rotation_output_replayed(
+                    client,
+                    panes[pane_index],
+                    output_marker.as_bytes(),
+                );
             }
             let identity =
                 BrokerGuardianConnectionIdentityV1::new(guardian, new_mux, origin_build, build)
@@ -6221,6 +6230,95 @@ mod tests {
         }
         println!("MUX_ROTATION_TWO_PANES_SUCCESS");
         println!("MUX_ROTATION_EMBEDDED_SUCCESSOR_BUILD={build}");
+    }
+
+    fn assert_rotation_output_replayed(client: &mut GuardianClient, pane: Uuid, marker: &[u8]) {
+        let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+        loop {
+            let mut request = GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::LatestCompatible,
+                max_plaintext_bytes: 65_536,
+                max_records: 16,
+                wait_millis: 0,
+            };
+            let mut output = Vec::new();
+            let mut complete = false;
+            for _ in 0..32 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rotation replay timed out"
+                );
+                let page = client.replay(pane, 2, Uuid::new_v4(), request).unwrap();
+                assert_eq!(page.header().pane_id(), pane);
+                assert_eq!(page.header().generation(), 2);
+                let snapshot_id = page.header().snapshot_id();
+                let snapshot_digest = page.header().snapshot_digest();
+                let page_index = page.header().page_index();
+                let page_digest = page.header().declassify_page_digest_for_ack();
+                let next = page.header().next_cursor();
+                let (through_sequence, through_digest) = match page.into_body() {
+                    GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                        assert!(matches!(
+                            chunk.descriptor().output_boundary(),
+                            GuardianCheckpointOutputBoundaryV1::Genesis { .. }
+                        ));
+                        chunk
+                            .write_all_bounded(&mut std::io::sink(), 65_536)
+                            .unwrap();
+                        (0, [0; 32])
+                    }
+                    GuardianReplayPageBodyDelivery::OutputRecords(records) => {
+                        assert!(output.len() + records.plaintext_bytes() as usize <= 65_536);
+                        let mut boundary = (0, [0; 32]);
+                        for record in records.into_records() {
+                            let metadata = record.write_all_bounded(&mut output, 65_536).unwrap();
+                            boundary = (metadata.sequence(), metadata.record_digest());
+                        }
+                        boundary
+                    }
+                    GuardianReplayPageBodyDelivery::Complete {
+                        through_sequence,
+                        terminal_record_digest,
+                        ..
+                    } => {
+                        complete = true;
+                        (through_sequence, terminal_record_digest)
+                    }
+                    other => panic!("rotation output replay failed: {other:?}"),
+                };
+                let ack = GuardianReplayAckV1::new(
+                    snapshot_id,
+                    snapshot_digest,
+                    page_index,
+                    page_digest,
+                    next.map(|cursor| cursor.digest()),
+                    through_sequence,
+                    through_digest,
+                    complete,
+                )
+                .unwrap();
+                assert_eq!(
+                    client.replay_ack(pane, 2, Uuid::new_v4(), ack).unwrap(),
+                    GuardianReplayAckReceiptV1::from_ack(ack)
+                );
+                if complete {
+                    assert!(next.is_none());
+                    break;
+                }
+                request = GuardianReplayRequestV1::Continue {
+                    cursor: next.expect("nonterminal replay page must advance"),
+                };
+            }
+            assert!(complete, "rotation replay exceeded the bounded page count");
+            if output.windows(marker.len()).any(|bytes| bytes == marker) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "post-transfer marker absent from authenticated output"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     struct OwnedSuccessorProcess(std::process::Child);

@@ -4424,7 +4424,8 @@ impl BrokerControlServiceV1 {
             return false;
         };
         live.lease_transition.is_none()
-            && live.adoption.pane.status().lifecycle == BrokerPaneLifecycleV1::Quarantined
+            && live.adoption.pane.status().lifecycle
+                == BrokerPaneLifecycleV1::Quarantined(BrokerQuarantineReasonV1::LeaseJournalFailure)
             && live.adoption.pane.active_attachment_identity().is_none()
             && matches!(live.adoption.pane.child.try_wait(), Ok(None))
     }
