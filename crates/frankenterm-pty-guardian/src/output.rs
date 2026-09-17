@@ -518,6 +518,21 @@ struct GuardianCheckpointStageStoreInner {
     custody_publication_cut: std::sync::atomic::AtomicU8,
 }
 
+/// Explicit adoption selector for offline checkpoint reopen.
+///
+/// Disambiguates unchanged-content successor checkpoints by binding both the
+/// content artifact identity (`checkpoint_id`) and the exact adoption event
+/// (`capture_generation`, `capturing_mux_incarnation`, `adoption_effect_id`,
+/// `adoption_sequence`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianCheckpointAdoptionSelectorV1 {
+    pub checkpoint_id: [u8; 32],
+    pub capturing_mux_incarnation: Uuid,
+    pub capture_generation: u64,
+    pub adoption_effect_id: Uuid,
+    pub adoption_sequence: u64,
+}
+
 /// An encrypted, synchronized, read-back capability. There is no raw constructor.
 /// A lost ACK reply is retried by reopening the same custody record.
 pub struct GuardianDurableSpawnCustodyV1 {
@@ -701,7 +716,7 @@ impl GuardianDurableSpawnCustodyV1 {
     /// a writer lease or permission to rotate a later successor generation.
     pub fn reopen_checkpoint(
         self,
-        checkpoint_id: [u8; 32],
+        selector: GuardianCheckpointAdoptionSelectorV1,
     ) -> Result<GuardianReopenedCheckpointV1, GuardianCheckpointStageStoreError> {
         self.store.with_exclusive_directory(|inner| {
             drop(read_spawn_custody_locked(inner, &self.context)?);
@@ -715,7 +730,12 @@ impl GuardianDurableSpawnCustodyV1 {
             checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
             let mut selected = scan.published.iter().filter(|member| {
                 member.format == CheckpointCatalogFormat::ProtectedV3
-                    && member.metadata.checkpoint_id == checkpoint_id
+                    && member.metadata.checkpoint_id == selector.checkpoint_id
+                    && member.metadata.capture_generation == selector.capture_generation
+                    && member.metadata.adoption_mux_incarnation
+                        == selector.capturing_mux_incarnation
+                    && member.metadata.adoption_effect_id == selector.adoption_effect_id
+                    && member.metadata.adoption_sequence == selector.adoption_sequence
             });
             let member = selected
                 .next()
@@ -13927,10 +13947,20 @@ mod tests {
             b"-successor",
             b"original-successor",
         )?;
+        let identity_base = 0xac230_u128;
+        let expected_adoption_effect_id = Uuid::from_u128(identity_base + 3);
+        let expected_adoption_sequence = 1_u64;
         let token = directory.join("guardian.token");
+        let selector = GuardianCheckpointAdoptionSelectorV1 {
+            checkpoint_id,
+            capturing_mux_incarnation: successor_mux,
+            capture_generation: 2,
+            adoption_effect_id: expected_adoption_effect_id,
+            adoption_sequence: expected_adoption_sequence,
+        };
         assert!(
             GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
-                .reopen_checkpoint(checkpoint_id)
+                .reopen_checkpoint(selector)
                 .is_err(),
             "publication without durable ACK cannot authorize offline reopen"
         );
@@ -13942,6 +13972,14 @@ mod tests {
                 .iter()
                 .find(|member| member.metadata.checkpoint_id == checkpoint_id)
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            assert_eq!(
+                member.metadata.adoption_effect_id, expected_adoption_effect_id,
+                "helper must assign adoption effect_id = identity_base + 3"
+            );
+            assert_eq!(
+                member.metadata.adoption_sequence, expected_adoption_sequence,
+                "helper must assign adoption sequence = 1"
+            );
             let bytes = checkpoint_catalog_read_file(
                 inner,
                 &member.candidate_path,
@@ -13985,7 +14023,7 @@ mod tests {
         drop(pipeline);
         drop(poll);
         let witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
-            .reopen_checkpoint(checkpoint_id)?;
+            .reopen_checkpoint(selector)?;
         assert_eq!(witness.scope(), scope);
         assert_eq!(witness.generation(), 2);
         assert_eq!(witness.capturing_mux_incarnation(), successor_mux);
@@ -13993,7 +14031,56 @@ mod tests {
             witness.capturing_mux_incarnation(),
             witness.scope().mux_incarnation
         );
-        assert_eq!(witness.checkpoint_id(), checkpoint_id);
+        assert_eq!(witness.checkpoint_id(), selector.checkpoint_id);
+        assert_eq!(
+            witness.capturing_mux_incarnation(),
+            selector.capturing_mux_incarnation
+        );
+        assert_eq!(witness.generation(), selector.capture_generation);
+        assert_eq!(witness.effect_id(), selector.adoption_effect_id);
+        assert_eq!(witness.sequence(), selector.adoption_sequence);
+
+        // Focused negative controls: each selector field must match the exact adoption.
+        let mut wrong_checkpoint = selector;
+        wrong_checkpoint.checkpoint_id = [0x19; 32];
+        assert!(matches!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(wrong_checkpoint),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+
+        let mut wrong_mux = selector;
+        wrong_mux.capturing_mux_incarnation = original_mux;
+        assert!(matches!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(wrong_mux),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+
+        let mut wrong_gen = selector;
+        wrong_gen.capture_generation = 1;
+        assert!(matches!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(wrong_gen),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+
+        let mut wrong_effect = selector;
+        wrong_effect.adoption_effect_id = Uuid::from_u128(0xdead_beef);
+        assert!(matches!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(wrong_effect),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+
+        let mut wrong_seq = selector;
+        wrong_seq.adoption_sequence = 2;
+        assert!(matches!(
+            GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+                .reopen_checkpoint(wrong_seq),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
+
         let mut wrong_scope = scope;
         wrong_scope.mux_incarnation = successor_mux;
         assert!(

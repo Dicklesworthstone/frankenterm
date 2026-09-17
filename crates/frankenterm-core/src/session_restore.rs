@@ -6889,7 +6889,7 @@ impl WholeMuxRecoveryVerifier {
     fn reopen_manifest_guardian_capture(
         &self,
         pane: &crate::mux_recovery_image::RecoveryPane,
-        checkpoint_id: [u8; 32],
+        selector: frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1,
     ) -> Result<Option<frankenterm_pty_guardian::GuardianReopenedCheckpointV1>, WholeMuxRecoveryError>
     {
         let Some(token_path) = self.guardian_custody_token_path.as_ref() else {
@@ -6926,7 +6926,7 @@ impl WholeMuxRecoveryVerifier {
             effect_id: *spawn_effect_id,
         };
         frankenterm_pty_guardian::GuardianDurableSpawnCustodyV1::open_existing(token_path, scope)
-            .and_then(|custody| custody.reopen_checkpoint(checkpoint_id))
+            .and_then(|custody| custody.reopen_checkpoint(selector))
             .map(Some)
             .map_err(|_| fail())
     }
@@ -7361,7 +7361,13 @@ impl WholeMuxRecoveryVerifier {
                                 let discovered = if registered.is_none() {
                                     self.reopen_manifest_guardian_capture(
                                         pane,
-                                        publication.checkpoint_identity,
+                                        frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
+                                            checkpoint_id: publication.checkpoint_identity,
+                                            capturing_mux_incarnation: publication.mux_incarnation,
+                                            capture_generation: *guardian_generation,
+                                            adoption_effect_id: publication.effect_id,
+                                            adoption_sequence: *catalog_generation,
+                                        },
                                     )?
                                 } else {
                                     None

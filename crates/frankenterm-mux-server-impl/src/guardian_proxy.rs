@@ -6858,15 +6858,20 @@ mod tests {
             .register_published_guardian_capture(&published)
             .unwrap();
         store.publish_generation_root(&root, &verifier).unwrap();
+        let selector = frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
+            checkpoint_id: published
+                .receipt()
+                .intent()
+                .checkpoint_identity()
+                .into_bytes(),
+            capturing_mux_incarnation: provenance.current_mux_incarnation,
+            capture_generation: published.receipt().generation(),
+            adoption_effect_id: published.receipt().effect_id(),
+            adoption_sequence: published.receipt().sequence(),
+        };
         let reopened = GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
             .unwrap()
-            .reopen_checkpoint(
-                published
-                    .receipt()
-                    .intent()
-                    .checkpoint_identity()
-                    .into_bytes(),
-            )
+            .reopen_checkpoint(selector)
             .unwrap();
         assert_eq!(
             reopened.payload_digest(),
@@ -6886,10 +6891,49 @@ mod tests {
         let mut wrong_scope = provenance.original;
         wrong_scope.effect_id = Uuid::new_v4();
         assert!(GuardianDurableSpawnCustodyV1::open_existing(token, wrong_scope).is_err());
+
+        let mut wrong_checkpoint = selector;
+        wrong_checkpoint.checkpoint_id = [0x19; 32];
         assert!(
             GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
                 .unwrap()
-                .reopen_checkpoint([0x19; 32])
+                .reopen_checkpoint(wrong_checkpoint)
+                .is_err()
+        );
+
+        let mut wrong_mux = selector;
+        wrong_mux.capturing_mux_incarnation = Uuid::new_v4();
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
+                .unwrap()
+                .reopen_checkpoint(wrong_mux)
+                .is_err()
+        );
+
+        let mut wrong_gen = selector;
+        wrong_gen.capture_generation = 99;
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
+                .unwrap()
+                .reopen_checkpoint(wrong_gen)
+                .is_err()
+        );
+
+        let mut wrong_effect = selector;
+        wrong_effect.adoption_effect_id = Uuid::new_v4();
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
+                .unwrap()
+                .reopen_checkpoint(wrong_effect)
+                .is_err()
+        );
+
+        let mut wrong_seq = selector;
+        wrong_seq.adoption_sequence = 99;
+        assert!(
+            GuardianDurableSpawnCustodyV1::open_existing(token, provenance.original)
+                .unwrap()
+                .reopen_checkpoint(wrong_seq)
                 .is_err()
         );
         // A new test process has no in-memory publication witness, capture,
