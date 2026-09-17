@@ -7183,6 +7183,14 @@ mod tests {
         let old_listing = sample_remote_tab_listing();
         apply(old_listing.clone());
         assert!(peer.is_empty(), "initial snapshot must not issue commands");
+        // Registration separately schedules the initial palette update. Drain
+        // and identify that request before measuring resize traffic; otherwise
+        // a later executor tick can mistake palette setup for a resize echo.
+        while executor.try_tick().unwrap() {}
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::SetPalette(_)));
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty(), "pane registration setup must be settled");
         let tab = mux
             .get_tab(inner.remote_to_local_tab_id(51).unwrap())
             .unwrap();
@@ -7199,7 +7207,8 @@ mod tests {
         tab.resize(desired);
         let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
         assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == desired));
-        executor.try_tick().unwrap();
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty(), "explicit resize response must be settled");
         apply(old_listing.clone());
         assert!(
             peer.is_empty(),
