@@ -23,7 +23,7 @@ use crate::error::{MuxObjectKind, MuxRejectionCode, StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
+    MoveDirection, MuxPaneText, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
     PaneTieredScrollbackSummary, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
     WeztermInterface,
 };
@@ -2348,6 +2348,26 @@ impl WeztermInterface for ShardedWeztermClient {
                 .get_text_with_cx(cx, route.local_pane_id, escapes)
                 .await
                 .map_err(|err| Self::backend_error(route.shard_id, "get_text", Some(pane_id), err))
+        })
+    }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> WeztermFuture<'a, MuxPaneText> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id)?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .get_text_tail_with_cx(cx, route.local_pane_id, escapes, tail)
+                .await
+                .map_err(|err| {
+                    Self::backend_error(route.shard_id, "get_text_tail", Some(pane_id), err)
+                })
         })
     }
 

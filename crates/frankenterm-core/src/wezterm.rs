@@ -140,6 +140,15 @@ pub struct MuxSemanticSnapshot {
     pub last_exit_code: Option<i32>,
 }
 
+/// Result of reading text from a pane, optionally bounded by a tail limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxPaneText {
+    pub text: String,
+    pub original_lines: usize,
+    pub original_bytes: Option<usize>,
+    pub truncated: bool,
+}
+
 /// Abstraction layer over an in-process mux session — the API the
 /// recorder, workflows, and policy layers use to drive panes/tabs/windows
 /// regardless of which concrete client (`WeztermClient`, mocks, sharded
@@ -213,6 +222,44 @@ pub trait MuxInterface: Send + Sync {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         self.get_text(pane_id, escapes)
+    }
+
+    /// Get text content from a pane, optionally bounded by a tail limit.
+    ///
+    /// Default impl delegates to [`get_text_with_cx`](Self::get_text_with_cx)
+    /// and performs in-memory tail slicing. Concrete impls with native mux
+    /// support bound the read over the wire at the RPC source.
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> WeztermFuture<'a, MuxPaneText> {
+        Box::pin(async move {
+            let full_text = self.get_text_with_cx(cx, pane_id, escapes).await?;
+            let original_lines = full_text.lines().count();
+            let original_bytes = Some(full_text.len());
+            match tail {
+                Some(n) if n > 0 && n < original_lines => {
+                    let lines: Vec<&str> = full_text.lines().collect();
+                    let start_idx = lines.len().saturating_sub(n);
+                    let text = lines[start_idx..].join("\n");
+                    Ok(MuxPaneText {
+                        text,
+                        original_lines,
+                        original_bytes,
+                        truncated: true,
+                    })
+                }
+                _ => Ok(MuxPaneText {
+                    text: full_text,
+                    original_lines,
+                    original_bytes,
+                    truncated: false,
+                }),
+            }
+        })
     }
 
     /// Get OSC 133 semantic zones retained by the live terminal state.
@@ -1644,10 +1691,24 @@ impl WeztermClient {
         pane_id: u64,
         escapes: bool,
     ) -> Result<String> {
+        self.get_text_tail_with_cx(cx, pane_id, escapes, None)
+            .await
+            .map(|pt| pt.text)
+    }
+
+    /// Get text content from a pane, optionally bounded to trailing rows over the wire.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn get_text_tail_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> Result<MuxPaneText> {
         if let Some(ref pool) = self.mux_pool {
             if escapes {
                 tracing::debug!(
-                    "mux pool get_text_with_cx does not support escapes; falling back to CLI"
+                    "mux pool get_text_tail_with_cx does not support escapes; falling back to CLI"
                 );
             } else if self.mux_circuit_guard() {
                 use crate::vendored::MuxTextReadResult;
@@ -1656,13 +1717,34 @@ impl WeztermClient {
                     0,
                 );
                 let result = pool
-                    .get_text_with_cx(cx, pane_id, MAX_CLI_BULK_OUTPUT_BYTES)
+                    .get_text_tail_with_cx(cx, pane_id, MAX_CLI_BULK_OUTPUT_BYTES, tail)
                     .await;
                 capacity_timer.finish_result(&result);
                 match result {
                     Ok(MuxTextReadResult::Text(text)) => {
                         self.mux_circuit_record_success();
-                        return Ok(text);
+                        let original_lines = text.lines().count();
+                        let original_bytes = Some(text.len());
+                        return Ok(MuxPaneText {
+                            text,
+                            original_lines,
+                            original_bytes,
+                            truncated: false,
+                        });
+                    }
+                    Ok(MuxTextReadResult::Bounded {
+                        text,
+                        original_lines,
+                        original_bytes,
+                        truncated,
+                    }) => {
+                        self.mux_circuit_record_success();
+                        return Ok(MuxPaneText {
+                            text,
+                            original_lines,
+                            original_bytes,
+                            truncated,
+                        });
                     }
                     Ok(MuxTextReadResult::OutputTooLarge { len, cap }) => {
                         return Err(WeztermError::OutputTooLarge {
@@ -1675,11 +1757,11 @@ impl WeztermClient {
                     Err(error) => {
                         self.mux_circuit_record_error(&error);
                         if !self.mux_error_should_fallback_to_cli_for_client(&error) {
-                            return Err(Self::mux_cancelled_error("get_text_with_cx", error));
+                            return Err(Self::mux_cancelled_error("get_text_tail_with_cx", error));
                         }
                         tracing::debug!(
                             failure_class = Self::mux_error_public_code(&error),
-                            "mux pool get_text_with_cx failed; falling back to CLI"
+                            "mux pool get_text_tail_with_cx failed; falling back to CLI"
                         );
                     }
                 }
@@ -1692,8 +1774,30 @@ impl WeztermClient {
         if escapes {
             args.push("--escapes");
         }
-        self.run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
-            .await
+        let full_text = self
+            .run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
+            .await?;
+        let original_lines = full_text.lines().count();
+        let original_bytes = Some(full_text.len());
+        match tail {
+            Some(n) if n > 0 && n < original_lines => {
+                let lines: Vec<&str> = full_text.lines().collect();
+                let start_idx = lines.len().saturating_sub(n);
+                let text = lines[start_idx..].join("\n");
+                Ok(MuxPaneText {
+                    text,
+                    original_lines,
+                    original_bytes,
+                    truncated: true,
+                })
+            }
+            _ => Ok(MuxPaneText {
+                text: full_text,
+                original_lines,
+                original_bytes,
+                truncated: false,
+            }),
+        }
     }
 
     /// Stub `get_text_with_cx` for configurations without
@@ -1705,13 +1809,48 @@ impl WeztermClient {
         pane_id: u64,
         escapes: bool,
     ) -> Result<String> {
+        self.get_text_tail_with_cx(cx, pane_id, escapes, None)
+            .await
+            .map(|pt| pt.text)
+    }
+
+    #[cfg(not(all(feature = "vendored", unix)))]
+    pub async fn get_text_tail_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> Result<MuxPaneText> {
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "get-text", "--pane-id", &pane_id_str];
         if escapes {
             args.push("--escapes");
         }
-        self.run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
-            .await
+        let full_text = self
+            .run_cli_with_pane_check_retry_with_cx(cx, &args, pane_id)
+            .await?;
+        let original_lines = full_text.lines().count();
+        let original_bytes = Some(full_text.len());
+        match tail {
+            Some(n) if n > 0 && n < original_lines => {
+                let lines: Vec<&str> = full_text.lines().collect();
+                let start_idx = lines.len().saturating_sub(n);
+                let text = lines[start_idx..].join("\n");
+                Ok(MuxPaneText {
+                    text,
+                    original_lines,
+                    original_bytes,
+                    truncated: true,
+                })
+            }
+            _ => Ok(MuxPaneText {
+                text: full_text,
+                original_lines,
+                original_bytes,
+                truncated: false,
+            }),
+        }
     }
 
     /// Get OSC 133 semantic zones from the live mux pane state.
@@ -3946,6 +4085,16 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { self.get_text_with_cx(cx, pane_id, escapes).await })
     }
 
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> WeztermFuture<'a, MuxPaneText> {
+        Box::pin(async move { self.get_text_tail_with_cx(cx, pane_id, escapes, tail).await })
+    }
+
     fn get_semantic_zones(&self, pane_id: u64) -> WeztermFuture<'_, MuxSemanticSnapshot> {
         Box::pin(async move { WeztermClient::get_semantic_zones(self, pane_id).await })
     }
@@ -4392,6 +4541,17 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         self.as_ref().get_text_with_cx(cx, pane_id, escapes)
+    }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> WeztermFuture<'a, MuxPaneText> {
+        self.as_ref()
+            .get_text_tail_with_cx(cx, pane_id, escapes, tail)
     }
 
     fn get_semantic_zones_with_cx<'a>(
@@ -9926,6 +10086,16 @@ impl WeztermInterface for UnifiedClient {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         self.inner.get_text_with_cx(cx, pane_id, escapes)
+    }
+
+    fn get_text_tail_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+        tail: Option<usize>,
+    ) -> WeztermFuture<'a, MuxPaneText> {
+        self.inner.get_text_tail_with_cx(cx, pane_id, escapes, tail)
     }
 
     fn get_semantic_zones_with_cx<'a>(

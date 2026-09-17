@@ -189,7 +189,7 @@ fn robot_get_text_fixture() -> RobotResponse<GetTextData> {
             escapes_included: false,
             truncated: true,
             truncation_info: Some(frankenterm_core::robot_types::TruncationInfo {
-                original_bytes: 4096,
+                original_bytes: Some(4096),
                 returned_bytes: 128,
                 original_lines: 120,
                 returned_lines: 40,
