@@ -235,7 +235,7 @@ impl crate::TermWindow {
         for (pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
             // The deadline belongs to the transaction, including panes in
             // hidden tabs that are not visited by the visible retry loop.
-            expired_copy |= crate::selection::PendingNativeSelection::expire_remote_copy(
+            expired_copy |= crate::selection::PendingNativeSelection::expire_text_copy(
                 &mut state.pending_native_selection,
                 now,
             );
@@ -260,7 +260,7 @@ impl crate::TermWindow {
         if expired_copy {
             frankenterm_toast_notification::persistent_toast_notification(
                 "Selection was not copied",
-                "The remote text did not arrive in time. Copy the selection again.",
+                "The selected text did not arrive in time. Copy the selection again.",
             );
         }
         // Released gestures retain their final endpoint through contention,
@@ -280,7 +280,7 @@ impl crate::TermWindow {
                 .pane_state(pos.pane.pane_id())
                 .pending_native_selection
                 .as_ref()
-                .and_then(|pending| pending.remote_copy.as_ref().map(|copy| copy.deadline()));
+                .and_then(|pending| pending.text_copy.as_ref().map(|copy| copy.wake_at()));
             if let Some(deadline) = copy_deadline {
                 self.schedule_animation_wake(deadline);
             }

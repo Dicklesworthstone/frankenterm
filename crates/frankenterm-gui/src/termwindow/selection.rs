@@ -6,14 +6,16 @@ use crate::smart_selection_a11y::emit_smart_selection_pick;
 use mux::pane::{LogicalLine, Pane, PaneId};
 use std::cell::RefMut;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 use window::WindowOps;
 
 /// One bounded clipboard transaction, independent of renderer cache capacity.
 /// The 64 MiB text cap and fixed deadline never reset as chunks arrive.
-#[derive(Debug, Clone)]
-pub(crate) struct RemoteSelectionCopy {
+#[derive(Debug)]
+pub(crate) struct SelectionCopy {
     source_sequence: termwiz::surface::SequenceNo,
     next_row: StableRowIndex,
     end_row: StableRowIndex,
@@ -24,18 +26,119 @@ pub(crate) struct RemoteSelectionCopy {
     join_previous: bool,
     has_line: bool,
     deadline: std::time::Instant,
+    local: bool,
+    local_read: Option<LocalSelectionRead>,
 }
 
-impl RemoteSelectionCopy {
+type SelectionReadPlans = anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>;
+
+/// Return hydrated rows to the admitted worker for destruction, including
+/// cancellation while the result is queued. The worker retains its permit.
+struct LocalSelectionReadReady {
+    plans: Option<SelectionReadPlans>,
+    retire: SyncSender<SelectionReadPlans>,
+}
+
+impl Drop for LocalSelectionReadReady {
+    fn drop(&mut self) {
+        if let Some(plans) = self.plans.take() {
+            let _ = self.retire.send(plans);
+        }
+    }
+}
+
+struct LocalSelectionRead {
+    receiver: Receiver<LocalSelectionReadReady>,
+    ready: Option<LocalSelectionReadReady>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for LocalSelectionRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSelectionRead")
+            .field("ready", &self.ready.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LocalSelectionRead {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl LocalSelectionRead {
+    fn start(
+        capture: impl FnOnce() -> Option<anyhow::Result<wezterm_term::screen::ScreenLineRead>>,
+        deadline: std::time::Instant,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Self>, &'static str> {
+        let Some(permit) = mux::pane::LineReadPermit::try_acquire() else {
+            return Ok(None);
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = sync_channel(1);
+        // Reserve and start before capturing any source allocations.
+        let worker = permit
+            .start(
+                move || {
+                    worker_cancelled.load(Ordering::Acquire)
+                        || std::time::Instant::now() >= deadline
+                },
+                move |plans, permit| {
+                    let (retire, retired) = sync_channel(1);
+                    let ready = LocalSelectionReadReady {
+                        plans: Some(plans),
+                        retire,
+                    };
+                    if sender.send(ready).is_ok() {
+                        wake();
+                        // Admission covers queued payload and its destruction.
+                        // Only this worker waits for the UI retirement guard.
+                        drop(retired.recv());
+                    }
+                    drop(permit);
+                },
+            )
+            .map_err(|_| "The text reader could not start. Copy the selection again.")?;
+        let Some(plan) = capture() else {
+            return Err("This pane cannot provide a bounded text read.");
+        };
+        let Ok(plan) = plan else {
+            return Ok(None);
+        };
+        let read = Self {
+            receiver,
+            ready: None,
+            cancelled,
+        };
+        worker.submit(vec![plan]);
+        Ok(Some(read))
+    }
+}
+
+impl SelectionCopy {
     const MAX_BYTES: usize = 64 * 1024 * 1024;
 
     pub(crate) fn deadline(&self) -> std::time::Instant {
         self.deadline
     }
 
+    pub(crate) fn wake_at(&self) -> std::time::Instant {
+        if self.local {
+            // Admission and terminal locks are nonblocking. A finite 20 Hz
+            // retry also covers a quiet pane when another read owns the pool.
+            self.deadline
+                .min(std::time::Instant::now() + std::time::Duration::from_millis(50))
+        } else {
+            self.deadline
+        }
+    }
+
     fn verify_source(&self, sequence: termwiz::surface::SequenceNo) -> Result<(), &'static str> {
         if std::time::Instant::now() >= self.deadline {
-            return Err("The remote text did not arrive in time. Copy the selection again.");
+            return Err("The selected text did not arrive in time. Copy the selection again.");
         }
         if sequence != self.source_sequence {
             return Err("The pane changed while copying. Copy the selection again.");
@@ -68,6 +171,8 @@ impl RemoteSelectionCopy {
             join_previous: false,
             has_line: false,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            local: false,
+            local_read: None,
         })
     }
 
@@ -302,13 +407,13 @@ impl super::TermWindow {
             return;
         };
         if pending
-            .remote_copy
+            .text_copy
             .as_ref()
             .is_some_and(|copy| std::time::Instant::now() >= copy.deadline())
         {
             frankenterm_toast_notification::persistent_toast_notification(
                 "Selection was not copied",
-                "The remote text did not arrive in time. Copy the selection again.",
+                "The selected text did not arrive in time. Copy the selection again.",
             );
             return;
         }
@@ -364,9 +469,17 @@ impl super::TermWindow {
                 }
             }
             if let Some(destination) = pending.copy {
-                if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
-                    match self.advance_remote_selection_copy(pane, client, &mut pending) {
-                        Ok(Some(text)) => self.copy_to_clipboard(destination, text),
+                if local.is_some()
+                    || pane
+                        .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                        .is_some()
+                {
+                    match self.advance_selection_copy(pane, &mut pending) {
+                        Ok(Some(text)) => {
+                            if local.is_none() || !text.is_empty() {
+                                self.copy_to_clipboard(destination, text);
+                            }
+                        }
                         Ok(None) => {
                             self.pane_state(pane.pane_id()).pending_native_selection =
                                 Some(pending);
@@ -380,54 +493,96 @@ impl super::TermWindow {
                     }
                     return;
                 }
-                let Some(local) = local else {
-                    return;
-                };
-                // Copy must be retried independently if its source acquisition
-                // loses the same contention race after anchor registration.
-                let Some(text) = self.try_selection_text(pane) else {
-                    self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
-                    return;
-                };
-                match Self::capture_native_selection(pane, local, &pending.desired) {
-                    crate::selection::NativeSelectionCapture::Busy => {
-                        self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
-                        return;
-                    }
-                    crate::selection::NativeSelectionCapture::Invalidated => {
-                        self.pane_state(pane.pane_id()).pending_native_selection = None;
-                        return;
-                    }
-                    _ => {}
-                }
-                self.pane_state(pane.pane_id()).pending_native_selection = None;
-                if !text.is_empty() {
-                    self.copy_to_clipboard(destination, text);
-                }
             }
         }
     }
 
-    fn advance_remote_selection_copy(
+    fn advance_local_selection_read(
         &self,
         pane: &Arc<dyn Pane>,
-        client: &frankenterm_client::pane::ClientPane,
+        copy: &mut SelectionCopy,
+        sequence: termwiz::surface::SequenceNo,
+        dimensions: mux::renderable::RenderableDimensions,
+        end: StableRowIndex,
+    ) -> Result<Option<Vec<Line>>, &'static str> {
+        copy.local = true;
+        let requested = copy.next_row..end;
+        if copy.local_read.is_none() {
+            let window = self.window.clone();
+            copy.local_read = LocalSelectionRead::start(
+                || pane.capture_line_read(requested.clone(), &mut Default::default()),
+                copy.deadline,
+                move || {
+                    if let Some(window) = window {
+                        window.invalidate();
+                    }
+                },
+            )?;
+            return Ok(None);
+        }
+        let read = copy.local_read.as_mut().unwrap();
+        if read.ready.is_none() {
+            match read.receiver.try_recv() {
+                Ok(ready) => read.ready = Some(ready),
+                Err(TryRecvError::Empty) => return Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    return Err("The text reader stopped. Copy the selection again.");
+                }
+            }
+        }
+        let plans = read
+            .ready
+            .as_ref()
+            .unwrap()
+            .plans
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .map_err(|_| "The selected history could not be loaded. Copy the selection again.")?;
+        if plans.len() != 1 {
+            return Err("The text reader returned an incomplete selection.");
+        }
+        let mut rows = None;
+        let published = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+            let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+            let mut work = 65_536;
+            rows =
+                plans[0].try_clone_viewport_for_snapshot(requested.clone(), &mut bytes, &mut work);
+        });
+        if !published {
+            return Ok(None);
+        }
+        let (first, rows) = rows.ok_or("The selected rows exceed the text read budget.")?;
+        if first != requested.start
+            || usize::try_from(requested.end - requested.start).ok() != Some(rows.len())
+        {
+            return Err("The selected history changed or is unavailable. Select it again.");
+        }
+        // Returning the ready object retires heavy hydrated state on its worker.
+        copy.local_read = None;
+        Ok(Some(rows))
+    }
+
+    fn advance_selection_copy(
+        &self,
+        pane: &Arc<dyn Pane>,
         pending: &mut crate::selection::PendingNativeSelection,
     ) -> Result<Option<String>, &'static str> {
         use frankenterm_client::pane::SelectionReadError;
-        let Some((authority, sequence, _)) = SelectionAuthority::capture_source(&**pane) else {
+        let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
+        else {
             return Ok(None);
         };
         if pending.desired.authority != Some(authority) {
             return Err("The pane changed. Select the text again to copy it.");
         }
-        if pending.remote_copy.is_none() {
-            pending.remote_copy = Some(
-                RemoteSelectionCopy::new(&pending.desired, sequence)
+        if pending.text_copy.is_none() {
+            pending.text_copy = Some(
+                SelectionCopy::new(&pending.desired, sequence)
                     .ok_or("The selection range is unavailable. Select the text again.")?,
             );
         }
-        let copy = pending.remote_copy.as_mut().unwrap();
+        let copy = pending.text_copy.as_mut().unwrap();
         copy.verify_source(sequence)?;
         if copy.next_row < copy.end_row {
             let end = copy
@@ -435,12 +590,22 @@ impl super::TermWindow {
                 .checked_add(64)
                 .unwrap_or(copy.end_row)
                 .min(copy.end_row);
-            match client.selection_lines(
-                authority.layout_floor(),
-                sequence,
-                pending.desired.seqno,
-                copy.next_row..end,
-            ) {
+            let rows = if let Some(client) =
+                pane.downcast_ref::<frankenterm_client::pane::ClientPane>()
+            {
+                client.selection_lines(
+                    authority.layout_floor(),
+                    sequence,
+                    pending.desired.seqno,
+                    copy.next_row..end,
+                )
+            } else {
+                match self.advance_local_selection_read(pane, copy, sequence, dimensions, end)? {
+                    Some(rows) => Ok(rows),
+                    None => return Ok(None),
+                }
+            };
+            match rows {
                 Ok(rows) => copy.push_chunk(rows)?,
                 Err(SelectionReadError::Busy) => return Ok(None),
                 Err(SelectionReadError::TooLarge) => {
@@ -489,9 +654,10 @@ impl super::TermWindow {
             return true;
         }
         if state.pending_native_selection.is_none()
-            && pane
-                .downcast_ref::<frankenterm_client::pane::ClientPane>()
-                .is_some()
+            && (pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
+                || pane
+                    .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                    .is_some())
             && state.selection.range.is_some()
         {
             let mut pending =
@@ -1100,38 +1266,147 @@ mod tests {
     use termwiz::surface::SEQ_ZERO;
 
     #[test]
+    fn local_selection_read_retires_busy_and_cancelled_workers_and_preserves_source_fence() {
+        #[derive(Debug)]
+        struct ReadConfig;
+        impl wezterm_term::TerminalConfiguration for ReadConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        fn available_permit() -> mux::pane::LineReadPermit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(permit) = mux::pane::LineReadPermit::try_acquire() {
+                    return permit;
+                }
+                assert!(std::time::Instant::now() < deadline, "read permit leaked");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let _other_readers: Vec<_> = (0..3).map(|_| available_permit()).collect();
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 2,
+                cols: 40,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 32,
+            },
+            Arc::new(ReadConfig),
+            "selection-read-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes("café 界 e\u{301}".as_bytes());
+        let terminal = parking_lot::Mutex::new(terminal);
+        let capture = || {
+            Some(
+                terminal
+                    .try_lock()
+                    .ok_or_else(|| anyhow::anyhow!("terminal busy"))
+                    .and_then(|term| {
+                        term.screen()
+                            .capture_line_read_with_budget(0..1, &mut Default::default())
+                    }),
+            )
+        };
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // A real held terminal lock abandons the already-started worker.
+        let held = terminal.lock();
+        assert!(
+            LocalSelectionRead::start(capture, deadline(), || {})
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        drop(available_permit());
+
+        // Completion remains charged while queued, and cancelling a queued
+        // result returns its heavy payload to the worker before permit release.
+        let (woke, wake) = sync_channel(1);
+        let read = LocalSelectionRead::start(capture, deadline(), move || {
+            woke.send(()).unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        wake.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(mux::pane::LineReadPermit::try_acquire().is_none());
+        let cancelled = Arc::clone(&read.cancelled);
+        drop(read);
+        assert!(cancelled.load(Ordering::Acquire));
+        drop(available_permit());
+
+        let read = LocalSelectionRead::start(capture, deadline(), || {})
+            .unwrap()
+            .unwrap();
+        let ready = read
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let plans = ready.plans.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(
+            plans[0]
+                .lines()
+                .next()
+                .unwrap()
+                .as_str()
+                .contains("café 界 e\u{301}")
+        );
+        assert!(terminal.lock().screen().validates_line_read(&plans[0]));
+        terminal.lock().advance_bytes(b"\rCHANGED");
+        assert!(!terminal.lock().screen().validates_line_read(&plans[0]));
+        drop(ready);
+        drop(read);
+        drop(available_permit());
+    }
+
+    #[test]
+    fn local_selection_copy_completes_a_valid_empty_span() {
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange::start(SelectionCoordinate::x_y(0, 0)));
+        let mut copy = SelectionCopy::new(&selection, 12).unwrap();
+        copy.local = true;
+        copy.push_chunk(vec![Line::from("")]).unwrap();
+        assert_eq!(copy.finish(12).unwrap(), Some(String::new()));
+    }
+
+    #[test]
     fn remote_selection_copy_expiry_releases_hidden_pane_text_once() {
         let mut selection = Selection::default();
         selection.range = Some(SelectionRange {
             start: SelectionCoordinate::x_y(0, 0),
             end: SelectionCoordinate::x_y(3, 2),
         });
-        let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        let mut copy = SelectionCopy::new(&selection, 12).unwrap();
         copy.push_chunk(vec![Line::from("retained"), Line::from("text")])
             .unwrap();
         assert!(!copy.text.is_empty());
         let deadline = copy.deadline();
         let mut intent = crate::selection::PendingNativeSelection::new(selection);
         intent.copy = Some(config::keyassignment::ClipboardCopyDestination::Clipboard);
-        intent.remote_copy = Some(copy);
+        intent.text_copy = Some(copy);
         let mut hidden = Some(intent);
-        assert!(
-            !crate::selection::PendingNativeSelection::expire_remote_copy(
-                &mut hidden,
-                deadline - std::time::Duration::from_nanos(1)
-            )
-        );
+        assert!(!crate::selection::PendingNativeSelection::expire_text_copy(
+            &mut hidden,
+            deadline - std::time::Duration::from_nanos(1)
+        ));
         assert!(hidden.is_some());
-        assert!(
-            crate::selection::PendingNativeSelection::expire_remote_copy(&mut hidden, deadline)
-        );
+        assert!(crate::selection::PendingNativeSelection::expire_text_copy(
+            &mut hidden,
+            deadline
+        ));
         assert!(
             hidden.is_none(),
             "hidden pane retains neither text nor clipboard intent after expiry"
         );
-        assert!(
-            !crate::selection::PendingNativeSelection::expire_remote_copy(&mut hidden, deadline)
-        );
+        assert!(!crate::selection::PendingNativeSelection::expire_text_copy(
+            &mut hidden,
+            deadline
+        ));
     }
 
     #[test]
@@ -1141,7 +1416,7 @@ mod tests {
             start: SelectionCoordinate::x_y(0, 0),
             end: SelectionCoordinate::x_y(3, 1),
         });
-        let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        let mut copy = SelectionCopy::new(&selection, 12).unwrap();
         copy.push_chunk(vec![Line::from("界 e\u{301}")]).unwrap();
         assert_eq!(copy.finish(12).unwrap(), None);
         assert!(copy.finish(13).is_err());
@@ -1154,7 +1429,7 @@ mod tests {
             copy.finish(12).unwrap(),
             Some("界 e\u{301}\ntail".to_string())
         );
-        let mut expired = RemoteSelectionCopy::new(&selection, 12).unwrap();
+        let mut expired = SelectionCopy::new(&selection, 12).unwrap();
         expired.deadline = std::time::Instant::now();
         assert!(expired.finish(12).is_err());
     }
@@ -1204,7 +1479,7 @@ mod tests {
                     );
                 }
                 for chunk_size in [1, 64] {
-                    let mut copy = RemoteSelectionCopy::new(&selection, 9).unwrap();
+                    let mut copy = SelectionCopy::new(&selection, 9).unwrap();
                     let end = usize::try_from(copy.end_row).unwrap();
                     let deadline = copy.deadline;
                     for chunk in physical[..end].chunks(chunk_size) {

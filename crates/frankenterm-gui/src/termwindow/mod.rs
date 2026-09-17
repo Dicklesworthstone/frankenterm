@@ -128,7 +128,7 @@ mod prevcursor;
 pub mod render;
 pub mod resize;
 mod selection;
-pub(crate) use selection::RemoteSelectionCopy;
+pub(crate) use selection::SelectionCopy;
 #[cfg(test)]
 pub(crate) use selection::selected_text_from_logical_lines;
 pub mod spawn;

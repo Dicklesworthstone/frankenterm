@@ -47,13 +47,13 @@ struct NativeSelectionAnchor {
 
 /// One uncommitted native gesture. Contention must neither replace the last
 /// anchored selection nor discard the final endpoint when the button lifts.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PendingNativeSelection {
     pub desired: Selection,
     pub copy: Option<config::keyassignment::ClipboardCopyDestination>,
     pub paint_retries_remaining: u8,
     pub committed: bool,
-    pub remote_copy: Option<crate::termwindow::RemoteSelectionCopy>,
+    pub text_copy: Option<crate::termwindow::SelectionCopy>,
 }
 
 pub(crate) enum NativeSelectionCapture {
@@ -93,10 +93,10 @@ impl
 }
 
 impl PendingNativeSelection {
-    pub(crate) fn expire_remote_copy(pending: &mut Option<Self>, now: std::time::Instant) -> bool {
+    pub(crate) fn expire_text_copy(pending: &mut Option<Self>, now: std::time::Instant) -> bool {
         if pending
             .as_ref()
-            .and_then(|pending| pending.remote_copy.as_ref())
+            .and_then(|pending| pending.text_copy.as_ref())
             .is_some_and(|copy| now >= copy.deadline())
         {
             *pending = None;
@@ -112,7 +112,7 @@ impl PendingNativeSelection {
             copy: None,
             paint_retries_remaining: 3,
             committed: false,
-            remote_copy: None,
+            text_copy: None,
         }
     }
 
