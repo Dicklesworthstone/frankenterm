@@ -1314,15 +1314,28 @@ power loss nor migration of those live sessions has been demonstrated.
   - [x] Diagnose the next real-process failure: whole-image validation compares
     compact-hex topology incarnation against hyphenated UUID Display. Preserve
     the existing topology encoding and reject different owner identities.
-  - [ ] Test the corrected identity comparison and rerun the real-process
+  - [x] Test the corrected identity comparison and rerun the real-process
     checkpoint/image/reopen path with the matching sealed guardian family.
     `a97be2b42` passed sealed compilation, but the actual test exposed a second
     contention path: replay I/O failure retired the pane despite retained
     exact Replay/Ack requests. `2726d1332` connects that retry contract to the
     mux reader loop, preserving parser failures/gaps as terminal and adding
-    no-redelivery coverage. Matching sealed rebuild is active on worker114.
+    no-redelivery coverage. The corrected core image suite passed 52 tests
+    through strict RCH on worker2480; five tail retry tests passed against the
+    sealed worker114 binary, including lost ACK without parser redelivery.
+    Fresh-process reopen then exposed a digest-domain mismatch: the catalog
+    uses the guardian domain-separated payload digest while the verifier used
+    plain SHA-256. `7a1dc66a6` uses the canonical digest in both witness paths.
   - [ ] Pass the real child birth/checkpoint/image/reopen test with the new
     companion, then broader checkpoint authority and registration tests.
+    Both exact real-process tests passed against the matching sealed `7a1dc66a6`
+    guardian and test executable: real birth/checkpoint/image/fresh reopen in
+    2.34s, and in-flight cancellation in 1.43s. Strict RCH Cargo execution of
+    both tests is active; direct-artifact diagnostics are not its substitute.
+  - [ ] Implement and prove successor-generation checkpoint reopen (`ft-7sdcc`):
+    the current custody reopen path rejects generation two and later. Preserve
+    original spawn custody and authenticate the later owner from durable
+    checkpoint/ACK evidence before changing this fence.
   - [ ] Validate reviewed follow-up checks for increasing journal offsets,
     nonzero geometry and the exact private capture authority inventory.
 - [x] Correct Clippy's similar-name error in the recovery-image adapter.
@@ -1330,8 +1343,16 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Complete strict remote workspace/all-targets check with supported
   feature union at `aa0e30459`, worker2480; retained
   `aa0e304-workspace-check-rch.log`. Newer waiter changes still require checks.
-- [ ] Finish the current strict workspace Clippy run at `b9b46eff2` on
-  worker2480, then incorporate any later source changes into final proof.
+- [ ] Finish strict workspace Clippy on the corrected selection revision.
+  The `7a1dc66a6` pass found the second pending-selection borrow error; fixed
+  in `98213b1b4`. The same error blocked GUI compilation at `61b282364`.
+  Worker126 now tests the corrected source through the real `glyphcache_unit`
+  harness. Neither failed compilation counts as selection test coverage.
+- [ ] Finish quick-select async acceptance review: remove blocking metadata
+  reads, retain Busy without restarting, retire on retry admission failure,
+  enforce deadlines while hydration is pending, publish exact read plans before
+  dispatch, and release pane-state borrows before overlay mutations. Fuchsia
+  owns this file; its initial formatting-only check is not runtime verification.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
   eight Cargo gates skipped. This is not strict release attestation closure.
 - [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping
