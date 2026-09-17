@@ -1118,3 +1118,45 @@ power loss nor migration of those live sessions has been demonstrated.
   native families, native/remote acceptance, required producer evidence,
   publication, verification, canary and safe upgrade/installation. No release
   is published and no existing remote mux has been restarted.
+
+### 2026-09-17 — live handoff proven; remaining release work
+
+- [x] Execute the sealed two-pane mux-process rotation at `f2fc069e4` through
+  strict RCH job `j-30023605353971981`: one passed, zero failed/ignored,
+  250 filtered. Both original children survive the tested ownership handoff.
+  Retain the executable independently of the mutable build pool; SHA-256
+  `78eddf76ece656a1117161b79e05a6958cb894f2503991b080607d8841510129`.
+- [ ] Build and retain a second sealed source executable, then prove actual
+  A-to-B transfer, delayed output/ACK, exact outer reply loss, and all three
+  lease-journal fault cuts. Same-build success does not close these controls.
+- [x] Commit actual input delivery gates in `2332b889b`: keyboard protocols,
+  composed input, SendKey/SendString, terminal mouse reports, paste and drops.
+  Retain local selection/copy and overlay interaction. Delayed paste retains
+  its original pane allocation and verifies current window ownership.
+- [ ] Execute the owned real-PTY pane-move regression and mixed-layout tests;
+  review reconnect delivery and saved-window restoration against native input.
+- [x] Fix the missing inherited guardian workspace dependency in `f85640a22`.
+  Both prior `2332b889b` verification jobs failed before compilation; neither
+  is a passing receipt. Scope durable Unix-only witnesses correctly in
+  `8e00c3e75` so Windows does not import unavailable output-store types.
+- [x] Retain and review the remote Cargo lock resolution for the new optional
+  core-to-guardian dependency: exactly one dependency-list entry, no version
+  changes. Local lock bytes match the retained remote file, SHA-256
+  `8bfd49e94374b368aff709714ec2d838d40f2c9258aefbe0552b261a4c653de8`.
+- [ ] Repeat verification with the committed lock and `--locked`.
+- [x] Execute latest core image suite at `25c029e9`: 72 passed, zero failed.
+- [ ] Execute fresh-process custody/catalog/ACK reopening through the real
+  birth-image parent test. Then connect verified discovery and atomic topology
+  publication to ordinary startup before listeners/default shells appear.
+- [ ] Finish clipboard deadline proof: both new retirement tests passed, but
+  the first complete suite was 30 passed/one failed due to two accessibility
+  tests draining one shared recorder. Fix isolation and rerun in parallel.
+- [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
+  separator corrections are committed; Bead `ft-kwrh9` retains the earlier
+  419-test surface receipt and terminal oracle corrections.
+- [ ] Finish current-source word-boundary proof and measure actual native
+  resize, tiling and font-change latency with fixed pixels and large history.
+- [ ] Complete final workspace check, Clippy, exact-source formatting proof,
+  DSR quality, native builds, native/remote acceptance, signed producer
+  artifacts, DSR publication/verification/canary/upgrade and Dock installation.
+  Existing user sessions remain untouched until their preservation is proved.
