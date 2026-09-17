@@ -4171,7 +4171,8 @@ mod tests {
                 .expect_err("one configured attempt must not enter fallback");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+                MuxPoolError::Mux(DirectMuxError::RenderBatchResyncRequired(source))
+                    if matches!(*source, DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
 
             let stats = pool.stats().await;
@@ -4182,7 +4183,7 @@ mod tests {
                 "one configured attempt creates only the failed pipeline connection"
             );
             assert_eq!(stats.pool.total_acquired, 1);
-            assert_eq!(stats.pool.idle_count, 1);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 
@@ -4256,7 +4257,8 @@ mod tests {
                 .expect_err("aligned semantic error must not replay or enter fallback");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+                MuxPoolError::Mux(DirectMuxError::RenderBatchResyncRequired(source))
+                    if matches!(*source, DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
 
             let stats = pool.stats().await;
@@ -4264,7 +4266,7 @@ mod tests {
             assert_eq!(stats.pool.total_acquired, 1);
             assert_eq!(stats.recovery_attempts, 0);
             assert_eq!(stats.recovery_successes, 0);
-            assert_eq!(stats.pool.idle_count, 1);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 
@@ -4308,12 +4310,13 @@ mod tests {
                 };
                 assert!(matches!(
                     error,
-                    MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+                    MuxPoolError::Mux(DirectMuxError::RenderBatchResyncRequired(source))
+                        if matches!(*source, DirectMuxError::AlignedUnexpectedResponse { .. })
                 ));
                 let stats = pool.stats().await;
                 assert_eq!(stats.connections_created, 1);
                 assert_eq!(stats.recovery_attempts, 0);
-                assert_eq!(stats.pool.idle_count, 1);
+                assert_eq!(stats.pool.idle_count, 0);
             }
         });
     }
@@ -5080,7 +5083,8 @@ mod tests {
                 .expect_err("one configured explicit-Cx attempt must not enter fallback");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::AlignedUnexpectedResponse { .. })
+                MuxPoolError::Mux(DirectMuxError::RenderBatchResyncRequired(source))
+                    if matches!(*source, DirectMuxError::AlignedUnexpectedResponse { .. })
             ));
 
             let stats = pool.stats().await;
@@ -5091,7 +5095,7 @@ mod tests {
                 "one configured explicit-Cx attempt creates only the failed pipeline connection"
             );
             assert_eq!(stats.pool.total_acquired, 1);
-            assert_eq!(stats.pool.idle_count, 1);
+            assert_eq!(stats.pool.idle_count, 0);
         });
     }
 

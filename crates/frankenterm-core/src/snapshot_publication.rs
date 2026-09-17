@@ -662,12 +662,14 @@ fn ensure_directory_hierarchy_nofollow(path: &Path) -> Result<Dir, PublicationEr
                     path: path.to_path_buf(),
                     reason: "path has no leaf component".to_string(),
                 })?;
-            let mut builder = cap_std::fs::DirBuilder::new();
+            let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use cap_std::fs::DirBuilderExt as _;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             parent_dir
                 .create_dir_with(leaf, &builder)
                 .map_err(|e| PublicationError::io(path, e))?;
@@ -1034,12 +1036,14 @@ impl SnapshotPublicationStore {
             // Ensure parent directory exists without symlinks
             let parent_dir = ensure_directory_hierarchy_nofollow(parent_path)?;
 
-            let mut builder = cap_std::fs::DirBuilder::new();
+            let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use cap_std::fs::DirBuilderExt as _;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             parent_dir
                 .create_dir_with(leaf, &builder)
                 .map_err(|e| PublicationError::io(&root_path, e))?;
@@ -1121,12 +1125,14 @@ impl SnapshotPublicationStore {
             sync_directory(parent, base_path)?;
             Ok(child_dir)
         } else {
-            let mut builder = cap_std::fs::DirBuilder::new();
+            let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use cap_std::fs::DirBuilderExt as _;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             parent
                 .create_dir_with(name, &builder)
                 .map_err(|e| PublicationError::io(&child_path, e))?;
@@ -1193,7 +1199,10 @@ impl SnapshotPublicationStore {
                 Err(e) => return Err(PublicationError::io(&lock_path, e)),
             };
 
-            if named_meta.file_type().is_symlink() || !named_meta.is_file() {
+            if named_meta.file_type().is_symlink()
+                || !named_meta.is_file()
+                || !opened_meta.is_file()
+            {
                 return Err(PublicationError::InsecurePermissions {
                     path: lock_path.clone(),
                     reason: "named lock path is not a regular file or is a symlink".to_string(),
@@ -1674,6 +1683,15 @@ impl SnapshotPublicationStore {
         let stage_fd_meta = stage_file
             .metadata()
             .map_err(|e| PublicationError::io(&stage_path, e))?;
+        if stage_named_meta.file_type().is_symlink()
+            || !stage_named_meta.is_file()
+            || !stage_fd_meta.is_file()
+        {
+            return Err(PublicationError::InsecurePermissions {
+                path: stage_path.clone(),
+                reason: "staging object is not a regular file or is a symlink".to_string(),
+            });
+        }
         #[cfg(unix)]
         {
             if stage_named_meta.dev() != stage_fd_meta.dev()
@@ -2351,7 +2369,10 @@ impl SnapshotPublicationStore {
             .metadata()
             .map_err(|e| PublicationError::io(&stage_path, e))?;
 
-        if stage_named_meta.file_type().is_symlink() || !stage_named_meta.is_file() {
+        if stage_named_meta.file_type().is_symlink()
+            || !stage_named_meta.is_file()
+            || !stage_fd_meta.is_file()
+        {
             return Err(PublicationError::InsecurePermissions {
                 path: stage_path.clone(),
                 reason: "stage file on disk is not a regular file or is a symlink".to_string(),
@@ -2388,6 +2409,12 @@ impl SnapshotPublicationStore {
             .roots_dir
             .symlink_metadata(target_filename)
             .map_err(|e| PublicationError::io(&target_full_path, e))?;
+        if target_meta.file_type().is_symlink() || !target_meta.is_file() {
+            return Err(PublicationError::InsecurePermissions {
+                path: target_full_path.clone(),
+                reason: "published root slot is not a regular file or is a symlink".to_string(),
+            });
+        }
 
         #[cfg(unix)]
         {

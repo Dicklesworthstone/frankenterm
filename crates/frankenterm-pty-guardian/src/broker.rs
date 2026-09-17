@@ -194,7 +194,8 @@ const BROKER_LEASE_CATALOG_MAX_PHYSICAL_BYTES: u64 = GUARDIAN_MAX_PANES as u64
         + BROKER_LEASE_CREATION_MARKER_BYTES);
 const BROKER_CONTROL_REQUEST_MAGIC: [u8; 4] = *b"FTBQ";
 const BROKER_CONTROL_RESPONSE_MAGIC: [u8; 4] = *b"FTBP";
-const BROKER_CONTROL_VERSION: u16 = 1;
+const BROKER_CONTROL_VERSION: u16 = 2;
+const BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES: usize = 3 * 16 + 2 * 32 + 32;
 const BROKER_CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const BROKER_CONTROL_REQUEST_FIXED_BYTES: usize = 240;
 const BROKER_CONTROL_REQUEST_PAYLOAD_OFFSET: usize = 208;
@@ -1750,7 +1751,7 @@ impl BrokerControlResponseHeaderV1 {
                             && self.lease_generation == 0
                             && self.child_identity.is_some())
                         || (successful
-                            && payload_bytes == BROKER_PANE_RECOVERY_SECRET_BYTES
+                            && payload_bytes == BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES
                             && self.lease_generation > 1
                             && self.child_identity.is_none())
                         || (self.status == BrokerControlResponseStatusV1::Quarantined
@@ -1776,7 +1777,7 @@ impl BrokerControlResponseHeaderV1 {
                     && self.lease_generation > 1
                     && self.child_identity.is_none()
                     && ((successful
-                        && matches!(payload_bytes, 0 | BROKER_PANE_RECOVERY_SECRET_BYTES))
+                        && matches!(payload_bytes, 0 | BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES))
                         || (unsuccessful && payload_bytes == 0))
             }
             BrokerControlOperationV1::ClosePane => {
@@ -3669,10 +3670,28 @@ struct BrokerLiveSpawnV1 {
 
 struct BrokerPendingSuccessorClaimV1 {
     handoff_id: Uuid,
+    predecessor: BrokerGuardianOwnerIdentity,
     owner: BrokerGuardianOwnerIdentity,
     attachment: BrokerAttachmentIdentityV1,
     recovery_secret: BrokerPaneRecoverySecretV1,
     recovery_verifier: BrokerPaneRecoveryVerifierV1,
+}
+
+impl BrokerPendingSuccessorClaimV1 {
+    fn payload(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(Vec::with_capacity(BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES));
+        for id in [
+            self.predecessor.guardian_incarnation,
+            self.predecessor.connection_id,
+            self.predecessor.mux_incarnation,
+        ] {
+            bytes.extend_from_slice(id.as_bytes());
+        }
+        bytes.extend_from_slice(&self.predecessor.guardian_build_identity_digest);
+        bytes.extend_from_slice(&self.predecessor.mux_build_identity_digest);
+        bytes.extend_from_slice(self.recovery_secret.as_wire());
+        bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5646,9 +5665,12 @@ impl BrokerControlServiceV1 {
             } else {
                 BrokerControlResponseStatusV1::Quarantined
             };
-            let payload = exact.then_some(pending.recovery_secret.as_wire().as_slice());
-            return BrokerControlResponseV1::new(response_header(status), payload.unwrap_or(&[]))
-                .map_err(|_| ());
+            let payload = if exact {
+                pending.payload()
+            } else {
+                Zeroizing::new(Vec::new())
+            };
+            return BrokerControlResponseV1::new(response_header(status), &payload).map_err(|_| ());
         }
         let pane_status = live.adoption.pane.status();
         let predecessor = live.adoption.pane.awaiting_successor_predecessor();
@@ -5680,6 +5702,7 @@ impl BrokerControlServiceV1 {
             predecessor: predecessor.ok_or(())?,
             successor: owner,
         };
+        let predecessor_owner = authority.predecessor.owner;
         let attachment = match live.adoption.pane.attach_successor(authority) {
             Ok(BrokerSuccessorAttachOutcomeV1::Attached(attachment)) => attachment.identity(),
             Ok(
@@ -5696,6 +5719,7 @@ impl BrokerControlServiceV1 {
         };
         live.pending_successor = Some(BrokerPendingSuccessorClaimV1 {
             handoff_id,
+            predecessor: predecessor_owner,
             owner,
             attachment,
             recovery_secret: successor_secret,
@@ -5704,7 +5728,7 @@ impl BrokerControlServiceV1 {
         let pending = live.pending_successor.as_ref().ok_or(())?;
         BrokerControlResponseV1::new(
             response_header(BrokerControlResponseStatusV1::Applied),
-            pending.recovery_secret.as_wire(),
+            &pending.payload(),
         )
         .map_err(|_| ())
     }
@@ -5730,13 +5754,14 @@ impl BrokerControlServiceV1 {
             } else {
                 BrokerControlResponseStatusV1::Quarantined
             };
+            let payload = if exact {
+                pending.payload()
+            } else {
+                Zeroizing::new(Vec::new())
+            };
             return BrokerControlResponseV1::new(
                 self.response_header(request.header, status),
-                if exact {
-                    pending.recovery_secret.as_wire()
-                } else {
-                    &[]
-                },
+                &payload,
             )
             .map_err(|_| ());
         }
@@ -6361,6 +6386,7 @@ fn evict_one_inactive_hello_receipt(
 
 /// Publicly nameable, privately minted post-synchronization custody capability.
 pub use crate::output::GuardianDurableSpawnCustodyV1;
+pub use crate::output::GuardianDurableSuccessorCustodyV1;
 
 /// Blocking guardian-side client for the production-disabled broker process.
 pub struct BrokerControlClientV1 {
@@ -6904,6 +6930,12 @@ pub enum BrokerSpawnClaimQueryV1 {
 /// generation. The caller must durably protect the capability and then
 /// acknowledge this exact handoff before any pane effects become available.
 pub struct BrokerSuccessorPaneClaimV1 {
+    origin: BrokerGuardianConnectionIdentityV1,
+    origin_connection: Uuid,
+    broker_incarnation: Uuid,
+    broker_lineage: Uuid,
+    broker_build: SealedAtomicBuildIdentity,
+    predecessor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1,
     durable_pane_id: Uuid,
     handoff_id: Uuid,
     lease_generation: u64,
@@ -7974,13 +8006,45 @@ impl BrokerControlClientV1 {
                 Ok(BrokerSuccessorClaimQueryV1::Pending)
             }
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
-                if response.payload().len() == BROKER_PANE_RECOVERY_SECRET_BYTES
+                if response.payload().len() == BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES
                     && response.header.child_identity.is_none() =>
             {
-                let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(response.payload())
+                let payload = response.payload();
+                let id_at = |offset: usize| -> Result<Uuid, BrokerControlClientError> {
+                    let id = Uuid::from_bytes(
+                        payload[offset..offset + 16]
+                            .try_into()
+                            .map_err(|_| BrokerControlClientError::Protocol)?,
+                    );
+                    if id.is_nil() {
+                        return Err(BrokerControlClientError::Protocol);
+                    }
+                    Ok(id)
+                };
+                let predecessor = mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                    guardian_incarnation: id_at(0)?,
+                    connection_id: id_at(16)?,
+                    mux_incarnation: id_at(32)?,
+                    guardian_build: payload[48..80]
+                        .try_into()
+                        .map_err(|_| BrokerControlClientError::Protocol)?,
+                    mux_build: payload[80..112]
+                        .try_into()
+                        .map_err(|_| BrokerControlClientError::Protocol)?,
+                };
+                if predecessor.guardian_build == [0; 32] || predecessor.mux_build == [0; 32] {
+                    return Err(BrokerControlClientError::Protocol);
+                }
+                let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(&payload[112..])
                     .map_err(|_| BrokerControlClientError::Protocol)?;
                 Ok(BrokerSuccessorClaimQueryV1::Claim(
                     BrokerSuccessorPaneClaimV1 {
+                        origin: self.identity,
+                        origin_connection: self.connection_id,
+                        broker_incarnation: self.broker_incarnation,
+                        broker_lineage: self.broker_lineage,
+                        broker_build: self.broker_build,
+                        predecessor,
                         durable_pane_id,
                         handoff_id,
                         lease_generation,
@@ -8003,9 +8067,104 @@ impl BrokerControlClientV1 {
         }
     }
 
-    /// Acknowledge one exact successor capability and atomically enable the
-    /// claimed generation. The caller must reuse `ack_id` after reply loss.
+    /// Synchronize an exact successor claim before granting ACK authority.
+    pub fn persist_successor_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        claim: &BrokerSuccessorPaneClaimV1,
+        ack_id: Uuid,
+    ) -> Result<
+        crate::output::GuardianDurableSuccessorCustodyV1,
+        crate::output::GuardianCheckpointStageStoreError,
+    > {
+        if claim.origin != self.identity
+            || claim.origin_connection != self.connection_id
+            || claim.broker_incarnation != self.broker_incarnation
+            || claim.broker_lineage != self.broker_lineage
+            || claim.broker_build != self.broker_build
+        {
+            return Err(crate::output::GuardianCheckpointStageStoreError::Conflict);
+        }
+        let context = mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 {
+            broker_incarnation: claim.broker_incarnation,
+            broker_lineage: claim.broker_lineage,
+            broker_build: claim.broker_build.into_bytes(),
+            predecessor: claim.predecessor,
+            successor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                guardian_incarnation: claim.origin.guardian_incarnation,
+                connection_id: claim.origin_connection,
+                mux_incarnation: claim.origin.mux_incarnation,
+                guardian_build: claim.origin.guardian_build_identity.into_bytes(),
+                mux_build: claim.origin.mux_build_identity.into_bytes(),
+            },
+            pane_id: claim.durable_pane_id,
+            handoff_id: claim.handoff_id,
+            ack_id,
+            lease_generation: claim.lease_generation,
+        };
+        store.persist_successor_custody(&context, claim.recovery_secret.as_wire())
+    }
+
+    /// Recover ACK/predecessor provenance from disk within this exact connection.
+    /// A fresh connection needs a separate authenticated rebind; it is not inferred.
+    pub fn reopen_successor_custody(
+        &self,
+        store: &crate::output::GuardianCheckpointStageStore,
+        pane_id: Uuid,
+        handoff_id: Uuid,
+        lease_generation: u64,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, crate::output::GuardianCheckpointStageStoreError>
+    {
+        store.lookup_successor_custody(mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1 {
+            broker_incarnation: self.broker_incarnation,
+            broker_lineage: self.broker_lineage,
+            broker_build: self.broker_build.into_bytes(),
+            successor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                guardian_incarnation: self.identity.guardian_incarnation,
+                connection_id: self.connection_id,
+                mux_incarnation: self.identity.mux_incarnation,
+                guardian_build: self.identity.guardian_build_identity.into_bytes(),
+                mux_build: self.identity.mux_build_identity.into_bytes(),
+            },
+            pane_id,
+            handoff_id,
+            lease_generation,
+        })
+    }
+
+    /// Reopen and resynchronize custody before any ACK network effect.
     pub fn acknowledge_successor_claim(
+        &mut self,
+        custody: crate::output::GuardianDurableSuccessorCustodyV1,
+    ) -> Result<BrokerSuccessorAcknowledgementV1, BrokerControlClientError> {
+        let context = custody.context();
+        if context.broker_incarnation != self.broker_incarnation
+            || context.broker_lineage != self.broker_lineage
+            || context.broker_build != self.broker_build.into_bytes()
+            || context.successor.guardian_incarnation != self.identity.guardian_incarnation
+            || context.successor.connection_id != self.connection_id
+            || context.successor.mux_incarnation != self.identity.mux_incarnation
+            || context.successor.guardian_build
+                != self.identity.guardian_build_identity.into_bytes()
+            || context.successor.mux_build != self.identity.mux_build_identity.into_bytes()
+        {
+            return Err(BrokerControlClientError::AuthenticationAuthority);
+        }
+        let secret = custody
+            .into_secret()
+            .map_err(|_| BrokerControlClientError::AuthenticationAuthority)?;
+        let secret = BrokerPaneRecoverySecretV1::from_wire(secret.as_slice())
+            .map_err(|_| BrokerControlClientError::Protocol)?;
+        self.acknowledge_successor_claim_request(
+            context.pane_id,
+            context.handoff_id,
+            context.ack_id,
+            context.lease_generation,
+            &secret,
+        )
+    }
+
+    fn acknowledge_successor_claim_request(
         &mut self,
         durable_pane_id: Uuid,
         handoff_id: Uuid,
@@ -8038,6 +8197,10 @@ impl BrokerControlClientV1 {
         )
         .map_err(|_| BrokerControlClientError::Protocol)?;
         let response = self.exchange(&request)?;
+        if response.header.child_identity.is_some() {
+            self.poisoned = true;
+            return Err(BrokerControlClientError::UnexpectedResponse);
+        }
         match response.header.status {
             BrokerControlResponseStatusV1::Rejected if response.payload().is_empty() => {
                 Ok(BrokerSuccessorAcknowledgementV1::Absent)
@@ -19862,6 +20025,12 @@ mod tests {
         )
         .expect("canonical Hello request");
         let encoded = encode_broker_control_request(&authority, &request).expect("encode request");
+        let mut obsolete = encoded.as_slice().to_vec();
+        obsolete[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(matches!(
+            decode_broker_control_request(&authority, &obsolete),
+            Err(BrokerControlProtocolError::InvalidVersion)
+        ));
         assert_eq!(encoded.as_slice().len(), BROKER_CONTROL_REQUEST_FIXED_BYTES);
         let decoded =
             decode_broker_control_request(&authority, encoded.as_slice()).expect("decode request");
@@ -19911,6 +20080,61 @@ mod tests {
                 .expect("decode response");
         assert_eq!(decoded_response.header, response.header);
         assert_eq!(decoded_response.payload(), hello_payload);
+        let successor_header = BrokerControlResponseHeaderV1 {
+            operation: BrokerControlOperationV1::AttachSuccessor,
+            durable_pane_id: id(707),
+            operation_id: id(708),
+            lease_generation: 2,
+            ..response.header
+        };
+        let successor_request = BrokerControlRequestHeaderV1 {
+            operation: BrokerControlOperationV1::AttachSuccessor,
+            durable_pane_id: id(707),
+            operation_id: id(708),
+            lease_generation: 2,
+            ..request.header
+        };
+        assert!(broker_control_response_lease_generation_matches(
+            successor_request,
+            successor_header
+        ));
+        assert!(!broker_control_response_lease_generation_matches(
+            successor_request,
+            BrokerControlResponseHeaderV1 {
+                lease_generation: 3,
+                ..successor_header
+            }
+        ));
+        for operation in [
+            BrokerControlOperationV1::AttachSuccessor,
+            BrokerControlOperationV1::QueryEffect,
+        ] {
+            let header = BrokerControlResponseHeaderV1 {
+                operation,
+                ..successor_header
+            };
+            assert!(
+                BrokerControlResponseV1::new(header, &[0x75; BROKER_SUCCESSOR_CLAIM_PAYLOAD_BYTES])
+                    .is_ok()
+            );
+            assert!(matches!(
+                BrokerControlResponseV1::new(header, &[0x75; BROKER_PANE_RECOVERY_SECRET_BYTES]),
+                Err(BrokerControlProtocolError::InvalidShape)
+            ));
+        }
+        let ack_header = BrokerControlResponseHeaderV1 {
+            operation: BrokerControlOperationV1::AcknowledgeEffect,
+            child_identity: Some(BrokerKernelChildIdentityV1 {
+                process_id: 42,
+                broker_child_nonce: id(709),
+                kernel_start_identity_digest: [0x76; 32],
+            }),
+            ..successor_header
+        };
+        assert!(matches!(
+            BrokerControlResponseV1::new(ack_header, &[]),
+            Err(BrokerControlProtocolError::InvalidShape)
+        ));
         assert!(
             decode_broker_control_request(&authority, encoded_response.as_slice()).is_err(),
             "a response-direction frame was accepted as a request"
@@ -24623,7 +24847,7 @@ mod tests {
         ));
         assert_eq!(
             successor_client
-                .acknowledge_successor_claim(
+                .acknowledge_successor_claim_request(
                     binding.durable_pane_id,
                     handoff_id,
                     id(7_319),
@@ -24634,27 +24858,104 @@ mod tests {
             BrokerSuccessorAcknowledgementV1::Quarantined
         );
         let successor_ack_id = id(7_320);
-        assert_eq!(
+        for stage in [1, 2] {
+            custody_store.fail_spawn_custody_sync_for_test(stage);
+            assert!(
+                successor_client
+                    .persist_successor_custody(&custody_store, &successor_claim, successor_ack_id)
+                    .is_err()
+            );
+            custody_store.fail_spawn_custody_sync_for_test(0);
+            let census = successor_client.census().unwrap();
+            assert!(census.entries()[0].effects_disabled);
+            assert!(census.entries()[0].pty_available);
+        }
+        let successor_custody = successor_client
+            .persist_successor_custody(&custody_store, &successor_claim, successor_ack_id)
+            .expect("persist authenticated successor capability before ACK");
+        let successor_context = successor_custody.context();
+        let mutations: &[fn(&mut mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1)] = &[
+            |value| value.broker_incarnation = id(99_001),
+            |value| value.broker_lineage = id(99_002),
+            |value| value.broker_build[0] ^= 1,
+            |value| value.predecessor.guardian_incarnation = id(99_003),
+            |value| value.predecessor.connection_id = id(99_004),
+            |value| value.predecessor.mux_incarnation = id(99_005),
+            |value| value.predecessor.guardian_build[0] ^= 1,
+            |value| value.predecessor.mux_build[0] ^= 1,
+            |value| value.successor.guardian_incarnation = id(99_006),
+            |value| value.successor.connection_id = id(99_007),
+            |value| value.successor.mux_incarnation = id(99_008),
+            |value| value.successor.guardian_build[0] ^= 1,
+            |value| value.successor.mux_build[0] ^= 1,
+            |value| value.pane_id = id(99_009),
+            |value| value.handoff_id = id(99_010),
+            |value| value.ack_id = id(99_011),
+            |value| value.lease_generation += 1,
+        ];
+        for mutate in mutations {
+            let mut changed = successor_context;
+            mutate(&mut changed);
+            assert!(custody_store.reopen_successor_custody(&changed).is_err());
+        }
+        assert!(
             successor_client
-                .acknowledge_successor_claim(
-                    binding.durable_pane_id,
-                    handoff_id,
-                    successor_ack_id,
-                    2,
-                    successor_claim.recovery_secret(),
-                )
-                .expect("acknowledge the exact successor Claim"),
-            BrokerSuccessorAcknowledgementV1::Acknowledged
+                .persist_successor_custody(&custody_store, &successor_claim, id(99_012))
+                .is_err(),
+            "changed ACK cannot fork an existing custody record"
+        );
+        assert_eq!(
+            successor_context.predecessor.mux_incarnation,
+            connection_identity.mux_incarnation
+        );
+        assert_eq!(
+            successor_context.successor.mux_incarnation,
+            successor_identity.mux_incarnation
+        );
+        assert_eq!(successor_context.lease_generation, 2);
+        assert_eq!(successor_context.ack_id, successor_ack_id);
+        assert!(
+            other_mux_client
+                .acknowledge_successor_claim(successor_custody)
+                .is_err()
+        );
+        for stage in [1, 2] {
+            let token = custody_store
+                .reopen_successor_custody(&successor_context)
+                .unwrap();
+            custody_store.fail_spawn_custody_sync_for_test(stage);
+            assert!(successor_client.acknowledge_successor_claim(token).is_err());
+            custody_store.fail_spawn_custody_sync_for_test(0);
+            assert!(successor_client.census().unwrap().entries()[0].effects_disabled);
+        }
+        // Neither the claim nor its recovered ACK/context is used by discovery.
+        drop(successor_claim);
+        drop(custody_store);
+        drop(custody_pipeline);
+        let custody_pipeline =
+            GuardianOutputPipeline::open(&receiving_token_path, 1, Arc::clone(&custody_waker))
+                .expect("reopen successor custody encryption key from disk");
+        let custody_store = custody_pipeline.checkpoint_stage_store();
+        let recovered = successor_client
+            .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff_id, 2)
+            .expect("discover ACK and predecessor from authenticated disk scope");
+        assert_eq!(recovered.context().ack_id, id(7_320));
+        assert_eq!(
+            recovered.context().predecessor.mux_incarnation,
+            connection_identity.mux_incarnation
         );
         assert_eq!(
             successor_client
-                .acknowledge_successor_claim(
-                    binding.durable_pane_id,
-                    handoff_id,
-                    successor_ack_id,
-                    2,
-                    successor_claim.recovery_secret(),
-                )
+                .acknowledge_successor_claim(recovered)
+                .expect("acknowledge the exact successor Claim"),
+            BrokerSuccessorAcknowledgementV1::Acknowledged
+        );
+        let recovered = successor_client
+            .reopen_successor_custody(&custody_store, binding.durable_pane_id, handoff_id, 2)
+            .expect("recover exact ACK identity after lost reply");
+        assert_eq!(
+            successor_client
+                .acknowledge_successor_claim(recovered)
                 .expect("recover the exact successor acknowledgement reply"),
             BrokerSuccessorAcknowledgementV1::Acknowledged
         );
@@ -24679,6 +24980,7 @@ mod tests {
             Some(successor_identity.mux_incarnation)
         );
         assert_eq!(successor_entry.lease_generation, 2);
+        assert_eq!(successor_entry.child_identity, Some(child_identity));
         assert!(!successor_entry.effects_disabled);
         assert!(successor_entry.lease_available);
         assert!(successor_entry.output_replay_available);

@@ -322,7 +322,8 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
     use MuxConnectionDisposition::{Discard, Reuse};
 
     match err {
-        DirectMuxError::InFlightScopeAbandoned(source) => {
+        DirectMuxError::InFlightScopeAbandoned(source)
+        | DirectMuxError::RenderBatchResyncRequired(source) => {
             let source_decision = mux_recovery_decision(source);
             MuxRecoveryDecision {
                 kind: source_decision.kind,
@@ -1631,6 +1632,27 @@ mod tests {
                 expected.kind,
                 "finite display projection drifted for {error:?}"
             );
+        }
+
+        for response in [
+            codec::ErrorResponse::backend_failure(request_ident),
+            codec::ErrorResponse::quota_exceeded(request_ident),
+            codec::ErrorResponse::cancelled(request_ident),
+            codec::ErrorResponse::pane_not_found(request_ident, 1),
+        ] {
+            let source = DirectMuxError::RemoteRejection(response);
+            let original = mux_recovery_decision(&source);
+            let explicit_capability_cancelled = source.is_cancelled();
+            let error = DirectMuxError::RenderBatchResyncRequired(Box::new(source));
+            let decision = mux_recovery_decision(&error);
+            assert_eq!(decision.kind, original.kind);
+            assert_eq!(decision.cancelled, original.cancelled);
+            assert_eq!(error.is_cancelled(), explicit_capability_cancelled);
+            assert!(
+                !decision.retry,
+                "discarded partial output cannot be replayed silently"
+            );
+            assert_eq!(decision.connection, MuxConnectionDisposition::Discard);
         }
 
         let mismatch = DirectMuxError::RemoteRejectionRequestMismatch {

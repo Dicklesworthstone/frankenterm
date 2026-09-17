@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 1;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -660,10 +660,32 @@ pub struct RecoveryWindow {
     pub window_id: usize,
     pub stable_window_id: String,
     pub workspace: String,
+    pub title: String,
     pub order_revision: u64,
     pub gui_position: Option<RecoveryGuiPosition>,
     pub tabs: Vec<RecoveryTab>,
     pub active_tab_index: usize,
+    #[serde(deserialize_with = "deserialize_required_last_active_tab_id")]
+    pub last_active_tab_id: Option<usize>,
+    pub tab_stacks: Vec<RecoveryTabStack>,
+}
+
+// An absent field must not silently become None in a supposedly complete image.
+fn deserialize_required_last_active_tab_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer)
+}
+
+/// Window-level tab grouping; member order and visible identity are semantic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryTabStack {
+    pub stack_id: usize,
+    pub tab_ids: Vec<usize>,
+    pub visible_tab_id: usize,
 }
 
 /// Ordered tab representation preserving exact split hierarchy, sizes, floating panes, and stacks.
@@ -1000,6 +1022,25 @@ impl MuxRecoveryImage {
                 MAX_ID_STRING_BYTES,
             )?;
             validate_string_len("window.workspace", &window.workspace, MAX_STRING_BYTES)?;
+            validate_string_len("window.title", &window.title, MAX_STRING_BYTES)?;
+
+            if window.tab_stacks.len() > MAX_RECOVERY_TABS_PER_WINDOW {
+                return Err(MuxRecoveryImageError::ResourceLimit {
+                    resource: "window_tab_stacks",
+                    count: window.tab_stacks.len(),
+                    limit: MAX_RECOVERY_TABS_PER_WINDOW,
+                });
+            }
+            let stack_members = window.tab_stacks.iter().try_fold(0usize, |count, stack| {
+                count.checked_add(stack.tab_ids.len())
+            });
+            if stack_members.is_none_or(|count| count > MAX_RECOVERY_TABS_PER_WINDOW) {
+                return Err(MuxRecoveryImageError::ResourceLimit {
+                    resource: "window_tab_stack_members",
+                    count: stack_members.unwrap_or(usize::MAX),
+                    limit: MAX_RECOVERY_TABS_PER_WINDOW,
+                });
+            }
 
             if window.tabs.len() > MAX_RECOVERY_TABS_PER_WINDOW {
                 return Err(MuxRecoveryImageError::ResourceLimit {
@@ -1279,6 +1320,33 @@ impl MuxRecoveryImage {
                     index: window.active_tab_index,
                     count: window.tabs.len(),
                 });
+            }
+
+            let window_tab_ids: HashSet<_> = window.tabs.iter().map(|tab| tab.tab_id).collect();
+            if window
+                .last_active_tab_id
+                .is_some_and(|id| !window_tab_ids.contains(&id))
+            {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "last active tab is absent from its window",
+                ));
+            }
+            let mut previous_stack_id = None;
+            let mut stacked_tabs = HashSet::new();
+            for stack in &window.tab_stacks {
+                if previous_stack_id.is_some_and(|id| id >= stack.stack_id)
+                    || stack.tab_ids.is_empty()
+                    || !stack.tab_ids.contains(&stack.visible_tab_id)
+                    || stack
+                        .tab_ids
+                        .iter()
+                        .any(|id| !window_tab_ids.contains(id) || !stacked_tabs.insert(*id))
+                {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "invalid window tab stack membership, visibility, or canonical order",
+                    ));
+                }
+                previous_stack_id = Some(stack.stack_id);
             }
 
             for tab in &window.tabs {
@@ -1759,6 +1827,11 @@ impl MuxRecoveryImage {
         // 6. Build windows and tabs
         let mut captured_tabs_by_id = HashMap::new();
         for tab in &captured.tabs {
+            if tab.durable_tab_id.is_nil() {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "captured tab has no durable identity",
+                ));
+            }
             if captured_tabs_by_id.insert(tab.tab_id, tab).is_some() {
                 return Err(MuxRecoveryImageError::DuplicateTabId(tab.tab_id));
             }
@@ -1766,6 +1839,11 @@ impl MuxRecoveryImage {
 
         let mut windows = Vec::with_capacity(captured.windows.len());
         for win in &captured.windows {
+            if win.durable_window_id.is_nil() {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "captured window has no durable identity",
+                ));
+            }
             let mut tabs = Vec::with_capacity(win.ordered_tab_ids.len());
             for &tab_id in &win.ordered_tab_ids {
                 {
@@ -1832,7 +1910,7 @@ impl MuxRecoveryImage {
 
                     tabs.push(RecoveryTab {
                         tab_id: tab.tab_id,
-                        stable_tab_id: format!("tab-{}", tab.tab_id),
+                        stable_tab_id: tab.durable_tab_id.to_string(),
                         title: tab.title.clone(),
                         working_dir: None,
                         size: TerminalSize {
@@ -1876,12 +1954,15 @@ impl MuxRecoveryImage {
 
             windows.push(RecoveryWindow {
                 window_id: win.window_id,
-                stable_window_id: format!("win-{}", win.window_id),
+                stable_window_id: win.durable_window_id.to_string(),
                 workspace: win.workspace.clone(),
+                title: win.title.clone(),
                 order_revision: win.order_revision.get(),
                 gui_position: win.position.as_ref().map(RecoveryGuiPosition::from),
                 tabs,
                 active_tab_index,
+                last_active_tab_id: win.last_active_tab_id,
+                tab_stacks: convert_mux_window_tab_stacks(&win.tab_stacks)?,
             });
         }
         if !captured_tabs_by_id.is_empty() {
@@ -1939,6 +2020,56 @@ impl MuxRecoveryImage {
         image.validate()?;
         Ok(image)
     }
+}
+
+#[cfg(feature = "frankenterm-deps")]
+fn convert_mux_window_tab_stacks(
+    entries: &[mux::tab::TabStackEntry],
+) -> Result<Vec<RecoveryTabStack>, MuxRecoveryImageError> {
+    if entries.len() > MAX_RECOVERY_TABS_PER_WINDOW {
+        return Err(MuxRecoveryImageError::ResourceLimit {
+            resource: "window_tab_stack_members",
+            count: entries.len(),
+            limit: MAX_RECOVERY_TABS_PER_WINDOW,
+        });
+    }
+    let invalid = || {
+        MuxRecoveryImageError::InvalidCapturedTopology(
+            "window tab stack entries require ordered contiguous positions and one visible member",
+        )
+    };
+    let mut stacks = Vec::new();
+    let mut remaining = entries;
+    while let Some(first) = remaining.first() {
+        if stacks
+            .last()
+            .is_some_and(|stack: &RecoveryTabStack| stack.stack_id >= first.stack_id.0)
+        {
+            return Err(invalid());
+        }
+        let count = remaining
+            .iter()
+            .take_while(|entry| entry.stack_id == first.stack_id)
+            .count();
+        let mut visible_tab_id = None;
+        let mut tab_ids = Vec::with_capacity(count);
+        for (position, entry) in remaining[..count].iter().enumerate() {
+            if entry.position != position {
+                return Err(invalid());
+            }
+            if entry.is_visible && visible_tab_id.replace(entry.tab_id).is_some() {
+                return Err(invalid());
+            }
+            tab_ids.push(entry.tab_id);
+        }
+        stacks.push(RecoveryTabStack {
+            stack_id: first.stack_id.0,
+            tab_ids,
+            visible_tab_id: visible_tab_id.ok_or_else(invalid)?,
+        });
+        remaining = &remaining[count..];
+    }
+    Ok(stacks)
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -2110,6 +2241,123 @@ fn validate_split_node(
 mod tests {
     use super::*;
 
+    #[test]
+    fn window_recovery_metadata_is_required_and_prior_schema_is_rejected() {
+        let image = make_valid_test_image();
+        for field in ["title", "tab_stacks", "last_active_tab_id"] {
+            let mut value = serde_json::to_value(&image).unwrap();
+            value["topology"]["windows"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<MuxRecoveryImage>(value).is_err(),
+                "{field}"
+            );
+        }
+        let mut old = image;
+        old.header.schema_version = 1;
+        assert_eq!(
+            old.validate().unwrap_err(),
+            MuxRecoveryImageError::UnsupportedSchemaVersion(1)
+        );
+    }
+
+    #[test]
+    fn window_recovery_bounds_report_the_offending_field_and_count() {
+        let mut image = make_valid_test_image();
+        image.topology.windows[0].title = "x".repeat(MAX_STRING_BYTES + 1);
+        assert_eq!(
+            image.validate_bounds().unwrap_err(),
+            MuxRecoveryImageError::StringTooLong {
+                field: "window.title",
+                len: MAX_STRING_BYTES + 1,
+                limit: MAX_STRING_BYTES,
+            }
+        );
+        image.topology.windows[0].title.clear();
+        let empty_stack = RecoveryTabStack {
+            stack_id: 0,
+            tab_ids: vec![],
+            visible_tab_id: 0,
+        };
+        image.topology.windows[0].tab_stacks =
+            vec![empty_stack.clone(); MAX_RECOVERY_TABS_PER_WINDOW + 1];
+        assert_eq!(
+            image.validate_bounds().unwrap_err(),
+            MuxRecoveryImageError::ResourceLimit {
+                resource: "window_tab_stacks",
+                count: MAX_RECOVERY_TABS_PER_WINDOW + 1,
+                limit: MAX_RECOVERY_TABS_PER_WINDOW,
+            }
+        );
+        image.topology.windows[0].tab_stacks = vec![RecoveryTabStack {
+            tab_ids: vec![0; MAX_RECOVERY_TABS_PER_WINDOW + 1],
+            ..empty_stack
+        }];
+        assert_eq!(
+            image.validate_bounds().unwrap_err(),
+            MuxRecoveryImageError::ResourceLimit {
+                resource: "window_tab_stack_members",
+                count: MAX_RECOVERY_TABS_PER_WINDOW + 1,
+                limit: MAX_RECOVERY_TABS_PER_WINDOW,
+            }
+        );
+    }
+
+    #[test]
+    fn window_recovery_rejects_malformed_stacks_and_dangling_history() {
+        let base = make_valid_test_image();
+        let tab_id = base.topology.windows[0].tabs[0].tab_id;
+        let valid_stack = RecoveryTabStack {
+            stack_id: 3,
+            tab_ids: vec![tab_id],
+            visible_tab_id: tab_id,
+        };
+        let mut valid = base.clone();
+        valid.topology.windows[0].tab_stacks = vec![valid_stack.clone()];
+        valid.topology.windows[0].last_active_tab_id = Some(tab_id);
+        valid.image_digest = valid.compute_digest().unwrap();
+        valid.validate().unwrap();
+        for stacks in [
+            vec![RecoveryTabStack {
+                tab_ids: vec![],
+                ..valid_stack.clone()
+            }],
+            vec![RecoveryTabStack {
+                tab_ids: vec![tab_id, tab_id],
+                ..valid_stack.clone()
+            }],
+            vec![RecoveryTabStack {
+                tab_ids: vec![999],
+                visible_tab_id: 999,
+                ..valid_stack.clone()
+            }],
+            vec![RecoveryTabStack {
+                visible_tab_id: 999,
+                ..valid_stack.clone()
+            }],
+            vec![valid_stack.clone(), valid_stack],
+        ] {
+            let mut image = base.clone();
+            image.topology.windows[0].tab_stacks = stacks;
+            image.image_digest = image.compute_digest().unwrap();
+            assert!(matches!(
+                image.validate(),
+                Err(MuxRecoveryImageError::InvalidCapturedTopology(_))
+            ));
+        }
+        let mut image = base;
+        image.topology.windows[0].last_active_tab_id = Some(999);
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::InvalidCapturedTopology(
+                "last active tab is absent from its window"
+            )
+        );
+    }
+
     fn make_test_pane(pane_id: usize, pane_uuid: &str, incarnation_id: &str) -> RecoveryPane {
         RecoveryPane {
             pane_id,
@@ -2229,6 +2477,9 @@ mod tests {
             window_id: 100,
             stable_window_id: "uuid-window-100".to_string(),
             workspace: "default".to_string(),
+            title: "recovery window".to_string(),
+            last_active_tab_id: None,
+            tab_stacks: vec![],
             order_revision: 1,
             gui_position: Some(RecoveryGuiPosition {
                 x: RecoveryGuiDimension::Pixels(100.0_f32.to_bits()),
@@ -2900,6 +3151,9 @@ mod tests {
                     window_id: 100,
                     stable_window_id: "win-100".to_string(),
                     workspace: "default".to_string(),
+                    title: String::new(),
+                    last_active_tab_id: None,
+                    tab_stacks: vec![],
                     order_revision: 1,
                     gui_position: None,
                     tabs: vec![tab],
@@ -3173,6 +3427,61 @@ mod converter_tests {
     use frankenterm_term::{Terminal, TerminalSize as TermTerminalSize};
     use std::sync::Arc;
 
+    #[test]
+    fn converter_rejects_malformed_window_stack_entries_and_raw_history() {
+        let entry = mux::tab::TabStackEntry {
+            stack_id: mux::tab::TabStackId(4),
+            tab_id: 20,
+            position: 0,
+            is_visible: true,
+        };
+        for entries in [
+            vec![mux::tab::TabStackEntry {
+                position: 1,
+                ..entry.clone()
+            }],
+            vec![mux::tab::TabStackEntry {
+                is_visible: false,
+                ..entry.clone()
+            }],
+            vec![
+                entry.clone(),
+                mux::tab::TabStackEntry {
+                    position: 1,
+                    ..entry.clone()
+                },
+            ],
+            vec![entry.clone(), entry.clone()],
+            vec![mux::tab::TabStackEntry {
+                tab_id: 999,
+                ..entry.clone()
+            }],
+            vec![
+                entry.clone(),
+                mux::tab::TabStackEntry {
+                    stack_id: mux::tab::TabStackId(3),
+                    ..entry
+                },
+            ],
+        ] {
+            let (meta, mut captured, acks, refs) = make_test_fixture();
+            captured.windows[0].tab_stacks = entries;
+            assert!(matches!(
+                MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs),
+                Err(MuxRecoveryImageError::InvalidCapturedTopology(_))
+            ));
+        }
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.windows[0].last_active_tab_id = Some(999);
+        assert_eq!(
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap_err(),
+            MuxRecoveryImageError::InvalidCapturedTopology(
+                "last active tab is absent from its window"
+            )
+        );
+    }
+
     fn borrowed_acks(
         acks: &HashMap<usize, mux::ModelParserCheckpointAck>,
     ) -> HashMap<usize, &mux::ModelParserCheckpointAck> {
@@ -3370,6 +3679,7 @@ mod converter_tests {
 
         let tab = mux::MuxCapturedTab {
             tab_id: 20,
+            durable_tab_id: uuid::Uuid::from_u128(0x7420),
             window_id: 10,
             title: "main".to_string(),
             size: frankenterm_term::TerminalSize {
@@ -3396,12 +3706,15 @@ mod converter_tests {
 
         let window = mux::MuxCapturedWindow {
             window_id: 10,
+            durable_window_id: uuid::Uuid::from_u128(0x7710),
             workspace: "default".to_string(),
             title: "win".to_string(),
             order_revision: mux::window::WindowOrderRevision::new(1),
             ordered_tab_ids: vec![20],
             active_tab_id: Some(20),
             active_tab_index: Some(0),
+            last_active_tab_id: None,
+            tab_stacks: vec![],
             position: None,
             structural_pane_count: 2,
         };
@@ -3484,6 +3797,75 @@ mod converter_tests {
         assert_eq!(tab.active_pane_id, 101);
         assert!(tab.root_split.is_some());
         assert_eq!(tab.all_pane_ids(), vec![101, 102]);
+    }
+
+    #[test]
+    fn converter_uses_durable_object_identity_despite_reused_numeric_ids() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        let first = MuxRecoveryImage::from_mux_captured(
+            meta.clone(),
+            &captured,
+            &borrowed_acks(&acks),
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(
+            first.topology.windows[0].stable_window_id,
+            captured.windows[0].durable_window_id.to_string()
+        );
+        assert_eq!(
+            first.topology.windows[0].tabs[0].stable_tab_id,
+            captured.tabs[0].durable_tab_id.to_string()
+        );
+
+        // A subsequent process may reuse both numeric counters. Its different
+        // object identities must not alias the prior recovery image.
+        captured.windows[0].durable_window_id = uuid::Uuid::from_u128(0x8810);
+        captured.tabs[0].durable_tab_id = uuid::Uuid::from_u128(0x8820);
+        let second = MuxRecoveryImage::from_mux_captured(
+            meta.clone(),
+            &captured,
+            &borrowed_acks(&acks),
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(
+            first.topology.windows[0].window_id,
+            second.topology.windows[0].window_id
+        );
+        assert_eq!(
+            first.topology.windows[0].tabs[0].tab_id,
+            second.topology.windows[0].tabs[0].tab_id
+        );
+        assert_ne!(
+            first.topology.windows[0].stable_window_id,
+            second.topology.windows[0].stable_window_id
+        );
+        assert_ne!(
+            first.topology.windows[0].tabs[0].stable_tab_id,
+            second.topology.windows[0].tabs[0].stable_tab_id
+        );
+        let reopened =
+            MuxRecoveryImage::from_json_slice(&second.to_canonical_json().unwrap()).unwrap();
+        assert_eq!(reopened.topology, second.topology);
+
+        for missing_window in [true, false] {
+            let mut invalid = captured.clone();
+            if missing_window {
+                invalid.windows[0].durable_window_id = uuid::Uuid::nil();
+            } else {
+                invalid.tabs[0].durable_tab_id = uuid::Uuid::nil();
+            }
+            assert!(matches!(
+                MuxRecoveryImage::from_mux_captured(
+                    meta.clone(),
+                    &invalid,
+                    &borrowed_acks(&acks),
+                    &refs
+                ),
+                Err(MuxRecoveryImageError::InvalidCapturedTopology(_))
+            ));
+        }
     }
 
     #[test]

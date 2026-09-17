@@ -266,12 +266,15 @@ pub struct MuxCapturedWorkspace {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MuxCapturedWindow {
     pub window_id: WindowId,
+    pub durable_window_id: uuid::Uuid,
     pub workspace: String,
     pub title: String,
     pub order_revision: WindowOrderRevision,
     pub ordered_tab_ids: Vec<TabId>,
     pub active_tab_id: Option<TabId>,
     pub active_tab_index: Option<usize>,
+    pub last_active_tab_id: Option<TabId>,
+    pub tab_stacks: Vec<crate::tab::TabStackEntry>,
     pub position: Option<GuiPosition>,
     pub structural_pane_count: usize,
 }
@@ -18473,12 +18476,15 @@ impl Mux {
 
                     window_snapshots.push(MuxCapturedWindow {
                         window_id,
+                        durable_window_id: window.durable_id(),
                         workspace: window.get_workspace().to_string(),
                         title: window.get_title().to_string(),
                         order_revision: frozen_order.order_revision(),
                         ordered_tab_ids,
                         active_tab_id,
                         active_tab_index,
+                        last_active_tab_id: window.last_active_tab_id(),
+                        tab_stacks: window.tab_stack_entries(),
                         position: window.get_initial_position().clone(),
                         structural_pane_count: window.structural_pane_count(),
                     });

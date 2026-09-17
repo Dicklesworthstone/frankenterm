@@ -1861,6 +1861,7 @@ pub struct GuardianOutputRecoveryCursor {
 
 /// Opaque, plaintext-free position issued only by an authenticated cursor.
 /// It owns no descriptor and can be resumed only against the same frozen view.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 pub struct GuardianOutputRecoveryBookmark {
     identity: GuardianOutputSegmentIdentity,
@@ -1879,6 +1880,7 @@ pub struct GuardianOutputRecoveryBookmark {
     exhausted: bool,
 }
 
+#[cfg(unix)]
 impl GuardianOutputRecoveryBookmark {
     #[must_use]
     pub const fn next_sequence(&self) -> Option<u64> {
@@ -1887,6 +1889,7 @@ impl GuardianOutputRecoveryBookmark {
 }
 
 impl GuardianOutputRecoveryCursor {
+    #[cfg(unix)]
     pub fn bookmark(&self) -> Result<GuardianOutputRecoveryBookmark, GuardianOutputJournalError> {
         if self.failed {
             return Err(GuardianOutputJournalError::RecoveryCursorFailed);

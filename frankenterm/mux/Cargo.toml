@@ -76,7 +76,7 @@ textwrap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
-uuid = { workspace = true, features = ["v4", "rng"] }
+uuid = { workspace = true, features = ["v4", "rng", "serde"] }
 zeroize.workspace = true
 frankenterm-dynamic.workspace = true
 frankenterm-sigpipe.workspace = true
