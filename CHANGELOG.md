@@ -73,7 +73,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Text-tail requests fetch the requested suffix without transferring the entire
   scrollback. Truncation metadata omits the unfetched prefix's byte count.
 
-The `0.15.6-rc.31` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.32` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.
