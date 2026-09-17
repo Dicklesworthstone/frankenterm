@@ -181,7 +181,7 @@ pub enum WholeMuxCaptureError {
 #[derive(Debug)]
 enum CapturedPaneCheckpoint {
     Model(mux::ModelParserCheckpointAck),
-    Guardian(mux::guardian_checkpoint::PublishedGuardianCheckpoint),
+    Guardian(Box<mux::guardian_checkpoint::PublishedGuardianCheckpoint>),
 }
 
 /// Capture actual mux/parser state and publish an encrypted offline recovery image.
@@ -333,7 +333,7 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                 .checked_add(capture.terminal_checkpoint().canonical_payload().len())
                 .filter(|bytes| *bytes <= 256 * 1024 * 1024)
                 .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
-            CapturedPaneCheckpoint::Guardian(published)
+            CapturedPaneCheckpoint::Guardian(Box::new(published))
         } else {
             let result = mux.capture_pane_model_checkpoint(pane.pane_id, limits, remaining, || {
                 match snapshot_cx_checkpoint(cx) {
