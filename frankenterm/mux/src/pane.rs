@@ -776,6 +776,13 @@ pub trait Pane: Downcast + Send + Sync {
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
         Ok(None)
     }
+    /// Consume the model-bound restored prefix while the new reader gate is
+    /// still held. Ordinary panes and virgin guardian readers have no prefix.
+    fn take_guardian_restored_prefix(
+        &self,
+    ) -> anyhow::Result<Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>> {
+        Ok(None)
+    }
     /// Nonsecret original birth provenance. A restore must still reopen and
     /// authenticate private custody before it can request any lease effect.
     fn guardian_spawn_custody(

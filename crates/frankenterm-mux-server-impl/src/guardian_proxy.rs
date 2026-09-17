@@ -17,7 +17,8 @@ use mux::domain::{
     Domain, DomainId, DomainState, GuardianPanePublicationReceipt, LocalDomain, UnpublishedPane,
 };
 use mux::guardian_checkpoint::{
-    GuardianSpawnCustodyScopeV1, LiveParserCheckpointAck, PublishedGuardianCheckpoint,
+    GuardianRestoredParserPrefix, GuardianRestoredTerminal, GuardianSpawnCustodyScopeV1,
+    LiveParserCheckpointAck, PublishedGuardianCheckpoint,
 };
 use mux::guardian_protocol::{
     GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
@@ -48,10 +49,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
-use wezterm_term::terminalstate::checkpoint::{
-    TerminalCheckpointError, TerminalCheckpointLimits, TerminalCheckpointV2,
-};
-use wezterm_term::{InertTerminal, InertTerminalError, Terminal, TerminalConfiguration};
+#[cfg(test)]
+use wezterm_term::InertTerminal;
+use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointError, TerminalCheckpointLimits};
+use wezterm_term::{InertTerminalError, Terminal, TerminalConfiguration};
 use zeroize::{Zeroize as _, Zeroizing};
 
 const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -477,6 +478,8 @@ pub enum GuardianProxyError {
     TerminalReplay(#[source] InertTerminalError),
     #[error("guardian terminal activation failed before topology publication: {0}")]
     TerminalActivation(#[source] InertTerminalError),
+    #[error("guardian restored model and output prefix validation failed")]
+    RestoredModel(#[source] anyhow::Error),
     #[error("guardian mutation outcome is indeterminate; the lease is quarantined")]
     MutationOutcomeIndeterminate,
     #[error("guardian returned a reply inconsistent with the pending mutation")]
@@ -3395,34 +3398,8 @@ impl GuardianReplayBoundary {
     }
 }
 
-struct InertReplayWriter<'a> {
-    terminal: &'a mut InertTerminal,
-    failure: Option<InertTerminalError>,
-}
-
-impl Write for InertReplayWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.failure.is_some() {
-            return Err(io::Error::other(
-                "guardian inert replay writer is already poisoned",
-            ));
-        }
-        match self.terminal.replay_bytes(bytes) {
-            Ok(()) => Ok(bytes.len()),
-            Err(error) => {
-                self.failure = Some(error);
-                Err(io::Error::other("guardian inert terminal rejected replay"))
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 struct VerifiedGuardianReplayRestore {
-    inert_terminal: InertTerminal,
+    inert_terminal: GuardianRestoredTerminal,
     checkpoint_id: GuardianCheckpointIdentityDigest,
     boundary: GuardianReplayBoundary,
 }
@@ -3478,60 +3455,30 @@ fn validate_checkpoint_descriptor_for_proxy(
 }
 
 fn restore_inert_checkpoint(
+    pane_id: Uuid,
     descriptor: GuardianCheckpointDescriptorV1,
     checkpoint: &BoundedReplayBuffer,
     expected_size: PtySize,
     config: Arc<dyn TerminalConfiguration>,
     limits: TerminalCheckpointLimits,
-) -> Result<InertTerminal, GuardianProxyError> {
+) -> Result<GuardianRestoredTerminal, GuardianProxyError> {
     if u64::try_from(checkpoint.len()) != Ok(descriptor.total_bytes()) {
         return Err(GuardianProxyError::ReplayInvariant(
             "checkpoint replay did not assemble its exact declared length",
         ));
     }
-    descriptor
-        .validate_canonical_payload(checkpoint.as_slice())
-        .map_err(GuardianProxyError::ReplayProtocol)?;
-    let validated = TerminalCheckpointV2::decode_canonical_json(checkpoint.as_slice(), limits)
-        .map_err(GuardianProxyError::TerminalCheckpoint)?;
-    if validated.rows() != descriptor.rows() || validated.cols() != descriptor.cols() {
-        return Err(GuardianProxyError::ReplayInvariant(
-            "decoded checkpoint geometry differs from its authenticated descriptor",
-        ));
-    }
-    if validated.pixel_width() != u64::from(expected_size.pixel_width)
-        || validated.pixel_height() != u64::from(expected_size.pixel_height)
-    {
-        return Err(GuardianProxyError::ReplayInvariant(
-            "checkpoint pixel geometry does not match the claimed topology manifest",
-        ));
-    }
-    validated
-        .restore_inert(config)
-        .map_err(GuardianProxyError::TerminalCheckpoint)
-}
-
-fn replay_record_into_inert_terminal(
-    terminal: &mut InertTerminal,
-    record: mux::guardian_protocol::GuardianReplayRecordDelivery,
-    maximum_record_bytes: u32,
-) -> Result<mux::guardian_protocol::GuardianReplayRecordMetadataV1, GuardianProxyError> {
-    let expected = record.metadata();
-    let mut writer = InertReplayWriter {
-        terminal,
-        failure: None,
-    };
-    let delivery = record.write_all_bounded(&mut writer, maximum_record_bytes);
-    if let Some(error) = writer.failure.take() {
-        return Err(GuardianProxyError::TerminalReplay(error));
-    }
-    let observed = delivery.map_err(GuardianProxyError::ReplayDelivery)?;
-    if observed != expected {
-        return Err(GuardianProxyError::ReplayInvariant(
-            "consuming replay record returned different authenticated metadata",
-        ));
-    }
-    Ok(observed)
+    GuardianRestoredTerminal::from_checkpoint(
+        pane_id,
+        descriptor,
+        checkpoint.as_slice(),
+        (
+            u64::from(expected_size.pixel_width),
+            u64::from(expected_size.pixel_height),
+        ),
+        config,
+        limits,
+    )
+    .map_err(GuardianProxyError::RestoredModel)
 }
 
 fn replay_page_ack_plan(
@@ -3647,6 +3594,7 @@ fn consume_one_guardian_replay_snapshot(
 
                 if u64::try_from(checkpoint.len()) == Ok(observed_descriptor.total_bytes()) {
                     let restored = restore_inert_checkpoint(
+                        identity.pane_id(),
                         observed_descriptor,
                         &checkpoint,
                         expected_size,
@@ -3688,8 +3636,9 @@ fn consume_one_guardian_replay_snapshot(
                             "output record does not extend cumulative replay authority",
                         ));
                     }
-                    let observed =
-                        replay_record_into_inert_terminal(restored, record, maximum_record_bytes)?;
+                    let observed = restored
+                        .replay_record(record)
+                        .map_err(GuardianProxyError::RestoredModel)?;
                     current = GuardianReplayBoundary {
                         next_sequence: observed
                             .sequence()
@@ -5039,27 +4988,21 @@ impl GuardianProxyStaging {
 
     fn activate_verified_restore(
         self,
-        inert_terminal: InertTerminal,
+        inert_terminal: GuardianRestoredTerminal,
         guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
         let identity = self.identity();
         let terminal_writer = GuardianProxyWriter {
             actor: Arc::clone(&self.actor),
         };
-        let terminal = match inert_terminal.into_live(Box::new(terminal_writer.clone())) {
-            Ok(terminal) => terminal,
-            Err(failure) => {
-                let (error, _inert_terminal) = failure.into_parts();
-                log::error!(
-                    "guardian terminal activation failed before topology publication: {error}"
-                );
-                return Err(GuardianProxyError::TerminalActivation(error));
-            }
-        };
+        let (terminal, restored_prefix) = inert_terminal
+            .activate(Box::new(terminal_writer.clone()))
+            .map_err(GuardianProxyError::RestoredModel)?;
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
             spawn_custody: self.spawn_custody,
             terminal,
+            restored_prefix: Some(restored_prefix),
             process: Box::new(GuardianProxyChild {
                 actor: Arc::clone(&actor),
                 census: Arc::clone(&self.census),
@@ -5102,6 +5045,7 @@ impl GuardianProxyStaging {
         TestActivatedGuardianProxy {
             spawn_custody: self.spawn_custody,
             terminal,
+            restored_prefix: None,
             process: Box::new(GuardianProxyChild {
                 actor: Arc::clone(&actor),
                 census: Arc::clone(&self.census),
@@ -5130,6 +5074,7 @@ impl GuardianProxyStaging {
 pub struct ActivatedGuardianProxy {
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
     terminal: Terminal,
+    restored_prefix: Option<GuardianRestoredParserPrefix>,
     process: Box<dyn Child + Send>,
     pty: Box<dyn MasterPty>,
     writer: Box<dyn Write + Send>,
@@ -5175,6 +5120,7 @@ impl ActivatedGuardianProxy {
                 .take()
                 .expect("verified guardian activation must retain its checkpoint publisher"),
             self.spawn_custody,
+            self.restored_prefix,
         );
         // Construction completed, so the LocalPane's guardian ownership is
         // now the sole close/retire authority. If construction unwinds before
@@ -5588,6 +5534,7 @@ mod tests {
         let births = directory.join("births");
         let signaled = directory.join("signaled");
         let finished = directory.join("finished");
+        let post_registration = directory.join("post-registration");
         let mut services = StopOwnedServices {
             children: Vec::new(),
             release: release.clone(),
@@ -5659,11 +5606,12 @@ mod tests {
                 // The release file is normal cleanup. This approximately
                 // 120-second emergency fuse is separate from the unchanged
                 // five-second phase assertions, not an accepted latency bound.
-                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_POST_REGISTRATION\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_REGISTRATION\"; then printf guardian-domain-post-registration-marker; fi; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
                 command.env("FT_BIRTHS", &births);
                 command.env("FT_SIGNALED", &signaled);
                 command.env("FT_RELEASE", &release);
                 command.env("FT_FINISHED", &finished);
+                command.env("FT_POST_REGISTRATION", &post_registration);
                 command
             };
             let size = TerminalSize {
@@ -6343,6 +6291,25 @@ mod tests {
         mux.add_tab_to_window(&tab, *window).unwrap();
         drop(window);
 
+        let post_registration = directory.join("post-registration");
+        std::fs::write(&post_registration, b"step").unwrap();
+        let post_registration_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let (_, lines) = pane.get_lines(0..24);
+            if lines.iter().any(|line| {
+                line.as_str()
+                    .contains("guardian-domain-post-registration-marker")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < post_registration_deadline,
+                "published pane did not render fresh child output after registration"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let capture_mux = Arc::clone(mux);
         let pane_id = pane.pane_id();
@@ -6577,6 +6544,24 @@ mod tests {
                 .capture()
                 .terminal_checkpoint()
                 .canonical_payload()
+        );
+        let checkpoint_json: serde_json::Value = serde_json::from_slice(
+            published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload(),
+        )
+        .unwrap();
+        let restored_text: String = checkpoint_json["primary_screen"]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|line| line["cells"].as_array().unwrap())
+            .map(|cell| cell["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            restored_text.contains("guardian-domain-post-registration-marker"),
+            "guardian terminal checkpoint did not contain post-registration child output"
         );
         let successor_census = Arc::new(
             GuardianCensusCoordinator::connect(
@@ -7109,9 +7094,19 @@ mod tests {
         let (sender, receiver) = sync_channel(1);
         let (delivered_sender, delivered_receiver) = sync_channel(1);
         let (staging, mutation_state) = fake_staging([], 1);
+        let (genesis, canonical) = genesis_checkpoint_fixture();
+        let restored = GuardianRestoredTerminal::from_checkpoint(
+            identity().pane_id(),
+            genesis,
+            &canonical,
+            (640, 384),
+            test_terminal_config(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
         let activated = staging
             .activate_verified_restore(
-                inert_terminal(),
+                restored,
                 Box::new(ChannelGuardianReader {
                     receiver,
                     delivered: delivered_sender,
@@ -7861,6 +7856,7 @@ mod tests {
             .expect("fixture pixel width advances");
 
         let error = restore_inert_checkpoint(
+            identity().pane_id(),
             fixture.descriptor,
             &checkpoint,
             mismatched_size,
@@ -7868,12 +7864,10 @@ mod tests {
             limits,
         )
         .expect_err("pixel geometry drift cannot become a live terminal");
-        assert!(matches!(
-            error,
-            GuardianProxyError::ReplayInvariant(
-                "checkpoint pixel geometry does not match the claimed topology manifest"
-            )
-        ));
+        assert!(
+            format!("{error:#}")
+                .contains("checkpoint pixel geometry does not match the claimed topology manifest")
+        );
     }
 
     #[derive(Clone, Copy)]

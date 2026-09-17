@@ -4469,6 +4469,9 @@ fn checkpoint_stage_u64_at(bytes: &[u8], offset: usize) -> u64 {
 
 /// Exact synchronized raw-output position at which a terminal checkpoint was
 /// captured while the parser was recovery-ground.
+///
+/// Parser byte positions belong to one registration. A restored model starts
+/// with a fresh external parser at byte zero even when its journal is nonempty.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianCheckpointBoundary {
     version: u32,
@@ -4484,6 +4487,223 @@ pub struct GuardianCheckpointBoundary {
     cols: u32,
     terminal_payload_bytes: u64,
     terminal_payload_digest: [u8; 32],
+}
+
+/// Owns the restored model together with the authenticated output prefix that
+/// produced it. Neither the model nor its prefix can be replaced independently.
+pub struct GuardianRestoredTerminal {
+    terminal: frankenterm_term::InertTerminal,
+    pane_id: Uuid,
+    output: crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1,
+    limits: TerminalCheckpointLimits,
+}
+
+/// Single-use registration bootstrap, minted only while activating its model.
+/// This is not an append receipt and cannot authorize delivery of any bytes.
+pub struct GuardianRestoredParserPrefix {
+    boundary: Option<GuardianCheckpointBoundary>,
+    pane_id: Uuid,
+    model_digest: [u8; 32],
+    limits: TerminalCheckpointLimits,
+}
+
+impl GuardianRestoredParserPrefix {
+    pub(crate) fn into_boundary(self) -> Option<GuardianCheckpointBoundary> {
+        self.boundary
+    }
+
+    pub(crate) fn validate_model(
+        &self,
+        terminal: &frankenterm_term::Terminal,
+        pane_id: Uuid,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pane_id == pane_id,
+            "restored guardian prefix belongs to another pane"
+        );
+        let checkpoint = terminal.capture_recovery_checkpoint(self.limits)?;
+        let (_, digest) = terminal_payload_identity(checkpoint.canonical_payload())?;
+        anyhow::ensure!(
+            digest == self.model_digest,
+            "restored guardian model changed before parser registration"
+        );
+        Ok(())
+    }
+}
+
+impl GuardianRestoredTerminal {
+    pub fn from_checkpoint(
+        pane_id: Uuid,
+        descriptor: crate::guardian_protocol::GuardianCheckpointDescriptorV1,
+        payload: &[u8],
+        expected_pixel_size: (u64, u64),
+        config: Arc<dyn frankenterm_term::TerminalConfiguration>,
+        limits: TerminalCheckpointLimits,
+    ) -> anyhow::Result<Self> {
+        use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
+        anyhow::ensure!(!pane_id.is_nil(), "restored guardian pane identity is nil");
+        descriptor.validate_canonical_payload(payload)?;
+        let output = descriptor.output_boundary();
+        if matches!(output, GuardianCheckpointOutputBoundaryV1::Record { .. }) {
+            anyhow::ensure!(
+                descriptor.durable_pane_id() == Some(pane_id),
+                "restored guardian checkpoint belongs to another pane"
+            );
+        }
+        let validated = TerminalCheckpointV2::decode_canonical_json(payload, limits)?;
+        anyhow::ensure!(
+            validated.rows() == descriptor.rows() && validated.cols() == descriptor.cols(),
+            "restored guardian checkpoint geometry differs from its descriptor"
+        );
+        anyhow::ensure!(
+            (validated.pixel_width(), validated.pixel_height()) == expected_pixel_size,
+            "checkpoint pixel geometry does not match the claimed topology manifest"
+        );
+        Ok(Self {
+            terminal: validated.restore_inert(config)?,
+            pane_id,
+            output,
+            limits,
+        })
+    }
+
+    pub fn replay_record(
+        &mut self,
+        record: crate::guardian_protocol::GuardianReplayRecordDelivery,
+    ) -> anyhow::Result<crate::guardian_protocol::GuardianReplayRecordMetadataV1> {
+        use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
+        let metadata = record.metadata();
+        let (previous_sequence, previous_bytes) = match self.output {
+            GuardianCheckpointOutputBoundaryV1::Genesis { .. } => (0, 0),
+            GuardianCheckpointOutputBoundaryV1::Record {
+                sequence,
+                cumulative_plaintext_bytes,
+                ..
+            } => (sequence, cumulative_plaintext_bytes),
+        };
+        anyhow::ensure!(
+            previous_sequence.checked_add(1) == Some(metadata.sequence())
+                && previous_bytes.checked_add(u64::from(metadata.payload_bytes()))
+                    == Some(metadata.cumulative_plaintext_bytes())
+                && usize::try_from(metadata.payload_bytes())?
+                    <= self.limits.max_replay_record_bytes,
+            "restored guardian record does not extend the exact prefix"
+        );
+        let (segment, receipt, payload) = record.into_live_output(self.pane_id)?;
+        match self.output {
+            GuardianCheckpointOutputBoundaryV1::Genesis { .. } => {
+                anyhow::ensure!(
+                    segment.first_sequence() == 1 && segment.predecessor().is_none(),
+                    "restored guardian Genesis suffix has a predecessor"
+                );
+            }
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id,
+                sequence,
+                record_digest,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                ..
+            } if segment_id != segment.segment_id() => {
+                let predecessor = segment.predecessor().ok_or_else(|| {
+                    anyhow::anyhow!("restored guardian rollover has no predecessor")
+                })?;
+                anyhow::ensure!(
+                    predecessor.segment_id() == segment_id
+                        && predecessor.last_sequence() == sequence
+                        && predecessor.terminal_record_digest() == record_digest
+                        && predecessor.committed_log_bytes() == committed_log_bytes
+                        && predecessor.cumulative_plaintext_bytes() == cumulative_plaintext_bytes
+                        && segment.first_sequence() == receipt.sequence(),
+                    "restored guardian rollover differs from the exact prefix"
+                );
+            }
+            GuardianCheckpointOutputBoundaryV1::Record { .. } => {}
+        }
+        self.terminal.replay_bytes(payload.as_ref())?;
+        self.output = GuardianCheckpointOutputBoundaryV1::Record {
+            segment_id: receipt.segment_id(),
+            sequence: receipt.sequence(),
+            record_digest: receipt.record_digest(),
+            committed_log_bytes: receipt.committed_log_bytes(),
+            cumulative_plaintext_bytes: receipt.cumulative_plaintext_bytes(),
+            // The registration's external parser has not consumed any bytes.
+            parser_stream_bytes: 0,
+        };
+        Ok(metadata)
+    }
+
+    pub fn checkpoint(&self) -> Result<TerminalCheckpointV2, frankenterm_term::InertTerminalError> {
+        self.terminal.checkpoint()
+    }
+
+    pub fn activate(
+        self,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> anyhow::Result<(frankenterm_term::Terminal, GuardianRestoredParserPrefix)> {
+        use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;
+        let checkpoint = self.terminal.checkpoint()?;
+        let payload = Zeroizing::new(checkpoint.to_canonical_json(self.limits)?);
+        let (terminal_payload_bytes, terminal_payload_digest) =
+            terminal_payload_identity(&payload)?;
+        let boundary = match self.output {
+            GuardianCheckpointOutputBoundaryV1::Genesis { .. } => None,
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id,
+                sequence,
+                record_digest,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                ..
+            } => Some(GuardianCheckpointBoundary {
+                version: GUARDIAN_CHECKPOINT_BOUNDARY_VERSION,
+                durable_pane_id: self.pane_id,
+                segment_id,
+                output_sequence: sequence,
+                output_record_digest: record_digest,
+                output_committed_log_bytes: committed_log_bytes,
+                journal_cumulative_plaintext_bytes: cumulative_plaintext_bytes,
+                parser_stream_bytes: 0,
+                replay_identity_digest: current_replay_identity_digest(),
+                rows: u32::try_from(checkpoint.primary_rows())?,
+                cols: u32::try_from(checkpoint.primary_cols())?,
+                terminal_payload_bytes,
+                terminal_payload_digest,
+            }),
+        };
+        let terminal = self.terminal.into_live(writer).map_err(|failure| {
+            let (error, _) = failure.into_parts();
+            anyhow::anyhow!("restored guardian model activation failed: {error}")
+        })?;
+        Ok((
+            terminal,
+            GuardianRestoredParserPrefix {
+                boundary,
+                pane_id: self.pane_id,
+                model_digest: terminal_payload_digest,
+                limits: self.limits,
+            },
+        ))
+    }
+}
+
+impl std::fmt::Debug for GuardianRestoredTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianRestoredTerminal")
+            .field("pane_id", &self.pane_id)
+            .field("output", &self.output)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LiveParserCheckpointSource {
+    Output {
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+    },
+    Restored(GuardianCheckpointBoundary),
 }
 
 impl GuardianCheckpointBoundary {
@@ -4741,8 +4961,7 @@ pub(crate) struct LiveParserCaptureRequest {
     request_id: u64,
     target: u64,
     durable_pane_id: Uuid,
-    segment: GuardianOutputSegmentIdentity,
-    output: GuardianOutputAppendReceipt,
+    source: LiveParserCheckpointSource,
     limits: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits,
     registration_wire_identity: [u8; 16],
     expected_pane: Weak<dyn Pane>,
@@ -4792,8 +5011,7 @@ impl LiveParserCheckpointControl {
             request_id: pending.request_id,
             target,
             durable_pane_id: pending.durable_pane_id,
-            segment: pending.segment,
-            output: pending.output,
+            source: pending.source,
             limits: pending.limits,
             registration_wire_identity: state.registration_wire_identity,
             expected_pane: pending.expected_pane.clone(),
@@ -4908,6 +5126,43 @@ impl LiveParserCheckpointAck {
             output,
             &terminal_checkpoint,
         )?;
+        let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
+        Ok(Self {
+            registration_wire_identity,
+            boundary,
+            boundary_digest,
+            terminal_checkpoint,
+        })
+    }
+
+    fn capture_restored(
+        registration_wire_identity: [u8; 16],
+        durable_pane_id: Uuid,
+        restored: GuardianCheckpointBoundary,
+        terminal_checkpoint: RecoveryTerminalCheckpointV2,
+    ) -> Result<Self, GuardianCheckpointBoundaryError> {
+        if registration_wire_identity == [0; 16] {
+            return Err(GuardianCheckpointBoundaryError::NilRegistrationWireIdentity);
+        }
+        if durable_pane_id != restored.durable_pane_id {
+            return Err(GuardianCheckpointBoundaryError::ExpectedPaneIdentityMismatch);
+        }
+        // A restored source is available only before the first new delivery.
+        // Its model was installed before this external parser was constructed.
+        if terminal_checkpoint.parser_stream_bytes() != 0 || restored.parser_stream_bytes != 0 {
+            return Err(GuardianCheckpointBoundaryError::ParserWatermarkMismatch);
+        }
+        let (terminal_payload_bytes, terminal_payload_digest) =
+            terminal_payload_identity(terminal_checkpoint.canonical_payload())?;
+        let boundary = GuardianCheckpointBoundary {
+            rows: u32::try_from(terminal_checkpoint.rows())
+                .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?,
+            cols: u32::try_from(terminal_checkpoint.cols())
+                .map_err(|_| GuardianCheckpointBoundaryError::GeometryOutOfRange)?,
+            terminal_payload_bytes,
+            terminal_payload_digest,
+            ..restored
+        };
         let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
         Ok(Self {
             registration_wire_identity,
@@ -5048,14 +5303,24 @@ pub(crate) fn capture_and_bind_live_parser_checkpoint(
     if !pending_actions.is_empty() || terminal_checkpoint.parser_stream_bytes() != request.target {
         return Err(LiveParserCaptureAndBindError::PendingActionsRemain);
     }
-    LiveParserCheckpointAck::capture(
-        request.registration_wire_identity,
-        request.durable_pane_id,
-        request.segment,
-        request.output,
-        request.target,
-        terminal_checkpoint,
-    )
+    match request.source {
+        LiveParserCheckpointSource::Output { segment, output } => LiveParserCheckpointAck::capture(
+            request.registration_wire_identity,
+            request.durable_pane_id,
+            segment,
+            output,
+            request.target,
+            terminal_checkpoint,
+        ),
+        LiveParserCheckpointSource::Restored(boundary) => {
+            LiveParserCheckpointAck::capture_restored(
+                request.registration_wire_identity,
+                request.durable_pane_id,
+                boundary,
+                terminal_checkpoint,
+            )
+        }
+    }
     .map_err(LiveParserCaptureAndBindError::Boundary)
 }
 
@@ -8171,6 +8436,69 @@ mod tests {
         let descriptor = GuardianCheckpointArtifactDescriptorV1::from_live_capture(&capture)
             .expect("construct record descriptor");
         (descriptor, segment, output, capture)
+    }
+
+    #[test]
+    fn restored_record_prefix_preserves_journal_with_fresh_parser_and_rejects_model_splice() {
+        use crate::guardian_protocol::GuardianCheckpointDescriptorV1;
+        let (_, _, _, capture) = record_descriptor();
+        let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(&capture, 1).unwrap();
+        let restore = |pane_id, payload: &[u8]| {
+            GuardianRestoredTerminal::from_checkpoint(
+                pane_id,
+                descriptor,
+                payload,
+                (640, 384),
+                Arc::new(CheckpointTerminalConfig),
+                TerminalCheckpointLimits::default(),
+            )
+        };
+        let payload = capture.terminal_checkpoint().canonical_payload();
+        assert!(restore(Uuid::new_v4(), payload).is_err());
+        assert!(restore(capture.durable_pane_id(), b"{}").is_err());
+        let (mut terminal, prefix) = restore(capture.durable_pane_id(), payload)
+            .unwrap()
+            .activate(Box::new(Vec::<u8>::new()))
+            .unwrap();
+        prefix
+            .validate_model(&terminal, capture.durable_pane_id())
+            .unwrap();
+        assert!(prefix.validate_model(&terminal, Uuid::new_v4()).is_err());
+        let boundary = prefix.boundary.unwrap();
+        assert_eq!(boundary.output_sequence(), capture.output_sequence());
+        assert_eq!(
+            boundary.output_record_digest(),
+            capture.output_record_digest()
+        );
+        assert_eq!(
+            boundary.journal_cumulative_plaintext_bytes(),
+            capture.journal_cumulative_plaintext_bytes()
+        );
+        assert_eq!(boundary.parser_stream_bytes(), 0);
+        let parser = termwiz::escape::parser::Parser::new();
+        let ground = parser.recovery_ground_boundary().unwrap();
+        let checkpoint = terminal
+            .capture_recovery_checkpoint_at_external_parser_ground(
+                ground,
+                TerminalCheckpointLimits::default(),
+            )
+            .unwrap();
+        let restored_capture = LiveParserCheckpointAck::capture_restored(
+            [2; 16],
+            capture.durable_pane_id(),
+            boundary,
+            checkpoint,
+        )
+        .unwrap();
+        let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(&restored_capture, 2)
+            .expect("a quiet restored Record has a genuine zero-byte fresh parser");
+        descriptor
+            .validate_canonical_payload(restored_capture.terminal_checkpoint().canonical_payload())
+            .unwrap();
+        terminal.advance_bytes(b"unrelated replacement model");
+        assert!(prefix
+            .validate_model(&terminal, capture.durable_pane_id())
+            .is_err());
     }
 
     #[test]

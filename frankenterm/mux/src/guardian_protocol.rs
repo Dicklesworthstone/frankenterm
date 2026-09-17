@@ -4420,15 +4420,16 @@ impl GuardianCheckpointDescriptorV1 {
                 record_digest,
                 committed_log_bytes,
                 cumulative_plaintext_bytes,
-                parser_stream_bytes,
+                ..
             } => {
+                // A restored model starts a new external parser at byte zero;
+                // journal sequence and cumulative bytes retain their history.
                 !self.durable_pane_id.is_nil()
                     && !segment_id.is_nil()
                     && sequence > 0
                     && !digest_is_zero(record_digest)
                     && committed_log_bytes > 0
                     && cumulative_plaintext_bytes > 0
-                    && parser_stream_bytes > 0
             }
         };
         if self.capture_generation == 0

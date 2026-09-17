@@ -1270,6 +1270,8 @@ pub struct LocalPane {
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
     guardian_live_output_reader: Mutex<Option<Box<dyn GuardianLiveOutputReader>>>,
+    guardian_restored_prefix:
+        Mutex<Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>>,
     guardian_checkpoint_publisher: Option<Arc<dyn GuardianLiveCheckpointPublisher>>,
     resize_queue: Arc<Mutex<ResizeQueueState>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -1970,6 +1972,19 @@ impl Pane for LocalPane {
         &self,
     ) -> anyhow::Result<Option<Box<dyn GuardianLiveOutputReader>>> {
         Ok(self.guardian_live_output_reader.lock().take())
+    }
+
+    fn take_guardian_restored_prefix(
+        &self,
+    ) -> anyhow::Result<Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>> {
+        let mut prefix = self.guardian_restored_prefix.lock();
+        if let Some(prefix) = prefix.as_ref() {
+            prefix.validate_model(
+                &self.terminal.lock(),
+                Uuid::from_bytes(self.durable_pane_id),
+            )?;
+        }
+        Ok(prefix.take())
     }
 
     fn publish_guardian_checkpoint(
@@ -4474,8 +4489,9 @@ impl LocalPane {
         guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
         guardian_checkpoint_publisher: Arc<dyn GuardianLiveCheckpointPublisher>,
         spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
+        restored_prefix: Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>,
     ) -> Self {
-        Self::new_with_ownership(
+        let mut pane = Self::new_with_ownership(
             pane_id,
             terminal,
             process,
@@ -4487,7 +4503,9 @@ impl LocalPane {
             Some(guardian_live_output_reader),
             Some(guardian_checkpoint_publisher),
             LocalPaneOwnership::guardian(lease_identity, lease_control, spawn_custody),
-        )
+        );
+        *pane.guardian_restored_prefix.get_mut() = restored_prefix;
+        pane
     }
 
     /// Check mux-owned publication prerequisites without performing I/O or
@@ -4573,6 +4591,7 @@ impl LocalPane {
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
             guardian_live_output_reader: Mutex::new(guardian_live_output_reader),
+            guardian_restored_prefix: Mutex::new(None),
             guardian_checkpoint_publisher,
             resize_queue: Arc::new(Mutex::new(ResizeQueueState::default())),
             writer: Mutex::new(writer),
@@ -5876,6 +5895,7 @@ mod tests {
             "guardian-lifetime-test".to_string(),
             Box::new(GuardianLifetimeTestOutputReader),
             Arc::new(GuardianLifetimeTestCheckpointPublisher),
+            None,
             None,
         )
     }

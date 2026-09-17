@@ -348,7 +348,9 @@ impl Default for MuxTopologyCaptureConfig {
 pub enum MuxTopologyCaptureError {
     #[error("mux topology authority exhausted")]
     AuthorityExhausted,
-    #[error("concurrent mutation detected across {attempts} capture attempts (initial: {initial:?}, current: {current:?})")]
+    #[error(
+        "concurrent mutation detected across {attempts} capture attempts (initial: {initial:?}, current: {current:?})"
+    )]
     ConcurrentMutation {
         attempts: usize,
         initial: (MuxSessionIncarnation, TopologyRevision),
@@ -2202,6 +2204,25 @@ pub enum LiveParserCheckpointError {
     Timeout,
     #[error("live parser checkpoint completion channel disconnected")]
     CompletionDisconnected,
+    #[error("restored parser prefix has already been seeded for this registration")]
+    RestoredPrefixAlreadySeeded,
+    #[error("live parser checkpoint control is not in pristine initial state for prefix seeding")]
+    NonPristineControl,
+    #[error("restored prefix pane UUID ({observed}) does not match pane ({expected})")]
+    RestoredPrefixPaneMismatch {
+        expected: uuid::Uuid,
+        observed: uuid::Uuid,
+    },
+    #[error("restored prefix segment identity is nil")]
+    NilSegmentIdentity,
+    #[error("restored prefix output sequence is zero")]
+    ZeroOutputSequence,
+    #[error("restored prefix output record digest is zero")]
+    ZeroOutputRecordDigest,
+    #[error("restored prefix committed log bytes is zero")]
+    ZeroOutputCommittedLogBytes,
+    #[error("restored prefix journal plaintext watermark is zero")]
+    ZeroJournalPlaintextWatermark,
 }
 
 /// Authenticated, bounded output-journal page prepared for a future
@@ -2317,8 +2338,7 @@ enum GuardianOutputReplayPreparationError {
 
 #[derive(Clone, Copy)]
 struct LiveParserGuardianCursor {
-    authenticated_segment: GuardianOutputSegmentIdentity,
-    authenticated_output: GuardianOutputAppendReceipt,
+    source: crate::guardian_checkpoint::LiveParserCheckpointSource,
     segment_id: uuid::Uuid,
     output_sequence: u64,
     output_record_digest: [u8; 32],
@@ -2333,17 +2353,34 @@ struct LiveParserAuthorizedDelivery {
 }
 
 impl LiveParserGuardianCursor {
-    fn matches_receipt(
+    fn matches_source(
         self,
-        segment: GuardianOutputSegmentIdentity,
-        output: GuardianOutputAppendReceipt,
+        source: crate::guardian_checkpoint::LiveParserCheckpointSource,
     ) -> bool {
-        segment.segment_id() == self.segment_id
-            && output.segment_id() == self.segment_id
-            && output.sequence() == self.output_sequence
-            && output.record_digest() == self.output_record_digest
-            && output.committed_log_bytes() == self.output_committed_log_bytes
-            && output.cumulative_plaintext_bytes() == self.journal_cumulative_plaintext_bytes
+        match (self.source, source) {
+            (
+                crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                    segment: cur_seg,
+                    output: cur_out,
+                },
+                crate::guardian_checkpoint::LiveParserCheckpointSource::Output { segment, output },
+            ) => {
+                cur_seg == segment
+                    && cur_out == output
+                    && segment.segment_id() == self.segment_id
+                    && output.segment_id() == self.segment_id
+                    && output.sequence() == self.output_sequence
+                    && output.record_digest() == self.output_record_digest
+                    && output.committed_log_bytes() == self.output_committed_log_bytes
+                    && output.cumulative_plaintext_bytes()
+                        == self.journal_cumulative_plaintext_bytes
+            }
+            (
+                crate::guardian_checkpoint::LiveParserCheckpointSource::Restored(cur_boundary),
+                crate::guardian_checkpoint::LiveParserCheckpointSource::Restored(boundary),
+            ) => cur_boundary == boundary,
+            _ => false,
+        }
     }
 }
 
@@ -2351,8 +2388,7 @@ struct PendingLiveParserCheckpoint {
     request_id: u64,
     target: u64,
     durable_pane_id: uuid::Uuid,
-    segment: GuardianOutputSegmentIdentity,
-    output: GuardianOutputAppendReceipt,
+    source: crate::guardian_checkpoint::LiveParserCheckpointSource,
     limits: TerminalCheckpointLimits,
     expected_pane: Weak<dyn Pane>,
     expected_generation: Weak<PaneRegistrationGeneration>,
@@ -2400,6 +2436,7 @@ struct LiveParserCheckpointState {
     next_request_id: u64,
     pending: Option<PendingLiveParserCheckpoint>,
     pending_model: Option<PendingModelParserCheckpoint>,
+    seeded: bool,
 }
 
 impl LiveParserCheckpointState {
@@ -2420,6 +2457,7 @@ impl LiveParserCheckpointState {
             next_request_id: 1,
             pending: None,
             pending_model: None,
+            seeded: false,
         }
     }
 }
@@ -3035,8 +3073,10 @@ impl LiveParserCheckpointControl {
         state.guardian_mode = true;
         state.authorized_delivery = Some(LiveParserAuthorizedDelivery {
             cursor: LiveParserGuardianCursor {
-                authenticated_segment: segment,
-                authenticated_output: output,
+                source: crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                    segment,
+                    output,
+                },
                 segment_id: output.segment_id(),
                 output_sequence: output.sequence(),
                 output_record_digest: output.record_digest(),
@@ -3083,8 +3123,7 @@ impl LiveParserCheckpointControl {
         pane: &Arc<dyn Pane>,
         generation: &Arc<PaneRegistrationGeneration>,
         durable_pane_id: uuid::Uuid,
-        segment: GuardianOutputSegmentIdentity,
-        output: GuardianOutputAppendReceipt,
+        source: crate::guardian_checkpoint::LiveParserCheckpointSource,
         limits: TerminalCheckpointLimits,
     ) -> Result<
         (
@@ -3120,11 +3159,11 @@ impl LiveParserCheckpointControl {
                 .authorized_delivery
                 .as_ref()
                 .map(|delivery| delivery.cursor)
-                .filter(|cursor| cursor.matches_receipt(segment, output))
+                .filter(|cursor| cursor.matches_source(source))
                 .or_else(|| {
                     state
                         .guardian_cursor
-                        .filter(|cursor| cursor.matches_receipt(segment, output))
+                        .filter(|cursor| cursor.matches_source(source))
                 })
                 .ok_or_else(|| {
                     if state.guardian_mode {
@@ -3150,8 +3189,7 @@ impl LiveParserCheckpointControl {
                 request_id,
                 target,
                 durable_pane_id,
-                segment,
-                output,
+                source,
                 limits,
                 expected_pane: Arc::downgrade(pane),
                 expected_generation: Arc::downgrade(generation),
@@ -3163,6 +3201,94 @@ impl LiveParserCheckpointControl {
         };
         self.wake_parser();
         Ok((request_id, receiver))
+    }
+
+    pub(crate) fn seed_restored_prefix(&self, pane: &dyn Pane) -> anyhow::Result<()> {
+        let prefix = pane
+            .take_guardian_restored_prefix()
+            .context("failed to take guardian restored prefix")?;
+
+        let mut state = self.state.lock();
+        if state.seeded {
+            return Err(LiveParserCheckpointError::RestoredPrefixAlreadySeeded.into());
+        }
+        if state.attached
+            || state.dead
+            || state.poison.is_some()
+            || state.delivered_bytes != 0
+            || state.parsed_bytes != 0
+            || state.delivery_call_in_flight
+            || state.socket_write_in_flight
+            || state.guardian_mode
+            || state.guardian_cursor.is_some()
+            || state.authorized_delivery.is_some()
+            || state.pending.is_some()
+            || state.pending_model.is_some()
+        {
+            return Err(LiveParserCheckpointError::NonPristineControl.into());
+        }
+
+        let Some(prefix) = prefix else {
+            state.seeded = true;
+            return Ok(());
+        };
+
+        let Some(boundary) = prefix.into_boundary() else {
+            state.seeded = true;
+            return Ok(());
+        };
+
+        let durable_pane_id = pane
+            .durable_pane_id()
+            .map(uuid::Uuid::from_bytes)
+            .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+        if durable_pane_id.is_nil() {
+            return Err(LiveParserCheckpointError::NilDurablePaneIdentity.into());
+        }
+        if boundary.durable_pane_id() != durable_pane_id {
+            return Err(LiveParserCheckpointError::RestoredPrefixPaneMismatch {
+                expected: durable_pane_id,
+                observed: boundary.durable_pane_id(),
+            }
+            .into());
+        }
+
+        if boundary.segment_id().is_nil() {
+            return Err(LiveParserCheckpointError::NilSegmentIdentity.into());
+        }
+        if boundary.output_sequence() == 0 {
+            return Err(LiveParserCheckpointError::ZeroOutputSequence.into());
+        }
+        if boundary.output_record_digest() == [0; 32] {
+            return Err(LiveParserCheckpointError::ZeroOutputRecordDigest.into());
+        }
+        if boundary.output_committed_log_bytes() == 0 {
+            return Err(LiveParserCheckpointError::ZeroOutputCommittedLogBytes.into());
+        }
+        if boundary.journal_cumulative_plaintext_bytes() == 0 {
+            return Err(LiveParserCheckpointError::ZeroJournalPlaintextWatermark.into());
+        }
+
+        anyhow::ensure!(
+            boundary.parser_stream_bytes() == 0,
+            "restored guardian boundary parser_stream_bytes must be zero for fresh registration"
+        );
+
+        state.seeded = true;
+        state.guardian_mode = true;
+        state.delivered_bytes = 0;
+        state.parsed_bytes = 0;
+        state.guardian_cursor = Some(LiveParserGuardianCursor {
+            source: crate::guardian_checkpoint::LiveParserCheckpointSource::Restored(boundary),
+            segment_id: boundary.segment_id(),
+            output_sequence: boundary.output_sequence(),
+            output_record_digest: boundary.output_record_digest(),
+            output_committed_log_bytes: boundary.output_committed_log_bytes(),
+            journal_cumulative_plaintext_bytes: boundary.journal_cumulative_plaintext_bytes(),
+            parser_global_endpoint: 0,
+        });
+
+        Ok(())
     }
 
     fn cancel_checkpoint(&self, request_id: u64) {
@@ -4769,6 +4895,19 @@ mod pane_registration_handle {
             limits: TerminalCheckpointLimits,
             timeout: Duration,
         ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            self.capture_live_parser_checkpoint_source(
+                crate::guardian_checkpoint::LiveParserCheckpointSource::Output { segment, output },
+                limits,
+                timeout,
+            )
+        }
+
+        pub(crate) fn capture_live_parser_checkpoint_source(
+            &self,
+            source: crate::guardian_checkpoint::LiveParserCheckpointSource,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
             if timeout.is_zero() || timeout > LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT {
                 return Err(LiveParserCheckpointError::InvalidTimeout);
             }
@@ -4781,15 +4920,10 @@ mod pane_registration_handle {
             if durable_pane_id.is_nil() {
                 return Err(LiveParserCheckpointError::NilDurablePaneIdentity);
             }
-            let (request_id, completion) =
-                self.generation.live_parser_checkpoint.register_checkpoint(
-                    &pane,
-                    &self.generation,
-                    durable_pane_id,
-                    segment,
-                    output,
-                    limits,
-                )?;
+            let (request_id, completion) = self
+                .generation
+                .live_parser_checkpoint
+                .register_checkpoint(&pane, &self.generation, durable_pane_id, source, limits)?;
             let result = match completion.recv_timeout(timeout) {
                 Ok(result) => result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -4936,7 +5070,7 @@ mod pane_registration_handle {
             limits: TerminalCheckpointLimits,
             timeout: Duration,
         ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
-            let cursor = {
+            let source = {
                 let state = self.generation.live_parser_checkpoint.state.lock();
                 if state.dead
                     || state.poison.is_some()
@@ -4948,16 +5082,15 @@ mod pane_registration_handle {
                 {
                     return Err(LiveParserCheckpointError::GuardianDeliveryBusy.into());
                 }
-                state
+                let cursor = state
                     .guardian_cursor
-                    .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?;
+                cursor.source
             };
-            self.capture_and_publish_guardian_checkpoint(
-                cursor.authenticated_segment,
-                cursor.authenticated_output,
-                limits,
-                timeout,
-            )
+            let capture = self
+                .capture_live_parser_checkpoint_source(source, limits, timeout)
+                .map_err(anyhow::Error::new)?;
+            self.pane.publish_guardian_checkpoint(capture)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -15162,6 +15295,9 @@ impl Mux {
         ),
         Error,
     > {
+        generation
+            .live_parser_checkpoint
+            .seed_restored_prefix(pane.as_ref())?;
         let PreparedPaneRegistration {
             pane_id,
             reader,
@@ -23207,6 +23343,163 @@ mod tests {
     }
 
     #[test]
+    fn seed_restored_prefix_duplicate_rejected() {
+        let wire_identity = *uuid::Uuid::new_v4().as_bytes();
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        let pane = KillCountingPane::new_live_checkpoint(1, *uuid::Uuid::new_v4().as_bytes(), None);
+        assert!(control.seed_restored_prefix(pane.as_ref()).is_ok());
+        let second = control.seed_restored_prefix(pane.as_ref());
+        assert!(matches!(
+            second
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::RestoredPrefixAlreadySeeded)
+        ));
+    }
+
+    #[test]
+    fn seed_restored_prefix_nonpristine_rejected() {
+        let wire_identity = *uuid::Uuid::new_v4().as_bytes();
+        let pane = KillCountingPane::new_live_checkpoint(1, *uuid::Uuid::new_v4().as_bytes(), None);
+
+        // Case 1: attached
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().attached = true;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 2: delivered_bytes > 0
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().delivered_bytes = 1;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 3: guardian_mode already active
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().guardian_mode = true;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 4: dead
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().dead = true;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 5: poison
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().poison = Some("test poison");
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 6: parsed_bytes > 0
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().parsed_bytes = 1;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 7: delivery_call_in_flight
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().delivery_call_in_flight = true;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+
+        // Case 8: socket_write_in_flight
+        let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
+        control.state.lock().socket_write_in_flight = true;
+        assert!(matches!(
+            control
+                .seed_restored_prefix(pane.as_ref())
+                .err()
+                .and_then(|e| e.downcast::<LiveParserCheckpointError>().ok()),
+            Some(LiveParserCheckpointError::NonPristineControl)
+        ));
+    }
+
+    #[test]
+    fn cursor_matches_source_requires_exact_output_receipt() {
+        let durable_pane_id = uuid::Uuid::new_v4();
+        let (segment, receipts) =
+            live_checkpoint_receipts(durable_pane_id, &[b"payload1", b"payload2"]);
+        let r0 = receipts[0];
+        let r1 = receipts[1];
+
+        let cursor = LiveParserGuardianCursor {
+            source: crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                segment,
+                output: r0,
+            },
+            segment_id: r0.segment_id(),
+            output_sequence: r0.sequence(),
+            output_record_digest: r0.record_digest(),
+            output_committed_log_bytes: r0.committed_log_bytes(),
+            journal_cumulative_plaintext_bytes: r0.cumulative_plaintext_bytes(),
+            parser_global_endpoint: 8,
+        };
+
+        // Same output matches
+        assert!(cursor.matches_source(
+            crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                segment,
+                output: r0,
+            }
+        ));
+
+        // Different output receipt does not match
+        assert!(!cursor.matches_source(
+            crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                segment,
+                output: r1,
+            }
+        ));
+
+        // Different segment identity does not match
+        let (other_seg, other_receipts) =
+            live_checkpoint_receipts(uuid::Uuid::new_v4(), &[b"payload1"]);
+        assert!(!cursor.matches_source(
+            crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                segment: other_seg,
+                output: other_receipts[0],
+            }
+        ));
+    }
+
+    #[test]
     fn delivery_reservation_unwind_poison_clears_both_flags_and_wakes_waiters() {
         let wire_identity = *uuid::Uuid::new_v4().as_bytes();
         let control = Arc::new(LiveParserCheckpointControl::new(wire_identity));
@@ -24170,7 +24463,10 @@ mod tests {
         );
         assert_eq!(attempts, 1);
         assert_eq!(effects.len(), 1);
-        println!("OSC52_MUX request={request_id} pane={} window={window_id} admission_effects=0 accepted_effects=1 failed_attempts=1 delivery_ack=unproven", pane.pane_id());
+        println!(
+            "OSC52_MUX request={request_id} pane={} window={window_id} admission_effects=0 accepted_effects=1 failed_attempts=1 delivery_ack=unproven",
+            pane.pane_id()
+        );
     }
 
     #[test]
@@ -24340,7 +24636,9 @@ mod tests {
             error.downcast_ref::<frankenterm_term::Osc52PromptError>(),
             Some(&frankenterm_term::Osc52PromptError::Expired)
         );
-        println!("OSC52_DEADLINE live_at_lock_wait=true expired_before_enqueue=true effects=0 worker_joined=true");
+        println!(
+            "OSC52_DEADLINE live_at_lock_wait=true expired_before_enqueue=true effects=0 worker_joined=true"
+        );
     }
 
     #[test]
