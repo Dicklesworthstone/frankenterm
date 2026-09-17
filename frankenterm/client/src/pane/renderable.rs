@@ -1319,10 +1319,33 @@ impl RenderableInner {
     }
 
     pub fn make_all_stale(&mut self) {
+        // Profiling only: enable before launching the client. Keep clock reads
+        // and per-call logs out of the normal resize path. This measures cache
+        // invalidation, not server reflow or time to a presented native frame.
+        static PROFILE_CACHE_INVALIDATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let measurement = (*PROFILE_CACHE_INVALIDATION.get_or_init(|| {
+            std::env::var_os("FT_PROFILE_CLIENT_CACHE_INVALIDATION")
+                .is_some_and(|value| value == "1")
+        }))
+        .then(|| (Instant::now(), self.lines.len()));
         let config = configuration();
         let capacity = render_line_cache_capacity(&config, &self.dimensions);
         rebuild_cache_as_stale(&mut self.lines, capacity);
         self.selection_row_sequences.resize(capacity);
+        if let Some((started, cached_before)) = measurement {
+            let elapsed_us = started.elapsed().as_micros();
+            log::info!(
+                target: "perf.profile",
+                "perf.profile.client_cache_invalidation pane_id={} cols={} viewport_rows={} cached_before={} cached_after={} capacity={} elapsed_us={}",
+                self.local_pane_id,
+                self.dimensions.cols,
+                self.dimensions.viewport_rows,
+                cached_before,
+                self.lines.len(),
+                capacity.get(),
+                elapsed_us,
+            );
+        }
     }
 
     fn make_stale(&mut self, stable_row: StableRowIndex) {
