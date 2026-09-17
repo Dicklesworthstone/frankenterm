@@ -3,11 +3,15 @@
 #![allow(clippy::range_plus_one)]
 use frankenterm_core::smart_selection::SelectionPatternKind;
 use frankenterm_core::smart_selection_patterns::{smart_match_at_click, smart_match_in_line};
-use mux::pane::Pane;
+use mux::pane::{LineReadPermit, LogicalLine, Pane};
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{self, AtomicBool};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use termwiz::surface::SequenceNo;
 use termwiz::surface::line::DoubleClickRange;
+use wezterm_term::screen::ScreenLineRead;
 use wezterm_term::unicode_column_width;
 use wezterm_term::{SemanticZone, StableRowIndex};
 
@@ -261,8 +265,395 @@ impl SelectionFrameStamp {
     }
 }
 
+pub type SelectionReadPlans = anyhow::Result<Vec<ScreenLineRead>>;
+
+pub struct WordLineSelectionReady {
+    pub result: Option<anyhow::Result<WordLineSelectionPayload>>,
+    pub plans: Option<SelectionReadPlans>,
+    pub retire: SyncSender<SelectionReadPlans>,
+}
+
+impl Drop for WordLineSelectionReady {
+    fn drop(&mut self) {
+        if let Some(plans) = self.plans.take() {
+            let _ = self.retire.send(plans);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordLineSelectionPayload {
+    pub range: SelectionRange,
+    pub pick: Option<SmartSelectionPick>,
+}
+
+pub struct WordLineSelectionRead {
+    receiver: Receiver<WordLineSelectionReady>,
+    ready: Option<WordLineSelectionReady>,
+    cancelled: Arc<AtomicBool>,
+    deadline: std::time::Instant,
+    source_sequence: SequenceNo,
+    authority: SelectionAuthority,
+    mode: SelectionMode,
+    coordinate: SelectionCoordinate,
+    end_coordinate: Option<SelectionCoordinate>,
+}
+
+impl Drop for WordLineSelectionRead {
+    fn drop(&mut self) {
+        self.cancelled.store(true, atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for WordLineSelectionRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WordLineSelectionRead")
+            .field("deadline", &self.deadline)
+            .field("source_sequence", &self.source_sequence)
+            .field("authority", &self.authority)
+            .field("mode", &self.mode)
+            .field("coordinate", &self.coordinate)
+            .field("end_coordinate", &self.end_coordinate)
+            .field("ready", &self.ready.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WordLineSelectionRead {
+    pub const FIXED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    pub const MAX_CONTEXT_ROWS: usize = 64;
+
+    #[must_use]
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+
+    #[must_use]
+    pub fn source_sequence(&self) -> SequenceNo {
+        self.source_sequence
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> SelectionAuthority {
+        self.authority
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> SelectionMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn coordinate(&self) -> SelectionCoordinate {
+        self.coordinate
+    }
+
+    #[must_use]
+    pub fn end_coordinate(&self) -> Option<SelectionCoordinate> {
+        self.end_coordinate
+    }
+
+    pub fn start(
+        pane: &Arc<dyn Pane>,
+        authority: SelectionAuthority,
+        sequence: SequenceNo,
+        mode: SelectionMode,
+        coordinate: SelectionCoordinate,
+        end_coordinate: Option<SelectionCoordinate>,
+        deadline: std::time::Instant,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Result<Option<Self>, &'static str> {
+        if std::time::Instant::now() >= deadline {
+            return Err("The selection deadline expired. Select again.");
+        }
+        let Some(permit) = LineReadPermit::try_acquire() else {
+            return Ok(None);
+        };
+
+        let start_y = coordinate.y;
+        let start_req = start_y.saturating_sub(Self::MAX_CONTEXT_ROWS as StableRowIndex)
+            ..start_y.saturating_add(Self::MAX_CONTEXT_ROWS as StableRowIndex + 1);
+
+        let mut requested_ranges = vec![start_req];
+        if let Some(end) = end_coordinate {
+            let end_y = end.y;
+            let in_start_req =
+                end_y >= requested_ranges[0].start && end_y < requested_ranges[0].end;
+            if !in_start_req {
+                let end_req = end_y.saturating_sub(Self::MAX_CONTEXT_ROWS as StableRowIndex)
+                    ..end_y.saturating_add(Self::MAX_CONTEXT_ROWS as StableRowIndex + 1);
+                requested_ranges.push(end_req);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let is_cancelled = Arc::clone(&cancelled);
+        let exec_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = sync_channel(1);
+        let ranges_for_worker = requested_ranges.clone();
+
+        // Reserve and start before capturing any source allocations.
+        let worker = permit
+            .start(
+                move || {
+                    is_cancelled.load(atomic::Ordering::Acquire)
+                        || std::time::Instant::now() >= deadline
+                },
+                move |plans, permit| {
+                    let (retire, retired) = sync_channel(1);
+                    let result = process_hydrated_word_line_selection(
+                        &plans,
+                        &ranges_for_worker,
+                        mode,
+                        coordinate,
+                        end_coordinate,
+                        &exec_cancelled,
+                    );
+                    let ready = WordLineSelectionReady {
+                        result: Some(result),
+                        plans: Some(plans),
+                        retire,
+                    };
+                    if sender.send(ready).is_ok() {
+                        wake();
+                        drop(retired.recv());
+                    }
+                    drop(permit);
+                },
+            )
+            .map_err(|_| "The text reader could not start. Select again.")?;
+
+        let mut submitted_plans = Vec::with_capacity(requested_ranges.len());
+        for range in &requested_ranges {
+            let capture = pane.capture_line_read(range.clone(), &mut Default::default());
+            let Some(plan) = capture else {
+                cancelled.store(true, atomic::Ordering::Release);
+                worker.submit(submitted_plans);
+                return Err("This pane cannot provide a bounded text read.");
+            };
+            let Ok(plan) = plan else {
+                cancelled.store(true, atomic::Ordering::Release);
+                worker.submit(submitted_plans);
+                return Ok(None);
+            };
+            submitted_plans.push(plan);
+        }
+
+        worker.submit(submitted_plans);
+
+        Ok(Some(Self {
+            receiver,
+            ready: None,
+            cancelled,
+            deadline,
+            source_sequence: sequence,
+            authority,
+            mode,
+            coordinate,
+            end_coordinate,
+        }))
+    }
+
+    pub fn poll_ready(&mut self) -> Result<bool, &'static str> {
+        if std::time::Instant::now() >= self.deadline {
+            self.cancelled.store(true, atomic::Ordering::Release);
+            return Err("The selection deadline expired. Select again.");
+        }
+        if self.ready.is_some() {
+            return Ok(true);
+        }
+        match self.receiver.try_recv() {
+            Ok(ready) => {
+                self.ready = Some(ready);
+                Ok(true)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => {
+                Err("The text reader stopped unexpectedly. Select again.")
+            }
+        }
+    }
+
+    pub fn plans(&self) -> Option<&[ScreenLineRead]> {
+        self.ready
+            .as_ref()?
+            .plans
+            .as_ref()?
+            .as_ref()
+            .ok()
+            .map(|p| p.as_slice())
+    }
+
+    pub fn take_payload(&mut self) -> Result<WordLineSelectionPayload, &'static str> {
+        let ready = self.ready.as_mut().ok_or("Selection read is not ready")?;
+        let result = ready
+            .result
+            .take()
+            .ok_or("Selection result already consumed")?;
+        self.ready = None;
+        match result {
+            Ok(payload) => Ok(payload),
+            Err(_) => Err("Incomplete selection snapshot. Select again."),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn try_take_result(&mut self) -> Result<Option<WordLineSelectionPayload>, &'static str> {
+        if !self.poll_ready()? {
+            return Ok(None);
+        }
+        self.take_payload().map(Some)
+    }
+}
+
+fn logical_lines_from_plan(
+    plan: &ScreenLineRead,
+    requested: &Range<StableRowIndex>,
+    target_coord: SelectionCoordinate,
+    cancelled: &Arc<AtomicBool>,
+) -> anyhow::Result<(Vec<LogicalLine>, usize)> {
+    let row_count = plan.row_count();
+    anyhow::ensure!(row_count > 0, "empty line read snapshot");
+    let first_row = plan.first_row();
+    let last_snapshot_row = first_row
+        .checked_add(row_count as StableRowIndex - 1)
+        .ok_or_else(|| anyhow::anyhow!("row overflow"))?;
+
+    let mut logical_lines = Vec::new();
+    for (idx, line) in plan.lines().enumerate() {
+        if cancelled.load(atomic::Ordering::Acquire) {
+            anyhow::bail!("selection read cancelled");
+        }
+        let row = first_row
+            .checked_add(idx as StableRowIndex)
+            .ok_or_else(|| anyhow::anyhow!("row overflow"))?;
+        match logical_lines.last_mut() {
+            None => {
+                logical_lines.push(LogicalLine {
+                    physical_lines: vec![line.clone()],
+                    logical: line.clone(),
+                    first_row: row,
+                });
+            }
+            Some(prior)
+                if prior.logical.last_cell_was_wrapped()
+                    && !prior
+                        .logical
+                        .len()
+                        .checked_add(line.len())
+                        .map_or(true, |n| n > mux::pane::MAX_LOGICAL_LINE_LEN) =>
+            {
+                let seqno = prior.logical.current_seqno().max(line.current_seqno());
+                prior.logical.set_last_cell_was_wrapped(false, seqno);
+                prior.logical.append_line(line.clone(), seqno);
+                prior.physical_lines.push(line.clone());
+            }
+            Some(_) => {
+                logical_lines.push(LogicalLine {
+                    physical_lines: vec![line.clone()],
+                    logical: line.clone(),
+                    first_row: row,
+                });
+            }
+        }
+    }
+
+    let (target_idx, target_logical) = logical_lines
+        .iter()
+        .enumerate()
+        .find(|(_, ll)| ll.contains_y(target_coord.y))
+        .ok_or_else(|| anyhow::anyhow!("target coordinate not contained in line snapshot"))?;
+
+    // Decline incomplete snapshots: verify logical line was not truncated at the boundary
+    if let Some(last_phys) = target_logical.physical_lines.last() {
+        let last_phys_row = target_logical
+            .first_row
+            .checked_add(target_logical.physical_lines.len() as StableRowIndex - 1)
+            .ok_or_else(|| anyhow::anyhow!("row overflow"))?;
+        if last_phys_row == last_snapshot_row && last_phys.last_cell_was_wrapped() {
+            anyhow::bail!("logical line truncated at forward snapshot boundary");
+        }
+    }
+
+    // Decline backward truncated logical lines that extend to snapshot boundary
+    if target_logical.first_row == first_row && first_row == requested.start {
+        anyhow::bail!("logical line truncated at backward snapshot boundary");
+    }
+
+    Ok((logical_lines, target_idx))
+}
+
+fn process_hydrated_word_line_selection(
+    plans: &anyhow::Result<Vec<ScreenLineRead>>,
+    requested_ranges: &[Range<StableRowIndex>],
+    mode: SelectionMode,
+    start_coord: SelectionCoordinate,
+    end_coord: Option<SelectionCoordinate>,
+    cancelled: &Arc<AtomicBool>,
+) -> anyhow::Result<WordLineSelectionPayload> {
+    anyhow::ensure!(
+        !cancelled.load(atomic::Ordering::Acquire),
+        "selection read cancelled"
+    );
+    let plans = plans
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("line read failed: {e}"))?;
+    anyhow::ensure!(
+        plans.len() == requested_ranges.len(),
+        "incomplete line read plans"
+    );
+    anyhow::ensure!(!plans.is_empty(), "missing line read plans");
+
+    let (start_lines, _) =
+        logical_lines_from_plan(&plans[0], &requested_ranges[0], start_coord, cancelled)?;
+
+    let (mut range, mut pick) = match mode {
+        SelectionMode::Word => {
+            SelectionRange::smart_or_word_around_in_logical_lines(start_coord, &start_lines)
+        }
+        SelectionMode::Line => {
+            SelectionRange::smart_or_line_around_in_logical_lines(start_coord, &start_lines)
+        }
+        _ => anyhow::bail!("unsupported mode for background selection reader"),
+    };
+
+    if let Some(end) = end_coord {
+        if end != start_coord {
+            let (end_lines, _) = if requested_ranges.len() > 1 {
+                logical_lines_from_plan(&plans[1], &requested_ranges[1], end, cancelled)?
+            } else {
+                logical_lines_from_plan(&plans[0], &requested_ranges[0], end, cancelled)?
+            };
+            let (end_range, end_pick) = match mode {
+                SelectionMode::Word => {
+                    SelectionRange::smart_or_word_around_in_logical_lines(end, &end_lines)
+                }
+                SelectionMode::Line => {
+                    SelectionRange::smart_or_line_around_in_logical_lines(end, &end_lines)
+                }
+                _ => anyhow::bail!("unsupported mode"),
+            };
+            range = range.extend_with(end_range);
+            if end_pick.is_some() {
+                pick = end_pick;
+            }
+        }
+    }
+
+    Ok(WordLineSelectionPayload { range, pick })
+}
+
+#[derive(Debug)]
+pub struct SelectionStartDeadline(pub futures::future::AbortHandle);
+
+impl Drop for SelectionStartDeadline {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A press whose displayed coordinates are known, but whose source is busy.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct PendingSelectionStart {
     pub frame: SelectionFrameStamp,
     pub coordinate: SelectionCoordinate,
@@ -272,9 +663,38 @@ pub struct PendingSelectionStart {
     pub released: bool,
     pub end: Option<(wezterm_term::input::ClickPosition, StableRowIndex)>,
     pub copy: Option<config::keyassignment::ClipboardCopyDestination>,
+    pub read: Option<Arc<parking_lot::Mutex<WordLineSelectionRead>>>,
+    pub deadline: std::time::Instant,
+    pub deadline_wake: Option<Arc<SelectionStartDeadline>>,
 }
 
 impl PendingSelectionStart {
+    pub fn new(
+        frame: SelectionFrameStamp,
+        coordinate: SelectionCoordinate,
+        mode: SelectionMode,
+        button: window::MousePress,
+    ) -> Self {
+        Self {
+            frame,
+            coordinate,
+            mode,
+            button,
+            paint_retries_remaining: 3,
+            released: false,
+            end: None,
+            copy: None,
+            read: None,
+            deadline: std::time::Instant::now() + WordLineSelectionRead::FIXED_DEADLINE,
+            deadline_wake: None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
     pub fn retain_endpoint(
         &mut self,
         frame: SelectionFrameStamp,
@@ -301,7 +721,7 @@ impl PendingSelectionStart {
 
     /// Defer a busy/unpresented frame and retire obsolete pixel coordinates.
     pub fn resolve(
-        self,
+        &self,
         current: Option<SelectionFrameStamp>,
         frames: &SelectionFrameState,
     ) -> PendingSelectionResolution {
@@ -1468,12 +1888,16 @@ mod tests {
             released: false,
             end: None,
             copy: None,
+            read: None,
+            deadline: std::time::Instant::now() + WordLineSelectionRead::FIXED_DEADLINE,
+            deadline_wake: None,
         };
-        let mut retries = pending;
+        let mut retries = pending.clone();
         for _ in 0..3 {
             assert!(retries.take_paint_retry());
         }
         assert!(!retries.take_paint_retry());
+        assert!(!pending.is_expired());
         assert!(matches!(
             pending.resolve(None, &state),
             PendingSelectionResolution::Wait
@@ -1494,7 +1918,7 @@ mod tests {
         // No motion event arrived while the source was busy. The release
         // position itself must become the final endpoint, even if release was
         // marked before coordinate conversion in the native event handler.
-        let mut released = pending;
+        let mut released = pending.clone();
         released.released = true;
         released.retain_endpoint(
             frame,
@@ -2050,5 +2474,208 @@ mod tests {
         );
         assert_eq!(pick, None);
         assert_eq!(range_smart, range);
+    }
+
+    #[test]
+    fn process_hydrated_word_selection_single_char_and_multiline_unicode() {
+        let size = wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 384,
+        };
+        let mut term = wezterm_term::Terminal::new(
+            size,
+            std::sync::Arc::new(NativeAnchorTestConfig),
+            "selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        term.advance_bytes(b"hello a https://example.com/\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e world\r\nsecond line\r\n");
+
+        let requested = 0..2;
+        let plan = term.screen().capture_line_read(requested.clone()).unwrap();
+        let plans = Ok(vec![plan]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // 1. Single character word "a" at col 6, row 0: MUST be preserved, not rejected
+        let a_coord = SelectionCoordinate::x_y(6, 0);
+        let payload_a = process_hydrated_word_line_selection(
+            &plans,
+            std::slice::from_ref(&requested),
+            SelectionMode::Word,
+            a_coord,
+            None,
+            &cancelled,
+        )
+        .expect("single character word selection must succeed");
+
+        assert_eq!(payload_a.range.start, SelectionCoordinate::x_y(6, 0));
+        assert_eq!(payload_a.range.end, SelectionCoordinate::x_y(6, 0));
+        assert_eq!(payload_a.pick, None);
+
+        // 2. Multiline Unicode URL: smart pick matches full Japanese URL
+        let url_coord = SelectionCoordinate::x_y(10, 0);
+        let payload_url = process_hydrated_word_line_selection(
+            &plans,
+            std::slice::from_ref(&requested),
+            SelectionMode::Word,
+            url_coord,
+            None,
+            &cancelled,
+        )
+        .expect("smart URL with Unicode characters must match");
+
+        let pick = payload_url.pick.expect("should match URL pattern");
+        assert_eq!(pick.kind, SelectionPatternKind::Url);
+        assert_eq!(pick.text, "https://example.com/日本語");
+        assert_eq!(payload_url.range.start, SelectionCoordinate::x_y(8, 0));
+        // URL is 20 ASCII chars + 3 CJK double-width (6 cols) = 26 cols total.
+        // Starts at 8 -> ends at 8 + 26 - 1 = 33
+        assert_eq!(payload_url.range.end, SelectionCoordinate::x_y(33, 0));
+
+        // 3. Line mode (triple click) on row 1
+        let line_coord = SelectionCoordinate::x_y(3, 1);
+        let payload_line = process_hydrated_word_line_selection(
+            &plans,
+            std::slice::from_ref(&requested),
+            SelectionMode::Line,
+            line_coord,
+            None,
+            &cancelled,
+        )
+        .expect("line selection must succeed");
+        assert_eq!(payload_line.range.start, SelectionCoordinate::x_y(0, 1));
+        assert_eq!(
+            payload_line.range.end,
+            SelectionCoordinate::x_y(usize::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn process_hydrated_word_line_selection_declines_truncation_and_cancellation() {
+        let size = wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 10,
+            dpi: 96,
+            pixel_width: 80,
+            pixel_height: 384,
+        };
+        let mut term = wezterm_term::Terminal::new(
+            size,
+            std::sync::Arc::new(NativeAnchorTestConfig),
+            "selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // "0123456789wrappedline" wraps across 10-col boundary (rows 0 and 1)
+        term.advance_bytes(b"0123456789wrappedline\r\n");
+
+        // 1. Cancellation halts processing immediately
+        let requested_full = 0..2;
+        let plan_full = term
+            .screen()
+            .capture_line_read(requested_full.clone())
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let cancel_res = process_hydrated_word_line_selection(
+            &Ok(vec![plan_full]),
+            std::slice::from_ref(&requested_full),
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(2, 0),
+            None,
+            &cancelled,
+        );
+        assert!(cancel_res.is_err(), "cancelled read must return error");
+
+        // 2. Forward truncation: snapshot covers only row 0, but line wraps into row 1
+        let requested_fwd = 0..1;
+        let plan_fwd = term
+            .screen()
+            .capture_line_read(requested_fwd.clone())
+            .unwrap();
+        let not_cancelled = Arc::new(AtomicBool::new(false));
+        let fwd_res = process_hydrated_word_line_selection(
+            &Ok(vec![plan_fwd]),
+            std::slice::from_ref(&requested_fwd),
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(2, 0),
+            None,
+            &not_cancelled,
+        );
+        assert!(
+            fwd_res.is_err(),
+            "forward truncated snapshot must be declined without fake fallback"
+        );
+
+        // 3. Backward truncation: snapshot requested covers row 1, but row 1 wrapped from row 0
+        let requested_back = 1..2;
+        let plan_back = term
+            .screen()
+            .capture_line_read(requested_back.clone())
+            .unwrap();
+        let back_res = process_hydrated_word_line_selection(
+            &Ok(vec![plan_back]),
+            std::slice::from_ref(&requested_back),
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(2, 1),
+            None,
+            &not_cancelled,
+        );
+        assert!(
+            back_res.is_err(),
+            "backward truncated snapshot must be declined without fake fallback"
+        );
+    }
+
+    #[test]
+    fn process_hydrated_word_selection_independent_bounded_endpoints() {
+        let size = wezterm_term::TerminalSize {
+            rows: 100,
+            cols: 80,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 1600,
+        };
+        let mut term = wezterm_term::Terminal::new(
+            size,
+            std::sync::Arc::new(NativeAnchorTestConfig),
+            "selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        // Write text at top and bottom
+        let mut text = String::from("alpha_start beta\r\n");
+        for _ in 0..70 {
+            text.push_str("filler line\r\n");
+        }
+        text.push_str("gamma omega_end\r\n");
+        term.advance_bytes(text.as_bytes());
+
+        let req0 = 0..5;
+        let req1 = 70..75;
+        let plan0 = term.screen().capture_line_read(req0.clone()).unwrap();
+        let plan1 = term.screen().capture_line_read(req1.clone()).unwrap();
+
+        let plans = Ok(vec![plan0, plan1]);
+        let requested_ranges = vec![req0, req1];
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let start_coord = SelectionCoordinate::x_y(2, 0); // "alpha_start"
+        let end_coord = SelectionCoordinate::x_y(8, 71); // "omega_end"
+
+        let payload = process_hydrated_word_line_selection(
+            &plans,
+            &requested_ranges,
+            SelectionMode::Word,
+            start_coord,
+            Some(end_coord),
+            &cancelled,
+        )
+        .expect("independent bounded endpoint selection must succeed");
+
+        assert_eq!(payload.range.start, SelectionCoordinate::x_y(0, 0));
+        assert_eq!(payload.range.end, SelectionCoordinate::x_y(14, 71));
     }
 }

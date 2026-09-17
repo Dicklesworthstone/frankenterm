@@ -1,6 +1,6 @@
 use crate::selection::{
     Selection, SelectionAuthority, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX,
-    SmartSelectionPick,
+    SmartSelectionPick, WordLineSelectionRead,
 };
 use crate::smart_selection_a11y::emit_smart_selection_pick;
 use mux::pane::{LogicalLine, Pane, PaneId};
@@ -354,6 +354,96 @@ impl super::TermWindow {
                                 );
                             }
                         })));
+                    },
+                    registration,
+                )
+                .await;
+            })
+            .detach();
+        Ok(())
+    }
+
+    /// Gesture start ownership must expire even when a hidden, obscured, or
+    /// quiet surface never presents another frame. One cancellable wake belongs
+    /// to each pending selection start. Paced retries wake the UI if publication
+    /// was deferred by transient terminal lock contention.
+    fn arm_selection_start_deadline(
+        &self,
+        pane_id: PaneId,
+        pending: &mut crate::selection::PendingSelectionStart,
+    ) -> Result<(), &'static str> {
+        if pending.deadline_wake.is_some() {
+            return Ok(());
+        }
+        let window = self
+            .window
+            .clone()
+            .ok_or("The window closed before selection could complete.")?;
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            _ => {
+                return Err("The selection deadline could not be scheduled. Select again.");
+            }
+        };
+        let deadline = pending.deadline;
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        pending.deadline_wake = Some(Arc::new(crate::selection::SelectionStartDeadline(abort)));
+        reservation
+            .spawn_local(async move {
+                let _ = futures::future::Abortable::new(
+                    async move {
+                        let mut backoff = std::time::Duration::from_millis(20);
+                        loop {
+                            let now = std::time::Instant::now();
+                            if now >= deadline {
+                                window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+                                    let mut state = tw.pane_state(pane_id);
+                                    if state
+                                        .pending_selection_start
+                                        .as_ref()
+                                        .is_some_and(|p| p.deadline == deadline)
+                                    {
+                                        state.pending_selection_start = None;
+                                        drop(state);
+                                        if let Some(window) = tw.window.as_ref() {
+                                            window.invalidate();
+                                        }
+                                    }
+                                })));
+                                break;
+                            }
+                            let sleep_dur = backoff.min(deadline.saturating_duration_since(now));
+                            promise::spawn::sleep(sleep_dur).await;
+                            backoff = (backoff * 3 / 2).min(std::time::Duration::from_millis(50));
+
+                            window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+                                let is_pending = tw
+                                    .pane_state(pane_id)
+                                    .pending_selection_start
+                                    .as_ref()
+                                    .is_some_and(|p| p.deadline == deadline);
+                                if !is_pending {
+                                    return;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    let mut state = tw.pane_state(pane_id);
+                                    state.pending_selection_start = None;
+                                    drop(state);
+                                    if let Some(window) = tw.window.as_ref() {
+                                        window.invalidate();
+                                    }
+                                    return;
+                                }
+                                if let Some(pane) =
+                                    mux::Mux::try_get().and_then(|m| m.get_pane(pane_id))
+                                {
+                                    tw.retry_pending_selection_start(&pane);
+                                }
+                            })));
+                        }
                     },
                     registration,
                 )
@@ -990,6 +1080,19 @@ impl super::TermWindow {
     ) -> bool {
         // Even a deferred first motion is a drag, not a hyperlink click.
         self.pane_state(pane.pane_id()).suppress_selection_link = true;
+
+        if let Some((_auth, pos, row)) = retained {
+            let mut state = self.pane_state(pane.pane_id());
+            if let Some(pending) = state.pending_selection_start.as_mut() {
+                if let Some(frame) = state
+                    .mouse_selection_frame
+                    .or_else(|| self.selection_frame_stamp(pane))
+                {
+                    pending.retain_endpoint(frame, pos, row, None);
+                }
+            }
+        }
+
         let had_pending_start = self
             .pane_state(pane.pane_id())
             .pending_selection_start
@@ -1024,6 +1127,56 @@ impl super::TermWindow {
             self.clear_selection(pane);
             return false;
         }
+
+        if (mode == SelectionMode::Word || mode == SelectionMode::Line)
+            && pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
+        {
+            let Some((_authority, _sequence, _dims)) = current_source else {
+                return false;
+            };
+            let (position, y) = match retained
+                .map(|(_, position, row)| (position, row))
+                .or_else(|| self.pane_state(pane.pane_id()).mouse_terminal_coords)
+            {
+                Some(coords) => coords,
+                None => return false,
+            };
+
+            let mut state = self.pane_state(pane.pane_id());
+            let frame = state
+                .mouse_selection_frame
+                .or_else(|| self.selection_frame_stamp(pane));
+            let button = self
+                .active_selection_drag_button
+                .unwrap_or(window::MousePress::Left);
+
+            if let Some(pending) = state.pending_selection_start.as_mut() {
+                if let Some(f) = frame {
+                    pending.retain_endpoint(f, position, y, None);
+                }
+            } else if let Some(frame) = frame {
+                let anchor = desired
+                    .origin
+                    .unwrap_or_else(|| SelectionCoordinate::x_y(position.column, y));
+                let mut pending =
+                    crate::selection::PendingSelectionStart::new(frame, anchor, mode, button);
+                pending.retain_endpoint(frame, position, y, None);
+                if self
+                    .arm_selection_start_deadline(pane.pane_id(), &mut pending)
+                    .is_ok()
+                {
+                    state.pending_selection_start = Some(pending);
+                } else {
+                    state.pending_selection_start = None;
+                }
+            }
+
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+            return false;
+        }
+
         if !desired.is_authorized_by(current)
             || retained
                 .map(|r| r.0)
@@ -1041,17 +1194,18 @@ impl super::TermWindow {
                     self.active_selection_drag_button,
                 ) {
                     if desired.authority == Some(frame.authority) {
-                        state.pending_selection_start =
-                            Some(crate::selection::PendingSelectionStart {
-                                frame,
-                                coordinate,
-                                mode,
-                                button,
-                                paint_retries_remaining: 3,
-                                released: false,
-                                end: Some(end),
-                                copy: None,
-                            });
+                        let mut p = crate::selection::PendingSelectionStart::new(
+                            frame, coordinate, mode, button,
+                        );
+                        p.end = Some(end);
+                        if self
+                            .arm_selection_start_deadline(pane.pane_id(), &mut p)
+                            .is_ok()
+                        {
+                            state.pending_selection_start = Some(p);
+                        } else {
+                            state.pending_selection_start = None;
+                        }
                     }
                 }
             }
@@ -1216,21 +1370,25 @@ impl super::TermWindow {
                     .zip(state.mouse_terminal_coords)
                     .zip(self.active_selection_drag_button)
                     .map(|((frame, (position, row)), button)| {
-                        crate::selection::PendingSelectionStart {
+                        crate::selection::PendingSelectionStart::new(
                             frame,
-                            coordinate: SelectionCoordinate::x_y(position.column, row),
+                            SelectionCoordinate::x_y(position.column, row),
                             mode,
                             button,
-                            paint_retries_remaining: 3,
-                            released: false,
-                            end: None,
-                            copy: None,
-                        }
+                        )
                     })
             };
             self.selection(pane.pane_id()).clear();
             let mut state = self.pane_state(pane.pane_id());
             state.pending_selection_start = pending;
+            if let Some(p) = state.pending_selection_start.as_mut() {
+                if self
+                    .arm_selection_start_deadline(pane.pane_id(), p)
+                    .is_err()
+                {
+                    state.pending_selection_start = None;
+                }
+            }
             state.suppress_selection_link = true;
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
@@ -1239,9 +1397,17 @@ impl super::TermWindow {
     }
 
     pub fn retry_pending_selection_start(&mut self, pane: &Arc<dyn Pane>) {
-        let Some(pending) = self.pane_state(pane.pane_id()).pending_selection_start else {
+        let Some(pending) = self
+            .pane_state(pane.pane_id())
+            .pending_selection_start
+            .clone()
+        else {
             return;
         };
+        if pending.is_expired() {
+            self.clear_selection(pane);
+            return;
+        }
         if !pending.released
             && (self.active_selection_drag_pane != Some(pane.pane_id())
                 || self.active_selection_drag_button != Some(pending.button)
@@ -1260,6 +1426,187 @@ impl super::TermWindow {
                 return;
             }
         };
+
+        if (pending.mode == SelectionMode::Word || pending.mode == SelectionMode::Line)
+            && pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
+        {
+            let Some((authority, sequence, dimensions)) =
+                SelectionAuthority::capture_source(&**pane)
+            else {
+                return;
+            };
+            if authority != pending.frame.authority {
+                self.clear_selection(pane);
+                return;
+            }
+
+            let current_end = pending
+                .end
+                .map(|(pos, row)| SelectionCoordinate::x_y(pos.column, row));
+
+            if pending.read.is_none() {
+                let window = self.window.clone();
+                let wake = move || {
+                    if let Some(w) = window {
+                        w.invalidate();
+                    }
+                };
+                match WordLineSelectionRead::start(
+                    pane,
+                    authority,
+                    sequence,
+                    pending.mode,
+                    pending.coordinate,
+                    current_end,
+                    pending.deadline,
+                    wake,
+                ) {
+                    Ok(Some(read)) => {
+                        let mut state = self.pane_state(pane.pane_id());
+                        if let Some(p) = state.pending_selection_start.as_mut() {
+                            if self
+                                .arm_selection_start_deadline(pane.pane_id(), p)
+                                .is_err()
+                            {
+                                p.read = None;
+                                state.pending_selection_start = None;
+                                drop(state);
+                                self.clear_selection(pane);
+                                return;
+                            }
+                            p.read = Some(Arc::new(parking_lot::Mutex::new(read)));
+                        } else {
+                            drop(read);
+                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        // Permit pool busy or capture deferred; keep pending to retry
+                        return;
+                    }
+                    Err(_) => {
+                        self.clear_selection(pane);
+                        return;
+                    }
+                }
+            }
+
+            let read_arc = pending.read.clone().unwrap();
+            let mut read_guard = read_arc.lock();
+
+            // 1. Check authority and sequence coherence
+            if read_guard.source_sequence() != sequence || read_guard.authority() != authority {
+                drop(read_guard);
+                self.clear_selection(pane);
+                return;
+            }
+
+            // 2. Check stale endpoint race during drag:
+            // If the user moved the mouse while the background worker was executing,
+            // the captured endpoint is obsolete. Drop the reader so it restarts
+            // with current_end within the original deadline.
+            if current_end != read_guard.end_coordinate()
+                || pending.coordinate != read_guard.coordinate()
+                || pending.mode != read_guard.mode()
+                || pending.deadline != read_guard.deadline()
+            {
+                drop(read_guard);
+                let mut state = self.pane_state(pane.pane_id());
+                if let Some(p) = state.pending_selection_start.as_mut() {
+                    p.read = None;
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+                return;
+            }
+
+            // 3. Poll worker readiness
+            match read_guard.poll_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Reader still executing on background worker
+                    return;
+                }
+                Err(_) => {
+                    drop(read_guard);
+                    self.clear_selection(pane);
+                    return;
+                }
+            }
+
+            // 4. Validate exact read plans via publish_line_reads_at_layout
+            let Some(plans) = read_guard.plans() else {
+                drop(read_guard);
+                self.clear_selection(pane);
+                return;
+            };
+
+            let mut published = false;
+            let ok = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+                published = true;
+            });
+
+            if !ok || !published {
+                if pending.is_expired() {
+                    drop(read_guard);
+                    self.clear_selection(pane);
+                    return;
+                }
+
+                // Distinguish transient Busy from genuine invalidation.
+                if let Some((current_auth, current_seq, current_dims)) =
+                    SelectionAuthority::capture_source(&**pane)
+                {
+                    if current_auth != pending.frame.authority
+                        || current_seq != sequence
+                        || !mux::renderable::same_line_layout_geometry(&current_dims, &dimensions)
+                    {
+                        drop(read_guard);
+                        self.clear_selection(pane);
+                        return;
+                    }
+                }
+
+                // Authority and sequence match or terminal is still locked (capture_source is None).
+                // Transient Busy: retain pending.read, plans, and pending endpoint.
+                // The paced deadline timer will retry publication until the fixed deadline.
+                drop(read_guard);
+                return;
+            }
+
+            // 5. Layout publication succeeded; now consume payload and retire worker
+            let payload = match read_guard.take_payload() {
+                Ok(payload) => payload,
+                Err(_) => {
+                    drop(read_guard);
+                    self.clear_selection(pane);
+                    return;
+                }
+            };
+            drop(read_guard);
+
+            // 6. Commit candidate selection
+            self.pane_state(pane.pane_id()).pending_selection_start = None;
+            let mut desired = Selection::default();
+            desired.origin = Some(pending.coordinate);
+            desired.range = Some(payload.range);
+            desired.rectangular = false;
+            desired.seqno = sequence;
+            desired.authority = Some(authority);
+
+            announce_pick_if_smart(payload.pick);
+            self.commit_selection_candidate(pane, desired);
+
+            if let Some(destination) = pending.copy {
+                self.defer_pending_selection_copy(pane, destination);
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+            return;
+        }
+
         self.pane_state(pane.pane_id()).pending_selection_start = None;
         let SelectionX::Cell(x) = pending.coordinate.x else {
             return;
@@ -1320,6 +1667,13 @@ impl super::TermWindow {
         if Some(authority) != expected {
             self.clear_selection(pane);
             return true;
+        }
+        if (mode == SelectionMode::Word || mode == SelectionMode::Line)
+            && pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
+        {
+            // Defer word and line selection reads off the GUI thread to
+            // PendingSelectionStart with background WordLineSelectionRead.
+            return false;
         }
         let mut desired = Selection::default();
         match mode {
@@ -2460,5 +2814,381 @@ mod tests {
         }
 
         let _ = shared_smart_selection_recorder().take();
+    }
+
+    #[test]
+    fn word_line_selection_read_local_pane_async_resolution_and_fences() {
+        #[derive(Debug)]
+        struct TestConfig;
+        impl wezterm_term::TerminalConfiguration for TestConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 40,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 64,
+            },
+            Arc::new(TestConfig),
+            "word-line-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(
+            b"hello https://example.com/test world\r\nsecond row\r\nthird row\r\nfourth",
+        );
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_401,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_401,
+            [0x35; 16],
+            "word line test".to_owned(),
+        ));
+        struct ChildGuard(Arc<dyn Pane>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _child = ChildGuard(Arc::clone(&pane));
+
+        let (authority, sequence, _) = SelectionAuthority::capture_source(&*pane).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        // 1. Word mode async start and resolution: URL smart match
+        let (woke, wake) = sync_channel(1);
+        let mut read = WordLineSelectionRead::start(
+            &pane,
+            authority,
+            sequence,
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(10, 0), // within https://...
+            None,
+            deadline,
+            move || {
+                let _ = woke.send(());
+            },
+        )
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("wake must trigger");
+        let payload = read
+            .try_take_result()
+            .expect("read ok")
+            .expect("payload present");
+        assert_eq!(
+            payload.pick.as_ref().map(|p| p.kind),
+            Some(SelectionPatternKind::Url)
+        );
+        assert_eq!(
+            payload.pick.as_ref().map(|p| p.text.as_str()),
+            Some("https://example.com/test")
+        );
+        assert_eq!(payload.range.start, SelectionCoordinate::x_y(6, 0));
+        assert_eq!(payload.range.end, SelectionCoordinate::x_y(29, 0));
+        assert_eq!(read.end_coordinate(), None);
+        drop(read);
+
+        // 2. Line mode async start and resolution: triple click
+        let (woke_line, wake_line) = sync_channel(1);
+        let mut read_line = WordLineSelectionRead::start(
+            &pane,
+            authority,
+            sequence,
+            SelectionMode::Line,
+            SelectionCoordinate::x_y(2, 1),
+            None,
+            deadline,
+            move || {
+                let _ = woke_line.send(());
+            },
+        )
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake_line
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("wake must trigger");
+        let payload_line = read_line
+            .try_take_result()
+            .expect("read ok")
+            .expect("payload present");
+        assert_eq!(payload_line.range.start, SelectionCoordinate::x_y(0, 1));
+        assert_eq!(
+            payload_line.range.end,
+            SelectionCoordinate::x_y(usize::MAX, 1)
+        );
+        drop(read_line);
+
+        // 3. Independent endpoint contexts: start at row 0, retained end at row 2
+        let (woke_ext, wake_ext) = sync_channel(1);
+        let mut read_ext = WordLineSelectionRead::start(
+            &pane,
+            authority,
+            sequence,
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(1, 0),       // "hello"
+            Some(SelectionCoordinate::x_y(2, 2)), // "third"
+            deadline,
+            move || {
+                let _ = woke_ext.send(());
+            },
+        )
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake_ext
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("wake must trigger");
+        let payload_ext = read_ext
+            .try_take_result()
+            .expect("read ok")
+            .expect("payload present");
+        assert_eq!(payload_ext.range.start, SelectionCoordinate::x_y(0, 0));
+        assert_eq!(payload_ext.range.end, SelectionCoordinate::x_y(4, 2));
+        assert_eq!(
+            read_ext.end_coordinate(),
+            Some(SelectionCoordinate::x_y(2, 2))
+        );
+        drop(read_ext);
+
+        // 4. Source sequence fence & causal publication Busy retention:
+        let (woke_fence, wake_fence) = sync_channel(1);
+        let mut read_fence = WordLineSelectionRead::start(
+            &pane,
+            authority,
+            sequence,
+            SelectionMode::Word,
+            SelectionCoordinate::x_y(0, 0),
+            None,
+            deadline,
+            move || {
+                let _ = woke_fence.send(());
+            },
+        )
+        .expect("start must succeed")
+        .expect("permit must be acquired");
+
+        wake_fence
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("wake must trigger");
+        assert!(read_fence.poll_ready().expect("poll ok"));
+        let plans = read_fence.plans().expect("plans present");
+        let (_, _, dims) = SelectionAuthority::capture_source(&*pane).unwrap();
+
+        // 4a. Causal publication Busy test: hold real terminal lock during publication
+        struct BusyPublishRunner<'a> {
+            pane: &'a Arc<dyn Pane>,
+            plans: &'a [wezterm_term::screen::ScreenLineRead],
+            sequence: termwiz::surface::SequenceNo,
+            dims: mux::renderable::RenderableDimensions,
+            published: bool,
+            ok: bool,
+            ran: bool,
+        }
+        impl mux::pane::WithPaneLines for BusyPublishRunner<'_> {
+            fn with_lines_mut(
+                &mut self,
+                _first: wezterm_term::StableRowIndex,
+                _lines: &mut [&mut wezterm_term::Line],
+            ) {
+                let mut published = false;
+                let ok = self.pane.publish_line_reads_at_layout(
+                    self.plans,
+                    self.sequence,
+                    self.dims,
+                    &mut || {
+                        published = true;
+                    },
+                );
+                self.ok = ok;
+                self.published = published;
+                self.ran = true;
+                // Under terminal lock, capture_source must also observe busy (returns None)
+                assert!(SelectionAuthority::capture_source(&**self.pane).is_none());
+            }
+        }
+        let mut busy_publish = BusyPublishRunner {
+            pane: &pane,
+            plans,
+            sequence,
+            dims,
+            published: false,
+            ok: false,
+            ran: false,
+        };
+        pane.with_lines_mut(0..1, &mut busy_publish);
+        assert!(busy_publish.ran, "busy publication runner must execute");
+        assert!(
+            !busy_publish.ok,
+            "publication must fail on transient terminal lock Busy"
+        );
+        assert!(
+            !busy_publish.published,
+            "callback must not be invoked on Busy"
+        );
+
+        // 4b. Terminal lock is released: publication now succeeds exactly once
+        let mut published_after_release = false;
+        let ok_after_release =
+            pane.publish_line_reads_at_layout(plans, sequence, dims, &mut || {
+                published_after_release = true;
+            });
+        assert!(
+            ok_after_release,
+            "publication must succeed once terminal lock is released"
+        );
+        assert!(
+            published_after_release,
+            "publication callback must be invoked exactly once"
+        );
+
+        // Mutate actual pane output
+        pane.perform_actions(vec![termwiz::escape::Action::PrintString(
+            " MUTATED".into(),
+        )]);
+
+        let (new_authority, new_sequence, new_dims) =
+            SelectionAuthority::capture_source(&*pane).unwrap();
+        assert!(new_sequence > sequence);
+        assert_ne!(read_fence.source_sequence(), new_sequence);
+
+        // Publication MUST fail when validating stale plans / sequence
+        let mut published_after = false;
+        let ok_after = pane.publish_line_reads_at_layout(plans, sequence, new_dims, &mut || {
+            published_after = true;
+        });
+        assert!(
+            !ok_after,
+            "publication must fail on stale sequence after pane mutation"
+        );
+        assert!(
+            !published_after,
+            "publication callback must not be invoked on stale sequence"
+        );
+
+        // Publication MUST also fail even if caller passes new_sequence because content changed
+        let mut published_with_new_seq = false;
+        let ok_with_new_seq =
+            pane.publish_line_reads_at_layout(plans, new_sequence, new_dims, &mut || {
+                published_with_new_seq = true;
+            });
+        assert!(
+            !ok_with_new_seq,
+            "publication with modified screen content must be rejected"
+        );
+        assert!(!published_with_new_seq);
+
+        drop(read_fence);
+
+        // 5. Ensure permits are freed before testing Busy capture
+        fn await_permit() -> mux::pane::LineReadPermit {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(permit) = mux::pane::LineReadPermit::try_acquire() {
+                    return permit;
+                }
+                assert!(std::time::Instant::now() < deadline, "read permit leaked");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        drop(await_permit());
+
+        // 6. Real Busy capture test: terminal lock contention returns Ok(None) and retires partial plans off-thread
+        struct BusyTestRunner<'a> {
+            pane: &'a Arc<dyn Pane>,
+            authority: SelectionAuthority,
+            sequence: termwiz::surface::SequenceNo,
+            deadline: std::time::Instant,
+            ran: bool,
+        }
+        impl mux::pane::WithPaneLines for BusyTestRunner<'_> {
+            fn with_lines_mut(
+                &mut self,
+                _first: wezterm_term::StableRowIndex,
+                _lines: &mut [&mut wezterm_term::Line],
+            ) {
+                let busy_read = WordLineSelectionRead::start(
+                    self.pane,
+                    self.authority,
+                    self.sequence,
+                    SelectionMode::Word,
+                    SelectionCoordinate::x_y(0, 0),
+                    Some(SelectionCoordinate::x_y(10, 2)),
+                    self.deadline,
+                    || {},
+                );
+                assert!(
+                    matches!(busy_read, Ok(None)),
+                    "capture under terminal lock contention must yield Ok(None)"
+                );
+                self.ran = true;
+            }
+        }
+        let mut runner = BusyTestRunner {
+            pane: &pane,
+            authority: new_authority,
+            sequence: new_sequence,
+            deadline,
+            ran: false,
+        };
+        pane.with_lines_mut(0..1, &mut runner);
+        assert!(runner.ran, "busy capture test must run under terminal lock");
+
+        // 7. Released endpoint test: endpoint locked upon release and ignores later drag motion
+        let frame = crate::selection::SelectionFrameStamp {
+            authority: new_authority,
+            source_sequence: new_sequence,
+            viewport: 0,
+            geometry: [0; 12],
+        };
+        let anchor = SelectionCoordinate::x_y(1, 0);
+        let mut pending = crate::selection::PendingSelectionStart::new(
+            frame,
+            anchor,
+            SelectionMode::Word,
+            window::MousePress::Left,
+        );
+        let release_pos = wezterm_term::input::ClickPosition {
+            column: 15,
+            row: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        };
+        pending.retain_endpoint(frame, release_pos, 0, Some(window::MousePress::Left));
+        assert!(pending.released);
+        assert_eq!(pending.end.unwrap().0.column, 15);
+        assert_eq!(pending.end.unwrap().1, 0);
+
+        // Further motion after release MUST be ignored
+        let post_release_pos = wezterm_term::input::ClickPosition {
+            column: 30,
+            row: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        };
+        pending.retain_endpoint(frame, post_release_pos, 0, None);
+        assert_eq!(
+            pending.end.unwrap().0.column,
+            15,
+            "motion after release must be ignored"
+        );
     }
 }
