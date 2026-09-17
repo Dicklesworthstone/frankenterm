@@ -1222,8 +1222,24 @@ power loss nor migration of those live sessions has been demonstrated.
 - [x] Reuse that exact row-validation helper during LocalPane anchor capture,
   removing its duplicate full-span pointer allocation when output intervenes.
   Preserve source, geometry, retention and selected-row mutation checks.
-- [ ] Execute the existing LocalPane native-selection capture regressions
-  against this helper reuse; the earlier term-only receipt is insufficient.
+- [x] Execute the existing LocalPane native-selection capture regressions
+  against this helper reuse at `1ee43344b`: strict epoch-qualified RCH
+  `j-30023605353972116`, two passed, zero failed, 1197 filtered;
+  retain `1ee4334-mux-native-selection-epoch-rch.log`.
+- [x] Remove blocking metadata reads from cell selection entrypoints in
+  `1ee43344b`; retain pending starts and released endpoints on Busy.
+  Independent source review and 34 GUI selection tests pass.
+- [ ] Prove those entrypoints under contention through a real native window;
+  semantic, word and overlay blocking-read paths remain tracked in `ft-w57v2`.
+- [x] Reduce fresh-process proof debug symbols through committed
+  `test-recovery` profile in `c8e69eb11`, preserving unwinding and assertions.
+  Earlier full-symbol compile was killed with SIGKILL; no OOM cause confirmed.
+- [ ] Complete fresh-process execution with its required same-source sealed
+  guardian companion. The `c8e69eb11` parent compiled and ran one test, then
+  failed because its invocation omitted `FT_GUARDIAN_TEST_EXECUTABLE`.
+  Build the companion with the same sealed identity/profile before retrying.
+- [x] Fix the remaining guardian alias visibility Clippy error in `d6bdb5ac7`;
+  the repeated workspace Clippy result is still pending.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier
   419-test surface receipt and terminal oracle corrections.
