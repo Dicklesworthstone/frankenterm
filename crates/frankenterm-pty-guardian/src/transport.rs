@@ -6233,6 +6233,11 @@ mod tests {
     }
 
     fn assert_rotation_output_replayed(client: &mut GuardianClient, pane: Uuid, marker: &[u8]) {
+        use mux::guardian_protocol::{
+            GuardianCheckpointOutputBoundaryV1, GuardianReplayPageBodyDelivery,
+            GuardianReplaySelectorV1,
+        };
+
         let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
         loop {
             let mut request = GuardianReplayRequestV1::Open {
