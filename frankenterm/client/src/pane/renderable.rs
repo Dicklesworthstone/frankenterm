@@ -3460,7 +3460,7 @@ impl RenderableState {
                 inner
                     .selection_row_sequences
                     .peek(&row)
-                    .is_some_and(|revision| *revision > selected_sequence)
+                    .is_some_and(|revision| *revision == SEQ_ZERO || *revision > selected_sequence)
             }) {
                 return Err(SelectionReadError::SourceChanged);
             }
@@ -3538,7 +3538,7 @@ impl RenderableState {
         let mut changed = RangeSet::new();
         // Work is bounded by cache capacity, not the selected history length.
         for (row, revision) in inner.selection_row_sequences.iter() {
-            if rows.contains(row) && *revision > sequence {
+            if rows.contains(row) && (*revision == SEQ_ZERO || *revision > sequence) {
                 changed.add(*row);
             }
         }
@@ -4102,6 +4102,59 @@ mod tests {
             state.selection_copy_snapshot(layout, 7, 0..1, &mut witness),
             Err(super::super::SelectionReadError::SourceChanged)
         ));
+    }
+
+    #[test]
+    fn selection_copy_rejects_unknown_server_revision_before_and_after_witness() {
+        use super::super::SelectionReadError;
+        for witness_first in [false, true] {
+            let renderable = test_renderable_state();
+            let state = renderable.lock();
+            state.inner.borrow_mut().seqno = 12;
+            let (layout, _, _, _) = state.selection_source_snapshot().unwrap();
+            let mut witness = None;
+            if witness_first {
+                state
+                    .selection_copy_snapshot(layout, 7, 0..1, &mut witness)
+                    .unwrap();
+            }
+            {
+                let mut inner = state.inner.borrow_mut();
+                let fetch = FetchToken::new(Instant::now());
+                inner.lines.put(0, LineEntry::Fetching(fetch.clone()));
+                assert!(inner.put_line(
+                    0,
+                    Line::from_text(
+                        "unknown revision",
+                        &CellAttributes::default(),
+                        SEQ_ZERO,
+                        None
+                    ),
+                    Some(&fetch)
+                ));
+                assert_eq!(
+                    fresh_cached_line(inner.lines.peek(&0))
+                        .unwrap()
+                        .current_seqno(),
+                    12,
+                    "fetch paint damage must not become content authority"
+                );
+            }
+            let snapshot = state.selection_copy_snapshot(layout, 7, 0..1, &mut witness);
+            if witness_first {
+                assert!(matches!(snapshot, Err(SelectionReadError::SourceChanged)));
+            } else {
+                snapshot.unwrap();
+            }
+            assert!(matches!(
+                state.selection_lines(layout, 12, 7, 0..1),
+                Err(SelectionReadError::SourceChanged)
+            ));
+            assert!(state
+                .selection_changed_since(layout, 7, 0..1)
+                .unwrap()
+                .contains(0));
+        }
     }
 
     #[test]
