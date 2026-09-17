@@ -743,6 +743,7 @@ fn determinism_report_identical() {
         let c = ctx();
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         for i in 0..10 {
+            let started = Instant::now();
             ml.evaluate(
                 (i + 1) * 30_000,
                 MissionTrigger::CadenceTick,
@@ -750,9 +751,25 @@ fn determinism_report_identical() {
                 &agents,
                 &c,
             );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(u128::from(ml.latest_metrics().unwrap().evaluation_latency_ms) <= elapsed_ms);
         }
         let report = ml.generate_operator_report(Some(&elog()), None);
-        serde_json::to_value(&report).unwrap()
+        let history = &ml.state().metrics_history;
+        let expected_latency = history
+            .iter()
+            .map(|sample| sample.evaluation_latency_ms as f64)
+            .sum::<f64>()
+            / history.len() as f64;
+        let mut serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["health"]
+                .as_object_mut()
+                .unwrap()
+                .remove("avg_evaluation_latency_ms"),
+            Some(serde_json::json!(expected_latency))
+        );
+        serialized
     };
 
     assert_eq!(run(), run());
@@ -766,6 +783,7 @@ fn determinism_metrics_history_identical() {
         let c = ctx();
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         for i in 0..10 {
+            let started = Instant::now();
             ml.evaluate(
                 (i + 1) * 30_000,
                 MissionTrigger::CadenceTick,
@@ -773,11 +791,25 @@ fn determinism_metrics_history_identical() {
                 &agents,
                 &c,
             );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(u128::from(ml.latest_metrics().unwrap().evaluation_latency_ms) <= elapsed_ms);
         }
         ml.state()
             .metrics_history
             .iter()
-            .map(|s| serde_json::to_value(s).unwrap())
+            .map(|sample| {
+                let mut serialized = serde_json::to_value(sample).unwrap();
+                // Validate the measured field before excluding only that
+                // independent physical-clock input from decision comparison.
+                assert_eq!(
+                    serialized
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("evaluation_latency_ms"),
+                    Some(serde_json::json!(sample.evaluation_latency_ms))
+                );
+                serialized
+            })
             .collect::<Vec<serde_json::Value>>()
     };
 
