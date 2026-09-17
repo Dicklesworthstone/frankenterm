@@ -1849,7 +1849,7 @@ impl ClientInner {
         })
     }
 
-    fn should_forward_local_metadata(&self) -> bool {
+    pub(crate) fn should_forward_local_metadata(&self) -> bool {
         let inner_key = self as *const Self as usize;
         REMOTE_METADATA_APPLICATION_DEPTHS
             .try_with(|depths| {

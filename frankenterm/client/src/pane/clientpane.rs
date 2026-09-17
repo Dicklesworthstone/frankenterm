@@ -3815,6 +3815,15 @@ impl ClientPane {
         size: TerminalSize,
         expected: Option<(u64, &RpcGenerationScope)>,
     ) -> anyhow::Result<()> {
+        // Installing an observed remote tree runs the mux's ordinary resize
+        // callbacks. That observation is not a new user resize command: a
+        // delayed listing may predate an already admitted font/window resize.
+        // Echoing it would undo the newer geometry on the server. Keep both
+        // the optimistic render geometry and any pending delivery identity;
+        // authoritative render applications reconcile the displayed state.
+        if !self.client.should_forward_local_metadata() {
+            return Ok(());
+        }
         let rpc = self.client.client.rpc_scope();
         if expected.is_some_and(|(_, ready)| !ready.same_generation(&rpc)) {
             return Ok(());
