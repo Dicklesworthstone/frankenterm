@@ -11,6 +11,10 @@
 //! intervals use CLOCK_MONOTONIC; the sampler must explicitly use the same clock.
 //! Instrumented timings must not be mixed into the ordinary latency baseline.
 
+// The nested Cx-aware timeout and transport futures require the same trait
+// solver depth as frankenterm-core when Clippy verifies their Send bounds.
+#![recursion_limit = "256"]
+
 #[cfg(not(all(unix, feature = "vendored")))]
 fn main() {
     eprintln!("remote_mux_resize_profile requires Unix and --features vendored");
