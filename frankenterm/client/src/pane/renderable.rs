@@ -4099,7 +4099,7 @@ mod tests {
         other.lock().inner.borrow_mut().seqno = 7;
         let (layout, _, _, _) = state.selection_source_snapshot().unwrap();
         let mut witnesses = Vec::new();
-        for _ in 0..MAX_SELECTION_READ_WITNESSES {
+        for _ in 0..super::MAX_SELECTION_READ_WITNESSES {
             let mut witness = None;
             state
                 .selection_copy_snapshot(layout, 7, 0..1, &mut witness)

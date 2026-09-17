@@ -382,7 +382,7 @@ pub enum LegacyTerminalCaptureError {
 
 enum LocalPaneOwnership {
     LegacyMuxOwned,
-    Guardian(GuardianPaneOwnership),
+    Guardian(Box<GuardianPaneOwnership>),
 }
 
 impl LocalPaneOwnership {
@@ -391,12 +391,12 @@ impl LocalPaneOwnership {
         control: Arc<dyn GuardianPaneLeaseControl>,
         spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
     ) -> Self {
-        Self::Guardian(GuardianPaneOwnership {
+        Self::Guardian(Box::new(GuardianPaneOwnership {
             identity,
             spawn_custody,
             control,
             disposition: Mutex::new(GuardianLeaseDisposition::Attached),
-        })
+        }))
     }
 
     /// Return true when guardian ownership handled the explicit close path.
