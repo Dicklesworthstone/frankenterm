@@ -7764,12 +7764,15 @@ mod tests {
                 "foreign page must fail before acknowledgement"
             );
         }
-        for expected_size in [
-            size(25, 80),
-            PtySize {
-                pixel_width: 641,
-                ..size(24, 80)
-            },
+        for (expected_size, pixel_mismatch) in [
+            (size(25, 80), false),
+            (
+                PtySize {
+                    pixel_width: 641,
+                    ..size(24, 80)
+                },
+                true,
+            ),
         ] {
             let (descriptor, checkpoint) = genesis_checkpoint_fixture();
             let state = Arc::new(Mutex::new(FakeReplayState {
@@ -7780,16 +7783,30 @@ mod tests {
                 acks: Vec::new(),
             }));
             let mut transport = FakeReplayTransport { state };
-            assert!(matches!(
-                consume_one_guardian_replay_snapshot(
-                    &mut transport,
-                    identity(),
-                    expected_size,
-                    test_terminal_config(),
-                    TerminalCheckpointLimits::default()
-                ),
-                Err(GuardianProxyError::ReplayInvariant(_))
-            ));
+            let error = consume_one_guardian_replay_snapshot(
+                &mut transport,
+                identity(),
+                expected_size,
+                test_terminal_config(),
+                TerminalCheckpointLimits::default(),
+            )
+            .expect_err("mismatched genesis geometry cannot activate");
+            if pixel_mismatch {
+                let GuardianProxyError::RestoredModel(source) = error else {
+                    panic!("pixel mismatch did not reach model validation: {error:?}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    "checkpoint pixel geometry does not match the claimed topology manifest"
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    GuardianProxyError::ReplayInvariant(
+                        "checkpoint geometry does not match the claimed topology manifest"
+                    )
+                ));
+            }
         }
         let (descriptor, checkpoint) = genesis_checkpoint_fixture();
         let mut pages = checkpoint_and_complete_pages(descriptor, checkpoint);
@@ -7969,9 +7986,12 @@ mod tests {
             limits,
         )
         .expect_err("pixel geometry drift cannot become a live terminal");
-        assert!(
-            format!("{error:#}")
-                .contains("checkpoint pixel geometry does not match the claimed topology manifest")
+        let GuardianProxyError::RestoredModel(source) = error else {
+            panic!("pixel mismatch did not reach model validation: {error:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "checkpoint pixel geometry does not match the claimed topology manifest"
         );
     }
 
