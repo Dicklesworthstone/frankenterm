@@ -1149,7 +1149,9 @@ impl RenderableInner {
                 || retained_end.is_none_or(|end| witness.rows.end > end)
                 || (delta.seqno > witness.selected_sequence
                     && delta.dirty_lines.iter().any(|range| {
-                        range.start < witness.rows.end && witness.rows.start < range.end
+                        range.start < range.end
+                            && range.start < witness.rows.end
+                            && witness.rows.start < range.end
                     }))
             {
                 witness.invalid.store(true, Ordering::Relaxed);
@@ -4033,6 +4035,19 @@ mod tests {
             "next"
         );
         delta.seqno = 9;
+        delta.dirty_lines = std::iter::once(64..64).collect();
+        assert!(state
+            .inner
+            .borrow_mut()
+            .apply_changes_to_surface(delta.clone(), Vec::new()));
+        assert_eq!(
+            state
+                .selection_copy_snapshot(layout, 7, 0..128, &mut witness)
+                .unwrap()
+                .0,
+            9
+        );
+        delta.seqno = 10;
         delta.dirty_lines = std::iter::once(0..1).collect();
         assert!(state
             .inner
