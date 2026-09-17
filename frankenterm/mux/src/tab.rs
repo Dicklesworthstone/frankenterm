@@ -49,6 +49,7 @@ pub struct TabStackEntry {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TabStackError {
     EmptyStack,
+    DuplicateStack(TabStackId),
     DuplicateTab(TabId),
     TabAlreadyStacked { tab_id: TabId, stack_id: TabStackId },
     MissingStack(TabStackId),
@@ -148,6 +149,9 @@ impl TabStackState {
     ) -> Result<(), TabStackError> {
         if tabs.is_empty() {
             return Err(TabStackError::EmptyStack);
+        }
+        if self.stacks.contains_key(&stack_id) {
+            return Err(TabStackError::DuplicateStack(stack_id));
         }
 
         let mut seen = HashSet::new();
@@ -369,6 +373,7 @@ struct TabInner {
 pub struct Tab {
     inner: Mutex<TabInner>,
     tab_id: TabId,
+    durable_id: uuid::Uuid,
     mux_owner_generation: AtomicU64,
 }
 
@@ -4725,8 +4730,15 @@ impl Tab {
         Self {
             inner: Mutex::new(inner),
             tab_id,
+            durable_id: uuid::Uuid::new_v4(),
             mux_owner_generation: AtomicU64::new(0),
         }
+    }
+
+    /// Immutable identity written into recovery images, independent of the
+    /// process-local tab number. Persistence occurs at the capture boundary.
+    pub const fn durable_id(&self) -> uuid::Uuid {
+        self.durable_id
     }
 
     /// Bind a successful serialized tab registration to one exact mux.
@@ -5410,6 +5422,7 @@ impl Tab {
 
             return Ok(MuxCapturedTab {
                 tab_id: self.tab_id,
+                durable_tab_id: self.durable_id,
                 window_id,
                 title,
                 size,
@@ -14455,6 +14468,7 @@ pub struct MuxCapturedPaneStack {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MuxCapturedTab {
     pub tab_id: TabId,
+    pub durable_tab_id: uuid::Uuid,
     pub window_id: WindowId,
     pub title: String,
     pub size: TerminalSize,
@@ -14538,6 +14552,33 @@ mod test {
     use url::Url;
 
     const TEST_ORDERED_PANE_CENSUS_WORK: usize = 32_767;
+
+    #[test]
+    fn durable_tab_identity_survives_capture_and_numeric_reuse() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let identity = tab.durable_id();
+        assert!(!identity.is_nil());
+        tab.set_title("renamed Ω");
+        for window_id in [7, 9] {
+            assert_eq!(
+                tab.capture_tab_topology(window_id, "default")
+                    .unwrap()
+                    .durable_tab_id,
+                identity
+            );
+        }
+        let mut other = Tab::new(&size);
+        other.tab_id = tab.tab_id;
+        other.inner.lock().id = tab.tab_id;
+        assert_ne!(other.durable_id(), identity);
+    }
 
     /// Ensure the global Mux singleton is initialized for tests that trigger
     /// focus-change notifications (e.g. floating pane and top-level split tests).
@@ -14662,6 +14703,36 @@ mod test {
                 stack_id: TabStackId(1),
             })
         );
+    }
+
+    #[test]
+    fn tab_stack_state_rejects_reused_id_without_losing_members_or_visibility() {
+        let mut state = TabStackState::default();
+        let first = TabStackId(7);
+        state.create_stack(first, vec![10, 20]).unwrap();
+        assert_eq!(state.cycle_visible(first, 1), Some(20));
+        let original = state.clone();
+
+        assert_eq!(
+            state.create_stack(first, vec![30, 40]),
+            Err(TabStackError::DuplicateStack(first))
+        );
+        assert_eq!(state, original);
+        assert_eq!(state.tabs_in_stack(first), Some([10, 20].as_slice()));
+        assert_eq!(state.visible_tab(first), Some(20));
+        for tab in [10, 20] {
+            assert_eq!(state.stack_for_tab(tab), Some(first));
+        }
+        for tab in [30, 40] {
+            assert_eq!(state.stack_for_tab(tab), None);
+        }
+
+        let second = TabStackId(8);
+        state.create_stack(second, vec![30, 40]).unwrap();
+        assert_eq!(state.visible_tab(first), Some(20));
+        assert_eq!(state.remove_stack(first), Some(vec![10, 20]));
+        state.create_stack(first, vec![10, 20]).unwrap();
+        assert_eq!(state.tabs_in_stack(second), Some([30, 40].as_slice()));
     }
 
     #[test]
