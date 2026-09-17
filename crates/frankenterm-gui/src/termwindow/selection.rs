@@ -688,9 +688,17 @@ impl super::TermWindow {
             pending.text_copy = Some(copy);
         }
         let copy = pending.text_copy.as_mut().unwrap();
-        if !Self::refresh_local_copy_source(pane, &pending.desired, copy, authority, sequence)? {
+        let Some((sequence, dimensions)) = Self::refresh_local_copy_source(
+            pane,
+            &pending.desired,
+            copy,
+            authority,
+            sequence,
+            dimensions,
+        )?
+        else {
             return Ok(None);
-        }
+        };
         copy.verify_source(sequence)?;
         if copy.next_row < copy.end_row {
             let end = copy
@@ -735,16 +743,18 @@ impl super::TermWindow {
         }
         match SelectionAuthority::capture_source(&**pane) {
             None => Ok(None),
-            Some((current, current_sequence, _)) if current == authority => {
-                if !Self::refresh_local_copy_source(
+            Some((current, current_sequence, current_dimensions)) if current == authority => {
+                let Some((current_sequence, _)) = Self::refresh_local_copy_source(
                     pane,
                     &pending.desired,
                     copy,
                     current,
                     current_sequence,
-                )? {
+                    current_dimensions,
+                )?
+                else {
                     return Ok(None);
-                }
+                };
                 copy.finish(current_sequence)
             }
             Some(_) => Err("The pane changed while copying. Copy the selection again."),
@@ -757,28 +767,38 @@ impl super::TermWindow {
         copy: &mut SelectionCopy,
         authority: SelectionAuthority,
         sequence: termwiz::surface::SequenceNo,
-    ) -> Result<bool, &'static str> {
-        if copy.source_sequence == sequence {
-            return Ok(true);
-        }
+        dimensions: mux::renderable::RenderableDimensions,
+    ) -> Result<
+        Option<(
+            termwiz::surface::SequenceNo,
+            mux::renderable::RenderableDimensions,
+        )>,
+        &'static str,
+    > {
         let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
-            return copy.verify_source(sequence).map(|()| true);
+            return copy
+                .verify_source(sequence)
+                .map(|()| Some((sequence, dimensions)));
         };
         let Some(anchor) = desired.native_anchor() else {
-            return copy.verify_source(sequence).map(|()| true);
+            return copy
+                .verify_source(sequence)
+                .map(|()| Some((sequence, dimensions)));
         };
         let Some((floor, observed, dimensions, points)) = local.selection_anchor_snapshot(anchor)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if SelectionAuthority::from_native_snapshot(&**pane, floor, dimensions) != Some(authority) {
             return Err("The pane layout changed while copying. Select the text again.");
         }
-        if observed != sequence {
-            return Ok(false);
+        if observed < sequence {
+            return Err("The pane source changed while copying. Select the text again.");
         }
         copy.follow_unchanged_native_selection(desired, observed, points)?;
-        Ok(true)
+        // Consume the same locked observation that proved the selected rows,
+        // even if unrelated output arrived after the earlier metadata capture.
+        Ok(Some((observed, dimensions)))
     }
 
     /// Bind release to the exact pending endpoint; never copy an older anchor.
@@ -1587,6 +1607,104 @@ mod tests {
                 .is_err()
         );
         assert!(stale.finish(changed).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_selection_copy_consumes_atomic_pane_observation_after_intervening_output() {
+        #[derive(Debug)]
+        struct ReadConfig;
+        impl wezterm_term::TerminalConfiguration for ReadConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 3,
+                cols: 40,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 48,
+            },
+            Arc::new(ReadConfig),
+            "selection-race-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"selected first\r\nselected second\r\noutside");
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_303,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_303,
+            [0x33; 16],
+            "selection race test".to_owned(),
+        ));
+        struct RetireChild(Arc<dyn Pane>);
+        impl Drop for RetireChild {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _child = RetireChild(Arc::clone(&pane));
+        let local = pane.downcast_ref::<mux::localpane::LocalPane>().unwrap();
+        let (authority, sequence, dimensions) = SelectionAuthority::capture_source(&*pane).unwrap();
+        let mut desired = Selection::default();
+        desired.seqno = sequence;
+        desired.authority = Some(authority);
+        desired.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(14, 1),
+        });
+        let token = local
+            .capture_selection_anchor(
+                authority.layout_floor(),
+                sequence,
+                dimensions,
+                desired.native_points(),
+            )
+            .unwrap()
+            .unwrap();
+        desired.remember_native_anchor(token);
+        let mut copy = SelectionCopy::new(&desired, sequence).unwrap();
+
+        // Deterministically change output after the first metadata observation.
+        pane.perform_actions(vec![termwiz::escape::Action::PrintString(
+            " more output".into(),
+        )]);
+        let (observed, _) = TermWindow::refresh_local_copy_source(
+            &pane, &desired, &mut copy, authority, sequence, dimensions,
+        )
+        .unwrap()
+        .expect("unchanged selection must progress despite intervening output");
+        assert!(observed > sequence);
+        assert_eq!(copy.source_sequence, observed);
+
+        // A newly created copy must not bypass the original anchor just because
+        // its initial sequence equals the current metadata observation.
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(b"\x1b[1;1HCHANGED", |action| actions.push(action));
+        pane.perform_actions(actions);
+        let (authority, sequence, dimensions) = SelectionAuthority::capture_source(&*pane).unwrap();
+        let mut stale = SelectionCopy::new(&desired, sequence).unwrap();
+        assert!(
+            TermWindow::refresh_local_copy_source(
+                &pane, &desired, &mut stale, authority, sequence, dimensions,
+            )
+            .is_err()
+        );
     }
 
     #[test]
