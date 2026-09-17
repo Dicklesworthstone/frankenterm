@@ -3897,6 +3897,8 @@ impl GuardianRuntime {
                                     eprintln!("GENESIS_OPEN_INITIAL_FAILED class={label}");
                                 }
                                 output.failed = true;
+                                self.counters.broker_control_failures =
+                                    self.counters.broker_control_failures.saturating_add(1);
                             }
                         },
                         BrokerPaneIoCompletionV1::Read { handle, result } => {

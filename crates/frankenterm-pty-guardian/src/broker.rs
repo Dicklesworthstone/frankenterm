@@ -366,6 +366,11 @@ fn update_broker_pane_recovery_scope(
 }
 
 #[cfg(test)]
+fn broker_exec_bootstrap_test_diagnostic_path(token_path: &Path, pane_id: Uuid) -> PathBuf {
+    token_path.with_extension(format!("bootstrap-error-{pane_id}"))
+}
+
+#[cfg(test)]
 fn record_broker_exec_bootstrap_test_stage(stage: &str) {
     let Some(path) = std::env::var_os(BROKER_EXEC_BOOTSTRAP_TEST_DIAGNOSTIC_ENV) else {
         return;
@@ -18514,7 +18519,10 @@ impl BrokerPreparedPaneV1 {
             }
             #[cfg(test)]
             BrokerExecBootstrapInvocationV1::UnitTestHarness => {
-                let diagnostic_path = launch.token_path.with_extension("bootstrap-error");
+                let diagnostic_path = broker_exec_bootstrap_test_diagnostic_path(
+                    &launch.token_path,
+                    binding.durable_pane_id,
+                );
                 bootstrap.arg("--quiet");
                 bootstrap.arg("--exact");
                 bootstrap.arg(BROKER_EXEC_BOOTSTRAP_TEST_ENTRY);
@@ -20790,9 +20798,42 @@ mod tests {
         (launch, wal_authority)
     }
 
-    fn unit_test_exec_bootstrap_diagnostic(token_path: &Path) -> String {
-        fs::read_to_string(token_path.with_extension("bootstrap-error"))
-            .unwrap_or_else(|_| "no child diagnostic was published".to_owned())
+    fn unit_test_exec_bootstrap_diagnostic(token_path: &Path, pane_id: Uuid) -> String {
+        fs::read_to_string(broker_exec_bootstrap_test_diagnostic_path(
+            token_path, pane_id,
+        ))
+        .unwrap_or_else(|_| "no child diagnostic was published".to_owned())
+    }
+
+    #[test]
+    fn exec_bootstrap_diagnostics_preserve_each_pane_and_refuse_duplicate_creation() {
+        let directory = private_catalog_directory().keep();
+        let token = directory.join("token");
+        let first = broker_exec_bootstrap_test_diagnostic_path(&token, id(1));
+        let second = broker_exec_bootstrap_test_diagnostic_path(&token, id(2));
+        let mut first_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&first)
+            .unwrap();
+        first_file.write_all(b"first-child").unwrap();
+        let mut second_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&second)
+            .unwrap();
+        second_file.write_all(b"second-child").unwrap();
+        assert_eq!(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&first)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(first).unwrap(), b"first-child");
+        assert_eq!(fs::read(second).unwrap(), b"second-child");
     }
 
     fn spawn_worker_completion(worker: &BrokerSpawnWorkerV1) -> BrokerSpawnWorkerCompletionV1 {
@@ -30435,7 +30476,7 @@ mod tests {
             BrokerDurableExecBarrierCommitV1::OutcomeIndeterminate { callback_error, .. } => {
                 panic!(
                     "first exec-barrier Spawn became indeterminate: {callback_error:?}; child: {}",
-                    unit_test_exec_bootstrap_diagnostic(&token_path)
+                    unit_test_exec_bootstrap_diagnostic(&token_path, binding.durable_pane_id)
                 )
             }
         };
@@ -30559,7 +30600,7 @@ mod tests {
             } => {
                 panic!(
                     "observation crash cut dropped the waiting bootstrap: {callback_error:?}; child: {}",
-                    unit_test_exec_bootstrap_diagnostic(&token_path)
+                    unit_test_exec_bootstrap_diagnostic(&token_path, binding.durable_pane_id)
                 )
             }
             BrokerDurableExecBarrierCommitV1::Applied { .. } => {

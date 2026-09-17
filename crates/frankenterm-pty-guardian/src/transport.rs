@@ -2367,7 +2367,7 @@ impl GuardianClient {
         let pane_id = custody.context().pane_id;
         let payload = custody
             .into_mux_rotation_payload()
-            .map_err(|_| GuardianClientError::UnexpectedReply)?;
+            .map_err(|_| GuardianClientError::Setup(GuardianServiceError::OutputInitialization))?;
         self.claim_with_payload(pane_id, 1, request_id, handoff_id, payload)
     }
 
