@@ -2846,6 +2846,25 @@ impl LocalPane {
         u64::try_from(seqno).ok()
     }
 
+    pub(crate) fn current_guardian_semantic_generation(&self) -> Option<u64> {
+        if !matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
+            return None;
+        }
+        let terminal = self.terminal.try_lock()?;
+        let seqno = terminal.current_seqno();
+        if seqno == usize::MAX {
+            return None;
+        }
+        u64::try_from(seqno).ok()
+    }
+
+    pub(crate) fn guardian_lease_identity(&self) -> Option<GuardianPaneLeaseIdentity> {
+        match &self.ownership {
+            LocalPaneOwnership::Guardian(guardian) => Some(guardian.identity),
+            LocalPaneOwnership::LegacyMuxOwned => None,
+        }
+    }
+
     pub(crate) fn stage_legacy_terminal_checkpoint(
         &self,
         _authority: ModelParserCaptureAuthority,
@@ -5898,6 +5917,44 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn current_model_and_guardian_semantic_generation_are_strictly_disjoint() {
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let guardian_pane =
+            guardian_lifetime_test_pane(888, identity, control.clone(), Arc::clone(&kills));
+        assert_eq!(guardian_pane.current_model_semantic_generation(), None);
+        let initial_seq = guardian_pane.current_guardian_semantic_generation();
+        assert!(initial_seq.is_some());
+        assert_eq!(guardian_pane.guardian_lease_identity(), Some(identity));
+
+        // Same-byte resize mutation increments semantic generation without external bytes
+        guardian_pane.terminal.lock().resize(TerminalSize {
+            rows: 25,
+            cols: 81,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        });
+        let resized_seq = guardian_pane.current_guardian_semantic_generation();
+        assert!(resized_seq > initial_seq);
+
+        let model_pane = LocalPane::new(
+            889,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild { kills }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x88; 16],
+            "model-pane-test".to_string(),
+        );
+        assert!(model_pane.current_model_semantic_generation().is_some());
+        assert_eq!(model_pane.current_guardian_semantic_generation(), None);
+        assert_eq!(model_pane.guardian_lease_identity(), None);
     }
 
     #[test]

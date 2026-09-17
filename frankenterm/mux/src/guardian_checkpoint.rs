@@ -5059,6 +5059,7 @@ pub struct LiveParserCheckpointAck {
     boundary: GuardianCheckpointBoundary,
     boundary_digest: [u8; 32],
     terminal_checkpoint: RecoveryTerminalCheckpointV2,
+    semantic_generation: u64,
 }
 
 /// Exact affine parser capture retained after its durable publication. Only
@@ -5133,6 +5134,7 @@ impl LiveParserCheckpointAck {
         output: GuardianOutputAppendReceipt,
         target_parser_stream_bytes: u64,
         terminal_checkpoint: RecoveryTerminalCheckpointV2,
+        limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if registration_wire_identity == [0; 16] {
             return Err(GuardianCheckpointBoundaryError::NilRegistrationWireIdentity);
@@ -5147,11 +5149,18 @@ impl LiveParserCheckpointAck {
             &terminal_checkpoint,
         )?;
         let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
+        let validated = TerminalCheckpointV2::decode_canonical_json(
+            terminal_checkpoint.canonical_payload(),
+            limits,
+        )
+        .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
+        let semantic_generation = validated.semantic_generation();
         Ok(Self {
             registration_wire_identity,
             boundary,
             boundary_digest,
             terminal_checkpoint,
+            semantic_generation,
         })
     }
 
@@ -5160,6 +5169,7 @@ impl LiveParserCheckpointAck {
         durable_pane_id: Uuid,
         restored: GuardianCheckpointBoundary,
         terminal_checkpoint: RecoveryTerminalCheckpointV2,
+        limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if registration_wire_identity == [0; 16] {
             return Err(GuardianCheckpointBoundaryError::NilRegistrationWireIdentity);
@@ -5195,11 +5205,18 @@ impl LiveParserCheckpointAck {
             ..restored
         };
         let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
+        let validated = TerminalCheckpointV2::decode_canonical_json(
+            terminal_checkpoint.canonical_payload(),
+            limits,
+        )
+        .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
+        let semantic_generation = validated.semantic_generation();
         Ok(Self {
             registration_wire_identity,
             boundary,
             boundary_digest,
             terminal_checkpoint,
+            semantic_generation,
         })
     }
 
@@ -5275,6 +5292,10 @@ impl LiveParserCheckpointAck {
         &self.terminal_checkpoint
     }
 
+    pub const fn semantic_generation(&self) -> u64 {
+        self.semantic_generation
+    }
+
     pub fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2) {
         (self.boundary, self.terminal_checkpoint)
     }
@@ -5342,6 +5363,7 @@ pub(crate) fn capture_and_bind_live_parser_checkpoint(
             output,
             request.target,
             terminal_checkpoint,
+            request.limits,
         ),
         LiveParserCheckpointSource::Restored(boundary) => {
             LiveParserCheckpointAck::capture_restored(
@@ -5349,6 +5371,7 @@ pub(crate) fn capture_and_bind_live_parser_checkpoint(
                 request.durable_pane_id,
                 boundary,
                 terminal_checkpoint,
+                request.limits,
             )
         }
     }
@@ -8482,12 +8505,17 @@ mod tests {
             output,
             parser_stream_bytes,
             checkpoint,
+            TerminalCheckpointLimits::default(),
         )
         .expect("capture registration-bound checkpoint fixture");
         assert_eq!(
             capture.parser_stream_bytes(),
             parser_stream_bytes,
             "live capture retains the exact parser watermark"
+        );
+        assert!(
+            capture.semantic_generation() > 0,
+            "live capture derives and retains validated semantic generation"
         );
         capture
     }
@@ -8556,6 +8584,7 @@ mod tests {
             capture.durable_pane_id(),
             boundary,
             checkpoint,
+            TerminalCheckpointLimits::default(),
         )
         .unwrap();
         let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(&restored_capture, 2)
@@ -8584,6 +8613,7 @@ mod tests {
             capture.durable_pane_id(),
             boundary,
             resized,
+            TerminalCheckpointLimits::default(),
         )
         .unwrap();
         assert_eq!(resized_capture.boundary().rows(), 20);
@@ -9063,6 +9093,7 @@ mod tests {
             output,
             first_watermark,
             first_checkpoint,
+            TerminalCheckpointLimits::default(),
         )
         .expect("capture first registration-bound checkpoint");
         let second_checkpoint = terminal_checkpoint();
@@ -9074,6 +9105,7 @@ mod tests {
             output,
             second_watermark,
             second_checkpoint,
+            TerminalCheckpointLimits::default(),
         )
         .expect("capture second registration-bound checkpoint");
 
@@ -11063,6 +11095,7 @@ mod tests {
                 "terminal_checkpoint",
                 "RecoveryTerminalCheckpointV2",
             ),
+            expected_authority_field("LiveParserCheckpointAck", "semantic_generation", "u64"),
             expected_authority_field(
                 "PublishedGuardianCheckpoint",
                 "capture",
@@ -11191,6 +11224,7 @@ mod tests {
             "LiveParserCheckpointAck::parser_stream_bytes:pub:production",
             "LiveParserCheckpointAck::registration_wire_identity:pub:production",
             "LiveParserCheckpointAck::segment_id:pub:production",
+            "LiveParserCheckpointAck::semantic_generation:pub:production",
             "LiveParserCheckpointAck::terminal_checkpoint:pub:production",
             "LiveParserCheckpointAck::terminal_payload_bytes:pub:production",
             "LiveParserCheckpointAck::terminal_payload_digest:pub:production",
@@ -11493,13 +11527,13 @@ mod tests {
                 "LiveParserCheckpointAck",
                 "private",
                 false,
-                "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+                "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV2, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
                 "private",
                 false,
-                "fn capture_restored(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, restored: GuardianCheckpointBoundary, terminal_checkpoint: RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+                "fn capture_restored(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, restored: GuardianCheckpointBoundary, terminal_checkpoint: RecoveryTerminalCheckpointV2, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -11590,6 +11624,12 @@ mod tests {
                 "pub",
                 false,
                 "const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn semantic_generation(&self) -> u64",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",

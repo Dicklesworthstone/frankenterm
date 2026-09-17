@@ -6899,6 +6899,9 @@ mod tests {
             WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
             reconstruct_whole_mux_image_inert, semantic_object_id_from_str,
         };
+        use frankenterm_core::snapshot_engine::{
+            WholeMuxPublicationIdentity, capture_and_publish_whole_mux_recovery,
+        };
         use frankenterm_core::snapshot_publication::{
             GenerationRootPublishRequest, PredecessorBinding, PublicationError,
             RecoveryObjectPayload, SnapshotPublicationStore,
@@ -6931,7 +6934,6 @@ mod tests {
         let quiet = capture_real_guardian_checkpoint(mux, pane.pane_id(), executor);
         let quiet_sequence = quiet.capture().output_sequence();
         let quiet_bytes = quiet.capture().journal_cumulative_plaintext_bytes();
-        drop(quiet);
         let post_registration = directory.join("post-registration");
         std::fs::write(&post_registration, b"step").unwrap();
         let post_registration_deadline = Instant::now() + Duration::from_secs(5);
@@ -6955,6 +6957,17 @@ mod tests {
         let published = capture_real_guardian_checkpoint(mux, pane_id, executor);
         assert!(published.capture().output_sequence() > quiet_sequence);
         assert!(published.capture().journal_cumulative_plaintext_bytes() > quiet_bytes);
+
+        // Predecessor live stage: common-cut validation before detach
+        assert!(
+            mux.guardian_checkpoint_is_current(pane_id, &published),
+            "fresh live guardian capture must be current before detach"
+        );
+        assert!(
+            !mux.guardian_checkpoint_is_current(pane_id, &quiet),
+            "quiet capture before child output must be stale (detected ABA/mutation)"
+        );
+        drop(quiet);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
         assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
@@ -7032,6 +7045,65 @@ mod tests {
             .register_published_guardian_capture(&published)
             .unwrap();
         let root_receipt = store.publish_generation_root(&root, &verifier).unwrap();
+
+        let recovery_store = SnapshotPublicationStore::open(
+            directory.join("whole-image-common-cut"),
+            Default::default(),
+        )
+        .unwrap();
+        let recovery_expected_gen1 = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "real-guardian-birth".into(),
+            mux_incarnation_id: hex::encode(captured.session_incarnation.as_bytes()),
+            root_object_id: [0x72; 32],
+            publisher_id: "actual-birth".into(),
+            ft_version: config::wezterm_version().to_owned(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let recovery_gen1_receipt = {
+            let thread_cx = frankenterm_core::cx::Cx::for_testing();
+            let thread_mux = Arc::clone(mux);
+            let thread_store = SnapshotPublicationStore::open(
+                directory.join("whole-image-common-cut"),
+                Default::default(),
+            )
+            .unwrap();
+            let thread_key = Arc::clone(&key);
+            let thread_expected = recovery_expected_gen1.clone();
+            let handle = thread::spawn(move || {
+                capture_and_publish_whole_mux_recovery(
+                    &thread_cx,
+                    &thread_mux,
+                    &thread_store,
+                    thread_key,
+                    &thread_expected,
+                    Duration::from_secs(5),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if handle.is_finished() {
+                    break handle
+                        .join()
+                        .unwrap()
+                        .expect("seed generation 1 via whole-mux recovery capture before detach");
+                }
+                assert!(Instant::now() < deadline, "gen1 recovery capture timed out");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        assert_eq!(recovery_gen1_receipt.generation, 1);
+        let recovery_gen1_selected = recovery_store
+            .select_verified_roots(&verifier)
+            .expect("verifier must select verified generation 1 root from common-cut store");
+        let recovery_gen1_validated = recovery_gen1_selected
+            .current
+            .expect("must verify published generation 1 root");
+        let recovery_gen1_image_digest = recovery_gen1_validated.image().image_digest;
+        let recovery_gen1_hash = recovery_gen1_receipt.sha256;
 
         let child_log_path = directory.join("fresh-image-verifier.stdout");
         let child_log = std::fs::OpenOptions::new()
@@ -7329,6 +7401,73 @@ mod tests {
             Some(gen2_provenance)
         );
 
+        // Successor stage: predecessor registration was detached; original mux MUST return false
+        assert!(
+            !mux.guardian_checkpoint_is_current(pane_id, &published),
+            "predecessor registration was detached; must be stale on predecessor mux"
+        );
+
+        assert!(
+            successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
+            "fresh real guardian capture must be current under exact successor registration"
+        );
+
+        let unknown_pane_id = alloc_pane_id().expect("allocate unknown pane id");
+        assert!(
+            !successor_mux.guardian_checkpoint_is_current(unknown_pane_id, &gen2_published),
+            "unknown pane ID must reject guardian checkpoint"
+        );
+
+        let dummy_model_ack = mux::ModelParserCheckpointAck {
+            registration_wire_identity: gen2_published.capture().registration_wire_identity(),
+            durable_pane_id: gen2_published.capture().durable_pane_id(),
+            parser_stream_bytes: gen2_published
+                .capture()
+                .terminal_checkpoint()
+                .parser_stream_bytes(),
+            semantic_generation: gen2_published.capture().semantic_generation(),
+            terminal_checkpoint: gen2_published.capture().terminal_checkpoint().clone(),
+        };
+        assert!(
+            !successor_mux.model_checkpoint_is_current(successor_pane.pane_id(), &dummy_model_ack),
+            "model checkpoint query must reject guardian pane"
+        );
+
+        assert!(
+            !successor_mux.guardian_checkpoint_is_current(successor_pane.pane_id(), &published),
+            "predecessor gen1 capture must not be current under successor mux (lease/incarnation mismatch)"
+        );
+
+        // Deterministic cancellation during live guardian wait blocked on live parser
+        {
+            let started = Instant::now();
+            let cancel_result = successor_mux.capture_pane_guardian_checkpoint(
+                successor_pane.pane_id(),
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+                || started.elapsed() >= Duration::from_millis(250),
+            );
+            let cancel_elapsed = started.elapsed();
+            assert!(
+                cancel_elapsed >= Duration::from_millis(200),
+                "cancellation must enforce elapsed lower-bound while waiting on parser, elapsed: {cancel_elapsed:?}"
+            );
+            assert!(
+                cancel_elapsed < Duration::from_secs(2),
+                "cancellation during wait must abort within bounded duration, elapsed: {cancel_elapsed:?}"
+            );
+            assert!(
+                matches!(
+                    cancel_result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| err.downcast_ref::<mux::LiveParserCheckpointError>()),
+                    Some(mux::LiveParserCheckpointError::Cancelled)
+                ),
+                "expected LiveParserCheckpointError::Cancelled, got {cancel_result:?}"
+            );
+        }
+
         let gen2_object_id = "real-guardian-terminal-gen2";
         let gen2_timestamp = gen2_captured.captured_at_epoch_ms;
         let encode_gen2 = |payload: &[u8], id, kind, predecessor_generation: Option<u64>| {
@@ -7491,6 +7630,69 @@ mod tests {
             .publish_generation_root(&gen2_root, &authorized_verifier)
             .unwrap();
         assert_eq!(gen2_root_receipt.generation, 2);
+
+        // Successor Gen 2 whole-mux recovery capture in same store with exact predecessor hash & verified image digest
+        {
+            let recovery_expected_gen2 = WholeMuxPublicationIdentity {
+                generation: 2,
+                session_id: "real-guardian-birth".into(),
+                mux_incarnation_id: hex::encode(gen2_captured.session_incarnation.as_bytes()),
+                root_object_id: [0x72; 32],
+                publisher_id: "successor-claim".into(),
+                ft_version: config::wezterm_version().to_owned(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: 1,
+                    expected_hash: recovery_gen1_hash,
+                }),
+                predecessor_image_digest: Some(recovery_gen1_image_digest),
+                existing_guardian_custody: Some(token.to_path_buf()),
+            };
+            let recovery_gen2_receipt = {
+                let thread_cx = frankenterm_core::cx::Cx::for_testing();
+                let thread_mux = Arc::clone(&successor_mux);
+                let thread_store = SnapshotPublicationStore::open(
+                    directory.join("whole-image-common-cut"),
+                    Default::default(),
+                )
+                .unwrap();
+                let thread_key = Arc::clone(&key);
+                let thread_expected = recovery_expected_gen2.clone();
+                let handle = thread::spawn(move || {
+                    capture_and_publish_whole_mux_recovery(
+                        &thread_cx,
+                        &thread_mux,
+                        &thread_store,
+                        thread_key,
+                        &thread_expected,
+                        Duration::from_secs(5),
+                    )
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    if handle.is_finished() {
+                        break handle.join().unwrap().expect(
+                            "capture and publish successor generation 2 in same recovery store",
+                        );
+                    }
+                    assert!(Instant::now() < deadline, "gen2 recovery capture timed out");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            };
+            assert_eq!(recovery_gen2_receipt.generation, 2);
+
+            let recovery_gen2_selected = recovery_store
+                .select_verified_roots(&authorized_verifier)
+                .expect("authorized verifier must select verified generation 2 root");
+            let recovery_gen2_validated = recovery_gen2_selected
+                .current
+                .expect("must verify published generation 2 root");
+            assert_eq!(recovery_gen2_validated.generation(), 2);
+            assert_eq!(
+                recovery_gen2_validated.image().header.predecessor_digest,
+                Some(recovery_gen1_image_digest)
+            );
+        }
 
         // 8. Fresh-process verification from disk without volatile per-pane hints
         let gen2_child_log_path = directory.join("fresh-image-verifier-gen2.stdout");
@@ -7823,6 +8025,14 @@ mod tests {
                 hex::encode(gen2_captured.session_incarnation.as_bytes())
             );
         }
+
+        // Terminal mutation with same stream bytes advances semantic generation; bound capture witness must be rejected
+        successor_pane.perform_actions(vec![termwiz::escape::Action::Print('!')]);
+        assert!(
+            !successor_mux
+                .guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
+            "terminal mutation advanced semantic generation; bound capture witness must be rejected"
+        );
 
         (successor_mux, successor_pane)
     }

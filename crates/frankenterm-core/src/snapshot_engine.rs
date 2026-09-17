@@ -167,22 +167,34 @@ pub enum WholeMuxCaptureError {
         #[source]
         source: mux::LiveParserCheckpointError,
     },
+    #[error("failed to capture guardian checkpoint for pane {pane_id}")]
+    GuardianPane {
+        pane_id: usize,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("encrypted model publication failed")]
     Publication(#[source] WholeMuxPublicationError),
 }
 
-/// Capture actual mux/parser state and publish an encrypted offline model image.
+#[cfg(feature = "frankenterm-deps")]
+#[derive(Debug)]
+enum CapturedPaneCheckpoint {
+    Model(mux::ModelParserCheckpointAck),
+    Guardian(mux::guardian_checkpoint::PublishedGuardianCheckpoint),
+}
+
+/// Capture actual mux/parser state and publish an encrypted offline recovery image.
 ///
 /// Run on an owned blocking worker, never a mux or readiness thread. There is
 /// one attempt, at most 1,024 panes, a total deadline checked between phases,
 /// and at most 100ms for each parser ACK channel wait. Registry locks, staging,
 /// and cold-history filesystem calls are not preemptible by that wait bound.
-/// PTY durability
-/// and guardian replay suffixes are not asserted by this model-only operation.
+/// Supports both legacy model-only panes and authenticated guardian-owned panes.
 /// All periodic/manual callers must share this store authority and this entry
 /// point. The store additionally serializes the final root CAS across processes.
 #[cfg(feature = "frankenterm-deps")]
-pub fn capture_and_publish_whole_mux_model(
+pub fn capture_and_publish_whole_mux_recovery(
     cx: &crate::cx::Cx,
     mux: &mux::Mux,
     store: &crate::snapshot_publication::SnapshotPublicationStore,
@@ -190,7 +202,7 @@ pub fn capture_and_publish_whole_mux_model(
     expected: &WholeMuxPublicationIdentity,
     capture_timeout: Duration,
 ) -> Result<crate::snapshot_publication::GenerationPublicationReceipt, WholeMuxCaptureError> {
-    capture_and_publish_whole_mux_model_at_boundary(
+    capture_and_publish_whole_mux_recovery_at_boundary(
         cx,
         mux,
         store,
@@ -206,7 +218,7 @@ pub fn capture_and_publish_whole_mux_model(
 /// this boundary to exercise a deterministic optimistic-cut race.
 #[cfg(feature = "frankenterm-deps")]
 #[allow(clippy::too_many_lines)]
-fn capture_and_publish_whole_mux_model_at_boundary(
+fn capture_and_publish_whole_mux_recovery_at_boundary(
     cx: &crate::cx::Cx,
     mux: &mux::Mux,
     store: &crate::snapshot_publication::SnapshotPublicationStore,
@@ -257,8 +269,9 @@ fn capture_and_publish_whole_mux_model_at_boundary(
     if hex::encode(captured.session_incarnation.as_bytes()) != expected.mux_incarnation_id {
         return Err(WholeMuxCaptureError::StaleCapture);
     }
-    let mut acks = Vec::with_capacity(captured.pane_bindings.len());
+    let mut checkpoints = Vec::with_capacity(captured.pane_bindings.len());
     let mut total_bytes = 0usize;
+    let limits = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default();
     for pane in &captured.pane_bindings {
         snapshot_cx_checkpoint(cx)?;
         let remaining = deadline
@@ -267,58 +280,122 @@ fn capture_and_publish_whole_mux_model_at_boundary(
             .ok_or(WholeMuxCaptureError::CaptureDeadline)?;
         let mut cancellation = None;
         let mut capture_deadline_reached = false;
-        let result = mux.capture_pane_model_checkpoint(
-            pane.pane_id,
-            frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
-            remaining,
-            || match snapshot_cx_checkpoint(cx) {
-                Ok(()) => {
-                    capture_deadline_reached = Instant::now() >= deadline;
-                    capture_deadline_reached
+        let checkpoint = if pane.spawn_custody.is_some() {
+            let result =
+                mux.capture_pane_guardian_checkpoint(pane.pane_id, limits, remaining, || {
+                    match snapshot_cx_checkpoint(cx) {
+                        Ok(()) => {
+                            capture_deadline_reached = Instant::now() >= deadline;
+                            capture_deadline_reached
+                        }
+                        Err(error) => {
+                            cancellation = Some(error);
+                            true
+                        }
+                    }
+                });
+            if let Some(error) = cancellation {
+                return Err(WholeMuxCaptureError::Context(error));
+            }
+            if capture_deadline_reached {
+                return Err(WholeMuxCaptureError::CaptureDeadline);
+            }
+            snapshot_cx_checkpoint(cx)?;
+            let published = result.map_err(|source| {
+                if let Some(live_err) = source.downcast_ref::<mux::LiveParserCheckpointError>() {
+                    match live_err {
+                        mux::LiveParserCheckpointError::StaleRegistration => {
+                            WholeMuxCaptureError::StaleCapture
+                        }
+                        mux::LiveParserCheckpointError::CheckpointBusy
+                        | mux::LiveParserCheckpointError::GuardianDeliveryBusy => {
+                            WholeMuxCaptureError::Busy
+                        }
+                        _ => WholeMuxCaptureError::GuardianPane {
+                            pane_id: pane.pane_id,
+                            source,
+                        },
+                    }
+                } else {
+                    WholeMuxCaptureError::GuardianPane {
+                        pane_id: pane.pane_id,
+                        source,
+                    }
                 }
-                Err(error) => {
-                    cancellation = Some(error);
-                    true
+            })?;
+            let capture = published.capture();
+            if capture.registration_wire_identity() != pane.registration_wire_identity
+                || capture.durable_pane_id().to_string() != pane.pane_uuid
+            {
+                return Err(WholeMuxCaptureError::StaleCapture);
+            }
+            total_bytes = total_bytes
+                .checked_add(capture.terminal_checkpoint().canonical_payload().len())
+                .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+                .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
+            CapturedPaneCheckpoint::Guardian(published)
+        } else {
+            let result = mux.capture_pane_model_checkpoint(pane.pane_id, limits, remaining, || {
+                match snapshot_cx_checkpoint(cx) {
+                    Ok(()) => {
+                        capture_deadline_reached = Instant::now() >= deadline;
+                        capture_deadline_reached
+                    }
+                    Err(error) => {
+                        cancellation = Some(error);
+                        true
+                    }
                 }
-            },
-        );
-        if let Some(error) = cancellation {
-            return Err(WholeMuxCaptureError::Context(error));
-        }
-        if capture_deadline_reached {
-            return Err(WholeMuxCaptureError::CaptureDeadline);
-        }
-        snapshot_cx_checkpoint(cx)?;
-        let ack = result.map_err(|source| match source {
-            mux::LiveParserCheckpointError::StaleRegistration => WholeMuxCaptureError::StaleCapture,
-            mux::LiveParserCheckpointError::CheckpointBusy => WholeMuxCaptureError::Busy,
-            source => WholeMuxCaptureError::Pane {
-                pane_id: pane.pane_id,
-                source,
-            },
-        })?;
-        if ack.registration_wire_identity != pane.registration_wire_identity
-            || ack.durable_pane_id.to_string() != pane.pane_uuid
-        {
-            return Err(WholeMuxCaptureError::StaleCapture);
-        }
-        total_bytes = total_bytes
-            .checked_add(ack.terminal_checkpoint.canonical_payload().len())
-            .filter(|bytes| *bytes <= 256 * 1024 * 1024)
-            .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
-        acks.push(ack);
+            });
+            if let Some(error) = cancellation {
+                return Err(WholeMuxCaptureError::Context(error));
+            }
+            if capture_deadline_reached {
+                return Err(WholeMuxCaptureError::CaptureDeadline);
+            }
+            snapshot_cx_checkpoint(cx)?;
+            let ack = result.map_err(|source| match source {
+                mux::LiveParserCheckpointError::StaleRegistration => {
+                    WholeMuxCaptureError::StaleCapture
+                }
+                mux::LiveParserCheckpointError::CheckpointBusy => WholeMuxCaptureError::Busy,
+                source => WholeMuxCaptureError::Pane {
+                    pane_id: pane.pane_id,
+                    source,
+                },
+            })?;
+            if ack.registration_wire_identity != pane.registration_wire_identity
+                || ack.durable_pane_id.to_string() != pane.pane_uuid
+            {
+                return Err(WholeMuxCaptureError::StaleCapture);
+            }
+            total_bytes = total_bytes
+                .checked_add(ack.terminal_checkpoint.canonical_payload().len())
+                .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+                .ok_or(WholeMuxCaptureError::CaptureByteLimit)?;
+            CapturedPaneCheckpoint::Model(ack)
+        };
+        checkpoints.push(checkpoint);
     }
     after_capture();
     snapshot_cx_checkpoint(cx)?;
     if Instant::now() >= deadline {
         return Err(WholeMuxCaptureError::CaptureDeadline);
     }
-    // Every ACK precedes every validation read. Unchanged monotonic model
-    // witnesses therefore establish a common cut between those two passes;
-    // equal visible state alone would incorrectly admit an A -> B -> A change.
-    for (pane, ack) in captured.pane_bindings.iter().zip(&acks) {
+    // Every checkpoint precedes every validation read. Unchanged monotonic
+    // witnesses establish a common cut between those two passes; equal visible
+    // state alone would incorrectly admit an A -> B -> A change.
+    for (pane, checkpoint) in captured.pane_bindings.iter().zip(&checkpoints) {
         snapshot_cx_checkpoint(cx)?;
-        if !mux.model_checkpoint_is_current(pane.pane_id, ack) {
+        let is_current = match checkpoint {
+            CapturedPaneCheckpoint::Model(ack) => {
+                mux.model_checkpoint_is_current(pane.pane_id, ack)
+            }
+            CapturedPaneCheckpoint::Guardian(published) => {
+                mux.guardian_checkpoint_is_current(pane.pane_id, published)
+            }
+        };
+        if !is_current {
             return Err(WholeMuxCaptureError::StaleCapture);
         }
     }
@@ -343,9 +420,14 @@ fn capture_and_publish_whole_mux_model_at_boundary(
     let names: Vec<_> = captured
         .pane_bindings
         .iter()
-        .map(|pane| {
+        .zip(&checkpoints)
+        .map(|(pane, checkpoint)| {
+            let prefix = match checkpoint {
+                CapturedPaneCheckpoint::Model(_) => "model",
+                CapturedPaneCheckpoint::Guardian(_) => "guardian",
+            };
             format!(
-                "model-{}-{}-{}",
+                "{prefix}-{}-{}-{}",
                 expected.generation, captured.captured_at_epoch_ms, pane.pane_id
             )
         })
@@ -353,9 +435,16 @@ fn capture_and_publish_whole_mux_model_at_boundary(
     let inputs: Vec<_> = captured
         .pane_bindings
         .iter()
-        .zip(&acks)
+        .zip(&checkpoints)
         .zip(&names)
-        .map(|((pane, ack), name)| WholeMuxPanePublication::model(pane.pane_id, name, ack))
+        .map(|((pane, checkpoint), name)| match checkpoint {
+            CapturedPaneCheckpoint::Model(ack) => {
+                WholeMuxPanePublication::model(pane.pane_id, name, ack)
+            }
+            CapturedPaneCheckpoint::Guardian(published) => {
+                WholeMuxPanePublication::guardian(pane.pane_id, name, published)
+            }
+        })
         .collect();
     attempt
         .handoff_state
@@ -12909,7 +12998,7 @@ mod tests {
         };
         let cx = crate::cx::Cx::for_testing();
         assert!(matches!(
-            capture_and_publish_whole_mux_model(
+            capture_and_publish_whole_mux_recovery(
                 &cx,
                 &mux,
                 &store,
@@ -12923,7 +13012,7 @@ mod tests {
         let cancelled = crate::cx::Cx::for_testing();
         cancelled.cancel_with(CancelKind::User, Some("model capture test"));
         assert!(matches!(
-            capture_and_publish_whole_mux_model(
+            capture_and_publish_whole_mux_recovery(
                 &cancelled,
                 &mux,
                 &store,
@@ -12935,7 +13024,7 @@ mod tests {
         ));
         expected.mux_incarnation_id = "wrong-incarnation".into();
         assert!(matches!(
-            capture_and_publish_whole_mux_model(
+            capture_and_publish_whole_mux_recovery(
                 &cx,
                 &mux,
                 &store,
@@ -12949,7 +13038,7 @@ mod tests {
         assert!(!authority.reconciliation_is_required());
         assert!(store.inspect_root_candidates().unwrap().0.is_empty());
         expected.mux_incarnation_id = hex::encode(topology.session_incarnation.as_bytes());
-        let receipt = capture_and_publish_whole_mux_model(
+        let receipt = capture_and_publish_whole_mux_recovery(
             &cx,
             &mux,
             &store,
@@ -13044,7 +13133,7 @@ mod tests {
         };
         let cx = crate::cx::Cx::for_testing();
         let mutation_after_ack = std::cell::Cell::new(false);
-        let changed = capture_and_publish_whole_mux_model_at_boundary(
+        let changed = capture_and_publish_whole_mux_recovery_at_boundary(
             &cx,
             &mux,
             &store,
@@ -13076,7 +13165,7 @@ mod tests {
         assert!(store.list_object_ids().unwrap().is_empty());
 
         let cancelled = crate::cx::Cx::for_testing();
-        let result = capture_and_publish_whole_mux_model_at_boundary(
+        let result = capture_and_publish_whole_mux_recovery_at_boundary(
             &cancelled,
             &mux,
             &store,
@@ -13177,7 +13266,7 @@ mod tests {
         )
         .unwrap();
         let durable_window_id = mux.get_window(*window).unwrap().durable_id();
-        let receipt = capture_and_publish_whole_mux_model(
+        let receipt = capture_and_publish_whole_mux_recovery(
             &cx,
             &mux,
             &store,
