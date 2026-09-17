@@ -6810,6 +6810,8 @@ pub struct WholeMuxRecoveryVerifier {
     #[cfg(all(unix, feature = "frankenterm-deps"))]
     reopened_guardian_captures:
         HashMap<uuid::Uuid, frankenterm_pty_guardian::GuardianReopenedCheckpointV1>,
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    guardian_custody_token_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -6861,6 +6863,8 @@ impl WholeMuxRecoveryVerifier {
             published_guardian_captures: HashMap::new(),
             #[cfg(all(unix, feature = "frankenterm-deps"))]
             reopened_guardian_captures: HashMap::new(),
+            #[cfg(all(unix, feature = "frankenterm-deps"))]
+            guardian_custody_token_path: None,
         }
     }
 
@@ -6868,6 +6872,63 @@ impl WholeMuxRecoveryVerifier {
     pub fn with_admission(mut self, admission: Arc<RepairAdmissionController>) -> Self {
         self.admission = Some(admission);
         self
+    }
+
+    /// Locate existing guardian custody from each authenticated manifest entry.
+    /// The caller supplies the private store location; serialized pane metadata
+    /// never chooses a filesystem path. Verification only reads existing records
+    /// and does not claim a lease, initialize custody, or activate a terminal.
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    #[must_use]
+    pub fn with_existing_guardian_custody(mut self, token_path: std::path::PathBuf) -> Self {
+        self.guardian_custody_token_path = Some(token_path);
+        self
+    }
+
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    fn reopen_manifest_guardian_capture(
+        &self,
+        pane: &crate::mux_recovery_image::RecoveryPane,
+        checkpoint_id: [u8; 32],
+    ) -> Result<Option<frankenterm_pty_guardian::GuardianReopenedCheckpointV1>, WholeMuxRecoveryError>
+    {
+        let Some(token_path) = self.guardian_custody_token_path.as_ref() else {
+            return Ok(None);
+        };
+        let fail = || WholeMuxRecoveryError::UnprovedGuardianAuthority {
+            pane_id: pane.pane_id as u64,
+            reason:
+                "existing guardian custody/catalog/ACK does not authenticate the manifest entry"
+                    .to_owned(),
+        };
+        let crate::mux_recovery_image::RecoverySpawnCustody::Original {
+            broker_lineage,
+            guardian_incarnation,
+            original_mux_incarnation,
+            broker_build,
+            guardian_build,
+            original_mux_build,
+            pane_id,
+            spawn_effect_id,
+            ..
+        } = &pane.spawn_custody
+        else {
+            return Err(fail());
+        };
+        let scope = mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
+            broker_lineage: *broker_lineage,
+            guardian_incarnation: *guardian_incarnation,
+            mux_incarnation: *original_mux_incarnation,
+            broker_build: *broker_build,
+            guardian_build: *guardian_build,
+            mux_build: *original_mux_build,
+            pane_id: *pane_id,
+            effect_id: *spawn_effect_id,
+        };
+        frankenterm_pty_guardian::GuardianDurableSpawnCustodyV1::open_existing(token_path, scope)
+            .and_then(|custody| custody.reopen_checkpoint(checkpoint_id))
+            .map(Some)
+            .map_err(|_| fail())
     }
 
     /// Authorize offline validation of this exact freshly published capture.
@@ -7239,6 +7300,8 @@ impl WholeMuxRecoveryVerifier {
             cx.checkpoint()
                 .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
             let obj_ref = &pane.checkpoint.checkpoint_ref;
+            #[cfg(feature = "frankenterm-deps")]
+            let mut guardian_payload_digest = None;
 
             // Enforce authority policy:
             // Watermark != 0 is NOT guardian authority validation.
@@ -7276,7 +7339,7 @@ impl WholeMuxRecoveryVerifier {
                                 && witness.registration
                                     == pane.checkpoint.registration_wire_identity
                             {
-                                // The exact published capture is the only exemption.
+                                guardian_payload_digest = Some(witness.payload_digest);
                             } else {
                                 return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                                     pane_id: pane.pane_id as u64,
@@ -7293,9 +7356,18 @@ impl WholeMuxRecoveryVerifier {
                             });
                             #[cfg(unix)]
                             {
-                                let witness = pane_uuid
-                                    .and_then(|id| self.reopened_guardian_captures.get(&id))
-                                    .ok_or_else(|| {
+                                let registered = pane_uuid
+                                    .and_then(|id| self.reopened_guardian_captures.get(&id));
+                                let discovered = if registered.is_none() {
+                                    self.reopen_manifest_guardian_capture(
+                                        pane,
+                                        publication.checkpoint_identity,
+                                    )?
+                                } else {
+                                    None
+                                };
+                                let witness =
+                                    registered.or(discovered.as_ref()).ok_or_else(|| {
                                         WholeMuxRecoveryError::UnprovedGuardianAuthority {
                                             pane_id: pane.pane_id as u64,
                                             reason:
@@ -7329,6 +7401,7 @@ impl WholeMuxRecoveryVerifier {
                                             .to_owned(),
                                     });
                                 }
+                                guardian_payload_digest = Some(witness.payload_digest());
                                 // Registration belongs to the authenticated whole-image
                                 // envelope and its bijection, not the durable catalog.
                             }
@@ -7431,29 +7504,12 @@ impl WholeMuxRecoveryVerifier {
                 &pane.checkpoint.authority,
                 CheckpointAuthority::Guardian { .. }
             ) {
-                let payload_digest = uuid::Uuid::parse_str(&pane.pane_uuid)
-                    .ok()
-                    .and_then(|id| {
-                        self.published_guardian_captures
-                            .get(&id)
-                            .map(|witness| witness.payload_digest)
-                            .or_else(|| {
-                                #[cfg(unix)]
-                                {
-                                    self.reopened_guardian_captures
-                                        .get(&id)
-                                        .map(|witness| witness.payload_digest())
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    None
-                                }
-                            })
-                    })
-                    .ok_or_else(|| WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                let payload_digest = guardian_payload_digest.ok_or_else(|| {
+                    WholeMuxRecoveryError::UnprovedGuardianAuthority {
                         pane_id: pane.pane_id as u64,
                         reason: "published guardian witness disappeared".to_owned(),
-                    })?;
+                    }
+                })?;
                 let (_, observed_digest) =
                     mux::guardian_checkpoint::terminal_payload_identity(decoded_json.as_slice())
                         .map_err(|error| WholeMuxRecoveryError::UnprovedGuardianAuthority {
