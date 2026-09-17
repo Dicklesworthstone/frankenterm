@@ -1966,6 +1966,19 @@ async fn forward_vendored_streaming_delta(
     lease: &CaptureLease,
     delta: PaneDelta,
 ) -> Option<String> {
+    tracing::trace!(
+        pane_id = identity.global_pane_id,
+        delta_kind = match &delta {
+            PaneDelta::Output { .. } => "output",
+            PaneDelta::Gap { .. } => "gap",
+            PaneDelta::Ended { .. } => "ended",
+        },
+        output_bytes = match &delta {
+            PaneDelta::Output { delta_text, .. } => delta_text.len(),
+            _ => 0,
+        },
+        "Received vendored capture delta"
+    );
     let delta = match remap_vendored_streaming_delta(identity, delta) {
         Ok(delta) => delta,
         Err(reason) => return Some(reason),
@@ -3157,6 +3170,10 @@ struct ActiveCaptureBinding {
     native_lease: Option<CaptureLease>,
     #[cfg(all(feature = "vendored", unix))]
     streaming_lease: Option<CaptureLease>,
+    /// A failed stream must not evict its polling fallback at the next sync.
+    /// Retry streaming only after this exact capture binding is replaced.
+    #[cfg(all(feature = "vendored", unix))]
+    streaming_failed: bool,
 }
 
 struct PendingCaptureResyncBinding {
@@ -3195,6 +3212,30 @@ fn pending_capture_resync_disposition(
 }
 
 impl ActiveCaptureBinding {
+    #[cfg(all(feature = "vendored", unix))]
+    fn latch_stream_failure(&mut self, stamp: crate::capture_authority::CaptureStamp) -> bool {
+        if self
+            .streaming_lease
+            .as_ref()
+            .is_some_and(|lease| lease.stamp() == stamp)
+        {
+            self.streaming_failed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn streaming_source_drained(&self) -> bool {
+        self.streaming_lease.is_none()
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn may_start_streaming(&self) -> bool {
+        !self.streaming_failed && self.streaming_source_drained()
+    }
+
     fn matches_observed(&self, pane: &ObservedCapturePane) -> bool {
         self.lifecycle_revision == pane.lifecycle_revision
             && self.pane_uuid == pane.pane_uuid
@@ -3486,6 +3527,8 @@ async fn activate_capture_binding(
         native_lease: None,
         #[cfg(all(feature = "vendored", unix))]
         streaming_lease: None,
+        #[cfg(all(feature = "vendored", unix))]
+        streaming_failed: false,
     })
 }
 
@@ -7382,6 +7425,11 @@ impl ObservationRuntime {
                         .remove_for_settlement(pane_id, false)
                         .expect("current streaming exit has an active task");
                     let task_stamp = task.lease.stamp();
+                    if should_record_streaming_fallback(&exit.reason)
+                        && let Some(binding) = capture_bindings.get_mut(&pane_id)
+                    {
+                        binding.latch_stream_failure(task_stamp);
+                    }
                     let binding_identity = capture_bindings.get(&pane_id).and_then(|binding| {
                         binding
                             .streaming_lease
@@ -7458,9 +7506,9 @@ impl ObservationRuntime {
                         .iter()
                         .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
                         .filter(|(pane_id, pane)| {
-                            capture_bindings
-                                .get(*pane_id)
-                                .is_some_and(|binding| binding.matches_observed(pane))
+                            capture_bindings.get(*pane_id).is_some_and(|binding| {
+                                binding.matches_observed(pane) && binding.streaming_source_drained()
+                            })
                         })
                         .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                         .collect();
@@ -8260,38 +8308,6 @@ impl ObservationRuntime {
                                     continue;
                                 }
 
-                                let Some((socket_shard, local_pane_id, socket_path)) =
-                                    vendored_streaming_route_for_pane(
-                                        &vendored_mux_socket_paths,
-                                        pane_id,
-                                    )
-                                else {
-                                    continue;
-                                };
-
-                                if !socket_path.exists() {
-                                    debug!(
-                                        pane_id,
-                                        generation = observed_pane.lifecycle_revision.get(),
-                                        local_pane_id,
-                                        socket_shard = socket_shard.0,
-                                        path = %socket_path.display(),
-                                        "Skipping vendored pane streaming because mux socket is missing"
-                                    );
-                                    continue;
-                                }
-
-                                let Some(token) =
-                                    allocate_streaming_task_token(&mut next_stream_task_token)
-                                else {
-                                    error!(
-                                        pane_id,
-                                        generation = observed_pane.lifecycle_revision.get(),
-                                        "Vendored streaming task token space exhausted; refusing to start an unidentifiable task"
-                                    );
-                                    continue;
-                                };
-
                                 let Some((binding_identity, existing_streaming_lease)) =
                                     capture_bindings.get(&pane_id).and_then(|binding| {
                                         binding.matches_observed(observed_pane).then(|| {
@@ -8342,6 +8358,46 @@ impl ObservationRuntime {
                                         }
                                     }
                                 }
+
+                                // A failed source remains polling-only for this
+                                // binding. Reach this check only after its retained
+                                // stream lease has successfully drained above.
+                                if capture_bindings
+                                    .get(&pane_id)
+                                    .is_none_or(|binding| !binding.may_start_streaming())
+                                {
+                                    continue;
+                                }
+
+                                let Some((socket_shard, local_pane_id, socket_path)) =
+                                    vendored_streaming_route_for_pane(
+                                        &vendored_mux_socket_paths,
+                                        pane_id,
+                                    )
+                                else {
+                                    continue;
+                                };
+                                if !socket_path.exists() {
+                                    debug!(
+                                        pane_id,
+                                        generation = observed_pane.lifecycle_revision.get(),
+                                        local_pane_id,
+                                        socket_shard = socket_shard.0,
+                                        path = %socket_path.display(),
+                                        "Skipping vendored pane streaming because mux socket is missing"
+                                    );
+                                    continue;
+                                }
+                                let Some(token) =
+                                    allocate_streaming_task_token(&mut next_stream_task_token)
+                                else {
+                                    error!(
+                                        pane_id,
+                                        generation = observed_pane.lifecycle_revision.get(),
+                                        "Vendored streaming task token space exhausted; refusing to start an unidentifiable task"
+                                    );
+                                    continue;
+                                };
 
                                 let streaming_lease = match capture_authority.issue_source(
                                     binding_identity,
@@ -8458,9 +8514,10 @@ impl ObservationRuntime {
                             .iter()
                             .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
                             .filter(|(pane_id, pane)| {
-                                capture_bindings
-                                    .get(*pane_id)
-                                    .is_some_and(|binding| binding.matches_observed(pane))
+                                capture_bindings.get(*pane_id).is_some_and(|binding| {
+                                    binding.matches_observed(pane)
+                                        && binding.streaming_source_drained()
+                                })
                             })
                             .map(|(pane_id, pane)| (*pane_id, pane.info.clone()))
                             .collect();
@@ -14735,6 +14792,8 @@ mod tests {
                 native_lease: None,
                 #[cfg(all(feature = "vendored", unix))]
                 streaming_lease: None,
+                #[cfg(all(feature = "vendored", unix))]
+                streaming_failed: false,
             };
             let second_binding = ActiveCaptureBinding {
                 lifecycle_revision: PaneLifecycleRevision::new(0),
@@ -14747,6 +14806,8 @@ mod tests {
                 native_lease: None,
                 #[cfg(all(feature = "vendored", unix))]
                 streaming_lease: None,
+                #[cfg(all(feature = "vendored", unix))]
+                streaming_failed: false,
             };
             let metadata = Arc::new(RwLock::new(HashMap::from([
                 (
@@ -17199,6 +17260,152 @@ mod tests {
             generation,
             capture_stamp: lease.stamp(),
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn failed_stream_keeps_polling_admitted_across_discovery_syncs() {
+        use std::sync::atomic::AtomicU64;
+
+        struct CountedSource(Arc<AtomicU64>);
+        impl crate::wezterm::PaneTextSource for CountedSource {
+            type Fut<'a> = std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>,
+            >;
+
+            fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok("fallback source output".to_string()) })
+            }
+        }
+
+        run_async_test(async {
+            let cx = runtime_loop_cx();
+            let authority = CaptureAuthority::new();
+            let metadata = Arc::new(RwLock::new(HashMap::new()));
+            authority
+                .install_desired_revisions(
+                    CaptureViewEpoch::new(1).unwrap(),
+                    &HashMap::from([(17, CaptureRevision::new(1).unwrap())]),
+                )
+                .unwrap();
+            let mut binding = activate_capture_binding(
+                &cx,
+                &authority,
+                17,
+                PaneLifecycleRevision::new(0),
+                &metadata,
+                CapturePaneMetadata {
+                    pane_uuid: "fallback-pane".into(),
+                    discovery_generation: 0,
+                    discovery_revision: DiscoveryRevision(1),
+                },
+            )
+            .await
+            .unwrap();
+            let stream = authority
+                .issue_source(binding.identity, CaptureSourceKind::VendoredStreaming)
+                .unwrap();
+            binding.streaming_lease = Some(stream.clone());
+            let held = stream.try_acquire_producer(stream.stamp(), 17).unwrap();
+            assert!(binding.latch_stream_failure(stream.stamp()));
+            assert!(!binding.streaming_source_drained());
+            assert!(
+                authority
+                    .begin_source_revocation(binding.identity, stream.stamp())
+                    .unwrap()
+                    .wait_with_cx(&cx, Duration::ZERO)
+                    .await
+                    .is_err()
+            );
+            assert!(!binding.streaming_source_drained());
+            assert!(!binding.may_start_streaming());
+            drop(held);
+            authority
+                .begin_source_revocation(binding.identity, stream.stamp())
+                .unwrap()
+                .wait_with_cx(&cx, Duration::from_secs(1))
+                .await
+                .unwrap();
+            binding.streaming_lease = None;
+
+            let reads = Arc::new(AtomicU64::new(0));
+            let (tx, mut rx) = mpsc::channel(4);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(17, PaneCursor::new(17))])));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let pane = make_pane(17, "fallback");
+            registry.write().await.update(vec![pane.clone()]);
+            let mut supervisor = TailerSupervisor::new(
+                TailerConfig {
+                    min_interval: Duration::ZERO,
+                    ..TailerConfig::default()
+                },
+                tx,
+                cursors,
+                registry,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(CountedSource(Arc::clone(&reads))),
+            );
+            // Reproduce the exit -> due discovery sync -> spawn ordering.
+            // Repeated syncs must not replace the fallback with another stream.
+            for _ in 0..3 {
+                assert!(!binding.may_start_streaming());
+                assert!(binding.streaming_source_drained());
+                supervisor
+                    .sync_authorized_tailers(
+                        &HashMap::from([(17, pane.clone())]),
+                        &HashMap::from([(17, binding.polling_lease.clone())]),
+                    )
+                    .unwrap();
+            }
+            let mut tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut tasks);
+            let (pane_id, outcome) =
+                runtime_timeout(&cx, Duration::from_secs(1), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .expect("polling must actually execute the source read");
+            supervisor.handle_poll_result(pane_id, outcome);
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            let event = recv_mpsc(&mut rx).await;
+            assert_eq!(event.segment.content, "fallback source output");
+            assert_eq!(event.segment.seq, 0);
+            drop(event);
+
+            authority
+                .begin_pane_revocation(binding.identity)
+                .unwrap()
+                .wait_with_cx(&cx, Duration::from_secs(1))
+                .await
+                .unwrap();
+            authority
+                .install_desired_revisions(
+                    CaptureViewEpoch::new(2).unwrap(),
+                    &HashMap::from([(17, CaptureRevision::new(2).unwrap())]),
+                )
+                .unwrap();
+            let mut successor = activate_capture_binding(
+                &cx,
+                &authority,
+                17,
+                PaneLifecycleRevision::new(1),
+                &metadata,
+                CapturePaneMetadata {
+                    pane_uuid: "successor-pane".into(),
+                    discovery_generation: 1,
+                    discovery_revision: DiscoveryRevision(2),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(successor.may_start_streaming());
+            let successor_stream = authority
+                .issue_source(successor.identity, CaptureSourceKind::VendoredStreaming)
+                .unwrap();
+            successor.streaming_lease = Some(successor_stream);
+            assert!(!successor.latch_stream_failure(stream.stamp()));
+            assert!(!successor.streaming_failed);
+        });
     }
 
     #[cfg(all(feature = "vendored", unix))]
