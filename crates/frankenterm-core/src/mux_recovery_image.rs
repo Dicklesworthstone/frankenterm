@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 2;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 3;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -113,6 +113,9 @@ pub enum MuxRecoveryImageError {
 
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
+
+    #[error("{field} must be a canonical nonnil UUID")]
+    InvalidDurableIdentity { field: &'static str },
 
     #[error("duplicate incarnation window id {0}")]
     DuplicateWindowId(usize),
@@ -739,6 +742,7 @@ impl RecoveryTab {
 pub struct RecoveryPane {
     pub pane_id: usize,
     pub pane_uuid: String,
+    pub spawn_custody: RecoverySpawnCustody,
     pub domain_name: String,
     /// Terminal-model title from the validated checkpoint; no process-title fallback.
     pub title: String,
@@ -749,6 +753,49 @@ pub struct RecoveryPane {
     pub cursor_position: (usize, usize),
     pub alt_screen_active: bool,
     pub checkpoint: PaneCheckpointBinding,
+}
+
+/// Nonsecret provenance, explicitly absent for legacy panes. Recorded values
+/// locate private AEAD custody; they never substitute for its capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoverySpawnCustody {
+    Absent,
+    Original {
+        broker_lineage: uuid::Uuid,
+        guardian_incarnation: uuid::Uuid,
+        original_mux_incarnation: uuid::Uuid,
+        broker_build: [u8; 32],
+        guardian_build: [u8; 32],
+        original_mux_build: [u8; 32],
+        pane_id: uuid::Uuid,
+        spawn_effect_id: uuid::Uuid,
+        current_mux_incarnation: uuid::Uuid,
+        current_lease_generation: u64,
+    },
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl From<Option<mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>>
+    for RecoverySpawnCustody
+{
+    fn from(value: Option<mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>) -> Self {
+        let Some(value) = value else {
+            return Self::Absent;
+        };
+        let scope = value.original;
+        Self::Original {
+            broker_lineage: scope.broker_lineage,
+            guardian_incarnation: scope.guardian_incarnation,
+            original_mux_incarnation: scope.mux_incarnation,
+            broker_build: scope.broker_build,
+            guardian_build: scope.guardian_build,
+            original_mux_build: scope.mux_build,
+            pane_id: scope.pane_id,
+            spawn_effect_id: scope.effect_id,
+            current_mux_incarnation: value.current_mux_incarnation,
+            current_lease_generation: value.current_lease_generation,
+        }
+    }
 }
 
 impl fmt::Debug for RecoveryPane {
@@ -816,9 +863,20 @@ pub enum CheckpointAuthority {
     /// Cryptographically signed or verified under guardian lease and catalog protocol.
     Guardian {
         guardian_generation: u64,
-        lease_verifier: String,
+        publication: RecoveryGuardianPublication,
         catalog_generation: u64,
     },
+}
+
+/// Serialized identity of a publication receipt, not a standalone verifier.
+/// Restore must authenticate it against live guardian custody/catalog state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryGuardianPublication {
+    pub guardian_incarnation: uuid::Uuid,
+    pub mux_incarnation: uuid::Uuid,
+    pub effect_id: uuid::Uuid,
+    pub checkpoint_identity: [u8; 32],
+    pub output_boundary_identity: [u8; 32],
 }
 
 /// Thin terminal reference projection consumed directly by the restore planner (`session_restore.rs`).
@@ -1003,16 +1061,6 @@ impl MuxRecoveryImage {
                 &pane.checkpoint.checkpoint_ref.object_id,
                 MAX_ID_STRING_BYTES,
             )?;
-            if let CheckpointAuthority::Guardian {
-                ref lease_verifier, ..
-            } = pane.checkpoint.authority
-            {
-                validate_string_len(
-                    "pane.checkpoint.authority.lease_verifier",
-                    lease_verifier,
-                    MAX_ID_STRING_BYTES,
-                )?;
-            }
         }
 
         for window in &self.topology.windows {
@@ -1252,6 +1300,49 @@ impl MuxRecoveryImage {
             }
 
             // Authority validation
+            if let RecoverySpawnCustody::Original {
+                broker_lineage,
+                guardian_incarnation,
+                original_mux_incarnation,
+                broker_build,
+                guardian_build,
+                original_mux_build,
+                pane_id,
+                spawn_effect_id,
+                current_mux_incarnation,
+                current_lease_generation,
+            } = &pane.spawn_custody
+            {
+                if [
+                    broker_lineage,
+                    guardian_incarnation,
+                    original_mux_incarnation,
+                    pane_id,
+                    spawn_effect_id,
+                    current_mux_incarnation,
+                ]
+                .iter()
+                .any(|id| id.is_nil())
+                    || [broker_build, guardian_build, original_mux_build]
+                        .iter()
+                        .any(|build| **build == [0; 32])
+                    || pane_id.to_string() != pane.pane_uuid
+                    || current_mux_incarnation.to_string() != self.header.mux_incarnation_id
+                    || *current_lease_generation == 0
+                    || (*current_lease_generation == 1
+                        && current_mux_incarnation != original_mux_incarnation)
+                    || !matches!(&pane.checkpoint.authority,
+                        CheckpointAuthority::Guardian { guardian_generation, publication, .. }
+                        if guardian_generation == current_lease_generation
+                            && publication.guardian_incarnation == *guardian_incarnation
+                            && publication.mux_incarnation == *current_mux_incarnation)
+                {
+                    return Err(MuxRecoveryImageError::InvalidAuthority {
+                        pane_id: pane.pane_id,
+                        reason: "original Spawn provenance does not match captured pane and current owner",
+                    });
+                }
+            }
             match &pane.checkpoint.authority {
                 CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms,
@@ -1272,7 +1363,7 @@ impl MuxRecoveryImage {
                 }
                 CheckpointAuthority::Guardian {
                     guardian_generation,
-                    lease_verifier,
+                    publication,
                     catalog_generation,
                 } => {
                     if *guardian_generation == 0 {
@@ -1287,10 +1378,15 @@ impl MuxRecoveryImage {
                             reason: "catalog_generation must be greater than zero",
                         });
                     }
-                    if lease_verifier.is_empty() {
+                    if publication.guardian_incarnation.is_nil()
+                        || publication.mux_incarnation.is_nil()
+                        || publication.effect_id.is_nil()
+                        || publication.checkpoint_identity == [0; 32]
+                        || publication.output_boundary_identity == [0; 32]
+                    {
                         return Err(MuxRecoveryImageError::InvalidAuthority {
                             pane_id: pane.pane_id,
-                            reason: "lease_verifier must not be empty",
+                            reason: "published guardian receipt identities must be nonzero",
                         });
                     }
                 }
@@ -1308,6 +1404,7 @@ impl MuxRecoveryImage {
             if !seen_window_ids.insert(window.window_id) {
                 return Err(MuxRecoveryImageError::DuplicateWindowId(window.window_id));
             }
+            validate_durable_identity("window.stable_window_id", &window.stable_window_id)?;
             if !seen_stable_window_ids.insert(&window.stable_window_id) {
                 return Err(MuxRecoveryImageError::DuplicateStableWindowId(
                     window.stable_window_id.clone(),
@@ -1350,6 +1447,7 @@ impl MuxRecoveryImage {
             }
 
             for tab in &window.tabs {
+                validate_durable_identity("tab.stable_tab_id", &tab.stable_tab_id)?;
                 if !seen_tab_ids.insert(tab.tab_id) {
                     return Err(MuxRecoveryImageError::DuplicateTabId(tab.tab_id));
                 }
@@ -1626,6 +1724,21 @@ impl MuxRecoveryImage {
 // =============================================================================
 
 #[cfg(feature = "frankenterm-deps")]
+pub enum RecoveryParserCheckpoint<'a> {
+    Model(&'a mux::ModelParserCheckpointAck),
+    Guardian(&'a mux::guardian_checkpoint::PublishedGuardianCheckpoint),
+}
+
+#[cfg(feature = "frankenterm-deps")]
+struct ImageParserCapture<'a> {
+    registration_wire_identity: [u8; 16],
+    durable_pane_id: uuid::Uuid,
+    parser_stream_bytes: u64,
+    semantic_generation: Option<u64>,
+    terminal_checkpoint: &'a frankenterm_term::RecoveryTerminalCheckpointV2,
+}
+
+#[cfg(feature = "frankenterm-deps")]
 impl MuxRecoveryImage {
     /// Converts a coherent live [`mux::MuxCapturedTopology`] and per-pane [`mux::ModelParserCheckpointAck`]s
     /// into a validated [`MuxRecoveryImage`]. The publisher authenticates its encrypted envelope.
@@ -1644,6 +1757,21 @@ impl MuxRecoveryImage {
         meta: RecoveryImageGenerationMeta,
         captured: &mux::MuxCapturedTopology,
         checkpoint_acks: &HashMap<usize, &mux::ModelParserCheckpointAck>,
+        checkpoint_object_refs: &HashMap<usize, RecoveryObjectRef>,
+    ) -> Result<Self, MuxRecoveryImageError> {
+        let captures = checkpoint_acks
+            .iter()
+            .map(|(pane, ack)| (*pane, RecoveryParserCheckpoint::Model(*ack)))
+            .collect();
+        Self::from_mux_captured_checkpoints(meta, captured, &captures, checkpoint_object_refs)
+    }
+
+    /// Convert exact model captures and durably published guardian captures.
+    /// Original Spawn provenance remains separate from checkpoint authority.
+    pub fn from_mux_captured_checkpoints(
+        meta: RecoveryImageGenerationMeta,
+        captured: &mux::MuxCapturedTopology,
+        checkpoint_acks: &HashMap<usize, RecoveryParserCheckpoint<'_>>,
         checkpoint_object_refs: &HashMap<usize, RecoveryObjectRef>,
     ) -> Result<Self, MuxRecoveryImageError> {
         // 1. Metadata validation
@@ -1713,6 +1841,80 @@ impl MuxRecoveryImage {
                 ));
             }
             let ack = checkpoint_acks.get(&binding.pane_id).unwrap();
+            let (ack, authority) = match ack {
+                RecoveryParserCheckpoint::Model(ack) => {
+                    if binding.spawn_custody.is_some() {
+                        return Err(MuxRecoveryImageError::InvalidAuthority {
+                            pane_id: binding.pane_id,
+                            reason: "guardian provenance requires a published guardian checkpoint",
+                        });
+                    }
+                    (
+                        ImageParserCapture {
+                            registration_wire_identity: ack.registration_wire_identity,
+                            durable_pane_id: ack.durable_pane_id,
+                            parser_stream_bytes: ack.parser_stream_bytes,
+                            semantic_generation: Some(ack.semantic_generation),
+                            terminal_checkpoint: &ack.terminal_checkpoint,
+                        },
+                        CheckpointAuthority::ModelOnly {
+                            captured_at_epoch_ms: captured.captured_at_epoch_ms,
+                            parser_seqno: None,
+                        },
+                    )
+                }
+                RecoveryParserCheckpoint::Guardian(published) => {
+                    let ack = published.capture();
+                    let receipt = published.receipt();
+                    let provenance =
+                        binding
+                            .spawn_custody
+                            .ok_or(MuxRecoveryImageError::InvalidAuthority {
+                                pane_id: binding.pane_id,
+                                reason: "guardian capture lacks original Spawn provenance",
+                            })?;
+                    if provenance.original.pane_id != receipt.pane_id()
+                        || provenance.original.guardian_incarnation
+                            != published.owner().guardian_incarnation()
+                        || provenance.current_mux_incarnation != published.owner().mux_incarnation()
+                        || provenance.current_lease_generation != receipt.generation()
+                        || provenance.current_mux_incarnation.as_bytes()
+                            != &captured.session_incarnation.as_bytes()
+                    {
+                        return Err(MuxRecoveryImageError::InvalidAuthority {
+                            pane_id: binding.pane_id,
+                            reason: "published capture differs from captured guardian lease",
+                        });
+                    }
+                    let checkpoint = ack.terminal_checkpoint();
+                    (
+                        ImageParserCapture {
+                            registration_wire_identity: ack.registration_wire_identity(),
+                            durable_pane_id: ack.durable_pane_id(),
+                            parser_stream_bytes: ack.parser_stream_bytes(),
+                            semantic_generation: None,
+                            terminal_checkpoint: checkpoint,
+                        },
+                        CheckpointAuthority::Guardian {
+                            guardian_generation: receipt.generation(),
+                            publication: RecoveryGuardianPublication {
+                                guardian_incarnation: provenance.original.guardian_incarnation,
+                                mux_incarnation: provenance.current_mux_incarnation,
+                                effect_id: receipt.effect_id(),
+                                checkpoint_identity: receipt
+                                    .intent()
+                                    .checkpoint_identity()
+                                    .into_bytes(),
+                                output_boundary_identity: receipt
+                                    .intent()
+                                    .output_boundary_identity()
+                                    .into_bytes(),
+                            },
+                            catalog_generation: receipt.sequence(),
+                        },
+                    )
+                }
+            };
             if binding.registration_wire_identity != ack.registration_wire_identity {
                 return Err(MuxRecoveryImageError::RegistrationWireIdentityMismatch {
                     pane_id: binding.pane_id,
@@ -1747,7 +1949,10 @@ impl MuxRecoveryImage {
                 frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
             ).map_err(|_| invalid_model("canonical checkpoint validation failed"))?;
             let model = validated.checkpoint();
-            if model.semantic_generation() != ack.semantic_generation {
+            if ack
+                .semantic_generation
+                .is_some_and(|expected| model.semantic_generation() != expected)
+            {
                 return Err(invalid_model("semantic generation differs from ACK"));
             }
             if model.primary_rows() != ack.terminal_checkpoint.rows()
@@ -1778,16 +1983,13 @@ impl MuxRecoveryImage {
                 .get(&binding.pane_id)
                 .unwrap()
                 .clone();
-            let authority = CheckpointAuthority::ModelOnly {
-                captured_at_epoch_ms: captured.captured_at_epoch_ms,
-                parser_seqno: None,
-            };
 
             pane_uuid_map.insert(binding.pane_id, binding.pane_uuid.clone());
 
             panes.push(RecoveryPane {
                 pane_id: binding.pane_id,
                 pane_uuid: binding.pane_uuid.clone(),
+                spawn_custody: binding.spawn_custody.into(),
                 domain_name: binding.domain_name.clone(),
                 title: model.title().to_owned(),
                 cwd: model.current_directory().map(str::to_owned),
@@ -2130,6 +2332,18 @@ fn convert_mux_pane_node(
 // Helper Functions
 // =============================================================================
 
+fn validate_durable_identity(
+    field: &'static str,
+    value: &str,
+) -> Result<(), MuxRecoveryImageError> {
+    let identity = uuid::Uuid::parse_str(value)
+        .map_err(|_| MuxRecoveryImageError::InvalidDurableIdentity { field })?;
+    if identity.is_nil() || identity.to_string() != value {
+        return Err(MuxRecoveryImageError::InvalidDurableIdentity { field });
+    }
+    Ok(())
+}
+
 fn validate_string_len(
     field: &'static str,
     val: &str,
@@ -2241,6 +2455,81 @@ fn validate_split_node(
 mod tests {
     use super::*;
 
+    fn test_guardian_publication() -> RecoveryGuardianPublication {
+        RecoveryGuardianPublication {
+            guardian_incarnation: uuid::Uuid::from_u128(1),
+            mux_incarnation: uuid::Uuid::from_u128(2),
+            effect_id: uuid::Uuid::from_u128(3),
+            checkpoint_identity: [4; 32],
+            output_boundary_identity: [5; 32],
+        }
+    }
+
+    #[test]
+    fn durable_window_and_tab_ids_require_canonical_nonnil_uuids() {
+        for window_identity in [true, false] {
+            for invalid in [
+                "",
+                "window-1",
+                "00000000-0000-0000-0000-000000000000",
+                "000000000000000000000000000000ab",
+                "00000000-0000-0000-0000-0000000000AB",
+                "urn:uuid:00000000-0000-0000-0000-0000000000ab",
+            ] {
+                let mut image = make_valid_test_image();
+                let field = if window_identity {
+                    image.topology.windows[0].stable_window_id = invalid.into();
+                    "window.stable_window_id"
+                } else {
+                    image.topology.windows[0].tabs[0].stable_tab_id = invalid.into();
+                    "tab.stable_tab_id"
+                };
+                image.image_digest = image.compute_digest().unwrap();
+                assert_eq!(
+                    image.validate().unwrap_err(),
+                    MuxRecoveryImageError::InvalidDurableIdentity { field }
+                );
+                assert!(matches!(
+                    MuxRecoveryImage::from_json_slice(&serde_json::to_vec(&image).unwrap()),
+                    Err(MuxRecoveryImageError::InvalidDurableIdentity { field: actual })
+                        if actual == field
+                ));
+            }
+        }
+        let mut image = make_valid_test_image();
+        image.topology.windows[0].stable_window_id = "00000000-0000-0000-0000-0000000000ab".into();
+        image.topology.windows[0].tabs[0].stable_tab_id =
+            "00000000-0000-0000-0000-0000000000cd".into();
+        image.image_digest = image.compute_digest().unwrap();
+        image.validate().unwrap();
+    }
+
+    #[test]
+    fn canonical_durable_id_duplicates_are_rejected_across_numeric_identities() {
+        let mut image = make_valid_test_image();
+        let mut duplicate = image.topology.windows[0].clone();
+        duplicate.window_id += 1;
+        duplicate.tabs.clear();
+        let expected = duplicate.stable_window_id.clone();
+        image.topology.windows.push(duplicate);
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::DuplicateStableWindowId(expected)
+        );
+
+        let mut image = make_valid_test_image();
+        let mut duplicate = image.topology.windows[0].tabs[0].clone();
+        duplicate.tab_id += 1;
+        let expected = duplicate.stable_tab_id.clone();
+        image.topology.windows[0].tabs.push(duplicate);
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::DuplicateStableTabId(expected)
+        );
+    }
+
     #[test]
     fn window_recovery_metadata_is_required_and_prior_schema_is_rejected() {
         let image = make_valid_test_image();
@@ -2255,12 +2544,20 @@ mod tests {
                 "{field}"
             );
         }
-        let mut old = image;
-        old.header.schema_version = 1;
-        assert_eq!(
-            old.validate().unwrap_err(),
-            MuxRecoveryImageError::UnsupportedSchemaVersion(1)
-        );
+        let mut without_provenance = serde_json::to_value(&image).unwrap();
+        without_provenance["panes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("spawn_custody");
+        assert!(serde_json::from_value::<MuxRecoveryImage>(without_provenance).is_err());
+        for version in [1, 2] {
+            let mut old = image.clone();
+            old.header.schema_version = version;
+            assert_eq!(
+                old.validate().unwrap_err(),
+                MuxRecoveryImageError::UnsupportedSchemaVersion(version)
+            );
+        }
     }
 
     #[test]
@@ -2360,6 +2657,7 @@ mod tests {
 
     fn make_test_pane(pane_id: usize, pane_uuid: &str, incarnation_id: &str) -> RecoveryPane {
         RecoveryPane {
+            spawn_custody: RecoverySpawnCustody::Absent,
             pane_id,
             pane_uuid: pane_uuid.to_string(),
             domain_name: "local".to_string(),
@@ -2448,7 +2746,7 @@ mod tests {
 
         let tab = RecoveryTab {
             tab_id: 10,
-            stable_tab_id: "uuid-tab-10".to_string(),
+            stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
             title: "main_tab".to_string(),
             working_dir: Some("/project".to_string()),
             size: TerminalSize {
@@ -2475,7 +2773,7 @@ mod tests {
 
         let window = RecoveryWindow {
             window_id: 100,
-            stable_window_id: "uuid-window-100".to_string(),
+            stable_window_id: "00000000-0000-0000-0000-000000000100".to_string(),
             workspace: "default".to_string(),
             title: "recovery window".to_string(),
             last_active_tab_id: None,
@@ -2554,11 +2852,19 @@ mod tests {
         assert!(image.find_pane_by_uuid("nonexistent").is_none());
 
         assert!(image.find_window(100).is_some());
-        assert!(image.find_window_by_stable_id("uuid-window-100").is_some());
+        assert!(
+            image
+                .find_window_by_stable_id("00000000-0000-0000-0000-000000000100")
+                .is_some()
+        );
         assert!(image.find_window(999).is_none());
 
         assert!(image.find_tab(10).is_some());
-        assert!(image.find_tab_by_stable_id("uuid-tab-10").is_some());
+        assert!(
+            image
+                .find_tab_by_stable_id("00000000-0000-0000-0000-000000000010")
+                .is_some()
+        );
         assert!(image.find_tab(999).is_none());
 
         let tab = image.find_tab(10).unwrap();
@@ -2585,7 +2891,7 @@ mod tests {
         let mut image = make_valid_test_image();
         image.panes[0].checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 5,
-            lease_verifier: "lease-sig-ok".to_string(),
+            publication: test_guardian_publication(),
             catalog_generation: 3,
         };
         image.image_digest = image.compute_digest().unwrap();
@@ -2865,7 +3171,7 @@ mod tests {
         let mut image = make_valid_test_image();
         let mut dup_tab = image.topology.windows[0].tabs[0].clone();
         dup_tab.tab_id = 11;
-        dup_tab.stable_tab_id = "uuid-tab-11".to_string();
+        dup_tab.stable_tab_id = "00000000-0000-0000-0000-000000000011".to_string();
         dup_tab.floating_panes.clear();
         dup_tab.floating_focus = None;
         dup_tab.pane_stacks.clear();
@@ -3035,7 +3341,7 @@ mod tests {
         let mut image = make_valid_test_image();
         image.panes[0].checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 0,
-            lease_verifier: "lease-sig".to_string(),
+            publication: test_guardian_publication(),
             catalog_generation: 1,
         };
         image.image_digest = image.compute_digest().unwrap();
@@ -3051,11 +3357,14 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_guardian_authority_empty_lease_verifier() {
+    fn test_negative_guardian_authority_zero_publication_identity() {
         let mut image = make_valid_test_image();
         image.panes[0].checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 1,
-            lease_verifier: String::new(),
+            publication: RecoveryGuardianPublication {
+                checkpoint_identity: [0; 32],
+                ..test_guardian_publication()
+            },
             catalog_generation: 1,
         };
         image.image_digest = image.compute_digest().unwrap();
@@ -3065,7 +3374,7 @@ mod tests {
             err,
             MuxRecoveryImageError::InvalidAuthority {
                 pane_id: 1,
-                reason: "lease_verifier must not be empty"
+                reason: "published guardian receipt identities must be nonzero"
             }
         ));
     }
@@ -3117,7 +3426,7 @@ mod tests {
 
         let tab = RecoveryTab {
             tab_id: 10,
-            stable_tab_id: "uuid-tab-10".to_string(),
+            stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
             title: "tree_tab".to_string(),
             working_dir: None,
             size: TerminalSize::default(),
@@ -3149,7 +3458,7 @@ mod tests {
                 }],
                 windows: vec![RecoveryWindow {
                     window_id: 100,
-                    stable_window_id: "win-100".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000100".to_string(),
                     workspace: "default".to_string(),
                     title: String::new(),
                     last_active_tab_id: None,
@@ -3254,7 +3563,7 @@ mod tests {
     fn test_negative_duplicate_window_id() {
         let mut image = make_valid_test_image();
         let mut dup_win = image.topology.windows[0].clone();
-        dup_win.stable_window_id = "uuid-window-other".to_string();
+        dup_win.stable_window_id = "00000000-0000-0000-0000-000000000101".to_string();
         image.topology.windows.push(dup_win);
         image.image_digest = image.compute_digest().unwrap();
 
@@ -3266,7 +3575,7 @@ mod tests {
     fn test_negative_duplicate_tab_id() {
         let mut image = make_valid_test_image();
         let mut dup_tab = image.topology.windows[0].tabs[0].clone();
-        dup_tab.stable_tab_id = "uuid-tab-other".to_string();
+        dup_tab.stable_tab_id = "00000000-0000-0000-0000-000000000011".to_string();
         dup_tab.root_split = None;
         dup_tab.floating_panes.clear();
         dup_tab.pane_stacks.clear();
@@ -3562,6 +3871,7 @@ mod converter_tests {
         let binding1 = mux::MuxCapturedPaneBinding {
             pane_id: 101,
             pane_uuid: uuid::Uuid::from_bytes(uuid1).to_string(),
+            spawn_custody: None,
             registration_wire_identity: wire1,
             domain_id: 1,
             domain_name: "local".to_string(),
@@ -3586,6 +3896,7 @@ mod converter_tests {
         let binding2 = mux::MuxCapturedPaneBinding {
             pane_id: 102,
             pane_uuid: uuid::Uuid::from_bytes(uuid2).to_string(),
+            spawn_custody: None,
             registration_wire_identity: wire2,
             domain_id: 1,
             domain_name: "local".to_string(),
@@ -3940,6 +4251,7 @@ mod converter_tests {
         captured.pane_bindings.push(mux::MuxCapturedPaneBinding {
             pane_id: 103,
             pane_uuid: uuid::Uuid::from_bytes(uuid3).to_string(),
+            spawn_custody: None,
             registration_wire_identity: wire3,
             domain_id: 1,
             domain_name: "local".to_string(),

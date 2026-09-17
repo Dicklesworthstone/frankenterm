@@ -16,9 +16,11 @@
 //! configured broker endpoint, the service publishes the authenticated Genesis
 //! model and prepares its encrypted journals before broker Spawn, then requires
 //! durable custody and real I/O handles before activating the pane. Replay
-//! binds that model to its original journal chain. Automatic mux selection,
-//! topology publication, successor lease transfer and guardian restart recovery
-//! still require integration; existing mux panes are never migrated implicitly.
+//! binds that model to its original journal chain. Explicit custody-backed
+//! first-generation mux transfer preserves the live broker child within one
+//! sealed build. Automatic mux selection, topology publication, cross-build
+//! upgrades and guardian restart recovery still require integration; existing
+//! mux panes are never migrated implicitly.
 //! The separately supervised broker exposes a content-free, paginated view of
 //! authenticated recovered Spawn journals. A live pre-acknowledgement
 //! Spawn also mints one plaintext recovery capability while persisting only its
@@ -27,9 +29,9 @@
 //! through an authenticated guarded
 //! transaction only while it owns no panes; a successful stop deliberately
 //! retains the socket path, so restart remains fail-closed until an explicit
-//! non-overwriting retirement design lands. Successor Claim/Query/Ack is live
-//! and effect-fenced in process, but its lease transitions are not yet in the
-//! authenticated WAL; successor activation therefore remains disabled.
+//! non-overwriting retirement design lands. Successor Claim/Query/Ack lease
+//! transitions synchronize through the authenticated WAL before activation;
+//! a failed or ambiguous append quarantines effects while retaining the child.
 
 pub use frankenterm_build_identity::{
     AtomicBuildIdentity, AtomicComponentIdentityError, SealedAtomicBuildIdentity,
@@ -97,6 +99,8 @@ pub use broker::{
 };
 #[cfg(unix)]
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
+#[cfg(unix)]
+pub use output::{GuardianDurableSpawnCustodyV1, GuardianReopenedCheckpointV1};
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]

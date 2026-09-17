@@ -78,7 +78,7 @@ write_envelope() {
   "completed": true,
   "expectations_failed": $expectations_failed,
   "timeline": {
-    "executed_resize_events": 8,
+    "executed_resize_events": 1,
     "events": [
       {
         "event_index": 0,
@@ -98,11 +98,11 @@ write_envelope() {
     ]
   },
   "stage_summary": [
-    {"stage":"input_intent","samples":8,"p95_duration_ns":500000},
-    {"stage":"scheduler_queueing","samples":8,"p95_duration_ns":2000000},
-    {"stage":"logical_reflow","samples":8,"p95_duration_ns":$logical_reflow_p95},
-    {"stage":"render_prep","samples":8,"p95_duration_ns":3000000},
-    {"stage":"presentation","samples":8,"p95_duration_ns":3000000}
+    {"stage":"input_intent","samples":1,"p95_duration_ns":500000},
+    {"stage":"scheduler_queueing","samples":1,"p95_duration_ns":2000000},
+    {"stage":"logical_reflow","samples":1,"p95_duration_ns":$logical_reflow_p95},
+    {"stage":"render_prep","samples":1,"p95_duration_ns":3000000},
+    {"stage":"presentation","samples":1,"p95_duration_ns":3000000}
   ],
   "aggregate_event_duration_ns": {
     "p50": $p50,
@@ -143,6 +143,38 @@ assert_json_eq "green summary status" "$ART1/resize-performance-report.json" '.s
 assert_json_eq "green hard_fail count" "$ART1/resize-performance-report.json" '.summary.scenario_hard_fail_count' "0"
 
 echo
+echo "Malformed evidence cannot produce a performance pass"
+for mutation in \
+    '.completed = false' \
+    '.timeline.executed_resize_events = 0 | .timeline.events = []' \
+    '.timeline.executed_resize_events = 2' \
+    'del(.aggregate_event_duration_ns.p95)' \
+    '.aggregate_event_duration_ns.p95 = "0"' \
+    '.aggregate_event_duration_ns.p50 = -1' \
+    '.aggregate_event_duration_ns.p95 = 1' \
+    '.stage_summary[0].samples = 0' \
+    '.stage_summary[0].p95_duration_ns = null' \
+    '.stage_summary += [.stage_summary[0]]' \
+    'del(.timeline.events[0].stages[1].queue_metrics)' \
+    '.timeline.events[0].stages[1].queue_metrics.depth_after = "0"' \
+    '.timeline.events[0].stages[1].queue_metrics.depth_before = -1' \
+    'del(.timeline.events[0].stages[1])' \
+    '.timeline.events[0].stages[2].duration_ns = null' \
+    '.scenario.name = "different-scenario"'; do
+    case_dir="$(new_tmpdir)"
+    mkdir -p "$case_dir/input"
+    for source in "$INPUT1/"*.json; do
+        jq "$mutation" "$source" >"$case_dir/input/$(basename "$source")"
+    done
+    assert_fail "reject $mutation" \
+        bash "$CHECKER" --check-only "$case_dir/input" \
+        --artifacts-dir "$case_dir/artifacts" --baseline-file "$case_dir/missing.json"
+    assert_json_eq "all malformed scenarios refuse" \
+        "$case_dir/artifacts/resize-performance-report.json" \
+        '.summary.scenario_hard_fail_count' "5"
+done
+
+echo
 echo "Test 2: near-threshold becomes warning, not hard fail"
 DIR2="$(new_tmpdir)"
 INPUT2="$DIR2/input"
@@ -162,6 +194,11 @@ write_suite "$INPUT3" 12000000 20000000 40000000 4000000 0
 assert_fail "checker hard fail exits non-zero" \
     bash "$CHECKER" --check-only "$INPUT3" --artifacts-dir "$ART3" --baseline-file "$DIR3/missing.json" --skip-test-lanes
 assert_json_eq "hard fail summary status" "$ART3/resize-performance-report.json" '.summary.overall_status' "hard_fail"
+assert_fail "failed measurements cannot establish a new baseline" \
+    env FT_RESIZE_GATE_BASELINE_REASON=test \
+    bash "$CHECKER" --check-only "$INPUT3" --artifacts-dir "$DIR3/baseline-attempt" \
+    --baseline-file "$DIR3/rejected-baseline.json" --write-baseline
+assert_pass "failed baseline remains absent" test ! -e "$DIR3/rejected-baseline.json"
 
 echo
 echo "Test 4: baseline drift hard-fails"

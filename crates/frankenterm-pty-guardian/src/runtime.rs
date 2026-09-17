@@ -210,6 +210,7 @@ struct RuntimeBrokerConnection {
     active_pane: Option<Uuid>,
     last_pane: Option<Uuid>,
     failed: bool,
+    fully_retired_outer_owner: bool,
 }
 
 fn activate_ready_broker_pane(
@@ -629,6 +630,17 @@ struct BrokerControlJob {
     mux_incarnation: Uuid,
     session: Box<BrokerPaneIoSessionV1>,
     handle: BrokerPaneOutputHandleV1,
+    rotation: Option<BrokerMuxRotationJob>,
+}
+
+struct BrokerMuxRotationJob {
+    endpoint: GuardianBrokerEndpoint,
+    predecessor_mux: Uuid,
+    successor_mux: Uuid,
+    mux_build: SealedAtomicBuildIdentity,
+    successor_session: Option<Box<BrokerPaneIoSessionV1>>,
+    successor_handle: Option<BrokerPaneOutputHandleV1>,
+    predecessor_was_retired: bool,
 }
 
 struct PendingBrokerControl {
@@ -637,6 +649,7 @@ struct PendingBrokerControl {
     protocol: GuardianProtocolState,
     request: AuthenticatedGuardianRequest,
     token_effect_authority: WorkerTokenEffectAuthority,
+    rotation: Option<BrokerMuxRotationJob>,
 }
 
 struct GenesisSpawnJob {
@@ -848,6 +861,9 @@ fn execute_checkpoint_job(
     job: &mut CheckpointJob,
 ) -> Option<GuardianResponseEnvelope> {
     if let Some(control) = job.broker_control.as_mut() {
+        if control.rotation.is_some() {
+            return execute_mux_rotation_job(store, &mut job.protocol, &job.request, control);
+        }
         return execute_broker_control_job(
             &mut job.protocol,
             &job.request,
@@ -935,6 +951,116 @@ fn execute_checkpoint_job(
 /// Execute one leased broker mutation on the authority worker. The original
 /// authenticated effect transaction owns deduplication; a socket error cannot
 /// establish that the child did not observe the mutation.
+fn execute_mux_rotation_job(
+    store: &GuardianCheckpointStageStore,
+    protocol: &mut GuardianProtocolState,
+    request: &AuthenticatedGuardianRequest,
+    control: &mut BrokerControlJob,
+) -> Option<GuardianResponseEnvelope> {
+    let reject = || {
+        Some(GuardianResponseEnvelope::rejection(
+            request,
+            GuardianRejectionCode::InvalidRequest,
+        ))
+    };
+    let Ok((context, presented)) = store.authenticate_mux_rotation_payload(request.payload())
+    else {
+        return reject();
+    };
+    if request.header().operation != GuardianOperation::Claim
+        || request.header().pane_id != Some(context.pane_id)
+        || context.pane_id != control.pane_id
+        || request.header().lease_generation != 1
+        || request.header().guardian_incarnation != context.guardian_incarnation
+    {
+        return reject();
+    }
+    let Some(handoff_id) = request.header().effect_id else {
+        return reject();
+    };
+    let Some(rotation) = control.rotation.as_mut() else {
+        return reject();
+    };
+    let can_rotate = rotation.predecessor_was_retired
+        && control.mux_incarnation == context.mux_incarnation
+        && context.mux_incarnation != request.header().mux_incarnation
+        && matches!(
+            protocol.pane_state(context.pane_id),
+            Some(GuardianPaneState::LiveUnclaimed { generation: 1 })
+        );
+    let result = protocol.apply_effect_transactionally(request, |_reply| {
+        if !can_rotate {
+            return GuardianEffectOutcome::DefinitelyNotApplied(
+                RuntimeEffectError::InternalInvariant,
+            );
+        }
+        let deadline = Instant::now() + BROKER_IO_DEADLINE;
+        if rotation.successor_session.is_none() {
+            let client = match control.session.client.connect_mux_successor(
+                &rotation.endpoint.socket_path,
+                &rotation.endpoint.token_path,
+                request.header().mux_incarnation,
+                rotation.mux_build,
+            ) {
+                Ok(client) => client,
+                Err(_) => {
+                    return GuardianEffectOutcome::DefinitelyNotApplied(
+                        RuntimeEffectError::InternalInvariant,
+                    );
+                }
+            };
+            rotation.successor_session = Some(Box::new(BrokerPaneIoSessionV1 { client }));
+        }
+        let Some(successor) = rotation.successor_session.as_mut() else {
+            return GuardianEffectOutcome::DefinitelyNotApplied(
+                RuntimeEffectError::InternalInvariant,
+            );
+        };
+        // These are pure authenticated provenance checks. A stale retained
+        // record cannot quarantine a live pane before any fence was sent.
+        if !successor
+            .client
+            .matches_mux_identity(request.header().mux_incarnation, rotation.mux_build)
+            || control
+                .session
+                .client
+                .validate_initial_mux_rotation(
+                    &successor.client,
+                    &control.handle,
+                    &context,
+                    handoff_id,
+                    request.header().request_id,
+                )
+                .is_err()
+        {
+            return GuardianEffectOutcome::DefinitelyNotApplied(
+                RuntimeEffectError::InternalInvariant,
+            );
+        }
+        match control.session.client.rotate_initial_mux_owner(
+            &mut successor.client,
+            store,
+            &control.handle,
+            &context,
+            &presented,
+            handoff_id,
+            request.header().request_id,
+            deadline,
+        ) {
+            Ok(handle) => {
+                rotation.successor_handle = Some(handle);
+                GuardianEffectOutcome::Applied
+            }
+            Err(_) => GuardianEffectOutcome::OutcomeIndeterminate,
+        }
+    });
+    let mut indeterminate = false;
+    match effect_result(request, result, &mut indeterminate) {
+        Ok(reply) => GuardianResponseEnvelope::reply(request, &reply).ok(),
+        Err(code) => Some(GuardianResponseEnvelope::rejection(request, code)),
+    }
+}
+
 fn execute_broker_control_job(
     protocol: &mut GuardianProtocolState,
     request: &AuthenticatedGuardianRequest,
@@ -1343,6 +1469,7 @@ pub struct GuardianRuntime {
     broker_endpoint: Option<GuardianBrokerEndpoint>,
     broker_connections: HashMap<Uuid, RuntimeBrokerConnection>,
     starting_broker_panes: HashMap<Uuid, StartingBrokerPane>,
+    rotation_admission_owner: Option<Uuid>,
     completion_waker: Arc<Waker>,
     // This slot is reachable only if the pane map violates the invariant that
     // a worker-owned pane cannot retire while the sole protocol authority is
@@ -1360,6 +1487,70 @@ pub struct GuardianRuntime {
 }
 
 impl GuardianRuntime {
+    #[cfg(test)]
+    pub(crate) fn genesis_admission_diagnostic_for_test(&self, panes: [Uuid; 2]) -> String {
+        let mut diagnostic = format!(
+            "protocol={} pending_genesis={} pipeline_failed={} indeterminate={} counters={:?}",
+            self.protocol.is_some(),
+            self.pending_genesis_submission.is_some(),
+            self.checkpoint_pipeline_failed,
+            self.indeterminate_effect,
+            self.counters,
+        );
+        for (index, id) in panes.into_iter().enumerate() {
+            let phase = match self.protocol.as_ref().and_then(|p| p.pane_state(id)) {
+                None => "absent-or-owned-by-worker",
+                Some(GuardianPaneState::LiveUnclaimed { .. }) => "live-unclaimed",
+                Some(GuardianPaneState::LiveClaimed { .. }) => "live-claimed",
+                Some(GuardianPaneState::ExitedUnclaimed { .. }) => "exited-unclaimed",
+                Some(GuardianPaneState::ClosedTerminal { .. }) => "closed",
+                Some(GuardianPaneState::Quarantined { .. }) => "quarantined",
+            };
+            diagnostic.push_str(&format!(" pane{index}.phase={phase}"));
+            if let Some(pane) = self.starting_broker_panes.get(&id) {
+                diagnostic.push_str(&format!(
+                    " activated={} initial_pending={} failed_before_spawn={} retry={} handle={} output={} output_failed={} input={} origin={} delivery={} ack={}",
+                    pane.activated, pane.initial_pending, pane.failed_before_spawn,
+                    pane.retry_before_publication.is_some(), pane.handle.is_some(),
+                    pane.output.is_some(), pane.output.as_ref().is_some_and(|output| output.failed),
+                    pane.input_journal.is_some(), pane.replay_origin.is_some(),
+                    pane.pending_delivery.is_some(), pane.pending_ack.is_some(),
+                ));
+                if let Some(connection) = self.broker_connections.get(&pane.mux_incarnation) {
+                    diagnostic.push_str(&format!(
+                        " worker={} session={} active={} active_this={} last_this={} failed={} retired={}",
+                        connection.worker.is_some(),
+                        connection.retained_session.is_some(),
+                        connection.active_pane.is_some(),
+                        connection.active_pane == Some(id),
+                        connection.last_pane == Some(id),
+                        connection.failed,
+                        connection.fully_retired_outer_owner,
+                    ));
+                }
+            }
+        }
+        diagnostic
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_broker_append_for_test(
+        &self,
+        pane_id: Uuid,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.output_pipeline
+            .pause_next_broker_append_for_test(pane_id, entered, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotation_pending_for_test(&self, pane_id: Uuid) -> bool {
+        self.pending_broker_control
+            .as_ref()
+            .is_some_and(|pending| pending.pane_id == pane_id && pending.rotation.is_some())
+    }
+
     pub(crate) fn new(
         registry: Registry,
         config: GuardianRuntimeConfig,
@@ -1396,6 +1587,7 @@ impl GuardianRuntime {
             broker_endpoint: None,
             broker_connections: HashMap::new(),
             starting_broker_panes: HashMap::new(),
+            rotation_admission_owner: None,
             completion_waker,
             orphaned_input_authority: None,
             pending_child_exits,
@@ -1523,6 +1715,20 @@ impl GuardianRuntime {
         &mut self,
         request: &AuthenticatedGuardianRequest,
     ) -> Option<GuardianResponseEnvelope> {
+        if request.header().operation == GuardianOperation::Hello {
+            if self.rotation_admission_owner == Some(request.header().mux_incarnation) {
+                return Some(GuardianResponseEnvelope::rejection(
+                    request,
+                    GuardianRejectionCode::InvalidRequest,
+                ));
+            }
+            if let Some(connection) = self
+                .broker_connections
+                .get_mut(&request.header().mux_incarnation)
+            {
+                connection.fully_retired_outer_owner = false;
+            }
+        }
         // Hello is the one protocol-independent observation: the immutable
         // incarnation is cached specifically so a mux can authenticate while
         // the sole mutable protocol authority is worker-owned. Every other
@@ -1902,13 +2108,15 @@ impl GuardianRuntime {
     }
 
     pub(crate) fn is_broker_control_request(&self, request: &AuthenticatedGuardianRequest) -> bool {
-        matches!(
+        (matches!(
             request.header().operation,
             GuardianOperation::Resize | GuardianOperation::Signal | GuardianOperation::Close
-        ) && request
-            .header()
-            .pane_id
-            .is_some_and(|pane_id| self.starting_broker_panes.contains_key(&pane_id))
+        ) || (request.header().operation == GuardianOperation::Claim
+            && !request.payload().is_empty()))
+            && request
+                .header()
+                .pane_id
+                .is_some_and(|pane_id| self.starting_broker_panes.contains_key(&pane_id))
     }
 
     /// Transfer the one global protocol authority and one owned authenticated
@@ -1976,15 +2184,65 @@ impl GuardianRuntime {
             let Some(pane_id) = request.header().pane_id else {
                 return GuardianCheckpointSubmission::CloseRetryably;
             };
+            let rotation = if operation == GuardianOperation::Claim {
+                let Some(mux_build) = genesis_connection
+                    .and_then(|connection| connection.mux_build_for_request(&request))
+                else {
+                    return GuardianCheckpointSubmission::Respond(
+                        GuardianResponseEnvelope::rejection(
+                            &request,
+                            GuardianRejectionCode::InvalidRequest,
+                        ),
+                    );
+                };
+                let Some(endpoint) = self.broker_endpoint.clone() else {
+                    return GuardianCheckpointSubmission::CloseRetryably;
+                };
+                let old_mux = self.starting_broker_panes[&pane_id].mux_incarnation;
+                let retired = self
+                    .broker_connections
+                    .get(&old_mux)
+                    .is_some_and(|connection| connection.fully_retired_outer_owner);
+                if old_mux != request.header().mux_incarnation
+                    && (!retired
+                        || (!self
+                            .broker_connections
+                            .contains_key(&request.header().mux_incarnation)
+                            && self.broker_connections.len() >= MAX_BROKER_CONNECTIONS))
+                {
+                    return GuardianCheckpointSubmission::Respond(
+                        GuardianResponseEnvelope::rejection(
+                            &request,
+                            GuardianRejectionCode::InvalidRequest,
+                        ),
+                    );
+                }
+                Some(BrokerMuxRotationJob {
+                    endpoint,
+                    predecessor_mux: old_mux,
+                    successor_mux: request.header().mux_incarnation,
+                    mux_build,
+                    successor_session: None,
+                    successor_handle: None,
+                    predecessor_was_retired: retired,
+                })
+            } else {
+                None
+            };
             let Some(protocol) = self.protocol.take() else {
                 return GuardianCheckpointSubmission::CloseRetryably;
             };
+            if rotation.is_some() {
+                self.rotation_admission_owner =
+                    Some(self.starting_broker_panes[&pane_id].mux_incarnation);
+            }
             self.pending_broker_control = Some(PendingBrokerControl {
                 route,
                 pane_id,
                 protocol,
                 request,
                 token_effect_authority,
+                rotation,
             });
             return GuardianCheckpointSubmission::Pending;
         }
@@ -2243,6 +2501,7 @@ impl GuardianRuntime {
                     active_pane: None,
                     last_pane: None,
                     failed: false,
+                    fully_retired_outer_owner: false,
                 });
         let Some(mut protocol) = self.protocol.take() else {
             return GuardianCheckpointSubmission::CloseRetryably;
@@ -2477,7 +2736,7 @@ impl GuardianRuntime {
     /// the protocol was absent, and yield one exact transport completion.
     fn resume_broker_control(
         &mut self,
-        pending: PendingBrokerControl,
+        mut pending: PendingBrokerControl,
     ) -> Option<GuardianRuntimeCheckpointCompletion> {
         let route = pending.route;
         let Some(pane) = self.starting_broker_panes.get_mut(&pending.pane_id) else {
@@ -2504,7 +2763,17 @@ impl GuardianRuntime {
                 response: None,
             });
         }
-        if connection.active_pane.is_some() || pane.handle.is_none() {
+        if connection.active_pane.is_some()
+            || pane.handle.is_none()
+            || (pending.rotation.is_some()
+                && (pane.pending_delivery.is_some()
+                    || pane.pending_ack.is_some()
+                    || pane.read_reservation != 0
+                    || pane
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.in_flight_bytes != 0)))
+        {
             self.pending_broker_control = Some(pending);
             return None;
         }
@@ -2526,12 +2795,70 @@ impl GuardianRuntime {
             }
         }
         drop(connection.worker.take());
+        let predecessor_mux = pane.mux_incarnation;
+        if let Some(rotation) = pending.rotation.as_mut() {
+            if rotation.successor_mux != predecessor_mux {
+                if let Some(successor) = self.broker_connections.get_mut(&rotation.successor_mux) {
+                    if successor.failed {
+                        self.protocol = Some(pending.protocol);
+                        return Some(GuardianRuntimeCheckpointCompletion {
+                            route,
+                            response: None,
+                        });
+                    }
+                    if successor.active_pane.is_some() {
+                        self.pending_broker_control = Some(pending);
+                        return None;
+                    }
+                    if let Some(worker) = successor.worker.as_mut() {
+                        match worker.try_take_session() {
+                            Ok(Some(session)) => successor.retained_session = Some(session),
+                            Ok(None) => {
+                                self.pending_broker_control = Some(pending);
+                                return None;
+                            }
+                            Err(_) => {
+                                successor.failed = true;
+                                self.protocol = Some(pending.protocol);
+                                return Some(GuardianRuntimeCheckpointCompletion {
+                                    route,
+                                    response: None,
+                                });
+                            }
+                        }
+                    }
+                    drop(successor.worker.take());
+                    let Some(session) = successor.retained_session.take() else {
+                        successor.failed = true;
+                        self.protocol = Some(pending.protocol);
+                        return Some(GuardianRuntimeCheckpointCompletion {
+                            route,
+                            response: None,
+                        });
+                    };
+                    rotation.successor_session = Some(session);
+                }
+            }
+        }
+        let connection = self
+            .broker_connections
+            .get_mut(&predecessor_mux)
+            .expect("predecessor connection remains owned during rotation admission");
         let (session, handle) = match (connection.retained_session.take(), pane.handle.take()) {
             (Some(session), Some(handle)) => (session, handle),
             (session, handle) => {
                 connection.retained_session = session;
                 pane.handle = handle;
                 connection.failed = true;
+                if let Some(rotation) = pending.rotation.as_mut() {
+                    if let Some(session) = rotation.successor_session.take() {
+                        if let Some(successor) =
+                            self.broker_connections.get_mut(&rotation.successor_mux)
+                        {
+                            successor.retained_session = Some(session);
+                        }
+                    }
+                }
                 self.protocol = Some(pending.protocol);
                 return Some(GuardianRuntimeCheckpointCompletion {
                     route,
@@ -2553,6 +2880,7 @@ impl GuardianRuntime {
                 mux_incarnation: pane.mux_incarnation,
                 session,
                 handle,
+                rotation: pending.rotation,
             }),
             replay_origin: None,
         };
@@ -2567,9 +2895,18 @@ impl GuardianRuntime {
                     }
                 };
                 let mut job = *job;
-                if let Some(control) = job.broker_control.take() {
+                if let Some(mut control) = job.broker_control.take() {
                     pane.handle = Some(control.handle);
                     connection.retained_session = Some(control.session);
+                    if let Some(rotation) = control.rotation.as_mut() {
+                        if let Some(session) = rotation.successor_session.take() {
+                            if let Some(successor) =
+                                self.broker_connections.get_mut(&rotation.successor_mux)
+                            {
+                                successor.retained_session = Some(session);
+                            }
+                        }
+                    }
                 }
                 self.protocol = Some(job.protocol);
                 Some(GuardianRuntimeCheckpointCompletion {
@@ -2781,7 +3118,14 @@ impl GuardianRuntime {
     /// replay proves the marker durable.
     pub(crate) fn try_checkpoint_completion(&mut self) -> GuardianRuntimeCheckpointCompletionState {
         if let Some(pending) = self.pending_broker_control.take() {
+            let rotation_owner = pending
+                .rotation
+                .as_ref()
+                .map(|rotation| rotation.predecessor_mux);
             if let Some(completion) = self.resume_broker_control(pending) {
+                if rotation_owner.is_some() && self.rotation_admission_owner == rotation_owner {
+                    self.rotation_admission_owner = None;
+                }
                 return GuardianRuntimeCheckpointCompletionState::Ready(Box::new(completion));
             }
         }
@@ -2903,15 +3247,72 @@ impl GuardianRuntime {
                 let mut completion = *completion;
                 debug_assert!(self.protocol.is_none());
                 self.protocol = Some(completion.protocol);
-                if let Some(control) = completion.broker_control {
-                    let failed = completion.worker_panicked
+                if let Some(mut control) = completion.broker_control {
+                    let was_rotation = control.rotation.is_some();
+                    if control.rotation.is_some()
+                        && self.rotation_admission_owner == Some(control.mux_incarnation)
+                    {
+                        self.rotation_admission_owner = None;
+                    }
+                    let mut failed = completion.worker_panicked
                         || completion.token_authority_failed
                         || completion.response.as_ref().is_none_or(|response| {
                             response.header().status
                                 == mux::guardian_protocol::GuardianResponseStatus::Indeterminate
                         });
+                    let mut installed_mux = control.mux_incarnation;
+                    if let Some(mut rotation) = control.rotation.take() {
+                        let successor_session_restored = match rotation.successor_session.take() {
+                            Some(session) => {
+                                if let Some(connection) =
+                                    self.broker_connections.get_mut(&rotation.successor_mux)
+                                {
+                                    if connection.worker.is_none()
+                                        && connection.retained_session.is_none()
+                                        && connection.active_pane.is_none()
+                                    {
+                                        connection.retained_session = Some(session);
+                                        connection.failed |= failed;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else if self.broker_connections.len() < MAX_BROKER_CONNECTIONS {
+                                    self.broker_connections.insert(
+                                        rotation.successor_mux,
+                                        RuntimeBrokerConnection {
+                                            worker: None,
+                                            retained_session: Some(session),
+                                            active_pane: None,
+                                            last_pane: None,
+                                            failed,
+                                            fully_retired_outer_owner: false,
+                                        },
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            None => rotation.successor_handle.is_none(),
+                        };
+                        failed |= !successor_session_restored;
+                        if !failed && rotation.successor_handle.is_some() {
+                            match rotation.successor_handle.take() {
+                                Some(handle)
+                                    if completion.response.as_ref().is_some_and(|response|
+                                            response.header().status == mux::guardian_protocol::GuardianResponseStatus::Success) =>
+                                {
+                                    installed_mux = rotation.successor_mux;
+                                    control.handle = handle;
+                                }
+                                _ => failed = true,
+                            }
+                        }
+                    }
                     if let Some(pane) = self.starting_broker_panes.get_mut(&control.pane_id) {
                         pane.handle = Some(control.handle);
+                        pane.mux_incarnation = installed_mux;
                         if failed {
                             if let Some(output) = pane.output.as_mut() {
                                 output.failed = true;
@@ -2925,6 +3326,13 @@ impl GuardianRuntime {
                         connection.failed |= failed;
                     }
                     if failed {
+                        if was_rotation {
+                            // The broker may have committed the handoff, but
+                            // no usable runtime authority was installed. A
+                            // closed response is indeterminate; never send the
+                            // worker's provisional Claimed success.
+                            completion.response = None;
+                        }
                         self.indeterminate_effect = true;
                         self.counters.broker_control_failures =
                             self.counters.broker_control_failures.saturating_add(1);
@@ -3126,10 +3534,19 @@ impl GuardianRuntime {
                 "guardian external effects are quarantined after an indeterminate outcome",
             ));
         }
-        self.protocol
+        let result = self
+            .protocol
             .as_mut()
             .map(|protocol| protocol.retire_disconnected_mux_leases(mux_incarnation))
-            .transpose()
+            .transpose()?;
+        if result.as_ref().is_some_and(|retirement| {
+            retirement.pending_input_panes == 0 && retirement.indeterminate_checkpoint_panes == 0
+        }) {
+            if let Some(connection) = self.broker_connections.get_mut(&mux_incarnation) {
+                connection.fully_retired_outer_owner = true;
+            }
+        }
+        Ok(result)
     }
 
     /// Read one bounded PTY record, then pause readiness until its encrypted
@@ -3455,7 +3872,34 @@ impl GuardianRuntime {
                                     .saturating_add(1);
                             }
                             Ok(None) => {}
-                            Err(_) => output.failed = true,
+                            Err(_error) => {
+                                #[cfg(test)]
+                                {
+                                    use crate::broker::BrokerControlClientError;
+                                    let label = match &_error {
+                                        BrokerControlClientError::Endpoint(_) => "endpoint",
+                                        BrokerControlClientError::Io(_) => "io",
+                                        BrokerControlClientError::AuthenticationAuthority => "authentication-authority",
+                                        BrokerControlClientError::Protocol => "protocol",
+                                        BrokerControlClientError::UnexpectedResponse => "unexpected-response",
+                                        BrokerControlClientError::BrokerBuildIdentityMismatch => "build-mismatch",
+                                        BrokerControlClientError::BrokerLineageMismatch => "lineage-mismatch",
+                                        BrokerControlClientError::CensusSnapshotUnavailable => "census-snapshot-unavailable",
+                                        BrokerControlClientError::CensusAuthorityConflict => "census-authority-conflict",
+                                        BrokerControlClientError::CensusCapacityUnavailable => "census-capacity-unavailable",
+                                        BrokerControlClientError::CensusCollectionDeadlineExceeded => "census-deadline",
+                                        BrokerControlClientError::CensusCollectionCapacityExhausted => "census-capacity-exhausted",
+                                        BrokerControlClientError::SpawnRejected => "spawn-rejected",
+                                        BrokerControlClientError::SpawnQuarantined => "spawn-quarantined",
+                                        BrokerControlClientError::SpawnPtyAvailable => "spawn-pty-available",
+                                        BrokerControlClientError::ConnectionPoisoned => "connection-poisoned",
+                                    };
+                                    eprintln!("GENESIS_OPEN_INITIAL_FAILED class={label}");
+                                }
+                                output.failed = true;
+                                self.counters.broker_control_failures =
+                                    self.counters.broker_control_failures.saturating_add(1);
+                            }
                         },
                         BrokerPaneIoCompletionV1::Read { handle, result } => {
                             pane.handle = Some(handle);
@@ -3585,11 +4029,21 @@ impl GuardianRuntime {
             {
                 continue;
             }
-            if self
-                .pending_broker_control
-                .as_ref()
-                .and_then(|pending| self.starting_broker_panes.get(&pending.pane_id))
-                .is_some_and(|pane| pane.mux_incarnation == *mux_incarnation)
+            let rotation_wait = self.pending_broker_control.as_ref().is_some_and(|pending| {
+                pending.rotation.as_ref().is_some_and(|rotation| {
+                    rotation.successor_mux == *mux_incarnation
+                        || self
+                            .starting_broker_panes
+                            .get(&pending.pane_id)
+                            .is_some_and(|pane| pane.mux_incarnation == *mux_incarnation)
+                })
+            });
+            if !rotation_wait
+                && self
+                    .pending_broker_control
+                    .as_ref()
+                    .and_then(|pending| self.starting_broker_panes.get(&pending.pane_id))
+                    .is_some_and(|pane| pane.mux_incarnation == *mux_incarnation)
             {
                 continue;
             }
@@ -3612,6 +4066,7 @@ impl GuardianRuntime {
                     return false;
                 };
                 pane.mux_incarnation == *mux_incarnation
+                    && (!rotation_wait || pane.pending_ack.is_some())
                     && !output.failed
                     && pane.pending_delivery.is_none()
                     && output.in_flight_bytes == 0

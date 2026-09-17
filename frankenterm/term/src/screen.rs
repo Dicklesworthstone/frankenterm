@@ -2805,6 +2805,23 @@ impl ScreenReflowPreparation {
         self.applied
     }
 
+    fn logical_cursor_for(&self, cursor: CursorPosition) -> Option<Option<(usize, usize)>> {
+        // The row controls trailing-blank pruning. Same-row cursor movement
+        // changes only the offset, while visibility/style/sequence do not
+        // change wrap geometry. Exact line validation remains mandatory.
+        if cursor.y != self.source_cursor.y || cursor.seqno < self.source_cursor.seqno {
+            return None;
+        }
+        // An absent physical-to-logical mapping is valid in the existing
+        // height/ConPTY resize path. Preserve it only for unchanged coordinates;
+        // the outer None instead means this preparation cannot be reused.
+        let Some((group, column)) = self.source_logical_cursor else {
+            return (cursor.x == self.source_cursor.x).then_some(None);
+        };
+        let prefix = column.checked_sub(self.source_cursor.x)?;
+        Some(Some((group, prefix.checked_add(cursor.x)?)))
+    }
+
     pub fn prepare(&mut self, is_cancelled: impl Fn() -> bool) -> bool {
         self.ready = false;
         self.applied = false;
@@ -4349,9 +4366,10 @@ impl Screen {
     ) -> Option<[Option<SelectionAnchorCoordinate>; 3]> {
         let entry = self.selection_anchors.0.iter().find(|entry| {
             entry.owner.as_ptr() == Arc::as_ptr(&token.0)
-                && entry.source_sequence == source_sequence
+                && entry.source_sequence <= source_sequence
                 && source_sequence != SequenceNo::MAX
                 && self.matches_coordinate_witness(&entry.witness)
+                && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
         })?;
         self.selection_anchor_points_are_resident(&entry.points)
             .then_some(entry.points)
@@ -4370,6 +4388,39 @@ impl Screen {
                 && (!line.last_cell_was_wrapped()
                     || point.column.is_none_or(|column| column < line.len()))
         })
+    }
+
+    /// The terminal owner supplies the current source sequence. Advancing
+    /// that sequence elsewhere does not invalidate these resident coordinates
+    /// when every row in the selected span is unchanged. Never load cold rows
+    /// or accept pruned endpoints as evidence of an unchanged selection.
+    fn selection_anchor_rows_unchanged_since(
+        &self,
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+        sequence: SequenceNo,
+    ) -> bool {
+        let mut rows = points.iter().flatten().map(|point| point.row);
+        let Some(first) = rows.next() else {
+            return false;
+        };
+        let (start, end) = rows.fold((first, first), |(start, end), row| {
+            (start.min(row), end.max(row))
+        });
+        let Some(start) = self.stable_row_to_phys(start) else {
+            return false;
+        };
+        let Some(end) = self
+            .stable_row_to_phys(end)
+            .and_then(|end| end.checked_add(1))
+        else {
+            return false;
+        };
+        // Validate directly across both deque slices. Materializing a pointer
+        // vector here allocates for the entire selection on every observation,
+        // including each clipboard chunk and resize preparation.
+        self.lines
+            .range(start..end)
+            .all(|line| !line.changed_since(sequence))
     }
 
     /// LocalPane finalizes its layout floor after the terminal resize. Only
@@ -4404,9 +4455,12 @@ impl Screen {
         anchors.0.retain(|entry| {
             entry.owner.strong_count() != 0
                 && seqno != SequenceNo::MAX
-                && entry.source_sequence.checked_add(1) == Some(seqno)
+                && seqno
+                    .checked_sub(1)
+                    .is_some_and(|before| entry.source_sequence <= before)
                 && self.matches_coordinate_witness(&entry.witness)
                 && self.selection_anchor_points_are_resident(&entry.points)
+                && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
         });
         anchors
     }
@@ -7041,7 +7095,7 @@ impl Screen {
         let matches = prepared.ready
             && self.allow_scrollback
             && prepared.target == size
-            && prepared.source_cursor == cursor
+            && prepared.logical_cursor_for(cursor).is_some()
             && prepared.source_dpi == self.dpi
             && prepared.snapshot.physical_cols == self.physical_cols
             && prepared.snapshot.physical_rows == self.physical_rows
@@ -7176,7 +7230,7 @@ impl Screen {
                         wrapped,
                         logical_count: cache.logical_lines.len(),
                         cache_entries: cache.wrapped_by_key.len(),
-                        logical_cursor: prepared.source_logical_cursor,
+                        logical_cursor: prepared.logical_cursor_for(cursor).flatten(),
                     });
             }
             // The preparation owns only new counters, never a stale copy of
@@ -7573,6 +7627,17 @@ impl Screen {
     ) {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
+        if y == 0 && cols.start == 0 && cols.end >= self.physical_cols {
+            // Erasing the entire first viewport row destroys the continuation
+            // of any retained soft-wrapped history. Keep that history's text,
+            // but do not let a later repaint join it during resize/reflow.
+            // Tiered scrollback retains at least one hot history row whenever
+            // history is enabled, so this boundary never needs cold sink I/O.
+            if let Some(previous) = line_idx.checked_sub(1) {
+                self.line_mut(previous)
+                    .set_last_cell_was_wrapped(false, seqno);
+            }
+        }
         let line = self.line_mut(line_idx);
         if cols.start == 0 {
             bidi_mode.apply_to_line(line, seqno);
@@ -8784,6 +8849,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn selection_anchor_survives_unrelated_output_but_not_selected_row_mutation() {
+        for change_selected_row in [false, true] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig::default());
+            let mut term = crate::Terminal::new(
+                test_size(4, 12, 96),
+                config,
+                "anchor-source",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            term.advance_bytes("A界BCDEF\r\nother".as_bytes());
+            let sequence = term.current_seqno();
+            let points = [anchor_point(3, 0); 3];
+            let token = term
+                .screen_mut()
+                .capture_selection_anchor(sequence, points)
+                .unwrap();
+            term.advance_bytes(if change_selected_row {
+                b"\x1b[1;1HZ"
+            } else {
+                b"\x1b[2;1HZ"
+            });
+            let after_output = term.current_seqno();
+            assert!(after_output > sequence);
+            assert_eq!(
+                term.screen().resolve_selection_anchor(&token, after_output),
+                (!change_selected_row).then_some(points)
+            );
+            term.resize(test_size(4, 2, 96));
+            let mapped = term
+                .screen()
+                .resolve_selection_anchor(&token, term.current_seqno());
+            if change_selected_row {
+                assert!(
+                    mapped.is_none(),
+                    "selected-row mutation must reject anchor transport"
+                );
+            } else {
+                let point =
+                    mapped.expect("unrelated output must preserve held selection")[0].unwrap();
+                let row = term.screen().stable_row_to_phys(point.row).unwrap();
+                assert_eq!(
+                    term.screen().lines[row]
+                        .get_cell(point.column.unwrap())
+                        .unwrap()
+                        .str(),
+                    "B"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_anchor_rejects_mutation_inside_selected_span() {
+        let mut screen = test_screen(3, 12, 96);
+        for row in 0..3 {
+            screen.lines[row] = Line::from_text("selected", &CellAttributes::blank(), 1, None);
+        }
+        let points = [anchor_point(0, 0), anchor_point(0, 0), anchor_point(3, 2)];
+        let token = screen.capture_selection_anchor(1, points).unwrap();
+        assert!(screen.resolve_selection_anchor(&token, 0).is_none());
+        screen.lines[1].set_cell(0, Cell::new('Z', CellAttributes::blank()), 2);
+        assert!(screen.resolve_selection_anchor(&token, 2).is_none());
+        screen.resize(test_size(3, 6, 96), test_cursor(3, 2, 2), 3, false);
+        assert!(screen.resolve_selection_anchor(&token, 3).is_none());
+    }
+
+    #[test]
     fn selection_anchor_projects_actual_wide_rows_and_repeated_widths() {
         let mut screen = test_screen(1, 12, 96);
         screen.lines[0] = Line::from_text("A界BCDEF", &CellAttributes::blank(), 1, None);
@@ -8822,9 +8955,10 @@ pub(crate) mod tests {
                 );
             }
         }
+        screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 5);
         assert!(
             screen.resolve_selection_anchor(&token, 5).is_none(),
-            "later content is not the committed source"
+            "later selected-row content is not the committed source"
         );
     }
 
@@ -8893,6 +9027,7 @@ pub(crate) mod tests {
         assert!(screen
             .capture_selection_anchor(1, [anchor_point(0, -1); 3])
             .is_none());
+        screen.lines[0].set_cell(0, Cell::new('Z', CellAttributes::blank()), 2);
         screen.resize(test_size(3, 5, 96), test_cursor(8, 0, 2), 3, false);
         assert!(
             screen.resolve_selection_anchor(&old, 3).is_none(),
@@ -13406,6 +13541,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prepared_reflow_reuses_exact_rows_after_cursor_only_parser_activity() {
+        for (action, reuse) in [
+            (b"\x1b[?25l".as_slice(), true),
+            (b"\x1b[5 q".as_slice(), true),
+            // CR deliberately publishes the row dirty; retain that exact
+            // source fence even though its printable contents are unchanged.
+            (b"\r".as_slice(), false),
+            (b"\x1b[3G".as_slice(), true),
+        ] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig::default());
+            let mut term = crate::Terminal::new(
+                test_size(4, 20, 96),
+                config,
+                "prepared-cursor",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            term.advance_bytes("界e\u{301} abcdefghijklmnopqrstuvwxyz".as_bytes());
+            let source_cursor = term.cursor_pos();
+            let size = test_size(4, 7, 96);
+            let mut prepared = term
+                .screen()
+                .capture_reflow_preparation(size, source_cursor)
+                .unwrap();
+            assert!(prepared.prepare(|| false));
+            assert!(prepared.source_logical_cursor.unwrap().1 > source_cursor.x);
+            term.advance_bytes(action);
+            let cursor = term.cursor_pos();
+            assert_ne!(cursor, source_cursor, "parser action {action:?}");
+            assert_eq!(cursor.y, source_cursor.y);
+            let seqno = term.current_seqno().checked_add(1).unwrap();
+            let mut synchronous = term.screen().clone();
+            let expected_cursor = synchronous.resize(size, cursor, seqno, false);
+            REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.set(0));
+            let actual_cursor = term.screen_mut().resize_with_prepared_reflow(
+                size,
+                cursor,
+                seqno,
+                false,
+                Some(&mut prepared),
+            );
+            assert_eq!(prepared.was_applied(), reuse, "parser action {:?}", action);
+            let scans = REFLOW_SOURCE_SIGNATURE_SCANS.with(|count| count.get());
+            if reuse {
+                assert_eq!(scans, 0);
+            } else {
+                assert!(scans > 0, "CR must retain fresh-source fallback");
+            }
+            assert_eq!(actual_cursor, expected_cursor, "parser action {action:?}");
+            assert_eq!(
+                term.screen().lines,
+                synchronous.lines,
+                "parser action {action:?}"
+            );
+            assert_eq!(actual_cursor.shape, cursor.shape);
+            assert_eq!(actual_cursor.visibility, cursor.visibility);
+        }
+    }
+
+    #[test]
+    fn prepared_reflow_rejects_backwards_cursor_sequence_and_offset_overflow() {
+        let mut screen = test_screen(3, 8, 96);
+        screen.lines[0] = Line::from_text("abcdefgh", &CellAttributes::blank(), 1, None);
+        screen.lines[0].set_last_cell_was_wrapped(true, 1);
+        screen.lines[1] = Line::from_text("ijkl", &CellAttributes::blank(), 1, None);
+        let cursor = test_cursor(2, 1, 2);
+        let size = test_size(3, 4, 96);
+        let mut prepared = screen.capture_reflow_preparation(size, cursor).unwrap();
+        assert!(prepared.prepare(|| false));
+        assert!(screen.matches_reflow_preparation(&prepared, size, cursor));
+        let backwards = CursorPosition { seqno: 1, ..cursor };
+        assert!(prepared.logical_cursor_for(backwards).is_none());
+        assert!(!screen.matches_reflow_preparation(&prepared, size, backwards));
+        let overflow = CursorPosition {
+            x: usize::MAX,
+            ..cursor
+        };
+        assert!(prepared.logical_cursor_for(overflow).is_none());
+        assert!(!screen.matches_reflow_preparation(&prepared, size, overflow));
+    }
+
+    #[test]
     fn prepared_reflow_rejects_changed_source_and_policy() {
         for mutation in 0..8 {
             let mut screen = test_screen(3, 8, 96);
@@ -13438,7 +13655,7 @@ pub(crate) mod tests {
                     screen.resize_wrap_policy.kp_cost_model.lookahead_limit = 1;
                 }
                 5 => {
-                    cursor.x = 1;
+                    cursor.y = 1;
                 }
                 6 => {
                     screen.dpi = 144;

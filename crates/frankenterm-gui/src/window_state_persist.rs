@@ -1867,6 +1867,34 @@ impl PersistenceWriter {
         Ok(outcome)
     }
 
+    /// Admit a complete window transfer before the worker can freeze a batch.
+    /// A refused member leaves every prior pending mutation unchanged.
+    pub fn queue_overlays(
+        &self,
+        overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
+    ) -> Result<(), PersistenceFailure> {
+        if overlays.len() > MAX_LAYOUT_OVERLAYS {
+            return Err(PersistenceFailure::quota(
+                "layout batch has too many windows",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for (_, overlay) in &overlays {
+            validate_overlay(overlay)?;
+            if !seen.insert(overlay.window_id()) {
+                return Err(PersistenceFailure::invalid("layout batch repeats a window"));
+            }
+        }
+        let mut pending = lock_pending(&self.shared.pending);
+        let mut next = pending.batch.clone();
+        for (base, overlay) in overlays {
+            next.queue_overlay_live(base, overlay)?;
+        }
+        self.wake_worker()?;
+        pending.batch = next;
+        Ok(())
+    }
+
     pub fn queue_overlay_delete(
         &self,
         window_id: LayoutWindowId,
@@ -3761,6 +3789,15 @@ pub fn load_snapshot_at(primary_path: &Path) -> Result<LayoutStateSnapshot, Pers
 pub fn load_layout_state() -> Result<LayoutStateSnapshot, PersistenceFailure> {
     ensure_legacy_window_state_migrated()?;
     load_snapshot_at(&state_file_name())
+}
+
+/// Reuse the startup cut; GUI callbacks must never reopen the state journal.
+pub fn startup_layout_state() -> Result<LayoutStateSnapshot, PersistenceFailure> {
+    STARTUP_SNAPSHOT
+        .get()
+        .ok_or_else(|| PersistenceFailure::invalid("layout startup cache is not initialized"))?
+        .snapshot
+        .clone()
 }
 
 #[derive(Debug)]
@@ -7265,6 +7302,12 @@ pub fn queue_layout_overlay(
     overlay: MixedDomainLayoutOverlay,
 ) -> Result<EnqueueOutcome, PersistenceFailure> {
     global_writer()?.queue_overlay(base_revision, overlay)
+}
+
+pub fn queue_layout_overlays(
+    overlays: Vec<(Option<u64>, MixedDomainLayoutOverlay)>,
+) -> Result<(), PersistenceFailure> {
+    global_writer()?.queue_overlays(overlays)
 }
 
 /// Queue retirement of one exact live overlay revision on the default worker.

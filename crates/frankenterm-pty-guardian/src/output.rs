@@ -10,6 +10,7 @@
 //! readiness loop never calls synchronous journal or PTY-write operations.
 
 use crate::transport::provision_guardian_token_in_pinned_parent;
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use mio::Waker;
 use mux::guardian_checkpoint::{
     GUARDIAN_CHECKPOINT_ACK_FINALIZER_BYTES, GUARDIAN_CHECKPOINT_CATALOG_ADOPTION_EVIDENCE_BYTES,
@@ -42,6 +43,7 @@ use mux::guardian_output_journal::{
 };
 use mux::guardian_protocol::{
     AuthenticatedGuardianRequest, GUARDIAN_MAX_CHECKPOINT_BYTES, GUARDIAN_MAX_CHECKPOINT_CHUNKS,
+    GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES, GUARDIAN_MUX_ROTATION_TAG,
     GuardianCheckpointCatalogAdoptionEvidenceSeedV1, GuardianCheckpointCatalogAdoptionPermitV1,
     GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
     GuardianCheckpointOutputBoundaryV1, GuardianCheckpointPolicyExpiryReceiptV1,
@@ -534,15 +536,233 @@ impl GuardianDurableSuccessorCustodyV1 {
         self.context
     }
 
+    pub(crate) fn select_rebind_origin(
+        &self,
+        authenticated_connection: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let mut scope = self.context.scope();
+        scope.successor.connection_id = authenticated_connection;
+        let selected = self.store.lookup_successor_custody(scope)?;
+        if selected.context.ack_id != self.context.ack_id
+            || selected.context.predecessor != self.context.predecessor
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        Ok(selected)
+    }
+
     pub(crate) fn into_secret(
         self,
     ) -> Result<Zeroizing<[u8; 32]>, GuardianCheckpointStageStoreError> {
         self.store
             .with_exclusive_directory(|inner| read_successor_custody_locked(inner, &self.context))
     }
+
+    pub(crate) fn prepare_rebind(
+        self,
+        connection_id: Uuid,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        if connection_id.is_nil() {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        if self.context.successor.connection_id == connection_id {
+            self.store.reopen_successor_custody(&self.context)
+        } else {
+            // Reauthenticate and synchronize the source before minting its child.
+            self.store.reopen_successor_custody(&self.context)?;
+            let mut next = self.context;
+            next.rebind_from_connection = self.context.successor.connection_id;
+            next.successor.connection_id = connection_id;
+            match self.store.reopen_successor_custody(&next) {
+                Ok(existing) => return Ok(existing),
+                Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                    source,
+                    ..
+                })) if source.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut secret = Zeroizing::new([0; 32]);
+            getrandom::fill(secret.as_mut()).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+            self.store.persist_successor_custody(&next, &secret)
+        }
+    }
+
+    pub(crate) fn rebind_secrets(
+        &self,
+    ) -> Result<
+        (
+            mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+            Zeroizing<[u8; 32]>,
+            Zeroizing<[u8; 32]>,
+        ),
+        GuardianCheckpointStageStoreError,
+    > {
+        self.store.with_exclusive_directory(|inner| {
+            if self.context.rebind_from_connection.is_nil() {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let mut scope = self.context.scope();
+            scope.successor.connection_id = self.context.rebind_from_connection;
+            let (parent, prior_secret) = read_successor_custody_scope_locked(inner, scope)?;
+            if parent.predecessor != self.context.predecessor
+                || parent.ack_id != self.context.ack_id
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            let secret = read_successor_custody_locked(inner, &self.context)?;
+            if secret == prior_secret {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok((parent, prior_secret, secret))
+        })
+    }
 }
 
 impl GuardianDurableSpawnCustodyV1 {
+    #[cfg(test)]
+    pub(crate) fn persist_historical_context_for_test(
+        &self,
+        context: GuardianSpawnCustodyContextV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        // A distinct immutable fixture record models retained authenticated
+        // history. It cannot overwrite the live pane's original custody.
+        assert_ne!(context.effect_id, self.context.effect_id);
+        let secret = self.store.read_spawn_custody(&self.context)?;
+        self.store.persist_spawn_custody(&context, &secret)
+    }
+
+    pub(crate) fn into_mux_rotation_payload(
+        self,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            let secret = read_spawn_custody_locked(inner, &self.context)?;
+            let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(
+                inner,
+                &spawn_custody_path(inner, &self.context),
+            )?;
+            let mut payload = Zeroizing::new(GUARDIAN_MUX_ROTATION_TAG.to_vec());
+            payload.extend_from_slice(&bytes);
+            payload.extend_from_slice(secret.as_slice());
+            Ok(payload)
+        })
+    }
+
+    /// Recover local possession of an existing encrypted Spawn capability.
+    /// Neither a transport token nor a checkpoint/image digest is sufficient:
+    /// the independently generated output key and exact authenticated custody
+    /// record must already exist. This path never provisions missing state.
+    pub fn open_existing(
+        token_path: &Path,
+        scope: GuardianSpawnCustodyScopeV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        Self::open_existing_store(token_path)?.lookup_spawn_custody(scope)
+    }
+
+    /// Recover provenance after an authenticated successful initial Spawn.
+    /// Broker lineage and child provenance come only from the existing AEAD
+    /// record. Every identity already known by the birth caller must match.
+    /// The current Hello response supplies only the guardian UUID; guardian
+    /// and broker builds are therefore learned from this authenticated record.
+    pub fn open_existing_for_birth(
+        token_path: &Path,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+        effect_id: Uuid,
+        mux_build: [u8; 32],
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let store = Self::open_existing_store(token_path)?;
+        let context = store.with_exclusive_directory(|inner| {
+            let path = inner
+                .directory_path
+                .join(format!("spawn-custody-v1-{pane_id}-{effect_id}.bin"));
+            let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(inner, &path)?;
+            let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
+            drop(secret);
+            if context.guardian_incarnation != guardian_incarnation
+                || context.mux_incarnation != mux_incarnation
+                || context.pane_id != pane_id
+                || context.effect_id != effect_id
+                || context.mux_build != mux_build
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok(context)
+        })?;
+        Ok(Self { store, context })
+    }
+
+    /// Nonsecret lookup provenance, never sufficient to claim a lease alone.
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.context.scope()
+    }
+
+    /// Reopen an acknowledged, protected checkpoint using existing private
+    /// custody and catalog bytes only. This grants offline verification, never
+    /// a writer lease or permission to rotate a later successor generation.
+    pub fn reopen_checkpoint(
+        self,
+        checkpoint_id: [u8; 32],
+    ) -> Result<GuardianReopenedCheckpointV1, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            let scan = checkpoint_catalog_scan(
+                inner,
+                CheckpointCatalogScope::Pane {
+                    pane_id: self.context.pane_id,
+                },
+            )?;
+            checkpoint_catalog_require_settled_for_generic_restore(&scan)?;
+            checkpoint_catalog_validate_generic_restore_evidence(&scan)?;
+            let mut selected = scan.published.iter().filter(|member| {
+                member.format == CheckpointCatalogFormat::ProtectedV3
+                    && member.metadata.checkpoint_id == checkpoint_id
+            });
+            let member = selected
+                .next()
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            if selected.next().is_some()
+                || member.metadata.capture_generation != 1
+                || member.metadata.adoption_mux_incarnation != self.context.mux_incarnation
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            checkpoint_catalog_require_existing_ack(inner, member)?;
+            Ok(GuardianReopenedCheckpointV1 {
+                scope: self.context.scope(),
+                metadata: member.metadata,
+            })
+        })
+    }
+
+    fn open_existing_store(
+        token_path: &Path,
+    ) -> Result<GuardianCheckpointStageStore, GuardianCheckpointStageStoreError> {
+        let (directory, directory_path, parent_identity, directory_identity) =
+            open_output_directory_with_creation(token_path, false)?;
+        let (cipher, key_path, key_identity) =
+            open_output_key_with_creation(&directory, &directory_path, false)?;
+        let persistence = Arc::new(PersistentOutputAuthority {
+            parent_path: directory_path
+                .parent()
+                .ok_or(GuardianOutputError::InvalidPath)?
+                .to_path_buf(),
+            parent_identity,
+            directory_path: directory_path.clone(),
+            directory_identity,
+            key_path,
+            key_identity,
+        });
+        GuardianCheckpointStageStore::open(
+            &directory,
+            &directory_path,
+            &cipher,
+            persistence,
+            GuardianCheckpointStagePolicy::production(),
+        )
+        .map_err(Into::into)
+    }
+
     pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
         self.context
     }
@@ -627,6 +847,40 @@ struct CheckpointCatalogMetadata {
     genesis_live_guardian_build_identity_digest: [u8; 32],
     genesis_pixel_width: u16,
     genesis_pixel_height: u16,
+}
+
+/// Read-only evidence obtained from an existing private Spawn capability and
+/// one settled ProtectedV3 publication with an authenticated ACK finalizer.
+/// The guardian identity comes from custody under the same pinned key; the
+/// catalog binds the pane, original mux, generation and canonical payload.
+/// Process-local registration is deliberately not claimed by this witness.
+pub struct GuardianReopenedCheckpointV1 {
+    scope: GuardianSpawnCustodyScopeV1,
+    metadata: CheckpointCatalogMetadata,
+}
+
+impl GuardianReopenedCheckpointV1 {
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.scope
+    }
+    pub const fn generation(&self) -> u64 {
+        self.metadata.capture_generation
+    }
+    pub const fn sequence(&self) -> u64 {
+        self.metadata.adoption_sequence
+    }
+    pub const fn effect_id(&self) -> Uuid {
+        self.metadata.adoption_effect_id
+    }
+    pub const fn checkpoint_id(&self) -> [u8; 32] {
+        self.metadata.checkpoint_id
+    }
+    pub const fn boundary_id(&self) -> [u8; 32] {
+        self.metadata.boundary_id
+    }
+    pub const fn payload_digest(&self) -> [u8; 32] {
+        self.metadata.terminal_payload_digest
+    }
 }
 
 /// Guardian-private proof that one exact Genesis reservation is represented by
@@ -2152,6 +2406,44 @@ impl GuardianCheckpointStageStore {
         self.with_exclusive_directory(|inner| read_spawn_custody_locked(inner, expected))
     }
 
+    pub(crate) fn authenticate_mux_rotation_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<
+        (GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>),
+        GuardianCheckpointStageStoreError,
+    > {
+        if payload.len() != GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES
+            || !payload.starts_with(GUARDIAN_MUX_ROTATION_TAG)
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        self.with_exclusive_directory(|inner| {
+            let record_end = GUARDIAN_MUX_ROTATION_TAG.len() + GUARDIAN_SPAWN_CUSTODY_BYTES;
+            let bytes = payload[GUARDIAN_MUX_ROTATION_TAG.len()..record_end]
+                .try_into()
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            let (context, stored_secret) = inner.cipher.open_spawn_custody_record(bytes)?;
+            // Validate the exact existing record, but never substitute its
+            // decrypted secret for the proof presented by the new mux.
+            drop(read_spawn_custody_locked(inner, &context)?);
+            let mut presented = Zeroizing::new([0; 32]);
+            presented.copy_from_slice(&payload[record_end..]);
+            let mut proof = Hmac::<Sha256>::new_from_slice(presented.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            proof.update(b"frankenterm.mux-owner-rotation.possession.v1\0");
+            proof.update(bytes);
+            let mut verifier = Hmac::<Sha256>::new_from_slice(stored_secret.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            verifier.update(b"frankenterm.mux-owner-rotation.possession.v1\0");
+            verifier.update(bytes);
+            verifier
+                .verify_slice(&proof.finalize().into_bytes())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            Ok((context, presented))
+        })
+    }
+
     pub(crate) fn persist_successor_custody(
         &self,
         context: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
@@ -2175,7 +2467,7 @@ impl GuardianCheckpointStageStore {
             let names = read_directory_names(&inner.directory)?;
             if names
                 .iter()
-                .filter(|name| name.as_bytes().starts_with(b"successor-custody-v1-"))
+                .filter(|name| name.as_bytes().starts_with(b"successor-custody-"))
                 .count()
                 >= inner.policy.max_stage_files
             {
@@ -2186,7 +2478,7 @@ impl GuardianCheckpointStageStore {
             getrandom::fill(&mut attempt).map_err(|_| GuardianSpawnCustodyError::Encryption)?;
             let path = successor_custody_path(inner, context);
             let staging_name = format!(
-                "successor-custody-v1-{}-{}.pending-{}",
+                "successor-custody-v2-{}-{}.pending-{}",
                 context.pane_id,
                 context.handoff_id,
                 Uuid::from_bytes(attempt)
@@ -2232,6 +2524,108 @@ impl GuardianCheckpointStageStore {
         let (context, secret) = self
             .with_exclusive_directory(|inner| read_successor_custody_scope_locked(inner, scope))?;
         drop(secret);
+        Ok(GuardianDurableSuccessorCustodyV1 {
+            store: self.clone(),
+            context,
+        })
+    }
+
+    pub(crate) fn lookup_successor_custody_for_reconnect(
+        &self,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        match self.lookup_successor_custody(scope) {
+            Ok(custody) => return Ok(custody),
+            Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                source,
+                ..
+            })) if source.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let context = self.with_exclusive_directory(|inner| {
+            let prefix = format!(
+                "successor-custody-v2-{}-{}-",
+                scope.pane_id, scope.handoff_id
+            );
+            let names = read_directory_names(&inner.directory)?;
+            let mut contexts = Vec::new();
+            for name in names {
+                if !name.as_bytes().starts_with(prefix.as_bytes())
+                    || !name.as_bytes().ends_with(b".bin")
+                {
+                    continue;
+                }
+                if contexts.len() >= inner.policy.max_stage_files {
+                    return Err(GuardianCheckpointStageStoreError::Capacity);
+                }
+                let path = inner.directory_path.join(&name);
+                let bytes = read_synced_custody_bytes::<
+                    { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
+                >(inner, &path)?;
+                let (context, secret) = inner.cipher.open_successor_custody_record(&bytes)?;
+                drop(secret);
+                let mut expected = scope;
+                expected.successor.connection_id = context.successor.connection_id;
+                if context.scope() != expected || successor_custody_path(inner, &context) != path {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+                contexts.push(context);
+            }
+            let mut by_connection = BTreeMap::new();
+            for (index, context) in contexts.iter().enumerate() {
+                if by_connection
+                    .insert(context.successor.connection_id, index)
+                    .is_some()
+                {
+                    return Err(GuardianCheckpointStageStoreError::Conflict);
+                }
+            }
+            let mut root = None;
+            let mut parents = Vec::with_capacity(contexts.len());
+            for (index, context) in contexts.iter().enumerate() {
+                if context.rebind_from_connection.is_nil() {
+                    if root.replace(index).is_some() {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    parents.push(None);
+                } else {
+                    let parent = *by_connection
+                        .get(&context.rebind_from_connection)
+                        .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+                    if contexts[parent].predecessor != context.predecessor
+                        || contexts[parent].ack_id != context.ack_id
+                    {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    parents.push(Some(parent));
+                }
+            }
+            let root = root.ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+            // Files are prepared intents, not the broker's committed authority.
+            // Allow branches left by failed network attempts, but every node
+            // must reach the one authenticated root. The broker selects the
+            // exact live parent before any rotated capability is submitted.
+            // Each vertex is visited at most once; avoid quadratic ancestor
+            // rescans on long reconnect histories. 1=visiting, 2=rooted.
+            let mut marks = vec![0_u8; contexts.len()];
+            marks[root] = 2;
+            let mut path = Vec::with_capacity(contexts.len());
+            for start in 0..contexts.len() {
+                let mut cursor = start;
+                while marks[cursor] != 2 {
+                    if marks[cursor] == 1 {
+                        return Err(GuardianCheckpointStageStoreError::Conflict);
+                    }
+                    marks[cursor] = 1;
+                    path.push(cursor);
+                    cursor = parents[cursor].ok_or(GuardianCheckpointStageStoreError::Conflict)?;
+                }
+                for visited in path.drain(..) {
+                    marks[visited] = 2;
+                }
+            }
+            Ok(contexts[root])
+        })?;
         Ok(GuardianDurableSuccessorCustodyV1 {
             store: self.clone(),
             context,
@@ -5936,8 +6330,8 @@ fn successor_custody_path(
     context: &mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
 ) -> PathBuf {
     inner.directory_path.join(format!(
-        "successor-custody-v1-{}-{}.bin",
-        context.pane_id, context.handoff_id
+        "successor-custody-v2-{}-{}-{}.bin",
+        context.pane_id, context.handoff_id, context.successor.connection_id
     ))
 }
 
@@ -5963,8 +6357,8 @@ fn read_successor_custody_scope_locked(
     GuardianCheckpointStageStoreError,
 > {
     let path = inner.directory_path.join(format!(
-        "successor-custody-v1-{}-{}.bin",
-        expected.pane_id, expected.handoff_id
+        "successor-custody-v2-{}-{}-{}.bin",
+        expected.pane_id, expected.handoff_id, expected.successor.connection_id
     ));
     let bytes = read_synced_custody_bytes::<
         { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
@@ -6817,6 +7211,15 @@ struct OutputQueueState {
 struct OutputQueue {
     state: Mutex<OutputQueueState>,
     ready: Condvar,
+    #[cfg(test)]
+    broker_append_pause: Mutex<Option<BrokerAppendPause>>,
+}
+
+#[cfg(test)]
+struct BrokerAppendPause {
+    pane_id: Uuid,
+    entered: SyncSender<()>,
+    release: Receiver<()>,
 }
 
 enum OutputQueuePushError {
@@ -6840,6 +7243,8 @@ impl OutputQueue {
                 shutdown: false,
             }),
             ready: Condvar::new(),
+            #[cfg(test)]
+            broker_append_pause: Mutex::new(None),
         })
     }
 
@@ -6951,6 +7356,25 @@ pub struct GuardianOutputPipeline {
 }
 
 impl GuardianOutputPipeline {
+    #[cfg(test)]
+    pub(crate) fn pause_next_broker_append_for_test(
+        &self,
+        pane_id: Uuid,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    ) {
+        let mut pause = self.queue.broker_append_pause.lock().unwrap();
+        assert!(
+            pause.is_none(),
+            "only one owned append pause may be installed"
+        );
+        *pause = Some(BrokerAppendPause {
+            pane_id,
+            entered,
+            release,
+        });
+    }
+
     pub(crate) fn open(
         token_path: &Path,
         max_panes: usize,
@@ -7365,6 +7789,30 @@ fn output_worker(
     completion_waker: &Waker,
 ) {
     while let Some(mut job) = queue.pop() {
+        #[cfg(test)]
+        if job.broker_delivery.is_some() {
+            let pause = {
+                let mut pause = queue.broker_append_pause.lock().unwrap();
+                if pause
+                    .as_ref()
+                    .is_some_and(|pause| pause.pane_id == job.pane_id)
+                {
+                    pause.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause
+                    .entered
+                    .send(())
+                    .expect("owned append observer remains live");
+                pause
+                    .release
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("owned append pause must be explicitly released");
+            }
+        }
         let payload_bytes = job.payload.len();
         let mut result = match job.journal.authority.lock() {
             Ok(mut authority) => match job.broker_delivery.as_deref() {
@@ -8942,6 +9390,13 @@ fn create_private_file_new_at(
 fn open_output_directory(
     token_path: &Path,
 ) -> Result<(File, PathBuf, DirectoryIdentity, DirectoryIdentity), GuardianOutputError> {
+    open_output_directory_with_creation(token_path, true)
+}
+
+fn open_output_directory_with_creation(
+    token_path: &Path,
+    create: bool,
+) -> Result<(File, PathBuf, DirectoryIdentity, DirectoryIdentity), GuardianOutputError> {
     validate_normalized_absolute_file_path(token_path)?;
     let parent = token_path
         .parent()
@@ -8969,10 +9424,12 @@ fn open_output_directory(
     )?;
 
     let directory_path = parent.join(OUTPUT_DIRECTORY_NAME);
-    match create_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(GuardianOutputError::io("output-directory-create", error)),
+    if create {
+        match create_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(GuardianOutputError::io("output-directory-create", error)),
+        }
     }
     let directory = open_private_directory_at(&parent_directory, OsStr::new(OUTPUT_DIRECTORY_NAME))
         .map_err(|error| GuardianOutputError::io("output-directory-open-at", error))?;
@@ -9021,6 +9478,14 @@ fn load_or_create_output_key(
     directory: &File,
     directory_path: &Path,
 ) -> Result<(GuardianOutputCipher, PathBuf, FileIdentity), GuardianOutputError> {
+    open_output_key_with_creation(directory, directory_path, true)
+}
+
+fn open_output_key_with_creation(
+    directory: &File,
+    directory_path: &Path,
+    create: bool,
+) -> Result<(GuardianOutputCipher, PathBuf, FileIdentity), GuardianOutputError> {
     validate_output_key_directory_authority(directory, directory_path)?;
     let key_path = directory_path.join(OUTPUT_KEY_NAME);
     let expected_len = u64::try_from(GuardianOutputCipher::KEY_BYTES)
@@ -9032,7 +9497,9 @@ fn load_or_create_output_key(
                 .map_err(|error| GuardianOutputError::io("output-key-metadata-at", error))?;
             validate_private_file_metadata(&metadata, Some(expected_len))?;
         }
-        Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+        Err(GuardianOutputError::Io { source, .. })
+            if create && source.kind() == ErrorKind::NotFound =>
+        {
             ensure_absent_output_key_has_no_abandoned_ciphertext(
                 directory,
                 directory_path,
@@ -9047,11 +9514,13 @@ fn load_or_create_output_key(
     // atomically moving the stage into this final name without replacement.
     // A crash therefore leaves either a resumable stage or a complete key,
     // never a partially written `journal.key` that blocks every later open.
-    provision_guardian_token_in_pinned_parent(&key_path, directory).map_err(|_| {
-        GuardianOutputError::FilesystemAuthority(
-            "guardian output key provisioning did not reach a complete private authority",
-        )
-    })?;
+    if create {
+        provision_guardian_token_in_pinned_parent(&key_path, directory).map_err(|_| {
+            GuardianOutputError::FilesystemAuthority(
+                "guardian output key provisioning did not reach a complete private authority",
+            )
+        })?;
+    }
     validate_output_key_directory_authority(directory, directory_path)?;
 
     let mut file = open_private_file_at(directory, directory_path, &key_path, false)?;
@@ -10524,6 +10993,140 @@ fn checkpoint_catalog_adoption_binding(
     .map_err(Into::into)
 }
 
+fn checkpoint_catalog_require_existing_ack(
+    inner: &GuardianCheckpointStageStoreInner,
+    member: &PublishedCheckpointCatalogMember,
+) -> Result<(), GuardianCheckpointStageStoreError> {
+    let census = checkpoint_stage_census(inner)?;
+    let metadata = member.metadata;
+    let CheckpointCatalogScope::Pane { pane_id } = metadata.identity.scope else {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    };
+    let mut candidates = census.entries.iter().filter(|entry| {
+        entry.key.scope
+            == (CheckpointStagePathScope::Pane {
+                pane_id,
+                generation: metadata.capture_generation,
+            })
+            && entry.key.upload_id == metadata.upload_id
+            && entry.role == CheckpointStageFileRole::Candidate
+    });
+    let entry = candidates
+        .next()
+        .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    if candidates.next().is_some() {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let (_, plaintext) = checkpoint_open_record(
+        inner,
+        entry,
+        CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES as u32,
+    )?;
+    let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+    if begin.kind() != GuardianCheckpointStageKindV1::Begin {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let shape = CheckpointStageRequestShape::from_request(&begin)?;
+    if shape.key() != entry.key
+        || shape.descriptor.checkpoint_id().into_bytes() != metadata.checkpoint_id
+        || shape.descriptor.boundary_id().into_bytes() != metadata.boundary_id
+    {
+        return Err(GuardianCheckpointStageStoreError::Conflict);
+    }
+    let inspection = checkpoint_inspect_upload(
+        inner,
+        &census,
+        &shape,
+        CheckpointStageSealInspection::IgnoreForHistoricalChunkRetry,
+    )?
+    .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+    if !inspection.ack_present
+        || !inspection.seal_present
+        || inspection.expiry_present
+        || inspection.publication_id != metadata.completion_id
+        || (inspection.next_index, inspection.committed_bytes)
+            != (shape.total_chunks, shape.total_bytes)
+    {
+        return Err(GuardianCheckpointStageStoreError::OutOfOrder);
+    }
+    let seal = census
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == shape.key()
+                && entry.role
+                    == (CheckpointStageFileRole::Seal {
+                        publication_id: metadata.completion_id,
+                    })
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, seal_record, _) =
+        checkpoint_read_record(inner, seal, GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES)?;
+    let seal_request = GuardianCheckpointStageRequestV1::seal(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+    )?;
+    let completion = inner.cipher.inspect_durable_manifest_receipt(
+        &shape.binding,
+        seal_request,
+        metadata.completion_id,
+        inspection.candidate_identity,
+        inspection
+            .ordered_chunk_set_identity
+            .ok_or(GuardianCheckpointStageStoreError::OutOfOrder)?,
+        &seal_record,
+    )?;
+    let bytes = checkpoint_catalog_read_file(
+        inner,
+        &member.candidate_path,
+        member.candidate_file_identity,
+        CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+    )?;
+    let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+    if candidate.format != CheckpointCatalogFormat::ProtectedV3
+        || candidate.metadata != metadata
+        || candidate.checksum != member.candidate_checksum
+    {
+        return Err(GuardianCheckpointStageStoreError::Poisoned);
+    }
+    let binding = checkpoint_catalog_adoption_binding(&candidate)?;
+    let evidence = candidate
+        .adoption_evidence
+        .as_ref()
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let ack = census
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.key == shape.key()
+                && entry.role
+                    == (CheckpointStageFileRole::Ack {
+                        publication_id: metadata.completion_id,
+                    })
+        })
+        .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+    let (_, ack_record, _) =
+        checkpoint_read_record(inner, ack, CHECKPOINT_STAGE_ACK_PLAINTEXT_BYTES as u32)?;
+    let ack_request = GuardianCheckpointStageRequestV1::ack(
+        shape.scope,
+        shape.upload_id,
+        shape.descriptor,
+        shape.chunk_bytes,
+        metadata.completion_id,
+    )?;
+    inner.cipher.inspect_ack_finalizer_from_catalog(
+        &completion,
+        &ack_request,
+        &binding,
+        evidence,
+        metadata.adoption_mux_incarnation,
+        &ack_record,
+    )?;
+    Ok(())
+}
+
 fn checkpoint_catalog_recover_adoption_evidence(
     inner: &GuardianCheckpointStageStoreInner,
     candidate: &CheckpointCatalogCandidate,
@@ -11956,6 +12559,82 @@ mod tests {
     }
 
     #[test]
+    fn successor_custody_reconnect_graph_authenticates_branches_and_rejects_disconnected_cycles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use mux::guardian_checkpoint::{
+            GuardianSuccessorCustodyContextV1, GuardianSuccessorCustodyOwnerV1,
+        };
+        let (_directory, _poll, pipeline) = pipeline_with_policy(
+            "ft-successor-custody-graph-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let owner = GuardianSuccessorCustodyOwnerV1 {
+            guardian_incarnation: Uuid::from_u128(1),
+            connection_id: Uuid::from_u128(2),
+            mux_incarnation: Uuid::from_u128(3),
+            guardian_build: [4; 32],
+            mux_build: [5; 32],
+        };
+        let root = GuardianSuccessorCustodyContextV1 {
+            broker_incarnation: Uuid::from_u128(6),
+            broker_lineage: Uuid::from_u128(7),
+            broker_build: [8; 32],
+            predecessor: owner,
+            successor: GuardianSuccessorCustodyOwnerV1 {
+                connection_id: Uuid::from_u128(9),
+                ..owner
+            },
+            pane_id: Uuid::from_u128(10),
+            handoff_id: Uuid::from_u128(11),
+            ack_id: Uuid::from_u128(12),
+            lease_generation: 2,
+            rebind_from_connection: Uuid::nil(),
+        };
+        store.persist_successor_custody(&root, &[0x21; 32])?;
+        for connection in [20, 21] {
+            store
+                .reopen_successor_custody(&root)?
+                .prepare_rebind(Uuid::from_u128(connection))?;
+        }
+        let mut scope = root.scope();
+        scope.successor.connection_id = Uuid::from_u128(99);
+        let recovered = store.lookup_successor_custody_for_reconnect(scope)?;
+        assert_eq!(
+            recovered.context(),
+            root,
+            "prepared branches do not choose broker authority"
+        );
+        let chosen = recovered.select_rebind_origin(Uuid::from_u128(20))?;
+        assert_eq!(
+            chosen.context().successor.connection_id,
+            Uuid::from_u128(20)
+        );
+        let next = chosen.prepare_rebind(Uuid::from_u128(22))?;
+        let (parent, old, rotated) = next.rebind_secrets()?;
+        assert_eq!(parent.successor.connection_id, Uuid::from_u128(20));
+        assert_ne!(*old, *rotated);
+        // Valid encrypted nodes can still form a disconnected cycle. Root and
+        // tip counts alone would accept this malformed custody graph.
+        for (connection, parent) in [(30, 31), (31, 30)] {
+            let context = GuardianSuccessorCustodyContextV1 {
+                successor: GuardianSuccessorCustodyOwnerV1 {
+                    connection_id: Uuid::from_u128(connection),
+                    ..root.successor
+                },
+                rebind_from_connection: Uuid::from_u128(parent),
+                ..root
+            };
+            store.persist_successor_custody(&context, &[0x44; 32])?;
+        }
+        assert!(matches!(
+            store.lookup_successor_custody_for_reconnect(scope),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn spawn_custody_survives_fresh_store_and_rejects_tamper_and_wrong_authority()
     -> Result<(), Box<dyn std::error::Error>> {
         let policy = OutputSegmentPolicy::production();
@@ -11984,6 +12663,97 @@ mod tests {
         let store = pipeline.checkpoint_stage_store();
         let recovered = store.lookup_spawn_custody(scope)?;
         let context = recovered.context();
+        let open_birth = |guardian, owner, pane, effect, build| {
+            GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+                &directory.join("guardian.token"),
+                guardian,
+                owner,
+                pane,
+                effect,
+                build,
+            )
+        };
+        assert_eq!(
+            open_birth(
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build
+            )?
+            .scope(),
+            scope
+        );
+        for (guardian, owner, pane, effect, build) in [
+            (
+                Uuid::new_v4(),
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                Uuid::new_v4(),
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                Uuid::new_v4(),
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                Uuid::new_v4(),
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                [0x77; 32],
+            ),
+        ] {
+            assert!(open_birth(guardian, owner, pane, effect, build).is_err());
+        }
+        let local =
+            GuardianDurableSpawnCustodyV1::open_existing(&directory.join("guardian.token"), scope)?;
+        let payload = local.into_mux_rotation_payload()?;
+        let (presented_context, presented_secret) =
+            store.authenticate_mux_rotation_payload(&payload)?;
+        assert_eq!(presented_context, context);
+        assert_eq!(*presented_secret, [0x93; 32]);
+        let mut wrong_possession = Zeroizing::new(payload.to_vec());
+        *wrong_possession.last_mut().unwrap() ^= 1;
+        assert!(
+            store
+                .authenticate_mux_rotation_payload(&wrong_possession)
+                .is_err()
+        );
+        for malformed_len in [payload.len() - 1, payload.len() + 1] {
+            let mut malformed = Zeroizing::new(payload.to_vec());
+            malformed.resize(malformed_len, 0);
+            assert!(store.authenticate_mux_rotation_payload(&malformed).is_err());
+        }
+        let mut wrong_tag = Zeroizing::new(payload.to_vec());
+        wrong_tag[0] ^= 1;
+        assert!(store.authenticate_mux_rotation_payload(&wrong_tag).is_err());
+        let (still_valid_context, still_valid_secret) =
+            store.authenticate_mux_rotation_payload(&payload)?;
+        assert_eq!(still_valid_context, context);
+        assert_eq!(*still_valid_secret, [0x93; 32]);
+        assert_eq!(
+            std::fs::read(&path)?,
+            ciphertext,
+            "opening custody cannot rewrite its record"
+        );
         assert_eq!(context.ack_id, Uuid::from_u128(7));
         assert_eq!(context.broker_incarnation, Uuid::from_u128(1));
         assert_eq!(context.child_pid, 12);
@@ -12064,6 +12834,16 @@ mod tests {
             let mut corrupt = ciphertext.clone();
             corrupt[offset] ^= 1;
             std::fs::write(&path, corrupt)?;
+            assert!(
+                open_birth(
+                    scope.guardian_incarnation,
+                    scope.mux_incarnation,
+                    scope.pane_id,
+                    scope.effect_id,
+                    scope.mux_build
+                )
+                .is_err()
+            );
             assert!(matches!(
                 store.lookup_spawn_custody(scope),
                 Err(GuardianCheckpointStageStoreError::SpawnCustody(

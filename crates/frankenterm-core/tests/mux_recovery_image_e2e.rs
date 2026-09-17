@@ -133,6 +133,7 @@ impl Fixture {
             .map(|(id, ack)| mux::MuxCapturedPaneBinding {
                 pane_id: id,
                 pane_uuid: ack.durable_pane_id.to_string(),
+                spawn_custody: None,
                 registration_wire_identity: ack.registration_wire_identity,
                 domain_id: if (3..=5).contains(&id) { 2 } else { 1 },
                 domain_name: if (3..=5).contains(&id) {
@@ -987,7 +988,13 @@ fn test_mux_recovery_e2e_production_verifier_rejects_fake_guardian() {
     let mut image = fixture.current(&cx, &store).image().clone();
     image.panes[1].checkpoint.authority = CheckpointAuthority::Guardian {
         guardian_generation: 1,
-        lease_verifier: "not-a-proof".into(),
+        publication: frankenterm_core::mux_recovery_image::RecoveryGuardianPublication {
+            guardian_incarnation: uuid::Uuid::from_bytes([0x91; 16]),
+            mux_incarnation: uuid::Uuid::from_bytes([0x92; 16]),
+            effect_id: uuid::Uuid::from_bytes([0x93; 16]),
+            checkpoint_identity: [0x94; 32],
+            output_boundary_identity: [0x95; 32],
+        },
         catalog_generation: 1,
     };
     image.image_digest = image.compute_digest().unwrap();

@@ -230,7 +230,15 @@ impl crate::TermWindow {
     /// swap from bypassing the bounded retry lane via an immediate animation or
     /// frame-budget repaint.
     pub(crate) fn complete_presented_paint(&mut self, outcome: PaintOutcome) {
+        let now = Instant::now();
+        let mut expired_copy = false;
         for (pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
+            // The deadline belongs to the transaction, including panes in
+            // hidden tabs that are not visited by the visible retry loop.
+            expired_copy |= crate::selection::PendingNativeSelection::expire_text_copy(
+                &mut state.pending_native_selection,
+                now,
+            );
             if let Some(frame) = state.selection_frame.presented() {
                 // This record is emitted only after backend acceptance and uses
                 // the complete frame actually staged for drawing. It is not a
@@ -249,21 +257,40 @@ impl crate::TermWindow {
                 );
             }
         }
-        if let Some(pane_id) = self.active_selection_drag_pane {
-            if let Some(pos) = self
-                .get_panes_to_render()
-                .into_iter()
-                .find(|pos| pos.pane.pane_id() == pane_id)
-            {
-                self.retry_pending_selection_start(&pos.pane);
-                let retry = self
-                    .pane_state(pane_id)
-                    .pending_selection_start
-                    .as_mut()
-                    .is_some_and(|pending| pending.take_paint_retry());
-                if retry {
-                    self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
-                }
+        if expired_copy {
+            frankenterm_toast_notification::persistent_toast_notification(
+                "Selection was not copied",
+                "The selected text did not arrive in time. Copy the selection again.",
+            );
+        }
+        // Released gestures retain their final endpoint through contention,
+        // so native anchor retries are not limited to an active drag.
+        for pos in self.get_panes_to_render() {
+            self.retry_pending_selection_start(&pos.pane);
+            self.retry_pending_native_selection(&pos.pane);
+            let retry = self
+                .pane_state(pos.pane.pane_id())
+                .pending_native_selection
+                .as_mut()
+                .is_some_and(|pending| pending.take_paint_retry());
+            if retry {
+                self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
+            }
+            let copy_deadline = self
+                .pane_state(pos.pane.pane_id())
+                .pending_native_selection
+                .as_ref()
+                .and_then(|pending| pending.text_copy.as_ref().map(|copy| copy.wake_at()));
+            if let Some(deadline) = copy_deadline {
+                self.schedule_animation_wake(deadline);
+            }
+            let retry = self
+                .pane_state(pos.pane.pane_id())
+                .pending_selection_start
+                .as_mut()
+                .is_some_and(|pending| pending.take_paint_retry());
+            if retry {
+                self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }
         }
         if outcome.post_present.should_force_frame_budget_paint {

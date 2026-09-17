@@ -871,8 +871,19 @@ power loss nor migration of those live sessions has been demonstrated.
   `Io(WouldBlock)`, exactly reproducing the defect; no compile failure or skip.
 - [x] Execute the same test on fixed `caa7ddc39`: strict ovh-a proof passed
   exactly one test; the unacquired-guard control also passed exactly one test.
-- [ ] Run all recorder stack integration tests and focused recorder unit
-  tests, including initialization failure, buffered repair and fsync faults.
+- [x] Run all 45 recorder stack integration tests on `caa7ddc39` through strict
+  ovh-a RCH: 45 passed, zero failed/ignored/filtered. Retain
+  `/Volumes/USB_NVME/ft-release-20260915/rc29-recorder-integration-ovh-rch.log`
+  (SHA256 `c126f06b3e788499efcafcbf63ccc22a680762958aa62f2ed6b4b92fa54810ec`).
+- [x] Run all 158 `recorder_storage::tests::` tests, including initialization
+  failure, buffered repair and fsync faults, through strict RCH using the
+  hash-pinned core test binary built from `caa7ddc39`: 158 passed, zero
+  failed/ignored, 31,664 filtered. Before/after binary SHA256 remained
+  `1ece9192dfa3eea6efdb81c39edd3e1882c9085459e281781d8c9a0dae4c632d`.
+  Retain `rc29-recorder-storage-prebuilt-ovh-rch-attempt4.log` in the same
+  evidence directory (SHA256
+  `92d73a2e807e74332144ff7758f9d37e69cdae1058e72a77dd87345ab0ca0e16`).
+  This is scoped committed-source proof, not final-source qualification.
 - [ ] Complete final-source workspace check, Clippy, tests and formatting
   through strict RCH before tagging or starting another native release build.
 
@@ -939,3 +950,229 @@ power loss nor migration of those live sessions has been demonstrated.
   and an eight-observation-minimum suppression control (`ft-cb5l2`).
 - [ ] Run the full `proptest_bocpd` target and deterministic boundary test through
   strict RCH. No production detector, threshold or generator was changed.
+
+### 2026-09-16 — measured snapshot retry latency and release blockers
+
+- [x] Retain the completed RC28 production measurement: 2,000 events, unchanged
+  offered envelope, failed finite-trace bound, and 1,987 explicit 10 ms retry
+  sleeps across 2,008 text reads. This does not establish maximum capacity.
+- [x] Remove the first source/layout retry's unconditional timer in `20a089aa0`;
+  yield cooperatively, preserve all consistency fences and the three-attempt
+  budget, retain repeated-churn and quota backoff, and obtain independent review.
+- [ ] Execute the real-socket text-read regressions and cancellation controls
+  through strict RCH, then rerun the unchanged producer on newly built binaries.
+- [ ] Repair the RCH client heartbeat gap before expensive source validation;
+  jobs 32025/32027 were cancelled by the stuck detector before compilation.
+  Do not disable detection or count these cancellations as product test results.
+- [x] Implement and independently review asynchronous live broker lease-journal
+  transitions in `b2df40bcd`; preserve fencing during I/O and quarantine failures.
+  Author consecutive-handoff, fault, owner-EOF and exact-child census regressions.
+- [ ] Execute those broker regressions through strict RCH. Source review does
+  not establish ordinary successor startup or fresh-connection recovery.
+- [x] Reject malformed, nil and noncanonical durable window/tab UUIDs in
+  `7d0a5c008`, including authenticated-image reconstruction controls.
+- [ ] Execute image and authenticated reconstruction controls through strict RCH.
+
+### 2026-09-16 — isolated native RC28 acceptance
+
+- [x] Launch the actual DSR RC28 app in a separate process with private home,
+  configuration, sockets and an owned local child; preserve installed RC15
+  process 89046 and all existing remote sessions. Candidate PID 7540 uses source
+  `55baaac56dd0d8ab665164041c8fb0922249c6d2`, not the later RC29 fixes.
+- [x] Drag-select the exact 69-byte Unicode line with native mouse input;
+  verify selection through the GUI's selection API. Initial unfocused drag was
+  empty; the focused drag preserved Chinese, combining accent and emoji bytes.
+- [x] Verify native menu font increase and Command-minus decrease retain the
+  1148 by 774 pixel window while the grid changes 80 by 24 to 69 by 21 and back.
+  Ordinary edge drag changes the window to 844 by 644 and grid to 58 by 19,
+  with visible reflow. These observations are not latency benchmark results.
+- [x] Trace the history-prefix join to the stale incoming scrollback wrap flag.
+  Retain regression-only `da37591d9` and reviewed repair `d99529957`, covering
+  full first-row erases while preserving partial-erase continuations.
+- [ ] Execute the negative baseline and fixed CSI controls through strict RCH,
+  then repeat native clear/repaint/reflow against the final artifact.
+- [x] Capture actual native key events: the synthesized equals event arrives as
+  Shift+Command with raw plus. Adding only its missing binding to the isolated
+  Lua configuration makes the identical event increase font size at fixed pixels.
+  Commit default alias repair `ce0582ee0` with InputMap/custom/disable controls.
+- [ ] Run both `cmd_plus` tests in `glyphcache_unit` through strict RCH and
+  verify final native default bindings without the diagnostic Lua override.
+- [ ] Repeat native acceptance against the final source and final DSR artifacts,
+  including remote-session reconnect, before release/install claims.
+
+### 2026-09-16 — remote compilation resumed and actual failures repaired
+
+- [x] Repair RCH preflight heartbeat ownership and execute its real Unix-socket
+  regression: job 32060 ran one test successfully. Build the corrected client
+  remotely and verify its SHA-256 on the Linux coordinator before use. No daemon
+  timeout or admission rule was weakened; the installed Mac client is unchanged.
+- [x] Import committed source objects into the existing coordinator repository
+  without changing its HEAD, index, refs, or working files. Focused core and
+  terminal/GUI queues now reach actual remote Cargo compilation.
+- [x] Repair the actual guardian test compile failure and Rust 2018 panic-format
+  warning in `caabcfd5862aec250e941025b291e2c90f024042`. The failed combined
+  attempt ran no tests; it is not a passing guardian receipt.
+- [x] Repair the default-feature terminal test-helper compilation defect in
+  `6163635feb1cf9002431de73ac4c3a49dad236b5`. Feature-matched ED2 baseline and
+  fixed-source execution remain separate from this source correction.
+- [ ] Finish core image/authenticated restore, snapshot retry, BOCPD, CSI,
+  Cmd-plus and guardian runtime queues, retaining actual test counts and source
+  identities. Repeat workspace qualification after the final source settles.
+- [x] Validate the private DSR quality configuration with the checked Linux
+  RCH transport. Preserve all six gates and native DSR build configuration.
+- [ ] Execute that complete DSR quality lane on the final imported source.
+  Static gates passed 29 checks on the earlier metadata checkpoint; this does
+  not qualify subsequent code or substitute for Cargo/native checks.
+- [ ] Verify held selection across native reflow. The isolated app remains
+  visible, but CUA coordinate drags currently fail with `noWindowsAvailable`;
+  its earlier successful Unicode drag does not establish this additional case.
+- [ ] Complete durable pending-Claim fresh-connection rebind, including lost
+  reply, stale owner, rotated custody and sync-failure controls. This bounded
+  slice does not establish new-mux-incarnation recovery, whole-topology startup
+  publication, broker restart adoption, or GUI reopen ordering.
+
+### 2026-09-16 — actual focused results and remaining implementation
+
+- [x] Execute c258 image controls: 72 passed, zero failed/ignored, 31,758
+  filtered. Execute authenticated whole-mux restoration: 15 passed, zero
+  failed/ignored, 31,815 filtered, including damaged-root RaptorQ repair.
+  These prove reconstruction behavior, not live startup or process continuity.
+- [x] Execute c258 real-PTY capture/publication: one passed, zero failed/ignored,
+  31,829 filtered. Execute text-read retry controls: 14 passed, zero
+  failed/ignored, 31,816 filtered, including first-retry yield without a timer.
+- [x] Execute recovery-image integration on c258: 15 passed, zero
+  failed/ignored/filtered, including authenticated repair from disk, hidden
+  stack reconstruction and active-destination refusal. Execute BOCPD: 38
+  passed, zero failed/ignored/filtered. Both ran on vmi1152480 through strict
+  RCH with the verified epoch client; this completes the focused core queue.
+- [x] Prove the ED2 regression fails on da375 at the stale-wrap assertion.
+  Execute fixed a2f3 CSI controls: 17 passed with serde and 17 passed without
+  it; the latter also proves the test-helper feature-gating repair.
+- [x] Execute both a2f3 Cmd-plus binding tests: two passed, zero failed/ignored,
+  730 filtered. Native default-binding acceptance still needs a final artifact.
+- [x] Commit pending native gesture capture and clipboard retention in 06fa,
+  with typed Busy/source-changed/unsupported-anchor outcomes and bounded wakeups.
+  Preserve alternate-screen and nonresident-history basic selection.
+- [x] Commit resident held-anchor preservation over unrelated output in d7fa,
+  after regression-only 7fdd. Mutations within selected rows still invalidate.
+- [x] Execute the held-anchor negative (one expected failure) and fixed terminal
+  (seven passed) and mux (13 passed) regressions. Fix soft-wrap BeforeZero
+  endpoint whitespace in 475355e16; all seven GUI regressions now pass, including
+  literal Unicode, hard-newline and real-blank-line controls.
+  This implementation covers LocalPane; remote ClientPane remapping remains
+  unsupported and must not be inferred from local results.
+- [x] Execute b7d full guardian library tests: 235 passed, four failed, four
+  ignored. Retain the failures; the subsequent mux tests did not execute.
+- [x] Fix wrong-mux reconnect rejection in two shared-fixture tests, the
+  capacity-one sentinel readiness race, and exact durable predecessor-fence
+  reopen failure. Fix claimant census ownership and connection EOF settlement.
+- [x] Execute full mux tests at 5b21777e2: 1,197 passed, zero failed/ignored,
+  including deterministic terminal-fence-before-cleanup settlement coverage.
+- [x] Complete guardian rerun at bb3884e3a: 239 passed, zero failed, four
+  ignored. The WAL-fault fixture now queries the actual owner after transfer.
+- [x] Implement the first new-mux owner rotation in 821036d94: existing-only encrypted custody
+  bootstrap, old outer-owner retirement, per-pane durable fence, new owner
+  claim, durable custody and acknowledgement, then runtime handle publication.
+- [x] Review and commit distinct-build ownership transfer and actual outer
+  lost-reply, delayed-output and three journal-cut fixtures in 8274c5336.
+  This is implementation, not successful execution proof.
+- [x] Retain the sealed 821036 compile failure: seven missing production
+  imports, zero tests executed. Correct those imports in 8274c5336; the workspace
+  check independently found the same defects and continues with keep-going.
+- [ ] Execute sealed 8274c5336 tests and retain its actual executable, then
+  prove transfer to a second genuinely distinct source build. Typed build IDs
+  within one executable do not satisfy this artifact-to-artifact check.
+- [ ] Prove rotation deadlines, exact outer lost-reply retries, rejected live
+  predecessors, missing/wrong credentials, and unchanged real child identity.
+  Broker connection loss after committed ACK remains a separate unproven case.
+- [ ] Connect image discovery and whole-topology prepare/commit to ordinary
+  startup before default replacement shells or public readiness are emitted.
+- [x] Execute prepared-reflow cursor controls at cf30f16b: nine passed, zero
+  failed, 507 filtered. Execute the unchanged-row stale-preparation reuse control:
+  one passed, zero failed, 515 filtered. These are remote correctness tests,
+  not native or remote-session latency measurements.
+- [ ] Finish the newly diagnosed remote ClientPane selection fixes: retain a
+  gesture through cache-lock contention and release without a final Motion;
+  read authoritative fresh text in bounded chunks; preserve original server row
+  revisions separately from fetch repaint damage; retry deferred clipboard work
+  without copying stale, predicted or partially fetched text.
+- [ ] Execute actual remote cache/gesture controls and repeat selection against
+  the final native application and an owned remote session.
+- [x] Diagnose incomplete resize evidence passing as zero latency (ft-n33w8).
+  Require complete nonempty numeric measurements and refuse failed baseline
+  refreshes. Independent review also found unvalidated queue measurements;
+  require actual per-event stages and numeric queue depths. All 59 shell
+  controls pass, including poisoned local-Cargo guards.
+- [x] Complete independent review of ft-n33w8; this gate evaluates
+  simulation evidence and cannot establish actual Mac resize performance.
+- [x] Retain ft-n33w8 shell receipt SHA-256
+  `b1c73f4e910ce19cfd9d3c500aa1b4a51ef1b2cc6daa0588c246b5cae184861b`.
+- [x] Diagnose repeated identical-source rebuilds: RCH refreshed every source
+  timestamp after all artifacts. Closure-bound freshness-epoch regressions now
+  pass 19 tests, including actual first-party Cargo reuse and changed-byte rebuild.
+- [x] Complete epoch workspace check, Clippy and format, build and hash-verify
+  its remote client, then adopt it only for future proof invocations. RCH commit
+  0812d5b42; delivered client SHA-256
+  eadcd3b749d515699af84d72c0ddaf2b3276c532a9626e47692136378c238740.
+- [ ] Complete final-source workspace and six-gate DSR qualification, all
+  native families, native/remote acceptance, required producer evidence,
+  publication, verification, canary and safe upgrade/installation. No release
+  is published and no existing remote mux has been restarted.
+
+### 2026-09-17 — live handoff proven; remaining release work
+
+- [x] Execute the sealed two-pane mux-process rotation at `f2fc069e4` through
+  strict RCH job `j-30023605353971981`: one passed, zero failed/ignored,
+  250 filtered. Both original children survive the tested ownership handoff.
+  Retain the executable independently of the mutable build pool; SHA-256
+  `78eddf76ece656a1117161b79e05a6958cb894f2503991b080607d8841510129`.
+- [x] Retain sealed second-source executable `8e00c3e75`, SHA-256
+  `ad80a6c6be7bcdaa14ecd7aae2569d1e147f033784aa6ed9b84eaaa4d7edc2b2`.
+  Strict RCH job `j-30023605353971986` proves distinct-binary handoff, exact
+  outer reply loss and all three lease-journal cuts: three passed, one failed.
+- [x] Diagnose that remaining delayed-output failure: census mistakes the
+  worker-owned output journal for missing custody. `b3752b0e8` tracks exact
+  pane/sequence transfer, validates returned ownership and keeps the lease
+  census available without exposing uncommitted output. Negative controls
+  reject missing, partial, wrong-pane and wrong-sequence custody.
+- [ ] Execute updated sealed upgrade/fault suite on worker126, retained log
+  `b3752b0-upgrade-and-faults-rch.log`; do not close on compilation alone.
+- [x] Commit actual input delivery gates in `2332b889b`: keyboard protocols,
+  composed input, SendKey/SendString, terminal mouse reports, paste and drops.
+  Retain local selection/copy and overlay interaction. Delayed paste retains
+  its original pane allocation and verifies current window ownership.
+- [ ] Execute the owned real-PTY pane-move regression and mixed-layout tests;
+  review reconnect delivery and saved-window restoration against native input.
+- [x] Fix the missing inherited guardian workspace dependency in `f85640a22`.
+  Both prior `2332b889b` verification jobs failed before compilation; neither
+  is a passing receipt. Scope durable Unix-only witnesses correctly in
+  `8e00c3e75` so Windows does not import unavailable output-store types.
+- [x] Retain and review the remote Cargo lock resolution for the new optional
+  core-to-guardian dependency: exactly one dependency-list entry, no version
+  changes. Local lock bytes match the retained remote file, SHA-256
+  `8bfd49e94374b368aff709714ec2d838d40f2c9258aefbe0552b261a4c653de8`.
+- [ ] Repeat verification with the committed lock and `--locked`.
+- [x] Execute latest core image suite at `25c029e9`: 72 passed, zero failed.
+- [ ] Execute fresh-process custody/catalog/ACK reopening through the real
+  birth-image parent test. Then connect verified discovery and atomic topology
+  publication to ordinary startup before listeners/default shells appear.
+- [x] Finish clipboard deadline proof and recorder isolation: strict RCH
+  job `30023644042232225`, 31 passed/zero failed, normal parallel execution.
+  Retain `ruby-selection-deadline-fixed-rch.log`; final test delta `c69137d5c`.
+  Close the narrow valid-empty bead `ft-t5mse`; keep `ft-ffrry` open for large
+  cold-span acquisition and native acceptance.
+- [x] Fix all three errors from completed `8e00c3e75` workspace check:
+  reconnect domain receiver, guard lifetime, and obsolete fake publication
+  test field. Updated locked workspace run is pinned to `c69137d5c`.
+- [x] Fix three GUI `WindowOrderMirror` private-import errors in `b3752b0e8`.
+- [ ] Execute updated GUI layout tests; retain `b3752b0-gui-layout-rch.log`.
+- [ ] Execute exact remote-pane mapping regression in client layout tests.
+- [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
+  separator corrections are committed; Bead `ft-kwrh9` retains the earlier
+  419-test surface receipt and terminal oracle corrections.
+- [ ] Finish current-source word-boundary proof and measure actual native
+  resize, tiling and font-change latency with fixed pixels and large history.
+- [ ] Complete final workspace check, Clippy, exact-source formatting proof,
+  DSR quality, native builds, native/remote acceptance, signed producer
+  artifacts, DSR publication/verification/canary/upgrade and Dock installation.
+  Existing user sessions remain untouched until their preservation is proved.

@@ -114,7 +114,7 @@ pub fn emit_smart_selection_pick(kind: SelectionPatternKind, text: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use frankenterm_core::a11y_tree::AccessibilityScenario;
     use frankenterm_core::smart_selection::SelectionPatternKind;
@@ -241,7 +241,7 @@ mod tests {
     /// Serialise tests that touch the process-wide
     /// [`shared_smart_selection_recorder`] so concurrent test
     /// execution doesn't race on its buffer.
-    fn shared_recorder_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn shared_recorder_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // PoisonError is fine here — a panicked sibling test
         // shouldn't block the next.

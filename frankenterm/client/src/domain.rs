@@ -46,6 +46,19 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Sample synchronously while handling a mux notification, before queueing
+/// GUI work: a later callback no longer has the remote application's origin.
+pub fn remote_layout_application_in_progress() -> bool {
+    REMOTE_METADATA_APPLICATION_DEPTHS
+        .try_with(|depths| {
+            depths
+                .try_borrow()
+                .map(|depths| !depths.is_empty())
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
 /// One attachment-generation-scoped bijection between remote and local ids.
 ///
 /// Keeping both directions behind the same mutex makes reverse lookups bounded
@@ -223,7 +236,167 @@ pub struct ClientInner {
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
     topology_session: Mutex<ClientTopologySessionState>,
+    layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
+    layout_snapshot: Mutex<Option<Arc<RemoteLayoutSnapshot>>>,
+    layout_failed: AtomicBool,
     detached: AtomicBool,
+}
+
+/// A committed attachment's remote identities. Construction is private: a
+/// configured endpoint or a legacy numeric mapping cannot mint this receipt.
+pub struct RemoteLayoutSnapshot {
+    inner: Weak<ClientInner>,
+    rpc: RpcGenerationScope,
+    binding: DurableClientBinding,
+    session: MuxSessionIncarnation,
+    tabs: Vec<RemoteLayoutTab>,
+}
+
+pub struct RemoteLayoutTab {
+    tab: Arc<Tab>,
+    remote_tab_id: TabId,
+    remote_window_id: WindowId,
+}
+
+impl RemoteLayoutTab {
+    fn validate(&self, mux: &Mux, inner: &Arc<ClientInner>) -> anyhow::Result<()> {
+        ensure!(
+            mux.get_tab(self.tab.tab_id())
+                .is_some_and(|tab| Arc::ptr_eq(&tab, &self.tab)),
+            "layout tab was replaced"
+        );
+        let mapped = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+            .get(&self.remote_tab_id)
+            .copied();
+        ensure!(
+            mapped == Some(self.tab.tab_id()),
+            "layout tab mapping changed"
+        );
+        let panes = self.tab.iter_all_panes();
+        ensure!(!panes.is_empty(), "remote layout tab has no owned panes");
+        for pane in panes {
+            ensure!(
+                mux.get_pane(pane.pane_id())
+                    .is_some_and(|current| Arc::ptr_eq(&current, &pane)),
+                "layout pane registration was replaced"
+            );
+            let client_pane = pane
+                .downcast_ref::<ClientPane>()
+                .context("remote layout tab contains a local pane")?;
+            ensure!(
+                pane.domain_id() == inner.local_domain_id
+                    && client_pane.belongs_to_client(inner)
+                    && client_pane.remote_tab_id == self.remote_tab_id,
+                "remote layout tab contains a pane from another attachment"
+            );
+            ensure!(
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+                    .get(&client_pane.remote_pane_id())
+                    .copied()
+                    == Some(pane.pane_id()),
+                "layout pane mapping changed"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn tab(&self) -> &Arc<Tab> {
+        &self.tab
+    }
+
+    pub fn remote_tab_id(&self) -> TabId {
+        self.remote_tab_id
+    }
+
+    pub fn remote_window_id(&self) -> WindowId {
+        self.remote_window_id
+    }
+}
+
+impl RemoteLayoutSnapshot {
+    pub fn binding(&self) -> DurableClientBinding {
+        self.binding
+    }
+
+    pub fn session(&self) -> MuxSessionIncarnation {
+        self.session
+    }
+
+    pub fn tabs(&self) -> &[RemoteLayoutTab] {
+        &self.tabs
+    }
+
+    /// Hold the original transport's consumer lease across the local commit.
+    /// Reconnecting to the same endpoint does not validate an old receipt.
+    pub fn with_current<T>(
+        &self,
+        mux: &Arc<Mux>,
+        apply: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _lease = self
+            .rpc
+            .retain_consumer_commit(RpcConsumerKind::TopologySnapshot)?;
+        self.validate_current(mux)?;
+        apply()
+    }
+
+    pub fn with_current_batch<T>(
+        snapshots: &[Arc<Self>],
+        mux: &Arc<Mux>,
+        apply: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        ensure!(
+            snapshots.len() <= 4_096,
+            "too many layout attachment receipts"
+        );
+        let mut leases = Vec::new();
+        leases.try_reserve_exact(snapshots.len())?;
+        for snapshot in snapshots {
+            leases.push(
+                snapshot
+                    .rpc
+                    .retain_consumer_commit(RpcConsumerKind::TopologySnapshot)?,
+            );
+        }
+        for snapshot in snapshots {
+            snapshot.validate_current(mux)?;
+        }
+        apply()
+    }
+
+    fn validate_current(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .context("layout attachment was released")?;
+        ensure!(!inner.is_detached(), "layout attachment was detached");
+        let domain = mux
+            .get_domain(inner.local_domain_id)
+            .context("layout domain was removed")?;
+        let domain = domain
+            .downcast_ref::<ClientDomain>()
+            .context("layout domain was replaced")?;
+        ensure!(
+            domain.inner_is_current(&inner),
+            "layout attachment was replaced"
+        );
+        ensure!(
+            domain.durable_layout_binding() == Some(self.binding),
+            "layout binding changed"
+        );
+        let current = lock_or_recover(&inner.layout_snapshot, "layout_snapshot");
+        ensure!(
+            current
+                .as_ref()
+                .is_some_and(|snapshot| std::ptr::eq(snapshot.as_ref(), self)),
+            "layout snapshot was superseded"
+        );
+        drop(current);
+        for entry in &self.tabs {
+            entry.validate(mux, &inner)?;
+        }
+        Ok(())
+    }
 }
 
 /// Owns one attachment's pending title update, including its RPC. Producers
@@ -1265,6 +1438,22 @@ pub type DomainBindingFuture =
 pub type DomainBindingResolver = fn(ClientEndpointFingerprint) -> DomainBindingFuture;
 
 static DOMAIN_BINDING_RESOLVER: OnceLock<DomainBindingResolver> = OnceLock::new();
+static LAYOUT_READY_OBSERVER: OnceLock<fn(DomainId)> = OnceLock::new();
+
+/// Wake the GUI only after a coherent snapshot and transport readiness commit.
+pub fn install_layout_ready_observer(observer: fn(DomainId)) -> anyhow::Result<()> {
+    match LAYOUT_READY_OBSERVER.set(observer) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if LAYOUT_READY_OBSERVER
+                .get()
+                .is_some_and(|current| std::ptr::fn_addr_eq(*current, observer)) =>
+        {
+            Ok(())
+        }
+        Err(_) => bail!("a different layout readiness observer is already installed"),
+    }
+}
 const LAYOUT_BINDING_RESOLUTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
 
@@ -1594,6 +1783,9 @@ impl ClientInner {
             reliable_input_queue: ReliableInputQueue::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
+            layout_tab_owners: Mutex::new(HashMap::new()),
+            layout_snapshot: Mutex::new(None),
+            layout_failed: AtomicBool::new(false),
             detached: AtomicBool::new(false),
         }
     }
@@ -2509,6 +2701,105 @@ impl ClientDomain {
             .flatten()
     }
 
+    pub fn layout_snapshot(&self) -> Option<Arc<RemoteLayoutSnapshot>> {
+        let inner = self.inner()?;
+        let snapshot = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").clone();
+        snapshot
+    }
+
+    pub fn layout_restore_pending(&self) -> bool {
+        if self.durable_layout_binding().is_none() {
+            return false;
+        }
+        let Some(inner) = self.inner() else {
+            return true;
+        };
+        if inner.layout_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if matches!(
+            *lock_or_recover(&inner.topology_session, "topology_session"),
+            ClientTopologySessionState::Bound(ClientTopologySession::Legacy46)
+        ) {
+            return false;
+        }
+        let pending = lock_or_recover(&inner.layout_snapshot, "layout_snapshot").is_none();
+        pending
+    }
+
+    fn publish_layout_snapshot(
+        &self,
+        mux: &Arc<Mux>,
+        inner: &Arc<ClientInner>,
+    ) -> anyhow::Result<()> {
+        let Some(binding) = self.durable_layout_binding() else {
+            return Ok(());
+        };
+        let session = match *lock_or_recover(&inner.topology_session, "topology_session") {
+            ClientTopologySessionState::Bound(ClientTopologySession::Current(session)) => session,
+            _ => return Ok(()),
+        };
+        let rpc = inner.client.rpc_scope();
+        if !rpc.is_available() {
+            return Ok(());
+        }
+        rpc.commit_sync(
+            RpcConsumerKind::TopologySnapshot,
+            || -> anyhow::Result<()> {
+                ensure!(
+                    self.inner_is_current(inner) && !inner.is_detached(),
+                    "layout attachment retired before publication"
+                );
+                let owners = lock_or_recover(&inner.layout_tab_owners, "layout_tab_owners");
+                ensure!(owners.len() <= 65_536, "layout snapshot exceeds tab bound");
+                let mappings = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
+                let mut tabs = Vec::new();
+                tabs.try_reserve_exact(owners.len())?;
+                for (&remote_tab_id, &remote_window_id) in owners.iter() {
+                    let local = mappings
+                        .get(&remote_tab_id)
+                        .context("layout tab mapping is missing")?;
+                    let tab = mux.get_tab(*local).context("layout tab was removed")?;
+                    tabs.push(RemoteLayoutTab {
+                        tab,
+                        remote_tab_id,
+                        remote_window_id,
+                    });
+                }
+                tabs.sort_unstable_by_key(|entry| entry.remote_tab_id);
+                drop(mappings);
+                drop(owners);
+                for entry in &tabs {
+                    entry.validate(mux, inner)?;
+                }
+                let snapshot = Arc::new(RemoteLayoutSnapshot {
+                    inner: Arc::downgrade(inner),
+                    rpc: rpc.clone(),
+                    binding,
+                    session,
+                    tabs,
+                });
+                *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = Some(snapshot);
+                Ok(())
+            },
+        )
+        .map_err(anyhow::Error::new)??;
+        Ok(())
+    }
+
+    fn refresh_layout_snapshot(&self, mux: &Arc<Mux>, inner: &Arc<ClientInner>) {
+        if let Err(error) = self.publish_layout_snapshot(mux, inner) {
+            *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
+            inner.layout_failed.store(true, Ordering::Release);
+            log::warn!("remote layout publication unavailable: {error:#}");
+        } else {
+            inner.layout_failed.store(false, Ordering::Release);
+        }
+        if let Some(observer) = LAYOUT_READY_OBSERVER.get() {
+            observer(self.local_domain_id);
+        }
+    }
+
     async fn resolve_layout_binding_with(
         &self,
         resolver: DomainBindingResolver,
@@ -2795,6 +3086,7 @@ impl ClientDomain {
             .client
             .publish_rpc_transport_ready(&rpc, readiness_guard)
             .await?;
+        client_domain.refresh_layout_snapshot(&mux, &expected);
         ui.close();
         Ok(())
     }
@@ -2854,17 +3146,20 @@ impl ClientDomain {
             return Ok(false);
         }
 
-        rpc.commit_sync(RpcConsumerKind::RenderBootstrap, || {
-            if !incarnation_is_current() {
-                bail!("client attachment retired before render bootstrap preparation");
-            }
-            Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), rpc)?;
-            if !incarnation_is_current() {
-                bail!("client attachment retired during render bootstrap preparation");
-            }
-            Ok(true)
-        })
-        .map_err(anyhow::Error::new)?
+        let prepared = rpc
+            .commit_sync(RpcConsumerKind::RenderBootstrap, || {
+                if !incarnation_is_current() {
+                    bail!("client attachment retired before render bootstrap preparation");
+                }
+                Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), rpc)?;
+                if !incarnation_is_current() {
+                    bail!("client attachment retired during render bootstrap preparation");
+                }
+                Ok(true)
+            })
+            .map_err(anyhow::Error::new)??;
+        domain.refresh_layout_snapshot(&mux, &inner);
+        Ok(prepared)
     }
 
     fn prepare_render_application_bootstrap(
@@ -3430,6 +3725,9 @@ impl ClientDomain {
         snapshot: RpcTopologySnapshot,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
+        // A partially applied or rejected successor must not leave the old
+        // layout receipt usable while its numeric mappings are changing.
+        *lock_or_recover(&inner.layout_snapshot, "layout_snapshot") = None;
         match snapshot {
             RpcTopologySnapshot::Current {
                 session_incarnation,
@@ -4182,6 +4480,8 @@ impl ClientDomain {
             }
         }
 
+        *lock_or_recover(&inner.layout_tab_owners, "layout_tab_owners") = remote_tab_owners;
+
         Ok(())
     }
 
@@ -4264,6 +4564,7 @@ impl ClientDomain {
             // rejects a second initial attachment without holding a callback-
             // reentrant mutex across mux topology mutation.
             let result = (|| {
+                let _remote_application = inner.begin_remote_metadata_application()?;
                 Self::process_topology_snapshot(mux, Arc::clone(&inner), panes, primary_window_id)?;
 
                 let mut published = lock_or_recover(&domain.inner, "client_domain_inner");
@@ -4346,6 +4647,7 @@ impl ClientDomain {
         }
         .await;
         bootstrap_result?;
+        domain.refresh_layout_snapshot(mux, &inner);
         cleanup.disarm();
 
         Ok(())
@@ -6296,6 +6598,40 @@ mod tests {
         );
         assert_eq!(mux.iter_windows().len(), 2);
         assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn layout_snapshot_rejects_changed_remote_pane_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_030);
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .unwrap();
+        let pane = mux.iter_panes().into_iter().next().unwrap();
+        let (_, _, tab_id) = mux.resolve_pane_id(pane.pane_id()).unwrap();
+        let receipt = RemoteLayoutTab {
+            tab: mux.get_tab(tab_id).unwrap(),
+            remote_tab_id: 51,
+            remote_window_id: 41,
+        };
+        receipt.validate(&mux, &inner).unwrap();
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping").insert(61, usize::MAX);
+        assert!(receipt
+            .validate(&mux, &inner)
+            .unwrap_err()
+            .to_string()
+            .contains("mapping changed"));
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+            .insert(61, pane.pane_id());
+        receipt.validate(&mux, &inner).unwrap();
+        let replacement = test_client_inner(inner.local_domain_id);
+        assert!(receipt.validate(&mux, &replacement).is_err());
     }
 
     #[test]

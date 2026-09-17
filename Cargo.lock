@@ -3840,6 +3840,7 @@ dependencies = [
  "frankenterm-core-telemetry-types",
  "frankenterm-core-test-macros",
  "frankenterm-core-x11-resize-types",
+ "frankenterm-pty-guardian",
  "frankenterm-sigpipe",
  "frankenterm-term",
  "frankenterm-uds",

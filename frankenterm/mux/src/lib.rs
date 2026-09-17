@@ -294,6 +294,7 @@ pub enum MuxCapturedPaneLane {
 pub struct MuxCapturedPaneBinding {
     pub pane_id: PaneId,
     pub pane_uuid: String,
+    pub spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>,
     pub registration_wire_identity: [u8; 16],
     pub domain_id: DomainId,
     pub domain_name: String,
@@ -2316,6 +2317,8 @@ enum GuardianOutputReplayPreparationError {
 
 #[derive(Clone, Copy)]
 struct LiveParserGuardianCursor {
+    authenticated_segment: GuardianOutputSegmentIdentity,
+    authenticated_output: GuardianOutputAppendReceipt,
     segment_id: uuid::Uuid,
     output_sequence: u64,
     output_record_digest: [u8; 32],
@@ -3032,6 +3035,8 @@ impl LiveParserCheckpointControl {
         state.guardian_mode = true;
         state.authorized_delivery = Some(LiveParserAuthorizedDelivery {
             cursor: LiveParserGuardianCursor {
+                authenticated_segment: segment,
+                authenticated_output: output,
                 segment_id: output.segment_id(),
                 output_sequence: output.sequence(),
                 output_record_digest: output.record_digest(),
@@ -4916,11 +4921,43 @@ mod pane_registration_handle {
             output: GuardianOutputAppendReceipt,
             limits: TerminalCheckpointLimits,
             timeout: Duration,
-        ) -> anyhow::Result<GuardianCheckpointReceipt> {
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
             let capture = self
                 .capture_live_parser_checkpoint(segment, output, limits, timeout)
                 .map_err(anyhow::Error::new)?;
             self.pane.publish_guardian_checkpoint(capture)
+        }
+
+        /// Capture the current fully parsed authenticated guardian prefix.
+        /// Retains the original typed receipt, never reconstructing one from
+        /// scalar watermarks. Existing capture admission rechecks this cut.
+        pub fn capture_current_guardian_checkpoint(
+            &self,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
+            let cursor = {
+                let state = self.generation.live_parser_checkpoint.state.lock();
+                if state.dead
+                    || state.poison.is_some()
+                    || !state.attached
+                    || state.authorized_delivery.is_some()
+                    || state.delivery_call_in_flight
+                    || state.socket_write_in_flight
+                    || state.delivered_bytes != state.parsed_bytes
+                {
+                    return Err(LiveParserCheckpointError::GuardianDeliveryBusy.into());
+                }
+                state
+                    .guardian_cursor
+                    .ok_or(LiveParserCheckpointError::GuardianDeliveryStartedLate)?
+            };
+            self.capture_and_publish_guardian_checkpoint(
+                cursor.authenticated_segment,
+                cursor.authenticated_output,
+                limits,
+                timeout,
+            )
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -10940,12 +10977,14 @@ fn publish_guardian_checkpoint_after_typed_delivery(
     if operation.wire_identity() != generation.wire_identity {
         return Err(LiveParserCheckpointError::StaleRegistration.into());
     }
-    operation.capture_and_publish_guardian_checkpoint(
-        segment,
-        output,
-        TerminalCheckpointLimits::default(),
-        GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
-    )
+    operation
+        .capture_and_publish_guardian_checkpoint(
+            segment,
+            output,
+            TerminalCheckpointLimits::default(),
+            GUARDIAN_LIVE_CHECKPOINT_CAPTURE_TIMEOUT,
+        )
+        .map(|published| published.receipt())
 }
 
 /// This function is run in a separate thread; its purpose is to perform
@@ -18602,6 +18641,7 @@ impl Mux {
                     pane_bindings.push(MuxCapturedPaneBinding {
                         pane_id: entry.pane_id,
                         pane_uuid,
+                        spawn_custody: reg.pane.guardian_spawn_custody(),
                         registration_wire_identity: wire_id,
                         domain_id,
                         domain_name,
@@ -18667,6 +18707,7 @@ impl Mux {
                         pane_bindings.push(MuxCapturedPaneBinding {
                             pane_id,
                             pane_uuid,
+                            spawn_custody: reg.pane.guardian_spawn_custody(),
                             registration_wire_identity: wire_id,
                             domain_id,
                             domain_name,
@@ -18732,6 +18773,7 @@ impl Mux {
                     pane_bindings.push(MuxCapturedPaneBinding {
                         pane_id: fp.pane_id,
                         pane_uuid,
+                        spawn_custody: reg.pane.guardian_spawn_custody(),
                         registration_wire_identity: wire_id,
                         domain_id,
                         domain_name,

@@ -6805,6 +6805,19 @@ pub struct WholeMuxRecoveryVerifier {
     repair_key: Option<Zeroizing<Vec<u8>>>,
     repair_bundles: HashMap<[u8; 32], EncodedRepairBundle>,
     admission: Option<Arc<RepairAdmissionController>>,
+    #[cfg(feature = "frankenterm-deps")]
+    published_guardian_captures: HashMap<uuid::Uuid, PublishedGuardianCaptureWitness>,
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    reopened_guardian_captures:
+        HashMap<uuid::Uuid, frankenterm_pty_guardian::GuardianReopenedCheckpointV1>,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+struct PublishedGuardianCaptureWitness {
+    owner: mux::localpane::GuardianPaneLeaseIdentity,
+    receipt: mux::guardian_protocol::GuardianCheckpointReceipt,
+    registration: [u8; 16],
+    payload_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for WholeMuxRecoveryVerifier {
@@ -6844,6 +6857,10 @@ impl WholeMuxRecoveryVerifier {
             repair_key: None,
             repair_bundles: HashMap::new(),
             admission: None,
+            #[cfg(feature = "frankenterm-deps")]
+            published_guardian_captures: HashMap::new(),
+            #[cfg(all(unix, feature = "frankenterm-deps"))]
+            reopened_guardian_captures: HashMap::new(),
         }
     }
 
@@ -6851,6 +6868,68 @@ impl WholeMuxRecoveryVerifier {
     pub fn with_admission(mut self, admission: Arc<RepairAdmissionController>) -> Self {
         self.admission = Some(admission);
         self
+    }
+
+    /// Authorize offline validation of this exact freshly published capture.
+    /// This witness is not persisted and cannot stand in for reopening guardian
+    /// catalog authority in a successor process. Default verification refuses it.
+    #[cfg(feature = "frankenterm-deps")]
+    pub fn register_published_guardian_capture(
+        &mut self,
+        published: &mux::guardian_checkpoint::PublishedGuardianCheckpoint,
+    ) -> Result<(), WholeMuxRecoveryError> {
+        let pane = published.capture().durable_pane_id();
+        let count = self.published_guardian_captures.len();
+        let duplicate = self.published_guardian_captures.contains_key(&pane);
+        #[cfg(unix)]
+        let count = count + self.reopened_guardian_captures.len();
+        #[cfg(unix)]
+        let duplicate = duplicate || self.reopened_guardian_captures.contains_key(&pane);
+        if count >= self.limits.max_panes || duplicate {
+            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                pane_id: 0,
+                reason: "duplicate or over-budget published guardian witness".to_owned(),
+            });
+        }
+        self.published_guardian_captures.insert(
+            pane,
+            PublishedGuardianCaptureWitness {
+                owner: published.owner(),
+                receipt: published.receipt(),
+                registration: published.capture().registration_wire_identity(),
+                payload_digest: Sha256::digest(
+                    published
+                        .capture()
+                        .terminal_checkpoint()
+                        .canonical_payload(),
+                )
+                .into(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Install only guardian-owned evidence reopened from existing custody,
+    /// a settled protected catalog, and its durable ACK. This authorizes
+    /// offline decoding of an authenticated image, never live pane activation.
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    pub fn register_reopened_guardian_capture(
+        &mut self,
+        witness: frankenterm_pty_guardian::GuardianReopenedCheckpointV1,
+    ) -> Result<(), WholeMuxRecoveryError> {
+        let pane = witness.scope().pane_id;
+        if self.published_guardian_captures.len() + self.reopened_guardian_captures.len()
+            >= self.limits.max_panes
+            || self.published_guardian_captures.contains_key(&pane)
+            || self.reopened_guardian_captures.contains_key(&pane)
+        {
+            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                pane_id: 0,
+                reason: "duplicate or over-budget reopened guardian witness".to_owned(),
+            });
+        }
+        self.reopened_guardian_captures.insert(pane, witness);
+        Ok(())
     }
 
     #[must_use]
@@ -7171,15 +7250,103 @@ impl WholeMuxRecoveryVerifier {
             // Watermark != 0 is NOT guardian authority validation.
             // Offline whole-mux reconstruction operates behind inert terminals;
             // unproved guardian authority cannot activate live writer leases.
-            match pane.checkpoint.authority {
+            match &pane.checkpoint.authority {
                 CheckpointAuthority::ModelOnly { .. } => {
                     // Valid for offline inert reconstruction
                 }
-                CheckpointAuthority::Guardian { .. } => {
-                    return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
-                        pane_id: pane.pane_id as u64,
-                        reason: "no guardian lease verifier is installed".to_string(),
-                    });
+                CheckpointAuthority::Guardian {
+                    guardian_generation,
+                    publication,
+                    catalog_generation,
+                } => {
+                    #[cfg(feature = "frankenterm-deps")]
+                    {
+                        let pane_uuid = uuid::Uuid::parse_str(&pane.pane_uuid).ok();
+                        if let Some(witness) =
+                            pane_uuid.and_then(|id| self.published_guardian_captures.get(&id))
+                        {
+                            if witness.owner.guardian_incarnation()
+                                == publication.guardian_incarnation
+                                && witness.owner.mux_incarnation() == publication.mux_incarnation
+                                && witness.receipt.generation() == *guardian_generation
+                                && witness.receipt.sequence() == *catalog_generation
+                                && witness.receipt.effect_id() == publication.effect_id
+                                && witness.receipt.intent().checkpoint_identity().into_bytes()
+                                    == publication.checkpoint_identity
+                                && witness
+                                    .receipt
+                                    .intent()
+                                    .output_boundary_identity()
+                                    .into_bytes()
+                                    == publication.output_boundary_identity
+                                && witness.registration
+                                    == pane.checkpoint.registration_wire_identity
+                            {
+                                // The exact published capture is the only exemption.
+                            } else {
+                                return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                    pane_id: pane.pane_id as u64,
+                                    reason: "published guardian witness does not match image"
+                                        .to_owned(),
+                                });
+                            }
+                        } else {
+                            #[cfg(not(unix))]
+                            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                pane_id: pane.pane_id as u64,
+                                reason: "no authenticated published guardian witness is installed"
+                                    .to_owned(),
+                            });
+                            #[cfg(unix)]
+                            {
+                                let witness = pane_uuid
+                                    .and_then(|id| self.reopened_guardian_captures.get(&id))
+                                    .ok_or_else(|| {
+                                        WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                            pane_id: pane.pane_id as u64,
+                                            reason:
+                                                "no authenticated guardian witness is installed"
+                                                    .to_owned(),
+                                        }
+                                    })?;
+                                let scope = witness.scope();
+                                let expected_provenance =
+                                crate::mux_recovery_image::RecoverySpawnCustody::from(Some(
+                                    mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+                                        original: scope,
+                                        current_mux_incarnation: scope.mux_incarnation,
+                                        current_lease_generation: witness.generation(),
+                                    },
+                                ));
+                                if pane.spawn_custody != expected_provenance
+                                    || scope.guardian_incarnation
+                                        != publication.guardian_incarnation
+                                    || scope.mux_incarnation != publication.mux_incarnation
+                                    || witness.generation() != *guardian_generation
+                                    || witness.sequence() != *catalog_generation
+                                    || witness.effect_id() != publication.effect_id
+                                    || witness.checkpoint_id() != publication.checkpoint_identity
+                                    || witness.boundary_id() != publication.output_boundary_identity
+                                {
+                                    return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                        pane_id: pane.pane_id as u64,
+                                        reason: "reopened guardian witness does not match image"
+                                            .to_owned(),
+                                    });
+                                }
+                                // Registration belongs to the authenticated whole-image
+                                // envelope and its bijection, not the durable catalog.
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "frankenterm-deps"))]
+                    {
+                        let _ = (guardian_generation, publication, catalog_generation);
+                        return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                            pane_id: pane.pane_id as u64,
+                            reason: "no guardian lease verifier is installed".to_string(),
+                        });
+                    }
                 }
             }
 
@@ -7264,6 +7431,42 @@ impl WholeMuxRecoveryVerifier {
                     .max_total_checkpoint_bytes
                     .saturating_sub(total_bytes),
             )?;
+            #[cfg(feature = "frankenterm-deps")]
+            if matches!(
+                &pane.checkpoint.authority,
+                CheckpointAuthority::Guardian { .. }
+            ) {
+                let payload_digest = uuid::Uuid::parse_str(&pane.pane_uuid)
+                    .ok()
+                    .and_then(|id| {
+                        self.published_guardian_captures
+                            .get(&id)
+                            .map(|witness| witness.payload_digest)
+                            .or_else(|| {
+                                #[cfg(unix)]
+                                {
+                                    self.reopened_guardian_captures
+                                        .get(&id)
+                                        .map(|witness| witness.payload_digest())
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    None
+                                }
+                            })
+                    })
+                    .ok_or_else(|| WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                        pane_id: pane.pane_id as u64,
+                        reason: "published guardian witness disappeared".to_owned(),
+                    })?;
+                if <[u8; 32]>::from(Sha256::digest(decoded_json.as_slice())) != payload_digest {
+                    return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                        pane_id: pane.pane_id as u64,
+                        reason: "decrypted terminal differs from published guardian capture"
+                            .to_owned(),
+                    });
+                }
+            }
             drop(payload);
             drop(repair_permit);
             cx.checkpoint()
@@ -7357,6 +7560,7 @@ impl RootVerifier for WholeMuxRecoveryVerifier {
 #[cfg(feature = "frankenterm-deps")]
 pub struct ReconstructedPaneTerminal {
     pub pane_id: u64,
+    pub spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody,
     pub tab_id: u64,
     pub domain_id: u64,
     pub terminal: InertTerminal,
@@ -7488,6 +7692,7 @@ pub fn reconstruct_whole_mux_image_inert_with_config<S: std::hash::BuildHasher>(
             pane.pane_id as u64,
             ReconstructedPaneTerminal {
                 pane_id: pane.pane_id as u64,
+                spawn_custody: pane.spawn_custody.clone(),
                 tab_id,
                 domain_id,
                 terminal: inert_terminal,
@@ -13553,6 +13758,7 @@ mod tests {
             RecoveryPane {
                 pane_id: 100,
                 pane_uuid: "uuid-pane-100".to_string(),
+                spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
                 domain_name: "local".to_string(),
                 title: "frankenterm".to_string(),
                 cwd: None,
@@ -13583,6 +13789,7 @@ mod tests {
             RecoveryPane {
                 pane_id: 101,
                 pane_uuid: "uuid-pane-101".to_string(),
+                spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
                 domain_name: "local".to_string(),
                 title: "frankenterm".to_string(),
                 cwd: None,
@@ -13620,13 +13827,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 10,
-                    stable_tab_id: "tab-10".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000010".to_string(),
                     title: "dev".to_string(),
                     working_dir: Some("/app".to_string()),
                     size: term_size1,
@@ -13686,6 +13893,38 @@ mod tests {
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("root verification must succeed");
+
+        // Authentication alone cannot make an invalid durable topology identity
+        // safe for reconstruction. Re-encrypt each malformed model so the
+        // structural identity check, rather than an AEAD/digest failure, rejects it.
+        for window_identity in [true, false] {
+            for invalid in [
+                "window-1",
+                "00000000-0000-0000-0000-000000000000",
+                "00000000000000000000000000000001",
+            ] {
+                let mut changed = image.clone();
+                let field = if window_identity {
+                    changed.topology.windows[0].stable_window_id = invalid.into();
+                    "window.stable_window_id"
+                } else {
+                    changed.topology.windows[0].tabs[0].stable_tab_id = invalid.into();
+                    "tab.stable_tab_id"
+                };
+                changed.image_digest = changed.compute_digest().unwrap();
+                let manifest_bytes = encrypted_test_image(&changed);
+                let mut changed_candidate = candidate.clone();
+                changed_candidate.manifest_sha256 = sha256_hex(&manifest_bytes);
+                changed_candidate.file_len = manifest_bytes.len() as u64;
+                changed_candidate.manifest_bytes = manifest_bytes;
+                assert!(matches!(
+                    verifier.verify_root(&changed_candidate, &store),
+                    Err(WholeMuxRecoveryError::Image(
+                        MuxRecoveryImageError::InvalidDurableIdentity { field: actual }
+                    )) if actual == field
+                ));
+            }
+        }
 
         // These roots are correctly encrypted and rehashed. The independent
         // terminal object is unchanged: projection disagreement must be rejected
@@ -13833,6 +14072,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 42,
             pane_uuid: "uuid-pane-42".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -13869,13 +14109,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -13996,6 +14236,7 @@ mod tests {
         let panes1 = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -14032,13 +14273,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14103,6 +14344,7 @@ mod tests {
         let panes2 = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -14139,13 +14381,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 2,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14337,6 +14579,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "shell".to_string(),
             cwd: None,
@@ -14373,13 +14616,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14479,6 +14722,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "shell".to_string(),
             cwd: None,
@@ -14515,13 +14759,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14667,6 +14911,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 99,
             pane_uuid: "uuid-pane-99".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "fake".to_string(),
             cwd: None,
@@ -14690,7 +14935,13 @@ mod tests {
                 },
                 authority: CheckpointAuthority::Guardian {
                     guardian_generation: 1,
-                    lease_verifier: "lease-v1".to_string(),
+                    publication: crate::mux_recovery_image::RecoveryGuardianPublication {
+                        guardian_incarnation: uuid::Uuid::from_u128(1),
+                        mux_incarnation: uuid::Uuid::from_u128(2),
+                        effect_id: uuid::Uuid::from_u128(3),
+                        checkpoint_identity: [4; 32],
+                        output_boundary_identity: [5; 32],
+                    },
                     catalog_generation: 1,
                 },
             },
@@ -14704,13 +14955,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -14828,6 +15079,7 @@ mod tests {
             RecoveryPane {
                 pane_id: 10,
                 pane_uuid: "uuid-pane-10".to_string(),
+                spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
                 domain_name: "domain-alpha".to_string(),
                 title: "frankenterm".to_string(),
                 cwd: None,
@@ -14858,6 +15110,7 @@ mod tests {
             RecoveryPane {
                 pane_id: 20,
                 pane_uuid: "uuid-pane-20".to_string(),
+                spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
                 domain_name: "domain-beta".to_string(),
                 title: "frankenterm".to_string(),
                 cwd: None,
@@ -14903,13 +15156,13 @@ mod tests {
             windows: vec![
                 RecoveryWindow {
                     window_id: 1,
-                    stable_window_id: "win-1".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     workspace: "workspace-1".to_string(),
                     order_revision: 1,
                     gui_position: None,
                     tabs: vec![RecoveryTab {
                         tab_id: 88,
-                        stable_tab_id: "tab-88".to_string(),
+                        stable_tab_id: "00000000-0000-0000-0000-000000000088".to_string(),
                         title: "tab-alpha".to_string(),
                         working_dir: Some("/app/alpha".to_string()),
                         size: term_size1,
@@ -14931,13 +15184,13 @@ mod tests {
                 },
                 RecoveryWindow {
                     window_id: 2,
-                    stable_window_id: "win-2".to_string(),
+                    stable_window_id: "00000000-0000-0000-0000-000000000002".to_string(),
                     workspace: "workspace-2".to_string(),
                     order_revision: 2,
                     gui_position: None,
                     tabs: vec![RecoveryTab {
                         tab_id: 99,
-                        stable_tab_id: "tab-99".to_string(),
+                        stable_tab_id: "00000000-0000-0000-0000-000000000099".to_string(),
                         title: "tab-beta".to_string(),
                         working_dir: Some("/app/beta".to_string()),
                         size: term_size2,
@@ -15083,6 +15336,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -15119,13 +15373,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15306,6 +15560,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -15342,13 +15597,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "main".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15599,6 +15854,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 999, // not placed in tab split or floating
             pane_uuid: "uuid-pane-999".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "local".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -15635,13 +15891,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,
@@ -15735,6 +15991,7 @@ mod tests {
         let panes = vec![RecoveryPane {
             pane_id: 1,
             pane_uuid: "uuid-pane-1".to_string(),
+            spawn_custody: crate::mux_recovery_image::RecoverySpawnCustody::Absent,
             domain_name: "domain-does-not-exist".to_string(),
             title: "frankenterm".to_string(),
             cwd: None,
@@ -15771,13 +16028,13 @@ mod tests {
             }],
             windows: vec![RecoveryWindow {
                 window_id: 1,
-                stable_window_id: "win-1".to_string(),
+                stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
                 workspace: "default".to_string(),
                 order_revision: 1,
                 gui_position: None,
                 tabs: vec![RecoveryTab {
                     tab_id: 1,
-                    stable_tab_id: "tab-1".to_string(),
+                    stable_tab_id: "00000000-0000-0000-0000-000000000001".to_string(),
                     title: "tab-1".to_string(),
                     working_dir: None,
                     size: term_size,

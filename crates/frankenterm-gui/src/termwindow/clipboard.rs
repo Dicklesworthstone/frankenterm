@@ -303,6 +303,11 @@ impl TermWindow {
     }
 
     pub fn paste_from_clipboard(&mut self, pane: &Arc<dyn Pane>, clipboard: ClipboardPasteSource) {
+        if !self.pane_input_ready(pane) {
+            return;
+        }
+        let expected_pane = Arc::clone(pane);
+        let expected_window = self.mux_window_id;
         let pane_id = pane.pane_id();
         log::trace!(
             "paste_from_clipboard in pane {} {:?}",
@@ -336,14 +341,10 @@ impl TermWindow {
             .spawn_local(async move {
                 if let Ok(clip) = future.await {
                     window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                        if let Some(pane) = myself
-                            .pane_state(pane_id)
-                            .overlay
-                            .as_ref()
-                            .map(|overlay| overlay.pane.clone())
-                            .or_else(|| Mux::try_get().and_then(|mux| mux.get_pane(pane_id)))
+                        if myself.mux_window_id == expected_window
+                            && myself.pane_input_ready(&expected_pane)
                         {
-                            pane.send_paste(&clip).ok();
+                            expected_pane.send_paste(&clip).ok();
                         }
                     })));
                 }

@@ -35,7 +35,10 @@ use crate::guardian_output_journal::{
     GuardianOutputSegmentIdentity,
 };
 
-pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
+pub const GUARDIAN_PROTOCOL_VERSION: u16 = 5;
+pub const GUARDIAN_MUX_ROTATION_TAG: &[u8; 9] = b"FTMUXROT1";
+pub const GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES: usize =
+    GUARDIAN_MUX_ROTATION_TAG.len() + crate::guardian_checkpoint::GUARDIAN_SPAWN_CUSTODY_BYTES + 32;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
 pub const GUARDIAN_MAC_BYTES: usize = 32;
 pub const GUARDIAN_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -1228,6 +1231,18 @@ pub struct GuardianAuthenticatedMuxConnectionAuthorityV1 {
 
 static_assertions::assert_not_impl_any!(GuardianAuthenticatedMuxConnectionAuthorityV1: Clone, Copy, serde::Serialize, serde::de::DeserializeOwned);
 
+impl GuardianAuthenticatedMuxConnectionAuthorityV1 {
+    /// Bind a worker-routed ownership request to the authenticated build Hello.
+    pub fn mux_build_for_request(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Option<SealedAtomicBuildIdentity> {
+        (request.header().guardian_incarnation == self.guardian_incarnation
+            && request.header().mux_incarnation == self.mux_incarnation)
+            .then_some(self.mux_build_identity)
+    }
+}
+
 impl std::fmt::Debug for GuardianAuthenticatedMuxConnectionAuthorityV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1926,7 +1941,7 @@ static_assertions::assert_not_impl_any!(
 
 /// Authenticated checkpoint receipt. `OutcomeIndeterminate` is terminal for
 /// blind retry and is encoded under a distinct response status.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct GuardianCheckpointReceipt {
     pane_id: Uuid,
     generation: u64,
@@ -1934,7 +1949,23 @@ pub struct GuardianCheckpointReceipt {
     effect_id: Uuid,
     intent: GuardianCheckpointIntent,
     disposition: GuardianCheckpointDisposition,
+    authenticated_owner: Option<(Uuid, Uuid)>,
 }
+
+// Equality is the durable wire receipt identity used by exact retries. Owner
+// authentication is separately required through authenticated_owner(); decoding
+// raw identical bytes must never manufacture that transport provenance.
+impl PartialEq for GuardianCheckpointReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.pane_id == other.pane_id
+            && self.generation == other.generation
+            && self.sequence == other.sequence
+            && self.effect_id == other.effect_id
+            && self.intent == other.intent
+            && self.disposition == other.disposition
+    }
+}
+impl Eq for GuardianCheckpointReceipt {}
 
 impl std::fmt::Debug for GuardianCheckpointReceipt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1950,6 +1981,10 @@ impl std::fmt::Debug for GuardianCheckpointReceipt {
 }
 
 impl GuardianCheckpointReceipt {
+    /// Present only after a verified response is correlated to its request.
+    pub const fn authenticated_owner(self) -> Option<(Uuid, Uuid)> {
+        self.authenticated_owner
+    }
     fn from_identity(
         identity: GuardianCheckpointEffectIdentity,
         disposition: GuardianCheckpointDisposition,
@@ -1961,6 +1996,7 @@ impl GuardianCheckpointReceipt {
             effect_id: identity.effect_id,
             intent: identity.intent,
             disposition,
+            authenticated_owner: None,
         }
     }
 
@@ -1983,6 +2019,7 @@ impl GuardianCheckpointReceipt {
             effect_id,
             intent,
             disposition: GuardianCheckpointDisposition::Committed,
+            authenticated_owner: None,
         }
     }
 
@@ -2043,6 +2080,7 @@ impl GuardianCheckpointReceipt {
         let mut output_boundary_identity = [0_u8; 32];
         output_boundary_identity.copy_from_slice(&payload[88..120]);
         let receipt = Self {
+            authenticated_owner: None,
             pane_id: read_required_uuid(payload, 8)?,
             generation: read_u64(payload, 24)?,
             sequence: read_u64(payload, 32)?,
@@ -6252,12 +6290,17 @@ impl CorrelatedGuardianResponse {
         {
             return Err(GuardianProtocolError::ResponseRequestMismatch);
         }
-        let reply = GuardianReply::decode_for_operation(self.0.header.operation, &self.0.payload)?;
+        let mut reply =
+            GuardianReply::decode_for_operation(self.0.header.operation, &self.0.payload)?;
         if reply.response_status() != self.0.header.status {
             return Err(GuardianProtocolError::InvalidReplyPayload);
         }
         reply.require_response_identity(&self.0.header)?;
         reply.require_request_payload(request)?;
+        if let GuardianReply::CheckpointReceipt(receipt) = &mut reply {
+            receipt.authenticated_owner =
+                Some((header.guardian_incarnation, header.mux_incarnation));
+        }
         Ok(reply)
     }
 
@@ -11920,8 +11963,15 @@ fn validate_request_envelope(
         GuardianOperation::Hello if !request.payload.is_empty() => {
             GuardianHelloBuildIdentityV1::decode(request.payload())?;
         }
+        GuardianOperation::Claim if !request.payload.is_empty() => {
+            if request.payload.len() != GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES
+                || !request.payload.starts_with(GUARDIAN_MUX_ROTATION_TAG)
+                || header.lease_generation != 1
+            {
+                return Err(GuardianProtocolError::InvalidOperationPayload);
+            }
+        }
         GuardianOperation::GuardedStop
-        | GuardianOperation::Claim
         | GuardianOperation::Attach
         | GuardianOperation::Close
         | GuardianOperation::RetireLease
@@ -13652,6 +13702,52 @@ mod tests {
             oversized.encode(),
             Err(GuardianProtocolError::PayloadTooLarge)
         );
+    }
+
+    #[test]
+    fn mux_rotation_claim_payload_requires_exact_tag_length_and_initial_generation() {
+        let payload = || {
+            let mut bytes = Zeroizing::new(vec![0x53; GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES]);
+            bytes[..GUARDIAN_MUX_ROTATION_TAG.len()].copy_from_slice(GUARDIAN_MUX_ROTATION_TAG);
+            bytes
+        };
+        let envelope = |generation, bytes| {
+            request_zeroizing(
+                GuardianOperation::Claim,
+                id(1),
+                id(2),
+                id(3),
+                Some(id(4)),
+                generation,
+                0,
+                Some(id(5)),
+                bytes,
+            )
+        };
+        let valid = envelope(1, payload());
+        let decoded = authenticate(&valid);
+        assert_eq!(decoded.payload(), valid.payload());
+        assert!(validate_request_envelope(&claim_request(id(1), id(2), id(4), 1, 3, 5)).is_ok());
+        let mut malformed = Vec::new();
+        let mut unknown_tag = payload();
+        unknown_tag[0] ^= 1;
+        malformed.push(envelope(1, unknown_tag));
+        for length in [
+            GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES - 1,
+            GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES + 1,
+        ] {
+            let mut bytes = payload();
+            bytes.resize(length, 0);
+            malformed.push(envelope(1, bytes));
+        }
+        malformed.push(envelope(2, payload()));
+        for request in malformed {
+            assert_eq!(
+                validate_request_envelope(&request),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            );
+            assert!(encode_guardian_request(&secret(), &request).is_err());
+        }
     }
 
     #[test]
