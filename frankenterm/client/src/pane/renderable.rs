@@ -3898,6 +3898,9 @@ mod tests {
     fn selection_copy_refuses_busy_stale_and_changed_source_without_renderer_fallback() {
         let renderable = test_renderable_state();
         let state = renderable.lock();
+        // SEQ_ZERO is always dirty in Line::changed_since. Real observed text
+        // needs a nonzero source epoch for the positive recovery control.
+        state.inner.borrow_mut().seqno = 7;
         let (layout, sequence, _, _) = state.selection_source_snapshot().unwrap();
         {
             let _busy = state.inner.borrow_mut();
@@ -3921,6 +3924,20 @@ mod tests {
             ));
         }
         state.inner.borrow_mut().lines.pop(&0);
+        assert!(matches!(
+            state.selection_lines(layout, sequence, sequence, 0..1),
+            Err(super::super::SelectionReadError::Busy)
+        ));
+        assert!(state.inner.borrow_mut().put_line(
+            0,
+            Line::from_text(
+                "not yet observed",
+                &CellAttributes::default(),
+                SEQ_ZERO,
+                None
+            ),
+            None
+        ));
         assert!(matches!(
             state.selection_lines(layout, sequence, sequence, 0..1),
             Err(super::super::SelectionReadError::Busy)
