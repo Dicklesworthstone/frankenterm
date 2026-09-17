@@ -679,21 +679,44 @@ impl SelectionRange {
         Self { start, end }
     }
 
-    /// Computes the selection range for the line around the specified coords
-    pub fn line_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
-        for logical in pane.get_logical_lines(start.y..start.y + 1) {
+    /// Computes the selection range for the line from an already-acquired logical line snapshot.
+    pub fn line_around_in_logical_line(
+        start: SelectionCoordinate,
+        logical: &mux::pane::LogicalLine,
+    ) -> Self {
+        if logical.contains_y(start.y) {
+            let offset = (logical.physical_lines.len().saturating_sub(1)) as StableRowIndex;
+            let end_row = logical.first_row.saturating_add(offset);
+            Self {
+                start: SelectionCoordinate::x_y(0, logical.first_row),
+                end: SelectionCoordinate::x_y(usize::MAX, end_row),
+            }
+        } else {
+            Self { start, end: start }
+        }
+    }
+
+    /// Computes the selection range for the line from already-acquired logical line snapshots.
+    pub fn line_around_in_logical_lines(
+        start: SelectionCoordinate,
+        lines: &[mux::pane::LogicalLine],
+    ) -> Self {
+        for logical in lines {
             if logical.contains_y(start.y) {
-                return Self {
-                    start: SelectionCoordinate::x_y(0, logical.first_row),
-                    end: SelectionCoordinate::x_y(
-                        usize::MAX,
-                        logical.first_row + (logical.physical_lines.len() - 1) as StableRowIndex,
-                    ),
-                };
+                return Self::line_around_in_logical_line(start, logical);
             }
         }
         // Shouldn't happen, but return a reasonable fallback
         Self { start, end: start }
+    }
+
+    /// Computes the selection range for the line around the specified coords
+    pub fn line_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
+        let Some(end_y) = start.y.checked_add(1) else {
+            return Self { start, end: start };
+        };
+        let lines = pane.get_logical_lines(start.y..end_y);
+        Self::line_around_in_logical_lines(start, &lines)
     }
 
     pub fn zone_around(start: SelectionCoordinate, pane: &dyn mux::pane::Pane) -> Self {
@@ -736,24 +759,39 @@ impl SelectionRange {
         }
     }
 
-    /// Computes the selection range for the word around the specified coords
-    pub fn word_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
-        for logical in pane.get_logical_lines(start.y..start.y + 1) {
-            if !logical.contains_y(start.y) {
-                continue;
-            }
+    /// Computes the selection range for the word from an already-acquired logical line snapshot.
+    pub fn word_around_in_logical_line(
+        start: SelectionCoordinate,
+        logical: &mux::pane::LogicalLine,
+    ) -> Self {
+        if !logical.contains_y(start.y) {
+            return Self { start, end: start };
+        }
 
-            if let SelectionX::Cell(start_x) = start.x {
-                let start_idx = logical.xy_to_logical_x(start_x, start.y);
-                return match logical
-                    .logical
-                    .compute_double_click_range(start_idx, is_double_click_word)
-                {
-                    DoubleClickRange::RangeWithWrap(click_range)
-                    | DoubleClickRange::Range(click_range) => {
-                        Self::from_logical_click_range(start, &logical, click_range)
-                    }
-                };
+        if let SelectionX::Cell(start_x) = start.x {
+            let start_idx = logical.xy_to_logical_x(start_x, start.y);
+            return match logical
+                .logical
+                .compute_double_click_range(start_idx, is_double_click_word)
+            {
+                DoubleClickRange::RangeWithWrap(click_range)
+                | DoubleClickRange::Range(click_range) => {
+                    Self::from_logical_click_range(start, logical, click_range)
+                }
+            };
+        }
+
+        Self { start, end: start }
+    }
+
+    /// Computes the selection range for the word from already-acquired logical line snapshots.
+    pub fn word_around_in_logical_lines(
+        start: SelectionCoordinate,
+        lines: &[mux::pane::LogicalLine],
+    ) -> Self {
+        for logical in lines {
+            if logical.contains_y(start.y) {
+                return Self::word_around_in_logical_line(start, logical);
             }
         }
 
@@ -761,9 +799,73 @@ impl SelectionRange {
         Self { start, end: start }
     }
 
+    /// Computes the selection range for the word around the specified coords
+    pub fn word_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
+        let Some(end_y) = start.y.checked_add(1) else {
+            return Self { start, end: start };
+        };
+        let lines = pane.get_logical_lines(start.y..end_y);
+        Self::word_around_in_logical_lines(start, &lines)
+    }
+
+    /// Computes the smart-selection range for the specified coords from an
+    /// already-acquired logical line snapshot, falling back to word selection
+    /// on the same snapshot when no smart pattern matches.
+    pub fn smart_or_word_around_in_logical_line(
+        start: SelectionCoordinate,
+        logical: &mux::pane::LogicalLine,
+    ) -> (Self, Option<SmartSelectionPick>) {
+        if !logical.contains_y(start.y) {
+            return (Self { start, end: start }, None);
+        }
+
+        if let SelectionX::Cell(start_x) = start.x {
+            let click_logical_x = logical.xy_to_logical_x(start_x, start.y);
+            let line_text = logical.logical.as_str();
+            if let Some(smart) = smart_match_logical_x_range(&line_text, click_logical_x) {
+                let (start_y, start_x) = logical.logical_x_to_physical_coord(smart.range.start);
+                let (end_y, end_x) =
+                    logical.logical_x_to_physical_coord(smart.range.end.saturating_sub(1));
+                let range = Self {
+                    start: SelectionCoordinate::x_y(start_x, start_y),
+                    end: SelectionCoordinate::x_y(end_x, end_y),
+                };
+                return (
+                    range,
+                    Some(SmartSelectionPick {
+                        kind: smart.kind,
+                        text: smart.text,
+                    }),
+                );
+            }
+        }
+
+        (Self::word_around_in_logical_line(start, logical), None)
+    }
+
+    /// Computes the smart-selection range for the specified coords from
+    /// already-acquired logical line snapshots, falling back to word selection
+    /// on the same snapshot when no smart pattern matches.
+    pub fn smart_or_word_around_in_logical_lines(
+        start: SelectionCoordinate,
+        lines: &[mux::pane::LogicalLine],
+    ) -> (Self, Option<SmartSelectionPick>) {
+        for logical in lines {
+            if logical.contains_y(start.y) {
+                return Self::smart_or_word_around_in_logical_line(start, logical);
+            }
+        }
+
+        (Self { start, end: start }, None)
+    }
+
     /// Computes the smart-selection range for the specified coords,
     /// falling back to the legacy word-boundary selection when the
     /// smart-selection catalog has no match at the click position.
+    ///
+    /// Reads logical line snapshots from the pane once, ensuring the
+    /// same snapshot is used for both smart pattern evaluation and
+    /// word-boundary fallback without duplicate I/O or race conditions.
     ///
     /// Returns the resolved range plus a `Some(SmartSelectionPick)`
     /// when a smart pattern was matched (so the caller can emit the
@@ -774,18 +876,39 @@ impl SelectionRange {
         start: SelectionCoordinate,
         pane: &dyn Pane,
     ) -> (Self, Option<SmartSelectionPick>) {
-        for logical in pane.get_logical_lines(start.y..start.y + 1) {
-            if !logical.contains_y(start.y) {
-                continue;
-            }
+        let Some(end_y) = start.y.checked_add(1) else {
+            return (Self { start, end: start }, None);
+        };
+        let lines = pane.get_logical_lines(start.y..end_y);
+        Self::smart_or_word_around_in_logical_lines(start, &lines)
+    }
 
-            if let SelectionX::Cell(start_x) = start.x {
-                let click_logical_x = logical.xy_to_logical_x(start_x, start.y);
-                let line_text = logical.logical.as_str();
-                if let Some(smart) = smart_match_logical_x_range(&line_text, click_logical_x) {
-                    let (start_y, start_x) = logical.logical_x_to_physical_coord(smart.range.start);
-                    let (end_y, end_x) =
-                        logical.logical_x_to_physical_coord(smart.range.end.saturating_sub(1));
+    /// Computes the smart-selection range for the line from an already-acquired
+    /// logical line snapshot, falling back to line selection on the same
+    /// snapshot when no smart pattern matches.
+    pub fn smart_or_line_around_in_logical_line(
+        start: SelectionCoordinate,
+        logical: &mux::pane::LogicalLine,
+    ) -> (Self, Option<SmartSelectionPick>) {
+        if !logical.contains_y(start.y) {
+            return (Self { start, end: start }, None);
+        }
+
+        let line_text = logical.logical.as_str();
+        // Triple-click resolves to the widest smart-pattern fully
+        // contained within the line. `smart_match_in_line` runs
+        // find_all → drop_shell_quoted_supersets →
+        // classify_triple_click in one call.
+        if let Some(selection_match) = smart_match_in_line(&line_text, 0, line_text.len()) {
+            let logical_start = logical_x_for_byte_offset(&line_text, selection_match.span_start);
+            let logical_end = logical_x_for_byte_offset(&line_text, selection_match.span_end);
+            if logical_start < logical_end {
+                let (start_y, start_x) = logical.logical_x_to_physical_coord(logical_start);
+                let (end_y, end_x) =
+                    logical.logical_x_to_physical_coord(logical_end.saturating_sub(1));
+                if let Some(text) =
+                    line_text.get(selection_match.span_start..selection_match.span_end)
+                {
                     let range = Self {
                         start: SelectionCoordinate::x_y(start_x, start_y),
                         end: SelectionCoordinate::x_y(end_x, end_y),
@@ -793,15 +916,31 @@ impl SelectionRange {
                     return (
                         range,
                         Some(SmartSelectionPick {
-                            kind: smart.kind,
-                            text: smart.text,
+                            kind: selection_match.kind,
+                            text: text.to_string(),
                         }),
                     );
                 }
             }
         }
 
-        (Self::word_around(start, pane), None)
+        (Self::line_around_in_logical_line(start, logical), None)
+    }
+
+    /// Computes the smart-selection range for the line from already-acquired
+    /// logical line snapshots, falling back to line selection on the same
+    /// snapshot when no smart pattern matches.
+    pub fn smart_or_line_around_in_logical_lines(
+        start: SelectionCoordinate,
+        lines: &[mux::pane::LogicalLine],
+    ) -> (Self, Option<SmartSelectionPick>) {
+        for logical in lines {
+            if logical.contains_y(start.y) {
+                return Self::smart_or_line_around_in_logical_line(start, logical);
+            }
+        }
+
+        (Self { start, end: start }, None)
     }
 
     /// Computes the smart-selection range for the *line* around the
@@ -809,6 +948,10 @@ impl SelectionRange {
     /// the legacy full-physical-line selection when the smart-
     /// selection catalog has no widest-pattern fully contained in
     /// the line.
+    ///
+    /// Reads logical line snapshots from the pane once, ensuring the
+    /// same snapshot is used for both smart pattern evaluation and
+    /// line fallback without duplicate I/O or race conditions.
     ///
     /// Returns the resolved range plus a `Some(SmartSelectionPick)`
     /// when a smart pattern was matched in the line — so the caller
@@ -825,44 +968,11 @@ impl SelectionRange {
         start: SelectionCoordinate,
         pane: &dyn Pane,
     ) -> (Self, Option<SmartSelectionPick>) {
-        for logical in pane.get_logical_lines(start.y..start.y + 1) {
-            if !logical.contains_y(start.y) {
-                continue;
-            }
-
-            let line_text = logical.logical.as_str();
-            // Triple-click resolves to the widest smart-pattern fully
-            // contained within the line. `smart_match_in_line` runs
-            // find_all → drop_shell_quoted_supersets →
-            // classify_triple_click in one call.
-            if let Some(selection_match) = smart_match_in_line(&line_text, 0, line_text.len()) {
-                let logical_start =
-                    logical_x_for_byte_offset(&line_text, selection_match.span_start);
-                let logical_end = logical_x_for_byte_offset(&line_text, selection_match.span_end);
-                if logical_start < logical_end {
-                    let (start_y, start_x) = logical.logical_x_to_physical_coord(logical_start);
-                    let (end_y, end_x) =
-                        logical.logical_x_to_physical_coord(logical_end.saturating_sub(1));
-                    if let Some(text) =
-                        line_text.get(selection_match.span_start..selection_match.span_end)
-                    {
-                        let range = Self {
-                            start: SelectionCoordinate::x_y(start_x, start_y),
-                            end: SelectionCoordinate::x_y(end_x, end_y),
-                        };
-                        return (
-                            range,
-                            Some(SmartSelectionPick {
-                                kind: selection_match.kind,
-                                text: text.to_string(),
-                            }),
-                        );
-                    }
-                }
-            }
-        }
-
-        (Self::line_around(start, pane), None)
+        let Some(end_y) = start.y.checked_add(1) else {
+            return (Self { start, end: start }, None);
+        };
+        let lines = pane.get_logical_lines(start.y..end_y);
+        Self::smart_or_line_around_in_logical_lines(start, &lines)
     }
 
     /// Extends the current selection by unioning it with another selection range
@@ -1633,5 +1743,319 @@ mod tests {
         let m = smart_match_in_line(text, 0, text.len()).expect("URL match");
         assert_eq!(m.kind, SelectionPatternKind::Url);
         assert_eq!(&text[m.span_start..m.span_end], "https://example.com/foo");
+    }
+
+    #[test]
+    fn smart_or_word_around_wrapped_literal_unicode_smart_match() {
+        // Wrapped logical line with a URL containing literal Unicode (Japanese chars)
+        // Physical row 10: "visit https://examp" (19 display cols)
+        // Physical row 11: "le.com/日本語 path" (17 display cols: 7 ASCII + 6 CJK wide + 4 ASCII)
+        // Combined logical line: "visit https://example.com/日本語 path"
+        let p0: termwiz::surface::line::Line = "visit https://examp".into();
+        let p1: termwiz::surface::line::Line = "le.com/日本語 path".into();
+        let full: termwiz::surface::line::Line = "visit https://example.com/日本語 path".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![p0, p1],
+            logical: full,
+            first_row: 10,
+        };
+
+        // Click on physical row 10, column 8 (within "https://examp")
+        let start = SelectionCoordinate::x_y(8, 10);
+        let (range, pick) =
+            SelectionRange::smart_or_word_around_in_logical_lines(start, &[logical.clone()]);
+
+        let pick = pick.expect("URL match with literal Unicode should succeed");
+        assert_eq!(pick.kind, SelectionPatternKind::Url);
+        assert_eq!(pick.text, "https://example.com/日本語");
+
+        // "visit " is 6 cols, URL starts at col 6 on row 10
+        assert_eq!(range.start, SelectionCoordinate::x_y(6, 10));
+        // URL ends at logical x 32 (exclusive). Inclusive end is 31.
+        // Physical line 0 len is 19 cols. 31 - 19 = 12 on row 11 (second cell of '語').
+        assert_eq!(range.end, SelectionCoordinate::x_y(12, 11));
+
+        // Click directly on row 11 on the wide Unicode character '本'
+        // 'le.com/' is 7 cols, '日' is 2 cols (cols 7..9), '本' is cols 9..11
+        let start_unicode = SelectionCoordinate::x_y(9, 11);
+        let (range_u, pick_u) =
+            SelectionRange::smart_or_word_around_in_logical_lines(start_unicode, &[logical]);
+        let pick_u = pick_u.expect("Click on wide Unicode inside URL should match");
+        assert_eq!(pick_u.text, "https://example.com/日本語");
+        assert_eq!(range_u, range);
+    }
+
+    #[test]
+    fn smart_or_word_around_wrapped_literal_unicode_fallback() {
+        // Plain wrapped line with CJK wide characters and no smart pattern.
+        // Verifies that fallback uses the same snapshot and respects word boundary across wrap.
+        // Row 20: "prefix 日本" (7 ASCII cols + 4 CJK cols = 11 cols)
+        // Row 21: "語word suffix" (2 CJK cols + 4 ASCII cols + 7 ASCII cols = 13 cols)
+        // Combined logical line: "prefix 日本語word suffix"
+        let p0: termwiz::surface::line::Line = "prefix 日本".into();
+        let p1: termwiz::surface::line::Line = "語word suffix".into();
+        let full: termwiz::surface::line::Line = "prefix 日本語word suffix".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![p0, p1],
+            logical: full,
+            first_row: 20,
+        };
+
+        // Click on row 21, column 0 ('語')
+        let start = SelectionCoordinate::x_y(0, 21);
+        let (range, pick) =
+            SelectionRange::smart_or_word_around_in_logical_lines(start, &[logical.clone()]);
+
+        // Fallback should fire without smart pick
+        assert_eq!(pick, None);
+
+        // Word "日本語word" starts at logical x 7 (col 7 on row 20)
+        assert_eq!(range.start, SelectionCoordinate::x_y(7, 20));
+        // Word is 6 CJK cols + 4 ASCII cols = 10 cols.
+        // In row 20: 4 cols ('日本'). Remaining 6 cols in row 21: '語' (2) + 'word' (4) = 6 cols (cols 0..6, end-1 is col 5).
+        assert_eq!(range.end, SelectionCoordinate::x_y(5, 21));
+
+        // Direct word_around_in_logical_lines produces the exact same range
+        let direct_range = SelectionRange::word_around_in_logical_lines(start, &[logical]);
+        assert_eq!(direct_range, range);
+    }
+
+    #[test]
+    fn smart_or_word_around_before_zero_and_boundary_cases() {
+        let p0: termwiz::surface::line::Line = "hello world".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![p0],
+            logical: "hello world".into(),
+            first_row: 5,
+        };
+
+        // BeforeZero coordinate: must preserve start == end and return None
+        let bz = SelectionCoordinate {
+            x: SelectionX::BeforeZero,
+            y: 5,
+        };
+        let (range_bz, pick_bz) =
+            SelectionRange::smart_or_word_around_in_logical_lines(bz, &[logical.clone()]);
+        assert_eq!(pick_bz, None);
+        assert_eq!(range_bz, SelectionRange { start: bz, end: bz });
+
+        // Past-end coordinate (e.g. col 999): must preserve start == end and return None
+        let past_end = SelectionCoordinate::x_y(999, 5);
+        let (range_pe, pick_pe) =
+            SelectionRange::smart_or_word_around_in_logical_lines(past_end, &[logical.clone()]);
+        assert_eq!(pick_pe, None);
+        assert_eq!(
+            range_pe,
+            SelectionRange {
+                start: past_end,
+                end: past_end,
+            }
+        );
+
+        // Non-matching row coordinate (row 99): must return fallback start == end
+        let wrong_row = SelectionCoordinate::x_y(2, 99);
+        let (range_wr, pick_wr) =
+            SelectionRange::smart_or_word_around_in_logical_lines(wrong_row, &[logical]);
+        assert_eq!(pick_wr, None);
+        assert_eq!(
+            range_wr,
+            SelectionRange {
+                start: wrong_row,
+                end: wrong_row,
+            }
+        );
+    }
+
+    #[test]
+    fn smart_or_line_around_wrapped_smart_match() {
+        // Wrapped line containing an email address across the wrap
+        // Row 30: "please write to " (16 cols)
+        // Row 31: "support@example.com for help" (28 cols)
+        let p0: termwiz::surface::line::Line = "please write to ".into();
+        let p1: termwiz::surface::line::Line = "support@example.com for help".into();
+        let full: termwiz::surface::line::Line =
+            "please write to support@example.com for help".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![p0, p1],
+            logical: full,
+            first_row: 30,
+        };
+
+        let start = SelectionCoordinate::x_y(0, 30);
+        let (range, pick) =
+            SelectionRange::smart_or_line_around_in_logical_lines(start, &[logical]);
+
+        let pick = pick.expect("Email smart pattern in line should be picked");
+        assert_eq!(pick.kind, SelectionPatternKind::Email);
+        assert_eq!(pick.text, "support@example.com");
+
+        // Email starts at logical col 16 -> on row 31, col 0
+        assert_eq!(range.start, SelectionCoordinate::x_y(0, 31));
+        // Email length 19 -> on row 31, col 18 (inclusive end)
+        assert_eq!(range.end, SelectionCoordinate::x_y(18, 31));
+    }
+
+    #[test]
+    fn smart_or_line_around_wrapped_plain_fallback() {
+        // Plain wrapped line with no smart pattern
+        // Row 40: "first physical line of text "
+        // Row 41: "second physical line of text"
+        let p0: termwiz::surface::line::Line = "first physical line of text ".into();
+        let p1: termwiz::surface::line::Line = "second physical line of text".into();
+        let full: termwiz::surface::line::Line =
+            "first physical line of text second physical line of text".into();
+        let logical = mux::pane::LogicalLine {
+            physical_lines: vec![p0, p1],
+            logical: full,
+            first_row: 40,
+        };
+
+        // Click within physical row 41
+        let start = SelectionCoordinate::x_y(5, 41);
+        let (range, pick) =
+            SelectionRange::smart_or_line_around_in_logical_lines(start, &[logical.clone()]);
+
+        assert_eq!(pick, None);
+        // Line selection spans row 40 col 0 to row 41 col usize::MAX
+        assert_eq!(range.start, SelectionCoordinate::x_y(0, 40));
+        assert_eq!(range.end, SelectionCoordinate::x_y(usize::MAX, 41));
+
+        // Direct line_around_in_logical_lines produces the exact same range
+        let direct = SelectionRange::line_around_in_logical_lines(start, &[logical.clone()]);
+        assert_eq!(direct, range);
+
+        // BeforeZero coordinate also selects the entire physical line span
+        let bz = SelectionCoordinate {
+            x: SelectionX::BeforeZero,
+            y: 40,
+        };
+        let (range_bz, pick_bz) =
+            SelectionRange::smart_or_line_around_in_logical_lines(bz, &[logical.clone()]);
+        assert_eq!(pick_bz, None);
+        assert_eq!(range_bz.start, SelectionCoordinate::x_y(0, 40));
+        assert_eq!(range_bz.end, SelectionCoordinate::x_y(usize::MAX, 41));
+
+        // Non-matching row falls back to start == end
+        let wrong_row = SelectionCoordinate::x_y(0, 99);
+        let (range_wr, pick_wr) =
+            SelectionRange::smart_or_line_around_in_logical_lines(wrong_row, &[logical]);
+        assert_eq!(pick_wr, None);
+        assert_eq!(
+            range_wr,
+            SelectionRange {
+                start: wrong_row,
+                end: wrong_row,
+            }
+        );
+    }
+
+    #[test]
+    fn extreme_stable_row_index_checked_add_boundary() {
+        let _mux = if mux::Mux::try_get().is_none() {
+            let m = std::sync::Arc::new(mux::Mux::new(None));
+            mux::Mux::set_mux(&m);
+            Some(m)
+        } else {
+            None
+        };
+        let size = wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 80,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 384,
+        };
+        let (_tw, pane) =
+            mux::termwiztermtab::allocate(size, std::sync::Arc::new(NativeAnchorTestConfig))
+                .unwrap();
+
+        // 1. Literal boundary negative: StableRowIndex::MAX.
+        // start.y + 1 cannot be represented in StableRowIndex (isize);
+        // checked_add returns None and all methods must return the fallback range
+        // without panicking or attempting an invalid range query.
+        let max_coord = SelectionCoordinate::x_y(0, StableRowIndex::MAX);
+        let expected_fallback = SelectionRange {
+            start: max_coord,
+            end: max_coord,
+        };
+
+        assert_eq!(
+            SelectionRange::line_around(max_coord, pane.as_ref()),
+            expected_fallback
+        );
+        assert_eq!(
+            SelectionRange::word_around(max_coord, pane.as_ref()),
+            expected_fallback
+        );
+        assert_eq!(
+            SelectionRange::smart_or_word_around(max_coord, pane.as_ref()),
+            (expected_fallback, None)
+        );
+        assert_eq!(
+            SelectionRange::smart_or_line_around(max_coord, pane.as_ref()),
+            (expected_fallback, None)
+        );
+
+        // BeforeZero coordinate at StableRowIndex::MAX
+        let max_bz = SelectionCoordinate {
+            x: SelectionX::BeforeZero,
+            y: StableRowIndex::MAX,
+        };
+        let expected_bz_fallback = SelectionRange {
+            start: max_bz,
+            end: max_bz,
+        };
+        assert_eq!(
+            SelectionRange::line_around(max_bz, pane.as_ref()),
+            expected_bz_fallback
+        );
+        assert_eq!(
+            SelectionRange::word_around(max_bz, pane.as_ref()),
+            expected_bz_fallback
+        );
+        assert_eq!(
+            SelectionRange::smart_or_word_around(max_bz, pane.as_ref()),
+            (expected_bz_fallback, None)
+        );
+        assert_eq!(
+            SelectionRange::smart_or_line_around(max_bz, pane.as_ref()),
+            (expected_bz_fallback, None)
+        );
+
+        // 2. Adjacent valid row positive: StableRowIndex::MAX - 1.
+        // start.y.checked_add(1) evaluates to Some(StableRowIndex::MAX),
+        // querying pane.get_logical_lines((MAX - 1)..MAX) cleanly without
+        // integer overflow. Since no lines exist at this offset, all methods
+        // return the fallback range.
+        let adj_coord = SelectionCoordinate::x_y(0, StableRowIndex::MAX - 1);
+        let expected_adj_fallback = SelectionRange {
+            start: adj_coord,
+            end: adj_coord,
+        };
+
+        assert_eq!(
+            SelectionRange::line_around(adj_coord, pane.as_ref()),
+            expected_adj_fallback
+        );
+        assert_eq!(
+            SelectionRange::word_around(adj_coord, pane.as_ref()),
+            expected_adj_fallback
+        );
+        assert_eq!(
+            SelectionRange::smart_or_word_around(adj_coord, pane.as_ref()),
+            (expected_adj_fallback, None)
+        );
+        assert_eq!(
+            SelectionRange::smart_or_line_around(adj_coord, pane.as_ref()),
+            (expected_adj_fallback, None)
+        );
+
+        // 3. Valid resident row positive: row 0 exists in the pane.
+        // Confirms that non-extreme coordinates query the pane and produce
+        // active selections.
+        let valid_coord = SelectionCoordinate::x_y(0, 0);
+        let valid_line = SelectionRange::line_around(valid_coord, pane.as_ref());
+        assert_eq!(valid_line.start, SelectionCoordinate::x_y(0, 0));
+        assert_eq!(valid_line.end, SelectionCoordinate::x_y(usize::MAX, 0));
     }
 }
