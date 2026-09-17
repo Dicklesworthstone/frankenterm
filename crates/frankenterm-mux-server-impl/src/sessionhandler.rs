@@ -6807,7 +6807,10 @@ impl SessionHandler {
         per_pane: Arc<Mutex<PerPane>>,
     ) {
         let pane_id = registration.pane_id();
-        match try_reserve_main_thread(
+        // Unsolicited render work must yield to input already admitted on the
+        // high-priority lane. The executor's bounded burst still advances it
+        // while input remains busy.
+        match try_reserve_main_thread_with_low_priority(
             MainThreadServiceClass::Render,
             MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
         ) {
@@ -22049,6 +22052,86 @@ mod tests {
             PaneRenderBaseline::default(),
             "an unrepresentable backend cursor span must not advance the baseline"
         );
+    }
+
+    #[test]
+    fn detached_render_push_yields_to_key_down_and_then_completes() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        for tracked in [false, true] {
+            let executor = SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let render: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_901, {
+                let order = Arc::clone(&order);
+                Arc::new(move || order.lock().unwrap().push("render"))
+            }));
+            let input = Arc::new(FakePane::new_with_key_down_probe(8_902, {
+                let order = Arc::clone(&order);
+                Arc::new(move || {
+                    order.lock().unwrap().push("key");
+                    Ok(())
+                })
+            }));
+            let input_dyn: Arc<dyn Pane> = input.clone();
+            mux.add_pane(&render).unwrap();
+            mux.add_pane(&input_dyn).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+            if tracked {
+                let registration = mux.capture_pane_registration(&render).unwrap();
+                handler.per_pane_for_registration(&registration);
+            }
+            drain_simple_executor(&executor);
+            order.lock().unwrap().clear();
+            if tracked {
+                handler.schedule_tracked_pane_push(render.pane_id());
+            } else {
+                handler.schedule_pane_push(render.pane_id());
+            }
+            handler.process_one(DecodedPdu {
+                serial: 9_801,
+                pdu: Pdu::SendKeyDown(SendKeyDown {
+                    pane_id: input.pane_id(),
+                    event: termwiz::input::KeyEvent {
+                        key: KeyCode::Char('x'),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    input_serial: InputSerial::empty(),
+                }),
+            });
+            assert!(order.lock().unwrap().is_empty());
+            // Local task creation may need a bootstrap tick. Neither that
+            // bootstrap nor the input effect may sit behind the render task.
+            for _ in 0..8 {
+                if input.key_down_count() != 0 {
+                    break;
+                }
+                assert!(order.lock().unwrap().is_empty());
+                assert!(executor.try_tick().unwrap());
+            }
+            assert_eq!(input.key_down_count(), 1);
+            assert_eq!(*order.lock().unwrap(), vec!["key"]);
+            for _ in 0..32 {
+                if !executor.try_tick().unwrap() {
+                    break;
+                }
+            }
+            assert_eq!(executor.queue_snapshot().depth, 0);
+            let events = order.lock().unwrap();
+            assert_eq!(events.first(), Some(&"key"));
+            assert!(events.len() > 1, "deferred render must make progress");
+            assert!(events[1..].iter().all(|event| *event == "render"));
+            let responses = captured.lock().unwrap();
+            assert!(
+                responses
+                    .iter()
+                    .any(|pdu| pdu.serial == 9_801 && matches!(&pdu.pdu, Pdu::UnitResponse(_)))
+            );
+            assert!(responses.iter().any(|pdu| matches!(&pdu.pdu,
+                Pdu::GetPaneRenderChangesResponse(response)
+                    if response.pane_id == render.pane_id())));
+        }
     }
 
     #[test]
