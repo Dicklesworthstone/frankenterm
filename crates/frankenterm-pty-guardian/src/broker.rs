@@ -3939,10 +3939,10 @@ impl BrokerPendingSuccessorClaimV1 {
 
     fn durable_fingerprint(
         &self,
-        spawn: BrokerSpawnWorkerFingerprintV1,
+        spawn: &BrokerSpawnWorkerFingerprintV1,
     ) -> BrokerLeaseWorkerFingerprintV1 {
         BrokerLeaseWorkerFingerprintV1 {
-            spawn,
+            spawn: *spawn,
             phase: if self.rebind.is_some() {
                 BrokerPaneLeaseWalPhaseV1::SuccessorRebound
             } else {
@@ -3988,7 +3988,7 @@ impl BrokerLiveSpawnV1 {
             .quarantine(BrokerQuarantineReasonV1::LeaseJournalFailure, false);
     }
 
-    fn lease_transition_committed(&self, expected: BrokerLeaseWorkerFingerprintV1) -> bool {
+    fn lease_transition_committed(&self, expected: &BrokerLeaseWorkerFingerprintV1) -> bool {
         let Some(journal) = self.lease_journal.as_ref() else {
             return false;
         };
@@ -4328,7 +4328,7 @@ impl BrokerLiveSpawnV1 {
                 .as_ref()
                 .ok_or(BrokerError::Quarantined)?;
             if self.lease_transition.is_none()
-                && self.lease_transition_committed(pending.durable_fingerprint(self.fingerprint))
+                && self.lease_transition_committed(&pending.durable_fingerprint(&self.fingerprint))
                 && self.adoption.pane.status().lifecycle
                     == BrokerPaneLifecycleV1::SuccessorClaimPending
             {
@@ -4959,7 +4959,7 @@ impl BrokerControlServiceV1 {
         live.lease_transition = None;
         if completion.token_authority_failed
             || !matches!(completion.result, Some(Ok(_)))
-            || !live.lease_transition_committed(fingerprint)
+            || !live.lease_transition_committed(&fingerprint)
         {
             live.quarantine_lease_journal();
             return;
@@ -6345,7 +6345,7 @@ impl BrokerControlServiceV1 {
                 }
                 status = if live.lease_transition == Some(fingerprint) {
                     BrokerControlResponseStatusV1::Retryable
-                } else if live.lease_transition_committed(fingerprint)
+                } else if live.lease_transition_committed(&fingerprint)
                     && live.adoption.pane.status().lifecycle
                         == BrokerPaneLifecycleV1::AwaitingSuccessor
                 {
@@ -6433,7 +6433,7 @@ impl BrokerControlServiceV1 {
                     live.journal.identity(),
                     predecessor_generation,
                 );
-            let durable = live.lease_transition_committed(BrokerLeaseWorkerFingerprintV1 {
+            let durable = live.lease_transition_committed(&BrokerLeaseWorkerFingerprintV1 {
                 spawn: live.fingerprint,
                 phase: claim_phase,
                 handoff_id,
@@ -6481,7 +6481,7 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         }
-        if !live.lease_transition_committed(BrokerLeaseWorkerFingerprintV1 {
+        if !live.lease_transition_committed(&BrokerLeaseWorkerFingerprintV1 {
             spawn: live.fingerprint,
             phase: BrokerPaneLeaseWalPhaseV1::PredecessorFenced,
             handoff_id: Uuid::nil(),
@@ -6575,7 +6575,7 @@ impl BrokerControlServiceV1 {
                     if live.lease_transition.is_some() {
                         status = BrokerControlResponseStatusV1::Retryable;
                     } else if live
-                        .lease_transition_committed(pending.durable_fingerprint(live.fingerprint))
+                        .lease_transition_committed(&pending.durable_fingerprint(&live.fingerprint))
                     {
                         status = BrokerControlResponseStatusV1::Recovered;
                         selected = Some(pending.owner.connection_id);
@@ -6655,10 +6655,11 @@ impl BrokerControlServiceV1 {
                     )
             });
         if exact_retry {
-            let expected = pending.durable_fingerprint(live.fingerprint);
+            let expected = pending.durable_fingerprint(&live.fingerprint);
             status = if live.lease_transition == Some(expected) {
                 BrokerControlResponseStatusV1::Retryable
-            } else if live.lease_transition.is_none() && live.lease_transition_committed(expected) {
+            } else if live.lease_transition.is_none() && live.lease_transition_committed(&expected)
+            {
                 BrokerControlResponseStatusV1::Recovered
             } else {
                 BrokerControlResponseStatusV1::Quarantined
@@ -6676,7 +6677,7 @@ impl BrokerControlServiceV1 {
                 generation,
             )
             && live.lease_transition.is_none()
-            && live.lease_transition_committed(pending.durable_fingerprint(live.fingerprint))
+            && live.lease_transition_committed(&pending.durable_fingerprint(&live.fingerprint))
         {
             let prior_attachment = pending.attachment;
             let prior_verifier = pending.recovery_verifier;
@@ -6696,7 +6697,7 @@ impl BrokerControlServiceV1 {
                 prior_verifier,
                 ack_id: request.header.request_id,
             });
-            live.lease_transition = Some(pending.durable_fingerprint(live.fingerprint));
+            live.lease_transition = Some(pending.durable_fingerprint(&live.fingerprint));
             status = BrokerControlResponseStatusV1::Retryable;
         }
         BrokerControlResponseV1::new(self.response_header(request.header, status), &[])
@@ -6723,7 +6724,7 @@ impl BrokerControlServiceV1 {
                 && live.adoption.pane.status().lifecycle
                     == BrokerPaneLifecycleV1::SuccessorClaimPending;
             let durable =
-                live.lease_transition_committed(pending.durable_fingerprint(live.fingerprint));
+                live.lease_transition_committed(&pending.durable_fingerprint(&live.fingerprint));
             let status = if exact && live.lease_transition.is_some() {
                 BrokerControlResponseStatusV1::Retryable
             } else if exact && durable {
@@ -6748,7 +6749,7 @@ impl BrokerControlServiceV1 {
                 && acknowledgement.attachment.lease_generation == request.header.lease_generation
                 && live.adoption.pane.active_attachment_identity()
                     == Some(acknowledgement.attachment)
-                && live.lease_transition_committed(BrokerLeaseWorkerFingerprintV1 {
+                && live.lease_transition_committed(&BrokerLeaseWorkerFingerprintV1 {
                     spawn: live.fingerprint,
                     phase: BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged,
                     handoff_id: acknowledgement.handoff_id,
@@ -6818,7 +6819,7 @@ impl BrokerControlServiceV1 {
                 && live.lease_transition.is_none()
                 && live.adoption.pane.active_attachment_identity()
                     == Some(acknowledgement.attachment)
-                && live.lease_transition_committed(BrokerLeaseWorkerFingerprintV1 {
+                && live.lease_transition_committed(&BrokerLeaseWorkerFingerprintV1 {
                     spawn: live.fingerprint,
                     phase: BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged,
                     handoff_id: acknowledgement.handoff_id,
@@ -6888,8 +6889,8 @@ impl BrokerControlServiceV1 {
             )
             .map_err(|_| ());
         }
-        let claim = pending.durable_fingerprint(live.fingerprint);
-        if !live.lease_transition_committed(claim) {
+        let claim = pending.durable_fingerprint(&live.fingerprint);
+        if !live.lease_transition_committed(&claim) {
             live.quarantine_lease_journal();
             return BrokerControlResponseV1::new(
                 response_header(BrokerControlResponseStatusV1::Quarantined),
@@ -8002,7 +8003,7 @@ impl std::fmt::Debug for BrokerSuccessorPaneClaimV1 {
 pub enum BrokerSuccessorClaimQueryV1 {
     Absent,
     Pending,
-    Claim(BrokerSuccessorPaneClaimV1),
+    Claim(Box<BrokerSuccessorPaneClaimV1>),
     Acknowledged,
     Quarantined,
 }
@@ -8987,8 +8988,7 @@ impl BrokerControlClientV1 {
         if handle.broker_incarnation != self.broker_incarnation
             || handle.connection_id != self.connection_id
             || handle.pane_id != context.pane_id
-            || handle.spawn_effect_id != context.effect_id
-            || handle.spawn_ack_id != context.ack_id
+            || (handle.spawn_effect_id, handle.spawn_ack_id) != (context.effect_id, context.ack_id)
             || handle.lease_generation != 1
             || handle.child_identity.process_id != context.child_pid
             || handle.child_identity.broker_child_nonce != context.child_nonce
@@ -9127,7 +9127,7 @@ impl BrokerControlClientV1 {
                                 });
                             }
                             BrokerSuccessorAcknowledgementV1::Pending => {
-                                thread::sleep(Duration::from_millis(1))
+                                thread::sleep(Duration::from_millis(1));
                             }
                             _ => return Err(BrokerControlClientError::AuthenticationAuthority),
                         }
@@ -9281,7 +9281,7 @@ impl BrokerControlClientV1 {
                 }
                 let recovery_secret = BrokerPaneRecoverySecretV1::from_wire(&payload[112..])
                     .map_err(|_| BrokerControlClientError::Protocol)?;
-                Ok(BrokerSuccessorClaimQueryV1::Claim(
+                Ok(BrokerSuccessorClaimQueryV1::Claim(Box::new(
                     BrokerSuccessorPaneClaimV1 {
                         origin: self.identity,
                         origin_connection: self.connection_id,
@@ -9294,7 +9294,7 @@ impl BrokerControlClientV1 {
                         lease_generation,
                         recovery_secret,
                     },
-                ))
+                )))
             }
             BrokerControlResponseStatusV1::Applied | BrokerControlResponseStatusV1::Recovered
                 if response.payload().is_empty() && response.header.child_identity.is_none() =>
@@ -13264,9 +13264,10 @@ impl BrokerPaneLeaseJournalV1 {
             self.wal.write_all(&wal_record)?;
             self.wal.sync_all()?;
             #[cfg(test)]
-            if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::PanicAfterWalSyncBeforeHead) {
-                panic!("injected lease storage panic after WAL sync");
-            }
+            assert!(
+                !self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::PanicAfterWalSyncBeforeHead),
+                "injected lease storage panic after WAL sync"
+            );
             #[cfg(test)]
             if self.take_fault(BrokerPaneLeaseWalInjectedFaultV1::AfterWalSyncBeforeHead) {
                 return Err(BrokerPaneLeaseWalErrorV1::Io(std::io::Error::other(
@@ -26183,7 +26184,7 @@ mod tests {
                             .lease_journal
                             .as_mut()
                             .unwrap()
-                            .inject_fault(fault.unwrap())
+                            .inject_fault(fault.unwrap());
                     });
                 }
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -26203,14 +26204,14 @@ mod tests {
                                 BrokerPaneLeaseWalPhaseV1::SuccessorAcknowledged,
                                 "failed WAL must not publish a secret"
                             );
-                            break Some(claim);
+                            break Some(*claim);
                         }
                         BrokerSuccessorClaimQueryV1::Quarantined => {
                             assert_eq!(phase, BrokerPaneLeaseWalPhaseV1::SuccessorClaimed);
                             break None;
                         }
                         BrokerSuccessorClaimQueryV1::Pending if Instant::now() < deadline => {
-                            thread::sleep(Duration::from_millis(1))
+                            thread::sleep(Duration::from_millis(1));
                         }
                         outcome => panic!("faulted claim did not settle: {outcome:?}"),
                     }
@@ -26273,11 +26274,12 @@ mod tests {
                                     .unwrap(),
                                 probe: None,
                             };
-                            let rejected = service
-                                .spawn_worker
-                                .try_submit_lease(job)
-                                .err()
-                                .expect("occupied real worker rejects second journal");
+                            let rejected = match service.spawn_worker.try_submit_lease(job) {
+                                Err(rejected) => rejected,
+                                Ok(_) => {
+                                    panic!("occupied real worker rejects second journal")
+                                }
+                            };
                             assert!(matches!(
                                 rejected.kind,
                                 BrokerSpawnWorkerSubmitErrorV1::ConflictingInFlight
@@ -26340,7 +26342,7 @@ mod tests {
                                 BrokerSuccessorAcknowledgementV1::Pending
                                     if Instant::now() < deadline =>
                                 {
-                                    thread::sleep(Duration::from_millis(1))
+                                    thread::sleep(Duration::from_millis(1));
                                 }
                                 outcome => {
                                     panic!("faulted ACK activated or failed to settle: {outcome:?}")
@@ -27167,7 +27169,7 @@ mod tests {
                 )
                 .expect("claim the exact successor generation")
             {
-                BrokerSuccessorClaimQueryV1::Claim(claim) => break claim,
+                BrokerSuccessorClaimQueryV1::Claim(claim) => break *claim,
                 BrokerSuccessorClaimQueryV1::Pending if Instant::now() < claim_deadline => {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -27371,7 +27373,7 @@ mod tests {
                         .lease_journal
                         .as_mut()
                         .unwrap()
-                        .inject_fault(fault)
+                        .inject_fault(fault);
                 });
             }
             let saved = fresh
@@ -27611,7 +27613,7 @@ mod tests {
                 match fresh.acknowledge_successor_claim(saved).unwrap() {
                     BrokerSuccessorAcknowledgementV1::Acknowledged => break,
                     BrokerSuccessorAcknowledgementV1::Pending if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(1))
+                        thread::sleep(Duration::from_millis(1));
                     }
                     other => panic!("rebound ACK failed: {other:?}"),
                 }
@@ -27702,7 +27704,7 @@ mod tests {
             {
                 BrokerSuccessorAcknowledgementV1::Acknowledged => break,
                 BrokerSuccessorAcknowledgementV1::Pending if Instant::now() < ack_deadline => {
-                    thread::sleep(Duration::from_millis(1))
+                    thread::sleep(Duration::from_millis(1));
                 }
                 outcome => panic!("durable successor ACK did not settle: {outcome:?}"),
             }
@@ -27804,7 +27806,7 @@ mod tests {
                     .claim_successor(binding.durable_pane_id, id(7_332), 3, &next_secret)
                     .unwrap()
                 {
-                    BrokerSuccessorClaimQueryV1::Claim(claim) => break claim,
+                    BrokerSuccessorClaimQueryV1::Claim(claim) => break *claim,
                     BrokerSuccessorClaimQueryV1::Pending => {}
                     outcome => panic!("second handoff failed: {outcome:?}"),
                 }
@@ -27853,7 +27855,7 @@ mod tests {
             match final_client.acknowledge_successor_claim(token).unwrap() {
                 BrokerSuccessorAcknowledgementV1::Acknowledged => break,
                 BrokerSuccessorAcknowledgementV1::Pending if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(1))
+                    thread::sleep(Duration::from_millis(1));
                 }
                 outcome => panic!("second durable ACK failed: {outcome:?}"),
             }

@@ -6022,7 +6022,7 @@ mod tests {
                 let mut historical_context = custody.context();
                 historical_context.effect_id = Uuid::new_v4();
                 let historical = custody
-                    .persist_historical_context_for_test(historical_context)
+                    .persist_historical_context_for_test(&historical_context)
                     .unwrap();
                 assert!(
                     matches!(

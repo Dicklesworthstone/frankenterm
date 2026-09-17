@@ -531,6 +531,12 @@ pub struct GuardianDurableSuccessorCustodyV1 {
     context: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
 }
 
+pub(crate) type GuardianRebindSecrets = (
+    mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+    Zeroizing<[u8; 32]>,
+    Zeroizing<[u8; 32]>,
+);
+
 impl GuardianDurableSuccessorCustodyV1 {
     pub const fn context(&self) -> mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 {
         self.context
@@ -589,14 +595,7 @@ impl GuardianDurableSuccessorCustodyV1 {
 
     pub(crate) fn rebind_secrets(
         &self,
-    ) -> Result<
-        (
-            mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
-            Zeroizing<[u8; 32]>,
-            Zeroizing<[u8; 32]>,
-        ),
-        GuardianCheckpointStageStoreError,
-    > {
+    ) -> Result<GuardianRebindSecrets, GuardianCheckpointStageStoreError> {
         self.store.with_exclusive_directory(|inner| {
             if self.context.rebind_from_connection.is_nil() {
                 return Err(GuardianCheckpointStageStoreError::Conflict);
@@ -622,13 +621,13 @@ impl GuardianDurableSpawnCustodyV1 {
     #[cfg(test)]
     pub(crate) fn persist_historical_context_for_test(
         &self,
-        context: GuardianSpawnCustodyContextV1,
+        context: &GuardianSpawnCustodyContextV1,
     ) -> Result<Self, GuardianCheckpointStageStoreError> {
         // A distinct immutable fixture record models retained authenticated
         // history. It cannot overwrite the live pane's original custody.
         assert_ne!(context.effect_id, self.context.effect_id);
         let secret = self.store.read_spawn_custody(&self.context)?;
-        self.store.persist_spawn_custody(&context, &secret)
+        self.store.persist_spawn_custody(context, &secret)
     }
 
     pub(crate) fn into_mux_rotation_payload(
@@ -2620,9 +2619,10 @@ impl GuardianCheckpointStageStore {
                     path.push(cursor);
                     cursor = parents[cursor].ok_or(GuardianCheckpointStageStoreError::Conflict)?;
                 }
-                for visited in path.drain(..) {
+                for &visited in &path {
                     marks[visited] = 2;
                 }
+                path.clear();
             }
             Ok(contexts[root])
         })?;

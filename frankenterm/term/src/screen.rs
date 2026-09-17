@@ -5161,6 +5161,7 @@ impl Screen {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "use_serde"))]
     pub(crate) fn resize_wrap_policy(&self) -> ResizeWrapPolicy {
         self.resize_wrap_policy
     }

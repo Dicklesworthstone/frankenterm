@@ -1445,6 +1445,7 @@ fn selected_lines_from_logical_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::TermWindow;
     use crate::smart_selection_a11y::shared_smart_selection_recorder;
     use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
