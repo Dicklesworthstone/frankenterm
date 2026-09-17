@@ -1097,13 +1097,11 @@ mod tests {
 
     #[test]
     fn remote_selection_copy_expiry_releases_hidden_pane_text_once() {
-        let selection = Selection {
-            range: Some(SelectionRange {
-                start: SelectionCoordinate::x_y(0, 0),
-                end: SelectionCoordinate::x_y(3, 2),
-            }),
-            ..Selection::default()
-        };
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(3, 2),
+        });
         let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
         copy.push_chunk(vec![Line::from("retained"), Line::from("text")])
             .unwrap();
@@ -1134,13 +1132,11 @@ mod tests {
 
     #[test]
     fn remote_selection_copy_never_publishes_partial_or_changed_source_text() {
-        let selection = Selection {
-            range: Some(SelectionRange {
-                start: SelectionCoordinate::x_y(0, 0),
-                end: SelectionCoordinate::x_y(3, 1),
-            }),
-            ..Selection::default()
-        };
+        let mut selection = Selection::default();
+        selection.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(3, 1),
+        });
         let mut copy = RemoteSelectionCopy::new(&selection, 12).unwrap();
         copy.push_chunk(vec![Line::from("界 e\u{301}")]).unwrap();
         assert_eq!(copy.finish(12).unwrap(), None);
@@ -1181,11 +1177,9 @@ mod tests {
                         y: if before_zero { 64 } else { 65 },
                     },
                 };
-                let selection = Selection {
-                    range: Some(range),
-                    rectangular,
-                    ..Selection::default()
-                };
+                let mut selection = Selection::default();
+                selection.range = Some(range);
+                selection.rectangular = rectangular;
                 let expected = selected_text_from_logical_lines(
                     &[logical_line_from_physical(physical.clone())],
                     range,
