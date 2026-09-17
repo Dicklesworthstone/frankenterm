@@ -7467,12 +7467,6 @@ mod tests {
             }
         };
 
-        let successor_term_config: Arc<dyn TerminalConfiguration> =
-            Arc::new(config::TermConfig::new());
-        let activated = staging
-            .restore_and_activate(successor_term_config, TerminalCheckpointLimits::default())
-            .expect("successor restore_and_activate must succeed");
-
         let successor_pane_id = alloc_pane_id().expect("allocate successor pane id");
         assert_ne!(
             successor_pane_id, pane_id,
@@ -7483,10 +7477,25 @@ mod tests {
             successor_domain_id, predecessor_domain_id,
             "successor domain id must be freshly allocated and distinct from predecessor domain"
         );
+        let successor_description =
+            format!("recovered guardian pane {}", provenance.original.pane_id);
+        // Match real pane birth: activation requires a storage capability
+        // bound to this successor pane and its preserved durable identity.
+        // TermConfig::new intentionally has no pane-specific spill backend.
+        let successor_term_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(config::TermConfig::new_for_pane(
+                successor_pane_id,
+                successor_domain_id,
+                *provenance.original.pane_id.as_bytes(),
+                successor_description.clone(),
+            ));
+        let activated = staging
+            .restore_and_activate(successor_term_config, TerminalCheckpointLimits::default())
+            .expect("successor restore_and_activate must succeed");
         let local_pane = activated.into_local_pane(
             successor_pane_id,
             successor_domain_id,
-            format!("recovered guardian pane {}", provenance.original.pane_id),
+            successor_description,
         );
         let unpublished = mux::domain::UnpublishedPane::from_guardian_proxy(local_pane)
             .expect("local pane converts to unpublished pane");
