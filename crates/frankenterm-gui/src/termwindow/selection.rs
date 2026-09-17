@@ -963,9 +963,15 @@ impl super::TermWindow {
 
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
         self.clear_selection_drag();
-        self.pane_state(pane.pane_id()).pending_selection_start = None;
-        self.pane_state(pane.pane_id()).pending_native_selection = None;
-        self.update_selection(pane, None, Selection::clear);
+        {
+            let mut state = self.pane_state(pane.pane_id());
+            state.pending_selection_start = None;
+            state.pending_native_selection = None;
+            state.selection.clear();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     pub fn extend_selection_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
@@ -1012,7 +1018,8 @@ impl super::TermWindow {
             .as_ref()
             .map(|pending| pending.desired.clone());
         let mut desired = pending_desired.unwrap_or_else(|| self.selection(pane.pane_id()).clone());
-        let current = SelectionAuthority::capture(&**pane);
+        let current_source = SelectionAuthority::capture_source(&**pane);
+        let current = current_source.map(|(authority, _, _)| authority);
         if desired.is_invalidated_by(current) {
             self.clear_selection(pane);
             return false;
@@ -1053,7 +1060,10 @@ impl super::TermWindow {
             }
             return false;
         }
-        desired.seqno = pane.get_current_seqno();
+        let Some((_, sequence, dims)) = current_source else {
+            return false;
+        };
+        desired.seqno = sequence;
         let (position, y) = match retained
             .map(|(_, position, row)| (position, row))
             .or(self.pane_state(pane.pane_id()).mouse_terminal_coords)
@@ -1164,7 +1174,6 @@ impl super::TermWindow {
             return false;
         }
         self.commit_selection_candidate(pane, desired);
-        let dims = pane.get_dimensions();
 
         // Scroll viewport when the mouse moves out of its vertical bounds.
         if position.row == 0 && position.y_pixel_offset < 0 {
@@ -1190,7 +1199,16 @@ impl super::TermWindow {
             state.suppress_selection_link = false;
         }
         let expected = self.mouse_selection_authority(pane);
-        if expected.is_none() {
+        if expected.is_some() {
+            let (x, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
+                Some(coords) => (coords.0.column, coords.1),
+                None => return,
+            };
+            if self.select_text_at_coordinate(mode, pane, expected, x, y) {
+                return;
+            }
+        }
+        {
             let pending = {
                 let state = self.pane_state(pane.pane_id());
                 state
@@ -1217,13 +1235,7 @@ impl super::TermWindow {
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
-            return;
         }
-        let (x, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
-            Some(coords) => (coords.0.column, coords.1),
-            None => return,
-        };
-        self.select_text_at_coordinate(mode, pane, expected, x, y);
     }
 
     pub fn retry_pending_selection_start(&mut self, pane: &Arc<dyn Pane>) {
@@ -1252,13 +1264,16 @@ impl super::TermWindow {
         let SelectionX::Cell(x) = pending.coordinate.x else {
             return;
         };
-        self.select_text_at_coordinate(
+        if !self.select_text_at_coordinate(
             pending.mode,
             pane,
             Some(pending.frame.authority),
             x,
             pending.coordinate.y,
-        );
+        ) {
+            self.pane_state(pane.pane_id()).pending_selection_start = Some(pending);
+            return;
+        }
         // The retained endpoint belongs to this exact displayed gesture;
         // later motion after release must not change a deferred copy.
         if let Some((position, row)) = pending.end {
@@ -1298,7 +1313,14 @@ impl super::TermWindow {
         expected: Option<SelectionAuthority>,
         x: usize,
         y: StableRowIndex,
-    ) {
+    ) -> bool {
+        let Some((authority, sequence, _)) = SelectionAuthority::capture_source(&**pane) else {
+            return false;
+        };
+        if Some(authority) != expected {
+            self.clear_selection(pane);
+            return true;
+        }
         let mut desired = Selection::default();
         match mode {
             SelectionMode::Line => {
@@ -1333,16 +1355,17 @@ impl super::TermWindow {
             }
         }
 
-        desired.seqno = pane.get_current_seqno();
+        desired.seqno = sequence;
         desired.authority = expected;
         if desired.is_invalidated_by(SelectionAuthority::capture(&**pane)) {
             self.clear_selection(pane);
-            return;
+            return true;
         }
         self.commit_selection_candidate(pane, desired);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+        true
     }
 }
 
