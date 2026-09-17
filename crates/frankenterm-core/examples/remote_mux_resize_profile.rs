@@ -159,7 +159,6 @@ mod measured {
         }
 
         fn phase(
-            &self,
             nonce: &str,
             cols: usize,
             name: &str,
@@ -323,22 +322,22 @@ mod measured {
             // Emit after measurement so stdout serialization cannot enter a
             // recorded resize interval. Missing intervals after a failure are
             // intentionally unusable for phase-filtered CPU attribution.
-            self.phase(
+            Self::phase(
                 nonce,
                 cols,
                 "resize_admission",
                 request_start,
                 admission_end,
             )?;
-            self.phase(
+            Self::phase(
                 nonce,
                 cols,
                 "terminal_convergence",
                 admission_end,
                 terminal_end,
             )?;
-            self.phase(nonce, cols, "pty_probe", terminal_end, probe_end)?;
-            self.phase(nonce, cols, "full_history_oracle", probe_end, oracle_end)?;
+            Self::phase(nonce, cols, "pty_probe", terminal_end, probe_end)?;
+            Self::phase(nonce, cols, "full_history_oracle", probe_end, oracle_end)?;
             Ok(json!({"status":"passed", "columns":cols, "rows":24,
                 "instrumented":self.profile_phases,
                 "from_columns":before.dimensions.cols, "admission_us":admission_us,
