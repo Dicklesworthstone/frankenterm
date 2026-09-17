@@ -1855,6 +1855,7 @@ impl PendingGuardianCheckpointPublication {
 struct GuardianCheckpointPublisherState {
     transport: Box<dyn GuardianCheckpointStageTransport>,
     pending: Option<PendingGuardianCheckpointPublication>,
+    last_acknowledged: Option<GuardianCheckpointReceipt>,
 }
 
 /// Serialized mux-side checkpoint publisher for one exact guardian lease.
@@ -1908,6 +1909,7 @@ impl GuardianCheckpointPublisher {
             state: Mutex::new(GuardianCheckpointPublisherState {
                 transport,
                 pending: None,
+                last_acknowledged: None,
             }),
         }
     }
@@ -1937,17 +1939,55 @@ impl GuardianCheckpointPublisher {
     ) -> Result<PublishedGuardianCheckpoint, GuardianProxyError> {
         let mut state = self.state.lock();
         if state.pending.is_some() {
-            let GuardianCheckpointPublisherState { transport, pending } = &mut *state;
+            let GuardianCheckpointPublisherState {
+                transport,
+                pending,
+                last_acknowledged,
+            } = &mut *state;
             let existing = pending
                 .as_mut()
                 .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
-            Self::drive_pending(&self.actor, transport.as_mut(), existing)?;
+            *last_acknowledged = Some(Self::drive_pending(
+                &self.actor,
+                transport.as_mut(),
+                existing,
+            )?);
             *pending = None;
+        }
+        // Checkpoint identities describe content, not capture attempts. A
+        // quiescent pane can be sampled repeatedly at the same durable output
+        // boundary. Starting another upload would try to adopt that immutable
+        // catalog identity under a different effect and correctly be rejected.
+        // Rebind the fresh affine parser capture only to a receipt whose Ack
+        // this exact publisher has already completed for its unchanged lease.
+        if let Some(receipt) = state.last_acknowledged {
+            let descriptor = GuardianCheckpointDescriptorV1::from_live_capture(
+                &capture,
+                self.identity.generation(),
+            )
+            .map_err(GuardianProxyError::ReplayProtocol)?;
+            if receipt.intent()
+                == GuardianCheckpointIntent::new(
+                    descriptor.checkpoint_id(),
+                    descriptor.boundary_id(),
+                )
+            {
+                let actor = self.actor.lock();
+                actor.ensure_identity(self.identity)?;
+                actor.ensure_attached()?;
+                return capture
+                    .bind_published(receipt, self.identity)
+                    .map_err(|_| GuardianProxyError::CheckpointStageInvariant);
+            }
         }
         let pending =
             PendingGuardianCheckpointPublication::from_live_capture(self.identity, capture)?;
         state.pending = Some(pending);
-        let GuardianCheckpointPublisherState { transport, pending } = &mut *state;
+        let GuardianCheckpointPublisherState {
+            transport,
+            pending,
+            last_acknowledged,
+        } = &mut *state;
         let current = pending
             .as_mut()
             .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
@@ -1955,6 +1995,7 @@ impl GuardianCheckpointPublisher {
         let completed = pending
             .take()
             .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
+        *last_acknowledged = Some(receipt);
         completed
             .capture
             .bind_published(receipt, self.identity)
@@ -6614,6 +6655,15 @@ mod tests {
         let published = capture_real_guardian_checkpoint(mux, pane_id, executor);
         assert!(published.capture().output_sequence() > quiet_sequence);
         assert!(published.capture().journal_cumulative_plaintext_bytes() > quiet_bytes);
+        assert_ne!(published.receipt(), quiet.receipt());
+        let repeated = capture_real_guardian_checkpoint(mux, pane_id, executor);
+        assert_eq!(
+            repeated.receipt(),
+            published.receipt(),
+            "an unchanged live capture must reuse the fully acknowledged publication"
+        );
+        assert!(mux.guardian_checkpoint_is_current(pane_id, &repeated));
+        drop(repeated);
         let captured = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(captured.pane_bindings.len(), 1);
         assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
