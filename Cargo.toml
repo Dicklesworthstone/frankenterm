@@ -627,6 +627,15 @@ frankenterm-redactor = { path = "crates/frankenterm-redactor", default-features 
 frankenterm-core-replay = { path = "crates/frankenterm-core-replay", default-features = false }
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
+[profile.test-recovery]
+# Fresh-process guardian/image proofs compile the full core. Keep debug
+# assertions and unwind behavior, but avoid full debug symbols exhausting a
+# shared worker. Sealed proof commands name this committed profile explicitly;
+# CARGO_PROFILE_* overrides remain forbidden by the build-identity guard.
+inherits = "dev"
+debug = 0
+panic = "unwind"
+
 [profile.release]
 opt-level = "z"     # Conventional safe release default; interactive artifacts override this
 lto = true          # Link-time optimization
