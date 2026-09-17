@@ -171,7 +171,7 @@ pub enum WholeMuxCaptureError {
     GuardianPane {
         pane_id: usize,
         #[source]
-        source: anyhow::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("encrypted model publication failed")]
     Publication(#[source] WholeMuxPublicationError),
@@ -313,13 +313,13 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
                         }
                         _ => WholeMuxCaptureError::GuardianPane {
                             pane_id: pane.pane_id,
-                            source,
+                            source: source.into(),
                         },
                     }
                 } else {
                     WholeMuxCaptureError::GuardianPane {
                         pane_id: pane.pane_id,
-                        source,
+                        source: source.into(),
                     }
                 }
             })?;
