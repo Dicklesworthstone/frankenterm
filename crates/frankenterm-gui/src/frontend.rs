@@ -29,15 +29,33 @@ static LAYOUT_PENDING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 /// Terminal delivery is fenced only during the short queued restore cut.
 /// UI bindings and selection/copy do not call this gate.
 pub(crate) fn layout_input_ready(window_id: MuxWindowId, pane: &Arc<dyn mux::pane::Pane>) -> bool {
-    if LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire) & 2 != 0 { return false; }
-    let Some(mux) = Mux::try_get() else { return false; };
-    if mux.get_window(window_id).is_none() { return false; }
+    if LAYOUT_PENDING.load(std::sync::atomic::Ordering::Acquire) & 2 != 0 {
+        return false;
+    }
+    let Some(mux) = Mux::try_get() else {
+        return false;
+    };
+    if !layout_pane_belongs_to_window(&mux, window_id, pane) {
+        return false;
+    }
     if let Some(domain) = mux.get_domain(pane.domain_id()) {
         if let Some(client) = domain.downcast_ref::<ClientDomain>() {
             return !client.layout_restore_pending();
         }
     }
     true
+}
+
+pub(crate) fn layout_pane_belongs_to_window(
+    mux: &Mux,
+    window_id: MuxWindowId,
+    pane: &Arc<dyn mux::pane::Pane>,
+) -> bool {
+    mux.get_pane(pane.pane_id())
+        .is_some_and(|current| Arc::ptr_eq(&current, pane))
+        && mux
+            .resolve_pane_id(pane.pane_id())
+            .is_some_and(|(_, owner, _)| owner == window_id)
 }
 
 use crate::window_state_persist::{
@@ -168,9 +186,14 @@ impl LayoutLifecycle {
                 .owned
                 .get(&id)
                 .filter(|owned| owned.mux_identity == identity);
-            if old.is_none() && self.startup.overlays.iter().any(|overlay|
-                !self.restored.contains(&overlay.window_id()) && overlay.slots().iter().any(|saved|
-                    slots.iter().any(|slot| slot.identity() == saved.identity()))) {
+            if old.is_none()
+                && self.startup.overlays.iter().any(|overlay| {
+                    !self.restored.contains(&overlay.window_id())
+                        && overlay.slots().iter().any(|saved| {
+                            slots.iter().any(|slot| slot.identity() == saved.identity())
+                        })
+                })
+            {
                 // Startup owns this association. A queued capture must not
                 // persist a competing freshly minted ID before restore runs.
                 continue;
@@ -315,10 +338,13 @@ impl LayoutLifecycle {
                     })
                     .context("restored tab lost its parent")?;
                 let mut target = existing.unwrap_or(source);
-                let compatible_workspace = mux.get_window(target).is_some_and(|window|
-                    window.get_workspace() == overlay.workspace());
-                let other_owner = self.owned.get(&target).is_some_and(|owned|
-                    owned.overlay.window_id() != overlay.window_id());
+                let compatible_workspace = mux
+                    .get_window(target)
+                    .is_some_and(|window| window.get_workspace() == overlay.workspace());
+                let other_owner = self
+                    .owned
+                    .get(&target)
+                    .is_some_and(|owned| owned.overlay.window_id() != overlay.window_id());
                 if !compatible_workspace || other_owner || !claimed_windows.insert(target) {
                     let builder = mux.new_empty_window(Some(overlay.workspace().to_owned()), None);
                     target = *builder;
@@ -428,7 +454,9 @@ impl Drop for LayoutReconcileAdmission<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.pending.store(0, std::sync::atomic::Ordering::Release);
-            log::warn!("layout reconciliation was cancelled before execution; next topology signal may retry");
+            log::warn!(
+                "layout reconciliation was cancelled before execution; next topology signal may retry"
+            );
         }
     }
 }
@@ -439,7 +467,10 @@ fn schedule_layout_reconcile(restore: bool) {
     if LAYOUT_PENDING.fetch_or(flag, Ordering::AcqRel) != 0 {
         return;
     }
-    let admission = LayoutReconcileAdmission { pending: &LAYOUT_PENDING, armed: true };
+    let admission = LayoutReconcileAdmission {
+        pending: &LAYOUT_PENDING,
+        armed: true,
+    };
     match try_reserve_main_thread(
         MainThreadServiceClass::Topology,
         FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
@@ -1585,6 +1616,83 @@ mod tests {
         CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn layout_input_target_rejects_a_pane_moved_to_another_window() {
+        use mux::pane::Pane;
+        use std::sync::Arc;
+
+        let owner = Arc::new(mux::Mux::new(None));
+        let _activity = mux::activity::Activity::new_for_mux(&owner);
+        let left = owner.new_empty_window(None, None);
+        let right = owner.new_empty_window(None, None);
+        let size = wezterm_term::TerminalSize::default();
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let terminal = wezterm_term::Terminal::new(
+            size,
+            Arc::new(config::TermConfig::new_for_pane(
+                998_301,
+                998_301,
+                [0x31; 16],
+                "layout input test".to_owned(),
+            )),
+            "FrankenTerm",
+            "layout-input-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_301,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_301,
+            [0x31; 16],
+            "layout input test".to_owned(),
+        ));
+        struct RetireChild(Arc<dyn Pane>);
+        impl Drop for RetireChild {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _child = RetireChild(Arc::clone(&pane));
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(&pane);
+        owner.add_tab_and_active_pane(&tab).unwrap();
+        owner.add_tab_to_window(&tab, *left).unwrap();
+        assert!(super::layout_pane_belongs_to_window(&owner, *left, &pane));
+        assert!(!super::layout_pane_belongs_to_window(&owner, *right, &pane));
+
+        let left_order = owner.window_order_snapshot(*left).unwrap().unwrap();
+        let right_order = owner.window_order_snapshot(*right).unwrap().unwrap();
+        owner
+            .apply_window_order_mirrors(vec![
+                mux::WindowOrderMirror {
+                    expected: left_order,
+                    ordered_tabs: Vec::new(),
+                    active_tab: None,
+                },
+                mux::WindowOrderMirror {
+                    expected: right_order,
+                    ordered_tabs: vec![Arc::clone(&tab)],
+                    active_tab: Some(Arc::clone(&tab)),
+                },
+            ])
+            .unwrap();
+        assert!(!super::layout_pane_belongs_to_window(&owner, *left, &pane));
+        assert!(super::layout_pane_belongs_to_window(&owner, *right, &pane));
+        left.cancel();
+        right.cancel();
+    }
 
     #[test]
     fn mixed_layout_restore_uses_one_atomic_mux_transaction_and_rejects_old_session_slots() {

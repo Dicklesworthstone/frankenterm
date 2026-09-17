@@ -404,6 +404,9 @@ impl super::TermWindow {
 
             if bypass_compose {
                 if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                    if !self.pane_input_ready(pane) {
+                        return true;
+                    }
                     let tw_raw_modifiers = raw_modifiers;
 
                     let mut did_encode = false;
@@ -719,6 +722,9 @@ impl super::TermWindow {
                     return;
                 }
 
+                if !self.pane_input_ready(&pane) {
+                    return;
+                }
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
                     if self.config.debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
@@ -782,6 +788,9 @@ impl super::TermWindow {
                 self.key_table_state.did_process_key();
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
+                }
+                if !self.pane_input_ready(&pane) {
+                    return;
                 }
                 pane.writer().write_all(s.as_bytes()).ok();
                 self.maybe_scroll_to_bottom_for_input(&pane);

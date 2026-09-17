@@ -3823,7 +3823,9 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                pane.send_paste(text.as_str())?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(text.as_str())?;
+                }
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -3837,7 +3839,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(urls.as_str())?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(urls.as_str())?;
+                }
                 Ok(true)
             }
             WindowEvent::DroppedFile(paths) => {
@@ -3855,7 +3859,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(&paths)?;
+                if self.pane_input_ready(&pane) {
+                    pane.send_paste(&paths)?;
+                }
                 Ok(true)
             }
             WindowEvent::DraggedFile(_) => Ok(true),
@@ -4608,6 +4614,25 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.notify(TermWindowNotif::EmitStatusUpdate);
         }
+    }
+
+    /// Keep local overlays usable while terminal input waits for saved layout
+    /// restoration. A delayed delivery must still belong to this exact window.
+    fn pane_input_ready(&self, pane: &Arc<dyn Pane>) -> bool {
+        let active_overlay = self.get_active_pane_or_overlay().is_some_and(|active| {
+            Arc::ptr_eq(&active, pane)
+                && self.get_active_pane_no_overlay().is_some_and(|underlying| {
+                    !Arc::ptr_eq(&underlying, pane)
+                        && Mux::try_get().is_some_and(|mux| {
+                            crate::frontend::layout_pane_belongs_to_window(
+                                &mux,
+                                self.mux_window_id,
+                                &underlying,
+                            )
+                        })
+                })
+        });
+        active_overlay || crate::frontend::layout_input_ready(self.mux_window_id, pane)
     }
 
     fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
@@ -7066,8 +7091,15 @@ impl TermWindow {
             ActivateWindowRelativeNoWrap(n) => {
                 self.activate_window_relative(*n, false)?;
             }
-            SendString(s) => pane.writer().write_all(s.as_bytes())?,
+            SendString(s) => {
+                if self.pane_input_ready(pane) {
+                    pane.writer().write_all(s.as_bytes())?;
+                }
+            }
             SendKey(key) => {
+                if !self.pane_input_ready(pane) {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
                 use keyevent::Key;
                 let mods = key.mods;
                 if let Key::Code(key) = self.win_key_code_to_termwiz_key_code(
