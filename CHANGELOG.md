@@ -30,7 +30,7 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-- Mouse selection survives ordinary terminal output and temporary frame contention while retaining displayed-layout validation. Forward and reverse drags, Unicode copying, and word/line selection are covered by native Mac acceptance checks.
+- Mouse selection retains displayed-layout validation across ordinary terminal output and temporary frame contention. Native Mac acceptance for forward and reverse drags, Unicode copying, and word/line selection remains pending.
 - Explicit-context timers isolate cleanup from unrelated ambient cancellation. Interrupted mux writes preserve typed cancellation and discard ambiguous connections.
 - Numeric fields in tagged JSON messages and saved layouts round-trip correctly with arbitrary-precision JSON enabled. Unicode emoji lookup again uses the hash version matching its generated tables.
 - Local-pane resize prepares text wrapping outside the terminal and resize-admission locks. It validates the captured text, cursor, geometry and policy before applying the result; parser output or a superseding resize invalidates stale work. Image-bearing content retains the synchronous path.
@@ -51,8 +51,15 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - The guardian broker's Spawn acknowledgment requires an authenticated, durably stored recovery capability. Interrupted writes use separate staging files, and recovery reloads the original acknowledgment and child identity from encrypted storage. Explicit guardian-domain opt-in now connects fresh child creation, durable output, terminal replay and mux pane publication. Cancellation retires the pane lease without terminating the child; an unpublished birth prevents another spawn until reconciled. This does not migrate existing sessions or enable successor attachment, guardian restart recovery, or full mux recovery.
 - Broker output acknowledgements authenticate the exact durable terminal journal record instead of rereading every earlier record. Foreign receipts, corruption, truncation and poisoned storage remain errors.
 - Fenced text replies report the exact captured layout range, so a clamped or rebased history read cannot be accepted as the originally requested range.
+- Capture retains output already received from the mux when a concurrent terminal change rejects the correlated snapshot. Bounded retries no longer lose the initial screen, and failed streaming bindings retain their polling fallback after the old source drains.
+- A failed render batch reports that resynchronization is required instead of silently retrying after discarding partial output. MCP test transports now leave their runtime reactor free to drive real mux operations, matching the production transport path.
 
-The `0.15.6-rc.26` candidate includes these changes. The 50 ms resize target,
+- OSC parsing preserves leading empty fields across parsing and rendering.
+- Recorder writer leases release after the final buffered flush, so inherited file descriptors do not keep a completed writer's locks alive. Failed contenders cannot release another writer's lease.
+- Whole-mux recovery images preserve window titles, ordered tab stacks and their visible members, and previous-active-tab history. Schema 2 requires these fields and rejects older images; restoring an image into a live successor mux remains unfinished.
+- Creating a tab stack with an existing ID now fails before changing its members or visible tab, preventing stale reverse mappings and lost groups.
+
+The `0.15.6-rc.29` candidate includes these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, and exact tab-order restoration after a full GUI
 reopen remain unqualified; this entry does not claim those acceptance goals
 are complete.
