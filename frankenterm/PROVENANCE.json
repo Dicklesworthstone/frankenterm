@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 195,
-        "fix": 236,
+        "fix": 237,
         "other": 49,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 92
       },
-      "fork_side_commit_count": 642,
+      "fork_side_commit_count": 643,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-17T03:35:02-04:00",
-        "sha": "aa0e304590cf4cd34319ff5cbcde742e37d7e438",
-        "subject": "fix(recovery): bind restored prefix after live activation advances model"
+        "committed_at": "2026-09-17T04:38:05-04:00",
+        "sha": "2726d1332e8ecc0e82190ab8fb1d4308b904e3cd",
+        "subject": "fix(recovery): retain live reader across retryable replay exchanges"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2717,
-  "generated_at": "2026-09-17T08:08:16.684778Z",
+  "fork_side_commit_total": 2718,
+  "generated_at": "2026-09-17T08:45:06.660045Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

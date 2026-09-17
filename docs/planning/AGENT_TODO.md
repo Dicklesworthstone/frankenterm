@@ -1248,6 +1248,17 @@ power loss nor migration of those live sessions has been demonstrated.
   `568bf38-gui-selection-fresh-ts1.log`, including actual changed GUI/mux
   compilation and all seven new snapshot/boundary tests. RCH mapped the
   requested fresh target to its existing pool; do not call this a cold build.
+- [x] Implement bounded native word/line workers in `61b282364`, including
+  exact read-plan publication, retained release endpoints, fixed deadline,
+  paced Busy retry and off-thread retirement of partial captures.
+- [x] Review follow-ups: `89f1add33` restores edge autoscroll after resolution;
+  `dbd2dfb8f` preserves contended drag intent and avoids a nested RefCell borrow.
+- [ ] Complete strict worker126 GUI harness run at `61b282364` (session30861,
+  `61b2823-gui-selection-rch.log`); follow-up commits need the final rerun.
+- [ ] Execute exact quick-select regression in the same real GUI harness.
+  Ruby's earlier `--lib` run executed zero tests; it is not passing evidence.
+- [ ] Finish semantic-zone and quick-select overlay nonblocking integration;
+  keep `ft-w57v2` open through native contention and release-endpoint proof.
 - [x] Replace repeated backward context array shifts with reverse-once
   accumulation in `568bf385f`, preserving bounded context and physical order.
 - [x] Execute the dedicated logical-context tests: 12 passed, zero failed,
@@ -1265,8 +1276,8 @@ power loss nor migration of those live sessions has been demonstrated.
   handle has the exact original registration identity (`c733933a7`).
   The intervening `3d8b73cd1` assertion incorrectly expected None; its actual
   one-test failure is retained in `3d8b73c-fresh-process-image-rch.log`.
-- [ ] Execute corrected recovery parent with the same-source companion and
-  matching test/binary feature union; the c733 family build is on worker114.
+- [x] Execute corrected recovery parent with the same-source companion and
+  matching test/binary feature union; the c733 failure is diagnosed below.
 - [x] Build that c733 family and execute its actual test binary for early
   diagnosis: one failure at guardian_proxy.rs:6379, not a compile failure.
   Restored child output was applied before registration, but its authenticated
@@ -1297,8 +1308,19 @@ power loss nor migration of those live sessions has been demonstrated.
     returned the error and LocalPane interpreted it as child exit.
   - [x] Commit `7f0b0bb8e`: retry observation errors only while the lease
     remains attached; add transient census and permanent fenced-lease tests.
-  - [ ] Execute both child-wait regressions and the real-process test at
-    `7f0b0bb8e`, retaining matching guardian/server artifact identities.
+  - [x] Execute the built `7f0b0bb8e` artifacts on worker114: both child-wait
+    regressions pass; real birth now renders fresh output after checkpoint.
+    These direct artifact runs are diagnostics, not the final RCH test receipt.
+  - [x] Diagnose the next real-process failure: whole-image validation compares
+    compact-hex topology incarnation against hyphenated UUID Display. Preserve
+    the existing topology encoding and reject different owner identities.
+  - [ ] Test the corrected identity comparison and rerun the real-process
+    checkpoint/image/reopen path with the matching sealed guardian family.
+    `a97be2b42` passed sealed compilation, but the actual test exposed a second
+    contention path: replay I/O failure retired the pane despite retained
+    exact Replay/Ack requests. `2726d1332` connects that retry contract to the
+    mux reader loop, preserving parser failures/gaps as terminal and adding
+    no-redelivery coverage. Matching sealed rebuild is active on worker114.
   - [ ] Pass the real child birth/checkpoint/image/reopen test with the new
     companion, then broader checkpoint authority and registration tests.
   - [ ] Validate reviewed follow-up checks for increasing journal offsets,
