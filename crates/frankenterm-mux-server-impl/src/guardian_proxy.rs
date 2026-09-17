@@ -5904,8 +5904,9 @@ mod tests {
             std::fs::write(&release, b"release").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
+                while executor.try_tick().unwrap() {}
                 let rows = snapshot(deadline);
-                if rows.iter().all(|row| row.exit_status.is_some()) {
+                if rows.len() == 2 && rows.iter().all(|row| row.exit_status == Some(0)) {
                     break;
                 }
                 assert!(
@@ -5916,6 +5917,41 @@ mod tests {
             }
             assert_eq!(std::fs::read(&finished).unwrap(), b"DD");
             assert!(!signaled.exists());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pane.is_dead() {
+                assert!(
+                    Instant::now() < deadline,
+                    "published pane did not observe child exit"
+                );
+                while executor.try_tick().unwrap() {}
+                thread::sleep(Duration::from_millis(2));
+            }
+            while executor.try_tick().unwrap() {}
+            if let Some(registration) = mux.capture_pane_registration(&pane) {
+                assert!(registration.retire_and_prune_if_current());
+            }
+            loop {
+                while executor.try_tick().unwrap() {}
+                let cleanup_snapshot = mux.pane_removal_cleanup_snapshot();
+                if cleanup_snapshot.active_fences == 0 && cleanup_snapshot.outstanding_leases == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pane removal cleanup did not settle within deadline"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            while executor.try_tick().unwrap() {}
+            drop(pane);
+            drop(snapshot);
+            drop(census);
+            drop(domain);
+            drop(registered);
+            drop(foreign_mux);
+            drop(mux);
+            while executor.try_tick().unwrap() {}
+            drop(executor);
             println!("GUARDIAN_DOMAIN_REAL_BIRTH_SUCCESS");
             if cancel_in_flight {
                 println!("GUARDIAN_DOMAIN_IN_FLIGHT_CANCELLATION_SUCCESS");
