@@ -11194,7 +11194,6 @@ fn checkpoint_catalog_validate_chain(
         .first()
         .map(|member| member.metadata.identity.scope);
     let mut previous: Option<&PublishedCheckpointCatalogMember> = None;
-    let mut boundaries = BTreeMap::new();
     let mut checkpoints = BTreeSet::new();
     let mut adoption_effects = BTreeSet::new();
     for member in published.iter() {
@@ -11230,12 +11229,10 @@ fn checkpoint_catalog_validate_chain(
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        if let Some(existing_checkpoint) =
-            boundaries.insert(member.metadata.boundary_id, member.metadata.checkpoint_id)
-            && existing_checkpoint != member.metadata.checkpoint_id
-        {
-            return Err(GuardianCheckpointStageStoreError::Poisoned);
-        }
+        // An output boundary identifies the consumed journal prefix, not the
+        // entire terminal model. A resize can publish another authenticated
+        // checkpoint at that prefix. The predecessor chain and unique
+        // checkpoint/effect identities still determine publication order.
         previous = Some(member);
     }
     Ok(())
@@ -12297,7 +12294,6 @@ fn checkpoint_catalog_publish_sealed_stage(
     let scan = checkpoint_catalog_scan(inner, scope)?;
     if let Some(existing) = scan.published.iter().find(|member| {
         member.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
-            || member.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
     }) {
         if existing.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
             && existing.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
@@ -17434,10 +17430,11 @@ mod tests {
         let mut mixed_scope = vec![first.clone(), mixed];
         assert!(checkpoint_catalog_validate_chain(&mut mixed_scope).is_err());
 
-        let mut divergent_boundary = second.clone();
-        divergent_boundary.metadata.boundary_id = first.metadata.boundary_id;
-        let mut boundary_splice = vec![first.clone(), divergent_boundary];
-        assert!(checkpoint_catalog_validate_chain(&mut boundary_splice).is_err());
+        let mut resized_at_same_boundary = second.clone();
+        resized_at_same_boundary.metadata.boundary_id = first.metadata.boundary_id;
+        let mut same_output_prefix = vec![first.clone(), resized_at_same_boundary];
+        checkpoint_catalog_validate_chain(&mut same_output_prefix)
+            .expect("distinct terminal checkpoints may share a durable output prefix");
 
         let mut duplicate_checkpoint = second;
         duplicate_checkpoint.metadata.checkpoint_id = first.metadata.checkpoint_id;
