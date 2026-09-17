@@ -642,6 +642,19 @@ mod alphabet_test {
         assert_eq!(read.poll_ready(deadline), Ok(true));
         let ready = read.ready.take().expect("ready payload must be present");
         assert_eq!(ready.text.as_deref().unwrap(), "https://example.com/target");
+        let (_, sequence, dimensions) =
+            crate::selection::SelectionAuthority::capture_source(&*fixture.pane).unwrap();
+        let mut published = false;
+        assert!(fixture.pane.publish_line_reads_at_layout(
+            ready.plans.as_ref().unwrap().as_ref().unwrap(),
+            sequence,
+            dimensions,
+            &mut || published = true,
+        ));
+        assert!(
+            published,
+            "the actual worker returned publishable read plans"
+        );
 
         // Off-thread retirement: dropping ready sends plans back to worker thread,
         // which unblocks the worker and drops the permit.
@@ -840,7 +853,8 @@ mod alphabet_test {
             end: SelectionCoordinate::x_y(4, 2),
         };
         let text = extract_text_from_read_plans(&plans, sel, &cancelled).unwrap();
-        assert_eq!(text, "cdefghijklmnopqrstuvw");
+        // The inclusive endpoint is the fifth cell of row 2: `y`.
+        assert_eq!(text, "cdefghijklmnopqrstuvwxy");
     }
 
     #[test]
@@ -906,7 +920,7 @@ mod alphabet_test {
 
     #[test]
     fn quickselect_publish_line_reads_at_layout_rejects_mutated_screen() {
-        let fixture = TestPaneFixture::new(b"initial baseline text\r\n", 998_408);
+        let fixture = TestPaneFixture::new(b"initial baseline text", 998_408);
         let pane = &fixture.pane;
 
         let (_auth, seqno, dims) =
@@ -915,14 +929,25 @@ mod alphabet_test {
         let plan = pane
             .capture_line_read(0..1, &mut budget)
             .expect("capture must be supported")
-            .expect("capture must succeed");
+            .expect("capture must succeed")
+            .hydrate(|| false)
+            .expect("hydrate complete publication witness");
 
-        // Mutate screen before publication synchronously via perform_actions
+        let plans = [plan];
+        let mut baseline_published = false;
+        assert!(
+            pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                baseline_published = true;
+            })
+        );
+        assert!(baseline_published);
+
+        // The cursor remains on captured row 0, so this changes the selected
+        // source rather than merely appending unrelated output on another row.
         fixture.mutate("mutation lines\r\n");
 
         // Publication of the old plan MUST fail because screen line generation changed
         let mut published = false;
-        let plans = [plan];
         let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
             published = true;
         });
@@ -945,7 +970,9 @@ mod alphabet_test {
         let plan = pane
             .capture_line_read(0..1, &mut budget)
             .expect("capture must be supported")
-            .expect("capture must succeed");
+            .expect("capture must succeed")
+            .hydrate(|| false)
+            .expect("hydrate complete publication witness");
 
         let plans = [plan];
         let mut published = false;
@@ -1050,7 +1077,9 @@ mod alphabet_test {
         let plan = pane
             .capture_line_read(0..1, &mut budget)
             .expect("capture must be supported")
-            .expect("capture must succeed");
+            .expect("capture must succeed")
+            .hydrate(|| false)
+            .expect("hydrate complete publication witness");
         let plans = [plan];
 
         // 1. Publication under lock fails without executing callback
@@ -1086,6 +1115,15 @@ mod alphabet_test {
             decision_unmutated,
             FailedPublicationDecision::RetryPaced,
             "Unmutated source after lock release must retain plans and retry paced"
+        );
+        assert!(
+            pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                published = true;
+            })
+        );
+        assert!(
+            published,
+            "the retained complete witness publishes after unlock"
         );
 
         // 4. If content actually mutates, evaluate_failed_publication_source rejects
