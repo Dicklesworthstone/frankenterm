@@ -1309,10 +1309,11 @@ impl RpcProtocolAuthority {
         // default instead of inheriting authority from a broad `<=` cutoff.
         // Above the legacy surface, only the fenced-topology trio, the
         // explicitly coordinated reliable-input request/reply and sampled
-        // paste request, and the reliable-pane-write request/reply are active.
+        // paste request, the reliable-pane-write request/reply, and the
+        // renderable coordinator's layout-fenced line request/reply are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=101
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=103
         )
     }
 
@@ -13322,7 +13323,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
-        expected.extend(96..=101);
+        expected.extend(96..=103);
 
         let actual = Pdu::all_wire_specs()
             .iter()
@@ -13333,6 +13334,46 @@ mod tests {
             actual, expected,
             "ordinary-client endpoint activation changed without updating its explicit baseline"
         );
+    }
+
+    #[test]
+    fn layout_fenced_lines_require_current_dialect_and_registered_protocol() {
+        let generation = NonZeroU64::new(17).unwrap();
+        let request = &<GetLinesAtLayout as PduWireIdent>::WIRE_SPEC;
+        let reply = &<GetLinesAtLayoutResponse as PduWireIdent>::WIRE_SPEC;
+        let current = RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
+        for point in [
+            RpcOutboundAdmissionPoint::Preflight,
+            RpcOutboundAdmissionPoint::Enqueue,
+            RpcOutboundAdmissionPoint::Dequeue,
+        ] {
+            current.validate_outbound(request, point).unwrap();
+        }
+        current
+            .validate_inbound(reply, PduWireRole::CorrelatedReply)
+            .unwrap();
+        assert!(matches!(
+            current.validate_inbound(reply, PduWireRole::Unilateral),
+            Err(OrdinaryMuxProtocolError::DirectionViolation { .. })
+        ));
+        let bootstrap = RpcProtocolAuthority::new(generation);
+        assert!(matches!(
+            bootstrap.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+        assert!(matches!(
+            bootstrap.validate_inbound(reply, PduWireRole::CorrelatedReply),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
+        ));
+        let legacy = RpcProtocolAuthority::established_for_test(generation, LEGACY46_CODEC_VERSION);
+        assert!(matches!(
+            legacy.validate_outbound(request, RpcOutboundAdmissionPoint::Preflight),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 65, .. })
+        ));
+        assert!(matches!(
+            legacy.validate_inbound(reply, PduWireRole::CorrelatedReply),
+            Err(OrdinaryMuxProtocolError::DialectViolation { required: 65, .. })
+        ));
     }
 
     #[test]
@@ -18282,7 +18323,8 @@ mod tests {
     }
 
     /// The v64 reliable pane-write request and exact-prefix ACK must make a real
-    /// socket/reader round trip. This is intentionally not ignored: a unit-only
+    /// socket/reader round trip, followed by the renderer's layout-fenced read.
+    /// This is intentionally not ignored: a unit-only
     /// responder can miss a request/response registration error in the physical
     /// reader path.
     #[cfg(unix)]
@@ -18325,6 +18367,21 @@ mod tests {
                                     bytes: u32::try_from(request.data.len())
                                         .expect("bounded pane-write payload fits u32"),
                                 },
+                            }),
+                            false,
+                        ),
+                        Pdu::GetLinesAtLayout(request) => (
+                            Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse {
+                                pane_id: request.pane_id,
+                                layout: request.layout,
+                                lines: vec![(
+                                    request.lines[0].start,
+                                    wezterm_term::Line::with_width(
+                                        request.layout.dimensions.cols,
+                                        request.layout.seqno,
+                                    ),
+                                )]
+                                .into(),
                             }),
                             true,
                         ),
@@ -18396,6 +18453,26 @@ mod tests {
         assert_eq!(
             response.outcome,
             ReliablePaneWriteOutcomeV1::AppliedPrefix { bytes: 12 }
+        );
+
+        let layout = LineReadLayout {
+            seqno: 9,
+            dimensions: mux::renderable::RenderableDimensions {
+                cols: 80,
+                ..Default::default()
+            },
+        };
+        let response = asupersync_block_on(client.get_lines_at_layout(GetLinesAtLayout {
+            pane_id: 1,
+            layout,
+            lines: std::iter::once(-20..-19).collect(),
+        }))
+        .expect("layout-fenced renderer read must pass the real request and reply guards");
+        assert_eq!(response.pane_id, 1);
+        assert_eq!(response.layout, layout);
+        assert_eq!(
+            response.lines,
+            vec![(-20, wezterm_term::Line::with_width(80, 9))].into()
         );
 
         drop(client);
