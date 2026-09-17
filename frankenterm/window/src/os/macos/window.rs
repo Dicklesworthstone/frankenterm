@@ -3115,11 +3115,16 @@ impl WindowView {
         }
     }
 
-    extern "C" fn did_end_live_resize(this: &mut Object, _sel: Sel, _notification: id) {
-        if let Some(this) = Self::get_this(this) {
-            let mut inner = this.inner.borrow_mut();
-            inner.live_resizing = false;
+    extern "C" fn did_end_live_resize(this: &mut Object, sel: Sel, notification: id) {
+        if let Some(window) = Self::get_this(this) {
+            window.inner.borrow_mut().live_resizing = false;
+        } else {
+            return;
         }
+        // Cocoa need not send another geometry change after mouse-up. Publish
+        // the non-live boundary even when the final dimensions are unchanged.
+        // The RefCell borrow above must end before did_resize borrows it again.
+        Self::did_resize(this, sel, notification);
     }
 
     extern "C" fn did_resize(this: &mut Object, _sel: Sel, _notification: id) {

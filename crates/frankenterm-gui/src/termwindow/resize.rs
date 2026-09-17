@@ -341,6 +341,15 @@ impl super::TermWindow {
             dimensions,
             window_state,
         );
+        // Gesture boundaries are independent of geometry changes. In
+        // particular, Cocoa's final non-live event repeats the last live
+        // dimensions, and minimizing can report zero dimensions. Consume the
+        // boundary before either geometry-only early return.
+        if live_resizing {
+            self.begin_quad_resize_gesture();
+        } else {
+            self.end_quad_resize_gesture();
+        }
         if dimensions.pixel_width == 0 || dimensions.pixel_height == 0 {
             // on windows, this can happen when minimizing the window.
             // NOP!
@@ -359,16 +368,6 @@ impl super::TermWindow {
         // circuits remain closed until reinitialization.
         self.note_render_surface_recovery_signal();
 
-        // ft-kciew: notify the quad-buffer policy of the gesture
-        // boundary so the underlying GPU buffer (continuation
-        // bead) won't reallocate during a drag. Idempotent on an
-        // active gesture; the level-transition tracking lives on
-        // TermWindow.
-        if live_resizing {
-            self.begin_quad_resize_gesture();
-        } else {
-            self.end_quad_resize_gesture();
-        }
         let last_state = self.window_state;
         self.window_state = window_state;
         if last_state != self.window_state {
