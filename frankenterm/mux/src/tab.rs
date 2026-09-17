@@ -23773,7 +23773,8 @@ mod test {
         assert!(
             err.to_string()
                 .contains("contradictory captured tab metadata"),
-            "unexpected error: {err:#}"
+            "unexpected error: {:#}",
+            err
         );
     }
 
@@ -23792,7 +23793,8 @@ mod test {
         assert!(
             err.to_string()
                 .contains("underlying tiled active pane id 999 not found in split tree leaves"),
-            "unexpected error: {err:#}"
+            "unexpected error: {:#}",
+            err
         );
     }
 
