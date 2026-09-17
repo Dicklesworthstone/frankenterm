@@ -577,7 +577,10 @@ fn logical_lines_from_plan(
     }
 
     // Decline backward truncated logical lines that extend to snapshot boundary
-    if target_logical.first_row == first_row && first_row == requested.start {
+    if target_logical.first_row == first_row
+        && first_row == requested.start
+        && !plan.starts_at_known_history_start()
+    {
         anyhow::bail!("logical line truncated at backward snapshot boundary");
     }
 
@@ -2481,9 +2484,9 @@ mod tests {
     fn process_hydrated_word_selection_single_char_and_multiline_unicode() {
         let size = wezterm_term::TerminalSize {
             rows: 24,
-            cols: 80,
+            cols: 20,
             dpi: 96,
-            pixel_width: 640,
+            pixel_width: 160,
             pixel_height: 384,
         };
         let mut term = wezterm_term::Terminal::new(
@@ -2495,8 +2498,10 @@ mod tests {
         );
         term.advance_bytes(b"hello a https://example.com/\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e world\r\nsecond line\r\n");
 
-        let requested = 0..2;
+        let requested = 0..4;
         let plan = term.screen().capture_line_read(requested.clone()).unwrap();
+        assert!(plan.starts_at_known_history_start());
+        assert!(plan.lines().next().unwrap().last_cell_was_wrapped());
         let plans = Ok(vec![plan]);
         let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -2533,11 +2538,11 @@ mod tests {
         assert_eq!(pick.text, "https://example.com/日本語");
         assert_eq!(payload_url.range.start, SelectionCoordinate::x_y(8, 0));
         // URL is 20 ASCII chars + 3 CJK double-width (6 cols) = 26 cols total.
-        // Starts at 8 -> ends at 8 + 26 - 1 = 33
-        assert_eq!(payload_url.range.end, SelectionCoordinate::x_y(33, 0));
+        // Starts at 8 and crosses the 20-column physical row boundary.
+        assert_eq!(payload_url.range.end, SelectionCoordinate::x_y(13, 1));
 
-        // 3. Line mode (triple click) on row 1
-        let line_coord = SelectionCoordinate::x_y(3, 1);
+        // 3. Line mode (triple click) on the following logical line.
+        let line_coord = SelectionCoordinate::x_y(3, 2);
         let payload_line = process_hydrated_word_line_selection(
             &plans,
             std::slice::from_ref(&requested),
@@ -2547,10 +2552,10 @@ mod tests {
             &cancelled,
         )
         .expect("line selection must succeed");
-        assert_eq!(payload_line.range.start, SelectionCoordinate::x_y(0, 1));
+        assert_eq!(payload_line.range.start, SelectionCoordinate::x_y(0, 2));
         assert_eq!(
             payload_line.range.end,
-            SelectionCoordinate::x_y(usize::MAX, 1)
+            SelectionCoordinate::x_y(usize::MAX, 2)
         );
     }
 
@@ -2616,6 +2621,7 @@ mod tests {
             .screen()
             .capture_line_read(requested_back.clone())
             .unwrap();
+        assert!(!plan_back.starts_at_known_history_start());
         let back_res = process_hydrated_word_line_selection(
             &Ok(vec![plan_back]),
             std::slice::from_ref(&requested_back),

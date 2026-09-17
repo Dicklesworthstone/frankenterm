@@ -272,6 +272,7 @@ pub struct ScreenLineRead {
     cold_context: Option<Range<StableRowIndex>>,
     rendered: Option<Vec<Line>>,
     hot_top: StableRowIndex,
+    known_resident_history_start: Option<StableRowIndex>,
     wrap_policy: ResizeWrapPolicy,
     layout: Option<Arc<ColdVisualLayout>>,
     logical_view: Option<(StableRowIndex, Vec<Line>)>,
@@ -1348,6 +1349,11 @@ impl ScreenLineRead {
 
     pub fn first_row(&self) -> StableRowIndex {
         self.first
+    }
+    /// The captured metadata proved that no readable row precedes this one.
+    /// Unknown spill metadata and rebased cold geometry cannot grant this proof.
+    pub fn starts_at_known_history_start(&self) -> bool {
+        self.known_resident_history_start == Some(self.first)
     }
     pub fn failure_witness(&self) -> LineReadFailureWitness {
         LineReadFailureWitness {
@@ -3704,6 +3710,7 @@ impl Screen {
         let hot_top = self.phys_to_stable_row_index(0);
         let newest = self.phys_to_stable_row_index(self.lines.len());
         let mut oldest = hot_top;
+        let mut oldest_is_known = true;
         let mut cold = None;
         if self.allow_scrollback {
             if let Some(sink) = self.config.scrollback_spill_sink() {
@@ -3728,7 +3735,9 @@ impl Screen {
                         }
                         cold = Some((sink, interval));
                     }
-                    _ if requested.start >= hot_top && requested.end <= newest => {}
+                    _ if requested.start >= hot_top && requested.end <= newest => {
+                        oldest_is_known = false;
+                    }
                     ScrollbackIntervalCapture::Busy => anyhow::bail!(ColdReadMetadataBusy),
                     ScrollbackIntervalCapture::Unavailable => {
                         anyhow::bail!("cold read metadata unavailable");
@@ -3799,6 +3808,7 @@ impl Screen {
             cold_context: None,
             rendered: None,
             hot_top,
+            known_resident_history_start: (oldest_is_known && oldest == hot_top).then_some(hot_top),
             wrap_policy: self.resize_wrap_policy,
             layout,
             logical_view: None,

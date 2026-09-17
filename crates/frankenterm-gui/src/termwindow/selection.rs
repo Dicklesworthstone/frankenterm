@@ -1082,12 +1082,11 @@ impl super::TermWindow {
         self.pane_state(pane.pane_id()).suppress_selection_link = true;
 
         if let Some((_auth, pos, row)) = retained {
+            let observed_frame = self.pane_state(pane.pane_id()).mouse_selection_frame;
+            let frame = observed_frame.or_else(|| self.selection_frame_stamp(pane));
             let mut state = self.pane_state(pane.pane_id());
             if let Some(pending) = state.pending_selection_start.as_mut() {
-                if let Some(frame) = state
-                    .mouse_selection_frame
-                    .or_else(|| self.selection_frame_stamp(pane))
-                {
+                if let Some(frame) = frame {
                     pending.retain_endpoint(frame, pos, row, None);
                 }
             }
