@@ -743,3 +743,199 @@ power loss nor migration of those live sessions has been demonstrated.
 - [ ] Qualify all four attestation producers and create the complete RC26
   retained manifest before the sixth DSR quality gate; its required input
   is currently absent. No release tag or published artifact exists yet.
+
+### 2026-09-16 15:47 UTC — live capture failure blocks release qualification
+
+- [x] Freeze `6821ca353bacda1a771e2f5daa5215620407022b` as local RC26.
+  Guardian 236 tests, proxy 47 tests, four Claim fault cases and two actual
+  Domain cases passed remotely. This does not prove successor recovery or
+  survival of power loss. RC26 has not been published.
+- [x] Run the normal Doctor command family: 31,812 core tests and all 16
+  integration targets passed, plus CLI parity 1, workflow 10 and redaction 1.
+  The three explicitly ignored live-mux tests subsequently failed; the
+  normal suite alone does not qualify Doctor.
+- [x] Execute the real fsync fault test: one passed with all 15 injection
+  controls. Retain the distinction between syscall failure and power loss.
+- [x] Build and collect RC26 native Mac and Linux x86 archives through DSR.
+- [x] Complete the Linux ARM build through DSR.
+- [ ] Complete the running Windows build. These frozen RC26
+  artifacts remain unqualified after the newly diagnosed capture defect.
+- [x] Diagnose `ft-btf5n`: serial-0 initial output precedes a retry-safe
+  correlated snapshot rejection; client error cleanup deletes that output,
+  although the server has already advanced its stream baseline.
+- [x] Verify the FIFO-preserving fix with exact packet-order tests and
+  exhausted retries. RCH31894 passed the new socket regression.
+- [x] Run all three owned live-mux transaction tests after fixing the fixture
+  reactor: RCH31892 passed 3/3 with actual PTY, rollback, persistence and clean
+  shutdown assertions. Final source-family qualification remains separate.
+- [x] Confirm the corrected FIFO path clears the original live readiness
+  failure. RCH31888 reached MCP transaction dispatch, then exposed a separate
+  test-harness reactor starvation; it was cancelled, not counted as a pass.
+- [x] Verify `ft-6hnol`: run synchronous MCP transport pumps on the blocking
+  pool while awaiting settlement on the owning runtime. The sole-thread
+  fixture prevented live socket operations from progressing; production
+  already uses the correct pattern. Preserve every response and EOF assertion.
+- [x] Run the repaired MCP integration targets: RCH31894 passed all 14
+  targets, 105 tests. Its core library ran 31,812 passed and two failed:
+  missing desired-revision setup in the new fallback test and an old batch
+  error expectation. RCH31896 subsequently passed all five exact regression
+  tests, including both corrected controls and the independent batch guard.
+- [x] Verify `ft-dxim8`: preserve polling fallback after a failed stream,
+  enforce source drain, and reject stale predecessor authority.
+- [x] Finish and verify `ft-ga70o`: prevent failed render batches from silently
+  becoming successful retries after discarding admitted output.
+- [ ] Verify `ft-2b10v`: remove Windows-only unused bindings by gating Unix
+  bookmark authority and retaining metadata validation on every platform.
+  Source review passed; final-source tests and native Windows build remain.
+- [ ] Run focused unit suites and Clippy on the combined fixes, then freeze
+  the next candidate. Keep RC26 tags and historical receipts immutable.
+- [ ] Complete current-source panic-profile subprocess proof, manifest
+  completeness and actual Lindley measurement with the final native family.
+- [ ] Qualify four producers and retain the complete 32-slot manifest, then
+  run all six DSR quality gates and sign/verify the final proof bundle.
+- [ ] Validate the final Mac app's selection, resize/reflow, fixed-window
+  font sizing and latency. Foreground automation still requires clearance of
+  the protected notification; never bypass the refusal.
+- [ ] Publish through DSR, verify release/canary/upgrade, and perform the
+  supported session-preserving installation and Dock verification. Existing
+  GUI/local PTYs and remote mux processes must remain protected.
+
+### 2026-09-16 18:13 UTC — RC28 formatting correction and qualification
+
+- [x] Retain RC27 formatting failure: RCH31927 ran the exact `498d78c5`
+  baseline and failed on eight import reorderings in `mux/src/domain.rs`.
+  Commit `47281d9a0` applies only those reorderings. RC27 remains immutable;
+  its ongoing builds and prior receipts do not qualify RC28.
+- [ ] Freeze RC28 after metadata and derived provenance updates, then rerun
+  the exact-source formatting proof and complete the full workspace tests.
+- [ ] Complete all four native DSR targets and final-family acceptance;
+  qualify the four producers, retain all 32 manifest slots, and pass all six
+  quality gates before signing, publication, or installation.
+
+### 2026-09-16 — RC29 late workspace failures and qualification
+
+- [x] Diagnose the three late failures in full-workspace RCH31913. OSC parsing
+  dropped leading empty fields (`ft-ebuyt`); the PTY property expected duplicate
+  environment assignments to survive last-write map semantics (`ft-vhc52`);
+  the MCP property incorrectly required secret-shaped server names to appear
+  unredacted in duplicate diagnostics (`ft-ywxwy`).
+- [x] Preserve the minimized OSC failure and correct the production field count.
+  Add exact empty-field, chunking and parameter-limit regressions. Correct the
+  PTY and MCP oracles without weakening raw-key preservation or redaction.
+- [x] Retain strict RCH31944 focused four-package proof: 885 passed, 0 failed,
+  0 ignored. Receipt `three-late-regressions-fixed-rch.log` SHA-256
+  `463547eda48b9a87e030f3376810ae5f2bca1bfd4e582941050c6f3757943c5a`
+  is under `/Volumes/USB_NVME/ft-release-20260915/`. Fixes are committed as
+  `99213c76c`; this focused result does not qualify the full workspace.
+- [ ] Complete full-workspace tests on the corrected RC29 source before
+  creating its tag or starting native release builds. RC29 remains untagged;
+  RC28 is immutable and must not be promoted or reused as corrected-source proof.
+- [ ] Complete exact-source formatting, Clippy and all six DSR quality gates;
+  qualify all native targets, final-family acceptance and four actual producers
+  before signing, publication or session-preserving installation.
+
+### 2026-09-16 — scheduler-independent cooldown qualification
+
+- [x] Diagnose actual RCH31929 failure in
+  `cooldown_expired_includes_suppressed_count`: three unchecked calls within a
+  real 10 ms window can expire and reset the count when the worker is preempted.
+- [x] Add explicit monotonic `check_at` to the unchanged cooldown state machine;
+  normal `check` samples the clock once. Replace the affected integration and
+  unit timing assumptions with exact suppression, expiry, reset and LRU checks.
+- [x] Obtain independent source review and exact-file formatting/diff checks.
+- [x] Execute strict remote cooldown regressions for `ft-nb5kl`: 34 integration
+  tests and 106 core-library tests passed on exact `9f7a895e8` through ovh-a.
+- [ ] Complete the final source's full workspace, Clippy and formatting checks. Existing
+  `939da9667` receipts remain bound to that earlier source; RC29 is untagged.
+- [ ] Execute the three audited, non-foreground GUI selection tests through
+  the opt-in `glyphcache_unit` target on the final source. Native mouse input,
+  visual output and latency still require separate native acceptance.
+- [ ] Complete successor topology integration under `.8.14.3.2` and `.3.4`,
+  including stable window/tab identities, titles, tab-stack membership/visible
+  member and last-active history. Inert image reconstruction is not live
+  successor recovery; preserve that distinction in release claims.
+
+### 2026-09-16 — recorder handoff with inherited descriptors
+
+- [x] Diagnose RCH31929's recorder handoff failure after owner drop. Concurrent
+  process creation can retain duplicated open-file descriptions and their
+  close-only advisory locks across the intended handoff (`ft-jgq83`).
+- [x] Retain an isolated regression-only commit, `f17a2098a`, which holds all
+  six duplicate descriptors open while requiring buffered bytes to flush and
+  the successor to acquire ownership. This is an intentional negative control.
+- [x] Implement acquired-only lease guards for data, state and path locks;
+  preserve final buffered-write ordering and report unlock failures. Add a
+  control proving that an unacquired guard cannot unlock another owner.
+- [x] Execute the regression-only baseline: strict ovh-a RCH31970 ran the
+  named test on `f17a2098a` and failed at successor acquisition with
+  `Io(WouldBlock)`, exactly reproducing the defect; no compile failure or skip.
+- [x] Execute the same test on fixed `caa7ddc39`: strict ovh-a proof passed
+  exactly one test; the unacquired-guard control also passed exactly one test.
+- [ ] Run all recorder stack integration tests and focused recorder unit
+  tests, including initialization failure, buffered repair and fsync faults.
+- [ ] Complete final-source workspace check, Clippy, tests and formatting
+  through strict RCH before tagging or starting another native release build.
+
+### 2026-09-16 — preserve window metadata in whole-mux recovery
+
+- [x] Trace concrete losses: capture omitted window tab stacks and previous
+  active identity; conversion additionally discarded the captured window title.
+- [x] Preserve raw history and ordered stack entries under the window read lock.
+  Require title, history and grouped stack metadata in image schema 2.
+- [x] Validate membership, positions, visibility, history, canonical stack order
+  and bounded metadata; reject older schemas and absent required fields.
+- [x] Author real-PTY capture/publication/reopen/verification/inert reconstruction
+  coverage plus malformed, missing-field and bounds regressions.
+- [ ] Complete independent review and strict-RCH execution of these regressions.
+- [ ] Finish durable tab/window identity mapping and atomic live successor
+  publication under existing `.8.14.3.2` and `.3.4`; this metadata slice does
+  not close those requirements or authorize restarting existing mux sessions.
+- [x] Diagnose adjacent duplicate-stack-ID corruption (`ft-7vav0`): disjoint
+  replacement members overwrote the forward stack but left old reverse mappings.
+- [x] Reject duplicate IDs before any mutation and add a regression preserving
+  complete state, nonfirst visibility and inverse membership, followed by valid
+  creation and reuse after removal.
+- [ ] Independently review and execute the mux tab-stack regressions through
+  strict RCH; preserve the distinction from live restored-window publication.
+
+### 2026-09-16 — durable window and tab capture identities
+
+- [x] Replace numeric-counter-derived recovery identities with immutable UUIDs
+  minted on actual window/tab construction and retained through coherent capture.
+- [x] Reject nil captured identities; retain global duplicate-ID validation.
+  Add numeric-reuse and JSON roundtrip regressions, plus real-PTY encrypted
+  publication/reopen assertions against the original live object UUIDs.
+- [x] Obtain independent six-file source review and scoped formatting checks.
+- [ ] Run the new mux and converter tests and extended real-PTY test through
+  strict RCH on the committed source, together with prior metadata regressions.
+- [ ] Bind verified durable IDs to reconstructed successor objects in the
+  atomic whole-topology transaction. UUID capture alone does not restore a mux.
+
+### 2026-09-16 — successor capability custody before acknowledgement
+
+- [x] Bind successor claims to authenticated broker lineage/build and both
+  owners; version the changed control payload and reject the old secret-only form.
+- [x] Require an opaque encrypted, synchronized custody token for successor
+  ACK; reopen and resynchronize the record before sending the ACK.
+- [x] Add authenticated scope lookup that recovers saved ACK/predecessor data
+  from disk without retaining the original claim/context in memory.
+- [x] Add real-child sync-failure, wrong-owner, changed-ACK, disk-reopen and
+  exact-retry checks, plus all-byte tamper and all-field binding controls.
+- [x] Independently review the production boundary and scoped formatting.
+- [ ] Execute guardian/mux custody tests, UUID tests and prior metadata tests
+  through strict RCH, then qualify the combined source.
+- [ ] Implement explicitly authenticated fresh-connection recovery. Current
+  successor custody is bound to the retained connection; duplicate ACK replay
+  is not proof of recovery after transport loss or successor-process restart.
+- [ ] Complete ordinary successor startup and atomic whole-topology publication.
+
+### 2026-09-16 — BOCPD warmup property boundary
+
+- [x] Diagnose the actual `939da9667` workspace failure: the property treated
+  observation `min_observations` as warmup, although the production contract
+  and existing unit tests make that observation eligible for detection.
+- [x] Preserve all generated inputs and updates; assert exact post-update count
+  and warmup state. Retain the minimized seven-observation positive control
+  and an eight-observation-minimum suppression control (`ft-cb5l2`).
+- [ ] Run the full `proptest_bocpd` target and deterministic boundary test through
+  strict RCH. No production detector, threshold or generator was changed.
