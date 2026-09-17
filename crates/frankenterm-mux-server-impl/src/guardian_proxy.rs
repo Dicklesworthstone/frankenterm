@@ -6332,11 +6332,13 @@ mod tests {
             provenance.current_mux_incarnation,
             provenance.original.mux_incarnation
         );
+        let original_registration = mux.capture_pane_registration(pane).unwrap();
         let tab = Arc::new(mux::tab::Tab::new(&size));
         tab.assign_pane(pane);
         // The domain has already registered this live pane. Bind its populated
         // tab through the structural-owner path without starting another reader.
-        assert!(mux.add_tab_and_active_pane(&tab).unwrap().is_none());
+        let registration = mux.add_tab_and_active_pane(&tab).unwrap().unwrap();
+        assert!(registration.same_registration(&original_registration));
         let window = mux.new_empty_window(None, None);
         mux.add_tab_to_window(&tab, *window).unwrap();
         drop(window);
