@@ -2,7 +2,6 @@ use crate::domain::DomainId;
 use crate::guardian_checkpoint::{
     LiveParserCaptureAuthority, LiveParserCheckpointAck, LiveParserPaneCaptureError,
 };
-use crate::guardian_protocol::GuardianCheckpointReceipt;
 #[cfg(test)]
 use crate::pane::GuardianLiveOutputDelivery;
 use crate::pane::{
@@ -335,6 +334,7 @@ enum GuardianLeaseDisposition {
 
 struct GuardianPaneOwnership {
     identity: GuardianPaneLeaseIdentity,
+    spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
     control: Arc<dyn GuardianPaneLeaseControl>,
     disposition: Mutex<GuardianLeaseDisposition>,
 }
@@ -389,9 +389,11 @@ impl LocalPaneOwnership {
     fn guardian(
         identity: GuardianPaneLeaseIdentity,
         control: Arc<dyn GuardianPaneLeaseControl>,
+        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
     ) -> Self {
         Self::Guardian(GuardianPaneOwnership {
             identity,
+            spawn_custody,
             control,
             disposition: Mutex::new(GuardianLeaseDisposition::Attached),
         })
@@ -1309,6 +1311,20 @@ fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
 
 #[async_trait(?Send)]
 impl Pane for LocalPane {
+    fn guardian_spawn_custody(
+        &self,
+    ) -> Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1> {
+        match &self.ownership {
+            LocalPaneOwnership::Guardian(owner) => owner.spawn_custody.map(|original| {
+                crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+                    original,
+                    current_mux_incarnation: owner.identity.mux_incarnation(),
+                    current_lease_generation: owner.identity.generation(),
+                }
+            }),
+            _ => None,
+        }
+    }
     fn pane_id(&self) -> PaneId {
         self.pane_id
     }
@@ -1959,7 +1975,7 @@ impl Pane for LocalPane {
     fn publish_guardian_checkpoint(
         &self,
         capture: LiveParserCheckpointAck,
-    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+    ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
         self.guardian_checkpoint_publisher
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("pane does not own a guardian checkpoint publisher"))?
@@ -4477,6 +4493,7 @@ impl LocalPane {
         command_description: String,
         guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
         guardian_checkpoint_publisher: Arc<dyn GuardianLiveCheckpointPublisher>,
+        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
     ) -> Self {
         Self::new_with_ownership(
             pane_id,
@@ -4489,7 +4506,7 @@ impl LocalPane {
             command_description,
             Some(guardian_live_output_reader),
             Some(guardian_checkpoint_publisher),
-            LocalPaneOwnership::guardian(lease_identity, lease_control),
+            LocalPaneOwnership::guardian(lease_identity, lease_control, spawn_custody),
         )
     }
 
@@ -4506,6 +4523,15 @@ impl LocalPane {
             || self.guardian_checkpoint_publisher.is_none()
         {
             anyhow::bail!("unpublished guardian pane has incomplete or consumed authority");
+        }
+        if let Some(scope) = ownership.spawn_custody {
+            if scope.pane_id != ownership.identity.pane_id()
+                || scope.guardian_incarnation != ownership.identity.guardian_incarnation()
+                || (ownership.identity.generation() == 1
+                    && scope.mux_incarnation != ownership.identity.mux_incarnation())
+            {
+                anyhow::bail!("guardian birth provenance does not match live lease");
+            }
         }
         Ok(())
     }
@@ -5757,7 +5783,7 @@ mod tests {
         fn publish_checkpoint(
             &self,
             _capture: LiveParserCheckpointAck,
-        ) -> anyhow::Result<GuardianCheckpointReceipt> {
+        ) -> anyhow::Result<crate::guardian_checkpoint::PublishedGuardianCheckpoint> {
             anyhow::bail!("guardian lifetime fixture does not publish checkpoints")
         }
     }
@@ -5870,6 +5896,7 @@ mod tests {
             "guardian-lifetime-test".to_string(),
             Box::new(GuardianLifetimeTestOutputReader),
             Arc::new(GuardianLifetimeTestCheckpointPublisher),
+            None,
         )
     }
 

@@ -655,6 +655,51 @@ impl GuardianDurableSpawnCustodyV1 {
         token_path: &Path,
         scope: GuardianSpawnCustodyScopeV1,
     ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        Self::open_existing_store(token_path)?.lookup_spawn_custody(scope)
+    }
+
+    /// Recover provenance after an authenticated successful initial Spawn.
+    /// Broker lineage and child provenance come only from the existing AEAD
+    /// record. Every identity already known by the birth caller must match.
+    /// The current Hello response supplies only the guardian UUID; guardian
+    /// and broker builds are therefore learned from this authenticated record.
+    pub fn open_existing_for_birth(
+        token_path: &Path,
+        guardian_incarnation: Uuid,
+        mux_incarnation: Uuid,
+        pane_id: Uuid,
+        effect_id: Uuid,
+        mux_build: [u8; 32],
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        let store = Self::open_existing_store(token_path)?;
+        let context = store.with_exclusive_directory(|inner| {
+            let path = inner
+                .directory_path
+                .join(format!("spawn-custody-v1-{pane_id}-{effect_id}.bin"));
+            let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(inner, &path)?;
+            let (context, secret) = inner.cipher.open_spawn_custody_record(&bytes)?;
+            drop(secret);
+            if context.guardian_incarnation != guardian_incarnation
+                || context.mux_incarnation != mux_incarnation
+                || context.pane_id != pane_id
+                || context.effect_id != effect_id
+                || context.mux_build != mux_build
+            {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok(context)
+        })?;
+        Ok(Self { store, context })
+    }
+
+    /// Nonsecret lookup provenance, never sufficient to claim a lease alone.
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.context.scope()
+    }
+
+    fn open_existing_store(
+        token_path: &Path,
+    ) -> Result<GuardianCheckpointStageStore, GuardianCheckpointStageStoreError> {
         let (directory, directory_path, parent_identity, directory_identity) =
             open_output_directory_with_creation(token_path, false)?;
         let (cipher, key_path, key_identity) =
@@ -676,8 +721,7 @@ impl GuardianDurableSpawnCustodyV1 {
             &cipher,
             persistence,
             GuardianCheckpointStagePolicy::production(),
-        )?
-        .lookup_spawn_custody(scope)
+        )
     }
 
     pub(crate) const fn context(&self) -> GuardianSpawnCustodyContextV1 {
@@ -12412,6 +12456,66 @@ mod tests {
         let store = pipeline.checkpoint_stage_store();
         let recovered = store.lookup_spawn_custody(scope)?;
         let context = recovered.context();
+        let open_birth = |guardian, owner, pane, effect, build| {
+            GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+                &directory.join("guardian.token"),
+                guardian,
+                owner,
+                pane,
+                effect,
+                build,
+            )
+        };
+        assert_eq!(
+            open_birth(
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build
+            )?
+            .scope(),
+            scope
+        );
+        for (guardian, owner, pane, effect, build) in [
+            (
+                Uuid::new_v4(),
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                Uuid::new_v4(),
+                scope.pane_id,
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                Uuid::new_v4(),
+                scope.effect_id,
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                Uuid::new_v4(),
+                scope.mux_build,
+            ),
+            (
+                scope.guardian_incarnation,
+                scope.mux_incarnation,
+                scope.pane_id,
+                scope.effect_id,
+                [0x77; 32],
+            ),
+        ] {
+            assert!(open_birth(guardian, owner, pane, effect, build).is_err());
+        }
         let local =
             GuardianDurableSpawnCustodyV1::open_existing(&directory.join("guardian.token"), scope)?;
         let payload = local.into_mux_rotation_payload()?;
@@ -12523,6 +12627,16 @@ mod tests {
             let mut corrupt = ciphertext.clone();
             corrupt[offset] ^= 1;
             std::fs::write(&path, corrupt)?;
+            assert!(
+                open_birth(
+                    scope.guardian_incarnation,
+                    scope.mux_incarnation,
+                    scope.pane_id,
+                    scope.effect_id,
+                    scope.mux_build
+                )
+                .is_err()
+            );
             assert!(matches!(
                 store.lookup_spawn_custody(scope),
                 Err(GuardianCheckpointStageStoreError::SpawnCustody(

@@ -13202,6 +13202,7 @@ mod tests {
             .map(|(index, ack)| mux::MuxCapturedPaneBinding {
                 pane_id: index,
                 pane_uuid: uuids[index].clone(),
+                spawn_custody: None,
                 registration_wire_identity: ack.registration_wire_identity,
                 domain_id: 0,
                 domain_name: "local".into(),

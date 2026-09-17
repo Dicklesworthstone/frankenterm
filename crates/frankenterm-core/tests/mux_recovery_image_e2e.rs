@@ -133,6 +133,7 @@ impl Fixture {
             .map(|(id, ack)| mux::MuxCapturedPaneBinding {
                 pane_id: id,
                 pane_uuid: ack.durable_pane_id.to_string(),
+                spawn_custody: None,
                 registration_wire_identity: ack.registration_wire_identity,
                 domain_id: if (3..=5).contains(&id) { 2 } else { 1 },
                 domain_name: if (3..=5).contains(&id) {

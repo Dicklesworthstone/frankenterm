@@ -10,11 +10,15 @@
 //! cancellation-safe mux commit boundary.
 
 use anyhow::Context as _;
-use frankenterm_pty_guardian::{GuardianClaimedPaneLease, GuardianClient, GuardianClientError};
+use frankenterm_pty_guardian::{
+    GuardianClaimedPaneLease, GuardianClient, GuardianClientError, GuardianDurableSpawnCustodyV1,
+};
 use mux::domain::{
     Domain, DomainId, DomainState, GuardianPanePublicationReceipt, LocalDomain, UnpublishedPane,
 };
-use mux::guardian_checkpoint::LiveParserCheckpointAck;
+use mux::guardian_checkpoint::{
+    GuardianSpawnCustodyScopeV1, LiveParserCheckpointAck, PublishedGuardianCheckpoint,
+};
 use mux::guardian_protocol::{
     GUARDIAN_MAX_INPUT_BYTES, GUARDIAN_MAX_PANES, GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES,
     GUARDIAN_MAX_REPLAY_RECORDS, GUARDIAN_MAX_REPLAY_WAIT_MILLIS, GuardianCensusEntry,
@@ -356,8 +360,23 @@ impl Domain for GuardianDomain {
                     }),
                 "guardian returned an unexpected birth receipt"
             );
+            // Hello authenticates the guardian UUID, not its or the broker's
+            // build. Recover those nonsecret fields only from private AEAD
+            // custody, binding all identities known by this successful birth.
+            let custody = GuardianDurableSpawnCustodyV1::open_existing_for_birth(
+                &token,
+                client.guardian_incarnation(),
+                mux_incarnation,
+                pane,
+                effect,
+                frankenterm_pty_guardian::guardian_runtime_build_identity()
+                    .context("guardian birth requires the compiled mux build")?
+                    .into_bytes(),
+            )
+            .context("authenticate existing guardian birth custody")?;
             let activated = GuardianProxyLeasePlan::prepare(&socket, &token, pty_size, census)
                 .context("prepare guardian birth lease")?
+                .with_spawn_custody(custody)?
                 .claim(pane, 0, Uuid::new_v4(), Uuid::new_v4())
                 .context("claim guardian birth lease")?
                 .restore_and_activate(config, TerminalCheckpointLimits::default())
@@ -811,15 +830,24 @@ struct GuardianPendingClaim {
     request_id: Uuid,
     effect_id: Uuid,
     size: PtySize,
+    spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
 }
 
 impl GuardianPendingClaim {
     fn connect(&self) -> Result<GuardianClient, GuardianProxyError> {
-        let client = GuardianClient::connect(
-            &self.socket_path,
-            &self.token_path,
-            self.identity.mux_incarnation(),
-        )
+        let client = if self.spawn_custody.is_some() && self.observed_generation == 1 {
+            GuardianClient::connect_for_genesis(
+                &self.socket_path,
+                &self.token_path,
+                self.identity.mux_incarnation(),
+            )
+        } else {
+            GuardianClient::connect(
+                &self.socket_path,
+                &self.token_path,
+                self.identity.mux_incarnation(),
+            )
+        }
         .map_err(map_replay_client_error)?;
         if client.guardian_incarnation() != self.identity.guardian_incarnation() {
             return Err(GuardianProxyError::GuardianIncarnationChanged);
@@ -831,6 +859,15 @@ impl GuardianPendingClaim {
         &self,
         client: GuardianClient,
     ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        if let Some(scope) = self.spawn_custody.filter(|_| self.observed_generation == 1) {
+            let custody = GuardianDurableSpawnCustodyV1::open_existing(&self.token_path, scope)
+                .map_err(|_| {
+                    GuardianClientError::Setup(
+                        frankenterm_pty_guardian::GuardianServiceError::OutputInitialization,
+                    )
+                })?;
+            return client.claim_mux_successor(custody, self.request_id, self.effect_id);
+        }
         client.claim(
             self.identity.pane_id(),
             self.observed_generation,
@@ -1434,7 +1471,7 @@ struct PendingGuardianCheckpointPublication {
     descriptor: GuardianCheckpointDescriptorV1,
     chunk_bytes: u32,
     total_chunks: u32,
-    terminal_payload: Zeroizing<Vec<u8>>,
+    capture: LiveParserCheckpointAck,
     begin_request_id: Uuid,
     chunk_request_ids: Vec<Uuid>,
     query_request_id: Uuid,
@@ -1471,9 +1508,9 @@ impl PendingGuardianCheckpointPublication {
         let descriptor =
             GuardianCheckpointDescriptorV1::from_live_capture(&capture, identity.generation())
                 .map_err(GuardianProxyError::ReplayProtocol)?;
-        let (_boundary, terminal) = capture.into_parts();
-        let terminal_payload = terminal.into_canonical_payload();
-        if u64::try_from(terminal_payload.len()) != Ok(descriptor.total_bytes()) {
+        if u64::try_from(capture.terminal_checkpoint().canonical_payload().len())
+            != Ok(descriptor.total_bytes())
+        {
             return Err(GuardianProxyError::CheckpointStageInvariant);
         }
         let total_chunks_u64 = descriptor
@@ -1500,7 +1537,7 @@ impl PendingGuardianCheckpointPublication {
             descriptor,
             chunk_bytes: GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
             total_chunks,
-            terminal_payload,
+            capture,
             begin_request_id: Uuid::new_v4(),
             chunk_request_ids,
             query_request_id: Uuid::new_v4(),
@@ -1664,7 +1701,9 @@ impl PendingGuardianCheckpointPublication {
             .try_reserve_exact(end.saturating_sub(start))
             .map_err(|_| GuardianProxyError::CheckpointStageCapacity)?;
         bytes.extend_from_slice(
-            self.terminal_payload
+            self.capture
+                .terminal_checkpoint()
+                .canonical_payload()
                 .get(start..end)
                 .ok_or(GuardianProxyError::CheckpointStageInvariant)?,
         );
@@ -1892,7 +1931,7 @@ impl GuardianCheckpointPublisher {
     pub fn publish(
         &self,
         capture: LiveParserCheckpointAck,
-    ) -> Result<GuardianCheckpointReceipt, GuardianProxyError> {
+    ) -> Result<PublishedGuardianCheckpoint, GuardianProxyError> {
         let mut state = self.state.lock();
         if state.pending.is_some() {
             let GuardianCheckpointPublisherState { transport, pending } = &mut *state;
@@ -1910,8 +1949,13 @@ impl GuardianCheckpointPublisher {
             .as_mut()
             .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
         let receipt = Self::drive_pending(&self.actor, transport.as_mut(), current)?;
-        *pending = None;
-        Ok(receipt)
+        let completed = pending
+            .take()
+            .ok_or(GuardianProxyError::CheckpointStageInvariant)?;
+        completed
+            .capture
+            .bind_published(receipt, self.identity)
+            .map_err(|_| GuardianProxyError::CheckpointStageInvariant)
     }
 }
 
@@ -1919,7 +1963,7 @@ impl GuardianLiveCheckpointPublisher for GuardianCheckpointPublisher {
     fn publish_checkpoint(
         &self,
         capture: LiveParserCheckpointAck,
-    ) -> anyhow::Result<GuardianCheckpointReceipt> {
+    ) -> anyhow::Result<PublishedGuardianCheckpoint> {
         self.publish(capture).map_err(anyhow::Error::new)
     }
 }
@@ -4360,6 +4404,8 @@ pub struct GuardianProxyLeasePlan {
     size: PtySize,
     census: Arc<GuardianCensusCoordinator>,
     client: GuardianClient,
+    spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    build_authenticated: bool,
 }
 
 impl fmt::Debug for GuardianProxyLeasePlan {
@@ -4374,6 +4420,62 @@ impl fmt::Debug for GuardianProxyLeasePlan {
 }
 
 impl GuardianProxyLeasePlan {
+    /// Prepare the first successor from validated image provenance. This only
+    /// reopens existing private custody; it neither claims nor publishes a pane.
+    /// Later generations require a separate successor-custody protocol.
+    pub fn prepare_from_recovery(
+        socket_path: &Path,
+        token_path: &Path,
+        size: PtySize,
+        census: Arc<GuardianCensusCoordinator>,
+        provenance: &frankenterm_core::mux_recovery_image::RecoverySpawnCustody,
+    ) -> Result<Self, GuardianProxyError> {
+        use frankenterm_core::mux_recovery_image::RecoverySpawnCustody;
+        let RecoverySpawnCustody::Original {
+            broker_lineage,
+            guardian_incarnation,
+            original_mux_incarnation,
+            broker_build,
+            guardian_build,
+            original_mux_build,
+            pane_id,
+            spawn_effect_id,
+            current_mux_incarnation,
+            current_lease_generation,
+        } = provenance
+        else {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "legacy pane has no original guardian custody",
+            ));
+        };
+        if *current_lease_generation != 1
+            || current_mux_incarnation != original_mux_incarnation
+            || *current_mux_incarnation == census.mux_incarnation()
+        {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "original custody supports only first successor generation",
+            ));
+        }
+        let scope = GuardianSpawnCustodyScopeV1 {
+            broker_lineage: *broker_lineage,
+            guardian_incarnation: *guardian_incarnation,
+            mux_incarnation: *original_mux_incarnation,
+            broker_build: *broker_build,
+            guardian_build: *guardian_build,
+            mux_build: *original_mux_build,
+            pane_id: *pane_id,
+            effect_id: *spawn_effect_id,
+        };
+        let custody =
+            GuardianDurableSpawnCustodyV1::open_existing(token_path, scope).map_err(|_| {
+                GuardianProxyError::InvalidConfiguration(
+                    "original guardian custody is missing or unauthenticated",
+                )
+            })?;
+        Self::prepare_with_build(socket_path, token_path, size, census, true)?
+            .with_spawn_custody(custody)
+    }
+
     /// Validate local proxy state and authenticate the exact pre-Claim client.
     pub fn prepare(
         socket_path: &Path,
@@ -4381,14 +4483,28 @@ impl GuardianProxyLeasePlan {
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
     ) -> Result<Self, GuardianProxyError> {
+        Self::prepare_with_build(socket_path, token_path, size, census, false)
+    }
+
+    fn prepare_with_build(
+        socket_path: &Path,
+        token_path: &Path,
+        size: PtySize,
+        census: Arc<GuardianCensusCoordinator>,
+        build_authenticated: bool,
+    ) -> Result<Self, GuardianProxyError> {
         validate_pty_size(size)?;
         if let Err(error) = census.retry_retained_lease_cleanup() {
             log::warn!(
                 "retained guardian lease retirement remains pending before a new lease plan: {error}"
             );
         }
-        let client = GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
-            .map_err(GuardianProxyError::Client)?;
+        let client = if build_authenticated {
+            GuardianClient::connect_for_genesis(socket_path, token_path, census.mux_incarnation())
+        } else {
+            GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
+        }
+        .map_err(GuardianProxyError::Client)?;
         if client.guardian_incarnation() != census.guardian_incarnation() {
             return Err(GuardianProxyError::GuardianIncarnationChanged);
         }
@@ -4398,7 +4514,35 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             client,
+            spawn_custody: None,
+            build_authenticated,
         })
+    }
+
+    /// Bind independently authenticated existing custody to this unpublished
+    /// plan. Image metadata alone cannot construct this capability.
+    pub fn with_spawn_custody(
+        mut self,
+        custody: GuardianDurableSpawnCustodyV1,
+    ) -> Result<Self, GuardianProxyError> {
+        let scope = custody.scope();
+        if scope.guardian_incarnation != self.client.guardian_incarnation() {
+            return Err(GuardianProxyError::GuardianIncarnationChanged);
+        }
+        if scope.mux_incarnation != self.client.mux_incarnation() && !self.build_authenticated {
+            self.client = GuardianClient::connect_for_genesis(
+                &self.socket_path,
+                &self.token_path,
+                self.census.mux_incarnation(),
+            )
+            .map_err(GuardianProxyError::Client)?;
+            if self.client.guardian_incarnation() != scope.guardian_incarnation {
+                return Err(GuardianProxyError::GuardianIncarnationChanged);
+            }
+            self.build_authenticated = true;
+        }
+        self.spawn_custody = Some(scope);
+        Ok(self)
     }
 
     /// Claim one currently unowned pane and immediately install rollback
@@ -4413,6 +4557,14 @@ impl GuardianProxyLeasePlan {
         request_id: Uuid,
         effect_id: Uuid,
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        if let Some(scope) = self.spawn_custody {
+            let initial = scope.mux_incarnation == self.client.mux_incarnation();
+            if scope.pane_id != pane_id || observed_generation != u64::from(!initial) {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "custody does not match initial birth or first successor claim",
+                ));
+            }
+        }
         if request_id.is_nil() || effect_id.is_nil() {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "guardian Claim request and effect identities must be nonzero",
@@ -4441,6 +4593,8 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             client,
+            spawn_custody,
+            build_authenticated: _,
         } = self;
         let pending = Box::new(GuardianPendingClaim {
             socket_path: socket_path.clone(),
@@ -4450,6 +4604,7 @@ impl GuardianProxyLeasePlan {
             request_id,
             effect_id,
             size,
+            spawn_custody,
         });
         let started = Instant::now();
         let mut attempts = 0_u32;
@@ -4460,7 +4615,10 @@ impl GuardianProxyLeasePlan {
             let connection = client.take().map_or_else(|| pending.connect(), Ok);
             let result = connection.and_then(|client| {
                 pending.claim(client).map_err(|error| {
-                    definitive_rejection = matches!(&error, GuardianClientError::Rejected(_));
+                    definitive_rejection = matches!(
+                        &error,
+                        GuardianClientError::Rejected(_) | GuardianClientError::Setup(_)
+                    );
                     map_replay_client_error(error)
                 })
             });
@@ -4495,7 +4653,7 @@ impl GuardianProxyLeasePlan {
                 }
             }
         };
-        GuardianProxyStaging::from_planned_lease(
+        let mut staging = GuardianProxyStaging::from_planned_lease(
             &socket_path,
             &token_path,
             identity,
@@ -4503,7 +4661,9 @@ impl GuardianProxyLeasePlan {
             retirement_reservation,
             size,
             census,
-        )
+        )?;
+        staging.spawn_custody = spawn_custody;
+        Ok(staging)
     }
 
     /// Attach to one lease already owned by this mux and immediately install
@@ -4532,11 +4692,13 @@ impl GuardianProxyLeasePlan {
             size,
             census,
             client,
+            spawn_custody,
+            build_authenticated: _,
         } = self;
         let claimed_lease = client
             .attach(pane_id, generation, request_id)
             .map_err(map_replay_client_error)?;
-        GuardianProxyStaging::from_planned_lease(
+        let mut staging = GuardianProxyStaging::from_planned_lease(
             &socket_path,
             &token_path,
             identity,
@@ -4544,7 +4706,9 @@ impl GuardianProxyLeasePlan {
             retirement_reservation,
             size,
             census,
-        )
+        )?;
+        staging.spawn_custody = spawn_custody;
+        Ok(staging)
     }
 }
 
@@ -4555,6 +4719,7 @@ impl GuardianProxyLeasePlan {
 /// its authenticated final sequence/digest and retain a record-aware live
 /// reader before any caller can construct a pane.
 pub struct GuardianProxyStaging {
+    spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
     actor: SharedGuardianPaneLeaseActor,
     census: Arc<GuardianCensusCoordinator>,
     reader_slot: Arc<GuardianReplayReaderSlot>,
@@ -4807,6 +4972,7 @@ impl GuardianProxyStaging {
             actor,
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
+            spawn_custody: None,
             replay_transport: None,
             checkpoint_publisher,
             lease_rollback,
@@ -4892,6 +5058,7 @@ impl GuardianProxyStaging {
         };
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
+            spawn_custody: self.spawn_custody,
             terminal,
             process: Box::new(GuardianProxyChild {
                 actor: Arc::clone(&actor),
@@ -4933,6 +5100,7 @@ impl GuardianProxyStaging {
         let identity = self.identity();
         let actor = Arc::clone(&self.actor);
         TestActivatedGuardianProxy {
+            spawn_custody: self.spawn_custody,
             terminal,
             process: Box::new(GuardianProxyChild {
                 actor: Arc::clone(&actor),
@@ -4960,6 +5128,7 @@ impl GuardianProxyStaging {
 /// Fully restored guardian proxy facets that remain unpublished until the
 /// caller deliberately constructs and registers a [`LocalPane`].
 pub struct ActivatedGuardianProxy {
+    spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
     terminal: Terminal,
     process: Box<dyn Child + Send>,
     pty: Box<dyn MasterPty>,
@@ -5005,6 +5174,7 @@ impl ActivatedGuardianProxy {
             self.guardian_checkpoint_publisher
                 .take()
                 .expect("verified guardian activation must retain its checkpoint publisher"),
+            self.spawn_custody,
         );
         // Construction completed, so the LocalPane's guardian ownership is
         // now the sole close/retire authority. If construction unwinds before
@@ -5542,6 +5712,11 @@ mod tests {
                     "published pane did not render real child output"
                 );
                 thread::sleep(Duration::from_millis(2));
+            }
+            if !cancel_in_flight {
+                assert_real_birth_image_roundtrip(
+                    &mux, &pane, &executor, &directory, &socket, &token, size,
+                );
             }
             if cancel_in_flight {
                 let coordinator = Arc::clone(domain.state.lock().census.as_ref().unwrap());
@@ -6122,7 +6297,262 @@ mod tests {
         }
     }
 
+    fn assert_real_birth_image_roundtrip(
+        mux: &Arc<Mux>,
+        pane: &Arc<dyn mux::pane::Pane>,
+        executor: &promise::spawn::SimpleExecutor,
+        directory: &Path,
+        socket: &Path,
+        token: &Path,
+        size: TerminalSize,
+    ) {
+        use frankenterm_core::mux_recovery_image::{
+            MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
+            RecoveryParserCheckpoint, RecoverySpawnCustody,
+        };
+        use frankenterm_core::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig,
+            reconstruct_whole_mux_image_inert, semantic_object_id_from_str,
+        };
+        use frankenterm_core::snapshot_publication::{
+            GenerationRootPublishRequest, RecoveryObjectPayload, SnapshotPublicationStore,
+        };
+        use frankenterm_core::snapshot_representation::{
+            ObjectMetadata, RecoveryKey, RecoveryObjectKind, encode_recovery_object,
+        };
+        let provenance = pane
+            .guardian_spawn_custody()
+            .expect("real birth retained authenticated provenance");
+        assert_eq!(
+            provenance.original.pane_id.as_bytes(),
+            &pane.durable_pane_id().unwrap()
+        );
+        assert_eq!(provenance.current_lease_generation, 1);
+        assert_eq!(
+            provenance.current_mux_incarnation,
+            provenance.original.mux_incarnation
+        );
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(pane);
+        mux.add_tab_no_panes(&tab).unwrap();
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window).unwrap();
+        drop(window);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let capture_mux = Arc::clone(mux);
+        let pane_id = pane.pane_id();
+        let capture_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let operation = capture_mux.capture_pane_operation(pane_id).unwrap();
+                let result = operation.capture_current_guardian_checkpoint(
+                    TerminalCheckpointLimits::default(),
+                    Duration::from_secs(5),
+                );
+                if matches!(
+                    result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<mux::LiveParserCheckpointError>()),
+                    Some(
+                        mux::LiveParserCheckpointError::CheckpointBusy
+                            | mux::LiveParserCheckpointError::GuardianDeliveryBusy
+                    )
+                ) && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                tx.send(result).unwrap();
+                break;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let published = loop {
+            while executor.try_tick().unwrap() {}
+            if let Ok(result) = rx.try_recv() {
+                break result.unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real guardian capture did not settle"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        capture_thread.join().unwrap();
+        let captured = mux.capture_topology_coherent(Default::default()).unwrap();
+        assert_eq!(captured.pane_bindings.len(), 1);
+        assert_eq!(captured.pane_bindings[0].spawn_custody, Some(provenance));
+        let key = Arc::new(RecoveryKey::from_bytes([0x51; 32]).unwrap());
+        let object_id = "real-guardian-terminal";
+        let timestamp = captured.captured_at_epoch_ms;
+        let encode = |payload: &[u8], id, kind| {
+            encode_recovery_object(
+                payload,
+                ObjectMetadata::single(id, kind, 1, None, timestamp),
+                &key,
+                None,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        let ciphertext = encode(
+            published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload(),
+            semantic_object_id_from_str(object_id),
+            RecoveryObjectKind::TerminalCheckpoint,
+        );
+        let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let references = HashMap::from([(
+            pane_id,
+            RecoveryObjectRef {
+                object_id: object_id.into(),
+                byte_length: ciphertext.len() as u64,
+                payload_digest: digest,
+                schema_version: 2,
+            },
+        )]);
+        let captures = HashMap::from([(pane_id, RecoveryParserCheckpoint::Guardian(&published))]);
+        let image = MuxRecoveryImage::from_mux_captured_checkpoints(
+            RecoveryImageGenerationMeta {
+                generation: 1,
+                predecessor_digest: None,
+                created_at_epoch_ms: timestamp,
+                ft_version: config::wezterm_version().to_owned(),
+                session_id: "real-guardian-birth".into(),
+            },
+            &captured,
+            &captures,
+            &references,
+        )
+        .unwrap();
+        let image_bytes = image.to_canonical_json().unwrap();
+        assert_eq!(
+            MuxRecoveryImage::from_json_slice(&image_bytes).unwrap(),
+            image
+        );
+        for control in 0..4 {
+            let mut changed = image.clone();
+            if control == 0 {
+                changed.panes[0].checkpoint.authority =
+                    frankenterm_core::mux_recovery_image::CheckpointAuthority::ModelOnly {
+                        captured_at_epoch_ms: timestamp,
+                        parser_seqno: None,
+                    };
+            } else if let RecoverySpawnCustody::Original {
+                current_lease_generation,
+                current_mux_incarnation,
+                guardian_incarnation,
+                ..
+            } = &mut changed.panes[0].spawn_custody
+            {
+                match control {
+                    1 => *current_lease_generation += 1,
+                    2 => *current_mux_incarnation = Uuid::new_v4(),
+                    _ => *guardian_incarnation = Uuid::new_v4(),
+                }
+            }
+            changed.image_digest = changed.compute_digest().unwrap();
+            assert!(
+                MuxRecoveryImage::from_json_slice(&serde_json::to_vec(&changed).unwrap()).is_err()
+            );
+        }
+        let store =
+            SnapshotPublicationStore::open(directory.join("whole-image"), Default::default())
+                .unwrap();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: object_id.into(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: ciphertext,
+            })
+            .unwrap();
+        let root = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "actual-birth".into(),
+            predecessor: None,
+            manifest_bytes: encode(&image_bytes, [0x72; 32], RecoveryObjectKind::WholeMuxImage),
+            created_at_ms: timestamp,
+        };
+        let mut verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        );
+        assert!(
+            store.publish_generation_root(&root, &verifier).is_err(),
+            "serialized Guardian identity alone is not authenticated authority"
+        );
+        verifier
+            .register_published_guardian_capture(&published)
+            .unwrap();
+        store.publish_generation_root(&root, &verifier).unwrap();
+        let validated = store
+            .select_verified_roots(&verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        let restored = reconstruct_whole_mux_image_inert(
+            &validated,
+            TerminalCheckpointLimits::default(),
+            None,
+            &std::collections::HashSet::<String>::new(),
+        )
+        .unwrap();
+        let restored_pane = &restored.pane_terminals[&(pane_id as u64)];
+        assert_eq!(restored_pane.spawn_custody, image.panes[0].spawn_custody);
+        assert_eq!(
+            restored_pane
+                .terminal
+                .checkpoint()
+                .unwrap()
+                .to_canonical_json(TerminalCheckpointLimits::default())
+                .unwrap()
+                .as_slice(),
+            published
+                .capture()
+                .terminal_checkpoint()
+                .canonical_payload()
+        );
+        let successor_census = Arc::new(
+            GuardianCensusCoordinator::connect(
+                socket,
+                token,
+                provenance.original.guardian_incarnation,
+                Uuid::new_v4(),
+            )
+            .unwrap(),
+        );
+        let plan = GuardianProxyLeasePlan::prepare_from_recovery(
+            socket,
+            token,
+            PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: size.pixel_width as u16,
+                pixel_height: size.pixel_height as u16,
+            },
+            successor_census,
+            &restored_pane.spawn_custody,
+        )
+        .unwrap();
+        assert!(
+            plan.claim(
+                provenance.original.pane_id,
+                1,
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            )
+            .is_err(),
+            "live predecessor still fences restored successor plan"
+        );
+    }
+
     struct RecordCheckpointFixture {
+        capture: LiveParserCheckpointAck,
         descriptor: GuardianCheckpointDescriptorV1,
         checkpoint: Zeroizing<Vec<u8>>,
         segment: GuardianOutputSegmentIdentity,
@@ -6636,6 +7066,7 @@ mod tests {
             .directives
             .push_back(FakeDirective::Observe(ObservedChildState::Exited(0)));
         RecordCheckpointFixture {
+            capture,
             descriptor,
             checkpoint,
             segment,
@@ -6922,7 +7353,7 @@ mod tests {
             descriptor,
             chunk_bytes: GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
             total_chunks,
-            terminal_payload: fixture.checkpoint,
+            capture: fixture.capture,
             begin_request_id: id(0x1_000_002),
             chunk_request_ids,
             query_request_id,
