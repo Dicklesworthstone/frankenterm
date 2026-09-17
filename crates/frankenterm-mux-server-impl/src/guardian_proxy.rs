@@ -7096,8 +7096,13 @@ mod tests {
             }
         };
         assert_eq!(recovery_gen1_receipt.generation, 1);
+        let recovery_gen1_verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x72; 32]),
+        )
+        .with_existing_guardian_custody(token.to_path_buf());
         let recovery_gen1_selected = recovery_store
-            .select_verified_roots(&verifier)
+            .select_verified_roots(&recovery_gen1_verifier)
             .expect("verifier must select verified generation 1 root from common-cut store");
         let recovery_gen1_validated = recovery_gen1_selected
             .current
@@ -7440,6 +7445,40 @@ mod tests {
 
         // Deterministic cancellation during live guardian wait blocked on live parser
         {
+            let physical_top = successor_pane.get_dimensions().physical_top;
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let blocking_pane = Arc::clone(&successor_pane);
+            struct HoldTerminalLines {
+                acquired_tx: Option<std::sync::mpsc::SyncSender<()>>,
+                release_rx: std::sync::mpsc::Receiver<()>,
+            }
+            impl mux::pane::WithPaneLines for HoldTerminalLines {
+                fn with_lines_mut(
+                    &mut self,
+                    _first: wezterm_term::StableRowIndex,
+                    _lines: &mut [&mut termwiz::surface::Line],
+                ) {
+                    if let Some(tx) = self.acquired_tx.take() {
+                        tx.send(()).expect("report held terminal lock");
+                    }
+                    self.release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release terminal lock after bounded cancellation");
+                }
+            }
+            let blocker = thread::spawn(move || {
+                blocking_pane.with_lines_mut(
+                    physical_top..physical_top.checked_add(1).unwrap(),
+                    &mut HoldTerminalLines {
+                        acquired_tx: Some(acquired_tx),
+                        release_rx,
+                    },
+                );
+            });
+            acquired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocker acquired the live terminal lock");
             let started = Instant::now();
             let cancel_result = successor_mux.capture_pane_guardian_checkpoint(
                 successor_pane.pane_id(),
@@ -7448,6 +7487,8 @@ mod tests {
                 || started.elapsed() >= Duration::from_millis(250),
             );
             let cancel_elapsed = started.elapsed();
+            release_tx.send(()).expect("release owned terminal blocker");
+            blocker.join().expect("owned terminal blocker settled");
             assert!(
                 cancel_elapsed >= Duration::from_millis(200),
                 "cancellation must enforce elapsed lower-bound while waiting on parser, elapsed: {cancel_elapsed:?}"

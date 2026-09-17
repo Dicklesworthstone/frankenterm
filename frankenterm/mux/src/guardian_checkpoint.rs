@@ -10845,6 +10845,7 @@ mod tests {
             "LiveParserCheckpointAck:boundary:private",
             "LiveParserCheckpointAck:boundary_digest:private",
             "LiveParserCheckpointAck:registration_wire_identity:private",
+            "LiveParserCheckpointAck:semantic_generation:private",
             "LiveParserCheckpointAck:terminal_checkpoint:private",
             "PublishedGuardianCheckpoint:capture:private",
             "PublishedGuardianCheckpoint:owner:private",
