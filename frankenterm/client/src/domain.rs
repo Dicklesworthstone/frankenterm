@@ -276,12 +276,25 @@ impl RemoteLayoutTab {
         ensure!(!panes.is_empty(), "remote layout tab has no owned panes");
         for pane in panes {
             ensure!(
+                mux.get_pane(pane.pane_id())
+                    .is_some_and(|current| Arc::ptr_eq(&current, &pane)),
+                "layout pane registration was replaced"
+            );
+            let client_pane = pane
+                .downcast_ref::<ClientPane>()
+                .context("remote layout tab contains a local pane")?;
+            ensure!(
                 pane.domain_id() == inner.local_domain_id
-                    && pane
-                        .downcast_ref::<ClientPane>()
-                        .is_some_and(|pane| pane.belongs_to_client(inner)
-                            && pane.remote_tab_id == self.remote_tab_id),
+                    && client_pane.belongs_to_client(inner)
+                    && client_pane.remote_tab_id == self.remote_tab_id,
                 "remote layout tab contains a pane from another attachment"
+            );
+            ensure!(
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+                    .get(&client_pane.remote_pane_id())
+                    .copied()
+                    == Some(pane.pane_id()),
+                "layout pane mapping changed"
             );
         }
         Ok(())
@@ -6585,6 +6598,40 @@ mod tests {
         );
         assert_eq!(mux.iter_windows().len(), 2);
         assert_eq!(mux.iter_panes().len(), 2);
+    }
+
+    #[test]
+    fn layout_snapshot_rejects_changed_remote_pane_mapping() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_030);
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .unwrap();
+        let pane = mux.iter_panes().into_iter().next().unwrap();
+        let (_, _, tab_id) = mux.resolve_pane_id(pane.pane_id()).unwrap();
+        let receipt = RemoteLayoutTab {
+            tab: mux.get_tab(tab_id).unwrap(),
+            remote_tab_id: 51,
+            remote_window_id: 41,
+        };
+        receipt.validate(&mux, &inner).unwrap();
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping").insert(61, usize::MAX);
+        assert!(receipt
+            .validate(&mux, &inner)
+            .unwrap_err()
+            .to_string()
+            .contains("mapping changed"));
+        lock_or_recover(&inner.remote_to_local_pane, "test pane mapping")
+            .insert(61, pane.pane_id());
+        receipt.validate(&mux, &inner).unwrap();
+        let replacement = test_client_inner(inner.local_domain_id);
+        assert!(receipt.validate(&mux, &replacement).is_err());
     }
 
     #[test]
