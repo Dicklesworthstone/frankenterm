@@ -390,7 +390,7 @@ impl LayoutLifecycle {
                     let (ordered_tabs, active_tab) = desired
                         .remove(&id)
                         .expect("every frozen window has a desired state");
-                    mux::WindowOrderMirror {
+                    mux::window::WindowOrderMirror {
                         expected,
                         ordered_tabs,
                         active_tab,
@@ -1676,12 +1676,12 @@ mod tests {
         let right_order = owner.window_order_snapshot(*right).unwrap().unwrap();
         owner
             .apply_window_order_mirrors(vec![
-                mux::WindowOrderMirror {
+                mux::window::WindowOrderMirror {
                     expected: left_order,
                     ordered_tabs: Vec::new(),
                     active_tab: None,
                 },
-                mux::WindowOrderMirror {
+                mux::window::WindowOrderMirror {
                     expected: right_order,
                     ordered_tabs: vec![Arc::clone(&tab)],
                     active_tab: Some(Arc::clone(&tab)),

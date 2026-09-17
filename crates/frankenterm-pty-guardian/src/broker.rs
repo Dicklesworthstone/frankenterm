@@ -3836,7 +3836,7 @@ struct BrokerOutputWorkerV1 {
     jobs: Option<SyncSender<BrokerOutputDrainJobV1>>,
     completions: Receiver<BrokerOutputDrainJobV1>,
     join: Option<JoinHandle<()>>,
-    active: bool,
+    active: Option<(Uuid, u64)>,
     retained: Option<BrokerOutputDrainJobV1>,
 }
 
@@ -3872,7 +3872,7 @@ impl BrokerOutputWorkerV1 {
             jobs: Some(jobs),
             completions,
             join: Some(join),
-            active: false,
+            active: None,
             retained: None,
         })
     }
@@ -4160,7 +4160,10 @@ impl BrokerLiveSpawnV1 {
         }
     }
 
-    fn census_entry(&self) -> Result<BrokerCensusEntryV1, BrokerControlProtocolError> {
+    fn census_entry(
+        &self,
+        output_in_flight: Option<(Uuid, u64)>,
+    ) -> Result<BrokerCensusEntryV1, BrokerControlProtocolError> {
         let status = self.journal.status();
         let lease_status = self
             .lease_journal
@@ -4190,7 +4193,13 @@ impl BrokerLiveSpawnV1 {
             || pane_status.child_identity.durable_pane_id != binding.durable_pane_id
             || pane_status.child_identity.spawn_effect_id != binding.spawn_effect_id
             || pane_status.lease_generation == 0
-            || self.adoption.pane.output_journal.is_none()
+            || (self.adoption.pane.output_journal.is_none()
+                && !(self.adoption.pane.proxy_reader.is_none()
+                    && output_in_flight
+                        == Some((
+                            binding.durable_pane_id,
+                            self.adoption.pane.next_output_sequence,
+                        ))))
         {
             return Err(BrokerControlProtocolError::InvalidShape);
         }
@@ -5049,6 +5058,10 @@ impl BrokerControlServiceV1 {
         let Ok(job) = self.output_worker.completions.try_recv() else {
             return;
         };
+        if self.output_worker.active != Some((job.pane_id, job.sequence)) {
+            self.output_worker.retained = Some(job);
+            return;
+        }
         let Some(live) = self.live_spawns.get_mut(&job.pane_id) else {
             self.output_worker.retained = Some(job);
             return;
@@ -5063,7 +5076,7 @@ impl BrokerControlServiceV1 {
             return;
         }
         pane.install_output_completion(job);
-        self.output_worker.active = false;
+        self.output_worker.active = None;
     }
 
     fn drain_spawn_completion(&mut self) {
@@ -5677,7 +5690,7 @@ impl BrokerControlServiceV1 {
             && live.adoption.pane.output_terminal.is_none()
         {
             header.status = BrokerControlResponseStatusV1::Retryable;
-            if self.output_worker.active {
+            if self.output_worker.active.is_some() {
                 return BrokerControlResponseV1::new(header, &[]).map_err(|_| ());
             }
             let pane = &mut live.adoption.pane;
@@ -5728,8 +5741,9 @@ impl BrokerControlServiceV1 {
                 pane.output_journal = Some(job.journal);
                 return Err(());
             };
+            let submitted = (job.pane_id, job.sequence);
             match sender.try_send(job) {
-                Ok(()) => self.output_worker.active = true,
+                Ok(()) => self.output_worker.active = Some(submitted),
                 Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
                     pane.proxy_reader = Some(job.reader);
                     pane.output_journal = Some(job.journal);
@@ -7195,7 +7209,13 @@ impl BrokerControlServiceV1 {
         entries.extend_from_slice(recovered);
         for live in self.live_spawns.values() {
             if live.census_visible_to_mux(owner.mux_incarnation) {
-                entries.push(live.census_entry().map_err(|_| ())?);
+                // Census describes lease/spawn custody, not uncommitted output.
+                // The sole reader and journal may be in the output worker, but
+                // only its exact admitted pane and sequence prove that custody.
+                entries.push(
+                    live.census_entry(self.output_worker.active)
+                        .map_err(|_| ())?,
+                );
             }
         }
         entries.sort_unstable_by(|left, right| {
@@ -25860,6 +25880,41 @@ mod tests {
             )
             .expect("authenticate acknowledged output authority")
             .expect("completed Spawn ACK mints output authority");
+        service.inspect(move |service| {
+            let live = service
+                .live_spawns
+                .get_mut(&binding.durable_pane_id)
+                .unwrap();
+            let expected = live.census_entry(None).expect("settled live census");
+            let sequence = live.adoption.pane.next_output_sequence;
+            let journal = live.adoption.pane.output_journal.take().unwrap();
+            assert!(live.census_entry(None).is_err());
+            assert!(
+                live.census_entry(Some((binding.durable_pane_id, sequence)))
+                    .is_err(),
+                "a reader still on the poll owner disproves worker custody"
+            );
+            let reader = live.adoption.pane.proxy_reader.take().unwrap();
+            assert!(
+                live.census_entry(None).is_err(),
+                "missing facets need exact custody"
+            );
+            assert!(live.census_entry(Some((id(81_199), sequence))).is_err());
+            assert!(
+                live.census_entry(Some((binding.durable_pane_id, sequence + 1)))
+                    .is_err(),
+                "a different output generation cannot authorize census"
+            );
+            assert_eq!(
+                live.census_entry(Some((binding.durable_pane_id, sequence)))
+                    .unwrap(),
+                expected,
+                "moving output facets must not change the authenticated lease census"
+            );
+            live.adoption.pane.proxy_reader = Some(reader);
+            live.adoption.pane.output_journal = Some(journal);
+            assert_eq!(live.census_entry(None).unwrap(), expected);
+        });
         let output_deadline = Instant::now() + Duration::from_secs(5);
         if matches!(
             lease_scenario,
@@ -26381,7 +26436,7 @@ mod tests {
                 live.lease_journal.as_mut().unwrap().identity.child_identity =
                     test_kernel_child(81_099);
                 assert!(
-                    live.census_entry().is_err(),
+                    live.census_entry(None).is_err(),
                     "quarantine cannot waive exact child binding"
                 );
                 live.lease_journal.as_mut().unwrap().identity.child_identity = authentic_child;
