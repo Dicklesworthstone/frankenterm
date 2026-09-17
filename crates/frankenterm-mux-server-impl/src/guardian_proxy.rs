@@ -7071,7 +7071,7 @@ mod tests {
             )
             .unwrap();
             let thread_key = Arc::clone(&key);
-            let thread_expected = recovery_expected_gen1.clone();
+            let thread_expected = recovery_expected_gen1;
             let handle = thread::spawn(move || {
                 capture_and_publish_whole_mux_recovery(
                     &thread_cx,
@@ -7423,15 +7423,28 @@ mod tests {
             "unknown pane ID must reject guardian checkpoint"
         );
 
+        // A real model-only capture must not acquire guardian authority merely
+        // by carrying the current pane's registration identity.
+        let model_checkpoint = Terminal::new(
+            size,
+            Arc::new(config::TermConfig::new()),
+            "FrankenTerm",
+            config::wezterm_version(),
+            Box::new(io::sink()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .unwrap();
+        let model_state = TerminalCheckpointV2::decode_canonical_json(
+            model_checkpoint.canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
         let dummy_model_ack = mux::ModelParserCheckpointAck {
             registration_wire_identity: gen2_published.capture().registration_wire_identity(),
             durable_pane_id: gen2_published.capture().durable_pane_id(),
-            parser_stream_bytes: gen2_published
-                .capture()
-                .terminal_checkpoint()
-                .parser_stream_bytes(),
-            semantic_generation: gen2_published.capture().semantic_generation(),
-            terminal_checkpoint: gen2_published.capture().terminal_checkpoint().clone(),
+            parser_stream_bytes: model_checkpoint.parser_stream_bytes(),
+            semantic_generation: model_state.checkpoint().semantic_generation(),
+            terminal_checkpoint: model_checkpoint,
         };
         assert!(
             !successor_mux.model_checkpoint_is_current(successor_pane.pane_id(), &dummy_model_ack),
@@ -7697,7 +7710,7 @@ mod tests {
                 )
                 .unwrap();
                 let thread_key = Arc::clone(&key);
-                let thread_expected = recovery_expected_gen2.clone();
+                let thread_expected = recovery_expected_gen2;
                 let handle = thread::spawn(move || {
                     capture_and_publish_whole_mux_recovery(
                         &thread_cx,
