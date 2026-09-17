@@ -7536,10 +7536,13 @@ mod tests {
         loop {
             while executor.try_tick().unwrap() {}
             let (_, lines) = successor_pane.get_lines(0..24);
-            if lines.iter().any(|line| {
-                line.as_str()
-                    .contains("guardian-domain-post-successor-marker")
-            }) {
+            // The fixture emits markers without newlines; the successor
+            // marker crosses a physical row after the restored prefix.
+            let mut observed = String::new();
+            for line in &lines {
+                observed.push_str(line.as_str().as_ref());
+            }
+            if observed.contains("guardian-domain-post-successor-marker") {
                 break;
             }
             assert!(
