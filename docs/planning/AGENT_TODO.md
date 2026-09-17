@@ -1250,7 +1250,9 @@ power loss nor migration of those live sessions has been demonstrated.
   requested fresh target to its existing pool; do not call this a cold build.
 - [x] Replace repeated backward context array shifts with reverse-once
   accumulation in `568bf385f`, preserving bounded context and physical order.
-- [ ] Execute the dedicated logical-context tests. First hz4 attempt failed
+- [x] Execute the dedicated logical-context tests: 12 passed, zero failed,
+  1188 filtered at `568bf385f`, hz4 job `j-30023605353972133`.
+  Retain `568bf38-mux-logical-clean-home-hz4.log`. First attempt failed
   source preflight on unselected Cargo-home config before Cargo; retry uses
   an isolated Cargo home and retains the selected-source check.
 - [x] Build the same-source sealed guardian companion for the recovery test
@@ -1258,6 +1260,21 @@ power loss nor migration of those live sessions has been demonstrated.
   `a8e65a4fef6d9693602d71b56dbee7788834fd89da95761b48eba7f5cc05f489`.
   RCH rejected the downloaded ELF as a Mac executable (E327); use the verified
   retained Linux artifact only on its Linux worker. Parent rerun is pending.
+- [x] Diagnose the executed parent failure: a populated tab cannot use
+  `add_tab_no_panes`. Use `add_tab_and_active_pane`, then assert its returned
+  handle has the exact original registration identity (`c733933a7`).
+  The intervening `3d8b73cd1` assertion incorrectly expected None; its actual
+  one-test failure is retained in `3d8b73c-fresh-process-image-rch.log`.
+- [ ] Execute corrected recovery parent with the same-source companion and
+  matching test/binary feature union; the c733 family build is on worker114.
+- [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
+  eight Cargo gates skipped. This is not strict release attestation closure.
+- [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping
+  difference in client consumer-commit code. Apply the exact formatter diff.
+- [ ] Repeat exact-source formatting proof after that correction.
+- [ ] Complete DSR quality: the c733 first check failed remote queue admission
+  without local fallback. Four canonical attestation producers remain open:
+  Lindley bounds, redaction, operating envelope and Doctor live transactions.
 - [x] Reconfirm word-boundary implementation/history: `87118af0e` and the
   separator corrections are committed; Bead `ft-kwrh9` retains the earlier
   419-test surface receipt and terminal oracle corrections.

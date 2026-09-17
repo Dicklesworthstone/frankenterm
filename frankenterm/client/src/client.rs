@@ -3029,8 +3029,11 @@ impl RpcGenerationScope {
         &self,
         consumer: RpcConsumerKind,
     ) -> Result<RpcGenerationCommitLease, RpcConsumerCommitError> {
-        let generation = self.generation.ok_or(RpcConsumerCommitError::Unavailable { consumer })?;
-        self.rpc_transport.begin_consumer_commit(generation, consumer)
+        let generation = self
+            .generation
+            .ok_or(RpcConsumerCommitError::Unavailable { consumer })?;
+        self.rpc_transport
+            .begin_consumer_commit(generation, consumer)
     }
 
     pub(crate) fn abort_guard(
