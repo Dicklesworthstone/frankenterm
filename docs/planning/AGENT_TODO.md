@@ -1267,6 +1267,18 @@ power loss nor migration of those live sessions has been demonstrated.
   one-test failure is retained in `3d8b73c-fresh-process-image-rch.log`.
 - [ ] Execute corrected recovery parent with the same-source companion and
   matching test/binary feature union; the c733 family build is on worker114.
+- [x] Build that c733 family and execute its actual test binary for early
+  diagnosis: one failure at guardian_proxy.rs:6379, not a compile failure.
+  Restored child output was applied before registration, but its authenticated
+  parser prefix never reached the new registration. The quiet checkpoint
+  therefore fails `GuardianDeliveryStartedLate`; later sequence>1 delivery
+  has the same missing prefix. Retain the diagnostic and full RCH rerun.
+- [ ] Fix `ft-interactive-swarm-product-convergence-7xqz4.8.14.3.14`:
+  carry a model-bound authenticated replay prefix through activation and
+  registration, including Record checkpoints without a replay suffix.
+  Do not manufacture an append receipt or seed raw caller-supplied watermarks.
+- [x] Correct Clippy's similar-name error in the recovery-image adapter.
+  Repeat current-source Clippy after the ongoing workspace pass settles.
 - [x] Run all static release gates at `431f7d5cb`: 29 passed, zero failed,
   eight Cargo gates skipped. This is not strict release attestation closure.
 - [x] Diagnose exact-source formatting failure at `431f7d5cb`: one wrapping

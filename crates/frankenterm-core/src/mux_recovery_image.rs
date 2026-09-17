@@ -1759,11 +1759,16 @@ impl MuxRecoveryImage {
         checkpoint_acks: &HashMap<usize, &mux::ModelParserCheckpointAck>,
         checkpoint_object_refs: &HashMap<usize, RecoveryObjectRef>,
     ) -> Result<Self, MuxRecoveryImageError> {
-        let captures = checkpoint_acks
+        let parser_checkpoints = checkpoint_acks
             .iter()
             .map(|(pane, ack)| (*pane, RecoveryParserCheckpoint::Model(*ack)))
             .collect();
-        Self::from_mux_captured_checkpoints(meta, captured, &captures, checkpoint_object_refs)
+        Self::from_mux_captured_checkpoints(
+            meta,
+            captured,
+            &parser_checkpoints,
+            checkpoint_object_refs,
+        )
     }
 
     /// Convert exact model captures and durably published guardian captures.
