@@ -22182,6 +22182,82 @@ mod tests {
     }
 
     #[test]
+    fn detached_render_push_redirtied_during_capture_yields_to_input() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let handler_slot: Arc<Mutex<Option<SessionHandler>>> = Arc::new(Mutex::new(None));
+        let dirtied = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(FakePane::new_with_id(8_914, None));
+        let input_dyn: Arc<dyn Pane> = input.clone();
+        let render: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_913, {
+            let handler_slot = Arc::downgrade(&handler_slot);
+            let dirtied = Arc::clone(&dirtied);
+            let callbacks = Arc::clone(&callbacks);
+            Arc::new(move || {
+                callbacks.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = handler_slot.upgrade() else {
+                    return;
+                };
+                let mut slot = slot.lock().unwrap();
+                let Some(handler) = slot.as_mut() else {
+                    return;
+                };
+                if dirtied.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                handler.schedule_tracked_pane_push(8_913);
+                handler.process_one(DecodedPdu {
+                    serial: 9_814,
+                    pdu: Pdu::SendKeyDown(SendKeyDown {
+                        pane_id: 8_914,
+                        event: termwiz::input::KeyEvent {
+                            key: KeyCode::Char('x'),
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        input_serial: InputSerial::empty(),
+                    }),
+                });
+            })
+        }));
+        mux.add_pane(&render).unwrap();
+        mux.add_pane(&input_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.schedule_pane_push(render.pane_id());
+        let state = Arc::clone(&handler.per_pane[&render.pane_id()].push_state);
+        *handler_slot.lock().unwrap() = Some(handler);
+        for _ in 0..8 {
+            if dirtied.load(Ordering::Acquire) {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        assert!(dirtied.load(Ordering::Acquire));
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_DIRTIED);
+        let first_capture_callbacks = callbacks.load(Ordering::Relaxed);
+        assert_eq!(input.key_down_count(), 0);
+        for _ in 0..8 {
+            if input.key_down_count() != 0 {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        assert_eq!(input.key_down_count(), 1);
+        assert_eq!(callbacks.load(Ordering::Relaxed), first_capture_callbacks);
+        drain_simple_executor(&executor);
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+        assert!(callbacks.load(Ordering::Relaxed) > first_capture_callbacks);
+        assert!(captured.lock().unwrap().iter().any(|decoded| {
+            decoded.serial == 9_814 && matches!(&decoded.pdu, Pdu::UnitResponse(_))
+        }));
+        drop(handler_slot.lock().unwrap().take());
+        drain_simple_executor(&executor);
+    }
+
+    #[test]
     fn detached_render_push_releases_claim_when_cancelled_before_poll() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let executor = SimpleExecutor::new();
