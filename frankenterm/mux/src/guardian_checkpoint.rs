@@ -5154,7 +5154,7 @@ impl LiveParserCheckpointAck {
             limits,
         )
         .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
-        let semantic_generation = validated.semantic_generation();
+        let semantic_generation = validated.checkpoint().semantic_generation();
         Ok(Self {
             registration_wire_identity,
             boundary,
@@ -5210,7 +5210,7 @@ impl LiveParserCheckpointAck {
             limits,
         )
         .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
-        let semantic_generation = validated.semantic_generation();
+        let semantic_generation = validated.checkpoint().semantic_generation();
         Ok(Self {
             registration_wire_identity,
             boundary,
