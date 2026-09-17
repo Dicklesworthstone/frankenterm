@@ -424,8 +424,9 @@ impl WordLineSelectionRead {
             .map_err(|_| "The text reader could not start. Select again.")?;
 
         let mut submitted_plans = Vec::with_capacity(requested_ranges.len());
+        let mut capture_budget = Default::default();
         for range in &requested_ranges {
-            let capture = pane.capture_line_read(range.clone(), &mut Default::default());
+            let capture = pane.capture_line_read(range.clone(), &mut capture_budget);
             let Some(plan) = capture else {
                 cancelled.store(true, atomic::Ordering::Release);
                 worker.submit(submitted_plans);
