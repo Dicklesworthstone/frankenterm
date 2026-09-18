@@ -1168,31 +1168,108 @@ fn rs_health_with_latest_offset_after_multi_event_batch() {
 }
 
 #[test]
-fn rs_appended_durability_persists_state() {
+fn rs_appended_durability_defers_state_publication_and_recovers_from_log() {
+    // Appended durability defers state publication to checkpoint/flush.
+    // This test verifies that Appended batches do not write state.json until
+    // an explicit flush, and that un-flushed Appended batches are correctly
+    // replayed and recovered from events.log across reopen.
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
         let state_path = cfg.state_path.clone();
-        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+        let data_path = cfg.data_path.clone();
+        let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
 
-        let _ = storage
+        // 1. Appended batch should NOT persist state immediately
+        let e1 = sample_event("e1", 1, 0, "data-1");
+        let resp1 = storage
             .append_batch(AppendRequest {
                 batch_id: "b1".to_string(),
-                events: vec![sample_event("e1", 1, 0, "data")],
+                events: vec![e1.clone()],
                 required_durability: DurabilityLevel::Appended,
                 producer_ts_ms: 1,
             })
             .await
             .unwrap();
+        assert_eq!(resp1.committed_durability, DurabilityLevel::Appended);
+        assert!(
+            !state_path.exists(),
+            "Appended durability must defer state publication until explicit flush or checkpoint"
+        );
 
-        assert!(state_path.exists());
-        let bytes = std::fs::read(&state_path).unwrap();
-        assert!(!bytes.is_empty());
+        // 2. Meaningful flush proof: explicit flush publishes state.json
+        let flush_stats = storage.flush(FlushMode::Durable).await.unwrap();
+        assert!(
+            state_path.exists(),
+            "Explicit flush must persist state file"
+        );
+        assert_eq!(
+            flush_stats.latest_offset.as_ref().map(|o| o.ordinal),
+            Some(0)
+        );
 
-        let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(state.get("next_ordinal").is_some());
-        assert_eq!(state["next_ordinal"], 1);
+        let bytes_after_flush = std::fs::read(&state_path).unwrap();
+        let state_after_flush: serde_json::Value =
+            serde_json::from_slice(&bytes_after_flush).unwrap();
+        assert_eq!(state_after_flush["next_ordinal"], 1);
+
+        // 3. Second Appended batch does not rewrite state.json
+        let e2 = sample_event("e2", 1, 1, "data-2");
+        let resp2 = storage
+            .append_batch(AppendRequest {
+                batch_id: "b2".to_string(),
+                events: vec![e2.clone()],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp2.first_offset.ordinal, 1);
+
+        let bytes_after_b2 = std::fs::read(&state_path).unwrap();
+        assert_eq!(
+            bytes_after_b2, bytes_after_flush,
+            "Appended batch must not rewrite state.json"
+        );
+
+        // 4. Meaningful replay proof across reopen without flush
+        drop(storage);
+
+        let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
+        let health = reopened.health().await;
+        assert!(!health.degraded);
+        let latest = health
+            .latest_offset
+            .expect("reopened storage must have latest_offset");
+        assert_eq!(latest.ordinal, 1);
+
+        // Replay and verify all records from events.log with full event payload equality
+        let data_bytes = std::fs::read(&data_path).unwrap();
+        let mut remaining = data_bytes.as_slice();
+        let mut recovered_events = Vec::new();
+        while !remaining.is_empty() {
+            assert!(remaining.len() >= 4);
+            let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+            remaining = &remaining[4..];
+            assert!(remaining.len() >= len);
+            let event: RecorderEvent = serde_json::from_slice(&remaining[..len]).unwrap();
+            recovered_events.push(event);
+            remaining = &remaining[len..];
+        }
+        assert_eq!(recovered_events, vec![e1, e2]);
+
+        // Subsequent append after recovery continues monotonically
+        let next = reopened
+            .append_batch(AppendRequest {
+                batch_id: "b3".to_string(),
+                events: vec![sample_event("e3", 1, 2, "data-3")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.first_offset.ordinal, 2);
     });
 }
 

@@ -1582,7 +1582,6 @@ impl AppendLogRecorderStorage {
             DurabilityLevel::Enqueued => {}
             DurabilityLevel::Appended => {
                 Self::flush_writer(inner)?;
-                Self::persist_state(inner)?;
             }
             DurabilityLevel::Fsync => {
                 Self::flush_writer(inner)?;
@@ -8455,6 +8454,7 @@ recorder_backend = "frankensqlite"
                     producer_ts_ms: 1,
                 };
                 let initial = storage.append_batch(request("initial")).await.unwrap();
+                storage.flush(FlushMode::Durable).await.unwrap();
                 let before = std::fs::read(&config.data_path).unwrap();
                 let state_before = std::fs::read(&config.state_path).unwrap();
                 // A real read-only descriptor fails either the direct prefix
@@ -8795,7 +8795,7 @@ recorder_backend = "frankensqlite"
                     .append_batch(AppendRequest {
                         batch_id: "b1".to_string(),
                         events: vec![sample_event("e1", 1, 0, "a"), sample_event("e2", 1, 1, "b")],
-                        required_durability: DurabilityLevel::Appended,
+                        required_durability: DurabilityLevel::Fsync,
                         producer_ts_ms: 1,
                     })
                     .await
@@ -9659,33 +9659,128 @@ recorder_backend = "frankensqlite"
     }
 
     #[test]
-    fn appended_durability_persists_state() {
+    fn appended_durability_defers_state_publication_and_recovers_from_log() {
+        // Appended durability defers state publication to checkpoint/flush.
+        // This test checkpoints an existing initial event, asserts that subsequent
+        // Appended batches do not rewrite state.json, and verifies that reopen
+        // recovers exact full event payloads from events.log while preserving
+        // existing checkpoints.
         run_async_test(async {
             let dir = tempdir().unwrap();
             let cfg = test_config(dir.path());
             let state_path = cfg.state_path.clone();
-            let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+            let data_path = cfg.data_path.clone();
+            let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
 
-            // Before any append, state file should not exist (or be empty)
-            let _ = storage
+            // 1. Append an existing initial event with Fsync durability
+            let initial_event = sample_event("e0", 1, 0, "initial-event");
+            let initial_resp = storage
                 .append_batch(AppendRequest {
-                    batch_id: "b1".to_string(),
-                    events: vec![sample_event("e1", 1, 0, "data")],
+                    batch_id: "initial-batch".to_string(),
+                    events: vec![initial_event.clone()],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 50,
+                })
+                .await
+                .unwrap();
+            assert_eq!(initial_resp.first_offset.ordinal, 0);
+
+            // 2. Commit a durable checkpoint referencing the existing initial event
+            let cp_consumer = CheckpointConsumerId("worker-1".to_string());
+            let initial_cp = RecorderCheckpoint {
+                consumer: cp_consumer.clone(),
+                upto_offset: initial_resp.last_offset.clone(),
+                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                committed_at_ms: 100,
+            };
+            let outcome = storage.commit_checkpoint(initial_cp.clone()).await.unwrap();
+            assert_eq!(outcome, CheckpointCommitOutcome::Advanced);
+
+            // Verify state file exists and capture its exact contents before Appended batch
+            assert!(state_path.exists());
+            let state_before = std::fs::read(&state_path).unwrap();
+            let state_before_json: serde_json::Value =
+                serde_json::from_slice(&state_before).unwrap();
+            assert_eq!(state_before_json["next_ordinal"], 1);
+
+            // 3. Append further events with DurabilityLevel::Appended
+            let further_events = vec![
+                sample_event("e1", 1, 1, "further-record-1"),
+                sample_event("e2", 1, 2, "further-record-2"),
+            ];
+            let batch = storage
+                .append_batch(AppendRequest {
+                    batch_id: "appended-batch-1".to_string(),
+                    events: further_events.clone(),
                     required_durability: DurabilityLevel::Appended,
-                    producer_ts_ms: 1,
+                    producer_ts_ms: 200,
                 })
                 .await
                 .unwrap();
 
-            // Appended durability should have written state file
-            assert!(state_path.exists());
-            let bytes = std::fs::read(&state_path).unwrap();
-            assert_ne!(bytes, [] as [u8; 0]);
+            assert_eq!(batch.accepted_count, 2);
+            assert_eq!(batch.committed_durability, DurabilityLevel::Appended);
+            assert_eq!(batch.first_offset.ordinal, 1);
+            assert_eq!(batch.last_offset.ordinal, 2);
 
-            // Verify state content is valid JSON
-            let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(state.get("next_ordinal").is_some());
-            assert_eq!(state["next_ordinal"], 1);
+            // State file on disk must NOT have been rewritten by Appended durability
+            let state_after = std::fs::read(&state_path).unwrap();
+            assert_eq!(
+                state_after, state_before,
+                "Appended durability must defer state publication and not rewrite state.json"
+            );
+
+            // 4. Drop storage without calling flush() to simulate restart without explicit state flush
+            drop(storage);
+
+            // 5. Reopen storage: must scan events.log, recover next_offset and next_ordinal,
+            // and preserve the existing checkpoint from the stale state file.
+            let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
+            let health = reopened.health().await;
+            assert!(!health.degraded);
+            let latest = health
+                .latest_offset
+                .expect("reopened storage must have latest_offset");
+            assert_eq!(latest.ordinal, 2);
+            assert_eq!(latest.byte_offset, batch.last_offset.byte_offset);
+
+            // Existing checkpoint must be preserved
+            let recovered_cp = reopened
+                .read_checkpoint(&cp_consumer)
+                .await
+                .unwrap()
+                .expect("existing checkpoint must be preserved across reopen");
+            assert_eq!(recovered_cp, initial_cp);
+
+            // 6. Decode all records from events.log and verify full events payload equality
+            let data_bytes = std::fs::read(&data_path).unwrap();
+            let mut remaining = data_bytes.as_slice();
+            let mut recovered_events = Vec::new();
+            while !remaining.is_empty() {
+                assert!(remaining.len() >= 4, "incomplete frame length");
+                let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+                remaining = &remaining[4..];
+                assert!(remaining.len() >= len, "incomplete frame payload");
+                let event: RecorderEvent = serde_json::from_slice(&remaining[..len]).unwrap();
+                recovered_events.push(event);
+                remaining = &remaining[len..];
+            }
+            let mut expected_events = vec![initial_event];
+            expected_events.extend(further_events);
+            assert_eq!(recovered_events, expected_events);
+
+            // 7. Appending another batch after reopen must continue monotonically
+            let next_event = sample_event("e3", 1, 3, "third-record");
+            let next_batch = reopened
+                .append_batch(AppendRequest {
+                    batch_id: "appended-batch-2".to_string(),
+                    events: vec![next_event],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 300,
+                })
+                .await
+                .unwrap();
+            assert_eq!(next_batch.first_offset.ordinal, 3);
         });
     }
 

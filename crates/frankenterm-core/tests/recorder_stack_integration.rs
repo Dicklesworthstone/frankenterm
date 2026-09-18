@@ -688,7 +688,7 @@ fn assert_append_retry_after_state_failure_is_idempotent(
             config.state_path.with_extension("tmp")
         };
         std::fs::create_dir(&obstruction).unwrap();
-        let request = AppendRequest {
+        let mut request = AppendRequest {
             batch_id: "accepted-before-save-error".to_string(),
             events: vec![
                 sample_event("retry-0", 1, 0, "first"),
@@ -697,6 +697,24 @@ fn assert_append_retry_after_state_failure_is_idempotent(
             required_durability: durability,
             producer_ts_ms: 0,
         };
+
+        if durability == DurabilityLevel::Appended {
+            // Appended durability flushes the writer into page cache without persisting state,
+            // so it succeeds even when state publication would fail.
+            let appended = storage.append_batch(request.clone()).await.unwrap();
+            assert!(!appended.was_idempotent_replay);
+            assert_eq!(appended.accepted_count, 2);
+            assert_eq!(appended.first_offset.ordinal, 0);
+            assert_eq!(appended.first_offset.byte_offset, 0);
+            assert_eq!(appended.last_offset.ordinal, 1);
+            assert_eq!(appended.committed_durability, DurabilityLevel::Appended);
+            assert!(!storage.health().await.degraded);
+
+            // Transition request to Fsync to exercise state publication failure and retry.
+            request.required_durability = DurabilityLevel::Fsync;
+            request.producer_ts_ms = 1;
+        }
+
         let expected_phase = if fail_rename {
             StatePublicationPhase::Rename
         } else {
@@ -748,7 +766,7 @@ fn assert_append_retry_after_state_failure_is_idempotent(
         assert_eq!(saved.first_offset.ordinal, 0);
         assert_eq!(saved.first_offset.byte_offset, 0);
         assert_eq!(saved.last_offset.ordinal, 1);
-        assert_eq!(saved.committed_durability, durability);
+        assert_eq!(saved.committed_durability, DurabilityLevel::Fsync);
         assert!(!storage.health().await.degraded);
         assert_eq!(std::fs::read(&config.data_path).unwrap(), accepted_bytes);
         assert_eq!(storage.append_batch(request.clone()).await.unwrap(), saved);
@@ -759,7 +777,7 @@ fn assert_append_retry_after_state_failure_is_idempotent(
                 batch_id: "after-recovered-save".to_string(),
                 events: vec![next_event.clone()],
                 required_durability: DurabilityLevel::Fsync,
-                producer_ts_ms: 0,
+                producer_ts_ms: 2,
             })
             .await
             .unwrap();
@@ -775,7 +793,7 @@ fn assert_append_retry_after_state_failure_is_idempotent(
         assert_eq!(persisted["next_ordinal"], 3);
 
         // Decode the actual length-prefixed log independently of the writer's
-        // counters, so a plausible receipt cannot hide duplicate/corrupt bytes.
+        // counters, verifying full typed events payload equality with zero duplicates.
         let bytes = std::fs::read(&config.data_path).unwrap();
         let mut remaining = bytes.as_slice();
         let mut records = Vec::new();
@@ -783,15 +801,12 @@ fn assert_append_retry_after_state_failure_is_idempotent(
             let (length, rest) = remaining.split_at(4);
             let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
             let (payload, rest) = rest.split_at(length);
-            records.push(serde_json::from_slice::<serde_json::Value>(payload).unwrap());
+            records.push(serde_json::from_slice::<RecorderEvent>(payload).unwrap());
             remaining = rest;
         }
         let mut expected = request.events;
         expected.push(next_event);
-        assert_eq!(
-            serde_json::Value::Array(records),
-            serde_json::to_value(expected).unwrap()
-        );
+        assert_eq!(records, expected);
         eprintln!(
             "recorder append retry: durability={durability:?}, rename={fail_rename}, phase=reopened, records=3, duplicates=0"
         );
