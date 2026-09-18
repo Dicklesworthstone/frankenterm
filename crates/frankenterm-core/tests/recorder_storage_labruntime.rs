@@ -1542,3 +1542,117 @@ fn rs_health_queue_depth_reflects_zero_when_idle() {
         assert!(health.latest_offset.is_none());
     });
 }
+
+#[test]
+fn rs_disjoint_nested_directories_durability_and_recovery() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let dir = tempdir().unwrap();
+        let data_path = dir.path().join("data_isolated/sub1/sub2/events.log");
+        let state_path = dir.path().join("state_isolated/sub1/sub2/state.json");
+
+        assert!(!data_path.parent().unwrap().exists());
+        assert!(!state_path.parent().unwrap().exists());
+
+        let cfg = AppendLogStorageConfig {
+            data_path: data_path.clone(),
+            state_path: state_path.clone(),
+            queue_capacity: 4,
+            max_batch_events: 16,
+            max_batch_bytes: 128 * 1024,
+            max_idempotency_entries: 8,
+        };
+
+        let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+        assert!(data_path.parent().unwrap().is_dir());
+        assert!(state_path.parent().unwrap().is_dir());
+        assert!(data_path.is_file());
+        // Open does not publish state_path
+        assert!(!state_path.exists());
+
+        let e1 = sample_event("e1", 1, 0, "first");
+        let e2 = sample_event("e2", 1, 1, "second");
+
+        // Append batch with Appended durability
+        let r1 = storage
+            .append_batch(AppendRequest {
+                batch_id: "b1".to_string(),
+                events: vec![e1.clone()],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r1.first_offset.ordinal, 0);
+        // Appended intentionally defers state publication
+        assert!(!state_path.exists());
+
+        // Append batch with Fsync durability
+        let r2 = storage
+            .append_batch(AppendRequest {
+                batch_id: "b2".to_string(),
+                events: vec![e2.clone()],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r2.first_offset.ordinal, 1);
+        // Fsync publishes state_path
+        assert!(state_path.is_file());
+
+        // Commit a checkpoint
+        let cp_outcome = storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("test-consumer".to_string()),
+                upto_offset: r2.last_offset.clone(),
+                schema_version: "v1".to_string(),
+                committed_at_ms: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cp_outcome, CheckpointCommitOutcome::Advanced);
+
+        drop(storage);
+
+        // Reopen from disjoint directories
+        let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
+        assert_eq!(
+            reopened.health().await.latest_offset,
+            Some(r2.last_offset.clone())
+        );
+        let checkpoint = reopened
+            .read_checkpoint(&CheckpointConsumerId("test-consumer".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.upto_offset, r2.last_offset);
+
+        // Decode records directly from events.log and verify full typed payload equality
+        let data_bytes = std::fs::read(&data_path).unwrap();
+        let mut remaining = data_bytes.as_slice();
+        let mut recovered_events = Vec::new();
+        while !remaining.is_empty() {
+            assert!(remaining.len() >= 4);
+            let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+            remaining = &remaining[4..];
+            assert!(remaining.len() >= len);
+            let event: RecorderEvent = serde_json::from_slice(&remaining[..len]).unwrap();
+            recovered_events.push(event);
+            remaining = &remaining[len..];
+        }
+        assert_eq!(recovered_events, vec![e1, e2]);
+
+        // Subsequent append continues monotonically
+        let next = reopened
+            .append_batch(AppendRequest {
+                batch_id: "b3".to_string(),
+                events: vec![sample_event("e3", 1, 2, "third")],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 3,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.first_offset.ordinal, 2);
+    });
+}

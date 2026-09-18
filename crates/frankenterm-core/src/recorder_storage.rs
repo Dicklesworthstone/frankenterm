@@ -1361,8 +1361,8 @@ impl AppendLogRecorderStorage {
         config.data_path = resolve_recorder_path(&config.data_path)?;
         config.state_path = resolve_recorder_path(&config.state_path)?;
         validate_recorder_paths(&config)?;
-        ensure_parent_dir(&config.data_path)?;
-        ensure_parent_dir(&config.state_path)?;
+        ensure_durable_parent_chain(&config.data_path)?;
+        ensure_durable_parent_chain(&config.state_path)?;
         validate_recorder_paths(&config)?;
 
         // The staging-name lease also excludes distinct logs that share state
@@ -1394,6 +1394,27 @@ impl AppendLogRecorderStorage {
         file.acquire()?;
 
         validate_recorder_paths(&config)?;
+
+        // ft-tfxjg: Persist events.log inode and data directory entry at open time.
+        // In configurations where data_path and state_path reside in disjoint directories,
+        // state_file.directory_sync only fsyncs state_path's parent directory.
+        // During subsequent append_batch calls, Fsync uses sync_data() (fdatasync) on
+        // the events log file descriptor, flushing data blocks and size without modifying
+        // the parent directory entry. Under held path leases and writer lock, the directory
+        // entry is invariant across the lifetime of the writer. Syncing child inode first
+        // and parent directory entry second establishes namespace durability prior to
+        // append traffic without adding per-append directory sync overhead.
+        file.file.sync_all()?;
+        let data_dir_sync = open_directory_sync(&data_dir)?;
+        let held_data_dir = CapMetadata::from_file(&data_dir_sync)?;
+        let current_data_dir = data_dir.dir_metadata()?;
+        if !held_data_dir.is_dir()
+            || recorder_file_identity(&held_data_dir)? != recorder_file_identity(&current_data_dir)?
+        {
+            return Err(std::io::Error::other("recorder data directory identity changed").into());
+        }
+        sync_directory_file(&data_dir_sync)?;
+
         let persisted = state_file.load()?;
         let scan = scan_valid_prefix(&mut file.file)?;
         let recovered_segment_id = 0;
@@ -3591,6 +3612,143 @@ fn recorder_parent(path: &Path) -> std::result::Result<(CapDir, PathBuf), Record
     ))
 }
 
+fn open_directory_sync(directory: &CapDir) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        // CapDir itself may be O_PATH, which Linux cannot fsync.
+        Ok(directory.open(".")?.into_std())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "recorder directory durability is not qualified on this platform",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod directory_sync_test_hook {
+    use super::{CapMetadata, File, RecorderStorageError, recorder_file_identity};
+    use std::cell::RefCell;
+
+    struct Recording {
+        fail_at: Option<usize>,
+        identities: Vec<(u64, u64)>,
+    }
+
+    thread_local! {
+        static RECORDING: RefCell<Option<Recording>> = const { RefCell::new(None) };
+    }
+
+    pub fn start(fail_at: Option<usize>) {
+        RECORDING.with(|recording| {
+            *recording.borrow_mut() = Some(Recording {
+                fail_at,
+                identities: Vec::new(),
+            });
+        });
+    }
+
+    pub fn take() -> Vec<(u64, u64)> {
+        RECORDING.with(|recording| recording.borrow_mut().take().unwrap().identities)
+    }
+
+    pub fn on_sync(file: &File) -> Result<(), RecorderStorageError> {
+        RECORDING.with(|recording| {
+            let mut recording = recording.borrow_mut();
+            let Some(recording) = recording.as_mut() else {
+                return Ok(());
+            };
+            let index = recording.identities.len();
+            recording
+                .identities
+                .push(recorder_file_identity(&CapMetadata::from_file(file)?)?);
+            if recording.fail_at == Some(index) {
+                return Err(std::io::Error::other("injected directory sync failure").into());
+            }
+            Ok(())
+        })
+    }
+}
+
+fn sync_directory_file(file: &File) -> std::result::Result<(), RecorderStorageError> {
+    #[cfg(test)]
+    directory_sync_test_hook::on_sync(file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Ensure parent directories exist for an append-log path, durably fsyncing
+/// the relevant ancestor directory chain.
+///
+/// Directory entries are created capability-bound via `CapDir`, handling concurrent
+/// creation and retries (`AlreadyExists`). Syncing traverses from the leaf directory
+/// up to the anchor so that child inodes/directory entries are synced before parent
+/// directory entries.
+fn ensure_durable_parent_chain(path: &Path) -> std::result::Result<(), RecorderStorageError> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+
+    // Deconstruct parent into its component path segments from anchor down to leaf.
+    let mut components = Vec::new();
+    let mut cur = parent;
+    while let Some(p) = cur.parent() {
+        if let Some(file_name) = cur.file_name() {
+            components.push(file_name);
+            cur = p;
+        } else {
+            break;
+        }
+    }
+
+    let anchor = if cur.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        cur
+    };
+
+    // Open anchor capability-bound.
+    let anchor_dir = CapDir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
+    let mut dir_chain = Vec::with_capacity(components.len() + 1);
+    dir_chain.push(anchor_dir);
+
+    // Descend component-by-component, creating directories if missing and verifying each is a directory.
+    for name in components.into_iter().rev() {
+        let current_dir = dir_chain.last().unwrap();
+        let child_dir = match current_dir.open_dir_nofollow(name) {
+            Ok(directory) => directory,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match current_dir.create_dir(name) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(err.into()),
+                }
+                current_dir.open_dir_nofollow(name)?
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let meta = child_dir.dir_metadata()?;
+        if !meta.is_dir() {
+            return Err(invalid_recorder_path(format!(
+                "ancestor component {name:?} is not a directory"
+            )));
+        }
+        dir_chain.push(child_dir);
+    }
+
+    // Sync from leaf directory up to anchor so child inodes/entries are durable
+    // before parent directory entries referencing them are synced.
+    for dir in dir_chain.iter().rev() {
+        sync_directory_file(&open_directory_sync(dir)?)?;
+    }
+
+    Ok(())
+}
+
 fn recorder_open_options() -> CapOpenOptions {
     let mut options = CapOpenOptions::new();
     options.follow(FollowSymlinks::No);
@@ -3854,7 +4012,7 @@ impl AppendLogStateFile {
         let (directory, state_name) = recorder_parent(path)?;
         // Fail closed before creating a lock or staging file on platforms
         // without a qualified directory-sync primitive.
-        let directory_sync = Self::open_directory_sync(&directory)?;
+        let directory_sync = open_directory_sync(&directory)?;
         let temporary_name = state_name.with_extension("tmp");
         let lock_name = recorder_state_lock_path(&state_name);
         let mut options = recorder_open_options();
@@ -3881,22 +4039,6 @@ impl AppendLogStateFile {
         };
         state_file.check_lock()?;
         Ok(state_file)
-    }
-
-    fn open_directory_sync(directory: &CapDir) -> std::io::Result<File> {
-        #[cfg(unix)]
-        {
-            // CapDir itself may be O_PATH, which Linux cannot fsync.
-            Ok(directory.open(".")?.into_std())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = directory;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "recorder directory durability is not qualified on this platform",
-            ))
-        }
     }
 
     fn check_directory(&self) -> std::result::Result<(), RecorderStorageError> {
@@ -10556,5 +10698,181 @@ recorder_backend = "frankensqlite"
         };
         let dbg = format!("{:?}", desc);
         assert!(dbg.contains("AppendLog"));
+    }
+
+    // =========================================================================
+    // ft-tfxjg: Data namespace durability & ancestor chain tests
+    // =========================================================================
+
+    #[test]
+    fn ensure_durable_parent_chain_creates_nested_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let target = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("level1/level2/level3/events.log");
+
+        assert!(!dir.path().join("level1/level2/level3").exists());
+
+        ensure_durable_parent_chain(&target).unwrap();
+        assert!(dir.path().join("level1/level2/level3").is_dir());
+
+        // Existing directories are synced again; existence alone is not durability.
+        ensure_durable_parent_chain(&target).unwrap();
+        assert!(dir.path().join("level1/level2/level3").is_dir());
+    }
+
+    #[test]
+    fn ensure_durable_parent_chain_rejects_non_directory_ancestor() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().canonicalize().unwrap().join("blocking_file");
+        std::fs::write(&file_path, b"not a dir").unwrap();
+
+        // Traversing through a regular file as a parent directory returns ENOTDIR Io error
+        let target_nested = file_path.join("nested/events.log");
+        let err = ensure_durable_parent_chain(&target_nested).unwrap_err();
+        match err {
+            RecorderStorageError::Io(io_err) => {
+                #[cfg(unix)]
+                assert_eq!(io_err.raw_os_error(), Some(libc::ENOTDIR));
+            }
+            RecorderStorageError::InvalidRequest { message } => {
+                assert!(message.contains("not a directory"));
+            }
+            other => panic!("expected Io(ENOTDIR) or InvalidRequest, got {other:?}"),
+        }
+
+        // Parent path itself is a regular file
+        let target_direct = file_path.join("events.log");
+        let err = ensure_durable_parent_chain(&target_direct).unwrap_err();
+        match err {
+            RecorderStorageError::Io(io_err) => {
+                #[cfg(unix)]
+                assert_eq!(io_err.raw_os_error(), Some(libc::ENOTDIR));
+            }
+            RecorderStorageError::InvalidRequest { message } => {
+                assert!(message.contains("not a directory"));
+            }
+            other => panic!("expected Io(ENOTDIR) or InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_durable_parent_chain_sync_failure_retry_performs_sync() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for fail_at in [0, 2] {
+            let target = base.join(format!("retry-{fail_at}/sub1/sub2/events.log"));
+            directory_sync_test_hook::start(Some(fail_at));
+            let error = ensure_durable_parent_chain(&target).unwrap_err();
+            let failed_attempt = directory_sync_test_hook::take();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected directory sync failure")
+            );
+            assert!(target.parent().unwrap().is_dir());
+            let expected: Vec<_> = target
+                .parent()
+                .unwrap()
+                .ancestors()
+                .map(|ancestor| {
+                    let file = File::open(ancestor).unwrap();
+                    recorder_file_identity(&CapMetadata::from_file(&file).unwrap()).unwrap()
+                })
+                .collect();
+            assert_eq!(failed_attempt, expected[..=fail_at]);
+
+            // Retry after both immediate and partial success must sync every
+            // ancestor in leaf-to-root order, even though mkdir already succeeded.
+            directory_sync_test_hook::start(None);
+            ensure_durable_parent_chain(&target).unwrap();
+            assert_eq!(directory_sync_test_hook::take(), expected);
+        }
+    }
+
+    #[test]
+    fn append_log_disjoint_nested_directories_open_and_durability() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let data_path = dir.path().join("data_tree/nested/events.log");
+            let state_path = dir.path().join("state_tree/isolated/state.json");
+
+            assert!(!dir.path().join("data_tree/nested").exists());
+            assert!(!dir.path().join("state_tree/isolated").exists());
+
+            let cfg = AppendLogStorageConfig {
+                data_path: data_path.clone(),
+                state_path: state_path.clone(),
+                queue_capacity: 4,
+                max_batch_events: 16,
+                max_batch_bytes: 128 * 1024,
+                max_idempotency_entries: 8,
+            };
+
+            // Open successfully creates both directory hierarchies and syncs inodes/dirs
+            let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+            assert!(data_path.parent().unwrap().is_dir());
+            assert!(state_path.parent().unwrap().is_dir());
+            assert!(data_path.is_file());
+            // Open does not publish state_path
+            assert!(!state_path.exists());
+
+            // Storage appends events with Appended durability
+            let r1 = storage
+                .append_batch(AppendRequest {
+                    batch_id: "batch-appended".to_string(),
+                    events: vec![sample_event("e1", 1, 0, "first")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(r1.first_offset.ordinal, 0);
+            // Appended intentionally defers state publication
+            assert!(!state_path.exists());
+
+            // Storage appends events with Fsync durability
+            let r2 = storage
+                .append_batch(AppendRequest {
+                    batch_id: "batch-fsync".to_string(),
+                    events: vec![sample_event("e2", 1, 1, "second")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+            assert_eq!(r2.first_offset.ordinal, 1);
+            // Fsync publishes state_path
+            assert!(state_path.is_file());
+
+            // Checkpoint commit publishes state
+            let cp = storage
+                .commit_checkpoint(RecorderCheckpoint {
+                    consumer: CheckpointConsumerId("consumer-1".to_string()),
+                    upto_offset: r2.last_offset.clone(),
+                    schema_version: "v1".to_string(),
+                    committed_at_ms: 100,
+                })
+                .await
+                .unwrap();
+            assert_eq!(cp, CheckpointCommitOutcome::Advanced);
+
+            drop(storage);
+
+            // Reopen verifies both disjoint directories and persistent state/events
+            let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
+            assert_eq!(
+                reopened.health().await.latest_offset,
+                Some(r2.last_offset.clone())
+            );
+            let checkpoint = reopened
+                .read_checkpoint(&CheckpointConsumerId("consumer-1".to_string()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(checkpoint.upto_offset, r2.last_offset);
+        });
     }
 }
