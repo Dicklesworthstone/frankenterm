@@ -32,6 +32,78 @@ static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUs
 pub type PaneId = usize;
 
 static LINE_READ_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_LINE_READ_WORKERS: usize = 4;
+type LineReadTask = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone)]
+struct LineReadPool {
+    sender: std::sync::mpsc::SyncSender<LineReadTask>,
+}
+
+impl LineReadPool {
+    fn new() -> std::io::Result<Self> {
+        Self::with_spawn(|run| {
+            std::thread::Builder::new()
+                .name("ft-cold-read".into())
+                .spawn(run)
+                .map(|_| ())
+        })
+    }
+
+    fn with_spawn(mut spawn: impl FnMut(LineReadTask) -> std::io::Result<()>) -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<LineReadTask>(MAX_LINE_READ_WORKERS);
+        let receiver = Arc::new(parking_lot::Mutex::new(receiver));
+        // Establish every receiver before admitting a capture. On partial
+        // startup failure, dropping sender wakes and retires all started
+        // workers; no task or source rows have entered the pool yet.
+        for _ in 0..MAX_LINE_READ_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            spawn(Box::new(move || loop {
+                let task = { receiver.lock().recv() };
+                let Ok(task) = task else {
+                    break;
+                };
+                // Never hold the receiver lock while hydrating, completing,
+                // or waiting for publication retirement. All four admitted
+                // reads must be able to progress independently.
+                let _ = frankenterm_sigpipe::catch_recoverable(
+                    frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
+                    std::panic::AssertUnwindSafe(task),
+                );
+            }))?;
+        }
+        Ok(Self { sender })
+    }
+
+    fn dispatch(&self, run: LineReadTask) -> std::io::Result<()> {
+        self.sender.try_send(run).map_err(|error| {
+            let kind = match error {
+                std::sync::mpsc::TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
+                std::sync::mpsc::TrySendError::Disconnected(_) => std::io::ErrorKind::BrokenPipe,
+            };
+            std::io::Error::new(kind, "line read worker dispatch unavailable")
+        })
+    }
+}
+
+static LINE_READ_POOL: parking_lot::Mutex<Option<LineReadPool>> = parking_lot::Mutex::new(None);
+
+fn dispatch_line_read_task(run: LineReadTask) -> std::io::Result<()> {
+    let pool = {
+        let mut shared = LINE_READ_POOL.lock();
+        match shared.as_ref() {
+            Some(pool) => pool.clone(),
+            None => {
+                let pool = LineReadPool::new()?;
+                *shared = Some(pool.clone());
+                pool
+            }
+        }
+    };
+    // Refused tasks own arbitrary completion captures. Release the pool lock
+    // before dispatch so their destructors cannot reenter it under that lock.
+    pool.dispatch(run)
+}
 
 /// Reserve before capturing row snapshots. Four workers, each with at most
 /// 16K rows/32MiB retained serialized payload plus one bounded storage batch.
@@ -77,7 +149,13 @@ impl LineReadPermit {
             .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                |n| if n < 4 { Some(n + 1) } else { None },
+                |n| {
+                    if n < MAX_LINE_READ_WORKERS {
+                        Some(n + 1)
+                    } else {
+                        None
+                    }
+                },
             )
             .ok()
             .map(|_| Self { _private: () })
@@ -91,12 +169,7 @@ impl LineReadPermit {
     where
         F: FnOnce(anyhow::Result<LineReadPlans>, Self) + Send + 'static,
     {
-        self.start_with_spawn(cancelled, complete, |run| {
-            std::thread::Builder::new()
-                .name("ft-cold-read".into())
-                .spawn(run)
-                .map(|_| ())
-        })
+        self.start_with_spawn(cancelled, complete, dispatch_line_read_task)
     }
 
     fn start_with_spawn<F>(
@@ -1210,6 +1283,121 @@ mod test {
             );
             std::thread::yield_now();
         }
+    }
+
+    fn occupy_line_read_pool(pool: &LineReadPool) -> std::collections::HashSet<std::thread::ThreadId> {
+        let caller = std::thread::current().id();
+        let (started, receiving) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..MAX_LINE_READ_WORKERS {
+            let started = started.clone();
+            let (release, released) = std::sync::mpsc::channel();
+            releases.push(release);
+            pool.dispatch(Box::new(move || {
+                started.send(std::thread::current().id()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }))
+            .unwrap();
+        }
+        let mut threads = std::collections::HashSet::new();
+        for _ in 0..MAX_LINE_READ_WORKERS {
+            let thread = receiving
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_ne!(thread, caller);
+            assert!(
+                threads.insert(thread),
+                "all four blocked tasks must run independently"
+            );
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        threads
+    }
+
+    #[test]
+    fn line_read_pool_reuses_four_independent_workers_after_task_panic() {
+        let pool = LineReadPool::new().unwrap();
+        let first = occupy_line_read_pool(&pool);
+        let (panicking, observed) = std::sync::mpsc::channel();
+        pool.dispatch(Box::new(move || {
+            panicking.send(std::thread::current().id()).unwrap();
+            panic!("injected line read task panic");
+        }))
+        .unwrap();
+        let panicking_thread = observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let second = occupy_line_read_pool(&pool);
+        assert_eq!(
+            first, second,
+            "successful dispatch must reuse the same four threads"
+        );
+        assert!(
+            second.contains(&panicking_thread),
+            "the panic must not retire its worker"
+        );
+    }
+
+    #[test]
+    fn line_read_pool_partial_start_failure_retires_started_receivers() {
+        let (exited, observed) = std::sync::mpsc::channel();
+        let mut starts = 0;
+        let result = LineReadPool::with_spawn(|run| {
+            starts += 1;
+            if starts == 3 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected third worker refusal",
+                ));
+            }
+            let exited = exited.clone();
+            std::thread::Builder::new()
+                .spawn(move || {
+                    run();
+                    exited.send(()).unwrap();
+                })
+                .map(|_| ())
+        });
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(starts, 3);
+        for _ in 0..2 {
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("partial initialization must disconnect every started receiver");
+        }
+    }
+
+    #[test]
+    fn line_read_pool_dispatch_refuses_full_or_disconnected_queue_without_running_task() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let pool = LineReadPool { sender };
+        pool.dispatch(Box::new(|| {})).unwrap();
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked_on_full = Arc::clone(&invoked);
+        assert_eq!(
+            pool.dispatch(Box::new(move || {
+                invoked_on_full.store(true, std::sync::atomic::Ordering::Release);
+            }))
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(receiver.recv().unwrap());
+        drop(receiver);
+        let invoked_on_disconnect = Arc::clone(&invoked);
+        assert_eq!(
+            pool.dispatch(Box::new(move || {
+                invoked_on_disconnect.store(true, std::sync::atomic::Ordering::Release);
+            }))
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(!invoked.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

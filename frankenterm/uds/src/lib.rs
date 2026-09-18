@@ -137,20 +137,17 @@ impl UnixStream {
 
     #[cfg(all(feature = "async-asupersync", unix))]
     pub async fn wait_for_readable(&self) -> std::io::Result<()> {
-        std::future::poll_fn(|cx| {
-            self.inner.set_nonblocking(true)?;
-            match self.try_readable_without_consuming() {
-                Ok(true) => Poll::Ready(Ok(())),
-                Ok(false) => {
-                    self.register_interest_for_read(cx)?;
-                    Poll::Pending
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    fallback_rewake(cx);
-                    Poll::Pending
-                }
-                Err(err) => Poll::Ready(Err(err)),
+        std::future::poll_fn(|cx| match self.try_readable_without_consuming() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => {
+                self.register_interest_for_read(cx)?;
+                Poll::Pending
             }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                fallback_rewake(cx);
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err)),
         })
         .await
     }
@@ -164,7 +161,6 @@ impl UnixStream {
     pub async fn wait_for_readable_or_writable(&self) -> std::io::Result<()> {
         let mut armed = false;
         std::future::poll_fn(|cx| {
-            self.inner.set_nonblocking(true)?;
             match self.try_readable_without_consuming() {
                 Ok(true) => return Poll::Ready(Ok(())),
                 Ok(false) => {}
@@ -205,9 +201,9 @@ impl UnixStream {
     /// an EOF is reported as readable so the normal read path can terminate.
     #[cfg(unix)]
     pub fn try_readable_without_consuming(&self) -> std::io::Result<bool> {
-        // The public direct-dispatch path does not necessarily pass through
-        // protocol detection first, so establish nonblocking mode here too.
-        self.inner.set_nonblocking(true)?;
+        // MSG_DONTWAIT bounds this probe even on a blocking socket. Do not
+        // issue a redundant mode-changing ioctl on every readiness check;
+        // actual async I/O and reactor registration establish their own mode.
         let mut probe = [0u8; 1];
         let result = unsafe {
             libc::recv(
@@ -820,6 +816,25 @@ mod tests {
         assert_eq!(&buf, b"x");
         client.join().unwrap().unwrap();
         cleanup(&path);
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    #[test]
+    fn readiness_probe_handles_blocking_empty_data_and_eof_without_consuming() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(false).unwrap();
+        assert!(!server.try_readable_without_consuming().unwrap());
+        client.write_all(b"probe").unwrap();
+        for _ in 0..8 {
+            assert!(server.try_readable_without_consuming().unwrap());
+        }
+        let mut bytes = [0; 5];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"probe");
+        assert!(!server.try_readable_without_consuming().unwrap());
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(server.try_readable_without_consuming().unwrap());
+        assert_eq!(server.read(&mut bytes).unwrap(), 0);
     }
 
     // ── UnixListener ───────────────────────────────────────────
