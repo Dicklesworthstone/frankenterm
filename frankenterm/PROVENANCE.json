@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 19,
         "feat": 53,
-        "fix": 97,
+        "fix": 99,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 34
       },
-      "fork_side_commit_count": 237,
+      "fork_side_commit_count": 239,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-17T15:58:20-04:00",
-        "sha": "079ea2283c73778064a0bbaba2ec13c5335714a1",
-        "subject": "test(client): reproduce font resize back to stale tab geometry"
+        "classification": "fix",
+        "committed_at": "2026-09-18T02:45:43-04:00",
+        "sha": "8b75335ddd2c1c4c77944b3ab08e1be96cedbe34",
+        "subject": "fix(client): reconcile remote geometry and drain executor tasks safely"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 29,
         "docs": 6,
         "feat": 196,
-        "fix": 243,
+        "fix": 247,
         "other": 49,
         "refactor": 11,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 96
       },
-      "fork_side_commit_count": 654,
+      "fork_side_commit_count": 658,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-17T16:00:18-04:00",
-        "sha": "ce9fe6d8f761bb2ccc6af5aee7db0a27d2734cd7",
-        "subject": "fix(mux): deliver explicit resize despite matching cached tab geometry"
+        "committed_at": "2026-09-18T02:45:43-04:00",
+        "sha": "8b75335ddd2c1c4c77944b3ab08e1be96cedbe34",
+        "subject": "fix(client): reconcile remote geometry and drain executor tasks safely"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -710,19 +710,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 8,
-        "fix": 20,
+        "fix": 21,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 4,
         "test": 7
       },
-      "fork_side_commit_count": 52,
+      "fork_side_commit_count": 53,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-03T15:52:30-04:00",
-        "sha": "651dde23ca329a4b3728413813eec2f567b8b5bd",
-        "subject": "fix(proof-doctor): accept the RCH proof command shape the blockers prescribe"
+        "committed_at": "2026-09-18T02:45:43-04:00",
+        "sha": "8b75335ddd2c1c4c77944b3ab08e1be96cedbe34",
+        "subject": "fix(client): reconcile remote geometry and drain executor tasks safely"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 15,
-        "fix": 93,
+        "fix": 94,
         "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 147,
+      "fork_side_commit_count": 148,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-15T15:21:31-04:00",
-        "sha": "2569bda9aa1987fa7fd0b66f14fd5dfbefc97d14",
-        "subject": "perf(window): measure native font menu dispatch latency"
+        "classification": "fix",
+        "committed_at": "2026-09-17T17:56:46-04:00",
+        "sha": "2da82db41403319501c87dd3754e0e6abffe7166",
+        "subject": "fix(macos): deliver the final live-resize gesture boundary"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2739,
-  "generated_at": "2026-09-17T20:33:31.170825Z",
+  "fork_side_commit_total": 2747,
+  "generated_at": "2026-09-18T06:56:42.023575Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

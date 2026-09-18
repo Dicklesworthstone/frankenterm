@@ -42,6 +42,10 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Large background gradients use bounded parallel row generation with the same pixel calculations and noise stream as the serial path. Cancellation and allocation limits cover preparation as well as rasterization.
 - A retained cold-history prefix no longer changes the layout sequence when a compatible successor is already installed. Temporary storage contention during geometry comparison also leaves an unchanged layout sequence intact.
 - Font-size shortcuts preserve the window size by default and reflow its contents. Setting `adjust_window_size_when_changing_font_size = true` explicitly retains window resizing.
+- Primary resize completion reaches the tab before cold-history preparation finishes. Cold indexing recaptures a moving resident frontier instead of leaving history reads stuck on an obsolete layout.
+- Client tabs reconcile their bounds after observed topology changes and accepted render-layout changes, including legacy remote connections. Ordinary output with unchanged layout does not trigger a split-tree walk.
+- Executor shutdown cancels parked tasks on their owner thread, including wakes already in transit and reserved bootstrap handoffs. Waking a cancelled receiver no longer destroys it inside the notifying channel's lock.
+- Buffered recorder appends defer state-file synchronization; explicit durable flushes, Fsync appends and checkpoints retain it. Opening an append log persists its data-directory entry and ancestor directories, including retries after partial directory-sync failure.
 
 - Remote resize admission failures preserve the prior cached geometry. Failed or cancelled completion waits notify the original pane and permit an explicit retry without automatically replaying an uncertain operation.
 - Window resize dispatches the active tab before hidden tabs on shared mux connections, while still resizing every tab and preserving their displayed order.
@@ -88,7 +92,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Offline recovery selects the authenticated checkpoint adoption by its complete
   capture identity, including mux incarnation, generation, effect and sequence.
 
-The `0.15.6-rc.37` candidate includes these changes. The 50 ms resize target,
+The `0.15.6-rc.38` candidate is being prepared with these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.
