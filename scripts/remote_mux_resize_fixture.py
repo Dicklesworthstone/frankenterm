@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -66,6 +67,13 @@ def write_bounded(data, deadline):
 
 
 def run(args):
+    if getattr(args, "arm", "resize") == "echo":
+        run_echo(args)
+    else:
+        run_resize(args)
+
+
+def run_resize(args):
     if not os.isatty(0) or not os.isatty(1):
         raise RuntimeError("fixture requires an explicitly owned real PTY")
     source = pathlib.Path(args.corpus).read_bytes()
@@ -119,6 +127,207 @@ def run(args):
         raise TimeoutError("owned PTY lifetime deadline expired")
     finally:
         os.set_blocking(1, original_blocking)
+        termios.tcsetattr(0, termios.TCSANOW, original)
+
+
+def run_echo(args):
+    """Opt-in sustained output & keystroke echo fixture (ft-4p4uo)."""
+    if not os.isatty(0) or not os.isatty(1):
+        raise RuntimeError("fixture requires an explicitly owned real PTY")
+    identity = {
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "arm": "echo",
+        "started_monotonic_ns": time.monotonic_ns(),
+    }
+    proc_stat = pathlib.Path("/proc/self/stat")
+    if proc_stat.exists():
+        identity["linux_start_ticks"] = process_identity(os.getpid())["start_ticks"]
+    write_new(args.owner, json.dumps(identity, sort_keys=True) + "\n")
+    original = termios.tcgetattr(0)
+    original_blocking_1 = os.get_blocking(1)
+    original_blocking_0 = os.get_blocking(0)
+    deadline = time.monotonic() + args.timeout_seconds
+
+    # Explicit caps as mandated by root review
+    MAX_PENDING_IN = 65536
+    MAX_PENDING_OUT = 262144
+    MAX_TOTAL_BYTES = 256 * 1024 * 1024
+    MAX_LINE_LENGTH = 256
+
+    COMMAND_RE = re.compile(rb"^(START_STREAM|PROBE|STREAM_FINISH|EXIT) ([a-zA-Z0-9_-]{1,64})$")
+
+    bytes_written = 0
+    streaming = False
+    stream_started = False
+    stream_done = False
+    active_stream_nonce = None
+    stream_finish_nonce = None
+    stream_record_seq = 0
+    stream_bytes_start = 0
+    stream_start_ns = 0
+    stream_bytes_end = 0
+    stream_end_ns = 0
+    probes_served = 0
+    pending_out = bytearray()
+    pending_in = bytearray()
+
+    # Pre-generate structured stream record template
+    # 128 bytes per record: 22-byte prefix + 104-byte payload + 2-byte \r\n
+    stream_payload = (b"0123456789abcdef" * 6) + b"01234567"
+
+    try:
+        tty.setraw(0)
+        os.set_blocking(1, False)
+        os.set_blocking(0, False)
+        write_bounded(b"FT_ECHO_READY\r\n", deadline)
+        bytes_written += len(b"FT_ECHO_READY\r\n")
+        write_new(str(args.owner) + ".ready", json.dumps({"arm": "echo", "status": "ready"}) + "\n")
+
+        while time.monotonic() < deadline:
+            # If streaming is active, refill pending_out up to 32 KiB
+            if streaming and len(pending_out) < 32768:
+                chunks = []
+                batch_bytes = 0
+                while batch_bytes < 32768:
+                    rec = f"FT_STR_{stream_record_seq:08d} ".encode("ascii") + stream_payload + b"\r\n"
+                    chunks.append(rec)
+                    batch_bytes += len(rec)
+                    stream_record_seq += 1
+                new_data = b"".join(chunks)
+                if len(pending_out) + len(new_data) > MAX_PENDING_OUT:
+                    raise RuntimeError("owned PTY pending_out exceeded cap during streaming refill")
+                pending_out.extend(new_data)
+
+            # If stream finish was requested and pending stream data has drained:
+            if stream_finish_nonce is not None and not pending_out:
+                stream_bytes_end = bytes_written
+                stream_end_ns = time.monotonic_ns()
+                marker = f"FT_STREAM_END {stream_finish_nonce} bytes={bytes_written} FT_END\r\n".encode("ascii")
+                if len(pending_out) + len(marker) > MAX_PENDING_OUT:
+                    raise RuntimeError("owned PTY pending_out exceeded cap")
+                pending_out.extend(marker)
+                stream_finish_nonce = None
+                stream_done = True
+
+            r_list = [0]
+            w_list = [1] if pending_out else []
+            r, w, _ = select.select(r_list, w_list, [], 0.005)
+
+            if 0 in r:
+                try:
+                    data = os.read(0, 4096)
+                except (BlockingIOError, InterruptedError):
+                    data = None
+                if data is not None:
+                    if len(data) == 0:
+                        raise RuntimeError("owned PTY input closed before explicit EXIT")
+                    if len(pending_in) + len(data) > MAX_PENDING_IN:
+                        raise RuntimeError("owned PTY pending_in exceeded 64 KiB cap")
+                    pending_in.extend(data)
+                    while b"\n" in pending_in:
+                        line, _, rest = pending_in.partition(b"\n")
+                        pending_in = bytearray(rest)
+                        cmd = line.rstrip(b"\r")
+                        if not cmd:
+                            continue
+                        if len(cmd) > MAX_LINE_LENGTH:
+                            raise ValueError("owned PTY command exceeded 256 bytes")
+                        match = COMMAND_RE.fullmatch(cmd)
+                        if match is None:
+                            raise ValueError(f"unexpected owned PTY command: {cmd!r}")
+                        operation, nonce_bytes = match.groups()
+                        nonce = nonce_bytes.decode("ascii")
+
+                        if operation == b"START_STREAM":
+                            if stream_started or streaming or stream_done:
+                                raise ValueError(
+                                    f"START_STREAM received in invalid state (started={stream_started}, streaming={streaming}, done={stream_done})"
+                                )
+                            stream_started = True
+                            streaming = True
+                            active_stream_nonce = nonce
+                            stream_bytes_start = bytes_written
+                            stream_start_ns = time.monotonic_ns()
+                            marker = f"FT_STREAM_START {nonce} bytes={bytes_written} FT_END\r\n".encode("ascii")
+                            if len(pending_out) + len(marker) > MAX_PENDING_OUT:
+                                raise RuntimeError("owned PTY pending_out exceeded cap")
+                            pending_out.extend(marker)
+                        elif operation == b"PROBE":
+                            if not streaming or stream_done:
+                                raise ValueError("PROBE command received when streaming is not active")
+                            expected_nonce = f"echo_trial_{probes_served:04}"
+                            if nonce != expected_nonce:
+                                raise ValueError(f"probe nonce mismatch: expected {expected_nonce}, got {nonce}")
+                            resp = f"FT_PROBE {nonce}\r\n".encode("ascii")
+                            if len(pending_out) + len(resp) > MAX_PENDING_OUT:
+                                raise RuntimeError("owned PTY pending_out exceeded cap")
+                            pending_out.extend(resp)
+                            probes_served += 1
+                        elif operation == b"STREAM_FINISH":
+                            if not streaming or not stream_started or stream_done or stream_finish_nonce is not None:
+                                raise ValueError(
+                                    f"STREAM_FINISH received in invalid state (started={stream_started}, streaming={streaming}, done={stream_done})"
+                                )
+                            if nonce != active_stream_nonce:
+                                raise ValueError(
+                                    f"STREAM_FINISH nonce mismatch: expected {active_stream_nonce}, got {nonce}"
+                                )
+                            streaming = False
+                            stream_finish_nonce = nonce
+                        elif operation == b"EXIT":
+                            if not stream_done:
+                                raise ValueError("EXIT command received before stream completion")
+                            if probes_served < 1000:
+                                raise ValueError(f"EXIT command received with only {probes_served} probes served")
+                            resp = f"FT_EXIT {nonce}\r\n".encode("ascii")
+                            if len(pending_out) + len(resp) > MAX_PENDING_OUT:
+                                raise RuntimeError("owned PTY pending_out exceeded cap")
+                            pending_out.extend(resp)
+                            exit_deadline = min(deadline, time.monotonic() + 5.0)
+                            while pending_out and time.monotonic() < exit_deadline:
+                                rem = exit_deadline - time.monotonic()
+                                if not select.select([], [1], [], max(0, min(rem, 0.25)))[1]:
+                                    continue
+                                try:
+                                    n = os.write(1, pending_out[:16384])
+                                    if n > 0:
+                                        del pending_out[:n]
+                                        bytes_written += n
+                                except (BlockingIOError, InterruptedError):
+                                    continue
+                            if pending_out:
+                                raise TimeoutError("owned PTY exit flush deadline expired")
+                            final_receipt = {
+                                "arm": "echo",
+                                "status": "completed",
+                                "bytes_written": bytes_written,
+                                "stream_nonce": active_stream_nonce,
+                                "stream_bytes_start": stream_bytes_start,
+                                "stream_start_ns": stream_start_ns,
+                                "stream_bytes_end": stream_bytes_end,
+                                "stream_end_ns": stream_end_ns,
+                                "actual_stream_bytes": stream_bytes_end - stream_bytes_start,
+                                "probes_served": probes_served,
+                            }
+                            write_new(str(args.owner) + ".final", json.dumps(final_receipt, sort_keys=True) + "\n")
+                            return
+
+            if 1 in w and pending_out:
+                try:
+                    written = os.write(1, pending_out[:16384])
+                    if written > 0:
+                        del pending_out[:written]
+                        bytes_written += written
+                        if bytes_written > MAX_TOTAL_BYTES:
+                            raise RuntimeError("owned PTY total bytes written exceeded 256 MiB cap")
+                except (BlockingIOError, InterruptedError):
+                    pass
+
+        raise TimeoutError("owned PTY lifetime deadline expired")
+    finally:
+        os.set_blocking(1, original_blocking_1)
+        os.set_blocking(0, original_blocking_0)
         termios.tcsetattr(0, termios.TCSANOW, original)
 
 
@@ -325,6 +534,150 @@ def validate_measurements(rows, instrumented):
         raise ValueError("incomplete or mismatched terminal measurement event")
 
 
+def nearest_rank_percentile(sorted_list, q):
+    """Nearest-rank percentile where q is in [0.0, 1.0] (e.g. 0.50, 0.90, 0.95, 0.99).
+
+    Rank is ceil(q * n), 0-indexed position is ceil(q * n) - 1, clamped to [0, n - 1].
+    """
+    n = len(sorted_list)
+    assert n > 0, "cannot compute percentile of empty list"
+    rank = int(math.ceil(q * n))
+    idx = max(0, min(rank, n) - 1)
+    return sorted_list[idx]
+
+
+def validate_echo_measurements(rows, fixture_receipt=None):
+    """Require exact contract, 100..1000 nonces, >=10MB/s throughput, p99 within budget.
+
+    Independently recomputes all statistics from raw trial rows using nearest-rank
+    percentiles (ceil(q*n)-1) without trusting client self-reported claims.
+    """
+    if not rows:
+        raise ValueError("empty measurement rows")
+    contract = rows[0]
+    if contract.get("event") != "contract" or contract.get("arm") != "echo":
+        raise ValueError("invalid or missing contract row for echo arm")
+    if contract.get("version") != 1:
+        raise ValueError("unsupported contract version")
+    trials = contract.get("trials")
+    if type(trials) is not int or trials != 1000:
+        raise ValueError(f"echo arm requires 1000 trials, got {trials!r}")
+    p99_budget = contract.get("p99_budget_us")
+    if p99_budget != 50_000:
+        raise ValueError(f"echo arm p99 budget must be 50,000 us, got {p99_budget!r}")
+    min_throughput = contract.get("min_throughput_mb_s")
+    if min_throughput != 10.0:
+        raise ValueError(f"echo arm min throughput must be 10.0 MB/s, got {min_throughput!r}")
+
+    expected_row_count = trials + 2
+    if len(rows) != expected_row_count:
+        raise ValueError(f"expected {expected_row_count} measurement rows, got {len(rows)}")
+
+    echo_trials = rows[1:-1]
+    latencies = []
+    seen_trials = set()
+    for idx, row in enumerate(echo_trials):
+        if row.get("event") != "echo_trial":
+            raise ValueError(f"row {idx + 1} is not an echo_trial event")
+        trial_num = row.get("trial")
+        if type(trial_num) is not int or trial_num != idx:
+            raise ValueError(f"missing, duplicate or out-of-order trial: expected {idx}, got {trial_num!r}")
+        if trial_num in seen_trials:
+            raise ValueError(f"duplicate trial index: {trial_num}")
+        seen_trials.add(trial_num)
+
+        expected_nonce = f"echo_trial_{idx:04}"
+        nonce = row.get("nonce")
+        if nonce != expected_nonce:
+            raise ValueError(f"nonce mismatch in trial {trial_num}: expected {expected_nonce!r}, got {nonce!r}")
+
+        latency = row.get("latency_us")
+        if type(latency) is not int:
+            raise ValueError(f"non-integer latency in trial {trial_num}: {latency!r}")
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError(f"invalid latency value in trial {trial_num}: {latency}")
+        latencies.append(latency)
+
+    latencies.sort()
+    n = len(latencies)
+    if n != trials:
+        raise ValueError(f"trial count mismatch: expected {trials}, got {n}")
+    indep_p50 = nearest_rank_percentile(latencies, 0.50)
+    indep_p90 = nearest_rank_percentile(latencies, 0.90)
+    indep_p95 = nearest_rank_percentile(latencies, 0.95)
+    indep_p99 = nearest_rank_percentile(latencies, 0.99)
+
+    if indep_p99 > p99_budget:
+        raise ValueError(f"independently computed p99 echo latency {indep_p99} us exceeds budget {p99_budget} us")
+
+    complete = rows[-1]
+    if complete.get("event") != "complete" or complete.get("status") != "passed" or complete.get("arm") != "echo":
+        raise ValueError("incomplete, unpassed, or mismatched terminal measurement event")
+    if complete.get("trials") != trials:
+        raise ValueError(f"complete event trials {complete.get('trials')} does not match contract {trials}")
+
+    start_bytes = complete.get("start_bytes")
+    if type(start_bytes) is not int or start_bytes < 0:
+        raise ValueError(f"invalid start_bytes in complete event: {start_bytes!r}")
+    end_bytes = complete.get("end_bytes")
+    if type(end_bytes) is not int or end_bytes < start_bytes:
+        raise ValueError(f"invalid end_bytes in complete event: {end_bytes!r}")
+
+    bytes_ingested = complete.get("bytes_ingested")
+    if type(bytes_ingested) is not int or bytes_ingested != (end_bytes - start_bytes) or bytes_ingested < 10 * 1024 * 1024:
+        raise ValueError(f"invalid bytes_ingested {bytes_ingested!r} in complete event (expected {end_bytes - start_bytes}, >= 10 MiB)")
+
+    duration_s = complete.get("duration_seconds")
+    if type(duration_s) not in (int, float) or not math.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError(f"invalid duration in complete event: {duration_s!r}")
+
+    indep_throughput_bytes_s = bytes_ingested / duration_s
+    indep_throughput_mb_s = indep_throughput_bytes_s / (1024.0 * 1024.0)
+    if not math.isfinite(indep_throughput_mb_s) or indep_throughput_mb_s < 10.0:
+        raise ValueError(f"independently computed throughput {indep_throughput_mb_s:.2f} MB/s below 10.0 MB/s requirement")
+
+    client_p99 = complete.get("p99_echo_us")
+    if type(client_p99) is not int or client_p99 != indep_p99:
+        raise ValueError(f"client self-reported p99 ({client_p99}) does not match independently computed p99 ({indep_p99})")
+    client_tp = complete.get("throughput_mb_s")
+    if type(client_tp) not in (int, float) or not math.isfinite(client_tp) or client_tp <= 0 or abs(client_tp - indep_throughput_mb_s) > 0.01:
+        raise ValueError(f"client self-reported throughput ({client_tp!r}) does not match independently computed throughput ({indep_throughput_mb_s:.2f})")
+
+    if fixture_receipt is not None:
+        if fixture_receipt.get("arm") != "echo" or fixture_receipt.get("status") != "completed":
+            raise ValueError("fixture receipt status is not completed")
+        if fixture_receipt.get("actual_stream_bytes") != bytes_ingested:
+            raise ValueError(
+                f"fixture recorded bytes {fixture_receipt.get('actual_stream_bytes')} "
+                f"mismatches client ingested bytes {bytes_ingested}"
+            )
+        if fixture_receipt.get("probes_served") != trials:
+            raise ValueError(
+                f"fixture probes served {fixture_receipt.get('probes_served')} "
+                f"mismatches client trials {trials}"
+            )
+        if fixture_receipt.get("stream_bytes_start") != start_bytes:
+            raise ValueError(
+                f"fixture stream_bytes_start {fixture_receipt.get('stream_bytes_start')} "
+                f"mismatches client start_bytes {start_bytes}"
+            )
+        if fixture_receipt.get("stream_bytes_end") != end_bytes:
+            raise ValueError(
+                f"fixture stream_bytes_end {fixture_receipt.get('stream_bytes_end')} "
+                f"mismatches client end_bytes {end_bytes}"
+            )
+        if fixture_receipt.get("actual_stream_bytes") != (fixture_receipt.get("stream_bytes_end") - fixture_receipt.get("stream_bytes_start")):
+            raise ValueError("fixture actual_stream_bytes does not equal stream_bytes_end - stream_bytes_start")
+        start_ns = fixture_receipt.get("stream_start_ns")
+        end_ns = fixture_receipt.get("stream_end_ns")
+        if type(start_ns) is not int or type(end_ns) is not int or start_ns <= 0 or end_ns <= start_ns:
+            raise ValueError(f"invalid fixture stream timestamps: start_ns={start_ns}, end_ns={end_ns}")
+        fixture_dur_s = (end_ns - start_ns) / 1e9
+        fixture_tp = (bytes_ingested / fixture_dur_s) / (1024.0 * 1024.0)
+        if not math.isfinite(fixture_tp) or fixture_tp < 10.0:
+            raise ValueError(f"fixture independently measured throughput {fixture_tp:.2f} MB/s below 10.0 MB/s requirement")
+
+
 def measure(args):
     """Run the bounded client against a newly created Linux-only mux instance."""
     if not pathlib.Path("/proc/self/stat").exists():
@@ -391,9 +744,11 @@ def measure(args):
         env[f"XDG_{kind}_HOME" if kind != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(root / kind.lower())
     script = pathlib.Path(__file__).resolve()
     argv = [str(binaries[1]), "--config-file", str(config_path), "--daemonize=false",
-            "--cwd", str(root), "--", sys.executable, str(script), "run",
-            "--corpus", str(corpus_path), "--owner", str(root / "pane-owner.json"),
-            "--timeout-seconds", "900"]
+            "--cwd", str(root), "--", sys.executable, str(script), "run"]
+    if getattr(args, "arm", "resize") == "echo":
+        argv.extend(["--arm", "echo"])
+    argv.extend(["--corpus", str(corpus_path), "--owner", str(root / "pane-owner.json"),
+                 "--timeout-seconds", "900"])
     owned = OwnedProcesses()
     server = None
     receipt = {"status": "failed", "scope": "private remote-host Unix socket only",
@@ -403,6 +758,8 @@ def measure(args):
                "binary_sha256": {str(p): file_sha256(p)
                                   for p in [*binaries, client]},
                "fixture_sha256": file_sha256(script)}
+    if getattr(args, "arm", "resize") == "echo":
+        receipt["arm"] = "echo"
     write_new(root / "env.json", json.dumps(receipt, indent=2) + "\n")
     try:
         with (root / "mux.stdout").open("xb") as stdout, (root / "mux.stderr").open("xb") as stderr:
@@ -436,16 +793,24 @@ def measure(args):
             raise TimeoutError("owned mux and corpus startup deadline expired")
         owner = json.loads((root / "pane-owner.json").read_text())
         ready = json.loads((root / "pane-owner.json.ready").read_text())
-        expected_digest = file_sha256(corpus_path)
-        if owner.get("corpus_sha256") != expected_digest or ready.get("corpus_sha256") != expected_digest:
-            raise RuntimeError("fixture readiness/corpus receipt mismatch")
+        if getattr(args, "arm", "resize") == "echo":
+            if owner.get("arm") != "echo" or ready.get("arm") != "echo":
+                raise RuntimeError("fixture readiness/echo receipt mismatch")
+        else:
+            expected_digest = file_sha256(corpus_path)
+            if owner.get("corpus_sha256") != expected_digest or ready.get("corpus_sha256") != expected_digest:
+                raise RuntimeError("fixture readiness/corpus receipt mismatch")
         owned.remember_descendants()
         receipt["fixture_custody"] = owned.require_fixture(owner, server.pid, binaries[2].resolve())
         receipt["owned_process_identities"] = list(owned.identities.values())
         write_new(root / "custody.json", json.dumps(receipt["fixture_custody"], indent=2) + "\n")
         write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
-        client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
-                       str(panes[0]["tab_id"]), str(corpus_path), "20"]
+        if getattr(args, "arm", "resize") == "echo":
+            client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
+                           str(panes[0]["tab_id"]), str(corpus_path), "1000", "echo"]
+        else:
+            client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
+                           str(panes[0]["tab_id"]), str(corpus_path), "20"]
         receipt["client_argv"] = client_argv
         with (root / "trials.jsonl").open("xb") as stdout, (root / "client.stderr").open("xb") as stderr:
             trial = subprocess.run(client_argv, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=600)
@@ -457,9 +822,40 @@ def measure(args):
         rows = [json.loads(line) for line in trace_bytes.splitlines()]
         if trial.returncode != 0:
             raise RuntimeError("real mux baseline client failed")
-        validate_measurements(rows, args.profile_phases)
-        receipt["status"] = "passed"
-        receipt["samples"] = 80
+        if getattr(args, "arm", "resize") == "echo":
+            receipt_file = root / "pane-owner.json.final"
+            deadline = time.monotonic() + 5.0
+            fixture_receipt = None
+            last_err = None
+            while time.monotonic() < deadline:
+                if receipt_file.exists():
+                    try:
+                        content = receipt_file.read_text()
+                        if content.strip():
+                            fixture_receipt = json.loads(content)
+                            break
+                    except (json.JSONDecodeError, OSError) as e:
+                        last_err = e
+                time.sleep(0.05)
+            if fixture_receipt is None:
+                raise RuntimeError(f"fixture final receipt missing or invalid after 5s deadline: {last_err}")
+            validate_echo_measurements(rows, fixture_receipt)
+            receipt["fixture_actual_stream_bytes"] = fixture_receipt["actual_stream_bytes"]
+            receipt["fixture_bytes_written"] = fixture_receipt["bytes_written"]
+            receipt["fixture_probes_served"] = fixture_receipt["probes_served"]
+            receipt["fixture_stream_bytes_start"] = fixture_receipt["stream_bytes_start"]
+            receipt["fixture_stream_bytes_end"] = fixture_receipt["stream_bytes_end"]
+            receipt["start_bytes"] = rows[-1]["start_bytes"]
+            receipt["end_bytes"] = rows[-1]["end_bytes"]
+            receipt["throughput_mb_s"] = rows[-1]["throughput_mb_s"]
+            receipt["bytes_ingested"] = rows[-1]["bytes_ingested"]
+            receipt["p99_echo_us"] = rows[-1]["p99_echo_us"]
+            receipt["samples"] = rows[-1]["trials"]
+            receipt["status"] = "passed"
+        else:
+            validate_measurements(rows, args.profile_phases)
+            receipt["status"] = "passed"
+            receipt["samples"] = 80
     except Exception as error:
         receipt["error"] = f"{type(error).__name__}: {error}"
         raise
@@ -477,6 +873,8 @@ def main():
     parser.add_argument("--bin-dir")
     parser.add_argument("--client")
     parser.add_argument("--artifact-dir")
+    parser.add_argument("--arm", choices=("resize", "echo"), default="resize",
+                        help="diagnostic arm: default resize or opt-in echo (ft-4p4uo)")
     parser.add_argument("--profile-phases", action="store_true",
                         help="instrumentation arm only; emit sampler-clock phase intervals")
     parser.add_argument("--records", type=int, default=10000)
