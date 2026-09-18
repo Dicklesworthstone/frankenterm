@@ -199,10 +199,24 @@ mod measured {
             let (records, suffix) = joined
                 .split_once(&self.ready)
                 .context("missing corpus ready marker")?;
-            ensure!(
-                records == self.expected,
-                "exact ordered Unicode/whitespace corpus differs"
-            );
+            if records != self.expected {
+                let first_difference = records
+                    .bytes()
+                    .zip(self.expected.bytes())
+                    .take_while(|(actual, expected)| actual == expected)
+                    .count();
+                let start = first_difference.saturating_sub(32);
+                let actual_end = first_difference.saturating_add(96).min(records.len());
+                let expected_end = first_difference.saturating_add(96).min(self.expected.len());
+                bail!(
+                    "exact ordered Unicode/whitespace corpus differs: first_byte={first_difference} \
+                     expected_bytes={} actual_bytes={} expected_context={:?} actual_context={:?}",
+                    self.expected.len(),
+                    records.len(),
+                    String::from_utf8_lossy(&self.expected.as_bytes()[start..expected_end]),
+                    String::from_utf8_lossy(&records.as_bytes()[start..actual_end]),
+                );
+            }
             // Only known fixture responses may follow the corpus, never another record.
             let mut suffix = suffix.trim_end_matches(' ');
             while !suffix.is_empty() {
