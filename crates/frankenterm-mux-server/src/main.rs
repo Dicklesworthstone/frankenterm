@@ -379,7 +379,8 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     };
     Mux::set_mux(&mux);
 
-    let executor = promise::spawn::SimpleExecutor::new();
+    let executor = promise::spawn::SimpleExecutor::with_io_runtime()
+        .context("initialize headless mux I/O reactor")?;
 
     let dispatch_config = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::production(
         opts.dispatch_io_backend.into(),

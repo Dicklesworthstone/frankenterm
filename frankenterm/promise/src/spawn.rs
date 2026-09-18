@@ -2241,6 +2241,14 @@ impl SimpleExecutorQueue {
     }
 }
 
+#[cfg(feature = "async-asupersync")]
+struct SimpleExecutorIo {
+    context: asupersync::Cx,
+    // Keep the driver alive until all owner-thread tasks and registrations
+    // have retired. A dedicated worker must keep polling while tick parks.
+    _runtime: asupersync::runtime::Runtime,
+}
+
 pub struct SimpleExecutor {
     queue: Arc<SimpleExecutorQueue>,
     binding: Arc<MainThreadSchedulerBinding>,
@@ -2249,6 +2257,8 @@ pub struct SimpleExecutor {
     // another thread would make polling or cancellation happen on the wrong
     // thread, so preserve that contract in the type system.
     _owner_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
+    #[cfg(feature = "async-asupersync")]
+    io: Option<SimpleExecutorIo>,
 }
 
 impl Default for SimpleExecutor {
@@ -2258,6 +2268,22 @@ impl Default for SimpleExecutor {
 }
 
 impl SimpleExecutor {
+    /// Own a reactor for headless dispatch while polling local tasks only on
+    /// this executor's owner thread. Existing ambient authority is preserved.
+    #[cfg(feature = "async-asupersync")]
+    pub fn with_io_runtime() -> Result<Self> {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()?;
+        let context = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let mut executor = Self::new();
+        executor.io = Some(SimpleExecutorIo {
+            context,
+            _runtime: runtime,
+        });
+        Ok(executor)
+    }
+
     pub fn new() -> Self {
         let limits = MainThreadAdmissionLimits::new(
             SIMPLE_EXECUTOR_TASK_CAPACITY,
@@ -2311,6 +2337,8 @@ impl SimpleExecutor {
             binding,
             owner_thread: std::thread::current().id(),
             _owner_affinity: std::marker::PhantomData,
+            #[cfg(feature = "async-asupersync")]
+            io: None,
         })
     }
 
@@ -2343,7 +2371,7 @@ impl SimpleExecutor {
     pub fn tick(&self) -> anyhow::Result<()> {
         self.ensure_owner_thread()?;
         if let Some(func) = self.queue.pop_until_idle_poll() {
-            func();
+            self.run_callback(func);
         }
         Ok(())
     }
@@ -2356,11 +2384,23 @@ impl SimpleExecutor {
     pub fn try_tick(&self) -> anyhow::Result<bool> {
         self.ensure_owner_thread()?;
         if let Some(func) = self.queue.try_pop() {
-            func();
+            self.run_callback(func);
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    fn run_callback(&self, func: SpawnFunc) {
+        #[cfg(feature = "async-asupersync")]
+        let _context = self.io.as_ref().and_then(|io| {
+            if asupersync::Cx::current().is_none() {
+                Some(asupersync::Cx::set_current(Some(io.context.clone())))
+            } else {
+                None
+            }
+        });
+        func();
     }
 }
 
@@ -4016,6 +4056,8 @@ mod tests {
             binding: Arc::clone(&binding),
             owner_thread: owner,
             _owner_affinity: std::marker::PhantomData,
+            #[cfg(feature = "async-asupersync")]
+            io: None,
         };
         struct Parked {
             waker: Arc<Mutex<Option<std::task::Waker>>>,
@@ -4663,6 +4705,146 @@ mod tests {
         let _exec = SimpleExecutor::new();
         // The constructor should mark scheduler as configured
         assert!(is_scheduler_configured());
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    #[test]
+    fn simple_executor_io_reactor_wakes_parked_owner_for_real_socket() {
+        use std::io::{Read, Write};
+
+        struct ForwardWake {
+            task: std::task::Waker,
+            observed: std::sync::mpsc::Sender<()>,
+        }
+        impl std::task::Wake for ForwardWake {
+            fn wake(self: Arc<Self>) {
+                self.task.wake_by_ref();
+                let _ = self.observed.send(());
+            }
+        }
+
+        let _lock = TEST_LOCK.lock().unwrap();
+        assert!(asupersync::Cx::current().is_none());
+        let exec = SimpleExecutor::with_io_runtime().unwrap();
+        let owner = std::thread::current().id();
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let (woke, wake) = std::sync::mpsc::channel();
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed = std::rc::Rc::clone(&done);
+        let mut registration = None;
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 1024) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected socket task admission: {:?}", other),
+        };
+        reservation
+            .spawn_local(async move {
+                std::future::poll_fn(|cx| {
+                    assert_eq!(std::thread::current().id(), owner);
+                    let current = asupersync::Cx::current().expect("owner task I/O context");
+                    let mut byte = [0];
+                    match reader.read(&mut byte) {
+                        Ok(1) => {
+                            assert_eq!(byte, [b'x']);
+                            registration.take();
+                            completed.set(true);
+                            Poll::Ready(())
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            let watch = current
+                                .register_io(&reader, asupersync::runtime::Interest::READABLE)
+                                .unwrap();
+                            assert!(watch.update_waker(std::task::Waker::from(Arc::new(
+                                ForwardWake {
+                                    task: cx.waker().clone(),
+                                    observed: woke.clone(),
+                                },
+                            ))));
+                            registration = Some(watch);
+                            Poll::Pending
+                        }
+                        other => panic!("unexpected socket result: {:?}", other),
+                    }
+                })
+                .await;
+            })
+            .detach();
+        assert!(exec.try_tick().unwrap());
+        assert!(!done.get());
+        assert!(asupersync::Cx::current().is_none());
+        writer.write_all(b"x").unwrap();
+        // Do not tick/poll the owner until the actual reactor wakes it. This
+        // cannot pass through a manual retry loop or the UDS fallback timer.
+        wake.recv_timeout(Duration::from_secs(5))
+            .expect("reactor must wake the parked owner without polling");
+        assert!(exec.try_tick().unwrap());
+        assert!(done.get());
+        assert!(asupersync::Cx::current().is_none());
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    #[test]
+    fn simple_executor_io_preserves_existing_restricted_context() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = SimpleExecutor::with_io_runtime().unwrap();
+        let existing = asupersync::Cx::detached_cancel_context();
+        let expected_task = existing.task_id();
+        let _context = existing.set_current_restricted();
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed = std::rc::Rc::clone(&done);
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 1024) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected context task admission: {:?}", other),
+        };
+        reservation
+            .spawn_local(async move {
+                let current = asupersync::Cx::current().unwrap();
+                assert_eq!(current.task_id(), expected_task);
+                assert!(!current.capabilities().io);
+                completed.set(true);
+            })
+            .detach();
+        assert!(exec.try_tick().unwrap());
+        assert!(done.get());
+        assert_eq!(asupersync::Cx::current().unwrap().task_id(), expected_task);
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    #[test]
+    fn simple_executor_io_retires_pending_socket_on_owner_before_runtime() {
+        struct OnDrop(std::rc::Rc<std::cell::Cell<Option<ThreadId>>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.set(Some(std::thread::current().id()));
+            }
+        }
+
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = SimpleExecutor::with_io_runtime().unwrap();
+        let owner = std::thread::current().id();
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(None));
+        let retired = OnDrop(std::rc::Rc::clone(&dropped));
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 1024) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected pending socket admission: {:?}", other),
+        };
+        reservation
+            .spawn_local(async move {
+                let _retired = retired;
+                let current = asupersync::Cx::current().expect("owner task I/O context");
+                let _registration = current
+                    .register_io(&reader, asupersync::runtime::Interest::READABLE)
+                    .unwrap();
+                std::future::pending::<()>().await;
+            })
+            .detach();
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(dropped.get(), None);
+        drop(exec);
+        assert_eq!(dropped.get(), Some(owner));
+        assert!(asupersync::Cx::current().is_none());
     }
 
     // ── spawn_into_new_thread captured variables ────────────
