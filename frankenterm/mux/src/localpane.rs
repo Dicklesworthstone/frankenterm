@@ -3830,6 +3830,9 @@ impl LocalPane {
                 .map(|result| recover_resize_apply_error(resize_queue.as_ref(), pending, result));
             if matches!(&settled_apply_result, Ok(Ok(metrics)) if !metrics.cancelled) {
                 if let Some(registration) = pending_registration {
+                    // Reconcile primary committed size before cold preparation waits,
+                    // covering required primary completion with its pre-admitted permit.
+                    Self::schedule_resize_completion(&resize_queue, token, registration.clone());
                     if allow_cold_preparation {
                         Self::prepare_cold_layout_after_resize(
                             pane_id,
@@ -3839,10 +3842,6 @@ impl LocalPane {
                             token,
                             registration,
                         );
-                    } else {
-                        // The inline spawn-failure fallback skips expensive
-                        // history preparation, never the committed-size wakeup.
-                        Self::schedule_resize_completion(&resize_queue, token, registration);
                     }
                 }
             }
@@ -4073,77 +4072,96 @@ impl LocalPane {
                 if settled.is_none() {
                     return Ok(false);
                 }
-                let Some(plan) = retry_cold_resize_step("index_capture", &cancelled, || {
-                    registration
-                        .try_with_current(|_| -> anyhow::Result<_> {
-                            let Some(term) = terminal.try_lock() else {
-                                return Ok(None);
-                            };
-                            let screen = term.screen();
-                            // Capture clamps this one-row request to the
-                            // oldest reachable visual row using one coherent
-                            // interval. A separate top-row probe can mistake
-                            // Busy metadata for an empty cold tier.
-                            let plan = screen
-                                .capture_line_read(StableRowIndex::MIN..StableRowIndex::MIN + 1)?;
-                            if plan.first_row() >= screen.phys_to_stable_row_index(0) {
-                                return Ok(Some(None));
-                            }
-                            Ok(Some(Some(plan)))
-                        })
-                        .unwrap_or(Ok(None))
-                })?
-                .flatten() else {
-                    return Ok(false);
-                };
-                let mut prepared = plan.prepare_cold_layout(&cancelled)?;
-                let committed = retry_cold_resize_step("index_commit", &cancelled, || {
-                    registration
-                        .try_with_current(|_| {
-                            let Some(mut term) = terminal.try_lock() else {
-                                return Ok(None);
-                            };
-                            let (decision, _) =
-                                with_resize_commit_barrier(resize_queue, token, || {
-                                    if !term.screen().validates_prepared_cold_layout(&prepared)
-                                        || term.current_seqno() == SequenceNo::MAX
-                                    {
-                                        return Ok(false);
-                                    }
-                                    let changes_layout = term
-                                        .screen()
-                                        .prepared_cold_layout_changes_layout(&prepared);
-                                    let seqno = if changes_layout {
-                                        next_cold_resize_sequence(term.current_seqno())?
-                                    } else {
-                                        term.current_seqno()
-                                    };
-                                    if !term
-                                        .screen_mut()
-                                        .install_prepared_cold_layout(&mut prepared, seqno)
-                                    {
-                                        return Ok(false);
-                                    }
-                                    if changes_layout {
-                                        term.increment_seqno();
-                                    }
-                                    Self::publish_resize_source(
-                                        pane_id,
-                                        line_layout_observation,
-                                        &mut term,
-                                        token,
-                                        token.seq,
-                                        "cold_index",
-                                    );
-                                    Ok::<_, anyhow::Error>(true)
-                                });
-                            match decision {
-                                ResizeCommitDecision::Committed(result) => result.map(Some),
-                                ResizeCommitDecision::Superseded { .. } => Ok(None),
-                            }
-                        })
-                        .unwrap_or(Ok(None))
-                })? == Some(true);
+                let indexed = retry_cold_resize_step("index_recapture", &cancelled, || {
+                    let Some(plan) = retry_cold_resize_step("index_capture", &cancelled, || {
+                        registration
+                            .try_with_current(|_| -> anyhow::Result<_> {
+                                let Some(term) = terminal.try_lock() else {
+                                    return Ok(None);
+                                };
+                                let screen = term.screen();
+                                // Capture clamps this one-row request to the
+                                // oldest reachable visual row using one coherent
+                                // interval. A separate top-row probe can mistake
+                                // Busy metadata for an empty cold tier.
+                                let plan = screen.capture_line_read(
+                                    StableRowIndex::MIN..StableRowIndex::MIN + 1,
+                                )?;
+                                if plan.first_row() >= screen.phys_to_stable_row_index(0) {
+                                    return Ok(Some(None));
+                                }
+                                Ok(Some(Some(plan)))
+                            })
+                            .unwrap_or(Ok(None))
+                    })?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(plan) = plan else {
+                        return Ok(Some(false));
+                    };
+                    let mut prepared = plan.prepare_cold_layout(&cancelled)?;
+                    let installed = retry_cold_resize_step("index_commit", &cancelled, || {
+                        registration
+                            .try_with_current(|_| {
+                                let Some(mut term) = terminal.try_lock() else {
+                                    return Ok(None);
+                                };
+                                let (decision, _) =
+                                    with_resize_commit_barrier(resize_queue, token, || {
+                                        if term.current_seqno() == SequenceNo::MAX {
+                                            anyhow::bail!("cold index sequence exhausted");
+                                        }
+                                        if !term.screen().validates_prepared_cold_layout(&prepared)
+                                        {
+                                            return Ok(false);
+                                        }
+                                        let changes_layout = term
+                                            .screen()
+                                            .prepared_cold_layout_changes_layout(&prepared);
+                                        let seqno = if changes_layout {
+                                            next_cold_resize_sequence(term.current_seqno())?
+                                        } else {
+                                            term.current_seqno()
+                                        };
+                                        if !term
+                                            .screen_mut()
+                                            .install_prepared_cold_layout(&mut prepared, seqno)
+                                        {
+                                            return Ok(false);
+                                        }
+                                        if changes_layout {
+                                            term.increment_seqno();
+                                        }
+                                        Self::publish_resize_source(
+                                            pane_id,
+                                            line_layout_observation,
+                                            &mut term,
+                                            token,
+                                            token.seq,
+                                            "cold_index",
+                                        );
+                                        Ok::<_, anyhow::Error>(true)
+                                    });
+                                match decision {
+                                    ResizeCommitDecision::Committed(result) => result.map(Some),
+                                    ResizeCommitDecision::Superseded { .. } => Ok(None),
+                                }
+                            })
+                            .unwrap_or(Ok(None))
+                    })?;
+                    if installed == Some(true) {
+                        Ok(Some(true))
+                    } else {
+                        // The token may still be newest while output/pruning
+                        // changes its source or frontier. Retire this stale
+                        // payload here, then recapture exact current authority.
+                        // Unavailable metadata or decode errors remain finite failures.
+                        drop(prepared);
+                        Ok(None)
+                    }
+                })?;
+                let committed = indexed.unwrap_or(false);
                 // The preparation and displaced layout retire here on this
                 // worker, after both locks and before the global permit.
                 Ok(committed)
@@ -4180,12 +4198,14 @@ impl LocalPane {
         token: ResizeCancellationToken,
         registration: PaneRegistrationHandle,
     ) {
-        let reservation = {
+        let (reservation, reconcile_tab) = {
             let mut queue = resize_queue.lock();
             if queue.superseded_by(token).is_some() {
                 return;
             }
-            queue.completion_reservation.take()
+            let reservation = queue.completion_reservation.take();
+            let reconcile_tab = std::mem::replace(&mut queue.reconcile_tab_on_completion, false);
+            (reservation, reconcile_tab)
         };
         // Taking before this check also releases reserved capacity when the
         // pane retired during preparation. A newer intent retains its permit.
@@ -4196,13 +4216,13 @@ impl LocalPane {
         let make_future = move || async move {
             // Admission is not commit authority: a newer request can arrive
             // after this callback was queued. Never notify for that old intent.
-            let reconcile_tab = {
+            let superseded = {
                 let queue = resize_queue.lock();
-                if queue.superseded_by(token).is_some() {
-                    return;
-                }
-                queue.reconcile_tab_on_completion
+                queue.superseded_by(token).is_some()
             };
+            if superseded {
+                return;
+            }
             let _ = registration.try_with_current(|pane| {
                 if reconcile_tab {
                     pane.notify_resize_completed();
@@ -5148,6 +5168,48 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct ColdResizeTestChild {
+        exit: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl ChildKiller for ColdResizeTestChild {
+        fn kill(&mut self) -> IoResult<()> {
+            *self.exit.0.lock().unwrap() = true;
+            self.exit.1.notify_all();
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Child for ColdResizeTestChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            // Window publication legitimately prunes exited panes. Resize
+            // fixtures must represent a shell that is still running.
+            Ok(self
+                .exit
+                .0
+                .lock()
+                .unwrap()
+                .then_some(ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            let mut exited = self.exit.0.lock().unwrap();
+            while !*exited {
+                exited = self.exit.1.wait(exited).unwrap();
+            }
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
     fn cold_resize_fixture(
         witness_admission: bool,
     ) -> (
@@ -5175,9 +5237,7 @@ mod tests {
         let pane = Arc::new(LocalPane::new(
             719,
             term,
-            Box::new(KillCountingChild {
-                kills: Arc::new(AtomicUsize::new(0)),
-            }),
+            Box::new(ColdResizeTestChild::default()),
             Box::new(GuardianLifetimeTestMasterPty),
             Box::new(Vec::<u8>::new()),
             domain.domain_id(),
@@ -5426,7 +5486,10 @@ mod tests {
             assert_eq!(
                 tab.get_size(),
                 term_size(
-                    if matches!(case, "no_cold" | "unavailable" | "saturated" | "inline_fallback") {
+                    if matches!(
+                        case,
+                        "no_cold" | "unavailable" | "saturated" | "inline_fallback"
+                    ) {
                         3
                     } else {
                         4
@@ -5474,10 +5537,171 @@ mod tests {
                 queue.recover_failed_intent(pending, failure),
                 ResizeFailureRecovery::ExhaustedRetained { .. },
             ));
-            assert!(queue.pending.is_some(), "failed target must remain retained");
+            assert!(
+                queue.pending.is_some(),
+                "failed target must remain retained"
+            );
             assert!(queue.completion_reservation.is_none());
             assert_eq!(executor.admission_snapshot().active_tasks, 0);
         }
+    }
+
+    #[test]
+    fn tab_geometry_completion_dispatches_while_cold_preparation_is_gated() {
+        const CHILD: &str = "FT_RESIZE_COMPLETION_GATED_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "localpane::tests::tab_geometry_completion_dispatches_while_cold_preparation_is_gated",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "notification subprocess failed: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "notification subprocess exceeded watchdog: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(8, 128 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        let (pane, mux, _registration, sink, token) = cold_resize_fixture(false);
+
+        let tab = Arc::new(crate::tab::Tab::new(&term_size(4, 2)));
+        mux.add_tab_no_panes(&tab).unwrap();
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window).unwrap();
+        drop(window);
+        let dynamic_pane: Arc<dyn Pane> = pane.clone();
+        tab.assign_pane(&dynamic_pane);
+        assert_eq!(tab.get_size(), term_size(4, 2));
+
+        // Settle cold seam first so read_gate cleanly isolates cold index preparation
+        let seam = {
+            let term = pane.terminal.lock();
+            term.screen().capture_cold_seam_reflow().unwrap().unwrap()
+        };
+        let mut seam = seam.hydrate(|| false).unwrap();
+        {
+            let mut term = pane.terminal.lock();
+            let seqno = next_cold_resize_sequence(term.current_seqno()).unwrap();
+            assert!(term
+                .screen_mut()
+                .install_cold_seam_reflow(&mut seam, seqno)
+                .unwrap());
+            term.increment_seqno();
+            assert!(LocalPane::publish_resize_source(
+                pane.pane_id(),
+                &pane.line_layout_observation,
+                &mut term,
+                token,
+                token.seq,
+                "cold_seam",
+            ));
+        }
+        drop(seam);
+
+        // Queue a remote resize to (3, 2). The fixture already owns worker admission,
+        // so this queues a real remote intent without creating another OS thread.
+        pane.resize_from_remote(term_size(3, 2)).unwrap();
+        assert!(pane.resize_queue.lock().completion_reservation.is_some());
+        assert!(pane.resize_queue.lock().reconcile_tab_on_completion);
+
+        // Gate cold preparation via sink.read_gate
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        *sink.read_gate.lock() = Some((entered_tx, release_rx));
+
+        // Spawn worker running actual run_resize_worker with gated cold preparation
+        let target = Arc::clone(&pane);
+        let (worker_done_tx, worker_done_rx) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            LocalPane::run_resize_worker(
+                target.pane_id(),
+                Arc::clone(&target.terminal),
+                Arc::clone(&target.line_layout_observation),
+                #[cfg(feature = "disruptor-pane-io")]
+                Arc::clone(&target.action_ring),
+                Arc::clone(&target.pty),
+                Arc::clone(&target.resize_queue),
+                Arc::clone(&target.mux_registration),
+                true,
+            );
+            worker_done_tx.send(()).unwrap();
+        });
+
+        // Worker enters cold preparation and suspends on read_gate
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        assert!(entered.is_ok(), "worker must enter gated cold preparation");
+
+        // Worker is still suspended; cold preparation has NOT completed
+        assert!(
+            worker_done_rx.try_recv().is_err(),
+            "worker must still be suspended in cold preparation"
+        );
+
+        // Causal check: tab geometry completion has already been dispatched to the executor
+        let mut dispatched = 0;
+        while executor.try_tick().unwrap() {
+            dispatched += 1;
+            assert!(dispatched <= 32);
+        }
+        assert!(
+            dispatched > 0,
+            "tab geometry completion must dispatch while cold preparation is gated"
+        );
+
+        // Tab size is now reconciled to (3, 2) WHILE worker is still suspended in cold preparation
+        assert_eq!(
+            tab.get_size(),
+            term_size(3, 2),
+            "tab geometry must be reconciled while cold preparation is still gated"
+        );
+
+        // Pre-admitted permit was consumed
+        assert!(pane.resize_queue.lock().completion_reservation.is_none());
+
+        // Worker remains suspended until gate is released
+        assert!(
+            worker_done_rx.try_recv().is_err(),
+            "worker must remain suspended until gate is released"
+        );
+
+        // Release gate and join worker
+        let _ = release_tx.send(());
+        let worker_finished = worker_done_rx.recv_timeout(Duration::from_secs(5));
+        worker.join().unwrap();
+        worker_finished.unwrap();
+
+        // Drain any remaining cold-ready wakeups
+        while executor.try_tick().unwrap() {}
     }
 
     #[test]
@@ -5656,6 +5880,118 @@ mod tests {
             cold_resize_read_all(&pane).unwrap(),
             "abcdZfgh\none\n\n",
             "old hydrated cells must not overwrite the current source or strand its seam"
+        );
+    }
+
+    #[test]
+    fn cold_resize_recaptures_when_output_scrolls_frontier_during_index_preparation() {
+        let (pane, _mux, registration, sink, token) = cold_resize_fixture(false);
+        // Settle the cold seam first so the read gate isolates index preparation.
+        let seam = {
+            let term = pane.terminal.lock();
+            term.screen().capture_cold_seam_reflow().unwrap().unwrap()
+        };
+        let mut seam = seam.hydrate(|| false).unwrap();
+        {
+            let mut term = pane.terminal.lock();
+            let seqno = next_cold_resize_sequence(term.current_seqno()).unwrap();
+            assert!(term
+                .screen_mut()
+                .install_cold_seam_reflow(&mut seam, seqno)
+                .unwrap());
+            term.increment_seqno();
+            assert!(LocalPane::publish_resize_source(
+                pane.pane_id(),
+                &pane.line_layout_observation,
+                &mut term,
+                token,
+                token.seq,
+                "cold_seam",
+            ));
+        }
+        drop(seam);
+
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        *sink.read_gate.lock() = Some((entered_tx, release_rx));
+        let target = Arc::clone(&pane);
+        let (done_tx, done_rx) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            LocalPane::prepare_cold_layout_after_resize(
+                target.pane_id(),
+                &target.terminal,
+                &target.line_layout_observation,
+                &target.resize_queue,
+                token,
+                registration,
+            );
+            done_tx.send(()).unwrap();
+        });
+
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        assert!(entered.is_ok(), "worker must enter index preparation");
+
+        // Worker is now suspended in prepare_cold_layout having captured the
+        // initial plan at the old resident frontier.
+        let frontier_before = pane.terminal.lock().screen().phys_to_stable_row_index(0);
+
+        // Prepare a sample layout at this old frontier to verify that moving
+        // the frontier deterministically invalidates it.
+        let probe_plan = {
+            let term = pane.terminal.lock();
+            term.screen()
+                .capture_line_read(StableRowIndex::MIN..StableRowIndex::MIN + 1)
+                .unwrap()
+        };
+        let probe_prepared = probe_plan.prepare_cold_layout(|| false).unwrap();
+        assert!(
+            pane.terminal
+                .lock()
+                .screen()
+                .validates_prepared_cold_layout(&probe_prepared),
+            "layout prepared at current frontier must initially validate"
+        );
+
+        // Advance bytes to write output and cause scrolling, which evicts physical row 0
+        // into the spill sink and advances phys_to_stable_row_index(0).
+        {
+            let mut term = pane.terminal.lock();
+            term.advance_bytes(b"two\r\n");
+        }
+
+        let frontier_after = pane.terminal.lock().screen().phys_to_stable_row_index(0);
+        assert!(
+            frontier_after > frontier_before,
+            "output scroll must advance resident cold frontier"
+        );
+
+        // Negative check: prove that the layout prepared at the old frontier
+        // fails validation now that the screen's resident frontier has moved.
+        assert!(
+            !pane
+                .terminal
+                .lock()
+                .screen()
+                .validates_prepared_cold_layout(&probe_prepared),
+            "layout prepared at stale frontier must be rejected by validates_prepared_cold_layout"
+        );
+
+        // Positive check: release the worker to complete the first pass (which
+        // fails commit validation on the stale layout) and recapture with the
+        // new frontier.
+        let _ = release_tx.send(());
+        let settled = done_rx.recv_timeout(Duration::from_secs(5));
+        if settled.is_err() {
+            pane.resize_queue.lock().next_seq += 1;
+        }
+        worker.join().unwrap();
+        settled.unwrap();
+
+        assert_eq!(pane.resize_queue.lock().next_seq, token.seq);
+        assert_eq!(
+            cold_resize_read_all(&pane).unwrap(),
+            "abcdefgh\none\ntwo\n\n",
+            "recaptured cold layout must install successfully and permit exact full-history reads"
         );
     }
 
