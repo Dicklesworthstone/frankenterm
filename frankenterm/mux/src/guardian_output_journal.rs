@@ -1845,6 +1845,7 @@ pub struct GuardianOutputRecoveryCursor {
     expected_next_sequence: Option<u64>,
     expected_terminal_receipt: Option<GuardianOutputAppendReceipt>,
     expected_authenticated_prefix_digest: [u8; 32],
+    #[cfg(unix)]
     file_header_digest: [u8; 32],
     tail: GuardianOutputJournalTail,
     offset: u64,
@@ -3156,6 +3157,7 @@ impl GuardianOutputJournal {
             expected_next_sequence: self.next_sequence,
             expected_terminal_receipt: self.terminal_receipt,
             expected_authenticated_prefix_digest: self.authenticated_prefix_digest,
+            #[cfg(unix)]
             file_header_digest: initial_authenticated_prefix_digest,
             tail: self.tail,
             offset: FILE_HEADER_BYTES_U64,
