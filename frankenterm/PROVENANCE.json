@@ -154,7 +154,7 @@
       "classification_summary": {
         "chore": 2,
         "cleanup": 2,
-        "cosmetic": 19,
+        "cosmetic": 20,
         "feat": 53,
         "fix": 99,
         "other": 17,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 34
       },
-      "fork_side_commit_count": 239,
+      "fork_side_commit_count": 240,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-18T02:45:43-04:00",
-        "sha": "8b75335ddd2c1c4c77944b3ab08e1be96cedbe34",
-        "subject": "fix(client): reconcile remote geometry and drain executor tasks safely"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-18T03:27:44-04:00",
+        "sha": "f641252422104be1f327da7ac140fa989ac9fa66",
+        "subject": "style(client): order pane re-exports for pinned rustfmt"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2747,
-  "generated_at": "2026-09-18T06:56:42.023575Z",
+  "fork_side_commit_total": 2748,
+  "generated_at": "2026-09-18T07:28:17.502212Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
