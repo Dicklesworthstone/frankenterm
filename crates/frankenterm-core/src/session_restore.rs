@@ -52,19 +52,21 @@ use crate::mux_recovery_image::{
 use crate::mux_recovery_image::{
     MUX_RECOVERY_IMAGE_MAGIC, MUX_RECOVERY_IMAGE_SCHEMA_VERSION, PaneCheckpointBinding,
     ParserCaptureIdentity, RecoveryDomain, RecoveryObjectRef, RecoverySplitNode, RecoveryTab,
-    RecoveryWindow, SplitDirectionAndSize, TerminalSize,
+    RecoveryWindow, TerminalSize,
 };
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use crate::mux_recovery_image::SplitDirectionAndSize;
 #[cfg(any(test, feature = "frankenterm-deps"))]
 use crate::mux_recovery_image::{RecoveryImageHeader, RecoveryTopology};
 #[cfg(test)]
-use crate::snapshot_publication::{
-    GenerationRootPublishRequest, PredecessorBinding, RecoveryObjectPayload, RootSlot, sha256_hex,
-};
+use crate::snapshot_publication::{RecoveryObjectPayload, RootSlot, sha256_hex};
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use crate::snapshot_publication::{GenerationRootPublishRequest, PredecessorBinding};
 use crate::snapshot_publication::{
     PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
     VerifiedRootSelection,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "frankenterm-deps"))]
 use crate::snapshot_repair::RepairProtectionClass;
 use crate::snapshot_repair::{
     AuthenticatedRepairSymbol, EncodedRepairBundle, ExpectedRecoveryIdentity,
