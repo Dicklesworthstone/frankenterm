@@ -52,8 +52,12 @@
 //! `FT_LINDLEY_MUX_SOCKET`, `FT_LINDLEY_PANE_ID`, a NEW
 //! `FT_LINDLEY_DB_PATH`, `FT_RELEASE_VERSION`, `FT_LINDLEY_SOURCE_SHA`, and
 //! `FT_LINDLEY_ARRIVAL_RATE_EVENTS_PER_MS` (for example 0.1, declared before
-//! measuring). `FT_WEZTERM_CLI` must name the same candidate CLI if the normal
-//! read-only fallback is needed. The example never creates or discovers panes.
+//! measuring). The primary path uses the explicit vendored mux connection.
+//! If the read-only CLI fallback is needed, `FT_WEZTERM_CLI` must name a
+//! candidate-compatible WezTerm-style CLI such as `frankenterm-gui`; the `ft`
+//! control-plane binary does not implement `cli get-text`. Without a compatible
+//! CLI, fallback must fail rather than being counted as qualified measurement.
+//! The example never creates or discovers panes.
 //! Invoke through `scripts/lindley-bounds-build.sh --measure-live-executable
 //! <this-example-binary>`: its external process watchdog bounds initialization,
 //! synchronous file writes and shutdown, which cooperative async timers cannot.

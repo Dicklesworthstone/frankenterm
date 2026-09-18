@@ -3734,7 +3734,8 @@ fn ensure_durable_parent_chain(path: &Path) -> std::result::Result<(), RecorderS
         let meta = child_dir.dir_metadata()?;
         if !meta.is_dir() {
             return Err(invalid_recorder_path(format!(
-                "ancestor component {name:?} is not a directory"
+                "ancestor component {} is not a directory",
+                name.display()
             )));
         }
         dir_chain.push(child_dir);

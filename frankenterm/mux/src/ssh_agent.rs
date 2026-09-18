@@ -66,6 +66,14 @@ fn update_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> anyho
     let original = original.as_ref();
     let link = link.as_ref();
 
+    // A GUI attaching to an explicit mux socket can reach this path before
+    // anything else creates the default runtime directory. Validate the
+    // private parent before either publishing or replacing the agent link.
+    config::create_user_owned_dirs(
+        link.parent()
+            .context("SSH agent proxy link has no parent directory")?,
+    )?;
+
     match symlink_file(original, link) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -238,6 +246,45 @@ impl AgentProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_link_creates_private_parent_and_updates_target() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let original = root.join("original.sock");
+        let successor = root.join("successor.sock");
+        let _original_listener = UnixListener::bind(&original).unwrap();
+        let _successor_listener = UnixListener::bind(&successor).unwrap();
+        let parent = root.join("missing/runtime");
+        let link = parent.join("agent.1");
+
+        update_symlink(&original, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        update_symlink(&successor, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), successor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_link_rejects_symlink_parent_without_publishing() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let real_parent = root.join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let alias = root.join("alias");
+        symlink_file(&real_parent, &alias).unwrap();
+
+        assert!(update_symlink(root.join("original.sock"), alias.join("agent.1")).is_err());
+        assert!(std::fs::symlink_metadata(real_parent.join("agent.1")).is_err());
+        assert_eq!(std::fs::read_link(&alias).unwrap(), real_parent);
+    }
 
     #[test]
     fn proxy_timestamp_bias_does_not_overflow() {
