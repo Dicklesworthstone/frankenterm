@@ -23360,7 +23360,11 @@ mod test {
         {
             let mut inner = tab.inner.lock();
             let zoomed = inner.zoomed.take();
-            assert_eq!(inner.iter_splits(), before, "hidden splits must stay intact");
+            assert_eq!(
+                inner.iter_splits(),
+                before,
+                "hidden splits must stay intact"
+            );
             inner.zoomed = zoomed;
         }
         tab.set_zoomed(false);

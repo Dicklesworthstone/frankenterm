@@ -4132,8 +4132,8 @@ mod pane_registration_handle {
             self.owner.notify(MuxNotification::PaneOutput(self.pane_id));
         }
 
-        pub(crate) fn notify_resize_completed(&self) {
-            // LocalPane resize admission is asynchronous. The immediate RPC
+        pub fn notify_resize_completed(&self) {
+            // Pane resize admission is asynchronous. The immediate RPC
             // callback can therefore have rebuilt this tab from old geometry.
             // Reconcile again after completion, using the exact current owner
             // index rather than scanning unrelated windows or resolving a

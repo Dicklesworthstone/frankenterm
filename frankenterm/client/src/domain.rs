@@ -4188,6 +4188,11 @@ impl ClientDomain {
                         root_size, tabroot, make_pane,
                     )?;
                 }
+                // Snapshot application suppresses resize commands and preserves
+                // newer client-pane geometry. Rebuild the newly installed split
+                // tree from those panes so a stale remote listing cannot leave
+                // the tab bounds out of step with the visible terminal grids.
+                tab.rebuild_splits_sizes_from_contained_panes();
 
                 // Neither ordinary listing dialect carries authoritative UI
                 // order. Floating-pane authority does not grant authority to
@@ -7176,8 +7181,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_topology_snapshot_does_not_echo_resize_over_newer_local_geometry() {
+    fn assert_stale_topology_snapshot_preserves_geometry(current: bool) {
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -7194,15 +7198,32 @@ mod tests {
             // Use the same exact-attachment, synchronous suppression scope as
             // the live initial-attachment and resync consumers.
             let _remote_application = inner.begin_remote_metadata_application().unwrap();
-            ClientDomain::process_topology_snapshot(
-                &mux,
-                Arc::clone(&inner),
-                RpcTopologySnapshot::Current {
-                    session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
-                    panes,
-                },
-                None,
-            )
+            if current {
+                ClientDomain::process_topology_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    RpcTopologySnapshot::Current {
+                        session_incarnation: MuxSessionIncarnation::from_bytes([0x92; 16]),
+                        panes,
+                    },
+                    None,
+                )
+            } else {
+                // Match the legacy decoder consumer: floating-pane authority
+                // is absent, rather than an authoritative empty collection.
+                inner
+                    .pin_topology_session(ClientTopologySession::Legacy46)
+                    .unwrap();
+                ClientDomain::process_pane_snapshot(
+                    &mux,
+                    Arc::clone(&inner),
+                    panes.tabs,
+                    panes.tab_titles,
+                    panes.window_titles,
+                    None,
+                    None,
+                )
+            }
             .unwrap();
         };
         let old_listing = sample_remote_tab_listing();
@@ -7219,6 +7240,7 @@ mod tests {
         let tab = mux
             .get_tab(inner.remote_to_local_tab_id(51).unwrap())
             .unwrap();
+        let stale_size = tab.get_size();
         let pane = tab.get_active_pane().unwrap();
         let desired = TerminalSize {
             cols: 80,
@@ -7241,12 +7263,10 @@ mod tests {
         );
         assert_eq!(pane.get_dimensions().cols, desired.cols);
         assert_eq!(pane.get_dimensions().viewport_rows, desired.rows);
+        assert_eq!(tab.get_size(), desired);
 
-        // A font increase can return to the geometry cached by the stale
-        // topology snapshot while the pane still has the newer, wider grid.
-        // That explicit command must reach the pane even though the tab's
-        // cached size already equals its target.
-        let stale_size = tab.get_size();
+        // Returning to the older geometry is still an explicit user command,
+        // whereas replaying the older listing above must remain observational.
         assert_ne!(stale_size, desired);
         tab.resize(stale_size);
         assert!(
@@ -7284,6 +7304,16 @@ mod tests {
         let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
         assert!(matches!(request, codec::Pdu::Resize(resize) if resize.size == next));
         executor.try_tick().unwrap();
+    }
+
+    #[test]
+    fn stale_topology_snapshot_does_not_echo_resize_over_newer_local_geometry() {
+        assert_stale_topology_snapshot_preserves_geometry(true);
+    }
+
+    #[test]
+    fn stale_legacy_topology_snapshot_preserves_newer_local_geometry() {
+        assert_stale_topology_snapshot_preserves_geometry(false);
     }
 
     fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {

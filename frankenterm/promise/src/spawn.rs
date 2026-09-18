@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::thread::ThreadId;
@@ -440,14 +440,22 @@ impl MainThreadSpawnReservation {
         let binding = Arc::clone(&self.binding);
         let wake_binding = Arc::clone(&binding);
         let high_priority = self.high_priority;
+        let registration = SpawnedTaskRegistration {
+            binding: Arc::clone(&binding),
+            ticket: admission.task_ticket,
+        };
         let (runnable, task) = async_task::spawn(
             async move {
+                // The local task reuses this admission ticket. End bootstrap
+                // tracking before the factory registers that successor.
+                drop(registration);
                 factory(self);
             },
             move |runnable| {
                 let _receipt = wake_binding.schedule(runnable, admission, high_priority);
             },
         );
+        let _ = binding.register_spawned_task(admission.task_ticket, runnable.waker());
         let initial_enqueue = binding.schedule(runnable, admission, high_priority);
         MainThreadSpawnedTask {
             task,
@@ -773,6 +781,18 @@ impl MainThreadAdmissionController {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnRegistryState {
+    Running,
+    Draining,
+    Closed,
+}
+
+struct SpawnRegistry {
+    state: SpawnRegistryState,
+    tasks: HashMap<NonZeroU64, std::task::Waker>,
+}
+
 /// One exact scheduler generation and its infallible admitted-runnable lanes.
 ///
 /// Tasks capture an `Arc` to this value before task allocation. Replacing the
@@ -784,6 +804,7 @@ pub struct MainThreadSchedulerBinding {
     high_priority: SharedMainThreadBoundScheduleFunc,
     low_priority: SharedMainThreadBoundScheduleFunc,
     retired: AtomicBool,
+    registry: Mutex<SpawnRegistry>,
 }
 
 impl std::fmt::Debug for MainThreadSchedulerBinding {
@@ -813,6 +834,10 @@ impl MainThreadSchedulerBinding {
             high_priority: Arc::from(high_priority),
             low_priority: Arc::from(low_priority),
             retired: AtomicBool::new(false),
+            registry: Mutex::new(SpawnRegistry {
+                state: SpawnRegistryState::Running,
+                tasks: HashMap::with_capacity(limits.task_capacity()),
+            }),
         }
     }
 
@@ -824,6 +849,44 @@ impl MainThreadSchedulerBinding {
     #[must_use]
     pub fn admission_snapshot(&self) -> MainThreadAdmissionSnapshot {
         self.admission.snapshot()
+    }
+
+    fn register_spawned_task(
+        &self,
+        task_ticket: NonZeroU64,
+        waker: std::task::Waker,
+    ) -> Result<(), ()> {
+        let mut registry = lock_or_recover(&self.registry);
+        match registry.state {
+            SpawnRegistryState::Closed => Err(()),
+            SpawnRegistryState::Running | SpawnRegistryState::Draining => {
+                registry.tasks.insert(task_ticket, waker);
+                Ok(())
+            }
+        }
+    }
+
+    fn unregister_spawned_task(&self, task_ticket: NonZeroU64) {
+        let mut registry = lock_or_recover(&self.registry);
+        registry.tasks.remove(&task_ticket);
+    }
+
+    fn start_draining(&self) -> Vec<std::task::Waker> {
+        let mut registry = lock_or_recover(&self.registry);
+        registry.state = SpawnRegistryState::Draining;
+        registry.tasks.values().cloned().collect()
+    }
+
+    fn try_close_and_drain(&self, queue: &SimpleExecutorQueue) -> Option<Vec<SpawnFunc>> {
+        let mut registry = lock_or_recover(&self.registry);
+        if !registry.tasks.is_empty() {
+            return None;
+        }
+        // Retire the queue before exposing Closed to late reservations. Queue
+        // callbacks are returned for disposal after both locks are released.
+        let remaining = queue.retire_and_drain();
+        registry.state = SpawnRegistryState::Closed;
+        Some(remaining)
     }
 
     pub fn retire(&self) {
@@ -1360,6 +1423,31 @@ fn rejected_spawn_outcome<R>(outcome: MainThreadAdmissionOutcome) -> MainThreadS
     }
 }
 
+struct SpawnedTaskRegistration {
+    binding: Arc<MainThreadSchedulerBinding>,
+    ticket: NonZeroU64,
+}
+
+impl Drop for SpawnedTaskRegistration {
+    fn drop(&mut self) {
+        self.binding.unregister_spawned_task(self.ticket);
+    }
+}
+
+struct AdmittedFutureWakerCleanup<F> {
+    // Declaration order keeps the task registered until its payload is dropped.
+    future: MainThreadAdmittedFuture<F>,
+    _registration: SpawnedTaskRegistration,
+}
+
+impl<F: Future> Future for AdmittedFutureWakerCleanup<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.future).poll(cx)
+    }
+}
+
 fn admitted_send_task<F, R>(
     binding: Arc<MainThreadSchedulerBinding>,
     permit: MainThreadTaskPermit,
@@ -1372,9 +1460,22 @@ where
 {
     let admission = permit.receipt();
     let wake_binding = Arc::clone(&binding);
-    let (runnable, task) = async_task::spawn(permit.bind(future), move |runnable| {
+    let cleanup_binding = Arc::clone(&binding);
+    let task_ticket = admission.task_ticket;
+    let bound_future = permit.bind(future);
+    let wrapped = AdmittedFutureWakerCleanup {
+        future: bound_future,
+        _registration: SpawnedTaskRegistration {
+            binding: cleanup_binding,
+            ticket: task_ticket,
+        },
+    };
+    let (runnable, task) = async_task::spawn(wrapped, move |runnable| {
         let _receipt = wake_binding.schedule(runnable, admission, high_priority);
     });
+    // Closed implies the bound queue is already retired. Its callback cancels
+    // this unpolled task on the creating thread and returns real queue state.
+    let _ = binding.register_spawned_task(task_ticket, runnable.waker());
     let initial_enqueue = binding.schedule(runnable, admission, high_priority);
     MainThreadSpawnedTask {
         task,
@@ -1395,9 +1496,20 @@ where
 {
     let admission = permit.receipt();
     let wake_binding = Arc::clone(&binding);
-    let (runnable, task) = async_task::spawn_local(permit.bind(future), move |runnable| {
+    let cleanup_binding = Arc::clone(&binding);
+    let task_ticket = admission.task_ticket;
+    let bound_future = permit.bind(future);
+    let wrapped = AdmittedFutureWakerCleanup {
+        future: bound_future,
+        _registration: SpawnedTaskRegistration {
+            binding: cleanup_binding,
+            ticket: task_ticket,
+        },
+    };
+    let (runnable, task) = async_task::spawn_local(wrapped, move |runnable| {
         let _receipt = wake_binding.schedule(runnable, admission, high_priority);
     });
+    let _ = binding.register_spawned_task(task_ticket, runnable.waker());
     let initial_enqueue = binding.schedule(runnable, admission, high_priority);
     MainThreadSpawnedTask {
         task,
@@ -1859,10 +1971,6 @@ struct SimpleExecutorBoundedItem {
     estimated_bytes: NonZeroUsize,
 }
 
-/// Count of retired-generation runnables that were leaked instead of dropped
-/// because the waker fired off the owner thread (see `enqueue_admitted`).
-pub static RETIRED_RUNNABLES_LEAKED_OFF_THREAD: AtomicUsize = AtomicUsize::new(0);
-
 struct SimpleExecutorQueueState {
     admitted_high: VecDeque<SimpleExecutorBoundedItem>,
     admitted_low: VecDeque<SimpleExecutorBoundedItem>,
@@ -1879,10 +1987,6 @@ struct SimpleExecutorQueue {
     identity: MainThreadSchedulerIdentity,
     task_capacity: usize,
     estimated_byte_capacity: usize,
-    /// Thread that created this queue. Local runnables are thread-affine:
-    /// dropping one anywhere else panics inside async_task's thread check, so
-    /// a retired queue must never drop a runnable delivered by a waker thread.
-    owner_thread: ThreadId,
     state: Mutex<SimpleExecutorQueueState>,
     available: Condvar,
 }
@@ -1891,7 +1995,6 @@ impl SimpleExecutorQueue {
     fn new(identity: MainThreadSchedulerIdentity, limits: MainThreadAdmissionLimits) -> Self {
         Self {
             identity,
-            owner_thread: std::thread::current().id(),
             task_capacity: limits.task_capacity(),
             estimated_byte_capacity: limits.estimated_byte_capacity(),
             state: Mutex::new(SimpleExecutorQueueState {
@@ -1954,22 +2057,13 @@ impl SimpleExecutorQueue {
                 true,
             )
             .expect("retired SimpleExecutor queue accounting must remain internally consistent");
+
+            // Under the teardown barrier, previously polled parked local tasks
+            // were already drained and cancelled on the owner thread before the queue
+            // retired. A late spawn of an initial unpolled task arriving on a retired
+            // queue is dropped here to release its permit cleanly.
             drop(state);
-            // Dropping a `spawn_local` runnable cancels its task, which is the
-            // right disposal for a retired generation, but only on the thread
-            // that created it. A waker firing from any other thread (a uds
-            // rewake thread, a listener thread) after the generation retired
-            // used to drop here and abort the whole process through
-            // async_task's thread check ("local task dropped by a thread that
-            // didn't spawn it", seen 2026-09-02 as a mux-server SIGABRT at
-            // shutdown). Off-thread, the runnable is leaked instead: the task
-            // stays pending for the retired generation, which is inert anyway.
-            if std::thread::current().id() == self.owner_thread {
-                drop(runnable);
-            } else {
-                RETIRED_RUNNABLES_LEAKED_OFF_THREAD.fetch_add(1, Ordering::Relaxed);
-                std::mem::forget(runnable);
-            }
+            drop(runnable);
             return MainThreadEnqueueReceipt {
                 queue_id: admission.queue_id,
                 scheduler_generation: admission.scheduler_generation,
@@ -2120,6 +2214,20 @@ impl SimpleExecutorQueue {
         Self::pop_locked(&mut state)
     }
 
+    fn drain_available(&self) -> Vec<SpawnFunc> {
+        let mut state = lock_or_recover(&self.state);
+        let mut drained = Vec::new();
+        while let Some(func) = Self::pop_locked(&mut state) {
+            drained.push(func);
+        }
+        drained
+    }
+
+    fn wait_for_incoming(&self) {
+        let state = lock_or_recover(&self.state);
+        let _ = self.available.wait_timeout(state, Duration::from_millis(5));
+    }
+
     fn retire_and_drain(&self) -> Vec<SpawnFunc> {
         let mut state = lock_or_recover(&self.state);
         state.retired = true;
@@ -2258,19 +2366,38 @@ impl SimpleExecutor {
 
 impl Drop for SimpleExecutor {
     fn drop(&mut self) {
-        // A dropped executor can no longer service admitted work. Retire its
-        // exact generation so a racing producer receives a terminal rejection
-        // and keeps its fallback authority instead of enqueueing onto a queue
-        // that will never be ticked again. A newer replacement owns a distinct
-        // binding, so retiring this generation cannot affect it.
+        // Step 1: Retire the binding admission so no new permits can be reserved.
         self.binding.retire();
 
-        // Each queued Runnable retains its scheduling binding, whose
-        // callbacks retain this queue. Retiring admission without draining
-        // therefore forms a strong reference cycle and leaves detached
-        // futures parked forever. Drop (do not run) every callback on the
-        // owner thread to cancel its task and release its admission permit.
-        for func in self.queue.retire_and_drain() {
+        // Step 2: Transition registry to Draining and wake all registered parked tasks while
+        // the queue remains open. Tasks registered during draining already have their initial
+        // runnable queued, so they need no wake-all replay.
+        let wakers = self.binding.start_draining();
+        for w in wakers {
+            w.wake();
+        }
+
+        // Step 3: Drain and drop runnables on the owner thread until the spawned
+        // task map is empty. If an off-thread wake callback is in transit, wait on
+        // the queue condvar for the incoming enqueue.
+        let remaining = loop {
+            if let Some(remaining) = self.binding.try_close_and_drain(&self.queue) {
+                break remaining;
+            }
+            let drained = self.queue.drain_available();
+            if drained.is_empty() {
+                self.queue.wait_for_incoming();
+            } else {
+                for func in drained {
+                    drop(func);
+                }
+            }
+        };
+
+        // Empty detection and closure share the registration lock: a pre-admitted
+        // producer either joins the drain or observes Closed and cancels its own
+        // unpolled runnable. No producer can register between those decisions.
+        for func in remaining {
             drop(func);
         }
     }
@@ -3639,6 +3766,7 @@ mod tests {
         .expect("background admission coordinator must not panic");
 
         assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert_eq!(exec.binding.registry.lock().unwrap().tasks.len(), 1);
         assert_eq!(exec.queue_snapshot().depth, 1);
         assert!(exec.try_tick().expect("bootstrap must be queued"));
         assert!(factory_ran.load(Ordering::Acquire));
@@ -3648,11 +3776,17 @@ mod tests {
             1,
             "the same task-lifetime permit must survive the handoff"
         );
+        assert_eq!(
+            exec.binding.registry.lock().unwrap().tasks.len(),
+            1,
+            "bootstrap cleanup must not unregister its local successor"
+        );
         assert_eq!(exec.queue_snapshot().depth, 1);
         assert!(exec.try_tick().expect("local future must be queued"));
         assert!(local_future_ran.load(Ordering::Acquire));
         assert_eq!(exec.admission_snapshot().active_tasks, 0);
         assert_eq!(exec.queue_snapshot().depth, 0);
+        assert!(exec.binding.registry.lock().unwrap().tasks.is_empty());
     }
 
     #[test]
@@ -3689,7 +3823,9 @@ mod tests {
     }
 
     /// A waker firing from another thread after the generation retired used to
-    /// drop the local runnable on that thread and abort the process.
+    /// drop the local runnable on that thread and abort the process. Under eager
+    /// teardown, parked tasks are cancelled on the owner thread before retirement,
+    /// so subsequent off-thread wakes are inert and release zero additional permits.
     #[test]
     fn retired_generation_wake_from_another_thread_does_not_drop_local_runnable_off_thread() {
         use std::future::Future;
@@ -3709,6 +3845,7 @@ mod tests {
         let old =
             SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
                 .unwrap();
+        let old_binding = capture_bounded_main_thread_scheduler().unwrap();
         let waker_slot = Arc::new(StdMutex::new(None));
         let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8) {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
@@ -3722,23 +3859,290 @@ mod tests {
             .clone()
             .expect("the future must have captured its waker");
 
-        // Dropping the executor retires its queue state (replacing it only
-        // retires the binding). The runnable's schedule closure still holds
-        // the queue through its Arc, exactly like a live connection task at
-        // mux-server shutdown.
+        // Dropping the executor eagerly wakes and drains all registered parked tasks,
+        // cancelling their payloads on the owner thread before retirement completes.
         drop(old);
-        let before = RETIRED_RUNNABLES_LEAKED_OFF_THREAD.load(Ordering::Relaxed);
 
+        assert_eq!(
+            old_binding.admission_snapshot().active_tasks,
+            0,
+            "parked task must be eagerly cancelled and permit released upon executor drop"
+        );
+
+        // Firing the waker from another thread after teardown must not panic, leak, or revive tasks.
         std::thread::spawn(move || waker.wake())
             .join()
             .expect("waking a retired-generation local task from another thread must not panic");
 
         assert_eq!(
-            RETIRED_RUNNABLES_LEAKED_OFF_THREAD.load(Ordering::Relaxed),
-            before + 1,
-            "the off-thread wake must be leaked, never dropped off-thread"
+            old_binding.admission_snapshot().active_tasks,
+            0,
+            "active tasks must remain zero after post-teardown off-thread wake"
         );
         task.detach();
+    }
+
+    /// Regression test for self-deadlock when a task is woken while a caller
+    /// lock (such as channel state or notification mutex) is held during
+    /// teardown.
+    ///
+    /// When closing a channel or notifying an event listener, the caller holds
+    /// an internal mutex and wakes parked tasks. If waking synchronously drops
+    /// the runnable or if teardown drops the task future while that same caller
+    /// mutex is held, the future's destructor (e.g. unregistering an event listener)
+    /// attempts to re-acquire the caller mutex, resulting in self-deadlock.
+    ///
+    /// Verified invariants:
+    /// 1. Eager cancellation wakes and drops parked tasks cleanly on the owner
+    ///    thread outside caller locks.
+    /// 2. Post-retirement wake callbacks are enqueue-only and never drop futures
+    ///    synchronously within the wake path.
+    #[test]
+    fn retired_generation_wake_on_owner_thread_does_not_deadlock_on_caller_mutex() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex as StdMutex;
+        use std::task::{Context, Poll, Waker};
+
+        let _lock = TEST_LOCK.lock().unwrap();
+
+        let caller_mutex = Arc::new(StdMutex::new(()));
+        let caller_mutex_clone = Arc::clone(&caller_mutex);
+
+        struct DeadlockProneFuture {
+            mutex: Arc<StdMutex<()>>,
+            waker_slot: Arc<StdMutex<Option<Waker>>>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Future for DeadlockProneFuture {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                *self.waker_slot.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        impl Drop for DeadlockProneFuture {
+            fn drop(&mut self) {
+                // Mimics EventListener::drop calling remove() on the caller's mutex
+                let _guard = self.mutex.lock().unwrap();
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let executor =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(2, 64, 0, 0).unwrap())
+                .unwrap();
+        let waker_slot = Arc::new(StdMutex::new(None));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 16) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected reserved admission, got {:?}", outcome),
+        };
+
+        let task = reservation.spawn_local(DeadlockProneFuture {
+            mutex: caller_mutex_clone,
+            waker_slot: Arc::clone(&waker_slot),
+            dropped: Arc::clone(&dropped),
+        });
+
+        assert!(
+            executor.try_tick().unwrap(),
+            "first poll registers the waker"
+        );
+        let waker = waker_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("future captured waker");
+
+        // Retire the executor. Eager cancellation wakes and drops parked tasks!
+        drop(executor);
+
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "SimpleExecutor drop must eagerly cancel and drop parked local tasks"
+        );
+
+        // Now test racing wake while caller mutex is held:
+        // Wake callback must be enqueue-only and never drop synchronously.
+        {
+            let _caller_guard = caller_mutex.lock().unwrap();
+            waker.wake();
+            // Must return without hanging on caller_mutex!
+        }
+
+        task.detach();
+    }
+
+    /// A wake may mark the task scheduled before its scheduler callback reaches
+    /// the queue. Shutdown must wait for that callback, not lose the parked task.
+    #[test]
+    fn executor_drop_waits_for_off_thread_wake_already_in_transit() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let owner = std::thread::current().id();
+        let limits = MainThreadAdmissionLimits::new(2, 64, 0, 0).unwrap();
+        let identity = try_allocate_main_thread_scheduler_identity().unwrap();
+        let queue = Arc::new(SimpleExecutorQueue::new(identity, limits));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let resume_rx = Mutex::new(resume_rx);
+        let high_queue = Arc::clone(&queue);
+        let low_queue = Arc::clone(&queue);
+        let binding = Arc::new(MainThreadSchedulerBinding::new(
+            identity,
+            limits,
+            Box::new(move |runnable, admission| {
+                if std::thread::current().id() != owner {
+                    entered_tx.send(()).unwrap();
+                    resume_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                high_queue.enqueue_admitted(runnable, admission, true)
+            }),
+            Box::new(move |runnable, admission| {
+                low_queue.enqueue_admitted(runnable, admission, false)
+            }),
+        ));
+        set_bounded_main_thread_scheduler(Arc::clone(&binding));
+        let executor = SimpleExecutor {
+            queue,
+            binding: Arc::clone(&binding),
+            owner_thread: owner,
+            _owner_affinity: std::marker::PhantomData,
+        };
+        struct Parked {
+            waker: Arc<Mutex<Option<std::task::Waker>>>,
+            dropped_on: Arc<Mutex<Option<ThreadId>>>,
+        }
+        impl Future for Parked {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        impl Drop for Parked {
+            fn drop(&mut self) {
+                *self.dropped_on.lock().unwrap() = Some(std::thread::current().id());
+            }
+        }
+        let waker = Arc::new(Mutex::new(None));
+        let dropped_on = Arc::new(Mutex::new(None));
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected reservation: {:?}", other),
+        };
+        let task = reservation.spawn_local(Parked {
+            waker: Arc::clone(&waker),
+            dropped_on: Arc::clone(&dropped_on),
+        });
+        assert!(executor.try_tick().unwrap());
+        let waker = waker.lock().unwrap().take().unwrap();
+        let waking = std::thread::spawn(move || waker.wake());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observer_binding = Arc::clone(&binding);
+        let release = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let registry = observer_binding.registry.lock().unwrap();
+                if registry.state == SpawnRegistryState::Draining {
+                    assert_eq!(registry.tasks.len(), 1);
+                    drop(registry);
+                    resume_tx.send(()).unwrap();
+                    break;
+                }
+                drop(registry);
+                assert!(Instant::now() < deadline, "executor never entered draining");
+                std::thread::yield_now();
+            }
+        });
+        drop(executor);
+        release.join().unwrap();
+        waking.join().unwrap();
+        assert_eq!(*dropped_on.lock().unwrap(), Some(owner));
+        assert_eq!(binding.admission_snapshot().active_tasks, 0);
+        assert_eq!(
+            binding.registry.lock().unwrap().state,
+            SpawnRegistryState::Closed
+        );
+        task.detach();
+    }
+
+    /// A late reservation cancels its unpolled task on the creating thread.
+    #[test]
+    fn late_spawn_after_executor_drop_cancels_unpolled_task_without_deadlock_or_leak() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let executor =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        let binding = capture_bounded_main_thread_scheduler().unwrap();
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected reserved admission, got {:?}", outcome),
+        };
+        assert_eq!(binding.admission_snapshot().active_tasks, 1);
+
+        // Drop the executor. Teardown transitions to Draining, completes, and seals Closed.
+        drop(executor);
+
+        // A late spawn using the previously admitted reservation after executor closure
+        // must cancel the unpolled task cleanly on the creating thread and release the permit.
+        let spawned = reservation.spawn_local(async {
+            panic!("unpolled late task must never run");
+        });
+
+        assert!(spawned.initial_enqueue.snapshot_after_enqueue.retired);
+        assert_eq!(spawned.initial_enqueue.snapshot_after_enqueue.depth, 0);
+        assert_eq!(
+            binding.admission_snapshot().active_tasks,
+            0,
+            "late unpolled task must release its admission permit on drop"
+        );
+        spawned.task.detach();
+    }
+
+    #[test]
+    fn executor_shutdown_cancels_bootstrap_before_and_after_queue_retirement() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        for enqueue_before_shutdown in [true, false] {
+            let executor = SimpleExecutor::try_with_limits(
+                MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap(),
+            )
+            .unwrap();
+            let binding = capture_bounded_main_thread_scheduler().unwrap();
+            let reservation = match try_reserve_main_thread(MainThreadServiceClass::Topology, 8) {
+                MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                outcome => panic!("expected reservation, got {:?}", outcome),
+            };
+            if enqueue_before_shutdown {
+                reservation
+                    .handoff_to_main_thread_local(|_| panic!("cancelled factory must not run"))
+                    .detach();
+                assert_eq!(binding.registry.lock().unwrap().tasks.len(), 1);
+                drop(executor);
+            } else {
+                drop(executor);
+                let spawned = std::thread::spawn(move || {
+                    reservation.handoff_to_main_thread_local(|_| {
+                        panic!("late factory must not run");
+                    })
+                })
+                .join()
+                .unwrap();
+                assert!(spawned.initial_enqueue.snapshot_after_enqueue.retired);
+                assert_eq!(spawned.initial_enqueue.snapshot_after_enqueue.depth, 0);
+                spawned.detach();
+            }
+            assert_eq!(binding.admission_snapshot().active_tasks, 0);
+            assert!(binding.registry.lock().unwrap().tasks.is_empty());
+        }
     }
 
     #[test]

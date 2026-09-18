@@ -12,14 +12,14 @@ use async_trait::async_trait;
 use codec::*;
 use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use mux::domain::DomainId;
 use mux::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
     SearchResult, WithPaneLines,
 };
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use mux::renderable::{same_line_layout_geometry, RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
 use mux::{MuxSessionIncarnation, PaneRegistrationHandle, PaneRegistrationSlot};
 use parking_lot::{Condvar, MappedMutexGuard, Mutex, MutexGuard};
@@ -296,10 +296,29 @@ impl ClientResizeCoordinator {
 
     pub(crate) fn detach(&self, detached: &AtomicBool) {
         detached.store(true, Ordering::Release);
-        let mut pending = self.pending.lock();
-        self.notify_tx.close();
-        self.notify_rx.close();
-        pending.clear();
+        let pending = {
+            let mut pending = self.pending.lock();
+            self.notify_tx.close();
+            self.notify_rx.close();
+            std::mem::take(&mut *pending)
+        };
+        // Cancel every accepted but unsent intent. Notify outside the queue
+        // lock because pane alerts may re-enter domain lifecycle callbacks.
+        for (_, intent) in pending {
+            {
+                let mut state = intent.delivery_state.lock();
+                if state.attempt == intent.attempt {
+                    state.unadmitted_retry = None;
+                }
+            }
+            ResizeDelivery {
+                state: intent.delivery_state,
+                attempt: intent.attempt,
+                registration: Some(intent.registration),
+                settled: false,
+            }
+            .settle(false);
+        }
     }
 
     pub(crate) fn start(self: &Arc<Self>, inner: Weak<ClientInner>) -> anyhow::Result<()> {
@@ -386,6 +405,12 @@ impl ClientResizeCoordinator {
                             }
                         });
 
+                    let mut delivery = ResizeDelivery {
+                        state: Arc::clone(&intent.delivery_state),
+                        attempt: intent.attempt,
+                        registration: Some(intent.registration),
+                        settled: false,
+                    };
                     match admission_result {
                         Some(Ok(RetriedAdmissionOutcome::Admitted(admitted))) => {
                             {
@@ -394,12 +419,6 @@ impl ClientResizeCoordinator {
                                     state.unadmitted_retry = None;
                                 }
                             }
-                            let mut delivery = ResizeDelivery {
-                                state: intent.delivery_state,
-                                attempt: intent.attempt,
-                                registration: Some(intent.registration),
-                                settled: false,
-                            };
                             in_flight.push(async move {
                                 let result = admitted.await;
                                 delivery.settle(result.is_ok());
@@ -409,18 +428,21 @@ impl ClientResizeCoordinator {
                             let mut state = intent.delivery_state.lock();
                             if state.attempt == intent.attempt {
                                 state.unadmitted_retry = None;
-                                state.settle(intent.attempt, true);
                             }
+                            drop(state);
+                            delivery.settle(true);
                         }
                         Some(Ok(RetriedAdmissionOutcome::GenerationRetired)) => {
                             let mut state = intent.delivery_state.lock();
                             if state.attempt == intent.attempt {
                                 state.unadmitted_retry = None;
-                                state.settle(intent.attempt, false);
                             }
+                            drop(state);
+                            delivery.settle(false);
                         }
                         Some(Ok(RetriedAdmissionOutcome::Superseded)) => {
                             // Newer attempt already active; do not touch state.
+                            delivery.disarm();
                         }
                         None => {
                             metrics::counter!(
@@ -431,16 +453,18 @@ impl ClientResizeCoordinator {
                             let mut state = intent.delivery_state.lock();
                             if state.attempt == intent.attempt {
                                 state.unadmitted_retry = None;
-                                state.settle(intent.attempt, false);
                             }
+                            drop(state);
+                            delivery.settle(false);
                         }
                         Some(Err(err)) => {
                             log::warn!("failed to admit retried resize RPC: {err:#}");
                             let mut state = intent.delivery_state.lock();
                             if state.attempt == intent.attempt {
                                 state.unadmitted_retry = None;
-                                state.settle(intent.attempt, false);
                             }
+                            drop(state);
+                            delivery.settle(false);
                         }
                     }
                 }
@@ -3705,16 +3729,21 @@ impl ClientPane {
             ));
         }
         let application = rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
-            registration.try_with_current_output(|current| {
+            let mut geometry_changed = false;
+            let result = registration.try_with_current_output(|current| {
                 if !current.is_same_pane_ref(self) {
                     return None;
                 }
-                let applied = self
-                    .renderable
-                    .lock()
-                    .inner
-                    .borrow_mut()
-                    .apply_render_application_to_surface(surface, bonus_lines, kind);
+                let applied = {
+                    let renderable = self.renderable.lock();
+                    let mut inner = renderable.inner.borrow_mut();
+                    let before = inner.dimensions;
+                    let applied =
+                        inner.apply_render_application_to_surface(surface, bonus_lines, kind);
+                    geometry_changed =
+                        applied && !same_line_layout_geometry(&before, &inner.dimensions);
+                    applied
+                };
                 if !applied {
                     return Some(false);
                 }
@@ -3757,7 +3786,14 @@ impl ClientPane {
                     current.dispatch_alert(alert);
                 }
                 Some(true)
-            })
+            });
+            if geometry_changed {
+                // Release the narrow output lease and renderable lock before
+                // reconciling topology. The RPC fence remains held and a fresh
+                // exact-registration lease excludes replacement panes.
+                registration.try_with_current(|current| current.notify_resize_completed());
+            }
+            result
         });
 
         let failure_stage = match application {
@@ -3841,13 +3877,17 @@ impl ClientPane {
 
                 let applied = rpc
                     .commit_sync(RpcConsumerKind::PaneUnilateral, || {
-                        registration
+                        let mut geometry_changed = false;
+                        let applied = registration
                             .try_with_current_output(|_| {
                                 let applied = {
                                     let renderable = self.renderable.lock();
                                     let mut inner = renderable.inner.borrow_mut();
+                                    let before = inner.dimensions;
                                     let applied =
                                         inner.apply_changes_to_surface(delta, bonus_lines);
+                                    geometry_changed = applied
+                                        && !same_line_layout_geometry(&before, &inner.dimensions);
                                     if applied {
                                         inner.mark_image_hydration_incomplete_rows(
                                             &incomplete_image_rows,
@@ -3861,7 +3901,12 @@ impl ClientPane {
                                 }
                                 applied
                             })
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        if geometry_changed {
+                            registration
+                                .try_with_current(|current| current.notify_resize_completed());
+                        }
+                        applied
                     })
                     .map_err(anyhow::Error::new)?;
                 if !applied {
@@ -4185,11 +4230,13 @@ impl ClientPane {
                 }
             }
             DispatchResizeOutcome::RetryableFull => {
-                let Some(registration) = self.mux_registration.load() else {
-                    let mut state = self.resize_delivery.lock();
-                    if state.attempt == attempt {
-                        state.settle(attempt, false);
-                    }
+                let mut delivery = ResizeDelivery {
+                    state: Arc::clone(&self.resize_delivery),
+                    attempt,
+                    registration: self.mux_registration.load(),
+                    settled: false,
+                };
+                let Some(registration) = delivery.registration.clone() else {
                     bail!(
                         "cannot enqueue unadmitted resize for pane {} without active registration",
                         self.local_pane_id
@@ -4215,10 +4262,12 @@ impl ClientPane {
                     let mut state = self.resize_delivery.lock();
                     if state.attempt == attempt {
                         state.unadmitted_retry = None;
-                        state.settle(attempt, false);
                     }
                     return Err(err);
                 }
+                // The coordinator now owns settlement. Admission failures above
+                // retain the guard so they report the same failure as an RPC.
+                delivery.disarm();
                 let render = self.renderable.lock();
                 let mut inner = render.inner.borrow_mut();
                 if !unchanged {
@@ -5841,6 +5890,42 @@ mod tests {
         assert!(!pane.resize_delivery.lock().failed);
     }
 
+    fn register_resize_test_pane(
+        mux: &Arc<Mux>,
+        executor: &promise::spawn::SimpleExecutor,
+        inner: &Arc<ClientInner>,
+        peer: &TestRpcPeer,
+        local_id: PaneId,
+        remote_id: PaneId,
+    ) -> Arc<ClientPane> {
+        let pane = test_client_pane(inner, local_id, remote_id);
+        let registered: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        // Binding admits a palette RPC. Complete it before deliberately
+        // exhausting scheduler capacity, or binding correctly retires the
+        // transport and the test never reaches resize admission at all.
+        for _ in 0..16 {
+            if !executor.try_tick().unwrap() {
+                break;
+            }
+        }
+        assert!(!peer.is_empty(), "pane binding must admit its palette RPC");
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(
+            matches!(request, Pdu::SetPalette(SetPalette { pane_id, .. }) if pane_id == remote_id)
+        );
+        for _ in 0..16 {
+            if !executor.try_tick().unwrap() {
+                break;
+            }
+        }
+        assert!(
+            peer.is_empty(),
+            "binding must not leave unrelated RPCs queued"
+        );
+        pane
+    }
+
     #[test]
     fn resize_scheduler_retryable_full_coalesces_and_retries_by_pre_admitted_driver() {
         let scope = MuxTestScope::enter();
@@ -5853,6 +5938,8 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         inner.start_resize_retry_driver().unwrap();
 
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+
         let occupying_reservation = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
             16,
@@ -5860,10 +5947,6 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::Reserved(res) => res,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
-
-        let pane = test_client_pane(&inner, 40, 29);
-        let registered: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&registered).unwrap();
 
         let mut size = TerminalSize {
             cols: 60,
@@ -5891,6 +5974,10 @@ mod tests {
 
         executor.try_tick().unwrap();
 
+        assert!(
+            !peer.is_empty(),
+            "retry driver must admit the pending resize"
+        );
         let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
         assert!(matches!(request, Pdu::Resize(Resize { size: observed, .. }) if observed == size));
 
@@ -5914,6 +6001,8 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         inner.start_resize_retry_driver().unwrap();
 
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+
         let occupying = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
             16,
@@ -5921,10 +6010,6 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::Reserved(res) => res,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
-
-        let pane = test_client_pane(&inner, 40, 29);
-        let registered: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&registered).unwrap();
 
         let size = TerminalSize {
             cols: 70,
@@ -5962,6 +6047,8 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         inner.start_resize_retry_driver().unwrap();
 
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+
         let occupying = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
             16,
@@ -5969,10 +6056,6 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::Reserved(res) => res,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
-
-        let pane = test_client_pane(&inner, 40, 29);
-        let registered: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&registered).unwrap();
 
         let size = TerminalSize {
             cols: 72,
@@ -5989,6 +6072,11 @@ mod tests {
         executor.try_tick().unwrap();
 
         assert!(peer.is_empty(), "detached domain must not send RPC");
+        assert!(pane.resize_delivery.lock().unadmitted_retry.is_none());
+        assert!(
+            pane.resize_delivery.lock().failed,
+            "detaching must settle accepted unsent resize ownership"
+        );
         drop(occupying);
     }
 
@@ -6004,6 +6092,8 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         inner.start_resize_retry_driver().unwrap();
 
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+
         let occupying = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
             16,
@@ -6011,10 +6101,6 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::Reserved(res) => res,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
-
-        let pane = test_client_pane(&inner, 40, 29);
-        let registered: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&registered).unwrap();
 
         let initial_size = TerminalSize {
             cols: 80,
@@ -6057,6 +6143,7 @@ mod tests {
         // only the newly dispatched RPC for initial_size arrives at peer.
         executor.try_tick().unwrap();
 
+        assert!(!peer.is_empty(), "new desired geometry must be admitted");
         let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
         assert!(
             matches!(request, Pdu::Resize(Resize { size: observed, .. }) if observed == initial_size),
@@ -6074,9 +6161,10 @@ mod tests {
     #[test]
     fn resize_scheduler_retryable_full_queue_capacity_rejects_excess() {
         let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
-        let (inner, _peer) = test_client_inner_with_rpc_peer(17);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
         let coordinator = &inner.resize_coordinator;
 
         let rpc_scope = inner.client.rpc_scope();
@@ -6084,9 +6172,8 @@ mod tests {
 
         let mut panes = Vec::with_capacity(MAX_COALESCED_RESIZE_INTENTS);
         for i in 0..MAX_COALESCED_RESIZE_INTENTS {
-            let pane = test_client_pane(&inner, (1000 + i) as PaneId, (2000 + i) as PaneId);
-            let registered: Arc<dyn Pane> = pane.clone();
-            mux.add_pane(&registered).unwrap();
+            let pane =
+                register_resize_test_pane(&mux, &executor, &inner, &peer, 1000 + i, 2000 + i);
             let registration = pane.mux_registration.load().expect("bound registration");
             let intent = QueuedResizeIntent {
                 pane_id: pane.pane_id(),
@@ -6103,7 +6190,10 @@ mod tests {
         }
 
         // Updating an existing pane must succeed by coalescing
-        let pane0_registration = panes[0].mux_registration.load().expect("bound registration");
+        let pane0_registration = panes[0]
+            .mux_registration
+            .load()
+            .expect("bound registration");
         let updated_intent = QueuedResizeIntent {
             pane_id: panes[0].pane_id(),
             remote_tab_id: 1,
@@ -6117,10 +6207,11 @@ mod tests {
         coordinator.enqueue(updated_intent).unwrap();
 
         // Adding an excess pane beyond capacity must be rejected
-        let excess_pane = test_client_pane(&inner, 9999 as PaneId, 9999 as PaneId);
-        let excess_registered: Arc<dyn Pane> = excess_pane.clone();
-        mux.add_pane(&excess_registered).unwrap();
-        let excess_registration = excess_pane.mux_registration.load().expect("bound registration");
+        let excess_pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 9999, 9999);
+        let excess_registration = excess_pane
+            .mux_registration
+            .load()
+            .expect("bound registration");
         let excess_intent = QueuedResizeIntent {
             pane_id: excess_pane.pane_id(),
             remote_tab_id: 1,
@@ -6144,10 +6235,22 @@ mod tests {
         .unwrap();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
-        let (inner, _peer) = test_client_inner_with_rpc_peer(17);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
         inner.start_resize_retry_driver().unwrap();
 
         assert_eq!(executor.admission_snapshot().active_tasks, 1);
+
+        let mut panes = Vec::new();
+        for i in 0..MAX_CONCURRENT_RESIZE_REPLIES {
+            panes.push(register_resize_test_pane(
+                &mux,
+                &executor,
+                &inner,
+                &peer,
+                300 + i,
+                400 + i,
+            ));
+        }
 
         let occupying = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Input,
@@ -6156,14 +6259,6 @@ mod tests {
             promise::spawn::MainThreadReservationOutcome::Reserved(res) => res,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
-
-        let mut panes = Vec::new();
-        for i in 0..MAX_CONCURRENT_RESIZE_REPLIES {
-            let pane = test_client_pane(&inner, (300 + i) as PaneId, (400 + i) as PaneId);
-            let registered: Arc<dyn Pane> = pane.clone();
-            mux.add_pane(&registered).unwrap();
-            panes.push(pane);
-        }
 
         let target_size = TerminalSize {
             cols: 120,
@@ -6191,7 +6286,11 @@ mod tests {
 
         inner.mark_detached();
 
-        executor.try_tick().unwrap();
+        for _ in 0..32 {
+            if !executor.try_tick().unwrap() {
+                break;
+            }
+        }
 
         assert_eq!(executor.admission_snapshot().active_tasks, 0);
 
@@ -8915,6 +9014,83 @@ mod tests {
                 nacks: 1,
                 cancelled_attempts: 0,
             }
+        );
+    }
+
+    #[test]
+    fn render_application_geometry_reconciles_tab_without_topology_snapshot() {
+        assert_render_geometry_reconciles_tab(true);
+    }
+
+    #[test]
+    fn legacy_render_geometry_reconciles_tab_without_topology_snapshot() {
+        assert_render_geometry_reconciles_tab(false);
+    }
+
+    fn assert_render_geometry_reconciles_tab(modern: bool) {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let old_size = TerminalSize {
+            cols: 120,
+            rows: 24,
+            pixel_width: 1200,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let pane = Arc::new(ClientPane::new(
+            &inner, 40, 23, 29, old_size, "shell", false,
+        ));
+        let rpc = inner.client.rpc_scope();
+        pane.prepare_render_application_bootstrap(&rpc).unwrap();
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux).unwrap();
+        let registration = mux.capture_pane_registration(&pane_for_mux).unwrap();
+        let tab = Arc::new(mux::tab::Tab::new(&old_size));
+        mux.add_tab_no_panes(&tab).unwrap();
+        tab.assign_pane(&pane_for_mux);
+        let window = mux.new_empty_window(Some("render-geometry".to_string()), None);
+        mux.add_tab_to_window(&tab, *window).unwrap();
+        assert_eq!(tab.get_size(), old_size);
+        let update = test_render_application_update(
+            rpc.connection_generation().unwrap().get(),
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        if modern {
+            let result = promise::spawn::block_on(pane.apply_render_application(
+                &registration,
+                &rpc,
+                update.clone(),
+            ));
+            let result = settlement(result);
+            result.validate_for(&update).unwrap();
+            assert!(matches!(
+                result.outcome,
+                RenderApplicationOutcome::Applied { .. }
+            ));
+        } else {
+            promise::spawn::block_on(pane.process_unilateral(
+                &registration,
+                &rpc,
+                Pdu::GetPaneRenderChangesResponse(update.surface),
+            ))
+            .unwrap();
+        }
+        assert_eq!(pane.get_dimensions().cols, 80);
+        assert_eq!(
+            tab.get_size(),
+            TerminalSize {
+                cols: 80,
+                pixel_width: 800,
+                ..old_size
+            },
+            "render-only geometry must update the containing tab"
         );
     }
 
