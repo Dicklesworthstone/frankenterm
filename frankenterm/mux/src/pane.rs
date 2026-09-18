@@ -50,8 +50,11 @@ impl LineReadPool {
         })
     }
 
-    fn with_spawn(mut spawn: impl FnMut(LineReadTask) -> std::io::Result<()>) -> std::io::Result<Self> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<LineReadTask>(MAX_LINE_READ_WORKERS);
+    fn with_spawn(
+        mut spawn: impl FnMut(LineReadTask) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<LineReadTask>(MAX_LINE_READ_WORKERS);
         let receiver = Arc::new(parking_lot::Mutex::new(receiver));
         // Establish every receiver before admitting a capture. On partial
         // startup failure, dropping sender wakes and retires all started
@@ -1285,7 +1288,9 @@ mod test {
         }
     }
 
-    fn occupy_line_read_pool(pool: &LineReadPool) -> std::collections::HashSet<std::thread::ThreadId> {
+    fn occupy_line_read_pool(
+        pool: &LineReadPool,
+    ) -> std::collections::HashSet<std::thread::ThreadId> {
         let caller = std::thread::current().id();
         let (started, receiving) = std::sync::mpsc::channel();
         let mut releases = Vec::new();

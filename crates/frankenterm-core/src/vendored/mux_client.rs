@@ -7417,10 +7417,7 @@ mod tests {
                                     GetLinesAtLayout::IDENT,
                                 ))
                             } else {
-                                text_read_reply(
-                                    request,
-                                    if seqno == 3 { "current" } else { "old" },
-                                )
+                                text_read_reply(request, if seqno == 3 { "current" } else { "old" })
                             }
                         }
                         other => panic!("unexpected text request {other:?}"),
