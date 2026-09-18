@@ -74,7 +74,7 @@ pub struct PatternTelemetry {
     scans_total: AtomicU64,
     /// Total individual pattern matches produced
     matches_total: AtomicU64,
-    /// Total scans rejected early by quick_reject (no anchor byte found)
+    /// Total scans rejected early by quick_reject (no possible anchor match)
     quick_rejects: AtomicU64,
     /// Total Bloom filter checks performed
     bloom_checks: AtomicU64,
@@ -5597,12 +5597,11 @@ impl PatternEngine {
         // byte hit, so a pane full of common anchor first-bytes cannot allocate
         // O(text length) temporary positions.
         if let Some(ref bloom) = index.bloom {
-            let mut saw_byte_match = false;
+            let mut checked_candidate = false;
             for &byte in &index.quick_bytes {
                 let mut pos = 0;
                 while let Some(offset) = memchr(byte, &bytes[pos..]) {
                     let start = pos + offset;
-                    saw_byte_match = true;
                     pos = start + 1;
 
                     // Ensure we start at a valid UTF-8 boundary.
@@ -5622,6 +5621,7 @@ impl PatternEngine {
                             continue;
                         }
                         let window = &text[start..end];
+                        checked_candidate = true;
                         saturating_atomic_add(&telemetry.bloom_checks, 1);
                         if bloom.check(window) {
                             saturating_atomic_add(&telemetry.bloom_positives, 1);
@@ -5631,7 +5631,7 @@ impl PatternEngine {
                     }
                 }
             }
-            if !saw_byte_match {
+            if !checked_candidate {
                 return false;
             }
             // Bloom filter rejected all candidate substrings - definitely no match

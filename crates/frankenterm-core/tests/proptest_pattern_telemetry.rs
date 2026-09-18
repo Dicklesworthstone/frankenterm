@@ -42,6 +42,28 @@ fn minimal_engine() -> PatternEngine {
 // =============================================================================
 
 #[test]
+fn short_anchor_prefixes_do_not_count_as_bloom_checks_or_rejections() {
+    let engine = minimal_engine();
+    for text in ["", "E", "W", "ER", "WAR"] {
+        assert!(engine.detect(text).is_empty());
+    }
+    let before = engine.telemetry().snapshot();
+    assert_eq!(before.scans_total, 5);
+    assert_eq!(before.bloom_checks, 0);
+    assert_eq!(before.bloom_rejects, 0);
+    assert_eq!(before.bloom_positives, 0);
+
+    assert!(engine.detect("EXXXX").is_empty());
+    let rejected = engine.telemetry().snapshot();
+    assert!(rejected.bloom_checks > 0);
+    assert_eq!(rejected.bloom_rejects, 1);
+    assert_eq!(engine.detect("ERROR: actual message").len(), 1);
+    let matched = engine.telemetry().snapshot();
+    assert!(matched.bloom_positives > 0);
+    assert_eq!(matched.bloom_rejects, rejected.bloom_rejects);
+}
+
+#[test]
 fn telemetry_starts_at_zero() {
     let engine = minimal_engine();
     let snap = engine.telemetry().snapshot();
