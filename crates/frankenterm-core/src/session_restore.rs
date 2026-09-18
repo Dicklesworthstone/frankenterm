@@ -13736,6 +13736,7 @@ mod tests {
         .expect("serialize encrypted test recovery object")
     }
 
+    #[cfg(feature = "frankenterm-deps")]
     fn encrypted_test_checkpoint(plaintext: &[u8], object_id: &str) -> (Vec<u8>, [u8; 32]) {
         let bytes = encrypted_test_payload(
             plaintext,
