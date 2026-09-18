@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 41,
+        "fix": 42,
         "other": 29,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 21
       },
-      "fork_side_commit_count": 121,
+      "fork_side_commit_count": 122,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-15T19:04:26-04:00",
-        "sha": "187bebc9d6bc66b01dab1c0d6236eedc1f08e777",
-        "subject": "fix(surface): use available row space before overwide words"
+        "committed_at": "2026-09-18T16:25:21-04:00",
+        "sha": "4154a6e6ca22252bc08da7fd2f2285e55026ba70",
+        "subject": "fix(term): preserve text across cold scrollback seams"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -896,20 +896,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 55,
-        "fix": 115,
+        "fix": 116,
         "other": 57,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 62
       },
-      "fork_side_commit_count": 322,
+      "fork_side_commit_count": 323,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-18T14:06:53-04:00",
-        "sha": "290558214b68fd6ddca409086572bf4e64edbfde",
-        "subject": "fix(term): preserve cold seam alignment across witnessed row spills"
+        "committed_at": "2026-09-18T16:25:21-04:00",
+        "sha": "4154a6e6ca22252bc08da7fd2f2285e55026ba70",
+        "subject": "fix(term): preserve text across cold scrollback seams"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2756,
-  "generated_at": "2026-09-18T18:29:37.668355Z",
+  "fork_side_commit_total": 2758,
+  "generated_at": "2026-09-18T20:28:09.333206Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
