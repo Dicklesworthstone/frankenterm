@@ -30,6 +30,10 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+- Headless mux socket waits use the runtime reactor while session tasks remain on their owner thread. Existing restricted contexts and shutdown ordering are preserved.
+- Line reads reuse four bounded workers instead of creating a thread per request. Admission still precedes row capture, and requests retain their permits through reply retirement.
+- Text-read retries reuse the correlated rejection snapshot while retaining chunk validation and the final source check. Unix readiness probes avoid redundant socket-mode changes.
+- SSH agent forwarding creates and validates its private runtime directory before publishing the proxy socket link on a fresh profile.
 - Mouse selection retains displayed-layout validation across ordinary terminal output and temporary frame contention. Native Mac acceptance for forward and reverse drags, Unicode copying, and word/line selection remains pending.
 - Explicit-context timers isolate cleanup from unrelated ambient cancellation. Interrupted mux writes preserve typed cancellation and discard ambiguous connections.
 - Numeric fields in tagged JSON messages and saved layouts round-trip correctly with arbitrary-precision JSON enabled. Unicode emoji lookup again uses the hash version matching its generated tables.
@@ -92,7 +96,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Offline recovery selects the authenticated checkpoint adoption by its complete
   capture identity, including mux incarnation, generation, effect and sequence.
 
-The `0.15.6-rc.39` candidate is being prepared with these changes. The 50 ms resize target,
+The `0.15.6-rc.40` candidate is being prepared with these changes. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.
