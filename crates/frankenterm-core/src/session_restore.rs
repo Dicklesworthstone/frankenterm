@@ -45,6 +45,8 @@ use crate::wezterm::WeztermHandle;
 use sha2::{Digest, Sha256};
 
 use crate::cx::Cx;
+#[cfg(all(test, feature = "frankenterm-deps"))]
+use crate::mux_recovery_image::SplitDirectionAndSize;
 use crate::mux_recovery_image::{
     CheckpointAuthority, MuxRecoveryImage, MuxRecoveryImageError, RecoveryPane,
 };
@@ -54,18 +56,16 @@ use crate::mux_recovery_image::{
     ParserCaptureIdentity, RecoveryDomain, RecoveryObjectRef, RecoverySplitNode, RecoveryTab,
     RecoveryWindow, TerminalSize,
 };
-#[cfg(all(test, feature = "frankenterm-deps"))]
-use crate::mux_recovery_image::SplitDirectionAndSize;
 #[cfg(any(test, feature = "frankenterm-deps"))]
 use crate::mux_recovery_image::{RecoveryImageHeader, RecoveryTopology};
-#[cfg(test)]
-use crate::snapshot_publication::{RecoveryObjectPayload, RootSlot, sha256_hex};
 #[cfg(all(test, feature = "frankenterm-deps"))]
 use crate::snapshot_publication::{GenerationRootPublishRequest, PredecessorBinding};
 use crate::snapshot_publication::{
     PublicationError, RootSlotCandidate, RootVerifier, SnapshotPublicationStore,
     VerifiedRootSelection,
 };
+#[cfg(test)]
+use crate::snapshot_publication::{RecoveryObjectPayload, RootSlot, sha256_hex};
 #[cfg(all(test, feature = "frankenterm-deps"))]
 use crate::snapshot_repair::RepairProtectionClass;
 use crate::snapshot_repair::{
