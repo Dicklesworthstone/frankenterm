@@ -1090,7 +1090,7 @@ impl Terminal {
         screen.cold_row_fragments = Some(Arc::new(crate::screen::ColdRowFragments {
             sink,
             interval,
-            rows: replacements,
+            rows: Arc::new(replacements),
             aligned_frontier: screen.phys_to_stable_row_index(0),
             aligned_source_start: 0,
             cols: screen.physical_cols,

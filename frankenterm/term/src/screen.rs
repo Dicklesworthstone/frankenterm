@@ -504,7 +504,7 @@ impl StoredPhysicalLayout {
 pub(crate) struct ColdRowFragments {
     pub(crate) sink: Arc<dyn crate::config::ScrollbackSpillSink>,
     pub(crate) interval: crate::config::ScrollbackInterval,
-    pub(crate) rows: BTreeMap<StableRowIndex, Line>,
+    pub(crate) rows: Arc<BTreeMap<StableRowIndex, Line>>,
     pub(crate) aligned_frontier: StableRowIndex,
     pub(crate) aligned_source_start: StableRowIndex,
     pub(crate) cols: usize,
@@ -836,7 +836,7 @@ impl ColdSeamReflow {
             Arc::new(ColdRowFragments {
                 sink: Arc::clone(&self.sink),
                 interval: self.interval.clone(),
-                rows: replacements,
+                rows: Arc::new(replacements),
                 aligned_frontier: self.frontier,
                 aligned_source_start: first,
                 cols: self.witness.cols,
@@ -5325,6 +5325,7 @@ impl Screen {
                 crate::config::ScrollbackLineAdmission::Admitted {
                     interval: Some(interval),
                 } => {
+                    self.advance_cold_seam_alignment(&sink, &interval, stable_row);
                     self.record_cold_geometry_row(
                         Arc::clone(&sink),
                         interval.clone(),
@@ -5345,6 +5346,36 @@ impl Screen {
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
         self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
         true
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn advance_cold_seam_alignment(
+        &mut self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        row: StableRowIndex,
+    ) {
+        let Some(end) = row.checked_add(1) else {
+            return;
+        };
+        let Some(fragments) = self.cold_row_fragments.as_mut() else {
+            return;
+        };
+        if !Arc::ptr_eq(&fragments.sink, sink)
+            || !fragments.aligned_at(row, self.physical_cols, self.dpi, self.resize_wrap_policy)
+            || !interval.retains(&fragments.interval, fragments.aligned_source_start..row)
+            || !interval.rows().is_some_and(|rows| rows.end == end)
+        {
+            return;
+        }
+        // The admitted row was already laid out on the resident side of this
+        // exact seam. Moving it to the sink does not require reflowing its
+        // continuation. Keep prior readers' certificates immutable: changing
+        // their frontier would authorize cells they never captured.
+        // The immutable row map is shared, so this copies only bounded metadata.
+        let fragments = Arc::make_mut(fragments);
+        fragments.aligned_frontier = end;
+        fragments.interval = interval.clone();
     }
 
     #[cfg(feature = "use_serde")]
@@ -9214,6 +9245,105 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn cold_seam_alignment_survives_spilling_a_wrapped_resident_row() {
+        let (mut terminal, _) = cold_seam_test_terminal();
+        let mut seam = terminal
+            .screen()
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let screen = terminal.screen_mut();
+        assert!(screen.install_cold_seam_reflow(&mut seam, 20).unwrap());
+        let end = screen.phys_to_stable_row_index(screen.lines.len());
+        let before = screen
+            .capture_line_read(0..end)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let expected: String = before
+            .lines()
+            .map(|line| line.as_str().into_owned())
+            .collect();
+        let frontier = screen.phys_to_stable_row_index(0);
+        let head = screen.lines.front().unwrap().clone();
+        assert!(
+            head.last_cell_was_wrapped(),
+            "fixture must spill an open logical group"
+        );
+        assert!(screen.record_scrollback_spill(frontier, &head, 21));
+        assert_eq!(
+            before.fragments.as_ref().unwrap().aligned_frontier,
+            frontier
+        );
+        assert_eq!(
+            screen.cold_row_fragments.as_ref().unwrap().aligned_frontier,
+            frontier + 1
+        );
+        assert!(Arc::ptr_eq(
+            &before.fragments.as_ref().unwrap().rows,
+            &screen.cold_row_fragments.as_ref().unwrap().rows,
+        ));
+        screen.lines.pop_front().unwrap();
+        screen.advance_stable_row_index_offset(1);
+        screen.lines.push_back(Line::new(21));
+        let end = screen.phys_to_stable_row_index(screen.lines.len());
+        let after = screen
+            .capture_line_read(0..end)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&after));
+        let actual: String = after
+            .lines()
+            .map(|line| line.as_str().into_owned())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "moving a wrapped row to cold storage must preserve every cell"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_seam_alignment_does_not_advance_without_current_geometry_and_receipt() {
+        for change in 0..5 {
+            let (mut terminal, sink) = cold_seam_test_terminal();
+            let mut seam = terminal
+                .screen()
+                .capture_cold_seam_reflow()
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            let screen = terminal.screen_mut();
+            assert!(screen.install_cold_seam_reflow(&mut seam, 20).unwrap());
+            let frontier = screen.phys_to_stable_row_index(0);
+            let head = screen.lines.front().unwrap().clone();
+            match change {
+                0 => screen.physical_cols += 1,
+                1 => screen.dpi += 1,
+                2 => sink.omit_admission_receipt.store(true, Ordering::Relaxed),
+                3 => sink.refuse_admission.store(true, Ordering::Relaxed),
+                4 => *sink.interval_identity.lock().unwrap() = Default::default(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                screen.record_scrollback_spill(frontier, &head, 21),
+                change != 3
+            );
+            assert_eq!(
+                screen.cold_row_fragments.as_ref().unwrap().aligned_frontier,
+                frontier,
+                "unqualified spill must not advance the certificate: case {}",
+                change
+            );
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn cold_seam_metadata_busy_retains_exact_prepared_transaction() {
         let (mut terminal, sink) = cold_seam_test_terminal();
         let mut plan = terminal
@@ -9654,7 +9784,7 @@ pub(crate) mod tests {
         screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
             sink: sink.clone(),
             interval,
-            rows: replacements,
+            rows: Arc::new(replacements),
             aligned_frontier: originals.len() as StableRowIndex,
             aligned_source_start: 0,
             cols,
@@ -10201,11 +10331,13 @@ pub(crate) mod tests {
         screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
             sink: sink.clone(),
             interval,
-            rows: [(
-                31,
-                Line::from_text("换界", &CellAttributes::blank(), 1, None),
-            )]
-            .into(),
+            rows: Arc::new(
+                [(
+                    31,
+                    Line::from_text("换界", &CellAttributes::blank(), 1, None),
+                )]
+                .into(),
+            ),
             aligned_frontier: 65,
             aligned_source_start: 0,
             cols: 8,
@@ -11427,7 +11559,7 @@ pub(crate) mod tests {
                     screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
                         sink: sink.clone(),
                         interval: prepared.source.cold.as_ref().unwrap().1.clone(),
-                        rows: BTreeMap::new(),
+                        rows: Arc::new(BTreeMap::new()),
                         aligned_frontier: 9,
                         aligned_source_start: 0,
                         cols: 11,
@@ -11800,7 +11932,7 @@ pub(crate) mod tests {
         screen.cold_row_fragments = Some(Arc::new(ColdRowFragments {
             sink: sink.clone(),
             interval,
-            rows: [(7, replacement)].into(),
+            rows: Arc::new([(7, replacement)].into()),
             aligned_frontier: 8,
             aligned_source_start: 0,
             cols: 11,
