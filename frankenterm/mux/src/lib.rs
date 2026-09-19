@@ -10256,43 +10256,12 @@ fn notify_synchronized_output_event(
         pane_id: pane.pane_id(),
         event,
     };
-    if mux.is_main_thread() || !promise::spawn::is_scheduler_configured() {
-        mux.notify(notification);
-        return;
-    }
-
-    let owner = Arc::downgrade(&mux);
-    match promise::spawn::try_reserve_main_thread(
-        promise::spawn::MainThreadServiceClass::Topology,
-        MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
-    ) {
-        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-            reservation
-                .spawn(async move {
-                    let _operation = operation;
-                    let Some(mux) = owner.upgrade() else {
-                        return;
-                    };
-                    mux.notify(notification);
-                })
-                .detach();
-        }
-        rejected => {
-            metrics::counter!(
-                "mux.main_thread_admission",
-                "operation" => "synchronized output notification",
-                "outcome" => "inline_fallback"
-            )
-            .increment(1);
-            log::error!(
-                "mux main-thread scheduler rejected synchronized output notification; preserving delivery inline: {rejected:?}"
-            );
-            let _operation = operation;
-            if let Some(mux) = owner.upgrade() {
-                mux.notify(notification);
-            }
-        }
-    }
+    // These are ordered counter/byte deltas. Mixing queued delivery with an
+    // inline full-queue fallback lets a later Drain overtake an earlier BSU
+    // or Admission. Subscribers already support off-thread fanout; always
+    // fold synchronously while retaining this exact registration operation.
+    let _operation = operation;
+    mux.notify(notification);
 }
 
 /// This function applies parsed actions to the pane and notifies any
@@ -30713,6 +30682,85 @@ mod tests {
         assert!(dbg.contains("SynchronizedOutput"));
         assert!(dbg.contains("Watchdog"));
         assert!(dbg.contains("7"));
+    }
+
+    #[test]
+    fn synchronized_output_preserves_order_across_scheduler_saturation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let mux = Arc::new(Mux::new(None));
+        let pane = register_test_pane(&mux, 719);
+        let generation = Arc::clone(&mux.panes.read().get(&719).unwrap().generation);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&observed);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::SynchronizedOutput { pane_id, event } = notification {
+                assert_eq!(pane_id, 719);
+                received.lock().push(event);
+            }
+            true
+        })
+        .unwrap();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(
+                1,
+                MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+                0,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let events = [
+            SynchronizedOutputEvent::Depth {
+                outcome: SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                max_depth: 1,
+            },
+            SynchronizedOutputEvent::Admission {
+                decision: SynchronizedOutputAdmissionDecision::Accepted,
+                bytes: 64,
+            },
+            SynchronizedOutputEvent::Drain {
+                cause: SynchronizedOutputDrainCause::Esu,
+                bytes: 64,
+                depth_outcome: Some(SynchronizedOutputDepthOutcome::Flushed),
+                max_depth: 1,
+            },
+            SynchronizedOutputEvent::ModeQuery,
+        ];
+        std::thread::spawn(move || {
+            let pane = Arc::downgrade(&pane);
+            // Begin with available capacity. The old mixed strategy queued
+            // this first event and delivered subsequent full-queue events
+            // inline, reversing the observed BSU/ESU order.
+            notify_synchronized_output_event(&pane, &generation, events[0]);
+            let occupying = match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    Some(reservation)
+                }
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => None,
+                other => panic!("unexpected scheduler rejection: {other:?}"),
+            };
+            assert!(matches!(
+                promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+                ),
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(_)
+            ));
+            for event in &events[1..] {
+                notify_synchronized_output_event(&pane, &generation, *event);
+            }
+            drop(occupying);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*observed.lock(), events.to_vec());
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
     }
 
     #[test]

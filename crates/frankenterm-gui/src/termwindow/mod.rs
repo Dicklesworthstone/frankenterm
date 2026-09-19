@@ -863,6 +863,33 @@ pub struct SyncOutputDoctorSnapshot {
     pub overrides_by_trigger: frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
 }
 
+#[derive(Default)]
+struct SyncOutputState {
+    watchdog: frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
+    orchestrator:
+        frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
+    depth_by_pane: HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
+    buffered_bytes_by_pane: HashMap<PaneId, u64>,
+}
+
+impl SyncOutputState {
+    fn record(&mut self, pane_id: PaneId, event: SynchronizedOutputEvent) {
+        record_sync_output_mux_event(
+            pane_id,
+            event,
+            &mut self.watchdog,
+            &mut self.orchestrator,
+            &mut self.depth_by_pane,
+            &mut self.buffered_bytes_by_pane,
+        );
+    }
+
+    fn forget_pane(&mut self, pane_id: PaneId) {
+        self.depth_by_pane.remove(&pane_id);
+        self.buffered_bytes_by_pane.remove(&pane_id);
+    }
+}
+
 pub(crate) fn record_sync_output_mux_event(
     pane_id: PaneId,
     event: SynchronizedOutputEvent,
@@ -1302,31 +1329,10 @@ pub struct TermWindow {
     /// empty; explicit bridge tests exercise its aggregation helpers.
     triple_buffer_pane_health:
         HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
-    /// DEC 2026 Begin-Synchronized-Update watchdog telemetry
-    /// (ft-a9eu1 / ft-1dq8h slice 1). Substrate's
-    /// SyncOutputTelemetry: BSU / ESU counts, watchdog
-    /// force-flushes, mid-BSU byte count, max depth observed,
-    /// mode-query count, adversarial-ESU-underflow count.
-    /// Surfaced into `sync_output_telemetry()` for ft doctor and fed
-    /// by mux DEC 2026 BSU/ESU notifications.
-    sync_output_watchdog_telemetry: frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
-    /// DEC 2026 BSU buffer + override-dispatch orchestrator
-    /// telemetry (ft-a9eu1). Substrate's
-    /// SyncOutputOrchestratorTelemetry: per-admission accept /
-    /// truncate / refuse counts, override pass-through /
-    /// coalesce / force-flush, drains by cause. Surfaced into
-    /// `sync_output_telemetry()` alongside the watchdog
-    /// counters.
-    sync_output_orchestrator_telemetry:
-        frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
-    /// Per-pane BSU depth state used to translate mux DEC 2026
-    /// notifications into watchdog telemetry.
-    sync_output_bsu_depth_by_pane:
-        HashMap<PaneId, frankenterm_core::sync_output_watchdog::BsuDepthCounter>,
-    /// Per-pane bytes admitted while a BSU window is open. Drain
-    /// notifications consume this map to attribute ESU/watchdog/live-resize
-    /// bytes without making the mux crate depend on frankenterm-core.
-    sync_output_buffered_bytes_by_pane: HashMap<PaneId, u64>,
+    /// Fold DEC 2026 deltas synchronously at mux delivery. GUI scheduler
+    /// saturation must not lose counters or terminate pane-output delivery.
+    /// Resolve mux membership before locking; never call the mux under this lock.
+    sync_output_state: Arc<Mutex<SyncOutputState>>,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -2413,8 +2419,12 @@ impl TermWindow {
     /// Folds the substrate's two telemetry types into one view.
     #[must_use]
     pub fn sync_output_telemetry(&self) -> SyncOutputDoctorSnapshot {
-        let w = &self.sync_output_watchdog_telemetry;
-        let o = &self.sync_output_orchestrator_telemetry;
+        let state = self
+            .sync_output_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let w = &state.watchdog;
+        let o = &state.orchestrator;
         SyncOutputDoctorSnapshot {
             bsu_count: w.bsu_count(),
             esu_count: w.esu_count(),
@@ -2441,25 +2451,6 @@ impl TermWindow {
             drains_no_op: o.drains_no_op,
             overrides_by_trigger: o.overrides_by_trigger,
         }
-    }
-
-    /// Per ft-a9eu1: feeders that the BSU watchdog hooks call
-    /// once they're wired. Today these are no-ops (no caller),
-    /// but the method shape matches what the future integration
-    /// will need so a future commit can flip the wiring without
-    /// reshaping TermWindow.
-    pub fn sync_output_watchdog_telemetry_mut(
-        &mut self,
-    ) -> &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry {
-        &mut self.sync_output_watchdog_telemetry
-    }
-
-    /// Per ft-a9eu1: orchestrator-side feeder.
-    pub fn sync_output_orchestrator_telemetry_mut(
-        &mut self,
-    ) -> &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry
-    {
-        &mut self.sync_output_orchestrator_telemetry
     }
 
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
@@ -3578,16 +3569,10 @@ impl TermWindow {
             frame_budget_gate_telemetry:
                 frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry::default(),
             frame_budget_reduce_motion_state: probe_reduce_motion_state(),
-            dirty_marks_by_source:
-                frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
+            dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
             triple_buffer_panes: TerminalStateTripleBufferRegistry::default(),
             triple_buffer_pane_health: HashMap::new(),
-            sync_output_watchdog_telemetry:
-                frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default(),
-            sync_output_orchestrator_telemetry:
-                frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry::default(),
-            sync_output_bsu_depth_by_pane: HashMap::new(),
-            sync_output_buffered_bytes_by_pane: HashMap::new(),
+            sync_output_state: Arc::new(Mutex::new(SyncOutputState::default())),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -4900,19 +4885,17 @@ impl TermWindow {
         if !self.window_contains_pane(pane_id) {
             return;
         }
-        record_sync_output_mux_event(
-            pane_id,
-            event,
-            &mut self.sync_output_watchdog_telemetry,
-            &mut self.sync_output_orchestrator_telemetry,
-            &mut self.sync_output_bsu_depth_by_pane,
-            &mut self.sync_output_buffered_bytes_by_pane,
-        );
+        self.sync_output_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(pane_id, event);
     }
 
     fn forget_sync_output_state_for_pane(&mut self, pane_id: PaneId) {
-        self.sync_output_bsu_depth_by_pane.remove(&pane_id);
-        self.sync_output_buffered_bytes_by_pane.remove(&pane_id);
+        self.sync_output_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget_pane(pane_id);
     }
 
     fn mux_notification_has_deferred_cleanup_authority(
@@ -5164,6 +5147,7 @@ impl TermWindow {
         let callback_title_refresh = Arc::clone(&retained_title_refresh);
         let pending_reconciliation = Arc::new(AtomicBool::new(false));
         let callback_reconciliation = Arc::clone(&pending_reconciliation);
+        let sync_output_state = Arc::clone(&self.sync_output_state);
         // Reserve retry ownership before accepting the subscription. The
         // capacity-one channel stores only a level-triggered output bit;
         // structural notifications retain their existing ordered path below.
@@ -5222,6 +5206,33 @@ impl TermWindow {
                 }
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
+                }
+                if matches!(&n, MuxNotification::SynchronizedOutput { .. } | MuxNotification::PaneRemoved(_)) {
+                    let Some(owner) = callback_mux.upgrade() else {
+                        return false;
+                    };
+                    if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)) {
+                        return false;
+                    }
+                    match &n {
+                        MuxNotification::SynchronizedOutput { pane_id, event } => {
+                            // Membership lookup precedes the accumulator lock;
+                            // the fold never calls mux or native window code.
+                            if owner.resolve_pane_id(*pane_id).is_some_and(|(_, window_id, _)| window_id == mux_window_id) {
+                                sync_output_state.lock().unwrap_or_else(|p| p.into_inner()).record(*pane_id, *event);
+                            }
+                            return true;
+                        }
+                        MuxNotification::PaneRemoved(pane_id) => {
+                            // The exact removal lease prevents same-ID reuse
+                            // until this callback and deferred GUI cleanup finish.
+                            // Never erase an accumulator using only a numeric ID.
+                            if pane_removal_cleanup.is_some() && owner.get_pane(*pane_id).is_none() {
+                                sync_output_state.lock().unwrap_or_else(|p| p.into_inner()).forget_pane(*pane_id);
+                            }
+                        }
+                        _ => unreachable!("notification kind was checked above"),
+                    }
                 }
                 if let MuxNotification::PaneOutput(pane_id) = &n {
                     // Full means an equivalent refresh is already retained.
@@ -9667,6 +9678,42 @@ mod tests {
         assert_eq!(exec.admission_snapshot().active_tasks, 1);
         assert_eq!(exec.queue_snapshot().depth, 0);
         assert_eq!(delivered.load(Ordering::Acquire), 0);
+        // DEC 2026 events are ordered deltas, not replaceable last values.
+        // The production accumulator must fold all of them while GUI capacity
+        // is full, without scheduling or disturbing the retained output wake.
+        let sync_output = std::sync::Mutex::new(super::SyncOutputState::default());
+        for event in [
+            mux::SynchronizedOutputEvent::Depth {
+                outcome: mux::SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                max_depth: 1,
+            },
+            mux::SynchronizedOutputEvent::Admission {
+                decision: mux::SynchronizedOutputAdmissionDecision::Accepted,
+                bytes: 64,
+            },
+            mux::SynchronizedOutputEvent::Drain {
+                cause: mux::SynchronizedOutputDrainCause::Esu,
+                bytes: 0,
+                depth_outcome: Some(mux::SynchronizedOutputDepthOutcome::Flushed),
+                max_depth: 1,
+            },
+            mux::SynchronizedOutputEvent::ModeQuery,
+        ] {
+            sync_output.lock().unwrap().record(7, event);
+        }
+        {
+            let state = sync_output.lock().unwrap();
+            assert_eq!(state.watchdog.bsu_count(), 1);
+            assert_eq!(state.watchdog.esu_count(), 1);
+            assert_eq!(state.watchdog.esu_flush_count(), 1);
+            assert_eq!(state.watchdog.mode_query_count(), 1);
+            assert_eq!(state.watchdog.mid_bsu_byte_count(), 64);
+            assert_eq!(state.orchestrator.bytes_accepted, 64);
+            assert_eq!(state.orchestrator.bytes_drained_total, 64);
+            assert!(state.buffered_bytes_by_pane.is_empty());
+        }
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert_eq!(exec.queue_snapshot().depth, 0);
         // No new producer event after capacity recovery: the retained request
         // itself must make progress through the admitted native operation.
         drop(occupying);
