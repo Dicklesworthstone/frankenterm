@@ -5222,7 +5222,11 @@ mod tests {
                 return ScrollbackUsageCapture::Busy;
             };
             let count = rows.1.len();
-            let bytes = rows.1.values().map(|l| l.scan_line().len()).sum();
+            let bytes = rows
+                .1
+                .values()
+                .map(|line| line.len() * std::mem::size_of::<termwiz::cell::Cell>())
+                .sum();
             ScrollbackUsageCapture::Ready(frankenterm_term::config::ScrollbackUsage {
                 rows: count,
                 bytes,
