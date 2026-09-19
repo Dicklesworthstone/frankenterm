@@ -11694,7 +11694,11 @@ mod tests {
         );
         assert!(retained_title.lock().unwrap().is_some());
         assert!(retained_reconciliation.load(Ordering::Acquire));
-        mux.remove_pane_if_same(first.pane_id(), original);
+        assert!(Arc::ptr_eq(
+            &mux.get_pane(first.pane_id()).unwrap(),
+            original
+        ));
+        mux.remove_pane(first.pane_id());
         assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 1);
         assert!(
             mux.add_pane(original).is_err(),

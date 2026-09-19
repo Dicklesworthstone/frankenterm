@@ -1827,11 +1827,12 @@ fn close_quick_select_overlay_if_current(
     pane_id: PaneId,
     instance_token: &Arc<()>,
 ) {
-    let overlay_pane = term_window
-        .pane_state(pane_id)
-        .overlay
-        .as_ref()
-        .map(|overlay| Arc::clone(&overlay.pane));
+    let overlay_pane = term_window.pane_state(pane_id).and_then(|state| {
+        state
+            .overlay
+            .as_ref()
+            .map(|overlay| Arc::clone(&overlay.pane))
+    });
     let is_current = overlay_pane
         .as_ref()
         .and_then(|pane| pane.downcast_ref::<QuickSelectOverlay>())
