@@ -1113,6 +1113,27 @@ impl XConnection {
         })
     }
 
+    pub(crate) fn with_window_inner_reserved_handoff<F>(
+        window: xcb::x::Window,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut XWindowInner, promise::spawn::MainThreadSpawnReservation) + Send + 'static,
+    {
+        reservation.handoff_to_main_thread_local(move |reservation| {
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = connection.x11().window_by_id(window) {
+                let mut inner = lock_window_inner(&handle, "handing off admitted X11 notification");
+                if inner.window_id == window {
+                    f(&mut inner, reservation);
+                }
+            }
+        })
+    }
+
     fn screen_from_focused_window(
         &self,
         by_name: &HashMap<String, ScreenInfo>,

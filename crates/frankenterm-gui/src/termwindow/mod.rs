@@ -188,6 +188,31 @@ impl PendingMuxOutput {
     }
 }
 
+type WindowEventAdmission = (
+    promise::spawn::MainThreadSpawnReservation,
+    promise::spawn::MainThreadSpawnReservation,
+);
+
+#[derive(Clone)]
+struct WindowEventRetryRequest {
+    pending: Arc<AtomicBool>,
+    wake: flume::Sender<()>,
+}
+
+impl WindowEventRetryRequest {
+    fn request(&self) {
+        self.pending.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+}
+
+struct WindowEventRetryDelivery {
+    pending: Arc<AtomicBool>,
+    deliver: Box<
+        dyn Fn(WindowEventAdmission) -> promise::spawn::MainThreadSpawnedTask<()> + Send + Sync,
+    >,
+}
+
 async fn run_mux_output_refresh(
     pending: flume::Receiver<()>,
     identity: promise::spawn::MainThreadAdmissionReceipt,
@@ -195,12 +220,53 @@ async fn run_mux_output_refresh(
     deliver: impl Fn(
         promise::spawn::MainThreadSpawnReservation,
     ) -> promise::spawn::MainThreadSpawnedTask<()>,
+    events: Option<WindowEventRetryDelivery>,
 ) {
     while pending.recv_async().await.is_ok() {
         let mut delay = Duration::from_millis(10);
+        let mut event_serviced = false;
         loop {
+            let mut retry_event = false;
             if pending.is_disconnected() || !is_live() {
                 return;
+            }
+            if let Some(events) = events
+                .as_ref()
+                .filter(|events| !event_serviced && events.pending.load(Ordering::Acquire))
+            {
+                match reserve_window_event_admission() {
+                    Ok(pair) => {
+                        let receipt = pair.0.admission_receipt();
+                        if receipt.queue_id != identity.queue_id
+                            || receipt.scheduler_generation != identity.scheduler_generation
+                        {
+                            return;
+                        }
+                        let _ = (events.deliver)(pair).into_task().fallible().await;
+                        event_serviced = true;
+                        // A missing pane can leave its accepted slot pending.
+                        // Do not spin native dispatches while topology settles.
+                        if events.pending.load(Ordering::Acquire) {
+                            sleep(delay).await;
+                        }
+                    }
+                    Err(rejected) => {
+                        let promise::spawn::MainThreadReservationOutcome::RetryableFull(rejected) =
+                            *rejected
+                        else {
+                            return;
+                        };
+                        if rejected.queue_id != identity.queue_id
+                            || rejected.scheduler_generation != identity.scheduler_generation
+                        {
+                            return;
+                        }
+                        // A callback pair can be full while one Render slot
+                        // remains usable. Keep output/title delivery moving;
+                        // retry the retained event after that task completes.
+                        retry_event = true;
+                    }
+                }
             }
             match promise::spawn::try_reserve_main_thread(
                 promise::spawn::MainThreadServiceClass::Render,
@@ -216,6 +282,11 @@ async fn run_mux_output_refresh(
                     // Completion includes native invalidation and permit
                     // release, not merely consumption of the GUI payload.
                     let _ = deliver(reservation).into_task().fallible().await;
+                    if retry_event {
+                        sleep(delay).await;
+                        delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                        continue;
+                    }
                     break;
                 }
                 promise::spawn::MainThreadReservationOutcome::RetryableFull(rejected) => {
@@ -355,6 +426,12 @@ pub enum TermWindowNotif {
         name: String,
         again: bool,
         generation: Arc<()>,
+    },
+    RetryWindowEvent {
+        mux_owner: Weak<Mux>,
+        mux_window_id: MuxWindowId,
+        retry_owner: Weak<AtomicBool>,
+        admission: Mutex<Option<WindowEventAdmission>>,
     },
     GetConfigOverrides(Sender<wezterm_dynamic::Value>),
     SetConfigOverrides(wezterm_dynamic::Value),
@@ -764,20 +841,36 @@ enum EventState {
     /// The event is running, and we have another one ready to
     /// run once it completes
     InProgressWithQueued(Arc<()>, Option<PaneId>),
+    /// Accepted successor waiting for its callback/completion admission pair.
+    Queued(Option<PaneId>),
 }
 
 impl EventState {
+    fn complete_and_request(
+        &mut self,
+        generation: &Arc<()>,
+        again: bool,
+        retry: &WindowEventRetryRequest,
+    ) {
+        if self.complete(generation, again).is_some() {
+            retry.request();
+        }
+    }
+
     /// Release only the callback which actually owns this running slot.
     fn complete(&mut self, generation: &Arc<()>, again: bool) -> Option<Option<PaneId>> {
         let current = match self {
             Self::InProgress(current) | Self::InProgressWithQueued(current, _) => current,
-            Self::None => return None,
+            Self::None | Self::Queued(_) => return None,
         };
         if !Arc::ptr_eq(current, generation) {
             return None;
         }
         match std::mem::replace(self, Self::None) {
-            Self::InProgressWithQueued(_, pane) if again => Some(pane),
+            Self::InProgressWithQueued(_, pane) if again => {
+                *self = Self::Queued(pane);
+                Some(pane)
+            }
             _ => None,
         }
     }
@@ -798,18 +891,15 @@ impl<F: FnOnce(bool)> Drop for WindowEventCompletion<F> {
     }
 }
 
-fn reserve_window_event_admission() -> Option<(
-    promise::spawn::MainThreadSpawnReservation,
-    promise::spawn::MainThreadSpawnReservation,
-)> {
+fn reserve_window_event_admission()
+-> Result<WindowEventAdmission, Box<promise::spawn::MainThreadReservationOutcome>> {
     use promise::spawn::{
         MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
     };
     let callback = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8 * 1024) {
         MainThreadReservationOutcome::Reserved(reservation) => reservation,
         rejected => {
-            log::error!("window Lua callback admission refused: {rejected:?}");
-            return None;
+            return Err(Box::new(rejected));
         }
     };
     match try_reserve_main_thread(MainThreadServiceClass::Render, 4 * 1024) {
@@ -820,14 +910,11 @@ fn reserve_window_event_admission() -> Option<(
                 != (second.queue_id, second.scheduler_generation)
             {
                 log::error!("window Lua admission pair crossed scheduler generations");
-                return None;
+                return Err(Box::new(MainThreadReservationOutcome::SchedulerUnavailable));
             }
-            Some((callback, completion))
+            Ok((callback, completion))
         }
-        rejected => {
-            log::error!("window Lua completion admission refused: {rejected:?}");
-            None
-        }
+        rejected => Err(Box::new(rejected)),
     }
 }
 
@@ -1443,6 +1530,8 @@ pub struct TermWindow {
     render_wake_state: RenderWakeState,
     render_wake_requests: Option<RenderWakeRequests>,
     output_refresh_abort: Option<RenderWakeAbort>,
+    window_event_retry: Option<WindowEventRetryRequest>,
+    last_window_event_retry: Option<String>,
     mux_subscription: Option<GuiMuxSubscription>,
     /// Gate for the iter-dirty render-pass clean-line accounting
     /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
@@ -3723,6 +3812,8 @@ impl TermWindow {
             render_wake_state: RenderWakeState::default(),
             render_wake_requests: None,
             output_refresh_abort: None,
+            window_event_retry: None,
+            last_window_event_retry: None,
             mux_subscription: None,
             // Per ft-gwzrm: live dirty sources are wired, and the
             // render path only records a clean-line skip after a
@@ -4381,6 +4472,61 @@ impl TermWindow {
                 tx.try_send(self.config.clone())
                     .map_err(chan_err)
                     .context("send GetEffectiveConfig response")?;
+            }
+            TermWindowNotif::RetryWindowEvent {
+                mux_owner,
+                mux_window_id,
+                retry_owner,
+                admission,
+            } => {
+                let Some(owner) = mux_owner.upgrade() else {
+                    return Ok(());
+                };
+                if self.mux_window_id != mux_window_id
+                    || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
+                    || !retry_owner.upgrade().is_some_and(|owner| {
+                        self.window_event_retry
+                            .as_ref()
+                            .is_some_and(|retry| Arc::ptr_eq(&owner, &retry.pending))
+                    })
+                {
+                    return Ok(());
+                }
+                if let Some(retry) = &self.window_event_retry {
+                    retry.pending.store(false, Ordering::Release);
+                }
+                let candidate = self
+                    .event_states
+                    .iter()
+                    .filter_map(|(name, state)| match state {
+                        EventState::Queued(pane) => Some((name.clone(), *pane)),
+                        _ => None,
+                    })
+                    .min_by_key(|(name, _)| {
+                        (
+                            self.last_window_event_retry
+                                .as_ref()
+                                .is_some_and(|last| name <= last),
+                            name.clone(),
+                        )
+                    });
+                if let Some((name, pane)) = candidate {
+                    if let Some(pair) = admission.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                        self.schedule_window_event_admitted(&name, pane, Some(pair));
+                        // A temporarily unresolved pane must not starve other
+                        // accepted names while its own queued slot is retained.
+                        self.last_window_event_retry = Some(name);
+                    }
+                }
+                if self
+                    .event_states
+                    .values()
+                    .any(|state| matches!(state, EventState::Queued(_)))
+                {
+                    if let Some(retry) = &self.window_event_retry {
+                        retry.request();
+                    }
+                }
             }
             TermWindowNotif::FinishWindowEvent {
                 name,
@@ -5341,6 +5487,11 @@ impl TermWindow {
             rejected => anyhow::bail!("reserving GUI pane-output scheduler owner: {rejected:?}"),
         };
         let (output_tx, output_rx) = flume::bounded(1);
+        let event_retry_pending = Arc::new(AtomicBool::new(false));
+        self.window_event_retry = Some(WindowEventRetryRequest {
+            pending: Arc::clone(&event_retry_pending),
+            wake: output_tx.clone(),
+        });
         let output_interest = Arc::new(PendingMuxOutput::new());
         let callback_output_interest = Arc::clone(&output_interest);
         let output_window = window.clone();
@@ -5482,6 +5633,28 @@ impl TermWindow {
             dead: owner_dead,
         });
         let (output_abort, output_registration) = AbortHandle::new_pair();
+        let event_window = output_window.clone();
+        let event_mux = output_mux.clone();
+        let event_mux_window_id = Arc::clone(&output_mux_window_id);
+        let event_retry_owner = Arc::downgrade(&event_retry_pending);
+        let event_delivery = WindowEventRetryDelivery {
+            pending: event_retry_pending,
+            deliver: Box::new(move |(callback, completion)| {
+                let mux_owner = event_mux.clone();
+                let retry_owner = event_retry_owner.clone();
+                let mux_window_id = *event_mux_window_id
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                event_window.notify_with_reservation_factory(callback, move |callback| {
+                    TermWindowNotif::RetryWindowEvent {
+                        mux_owner,
+                        mux_window_id,
+                        retry_owner,
+                        admission: Mutex::new(Some((callback, completion))),
+                    }
+                })
+            }),
+        };
         output_worker.spawn(async move {
             let _ = Abortable::new(
                 run_mux_output_refresh(
@@ -5509,6 +5682,7 @@ impl TermWindow {
                             Some(actions),
                         )
                     },
+                    Some(event_delivery),
                 ),
                 output_registration,
             )
@@ -5558,6 +5732,18 @@ impl TermWindow {
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) -> bool {
+        self.schedule_window_event_admitted(name, pane_id, None)
+    }
+
+    fn schedule_window_event_admitted(
+        &mut self,
+        name: &str,
+        pane_id: Option<PaneId>,
+        admission: Option<WindowEventAdmission>,
+    ) -> bool {
+        if self.window_event_retry.is_none() {
+            return false;
+        }
         let Some(window) = GuiWin::try_new(self) else {
             return false;
         };
@@ -5574,8 +5760,15 @@ impl TermWindow {
         };
         let pane = MuxPane(pane.pane_id());
         let name = name.to_string();
-        let Some((callback, completion)) = reserve_window_event_admission() else {
-            return false;
+        let (callback, completion) = match admission
+            .map(Ok)
+            .unwrap_or_else(reserve_window_event_admission)
+        {
+            Ok(pair) => pair,
+            Err(rejected) => {
+                log::error!("window Lua event admission refused: {rejected:?}");
+                return false;
+            }
         };
         let generation = Arc::new(());
         let finish_generation = Arc::clone(&generation);
@@ -5635,14 +5828,14 @@ impl TermWindow {
     /// to execute against, so we should just mark as done.
     /// Otherwise, if there is a queued item, schedule it now.
     fn finish_window_event(&mut self, name: &str, again: bool, generation: &Arc<()>) {
-        let next = self
-            .event_states
-            .get_mut(name)
-            .and_then(|state| state.complete(generation, again));
-        if let Some(pane) = next {
-            // Completion released this generation before starting its queued
-            // successor. A refusal leaves None, never a stranded InProgress.
-            self.schedule_window_event(name, pane);
+        if let Some(state) = self.event_states.get_mut(name) {
+            // The old native completion still owns its permit here. Preserve
+            // the accepted successor until the coordinator admits its pair.
+            if let Some(retry) = &self.window_event_retry {
+                state.complete_and_request(generation, again, retry);
+            } else {
+                state.complete(generation, again);
+            }
         }
     }
 
@@ -5674,6 +5867,12 @@ impl TermWindow {
                         pane_id,
                         other_pane
                     );
+                }
+                return;
+            }
+            EventState::Queued(_) => {
+                if let Some(retry) = &self.window_event_retry {
+                    retry.request();
                 }
                 return;
             }
@@ -9754,6 +9953,203 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn queued_window_event_retries_after_held_completion_without_external_wake() {
+        if run_scheduler_test_in_child(
+            "queued_window_event_retries_after_held_completion_without_external_wake",
+        ) {
+            return;
+        }
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let exec = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let (callback, completion) = super::reserve_window_event_admission().unwrap();
+        let identity = callback.admission_receipt();
+        let generation = Arc::new(());
+        let state = Arc::new(Mutex::new(super::EventState::InProgressWithQueued(
+            Arc::clone(&generation),
+            Some(17),
+        )));
+        let (wake, receive) = flume::bounded(1);
+        let retry = super::WindowEventRetryRequest {
+            pending: Arc::new(AtomicBool::new(false)),
+            wake,
+        };
+        let (release, held) = flume::bounded(1);
+        let finish_state = Arc::clone(&state);
+        let finish_retry = retry.clone();
+        let guard = super::WindowEventCompletion {
+            finish: Some(move |again| {
+                completion
+                    .spawn(async move {
+                        finish_state.lock().unwrap().complete_and_request(
+                            &generation,
+                            again,
+                            &finish_retry,
+                        );
+                        // This is the actual production state transition while
+                        // the old completion task still consumes its Render slot.
+                        held.recv_async().await.unwrap();
+                    })
+                    .detach();
+            }),
+            again: true,
+        };
+        callback
+            .spawn(async move {
+                drop(guard);
+            })
+            .detach();
+        for _ in 0..8 {
+            let _ = exec.try_tick().unwrap();
+            if retry.pending.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        assert!(matches!(
+            *state.lock().unwrap(),
+            super::EventState::Queued(Some(17))
+        ));
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let successors = Arc::new(AtomicUsize::new(0));
+        let output_interest = Arc::new(super::PendingMuxOutput::new());
+        output_interest.record(17);
+        let output_delivered = Arc::new(AtomicUsize::new(0));
+        let output_count = Arc::clone(&output_delivered);
+        let ran = Arc::clone(&successors);
+        let worker_state = Arc::clone(&state);
+        let pending = Arc::clone(&retry.pending);
+        let (attempted, attempts) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(
+                receive,
+                identity,
+                || {
+                    let _ = attempted.try_send(());
+                    true
+                },
+                |reservation| {
+                    let interest = output_interest.take();
+                    let count = Arc::clone(&output_count);
+                    assert_eq!(
+                        reservation.admission_receipt().service_class,
+                        MainThreadServiceClass::Render
+                    );
+                    reservation.spawn(async move {
+                        if super::PendingMuxOutput::includes(&interest, 17) {
+                            count.fetch_add(1, Ordering::AcqRel);
+                        }
+                    })
+                },
+                Some(super::WindowEventRetryDelivery {
+                    pending: Arc::clone(&pending),
+                    deliver: Box::new(move |(callback, completion)| {
+                        let callback_receipt = callback.admission_receipt();
+                        let completion_receipt = completion.admission_receipt();
+                        assert_eq!(
+                            callback_receipt.service_class,
+                            MainThreadServiceClass::Interactive
+                        );
+                        assert_eq!(callback_receipt.estimated_bytes.get(), 8192);
+                        assert_eq!(
+                            completion_receipt.service_class,
+                            MainThreadServiceClass::Render
+                        );
+                        assert_eq!(completion_receipt.estimated_bytes.get(), 4096);
+                        let state = Arc::clone(&worker_state);
+                        let pending = Arc::clone(&pending);
+                        let ran = Arc::clone(&ran);
+                        // Same exact-permit factory handoff used by native
+                        // delivery; no native window is fabricated by this test.
+                        callback.handoff_to_main_thread_local(move |callback| {
+                            assert_eq!(callback.admission_receipt(), callback_receipt);
+                            assert!(matches!(
+                                *state.lock().unwrap(),
+                                super::EventState::Queued(Some(17))
+                            ));
+                            pending.store(false, Ordering::Release);
+                            let generation = Arc::new(());
+                            *state.lock().unwrap() =
+                                super::EventState::InProgress(Arc::clone(&generation));
+                            let guard = super::WindowEventCompletion {
+                                finish: Some(move |again| {
+                                    completion
+                                        .spawn(async move {
+                                            state.lock().unwrap().complete(&generation, again);
+                                        })
+                                        .detach();
+                                }),
+                                again: true,
+                            };
+                            callback
+                                .spawn_local(async move {
+                                    let _completion = guard;
+                                    ran.fetch_add(1, Ordering::AcqRel);
+                                })
+                                .detach();
+                        })
+                    }),
+                }),
+            ));
+        });
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(occupying);
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
+        for _ in 0..2 {
+            while attempts.try_recv().is_err() {
+                assert!(
+                    Instant::now() < retry_deadline,
+                    "queued event did not retry"
+                );
+                let _ = exec.try_tick().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Even without the competing permit, the old completion makes a
+        // fresh pair impossible. The accepted slot must remain queued.
+        assert_eq!(successors.load(Ordering::Acquire), 0);
+        assert_eq!(
+            output_delivered.load(Ordering::Acquire),
+            1,
+            "one-slot output must not wait for the two-slot event pair"
+        );
+        assert!(matches!(
+            *state.lock().unwrap(),
+            super::EventState::Queued(Some(17))
+        ));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(*state.lock().unwrap(), super::EventState::None) {
+            assert!(
+                Instant::now() < deadline,
+                "accepted successor did not recover"
+            );
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(successors.load(Ordering::Acquire), 1);
+        drop(retry);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "coordinator did not retire");
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().unwrap();
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
     fn window_event_completion_survives_full_queue_error_and_unpolled_cancel() {
         if run_scheduler_test_in_child(
             "window_event_completion_survives_full_queue_error_and_unpolled_cancel",
@@ -9773,7 +10169,7 @@ mod tests {
             MainThreadAdmissionLimits::new(1, 16 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
-        assert!(super::reserve_window_event_admission().is_none());
+        assert!(super::reserve_window_event_admission().is_err());
         assert_eq!(one.admission_snapshot().active_tasks, 0);
         drop(one);
 
@@ -9837,7 +10233,10 @@ mod tests {
                 usize::from(!cancel_before_poll)
             );
             assert_eq!(*next.lock().unwrap(), Some(Some(17)));
-            assert!(matches!(*state.lock().unwrap(), super::EventState::None));
+            assert!(matches!(
+                *state.lock().unwrap(),
+                super::EventState::Queued(Some(17))
+            ));
             drop(occupying);
 
             // An admitted successor runs, and a late completion carrying the
@@ -9989,6 +10388,7 @@ mod tests {
                         delivery_released.recv_async().await.unwrap();
                     })
                 },
+                None,
             ));
         });
         attempts.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -10089,6 +10489,7 @@ mod tests {
             identity,
             || true,
             |_| panic!("old subscription must not migrate into a replacement scheduler"),
+            None,
         ));
         assert_eq!(replacement.admission_snapshot().active_tasks, 0);
         assert_eq!(replacement.queue_snapshot().depth, 0);
@@ -10103,6 +10504,7 @@ mod tests {
             identity,
             || true,
             |_| panic!("old subscription must retire even when replacement is full"),
+            None,
         ));
         drop(occupying);
     }
@@ -10461,6 +10863,7 @@ mod tests {
                         delivered.fetch_add(1, Ordering::AcqRel);
                     })
                 },
+                None,
             ))
         });
         drop(occupying);

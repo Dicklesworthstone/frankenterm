@@ -212,6 +212,24 @@ impl Connection {
             }
         })
     }
+
+    pub(crate) fn with_window_inner_reserved_handoff<F>(
+        window: HWindow,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut WindowInner, promise::spawn::MainThreadSpawnReservation) + Send + 'static,
+    {
+        reservation.handoff_to_main_thread_local(move |reservation| {
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = connection.get_window(window) {
+                f(&mut handle.borrow_mut(), reservation);
+            }
+        })
+    }
 }
 
 pub(crate) struct ScreenInfoHelper {

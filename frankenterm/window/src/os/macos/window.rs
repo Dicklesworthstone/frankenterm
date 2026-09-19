@@ -840,13 +840,7 @@ impl WindowOps for Window {
         Self: Sized,
     {
         Connection::with_window_inner(self.id, move |inner| {
-            if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                window_view
-                    .inner
-                    .borrow_mut()
-                    .events
-                    .dispatch(WindowEvent::Notification(Box::new(t)));
-            }
+            inner.dispatch_notification(|| t);
             Ok(())
         });
     }
@@ -858,13 +852,7 @@ impl WindowOps for Window {
         actions: Option<std::sync::Arc<crate::AdmittedWindowActions>>,
     ) -> promise::spawn::MainThreadSpawnedTask<()> {
         Connection::with_window_inner_reserved(self.id, reservation, move |inner| {
-            if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                window_view
-                    .inner
-                    .borrow_mut()
-                    .events
-                    .dispatch(WindowEvent::Notification(Box::new(t)));
-            }
+            inner.dispatch_notification(|| t);
             if let Some(actions) = actions {
                 actions.apply(|title, repaint| {
                     if let Some(title) = title {
@@ -876,6 +864,24 @@ impl WindowOps for Window {
                 });
             }
         })
+    }
+
+    fn notify_with_reservation_factory<T, F>(
+        &self,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        factory: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(promise::spawn::MainThreadSpawnReservation) -> T + Send + 'static,
+    {
+        Connection::with_window_inner_reserved_handoff(
+            self.id,
+            reservation,
+            move |inner, reservation| {
+                inner.dispatch_notification(|| factory(reservation));
+            },
+        )
     }
 
     fn close(&self) {
@@ -1109,6 +1115,20 @@ fn screen_point_to_cartesian(point: ScreenPoint) -> NSPoint {
 }
 
 impl WindowInner {
+    fn dispatch_notification<T: Any + Send + Sync>(&mut self, factory: impl FnOnce() -> T) {
+        // SAFETY: Connection's owner-thread window lookup retains this
+        // WindowInner and its NSView for the entire synchronous call. All
+        // notification paths use that main-thread lookup; the view is never
+        // borrowed after this method returns. Keep this audited dereference in
+        // one place, including the lazy reservation-transfer path.
+        if let Some(view) = WindowView::get_this(unsafe { &**self.view }) {
+            view.inner
+                .borrow_mut()
+                .events
+                .dispatch(WindowEvent::Notification(Box::new(factory())));
+        }
+    }
+
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
             window_view.inner.borrow_mut().enable_opengl()

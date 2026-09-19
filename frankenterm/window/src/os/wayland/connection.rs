@@ -193,6 +193,26 @@ impl WaylandConnection {
             }
         })
     }
+
+    pub(crate) fn with_window_inner_reserved_handoff<F>(
+        window: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut WaylandWindowInner, promise::spawn::MainThreadSpawnReservation)
+            + Send
+            + 'static,
+    {
+        reservation.handoff_to_main_thread_local(move |reservation| {
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = connection.wayland().window_by_id(window) {
+                f(&mut handle.borrow_mut(), reservation);
+            }
+        })
+    }
 }
 
 impl ConnectionOps for WaylandConnection {

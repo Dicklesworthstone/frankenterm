@@ -644,6 +644,26 @@ impl WindowOps for WaylandWindow {
         });
     }
 
+    fn notify_with_reservation_factory<T, F>(
+        &self,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        factory: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(promise::spawn::MainThreadSpawnReservation) -> T + Send + 'static,
+    {
+        WaylandConnection::with_window_inner_reserved_handoff(
+            self.0,
+            reservation,
+            move |inner, reservation| {
+                inner
+                    .events
+                    .dispatch(WindowEvent::Notification(Box::new(factory(reservation))));
+            },
+        )
+    }
+
     fn close(&self) {
         let window_id = self.0;
         match crate::reserve_window_main_thread(

@@ -2128,6 +2128,26 @@ impl WindowOps for XWindow {
         })
     }
 
+    fn notify_with_reservation_factory<T, F>(
+        &self,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        factory: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(promise::spawn::MainThreadSpawnReservation) -> T + Send + 'static,
+    {
+        XConnection::with_window_inner_reserved_handoff(
+            self.0,
+            reservation,
+            move |inner, reservation| {
+                inner
+                    .events
+                    .dispatch(WindowEvent::Notification(Box::new(factory(reservation))));
+            },
+        )
+    }
+
     fn close(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.close();

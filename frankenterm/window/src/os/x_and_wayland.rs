@@ -274,6 +274,22 @@ impl WindowOps for Window {
         }
     }
 
+    fn notify_with_reservation_factory<T, F>(
+        &self,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        factory: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(promise::spawn::MainThreadSpawnReservation) -> T + Send + 'static,
+    {
+        match self {
+            Self::X11(x) => x.notify_with_reservation_factory(reservation, factory),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.notify_with_reservation_factory(reservation, factory),
+        }
+    }
+
     fn hide(&self) {
         match self {
             Self::X11(x) => x.hide(),

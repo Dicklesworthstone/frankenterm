@@ -139,6 +139,24 @@ impl Connection {
             }
         })
     }
+
+    pub(crate) fn with_window_inner_reserved_handoff<F>(
+        window_id: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(&mut WindowInner, promise::spawn::MainThreadSpawnReservation) + Send + 'static,
+    {
+        reservation.handoff_to_main_thread_local(move |reservation| {
+            let Some(conn) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = conn.window_by_id(window_id) {
+                f(&mut handle.borrow_mut(), reservation);
+            }
+        })
+    }
 }
 
 /// `/System/Library/CoreServices/SystemVersion.plist`

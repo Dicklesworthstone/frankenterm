@@ -388,6 +388,19 @@ pub trait WindowOps {
     where
         Self: Sized;
 
+    /// Dispatch on the native owner thread while transferring the exact
+    /// admission into the payload. A missing native owner drops the factory
+    /// and reservation without invoking either the factory or handler.
+    fn notify_with_reservation_factory<T, F>(
+        &self,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        factory: F,
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
+        Self: Sized,
+        T: Any + Send + Sync,
+        F: FnOnce(promise::spawn::MainThreadSpawnReservation) -> T + Send + 'static;
+
     /// Setup opengl for rendering
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>>;
     /// Advise the window that a frame is finished
