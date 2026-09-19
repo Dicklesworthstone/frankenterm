@@ -296,7 +296,8 @@ mod measured {
 
                 let render = client
                     .get_pane_render_changes_with_cx(cx, self.pane)
-                    .await?;
+                    .await
+                    .context("poll render changes during echo observation")?;
                 ensure!(
                     Instant::now() < deadline,
                     "timeout waiting for {name} after {total_observed} bytes observed"
@@ -364,7 +365,8 @@ mod measured {
                             self.pane,
                             std::iter::once(self.next_row..chunk_end).collect(),
                         )
-                        .await?;
+                        .await
+                        .context("read text rows during echo observation")?;
                     ensure!(
                         Instant::now() < deadline,
                         "timeout waiting for {name} after {total_observed} bytes observed"

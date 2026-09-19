@@ -150,7 +150,11 @@ fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
         .is_some()
     {
         "metadata_busy"
-    } else if error.downcast_ref::<LineReadPublicationChanged>().is_some() {
+    } else if error.downcast_ref::<LineReadPublicationChanged>().is_some()
+        || error
+            .downcast_ref::<wezterm_term::screen::ColdReadSourceChanged>()
+            .is_some()
+    {
         "source_changed"
     } else {
         "other"
@@ -2399,7 +2403,10 @@ impl MuxRequestErrorContext {
         // observe a fresh layout before deciding whether to restart; preserve
         // its existing backend-failure/resynchronization path.
         if self.request_ident == GetLines::IDENT
-            && error.downcast_ref::<LineReadPublicationChanged>().is_some()
+            && (error.downcast_ref::<LineReadPublicationChanged>().is_some()
+                || error
+                    .downcast_ref::<wezterm_term::screen::ColdReadSourceChanged>()
+                    .is_some())
         {
             return ErrorResponse::resource_busy(self.request_ident);
         }
@@ -2413,8 +2420,13 @@ impl MuxRequestErrorContext {
             return ErrorResponse::quota_exceeded(self.request_ident);
         }
         if self.request_ident == GetPaneRenderChanges::IDENT
-            && error.downcast_ref::<PaneRenderPreparationError>()
-                == Some(&PaneRenderPreparationError::MetadataBusy)
+            && matches!(
+                error.downcast_ref::<PaneRenderPreparationError>(),
+                Some(
+                    PaneRenderPreparationError::MetadataBusy
+                        | PaneRenderPreparationError::SourceChanged
+                )
+            )
         {
             return ErrorResponse::resource_busy(self.request_ident);
         }
@@ -12945,74 +12957,92 @@ mod tests {
                 .starts_with("updated")
         );
 
-        let error = anyhow::Error::new(LineReadPublicationChanged)
-            .context("private source context must stay local");
-        assert_eq!(line_read_failure_reason(&error), "source_changed");
-        for request_ident in [
-            GetLines::IDENT,
-            GetLinesAtLayout::IDENT,
-            GetPaneRenderChanges::IDENT,
-            Ping::IDENT,
-            KillPane::IDENT,
+        for error in [
+            anyhow::Error::new(LineReadPublicationChanged),
+            anyhow::Error::new(wezterm_term::screen::ColdReadSourceChanged),
         ] {
-            let context = MuxRequestErrorContext {
-                request_ident,
-                object: None,
-                may_mutate: request_ident == KillPane::IDENT,
-            };
-            let response = context.response_for_error(&error);
-            response.validate().unwrap();
-            assert_eq!(response.request_ident, request_ident);
-            if request_ident == GetLines::IDENT {
-                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
-                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
-                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
-            } else if request_ident == KillPane::IDENT {
-                assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
-            } else {
-                assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+            let error = error.context("private source context must stay local");
+            assert_eq!(line_read_failure_reason(&error), "source_changed");
+            for request_ident in [
+                GetLines::IDENT,
+                GetLinesAtLayout::IDENT,
+                GetPaneRenderChanges::IDENT,
+                Ping::IDENT,
+                KillPane::IDENT,
+            ] {
+                let context = MuxRequestErrorContext {
+                    request_ident,
+                    object: None,
+                    may_mutate: request_ident == KillPane::IDENT,
+                };
+                let response = context.response_for_error(&error);
+                response.validate().unwrap();
+                assert_eq!(response.request_ident, request_ident);
+                if request_ident == GetLines::IDENT {
+                    assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                    assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                    assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+                } else if request_ident == KillPane::IDENT {
+                    assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
+                } else {
+                    assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+                }
+                assert_ne!(
+                    context
+                        .response_for_error(&anyhow!("line read source changed before publication"))
+                        .code,
+                    MuxErrorCode::RESOURCE_BUSY,
+                    "arbitrary backend errors cannot authorize retries"
+                );
+                assert!(!format!("{response:?}").contains("private"));
             }
-            assert_ne!(
-                context
-                    .response_for_error(&anyhow!("line read source changed before publication"))
-                    .code,
-                MuxErrorCode::RESOURCE_BUSY,
-                "arbitrary backend errors cannot authorize retries"
-            );
-            assert!(!format!("{response:?}").contains("private"));
         }
     }
 
     #[test]
     fn render_metadata_busy_retry_is_bound_to_exact_read_request() {
-        for request_ident in [GetPaneRenderChanges::IDENT, Ping::IDENT, KillPane::IDENT] {
-            let context = MuxRequestErrorContext {
-                request_ident,
-                object: None,
-                may_mutate: request_ident == KillPane::IDENT,
-            };
-            let response = context.response_for_error(
-                &anyhow::Error::new(PaneRenderPreparationError::MetadataBusy)
-                    .context("private metadata context"),
-            );
-            response
-                .validate()
-                .expect("canonical render contention response");
-            assert_eq!(response.request_ident, request_ident);
-            if request_ident == GetPaneRenderChanges::IDENT {
-                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
-                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
-                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
-                assert_eq!(
-                    context
-                        .response_for_error(&anyhow!("pane render metadata is temporarily busy"))
-                        .code,
-                    MuxErrorCode::BACKEND_FAILURE
+        for error in [
+            PaneRenderPreparationError::MetadataBusy,
+            PaneRenderPreparationError::SourceChanged,
+        ] {
+            for request_ident in [GetPaneRenderChanges::IDENT, Ping::IDENT, KillPane::IDENT] {
+                let context = MuxRequestErrorContext {
+                    request_ident,
+                    object: None,
+                    may_mutate: request_ident == KillPane::IDENT,
+                };
+                let response = context.response_for_error(
+                    &anyhow::Error::new(error).context("private metadata context"),
                 );
-            } else if request_ident == KillPane::IDENT {
-                assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
-            } else {
-                assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+                response
+                    .validate()
+                    .expect("canonical render contention response");
+                assert_eq!(response.request_ident, request_ident);
+                if request_ident == GetPaneRenderChanges::IDENT {
+                    assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                    assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                    assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+                    assert_eq!(
+                        context
+                            .response_for_error(&anyhow!(
+                                "pane render metadata is temporarily busy"
+                            ))
+                            .code,
+                        MuxErrorCode::BACKEND_FAILURE
+                    );
+                    assert_eq!(
+                        context
+                            .response_for_error(&anyhow::Error::new(
+                                PaneRenderPreparationError::SnapshotFailed
+                            ))
+                            .code,
+                        MuxErrorCode::BACKEND_FAILURE
+                    );
+                } else if request_ident == KillPane::IDENT {
+                    assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
+                } else {
+                    assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+                }
             }
         }
     }
@@ -22220,11 +22250,20 @@ mod tests {
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
 
-        assert_eq!(
-            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None,)
-                .unwrap_err(),
-            PaneRenderPreparationError::SourceChanged
-        );
+        let error =
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap_err();
+        assert_eq!(error, PaneRenderPreparationError::SourceChanged);
+        let response = MuxRequestErrorContext {
+            request_ident: GetPaneRenderChanges::IDENT,
+            object: None,
+            may_mutate: false,
+        }
+        .response_for_error(&anyhow::Error::new(error));
+        response.validate().unwrap();
+        assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+        assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
         let state = per_pane.lock().unwrap();
         assert_eq!(state.baseline, PaneRenderBaseline::default());
         assert!(state.transactional_dirty);

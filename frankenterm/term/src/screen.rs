@@ -254,6 +254,46 @@ impl std::fmt::Display for ColdReadMetadataBusy {
 #[cfg(feature = "use_serde")]
 impl std::error::Error for ColdReadMetadataBusy {}
 
+/// The captured source interval was invalidated before historical IO began.
+/// This does not classify an IO, authentication, or decoding failure as transient.
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdReadSourceChanged;
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for ColdReadSourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cold history source changed before reading")
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for ColdReadSourceChanged {}
+
+#[cfg(feature = "use_serde")]
+fn validate_cold_source_before_read(
+    sink: &dyn crate::config::ScrollbackSpillSink,
+    captured: &crate::config::ScrollbackInterval,
+    rows: Range<StableRowIndex>,
+) -> anyhow::Result<()> {
+    use crate::config::ScrollbackIntervalCapture;
+    let captured_rows = captured
+        .rows()
+        .ok_or_else(|| anyhow::anyhow!("cold read captured source unavailable"))?;
+    anyhow::ensure!(
+        rows.start < rows.end && captured_rows.start <= rows.start && rows.end <= captured_rows.end,
+        "cold read range exceeds captured source"
+    );
+    match sink.try_capture_scrollback_interval() {
+        ScrollbackIntervalCapture::Ready(current) => {
+            anyhow::ensure!(current.retains(captured, rows), ColdReadSourceChanged);
+            Ok(())
+        }
+        ScrollbackIntervalCapture::Busy => Err(ColdReadMetadataBusy.into()),
+        ScrollbackIntervalCapture::Unavailable => anyhow::bail!("cold read source unavailable"),
+    }
+}
+
 #[cfg(feature = "use_serde")]
 pub struct ScreenLineRead {
     witness: ScreenCoordinateWitness,
@@ -1227,6 +1267,7 @@ impl ScreenLineRead {
         while row < self.hot_top {
             anyhow::ensure!(!cancelled(), "cold index cancelled");
             let end = self.hot_top.min(row.saturating_add(32));
+            validate_cold_source_before_read(sink.as_ref(), interval, row..end)?;
             let batch = sink.load_scrollback_lines(row..end);
             anyhow::ensure!(
                 !batch.is_empty() && batch.len() <= (end - row) as usize,
@@ -1574,6 +1615,7 @@ impl ScreenLineRead {
         }
         fn context_batch(
             sink: &dyn crate::config::ScrollbackSpillSink,
+            interval: &crate::config::ScrollbackInterval,
             mut range: Range<StableRowIndex>,
             charge: &mut ColdReadCharge,
             cancelled: &impl Fn() -> bool,
@@ -1583,6 +1625,7 @@ impl ScreenLineRead {
             let mut result = Vec::new();
             while range.start < range.end {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
+                validate_cold_source_before_read(sink, interval, range.clone())?;
                 let batch = sink.load_scrollback_lines(range.clone());
                 anyhow::ensure!(
                     !batch.is_empty() && batch.len() <= (range.end - range.start) as usize,
@@ -1609,11 +1652,10 @@ impl ScreenLineRead {
                 self.resident_first <= layout.visual.end,
                 ColdReadGeometryUnavailable
             );
-            let sink = &self
+            let (sink, interval) = self
                 .cold
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?
-                .0;
+                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?;
             let mut visible = Vec::new();
             let mut context_first = None;
             let mut expanded_cells = 0usize;
@@ -1660,6 +1702,7 @@ impl ScreenLineRead {
                         // Never read beyond the selected logical context.
                         prefetched = context_batch(
                             sink.as_ref(),
+                            interval,
                             source_row..source_end.min(source_row.saturating_add(32)),
                             &mut charge,
                             &cancelled,
@@ -1797,12 +1840,12 @@ impl ScreenLineRead {
             .map_or(self.resident_first, |source| source.end);
         while row < cold_end {
             anyhow::ensure!(!cancelled(), "cold read cancelled");
-            let sink = &self
+            let (sink, interval) = self
                 .cold
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?
-                .0;
+                .ok_or_else(|| anyhow::anyhow!("cold read unavailable"))?;
             let end = cold_end.min(row.saturating_add(32));
+            validate_cold_source_before_read(sink.as_ref(), interval, row..end)?;
             let batch = sink.load_scrollback_lines(row..end);
             anyhow::ensure!(
                 !batch.is_empty() && batch.len() <= (end - row) as usize,
@@ -1846,6 +1889,7 @@ impl ScreenLineRead {
                 let from = retained.start.max(context_first.saturating_sub(count));
                 let batch = context_batch(
                     sink.as_ref(),
+                    interval,
                     from..context_first,
                     &mut charge,
                     &cancelled,
@@ -1892,6 +1936,7 @@ impl ScreenLineRead {
                     .min(context_end.saturating_add(count));
                 let batch = context_batch(
                     sink.as_ref(),
+                    interval,
                     context_end..to,
                     &mut charge,
                     &cancelled,
@@ -12383,6 +12428,61 @@ pub(crate) mod tests {
         });
         assert!(!screen.validates_line_read(&after));
         assert!(screen.capture_line_read(6..7).unwrap().layout.is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_hydration_refuses_changed_source_before_loading_rows() {
+        let (screen, sink) = stored_physical_fixture(6, 32);
+        let stale = screen.capture_line_read(0..3).unwrap();
+        let busy = screen.capture_line_read(0..3).unwrap();
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        let error = busy.hydrate(|| false).err().expect("busy source refused");
+        assert!(error.downcast_ref::<ColdReadMetadataBusy>().is_some());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        sink.force_busy_probe.store(false, Ordering::Relaxed);
+
+        // A real replacement preserves the row bounds but changes lineage.
+        let replacement = Line::from_text("replacement", &CellAttributes::blank(), 2, None);
+        assert!(sink.store_scrollback_line(0, &replacement, 32));
+        let error = stale.hydrate(|| false).err().expect("stale source refused");
+        assert!(error.downcast_ref::<ColdReadSourceChanged>().is_some());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+
+        let (screen, sink) = stored_physical_fixture(6, 32);
+        let stale = screen.capture_line_read(0..3).unwrap();
+        assert!(sink.store_scrollback_line(6, &replacement, 3));
+        let error = stale
+            .hydrate(|| false)
+            .err()
+            .expect("pruned source refused");
+        assert!(error.downcast_ref::<ColdReadSourceChanged>().is_some());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+
+        let (screen, sink) = stored_physical_fixture(6, 32);
+        let retained = screen.capture_line_read(0..3).unwrap();
+        let expected: Vec<_> = sink
+            .rows
+            .lock()
+            .unwrap()
+            .range(0..3)
+            .map(|(_, line)| line.clone())
+            .collect();
+        assert!(sink.store_scrollback_line(6, &replacement, 32));
+        let ready = retained.hydrate(|| false).expect("append retains old rows");
+        assert_eq!(ready.lines().cloned().collect::<Vec<_>>(), expected);
+
+        // A hole inside unchanged bounds is a missing-row failure, not proof
+        // of changed lineage. Do not turn damaged storage into a retry hint.
+        let (screen, sink) = stored_physical_fixture(6, 32);
+        let damaged = screen.capture_line_read(1..2).unwrap();
+        sink.rows.lock().unwrap().remove(&1);
+        let error = damaged
+            .hydrate(|| false)
+            .err()
+            .expect("missing row refused");
+        assert!(error.downcast_ref::<ColdReadSourceChanged>().is_none());
+        assert!(sink.batch_reads.load(Ordering::Relaxed) > 0);
     }
 
     #[cfg(feature = "use_serde")]
