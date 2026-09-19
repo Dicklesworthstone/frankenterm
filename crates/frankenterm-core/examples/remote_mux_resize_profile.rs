@@ -116,107 +116,111 @@ mod measured {
     }
 
     impl IncrementalPaneObserver {
+        fn new_with_state(
+            pane: u64,
+            start_row: isize,
+            expected_cols: usize,
+            expected_viewport_rows: usize,
+        ) -> Self {
+            Self {
+                pane,
+                next_row: start_row,
+                expected_cols,
+                expected_viewport_rows,
+                accumulated_text: String::new(),
+                current_live_line: String::new(),
+            }
+        }
+
         async fn new(client: &mut DirectMuxClient, cx: &Cx, pane: u64) -> Result<Self> {
             let render = client.get_pane_render_changes_with_cx(cx, pane).await?;
             ensure!(render.pane_id as u64 == pane, "pane mismatch");
-            ensure!(!render.alt_screen_active, "unexpected alt_screen_active in echo workload");
+            ensure!(
+                !render.alt_screen_active,
+                "unexpected alt_screen_active in echo workload"
+            );
             ensure!(
                 render.dimensions.cols == 80 && render.dimensions.viewport_rows == 24,
                 "unexpected geometry in echo workload: cols={}, rows={}",
                 render.dimensions.cols,
                 render.dimensions.viewport_rows
             );
-            Ok(Self {
+            Ok(Self::new_with_state(
                 pane,
-                next_row: render.dimensions.scrollback_top,
-                expected_cols: 80,
-                expected_viewport_rows: 24,
-                accumulated_text: String::new(),
-                current_live_line: String::new(),
-            })
+                render.dimensions.scrollback_top,
+                80,
+                24,
+            ))
         }
 
-        async fn poll_new_output(&mut self, client: &mut DirectMuxClient, cx: &Cx) -> Result<usize> {
-            let render = client.get_pane_render_changes_with_cx(cx, self.pane).await?;
-            ensure!(render.pane_id as u64 == self.pane, "pane mismatch in render changes");
-            ensure!(!render.alt_screen_active, "unexpected alt_screen_active in echo workload");
+        fn ingest_raw_chunk(
+            &mut self,
+            lines: &[(isize, &str, bool)],
+            chunk_end: isize,
+            live_cursor_y: isize,
+            total_observed: &mut usize,
+            max_observed_bytes: usize,
+            name: &str,
+        ) -> Result<()> {
             ensure!(
-                render.dimensions.cols == self.expected_cols && render.dimensions.viewport_rows == self.expected_viewport_rows,
-                "unexpected resize in echo workload: cols={}, rows={}",
-                render.dimensions.cols,
-                render.dimensions.viewport_rows
+                lines.len() == (chunk_end - self.next_row) as usize,
+                "row count mismatch: expected {}, got {}",
+                chunk_end - self.next_row,
+                lines.len()
             );
 
-            let scrollback_top = render.dimensions.scrollback_top;
-            let live_cursor_y = render.cursor_position.y;
-
-            // Strict retention overrun check: fail closed if next_row was dropped
-            ensure!(
-                self.next_row >= scrollback_top,
-                "retention overrun: observer next_row {} is behind scrollback_top {}",
-                self.next_row,
-                scrollback_top
-            );
-
-            ensure!(
-                live_cursor_y >= self.next_row,
-                "cursor moved backwards: live_cursor_y {} < next_row {}",
-                live_cursor_y,
-                self.next_row
-            );
-
-            let target_end = live_cursor_y.checked_add(1).context("cursor row overflow")?;
-            if self.next_row >= target_end {
-                return Ok(0);
-            }
-
-            const CHUNK_CAP: isize = 128;
-            let mut bytes_ingested = 0usize;
-            let mut cursor = self.next_row;
-
-            while cursor < target_end {
-                let chunk_end = cursor.saturating_add(CHUNK_CAP).min(target_end);
-                let resp = client
-                    .get_lines_with_cx(cx, self.pane, vec![cursor..chunk_end])
-                    .await?;
-                ensure!(resp.pane_id as u64 == self.pane, "pane mismatch in get_lines response");
-                let (lines, _) = resp.lines.extract_data();
+            for (offset, (row_idx, _, _)) in lines.iter().enumerate() {
+                let expected_row = self.next_row + offset as isize;
                 ensure!(
-                    lines.len() == (chunk_end - cursor) as usize,
-                    "row count mismatch in get_lines: expected {}, got {}",
-                    chunk_end - cursor,
-                    lines.len()
+                    *row_idx == expected_row,
+                    "row index gap detected: expected {}, got {}",
+                    expected_row,
+                    row_idx
                 );
-
-                // Exact row index and gap check
-                for (offset, (row_idx, _)) in lines.iter().enumerate() {
-                    let expected_row = cursor + offset as isize;
-                    ensure!(
-                        *row_idx == expected_row,
-                        "row index gap detected: expected {}, got {}",
-                        expected_row,
-                        row_idx
-                    );
-                }
-
-                for (row_idx, line) in lines {
-                    let s = line.as_str();
-                    if row_idx < live_cursor_y {
-                        bytes_ingested += s.len();
-                        self.accumulated_text.push_str(s.as_ref());
-                        if !line.last_cell_was_wrapped() {
-                            self.accumulated_text.push('\n');
-                            bytes_ingested += 1;
-                        }
-                    } else {
-                        self.current_live_line = s.into_owned();
-                    }
-                }
-                cursor = chunk_end;
             }
 
-            self.next_row = live_cursor_y;
-            Ok(bytes_ingested)
+            // Enforce byte cap BEFORE append / allocation
+            let mut chunk_bytes = 0usize;
+            for (row_idx, text, wrapped) in lines {
+                chunk_bytes = chunk_bytes
+                    .checked_add(text.len())
+                    .context("chunk byte count overflow")?;
+                if *row_idx < live_cursor_y && !wrapped {
+                    chunk_bytes = chunk_bytes
+                        .checked_add(1)
+                        .context("chunk byte count overflow")?;
+                }
+            }
+
+            ensure!(
+                total_observed.saturating_add(chunk_bytes) <= max_observed_bytes,
+                "observed byte cap exceeded ({} + {} > {}) waiting for {}",
+                total_observed,
+                chunk_bytes,
+                max_observed_bytes,
+                name
+            );
+
+            *total_observed += chunk_bytes;
+
+            // Clear stale live line if any committed rows are being ingested
+            if lines.iter().any(|(row_idx, _, _)| *row_idx < live_cursor_y) {
+                self.current_live_line.clear();
+            }
+
+            for (row_idx, text, wrapped) in lines {
+                if *row_idx < live_cursor_y {
+                    self.accumulated_text.push_str(text);
+                    if !wrapped {
+                        self.accumulated_text.push('\n');
+                    }
+                } else {
+                    self.current_live_line = (*text).to_string();
+                }
+            }
+
+            self.next_row = chunk_end.min(live_cursor_y);
+            Ok(())
         }
 
         fn search_and_prune<F, T>(&mut self, mut matcher: F) -> Option<T>
@@ -283,15 +287,122 @@ mod measured {
             let mut total_observed = 0usize;
 
             while Instant::now() < deadline {
-                let new_bytes = self.poll_new_output(client, cx).await?;
-                total_observed += new_bytes;
                 ensure!(
-                    total_observed <= max_observed_bytes,
-                    "observed byte cap exceeded ({total_observed} > {max_observed_bytes}) waiting for {name}"
+                    Instant::now() < deadline,
+                    "timeout waiting for {name} after {total_observed} bytes observed"
+                );
+                cx.checkpoint()
+                    .map_err(|e| anyhow::anyhow!("context cancelled waiting for {name}: {e}"))?;
+
+                let render = client
+                    .get_pane_render_changes_with_cx(cx, self.pane)
+                    .await?;
+                ensure!(
+                    Instant::now() < deadline,
+                    "timeout waiting for {name} after {total_observed} bytes observed"
+                );
+                ensure!(
+                    render.pane_id as u64 == self.pane,
+                    "pane mismatch in render changes"
+                );
+                ensure!(
+                    !render.alt_screen_active,
+                    "unexpected alt_screen_active in echo workload"
+                );
+                ensure!(
+                    render.dimensions.cols == self.expected_cols
+                        && render.dimensions.viewport_rows == self.expected_viewport_rows,
+                    "unexpected resize in echo workload: cols={}, rows={}",
+                    render.dimensions.cols,
+                    render.dimensions.viewport_rows
                 );
 
-                if let Some(val) = self.search_and_prune(&mut matcher) {
-                    return Ok(val);
+                let scrollback_top = render.dimensions.scrollback_top;
+                let live_cursor_y = render.cursor_position.y;
+
+                // Strict retention overrun check: fail closed if next_row was dropped
+                ensure!(
+                    self.next_row >= scrollback_top,
+                    "retention overrun: observer next_row {} is behind scrollback_top {}",
+                    self.next_row,
+                    scrollback_top
+                );
+
+                ensure!(
+                    live_cursor_y >= self.next_row,
+                    "cursor moved backwards: live_cursor_y {} < next_row {}",
+                    live_cursor_y,
+                    self.next_row
+                );
+
+                let pass_end = live_cursor_y
+                    .checked_add(1)
+                    .context("cursor row overflow")?;
+                if self.next_row >= pass_end {
+                    sleep_with_cx(cx, Duration::from_millis(1))
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    continue;
+                }
+
+                const CHUNK_CAP: isize = 128;
+                while self.next_row < pass_end {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "timeout waiting for {name} after {total_observed} bytes observed"
+                    );
+                    cx.checkpoint().map_err(|e| {
+                        anyhow::anyhow!("context cancelled waiting for {name}: {e}")
+                    })?;
+
+                    let chunk_end = self.next_row.saturating_add(CHUNK_CAP).min(pass_end);
+                    let reached_pass_end = chunk_end == pass_end;
+
+                    let resp = client
+                        .get_lines_with_cx(
+                            cx,
+                            self.pane,
+                            std::iter::once(self.next_row..chunk_end).collect(),
+                        )
+                        .await?;
+                    ensure!(
+                        Instant::now() < deadline,
+                        "timeout waiting for {name} after {total_observed} bytes observed"
+                    );
+                    ensure!(
+                        resp.pane_id as u64 == self.pane,
+                        "pane mismatch in get_lines response"
+                    );
+                    let (lines, _) = resp.lines.extract_data();
+
+                    let cows: Vec<(isize, std::borrow::Cow<'_, str>, bool)> = lines
+                        .iter()
+                        .map(|(r, l)| (*r, l.as_str(), l.last_cell_was_wrapped()))
+                        .collect();
+                    let chunk_tuples: Vec<(isize, &str, bool)> =
+                        cows.iter().map(|(r, c, w)| (*r, c.as_ref(), *w)).collect();
+
+                    self.ingest_raw_chunk(
+                        &chunk_tuples,
+                        chunk_end,
+                        live_cursor_y,
+                        &mut total_observed,
+                        max_observed_bytes,
+                        name,
+                    )?;
+
+                    // Search after EACH bounded chunk
+                    if let Some(val) = self.search_and_prune(&mut matcher) {
+                        ensure!(
+                            Instant::now() < deadline,
+                            "timeout waiting for {name} after {total_observed} bytes observed"
+                        );
+                        return Ok(val);
+                    }
+
+                    if reached_pass_end {
+                        break;
+                    }
                 }
 
                 sleep_with_cx(cx, Duration::from_millis(1))
@@ -309,26 +420,19 @@ mod measured {
             timeout: Duration,
         ) -> Result<()> {
             let target = "FT_ECHO_READY";
-            self.wait_for_marker(
-                client,
-                cx,
-                1024 * 1024,
-                timeout,
-                target,
-                |text| {
-                    let pos = text.find(target)?;
-                    let match_end = pos + target.len();
-                    let rest = &text[match_end..];
-                    let full_end = if rest.starts_with("\r\n") {
-                        match_end + 2
-                    } else if rest.starts_with('\n') || rest.starts_with('\r') {
-                        match_end + 1
-                    } else {
-                        match_end
-                    };
-                    Some((pos, full_end, ()))
-                },
-            )
+            self.wait_for_marker(client, cx, 1024 * 1024, timeout, target, |text| {
+                let pos = text.find(target)?;
+                let match_end = pos + target.len();
+                let rest = &text[match_end..];
+                let full_end = if rest.starts_with("\r\n") {
+                    match_end + 2
+                } else if rest.starts_with('\n') || rest.starts_with('\r') {
+                    match_end + 1
+                } else {
+                    match_end
+                };
+                Some((pos, full_end, ()))
+            })
             .await
         }
 
@@ -379,30 +483,23 @@ mod measured {
             timeout: Duration,
         ) -> Result<()> {
             let target = format!("FT_PROBE {nonce}");
-            self.wait_for_marker(
-                client,
-                cx,
-                16 * 1024 * 1024,
-                timeout,
-                &target,
-                |text| {
-                    let pos = text.find(&target)?;
-                    let match_end = pos + target.len();
-                    let rest = &text[match_end..];
-                    if rest.starts_with('\r') || rest.starts_with('\n') || rest.is_empty() {
-                        let full_end = if rest.starts_with("\r\n") {
-                            match_end + 2
-                        } else if rest.starts_with('\n') || rest.starts_with('\r') {
-                            match_end + 1
-                        } else {
-                            match_end
-                        };
-                        Some((pos, full_end, ()))
+            self.wait_for_marker(client, cx, 16 * 1024 * 1024, timeout, &target, |text| {
+                let pos = text.find(&target)?;
+                let match_end = pos + target.len();
+                let rest = &text[match_end..];
+                if rest.starts_with('\r') || rest.starts_with('\n') || rest.is_empty() {
+                    let full_end = if rest.starts_with("\r\n") {
+                        match_end + 2
+                    } else if rest.starts_with('\n') || rest.starts_with('\r') {
+                        match_end + 1
                     } else {
-                        None
-                    }
-                },
-            )
+                        match_end
+                    };
+                    Some((pos, full_end, ()))
+                } else {
+                    None
+                }
+            })
             .await
         }
 
@@ -453,26 +550,19 @@ mod measured {
             timeout: Duration,
         ) -> Result<()> {
             let target = format!("FT_EXIT {nonce}");
-            self.wait_for_marker(
-                client,
-                cx,
-                4 * 1024 * 1024,
-                timeout,
-                &target,
-                |text| {
-                    let pos = text.find(&target)?;
-                    let match_end = pos + target.len();
-                    let rest = &text[match_end..];
-                    let full_end = if rest.starts_with("\r\n") {
-                        match_end + 2
-                    } else if rest.starts_with('\n') || rest.starts_with('\r') {
-                        match_end + 1
-                    } else {
-                        match_end
-                    };
-                    Some((pos, full_end, ()))
-                },
-            )
+            self.wait_for_marker(client, cx, 4 * 1024 * 1024, timeout, &target, |text| {
+                let pos = text.find(&target)?;
+                let match_end = pos + target.len();
+                let rest = &text[match_end..];
+                let full_end = if rest.starts_with("\r\n") {
+                    match_end + 2
+                } else if rest.starts_with('\n') || rest.starts_with('\r') {
+                    match_end + 1
+                } else {
+                    match_end
+                };
+                Some((pos, full_end, ()))
+            })
             .await
         }
     }
@@ -810,22 +900,20 @@ mod measured {
             observer
                 .wait_for_ready(&mut client, &cx, Duration::from_secs(30))
                 .await
-                .context("echo fixture startup deadline expired waiting for FT_ECHO_READY")?;
-            emit(
-                json!({
-                    "event": "contract",
-                    "arm": "echo",
-                    "version": 1,
-                    "trials": self.trials,
-                    "min_throughput_mb_s": 10.0,
-                    "p99_budget_us": 50_000,
-                    "scope": "remote-host-private-Unix-socket; live SendText to PTY echo under sustained output",
-                    "socket": self.socket,
-                    "server_pid": self.server_pid,
-                    "pane_id": self.pane,
-                    "tab_id": self.tab,
-                }),
-            )?;
+                .context("echo fixture startup failed while waiting for FT_ECHO_READY")?;
+            emit(json!({
+                "event": "contract",
+                "arm": "echo",
+                "version": 1,
+                "trials": self.trials,
+                "min_throughput_mb_s": 10.0,
+                "p99_budget_us": 50_000,
+                "scope": "remote-host-private-Unix-socket; live SendText to PTY echo under sustained output",
+                "socket": self.socket,
+                "server_pid": self.server_pid,
+                "pane_id": self.pane,
+                "tab_id": self.tab,
+            }))?;
 
             // Signal start of sustained stream
             let stream_nonce = "stream_session_001";
@@ -842,24 +930,20 @@ mod measured {
             let start_bytes = observer
                 .wait_for_start_marker(&mut client, &cx, stream_nonce, Duration::from_secs(10))
                 .await
-                .context("stream start marker deadline expired")?;
+                .context("stream start marker observation failed")?;
 
             let mut latencies_us = Vec::with_capacity(self.trials);
             for trial in 0..self.trials {
                 let nonce = format!("echo_trial_{trial:04}");
                 let send_start = Instant::now();
                 client
-                    .write_to_pane_with_cx(
-                        &cx,
-                        self.pane,
-                        format!("PROBE {nonce}\n").into_bytes(),
-                    )
+                    .write_to_pane_with_cx(&cx, self.pane, format!("PROBE {nonce}\n").into_bytes())
                     .await?;
                 observer
                     .wait_for_probe(&mut client, &cx, &nonce, Duration::from_secs(5))
                     .await
                     .with_context(|| {
-                        format!("keystroke echo deadline expired for trial {trial} ({nonce})")
+                        format!("keystroke echo observation failed for trial {trial} ({nonce})")
                     })?;
                 let latency_us = send_start.elapsed().as_micros();
                 latencies_us.push(latency_us);
@@ -882,10 +966,13 @@ mod measured {
             let end_bytes = observer
                 .wait_for_end_marker(&mut client, &cx, stream_nonce, Duration::from_secs(30))
                 .await
-                .context("terminal stream marker deadline expired; output was not ingested")?;
+                .context("terminal stream marker observation failed; ingestion is unproven")?;
             let stream_duration = stream_start.elapsed();
             let duration_secs = stream_duration.as_secs_f64();
-            ensure!(end_bytes >= start_bytes, "stream end bytes less than start bytes");
+            ensure!(
+                end_bytes >= start_bytes,
+                "stream end bytes less than start bytes"
+            );
             let bytes_ingested = end_bytes - start_bytes;
             let throughput_bytes_per_sec = (bytes_ingested as f64) / duration_secs;
             let throughput_mb_s = throughput_bytes_per_sec / (1024.0 * 1024.0);
@@ -917,16 +1004,12 @@ mod measured {
 
             let exit_nonce = "echo_exit";
             client
-                .write_to_pane_with_cx(
-                    &cx,
-                    self.pane,
-                    format!("EXIT {exit_nonce}\n").into_bytes(),
-                )
+                .write_to_pane_with_cx(&cx, self.pane, format!("EXIT {exit_nonce}\n").into_bytes())
                 .await?;
             observer
                 .wait_for_exit(&mut client, &cx, exit_nonce, Duration::from_secs(5))
                 .await
-                .context("exit receipt deadline expired; FT_EXIT was not observed")?;
+                .context("exit receipt observation failed; FT_EXIT was not observed")?;
 
             emit(json!({
                 "event": "complete",
@@ -1045,5 +1128,266 @@ mod measured {
             .build()
             .map_err(anyhow::Error::msg)?;
         runtime.block_on(workload.measure())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_observer_pre_search_buffered() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            observer.accumulated_text = "FT_ECHO_READY\r\n".to_string();
+
+            let res = observer.search_and_prune(|text| {
+                let pos = text.find("FT_ECHO_READY")?;
+                Some((pos, pos + "FT_ECHO_READY\r\n".len(), ()))
+            });
+            assert!(res.is_some());
+            assert!(observer.accumulated_text.is_empty());
+        }
+
+        #[test]
+        fn test_observer_chunk_by_chunk_search() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 0;
+            let lines = vec![
+                (0, "FT_STR_00000000 payload", false),
+                (1, "FT_PROBE echo_trial_0000", false),
+            ];
+            // Chunk 0..2 where live_cursor_y is 2
+            let res = observer.ingest_raw_chunk(&lines, 2, 2, &mut total_observed, 1024, "probe");
+            assert!(res.is_ok());
+            assert_eq!(observer.next_row, 2);
+
+            let matched = observer.search_and_prune(|text| {
+                let pos = text.find("FT_PROBE echo_trial_0000")?;
+                Some((pos, pos + "FT_PROBE echo_trial_0000\n".len(), 42))
+            });
+            assert_eq!(matched, Some(42));
+        }
+
+        #[test]
+        fn test_observer_split_marker_across_chunks() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 0;
+
+            // Chunk 1: line ends with prefix of probe (e.g. wrapped or split record)
+            let chunk1 = vec![(0, "FT_PROBE echo_tr", true)];
+            observer
+                .ingest_raw_chunk(&chunk1, 1, 2, &mut total_observed, 1024, "probe")
+                .unwrap();
+            assert_eq!(observer.next_row, 1);
+
+            // Search after chunk 1 fails to find full probe
+            let target = "FT_PROBE echo_trial_0042";
+            let matched = observer.search_and_prune(|text| {
+                let pos = text.find(target)?;
+                Some((pos, pos + target.len(), ()))
+            });
+            assert!(matched.is_none());
+
+            // Chunk 2: line starts with suffix of probe
+            let chunk2 = vec![(1, "ial_0042\r\n", false)];
+            observer
+                .ingest_raw_chunk(&chunk2, 2, 2, &mut total_observed, 1024, "probe")
+                .unwrap();
+            assert_eq!(observer.next_row, 2);
+
+            // Search after chunk 2 succeeds across the chunk seam!
+            let matched2 = observer.search_and_prune(|text| {
+                let pos = text.find(target)?;
+                Some((pos, pos + target.len(), ()))
+            });
+            assert!(matched2.is_some());
+        }
+
+        #[test]
+        fn test_observer_byte_cap_enforced_before_append() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 80;
+            let max_cap = 100;
+
+            // Chunk has 30 bytes + 1 newline = 31 bytes, which exceeds 100 - 80 = 20 bytes headroom
+            let chunk = vec![(0, "123456789012345678901234567890", false)];
+            let res =
+                observer.ingest_raw_chunk(&chunk, 1, 1, &mut total_observed, max_cap, "test_cap");
+
+            // Must fail closed with byte cap error
+            assert!(res.is_err());
+            let err_str = res.unwrap_err().to_string();
+            assert!(err_str.contains("observed byte cap exceeded"));
+
+            // Must NOT have appended any data or advanced next_row
+            assert!(observer.accumulated_text.is_empty());
+            assert_eq!(observer.next_row, 0);
+            assert_eq!(total_observed, 80);
+        }
+
+        #[test]
+        fn test_observer_suffix_retention_preserves_split_marker() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+
+            // Fill accumulator to 65 KiB (exceeds ACCUMULATOR_MAX = 64 KiB)
+            let padding = "A".repeat(65 * 1024);
+            observer.accumulated_text = padding;
+            // Append start of marker at the very tail of accumulator
+            observer.accumulated_text.push_str("FT_STREAM_START s");
+
+            // Search fails, triggering prefix prune to RETAINED_SUFFIX (4096 bytes)
+            let res = observer.search_and_prune::<_, ()>(|_| None);
+            assert!(res.is_none());
+            assert_eq!(observer.accumulated_text.len(), 4096);
+            assert!(observer.accumulated_text.ends_with("FT_STREAM_START s"));
+
+            // Ingest next chunk with remainder of marker
+            let mut total_observed = 0;
+            let chunk = vec![(0, "tream_session_001 bytes=500 FT_END\r\n", false)];
+            observer
+                .ingest_raw_chunk(&chunk, 1, 1, &mut total_observed, 1024 * 1024, "stream")
+                .unwrap();
+
+            // Search finds the split marker across the prune boundary!
+            let expected_prefix = "FT_STREAM_START stream_session_001 bytes=";
+            let found = observer.search_and_prune(|text| {
+                let pos = text.find(expected_prefix)?;
+                Some((pos, pos + expected_prefix.len(), ()))
+            });
+            assert!(found.is_some());
+        }
+
+        #[test]
+        fn test_observer_gap_detection_refuses_discontinuous_rows() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 0;
+            // Row index 0, then 2 (gap: row 1 missing)
+            let lines = vec![(0, "row 0", false), (2, "row 2", false)];
+            let res =
+                observer.ingest_raw_chunk(&lines, 2, 2, &mut total_observed, 1024, "gap_test");
+            assert!(res.is_err());
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("row index gap detected")
+            );
+        }
+
+        #[test]
+        fn test_observer_row_count_mismatch_refused() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 0;
+            // Chunk range 0..3 expects 3 lines, but only 2 provided
+            let lines = vec![(0, "row 0", false), (1, "row 1", false)];
+            let res =
+                observer.ingest_raw_chunk(&lines, 3, 3, &mut total_observed, 1024, "count_test");
+            assert!(res.is_err());
+            assert!(res.unwrap_err().to_string().contains("row count mismatch"));
+        }
+
+        #[test]
+        fn test_observer_live_row_committed_during_multichunk_catchup() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 0;
+
+            // Step 1: Initial observation at cursor row 0 (live row)
+            let chunk0 = vec![(0, "LIVE_PREFIX", false)];
+            observer
+                .ingest_raw_chunk(&chunk0, 1, 0, &mut total_observed, 1024, "probe")
+                .unwrap();
+            assert_eq!(observer.accumulated_text, "");
+            assert_eq!(observer.current_live_line, "LIVE_PREFIX");
+            assert_eq!(observer.next_row, 0);
+
+            // Step 2: Cursor advances to row 3. Catch-up chunk 1 only fetches rows 0..2 (committed rows < 3)
+            // It does NOT reach live_cursor_y (3).
+            // Stale current_live_line ("LIVE_PREFIX") must be cleared so it does not duplicate when combined!
+            let chunk1 = vec![
+                (0, "LIVE_PREFIX_COMPLETED", false),
+                (1, "ROW_1_RECORD", false),
+            ];
+            observer
+                .ingest_raw_chunk(&chunk1, 2, 3, &mut total_observed, 1024, "probe")
+                .unwrap();
+            assert_eq!(
+                observer.accumulated_text,
+                "LIVE_PREFIX_COMPLETED\nROW_1_RECORD\n"
+            );
+            assert_eq!(observer.current_live_line, "");
+            assert_eq!(observer.next_row, 2);
+
+            // Verify search after chunk 1 does not duplicate LIVE_PREFIX
+            let count_live_prefix = {
+                let mut combined = observer.accumulated_text.clone();
+                combined.push_str(&observer.current_live_line);
+                combined.matches("LIVE_PREFIX").count()
+            };
+            assert_eq!(count_live_prefix, 1);
+
+            // Step 3: Catch-up chunk 2 fetches rows 2..4 (row 2 committed, row 3 live)
+            let chunk2 = vec![(2, "ROW_2_RECORD", false), (3, "NEW_LIVE_ROW_3", false)];
+            observer
+                .ingest_raw_chunk(&chunk2, 4, 3, &mut total_observed, 1024, "probe")
+                .unwrap();
+            assert_eq!(
+                observer.accumulated_text,
+                "LIVE_PREFIX_COMPLETED\nROW_1_RECORD\nROW_2_RECORD\n"
+            );
+            assert_eq!(observer.current_live_line, "NEW_LIVE_ROW_3");
+            assert_eq!(observer.next_row, 3);
+
+            // Search finds marker across the combined stream with zero duplicates
+            let target = "ROW_2_RECORD\nNEW_LIVE_ROW_3";
+            let matched = observer.search_and_prune(|text| {
+                let pos = text.find(target)?;
+                Some((pos, pos + target.len(), true))
+            });
+            assert_eq!(matched, Some(true));
+        }
+
+        #[test]
+        fn test_observer_byte_cap_includes_live_row_before_allocation() {
+            let mut observer = IncrementalPaneObserver::new_with_state(1, 0, 80, 24);
+            let mut total_observed = 90;
+            let max_cap = 100;
+
+            // Live row (row_idx == live_cursor_y == 0) with 20 bytes. 90 + 20 = 110 > 100.
+            let chunk = vec![(0, "12345678901234567890", false)];
+            let res = observer.ingest_raw_chunk(
+                &chunk,
+                1,
+                0,
+                &mut total_observed,
+                max_cap,
+                "test_live_cap",
+            );
+
+            // Must fail closed with byte cap error before allocating current_live_line
+            assert!(res.is_err());
+            let err_str = res.unwrap_err().to_string();
+            assert!(err_str.contains("observed byte cap exceeded"));
+            assert!(observer.current_live_line.is_empty());
+            assert_eq!(total_observed, 90);
+        }
+
+        #[test]
+        fn test_nearest_rank_percentile_calculations() {
+            // 100 items: 1..=100
+            let v100: Vec<u128> = (1..=100).collect();
+            // p50: rank = ceil(0.50 * 100) = 50 -> index 49 -> value 50
+            assert_eq!(nearest_rank_percentile(&v100, 0.50), 50);
+            // p90: rank = ceil(0.90 * 100) = 90 -> index 89 -> value 90
+            assert_eq!(nearest_rank_percentile(&v100, 0.90), 90);
+            // p95: rank = ceil(0.95 * 100) = 95 -> index 94 -> value 95
+            assert_eq!(nearest_rank_percentile(&v100, 0.95), 95);
+            // p99: rank = ceil(0.99 * 100) = 99 -> index 98 -> value 99
+            assert_eq!(nearest_rank_percentile(&v100, 0.99), 99);
+
+            // 1000 items: 1..=1000
+            let v1000: Vec<u128> = (1..=1000).collect();
+            assert_eq!(nearest_rank_percentile(&v1000, 0.50), 500);
+            assert_eq!(nearest_rank_percentile(&v1000, 0.90), 900);
+            assert_eq!(nearest_rank_percentile(&v1000, 0.95), 950);
+            assert_eq!(nearest_rank_percentile(&v1000, 0.99), 990);
+        }
     }
 }

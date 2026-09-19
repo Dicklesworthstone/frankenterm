@@ -547,7 +547,7 @@ def nearest_rank_percentile(sorted_list, q):
 
 
 def validate_echo_measurements(rows, fixture_receipt=None):
-    """Require exact contract, 100..1000 nonces, >=10MB/s throughput, p99 within budget.
+    """Require exactly 1000 nonces, >=10 MiB/s throughput, and the p99 budget.
 
     Independently recomputes all statistics from raw trial rows using nearest-rank
     percentiles (ceil(q*n)-1) without trusting client self-reported claims.
