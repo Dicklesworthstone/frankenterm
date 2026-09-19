@@ -1052,11 +1052,11 @@ impl TerminalState {
     }
 
     /// Parser-side maintenance of the primary screen, including while the
-    /// alternate screen is active. The caller drains its sink outside the
-    /// terminal mutex between attempts.
-    pub fn trim_deferred_scrollback(&mut self) -> Option<bool> {
+    /// alternate screen is active. The caller releases the terminal between
+    /// slices and drains the sink only when blocked or settled after progress.
+    pub fn trim_deferred_scrollback(&mut self) -> DeferredScrollbackTrim {
         let result = self.screen.screen.trim_deferred_scrollback(self.seqno);
-        if result == Some(true) {
+        if result.moved() {
             self.increment_seqno();
         }
         result

@@ -23,6 +23,24 @@ use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
+/// Parser maintenance distinguishes a cooperative yield from a full sink.
+/// Only a full sink or the final admitted slice requires a durability flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredScrollbackTrim {
+    Settled { moved: bool },
+    Yielded,
+    AdmissionBlocked { moved: bool },
+}
+
+impl DeferredScrollbackTrim {
+    pub(crate) fn moved(self) -> bool {
+        !matches!(
+            self,
+            Self::Settled { moved: false } | Self::AdmissionBlocked { moved: false }
+        )
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static REFLOW_SOURCE_SIGNATURE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -5581,11 +5599,13 @@ impl Screen {
         }
     }
 
-    /// Retry hot-tier overflow after a deferred sink has drained. Returns None
-    /// when settled, or whether any row moved, so the parser drains again
-    /// before accepting more input. Only scrollback is transferred; visible
-    /// rows, recovery-owned rows and the model's dirty sequence are unchanged.
-    pub(crate) fn trim_deferred_scrollback(&mut self, seqno: SequenceNo) -> Option<bool> {
+    /// Transfer a bounded slice of hot-tier overflow. The parser releases the
+    /// terminal between slices without flushing a partially filled sink.
+    /// One oversized physical row is indivisible, but cannot share a slice
+    /// with another row once it exhausts the column-work budget.
+    pub(crate) fn trim_deferred_scrollback(&mut self, seqno: SequenceNo) -> DeferredScrollbackTrim {
+        const MAX_ROWS: usize = 16;
+        const MAX_COLUMNS: usize = 2048;
         if !self.allow_scrollback
             || self.recovery_scrollback.is_some()
             || !self.config.scrollback_tier_config().enabled
@@ -5594,26 +5614,33 @@ impl Screen {
                 .scrollback_spill_sink()
                 .is_some_and(|sink| sink.requires_scrollback_flush())
         {
-            return None;
+            return DeferredScrollbackTrim::Settled { moved: false };
         }
         let limit = self
             .physical_rows
             .saturating_add(self.hot_scrollback_size());
-        let had_overflow = self.lines.len() > limit;
-        let mut moved = false;
+        let mut moved = 0usize;
+        let mut columns = 0usize;
         while self.lines.len() > limit {
+            let next_columns = self.lines.front().map_or(0, |line| line.len().max(1));
+            if moved > 0
+                && (moved >= MAX_ROWS || next_columns > MAX_COLUMNS.saturating_sub(columns))
+            {
+                return DeferredScrollbackTrim::Yielded;
+            }
             let Some(line) = self.lines.pop_front() else {
                 break;
             };
             let stable_row = self.stable_row_index_for_removed_top(0);
             if !self.record_scrollback_spill(stable_row, &line, seqno) {
                 self.lines.push_front(line);
-                break;
+                return DeferredScrollbackTrim::AdmissionBlocked { moved: moved > 0 };
             }
             self.advance_stable_row_index_offset(1);
-            moved = true;
+            moved += 1;
+            columns = columns.saturating_add(line.len().max(1));
         }
-        had_overflow.then_some(moved)
+        DeferredScrollbackTrim::Settled { moved: moved > 0 }
     }
 
     /// Force all warm-tier residency into cold-tier accounting.
@@ -12932,8 +12959,86 @@ pub(crate) mod tests {
         assert_eq!(stored.source, 0..end);
     }
 
+    #[test]
+    fn deferred_trim_bounds_geometry_slices_and_preserves_refused_rows() {
+        for cols in [80, 1024, 4096] {
+            let sink = Arc::new(TestColdScrollbackSink {
+                requires_flush: true,
+                ..TestColdScrollbackSink::default()
+            });
+            let mut screen = test_screen_with_config(
+                1,
+                cols,
+                96,
+                TestTermConfig {
+                    scrollback: 100,
+                    scrollback_tier: crate::config::ScrollbackTierConfig {
+                        enabled: true,
+                        hot_lines: 1,
+                        warm_max_bytes: 0,
+                    },
+                    cold_sink: Some(sink.clone()),
+                    ..TestTermConfig::default()
+                },
+            );
+            let original: Vec<Line> = (0..42)
+                .map(|row| {
+                    Line::from_text(
+                        &format!("{row:04}{}", "x".repeat(cols - 4)),
+                        &CellAttributes::blank(),
+                        0,
+                        None,
+                    )
+                })
+                .collect();
+            screen.lines = original.iter().cloned().collect();
+            sink.refuse_admission.store(true, Ordering::Relaxed);
+            assert_eq!(
+                screen.trim_deferred_scrollback(1),
+                DeferredScrollbackTrim::AdmissionBlocked { moved: false }
+            );
+            assert_eq!(
+                screen.lines,
+                original.iter().cloned().collect::<VecDeque<_>>()
+            );
+            assert_eq!(screen.stable_row_index_offset, 0);
+            sink.refuse_admission.store(false, Ordering::Relaxed);
+            loop {
+                let before = screen.lines.len();
+                let result = screen.trim_deferred_scrollback(2);
+                let moved = before - screen.lines.len();
+                assert!(moved > 0 && moved <= 16);
+                assert!(moved == 1 || moved * cols <= 2048);
+                if screen.lines.len() == 2 {
+                    assert_eq!(result, DeferredScrollbackTrim::Settled { moved: true });
+                    break;
+                }
+                assert_eq!(result, DeferredScrollbackTrim::Yielded);
+            }
+            assert_eq!(screen.stable_row_index_offset, 40);
+            assert_eq!(
+                screen.trim_deferred_scrollback(3),
+                DeferredScrollbackTrim::Settled { moved: false }
+            );
+            assert_eq!(
+                sink.rows
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                original[..40]
+            );
+            assert_eq!(
+                screen.lines.iter().cloned().collect::<Vec<_>>(),
+                original[40..]
+            );
+        }
+    }
+
     #[derive(Debug, Default)]
     pub(crate) struct TestColdScrollbackSink {
+        requires_flush: bool,
         rows: Mutex<BTreeMap<StableRowIndex, Line>>,
         interval_identity: Mutex<crate::config::ScrollbackIntervalIdentity>,
         batch_reads: AtomicU64,
@@ -12947,6 +13052,10 @@ pub(crate) mod tests {
     }
 
     impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
+        fn requires_scrollback_flush(&self) -> bool {
+            self.requires_flush
+        }
+
         fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
             if self.force_busy_probe.load(Ordering::Relaxed) {
                 return crate::config::ScrollbackIntervalCapture::Busy;

@@ -3626,6 +3626,7 @@ impl LocalPane {
         mut sink: Arc<dyn frankenterm_term::config::ScrollbackSpillSink>,
     ) {
         let mut reported_failure = false;
+        let mut needs_flush = true;
         loop {
             if matches!(
                 *self.process.lock(),
@@ -3635,17 +3636,38 @@ impl LocalPane {
             ) {
                 return;
             }
-            let stalled = match sink.flush_scrollback() {
+            let flushed = if needs_flush {
+                sink.flush_scrollback()
+            } else {
+                Ok(())
+            };
+            let stalled = match flushed {
                 Ok(()) => {
                     let mut terminal = self.locked_terminal();
-                    match terminal.trim_deferred_scrollback() {
-                        None => return,
-                        Some(moved) => {
-                            if let Some(current) = self.scrollback_flush_sink.lock().clone() {
-                                sink = current;
-                            } else {
-                                return;
-                            }
+                    let result = terminal.trim_deferred_scrollback();
+                    let current = self.scrollback_flush_sink.lock().clone();
+                    // Wake a queued reader before another geometry slice can
+                    // reacquire the mutex. Durability still runs outside it.
+                    MutexGuard::unlock_fair(terminal);
+                    let Some(current) = current else {
+                        return;
+                    };
+                    sink = current;
+                    match result {
+                        frankenterm_term::DeferredScrollbackTrim::Settled { moved: false } => {
+                            return
+                        }
+                        frankenterm_term::DeferredScrollbackTrim::Yielded => {
+                            needs_flush = false;
+                            metrics::counter!("mux.scrollback.geometry_yields").increment(1);
+                            // Opportunistic try-lock readers do not queue on
+                            // the mutex; give their executor a scheduling turn.
+                            std::thread::yield_now();
+                            false
+                        }
+                        frankenterm_term::DeferredScrollbackTrim::Settled { moved }
+                        | frankenterm_term::DeferredScrollbackTrim::AdmissionBlocked { moved } => {
+                            needs_flush = true;
                             !moved
                         }
                     }

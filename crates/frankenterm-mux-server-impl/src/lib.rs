@@ -9626,6 +9626,37 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn deferred_scrollback_geometry_yields_preserve_durable_batch_sizes() {
+        let (_dir, backing, deferred) = deferred_test_sink();
+        let pane = deferred_test_pane(deferred);
+        let mut corpus = String::new();
+        for row in 0..550 {
+            use std::fmt::Write as _;
+            write!(corpus, "row-{row:03} e\u{301} 日本語\r\n").unwrap();
+        }
+        let mut actions = Vec::new();
+        termwiz::escape::parser::Parser::new()
+            .parse(corpus.as_bytes(), |action| actions.push(action));
+        pane.perform_actions(actions);
+        assert_eq!(backing.retained_scrollback_rows(), 545);
+        // The first batch establishes authority with one row, then writes
+        // its other 255 rows. Later full and final batches write 256 and 33.
+        // Cooperative geometry slices must not create extra generations.
+        assert_eq!(backing.state.lock().unwrap().revision, 4);
+        let (first, lines) = pane.get_lines(0..551);
+        assert_eq!(first, 0);
+        assert_eq!(lines.len(), 551);
+        for (row, line) in lines.iter().take(550).enumerate() {
+            assert_eq!(
+                line.as_str().trim_end(),
+                format!("row-{row:03} e\u{301} 日本語")
+            );
+        }
+        assert!(lines[550].as_str().trim().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn deferred_scrollback_local_pane_releases_terminal_during_real_persistence() {
         for use_queue in [false, true] {
             let (_dir, backing, deferred) = deferred_test_sink();
