@@ -908,6 +908,40 @@ impl SyncOutputState {
     }
 }
 
+/// Reject irrelevant alerts before admission; preserve the ordinary path for
+/// relevant or unresolved panes. A returned bool is the subscription decision.
+fn prefilter_gui_alert_notification(
+    owner: &Weak<Mux>,
+    window_id: MuxWindowId,
+    notification: &MuxNotification,
+) -> Option<bool> {
+    let pane_id = match notification {
+        MuxNotification::Alert {
+            alert: Alert::SetProfileRequested { .. } | Alert::MouseShapeRequested { .. },
+            ..
+        } => return Some(true), // Explicit no-ops in the GUI handler.
+        MuxNotification::Alert {
+            alert: Alert::Bell | Alert::SetUserVar { .. },
+            pane_id,
+        } => *pane_id,
+        _ => return None,
+    };
+    let Some(owner) = owner.upgrade() else {
+        return Some(false);
+    };
+    if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)) {
+        return Some(false);
+    }
+    // These two handlers require actual mux membership, unlike output events
+    // which can target overlays. Resolve afresh for each notification: moves
+    // must not leave a cached interest decision behind. Unknown membership
+    // keeps the deferred path, allowing in-progress topology reconciliation.
+    match owner.resolve_pane_id(pane_id) {
+        Some((_, current_window, _)) if current_window != window_id => Some(true),
+        _ => None,
+    }
+}
+
 /// Fold telemetry before attempting any GUI admission. `None` means the
 /// notification still needs its ordinary lifecycle/event handling.
 fn fold_gui_sync_notification(
@@ -5278,6 +5312,11 @@ impl TermWindow {
                 }
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
+                }
+                if let Some(keep) =
+                    prefilter_gui_alert_notification(&callback_mux, mux_window_id, &n)
+                {
+                    return keep;
                 }
                 if let Some(keep) = fold_gui_sync_notification(
                     &callback_mux, mux_window_id, &sync_output_state, &n,
@@ -9991,6 +10030,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sync_output_subscription_survives_full_queue_and_filters_window() {
+        use super::Alert;
         if run_scheduler_test_in_child(
             "sync_output_subscription_survives_full_queue_and_filters_window",
         ) {
@@ -10062,6 +10102,8 @@ mod tests {
         let callback_state = Arc::clone(&state);
         let callback_owner = Arc::downgrade(&owner);
         let target = *left;
+        let admitted_alerts = Arc::new(AtomicUsize::new(0));
+        let callback_admitted_alerts = Arc::clone(&admitted_alerts);
         let (pending, receive) = flume::bounded(1);
         let lifetime = Arc::new(());
         let callback_lifetime = Arc::clone(&lifetime);
@@ -10070,6 +10112,11 @@ mod tests {
         let id = owner
             .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
                 let _lifetime = &callback_lifetime;
+                if let Some(keep) =
+                    super::prefilter_gui_alert_notification(&callback_owner, target, &notification)
+                {
+                    return keep;
+                }
                 if let Some(keep) = super::fold_gui_sync_notification(
                     &callback_owner,
                     target,
@@ -10084,6 +10131,18 @@ mod tests {
                         pending.try_send(()),
                         Err(flume::TrySendError::Disconnected(_))
                     );
+                }
+                if matches!(notification, mux::MuxNotification::Alert { .. }) {
+                    // Exercise actual admission after the production filter.
+                    // Without the filter a full queue retires this actual
+                    // subscriber, and the final owned output cannot arrive.
+                    return match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+                        MainThreadReservationOutcome::Reserved(_reservation) => {
+                            callback_admitted_alerts.fetch_add(1, Ordering::AcqRel);
+                            true
+                        }
+                        _ => false,
+                    };
                 }
                 true
             })
@@ -10106,6 +10165,31 @@ mod tests {
             try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
             MainThreadReservationOutcome::RetryableFull(_)
         ));
+        for (pane_id, alert) in [
+            (998_402, Alert::Bell),
+            (
+                998_402,
+                Alert::SetUserVar {
+                    name: "phase".into(),
+                    value: "other window".into(),
+                },
+            ),
+            (
+                998_401,
+                Alert::SetProfileRequested {
+                    name: "unused".into(),
+                },
+            ),
+            (
+                998_401,
+                Alert::MouseShapeRequested {
+                    shape: "text".into(),
+                },
+            ),
+        ] {
+            owner.notify(mux::MuxNotification::Alert { pane_id, alert });
+        }
+        assert_eq!(admitted_alerts.load(Ordering::Acquire), 0);
         for pane_id in [998_401, 998_402] {
             for event in [
                 mux::SynchronizedOutputEvent::Depth {
@@ -10155,6 +10239,32 @@ mod tests {
             ))
         });
         drop(occupying);
+        for alert in [
+            Alert::Bell,
+            Alert::SetUserVar {
+                name: "phase".into(),
+                value: "owned".into(),
+            },
+        ] {
+            owner.notify(mux::MuxNotification::Alert {
+                pane_id: 998_401,
+                alert,
+            });
+        }
+        assert_eq!(admitted_alerts.load(Ordering::Acquire), 2);
+        let (_, _, moved_tab) = owner.resolve_pane_id(998_402).unwrap();
+        owner
+            .move_tab_between_windows(moved_tab, *left, None)
+            .unwrap();
+        owner.notify(mux::MuxNotification::Alert {
+            pane_id: 998_402,
+            alert: Alert::Bell,
+        });
+        assert_eq!(
+            admitted_alerts.load(Ordering::Acquire),
+            3,
+            "membership must be re-read after a move"
+        );
         // Actual mux notification fanout must still reach the subscription
         // after the preceding full-queue synchronized-output traffic.
         owner.notify(mux::MuxNotification::PaneOutput(998_401));
