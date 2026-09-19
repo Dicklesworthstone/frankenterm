@@ -527,7 +527,8 @@ mod tests {
             entries
                 .iter()
                 .any(|(pid, p)| *pid == 98228 && *p == sock_path),
-            "entries must contain the bounded live socket: {entries:?}"
+            "entries must contain the bounded live socket: {:?}",
+            entries
         );
 
         drop(listener);

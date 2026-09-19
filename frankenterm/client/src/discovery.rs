@@ -1087,7 +1087,8 @@ mod tests {
         let discovered = discover_gui_socks_in(&long_runtime);
         assert!(
             discovered.contains(&live_path),
-            "discovered sockets must include live_path: {discovered:?}"
+            "discovered sockets must include live_path: {:?}",
+            discovered
         );
 
         drop(holder);
