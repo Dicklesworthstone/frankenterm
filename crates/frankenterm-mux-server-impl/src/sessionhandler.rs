@@ -129,6 +129,10 @@ impl Drop for CancelLineReadOnDrop {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("line read source changed before publication")]
+struct LineReadPublicationChanged;
+
 fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
     if error
         .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
@@ -146,6 +150,8 @@ fn line_read_failure_reason(error: &anyhow::Error) -> &'static str {
         .is_some()
     {
         "metadata_busy"
+    } else if error.downcast_ref::<LineReadPublicationChanged>().is_some() {
+        "source_changed"
     } else {
         "other"
     }
@@ -2385,6 +2391,15 @@ impl MuxRequestErrorContext {
         ) && error
             .downcast_ref::<wezterm_term::screen::ColdReadMetadataBusy>()
             .is_some()
+        {
+            return ErrorResponse::resource_busy(self.request_ident);
+        }
+        // An unfenced read can recapture the same requested rows after output
+        // invalidates its owned plan. A layout-fenced caller must instead
+        // observe a fresh layout before deciding whether to restart; preserve
+        // its existing backend-failure/resynchronization path.
+        if self.request_ident == GetLines::IDENT
+            && error.downcast_ref::<LineReadPublicationChanged>().is_some()
         {
             return ErrorResponse::resource_busy(self.request_ident);
         }
@@ -8836,9 +8851,9 @@ impl SessionHandler {
                                     })
                                 });
                                 if !response_attempted && !matches!(published, Ok(true)) {
-                                    let error = published.err().unwrap_or_else(|| {
-                                        anyhow!("cold read source changed or busy")
-                                    });
+                                    let error = published
+                                        .err()
+                                        .unwrap_or_else(|| LineReadPublicationChanged.into());
                                     record_line_read_failure("publish", &error);
                                     send_response(Err(error));
                                 }
@@ -12899,6 +12914,72 @@ mod tests {
                 MuxErrorCode::RESOURCE_BUSY,
                 "untyped backend text must not authorize contention retries",
             );
+        }
+    }
+
+    #[test]
+    fn changed_line_read_publication_retries_only_unfenced_reads() {
+        let mut term = line_read_test_terminal();
+        let stale = term
+            .screen()
+            .capture_line_read(3..4)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(term.screen().try_validate_line_read(&stale).unwrap());
+        term.advance_bytes(b"\rupdated");
+        assert!(!term.screen().try_validate_line_read(&stale).unwrap());
+        let fresh = term
+            .screen()
+            .capture_line_read(3..4)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(term.screen().try_validate_line_read(&fresh).unwrap());
+        assert!(
+            fresh
+                .lines()
+                .next()
+                .unwrap()
+                .as_str()
+                .starts_with("updated")
+        );
+
+        let error = anyhow::Error::new(LineReadPublicationChanged)
+            .context("private source context must stay local");
+        assert_eq!(line_read_failure_reason(&error), "source_changed");
+        for request_ident in [
+            GetLines::IDENT,
+            GetLinesAtLayout::IDENT,
+            GetPaneRenderChanges::IDENT,
+            Ping::IDENT,
+            KillPane::IDENT,
+        ] {
+            let context = MuxRequestErrorContext {
+                request_ident,
+                object: None,
+                may_mutate: request_ident == KillPane::IDENT,
+            };
+            let response = context.response_for_error(&error);
+            response.validate().unwrap();
+            assert_eq!(response.request_ident, request_ident);
+            if request_ident == GetLines::IDENT {
+                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            } else if request_ident == KillPane::IDENT {
+                assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
+            } else {
+                assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+            }
+            assert_ne!(
+                context
+                    .response_for_error(&anyhow!("line read source changed before publication"))
+                    .code,
+                MuxErrorCode::RESOURCE_BUSY,
+                "arbitrary backend errors cannot authorize retries"
+            );
+            assert!(!format!("{response:?}").contains("private"));
         }
     }
 
