@@ -9575,6 +9575,11 @@ mod tests {
         };
         let identity = occupying.admission_receipt();
         let (pending, receive) = flume::bounded(1);
+        let title_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained_title = Arc::new(std::sync::Mutex::new(
+            super::PendingMuxTitleRefresh::acquire(&title_pending),
+        ));
+        let worker_title = Arc::clone(&retained_title);
         for _ in 0..10_000 {
             let _ = pending.try_send(());
         }
@@ -9594,7 +9599,11 @@ mod tests {
                 |reservation| {
                     let delivered = Arc::clone(&delivered_worker);
                     let delivery_released = delivery_released.clone();
+                    let title = worker_title.lock().unwrap().take();
                     reservation.spawn(async move {
+                        title
+                            .expect("title refresh must survive saturation")
+                            .begin_refresh();
                         delivered.fetch_add(1, Ordering::AcqRel);
                         delivery_released.recv_async().await.unwrap();
                     })
@@ -9618,6 +9627,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(delivered.load(Ordering::Acquire), 1);
+        assert!(!title_pending.load(Ordering::Acquire));
+        *retained_title.lock().unwrap() = super::PendingMuxTitleRefresh::acquire(&title_pending);
         // A new burst during native delivery is represented once, and cannot
         // allocate another main-thread operation before acknowledgement.
         for _ in 0..10_000 {
@@ -9831,8 +9842,11 @@ mod tests {
         if std::env::var(marker).as_deref() == Ok(name) {
             return false;
         }
+        let thread = std::thread::current();
+        let test_name = thread.name().expect("libtest supplies the exact test name");
+        assert!(test_name.ends_with(name));
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg(format!("termwindow::tests::{name}"))
+            .arg(test_name)
             .args(["--exact", "--nocapture"])
             .env(marker, name)
             .output()
