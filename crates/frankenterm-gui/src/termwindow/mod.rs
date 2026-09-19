@@ -360,12 +360,14 @@ pub enum TermWindowNotif {
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
         interest: [u64; OUTPUT_INTEREST_WORDS],
+        repaint: Arc<AtomicBool>,
         completion: Sender<()>,
     },
     RenderWake {
         ticket: RenderWakeTicket,
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
+        repaint: Arc<AtomicBool>,
         completion: Sender<()>,
     },
     EmitStatusUpdate,
@@ -2814,6 +2816,55 @@ struct RenderWakeRequests {
     ready: Sender<()>,
 }
 
+async fn run_render_wakes(
+    ready: flume::Receiver<()>,
+    pending: Arc<Mutex<Option<RenderWakeRequest>>>,
+    identity: promise::spawn::MainThreadAdmissionReceipt,
+    is_live: impl Fn() -> bool,
+    deliver: impl Fn(RenderWakeTicket, promise::spawn::MainThreadSpawnReservation, Sender<()>),
+) {
+    while ready.recv_async().await.is_ok() {
+        let request = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some(RenderWakeRequest { ticket, due, registration }) = request else {
+            continue;
+        };
+        let admitted = Abortable::new(async {
+            sleep(due.saturating_duration_since(Instant::now())).await;
+            let mut delay = Duration::from_millis(10);
+            loop {
+                if ready.is_disconnected() || !is_live() {
+                    return None;
+                }
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    8 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        let receipt = reservation.admission_receipt();
+                        return (receipt.queue_id == identity.queue_id
+                            && receipt.scheduler_generation == identity.scheduler_generation)
+                            .then_some(reservation);
+                    }
+                    promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => {
+                        sleep(delay).await;
+                        delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                    }
+                    _ => return None,
+                }
+            }
+        }, registration).await;
+        match admitted {
+            Ok(Some(reservation)) => {
+                let (completion, completed) = flume::bounded(1);
+                deliver(ticket, reservation, completion);
+                let _ = completed.recv_async().await;
+            }
+            Ok(None) => return,
+            Err(_) => {} // superseded/cancelled exact ticket; take its successor
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RenderWakeReason {
     Retry(RenderFailureStage),
@@ -4175,6 +4226,7 @@ impl TermWindow {
                 ticket,
                 mux_owner,
                 mux_window_id,
+                repaint,
                 completion,
             } => {
                 let _completion = completion;
@@ -4189,11 +4241,11 @@ impl TermWindow {
                 match self.render_wake_state.dispatch(ticket) {
                     RenderWakeDispatch::Fired(RenderWakeReason::Retry(_)) => {
                         if self.render_recovery_state.mark_retry_ready(ticket) {
-                            self.paint_if_admitted(window)?;
+                            repaint.store(true, Ordering::Release);
                         }
                     }
                     RenderWakeDispatch::Fired(RenderWakeReason::Animation) => {
-                        self.paint_if_admitted(window)?;
+                        repaint.store(true, Ordering::Release);
                     }
                     RenderWakeDispatch::Stale => {}
                 }
@@ -4202,6 +4254,7 @@ impl TermWindow {
                 mux_owner,
                 mux_window_id,
                 interest,
+                repaint,
                 completion,
             } => {
                 // Holding completion until after paint bounds the producer to
@@ -4230,10 +4283,9 @@ impl TermWindow {
                     metrics::counter!("gui.render.retry", "action" => "native_frame_ready")
                         .increment(1);
                 }
-                // We already own Render admission and run outside a native
-                // event-handler borrow. Do not queue another fallible native
-                // invalidate operation between this wake and paint.
-                self.paint_if_admitted(window)?;
+                // The backend invalidates under this same admission after the
+                // callback, preserving its native frame pacing.
+                repaint.store(true, Ordering::Release);
             }
             TermWindowNotif::MuxNotification {
                 notification: n,
@@ -5033,6 +5085,7 @@ impl TermWindow {
                 pending_title_refresh,
             },
             reservation,
+            None,
         );
 
         true
@@ -5058,6 +5111,8 @@ impl TermWindow {
         // structural notifications retain their existing ordered path below.
         let output_worker = promise::spawn::try_reserve_background_task(4 * 1024)
             .context("reserving GUI pane-output retry owner")?;
+        let render_worker = promise::spawn::try_reserve_background_task(8 * 1024)
+            .context("reserving GUI render-wake retry owner")?;
         let output_identity = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Render,
             4 * 1024,
@@ -5074,6 +5129,16 @@ impl TermWindow {
         let output_mux = Arc::downgrade(&mux);
         let output_mux_window_id = Arc::clone(&mux_window_id);
         let output_dead = Arc::clone(&dead);
+        let (render_ready, render_receive) = flume::bounded(1);
+        let render_pending = Arc::new(Mutex::new(None));
+        let render_requests = RenderWakeRequests {
+            pending: Arc::clone(&render_pending),
+            ready: render_ready,
+        };
+        let render_window = window.clone();
+        let render_mux = Arc::downgrade(&mux);
+        let render_mux_window_id = Arc::clone(&mux_window_id);
+        let render_dead = Arc::clone(&dead);
         let allocated_subscription_id = mux
             .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
                 if dead.load(Ordering::Relaxed) {
@@ -5195,19 +5260,49 @@ impl TermWindow {
                     let mux_window_id = *output_mux_window_id
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let repaint = Arc::new(AtomicBool::new(false));
                     output_window.notify_with_reservation(
                         TermWindowNotif::MuxOutputRefresh {
                             mux_owner: output_mux.clone(),
                             mux_window_id,
                             interest: output_interest.take(),
+                            repaint: Arc::clone(&repaint),
                             completion,
                         },
                         reservation,
+                        Some(repaint),
                     );
                 },
             )
             .await;
         });
+        render_worker.spawn(async move {
+            run_render_wakes(
+                render_receive,
+                render_pending,
+                output_identity,
+                || !render_dead.load(Ordering::Acquire) && render_mux.upgrade().is_some(),
+                |ticket, reservation, completion| {
+                    let mux_window_id = *render_mux_window_id
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let repaint = Arc::new(AtomicBool::new(false));
+                    render_window.notify_with_reservation(
+                        TermWindowNotif::RenderWake {
+                            ticket,
+                            mux_owner: render_mux.clone(),
+                            mux_window_id,
+                            repaint: Arc::clone(&repaint),
+                            completion,
+                        },
+                        reservation,
+                        Some(repaint),
+                    );
+                },
+            )
+            .await;
+        });
+        self.render_wake_requests = Some(render_requests);
         subscription_id.store(allocated_subscription_id, Ordering::Release);
         if unsubscribe_requested.load(Ordering::Acquire) {
             let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);

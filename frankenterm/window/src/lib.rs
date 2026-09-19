@@ -352,6 +352,7 @@ pub trait WindowOps {
         &self,
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
+        repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) where
         Self: Sized;
 
