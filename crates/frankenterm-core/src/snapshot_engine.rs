@@ -757,7 +757,7 @@ pub fn publish_whole_mux_recovery(
         } else if let Some(predecessor) = expected.predecessor.as_ref() {
             if candidate.generation == predecessor.expected_generation {
                 let checked = predecessor_verifier.verify_root_with_cx(cx, candidate, store)?;
-                if candidate.manifest_sha256 != predecessor.expected_hash
+                if hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
                     || Some(checked.image().image_digest) != expected.predecessor_image_digest
                 {
                     return Err(VerifyPublicationError::Predecessor);

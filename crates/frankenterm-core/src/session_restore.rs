@@ -6676,6 +6676,7 @@ impl std::fmt::Debug for ValidatedPayloadMap {
 pub struct ValidatedWholeMuxRecovery {
     image: MuxRecoveryImage,
     generation: u64,
+    root_envelope_sha256: [u8; 32],
     checkpoint_payloads: ValidatedPayloadMap,
 }
 
@@ -6683,11 +6684,13 @@ impl ValidatedWholeMuxRecovery {
     pub(crate) fn new(
         image: MuxRecoveryImage,
         generation: u64,
+        root_envelope_sha256: [u8; 32],
         checkpoint_payloads: BTreeMap<String, Zeroizing<Vec<u8>>>,
     ) -> Self {
         Self {
             image,
             generation,
+            root_envelope_sha256,
             checkpoint_payloads: ValidatedPayloadMap::new(checkpoint_payloads),
         }
     }
@@ -6700,6 +6703,15 @@ impl ValidatedWholeMuxRecovery {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Identity of the exact encrypted root envelope that passed verification.
+    /// For repaired roots this names the reconstructed envelope, not damaged
+    /// slot bytes or the semantic image digest. Use it to bind the next root's
+    /// predecessor without reopening mutable publication files.
+    #[must_use]
+    pub fn root_envelope_sha256(&self) -> [u8; 32] {
+        self.root_envelope_sha256
     }
 
     #[must_use]
@@ -7131,7 +7143,7 @@ impl WholeMuxRecoveryVerifier {
         cx: &Cx,
         candidate: &RootSlotCandidate,
         store: &SnapshotPublicationStore,
-    ) -> Result<(Zeroizing<Vec<u8>>, u64), WholeMuxRecoveryError> {
+    ) -> Result<(Zeroizing<Vec<u8>>, [u8; 32]), WholeMuxRecoveryError> {
         let mut expected_rep_id = [0u8; 32];
         if let Ok(expected_bytes) = hex::decode(&candidate.manifest_sha256) {
             if expected_bytes.len() == 32 {
@@ -7140,8 +7152,10 @@ impl WholeMuxRecoveryVerifier {
         }
 
         let mut repair_permit = None;
-        let enc_obj = match EncryptedRecoveryObject::from_bytes(&candidate.manifest_bytes) {
-            Ok(obj) => obj,
+        let (enc_obj, root_envelope_sha256) = match EncryptedRecoveryObject::from_bytes(
+            &candidate.manifest_bytes,
+        ) {
+            Ok(obj) => (obj, Sha256::digest(&candidate.manifest_bytes).into()),
             Err(parse_err) => {
                 if let Some((reconstructed, permit)) = self.attempt_raptorq_repair(
                     cx,
@@ -7152,8 +7166,9 @@ impl WholeMuxRecoveryVerifier {
                     self.limits.max_image_bytes,
                 )? {
                     repair_permit = Some(permit);
-                    EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
-                        .map_err(WholeMuxRecoveryError::Representation)?
+                    let object = EncryptedRecoveryObject::from_bytes(reconstructed.as_slice())
+                        .map_err(WholeMuxRecoveryError::Representation)?;
+                    (object, Sha256::digest(reconstructed.as_slice()).into())
                 } else if !candidate.manifest_bytes.starts_with(&RECOVERY_OBJECT_MAGIC) {
                     return Err(WholeMuxRecoveryError::AeadRequired(
                         "manifest is unencrypted; whole-mux recovery requires AEAD encrypted recovery objects"
@@ -7187,7 +7202,7 @@ impl WholeMuxRecoveryVerifier {
 
         drop(enc_obj);
         drop(repair_permit);
-        Ok((decoded.into_plaintext(), candidate.generation))
+        Ok((decoded.into_plaintext(), root_envelope_sha256))
     }
 
     fn decode_and_verify_checkpoint_payload(
@@ -7253,8 +7268,9 @@ impl WholeMuxRecoveryVerifier {
         }
 
         // 1. Decode and verify root manifest with AEAD and independent trusted expected identity
-        let (raw_image_json, image_generation) =
+        let (raw_image_json, root_envelope_sha256) =
             self.decode_and_verify_manifest_payload(cx, candidate, store)?;
+        let image_generation = candidate.generation;
 
         // 2. Decode and structurally validate canonical image slice
         let image = MuxRecoveryImage::from_json_slice(raw_image_json.as_slice())?;
@@ -7602,6 +7618,7 @@ impl WholeMuxRecoveryVerifier {
         Ok(ValidatedWholeMuxRecovery::new(
             image,
             candidate.generation,
+            root_envelope_sha256,
             checkpoint_payloads,
         ))
     }
@@ -14920,7 +14937,7 @@ mod tests {
         };
         image.image_digest = image.compute_digest().expect("digest");
 
-        let validated = ValidatedWholeMuxRecovery::new(image, 1, BTreeMap::new());
+        let validated = ValidatedWholeMuxRecovery::new(image, 1, [0x31; 32], BTreeMap::new());
 
         let mut active_sessions = HashSet::new();
         active_sessions.insert("active-fleet-session-42".to_string());
@@ -15530,6 +15547,22 @@ mod tests {
         let validated = verifier
             .verify_root(&candidate, &store)
             .expect("verify AEAD encrypted root and checkpoints");
+        assert_eq!(
+            hex::encode(validated.root_envelope_sha256()),
+            sha256_hex(&enc_root_bytes)
+        );
+        assert_ne!(
+            validated.root_envelope_sha256(),
+            validated.image().image_digest
+        );
+        let mut mismatched_metadata = candidate.clone();
+        mismatched_metadata.manifest_sha256 = hex::encode([0x7d; 32]);
+        let verified_bytes = verifier.verify_root(&mismatched_metadata, &store).unwrap();
+        assert_eq!(
+            verified_bytes.root_envelope_sha256(),
+            validated.root_envelope_sha256(),
+            "predecessor authority must derive from authenticated bytes, not candidate metadata"
+        );
 
         // The verifier must have decrypted the checkpoint payload to plaintext
         let decrypted_payload = validated
@@ -15778,6 +15811,14 @@ mod tests {
             .verify_root(&damaged_candidate, &store)
             .expect("RaptorQ repair must reconstruct damaged root manifest and verify");
 
+        assert_eq!(
+            hex::encode(validated.root_envelope_sha256()),
+            sha256_hex(&enc_root_bytes)
+        );
+        assert_ne!(
+            hex::encode(validated.root_envelope_sha256()),
+            sha256_hex(&damaged_candidate.manifest_bytes)
+        );
         assert_eq!(validated.generation(), 1);
         assert_eq!(validated.pane_count(), 1);
     }
@@ -15872,7 +15913,7 @@ mod tests {
         let mut payloads = BTreeMap::new();
         payloads.insert("obj-secret-123".to_string(), secret_payload);
 
-        let validated = ValidatedWholeMuxRecovery::new(image, 5, payloads);
+        let validated = ValidatedWholeMuxRecovery::new(image, 5, [0x35; 32], payloads);
 
         let debug_str = format!("{validated:?}");
 
