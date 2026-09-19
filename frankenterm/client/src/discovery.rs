@@ -14,7 +14,6 @@ pub use config::gui_socket::{gui_socket_path_for_pid, parse_gui_socket_pid, GUI_
 fn is_gui_socket_name(name: &str) -> bool {
     parse_gui_socket_pid(name).is_some()
 }
-
 #[cfg(unix)]
 fn is_socket_entry(entry: &std::fs::DirEntry) -> bool {
     use std::os::unix::fs::FileTypeExt;
@@ -585,8 +584,26 @@ mod unix {
             config::gui_socket::published_gui_sock_path(class_name)
         }
 
+        #[cfg(test)]
+        fn compute_path_in(runtime_dir: &Path, class_name: &str) -> PathBuf {
+            config::gui_socket::published_gui_sock_path_in(runtime_dir, class_name)
+        }
+
         pub fn new(path: &Path, class_name: &str) -> anyhow::Result<Self> {
             let name = Self::compute_path(class_name);
+            Self::new_at(path, name)
+        }
+
+        #[cfg(test)]
+        pub fn new_in(runtime_dir: &Path, path: &Path, class_name: &str) -> anyhow::Result<Self> {
+            let name = Self::compute_path_in(runtime_dir, class_name);
+            Self::new_at(path, name)
+        }
+
+        fn new_at(path: &Path, name: PathBuf) -> anyhow::Result<Self> {
+            if let Some(parent) = name.parent() {
+                config::create_user_owned_dirs(parent)?;
+            }
             std::fs::remove_file(&name).ok();
             std::os::unix::fs::symlink(path, &name)
                 .with_context(|| format!("pointing {} -> {}", name.display(), path.display()))?;
@@ -597,8 +614,20 @@ mod unix {
         }
 
         pub fn resolve(class_name: &str) -> anyhow::Result<PathBuf> {
-            let name = Self::compute_path(class_name);
-            std::fs::read_link(&name).with_context(|| format!("reading symlink {}", name.display()))
+            config::gui_socket::resolve_published_gui_sock(class_name)
+                .with_context(|| format!("resolving published GUI socket for class {class_name}"))
+        }
+
+        #[cfg(test)]
+        pub fn resolve_in(runtime_dir: &Path, class_name: &str) -> anyhow::Result<PathBuf> {
+            config::gui_socket::resolve_published_gui_sock_in(runtime_dir, class_name).with_context(
+                || {
+                    format!(
+                        "resolving published GUI socket in {} for class {class_name}",
+                        runtime_dir.display()
+                    )
+                },
+            )
         }
     }
 }
@@ -615,11 +644,25 @@ pub fn publish_gui_sock_path(path: &Path, class_name: &str) -> anyhow::Result<Na
     NameHolder::new(path, class_name)
 }
 
+#[cfg(all(test, unix))]
+fn publish_gui_sock_path_in(
+    runtime_dir: &Path,
+    path: &Path,
+    class_name: &str,
+) -> anyhow::Result<NameHolder> {
+    NameHolder::new_in(runtime_dir, path, class_name)
+}
+
 /// Resolve the last published path for `class_name`.
 /// If successful, there is NO guarantee that the returned path references
 /// a running instance; it is just the last published path.
 pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
     NameHolder::resolve(class_name)
+}
+
+#[cfg(all(test, unix))]
+fn resolve_gui_sock_path_in(runtime_dir: &Path, class_name: &str) -> anyhow::Result<PathBuf> {
+    NameHolder::resolve_in(runtime_dir, class_name)
 }
 
 /// This function returns a list of the `frankenterm-gui-sock-<pid>` paths in
@@ -632,6 +675,19 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 }
 
 fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
+    let resolved_dir = config::gui_socket::gui_socket_dir_for(runtime_dir);
+    let mut socks = discover_gui_socks_direct(&resolved_dir);
+    if resolved_dir != runtime_dir {
+        for sock in discover_gui_socks_direct(runtime_dir) {
+            if !socks.contains(&sock) {
+                socks.push(sock);
+            }
+        }
+    }
+    socks
+}
+
+fn discover_gui_socks_direct(runtime_dir: &Path) -> Vec<PathBuf> {
     #[derive(Debug)]
     struct Entry {
         path: PathBuf,
@@ -999,5 +1055,43 @@ mod tests {
             ));
             assert!(socket.exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_and_publish_agree_on_bounded_gui_socket_dir() {
+        let fixture = tempfile::tempdir().expect("isolated fixture dir");
+        let long_runtime = fixture
+            .path()
+            .join("deep_test_nesting_layer_intended_to_simulate_a_long_home_directory_path_exceeding_sun_len")
+            .join(".local/share/frankenterm");
+
+        let live_path = config::gui_socket::gui_socket_path_for_pid_in(&long_runtime, 999888);
+        assert!(
+            live_path.as_os_str().len() <= config::gui_socket::MAX_SUN_PATH_LEN,
+            "live_path {} exceeds MAX_SUN_PATH_LEN",
+            live_path.display()
+        );
+        let parent = live_path.parent().expect("live socket parent dir");
+        config::create_user_owned_dirs(parent).expect("ensure user owned dir");
+
+        let listener = std::os::unix::net::UnixListener::bind(&live_path).expect("bind socket");
+        let class = "com.test.discovery.bounded";
+        let holder = publish_gui_sock_path_in(&long_runtime, &live_path, class).expect("publish");
+        let resolved = resolve_gui_sock_path_in(&long_runtime, class).expect("resolve");
+        assert_eq!(resolved, live_path);
+
+        let discovered = discover_gui_socks_in(&long_runtime);
+        assert!(
+            discovered.contains(&live_path),
+            "discovered sockets must include live_path: {discovered:?}"
+        );
+
+        drop(holder);
+        drop(listener);
+        std::fs::remove_file(&live_path).ok();
+        let pub_link = config::gui_socket::published_gui_sock_path_in(&long_runtime, class);
+        std::fs::remove_file(&pub_link).ok();
+        std::fs::remove_dir(parent).ok();
     }
 }

@@ -9697,13 +9697,6 @@ pub fn gui_socket_candidates_in(
 ) -> (Option<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     let published = ::config::gui_socket::resolve_published_gui_sock_in(runtime_dir, class_name)
         .ok()
-        .map(|target| {
-            if target.is_absolute() {
-                target
-            } else {
-                runtime_dir.join(target)
-            }
-        })
         .filter(|path| mux_socket_path_is_usable(path) && unix_socket_accepts_connections(path));
 
     let mut instances: Vec<(std::time::SystemTime, std::path::PathBuf)> =
@@ -12622,6 +12615,42 @@ mod unified_tests {
             gui_socket_candidates_in(dir.path(), "never.published"),
             (None, Vec::new())
         );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn gui_socket_candidates_with_long_runtime_dir_resolves_and_discovers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let long_parent = dir
+            .path()
+            .join("deep_test_nesting_layer_intended_to_simulate_a_long_home_directory_path_exceeding_sun_len");
+        let long_runtime = long_parent.join(".local/share/frankenterm");
+        let class = "test.frankenterm.long_root_class";
+
+        let live = ::config::gui_socket::gui_socket_path_for_pid_in(&long_runtime, 54321);
+        assert!(
+            live.as_os_str().len() <= ::config::gui_socket::MAX_SUN_PATH_LEN,
+            "bounded live socket path {} must fit within MAX_SUN_PATH_LEN",
+            live.display()
+        );
+
+        let parent = live.parent().expect("live socket parent dir");
+        ::config::create_user_owned_dirs(parent).expect("create bounded parent dir");
+
+        let live_listener =
+            UnixListener::bind(&live).expect("bind live listener under bounded dir");
+
+        let pub_path = ::config::gui_socket::published_gui_sock_path_in(&long_runtime, class);
+        symlink(&live, &pub_path).expect("publish symlink");
+
+        let (published, instances) = gui_socket_candidates_in(&long_runtime, class);
+        assert_eq!(published.as_deref(), Some(live.as_path()));
+        assert_eq!(instances, vec![live.clone()]);
+
+        drop(live_listener);
+        std::fs::remove_file(&pub_path).ok();
+        std::fs::remove_file(&live).ok();
+        std::fs::remove_dir(parent).ok();
     }
 
     #[test]
