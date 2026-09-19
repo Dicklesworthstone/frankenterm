@@ -6973,6 +6973,7 @@ impl SessionHandler {
                 reservation
                     .spawn_local(async move {
                         let mut guard = guard;
+                        let mut retry_delay = std::time::Duration::from_millis(1);
                         loop {
                             // This capture includes notifications that preceded
                             // it. Only updates during capture require another pass.
@@ -6994,7 +6995,29 @@ impl SessionHandler {
                                     })?
                             });
                             match result {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(())) => {
+                                    retry_delay = std::time::Duration::from_millis(1);
+                                }
+                                Ok(Err(err))
+                                    if matches!(
+                                        err.downcast_ref::<PaneRenderPreparationError>(),
+                                        Some(
+                                            PaneRenderPreparationError::MetadataBusy
+                                                | PaneRenderPreparationError::SourceChanged
+                                        )
+                                    ) =>
+                                {
+                                    // The final output notification may already
+                                    // be coalesced into this capture. Retain its
+                                    // admitted permit and obligation until a
+                                    // coherent capture succeeds or this exact
+                                    // authority retires; do not require output
+                                    // to arrive again to wake a stalled screen.
+                                    frankenterm_core::runtime_async::sleep(retry_delay).await;
+                                    retry_delay =
+                                        (retry_delay * 2).min(std::time::Duration::from_millis(16));
+                                    continue;
+                                }
                                 Ok(Err(err)) | Err(err) => {
                                     log::error!(
                                         "scheduled pane {pane_id} render push failed: {err:#}"
@@ -22892,6 +22915,116 @@ mod tests {
         }));
         drop(handler_slot.lock().unwrap().take());
         drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn detached_render_push_retains_final_notification_across_metadata_contention() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        for retire in [false, true] {
+            let executor = SimpleExecutor::with_io_runtime().unwrap();
+            let mux = Arc::new(Mux::new(None));
+            let pane = Arc::new(FakePane::new(None));
+            pane.coherent_surface.store(true, Ordering::Release);
+            pane.line_layout_busy.store(true, Ordering::Release);
+            let pane_dyn: Arc<dyn Pane> = pane.clone();
+            mux.add_pane(&pane_dyn).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            handler.schedule_pane_push(pane.pane_id());
+            let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
+            drain_simple_executor(&executor);
+            assert!(captured.lock().unwrap().is_empty());
+            assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_SCHEDULED);
+            // This is the final notification. The pending worker must retain
+            // it even when another capture still encounters the held lock.
+            pane.state.lock().unwrap().seqno = 12;
+            handler.schedule_tracked_pane_push(pane.pane_id());
+            assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_DIRTIED);
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while state.load(Ordering::Acquire) == PANE_PUSH_DIRTIED && Instant::now() < deadline {
+                drain_simple_executor(&executor);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_SCHEDULED);
+            handler.process_one(DecodedPdu {
+                serial: 9_815,
+                pdu: Pdu::Ping(Ping {}),
+            });
+            drain_simple_executor(&executor);
+            assert!(
+                captured.lock().unwrap().iter().any(|decoded| {
+                    decoded.serial == 9_815 && matches!(decoded.pdu, Pdu::Pong(_))
+                }),
+                "control work must advance while the render capture backs off"
+            );
+            if retire {
+                handler.owner.retire();
+            }
+            pane.line_layout_busy.store(false, Ordering::Release);
+            // Clearing contention deliberately sends no new notification.
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while state.load(Ordering::Acquire) != PANE_PUSH_IDLE && Instant::now() < deadline {
+                drain_simple_executor(&executor);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+            let responses = captured.lock().unwrap();
+            assert_eq!(
+                responses
+                    .iter()
+                    .filter(|decoded| matches!(
+                        &decoded.pdu,
+                        Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 12
+                    ))
+                    .count(),
+                usize::from(!retire),
+                "only the still-current session may publish the final screen"
+            );
+            drop(responses);
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn detached_render_push_retries_mixed_source_but_releases_exhausted_source() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        for exhausted in [false, true] {
+            let executor = SimpleExecutor::with_io_runtime().unwrap();
+            let mux = Arc::new(Mux::new(None));
+            let mut fake = FakePane::new(None);
+            if exhausted {
+                fake.state.lock().unwrap().seqno = SequenceNo::MAX;
+            } else {
+                fake.seqno_on_dimensions = Some(12);
+            }
+            let pane: Arc<dyn Pane> = Arc::new(fake);
+            mux.add_pane(&pane).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            handler.schedule_pane_push(pane.pane_id());
+            let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while state.load(Ordering::Acquire) != PANE_PUSH_IDLE && Instant::now() < deadline {
+                drain_simple_executor(&executor);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+            assert_eq!(
+                captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|decoded| matches!(
+                        &decoded.pdu,
+                        Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 12
+                    ))
+                    .count(),
+                usize::from(!exhausted)
+            );
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
     }
 
     #[test]
