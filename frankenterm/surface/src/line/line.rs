@@ -1234,6 +1234,20 @@ impl Line {
         }
     }
 
+    /// Count UTF-8 bytes in visible cells, excluding wide-cell padding.
+    /// Clustered storage already owns the contiguous visible text, so this
+    /// path neither allocates nor repeats Unicode grapheme segmentation.
+    /// This is a text charge, not an estimate of total retained heap memory.
+    /// Returns `None` if the sum of vector-cell text lengths overflows.
+    pub fn visible_text_bytes(&self) -> Option<usize> {
+        match &self.cells {
+            CellStorage::C(line) => Some(line.text.len()),
+            CellStorage::V(cells) => cells
+                .visible_cells()
+                .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.str().len())),
+        }
+    }
+
     pub fn split_off(&mut self, idx: usize, seqno: SequenceNo) -> Self {
         let my_cells = self.coerce_vec_storage();
         // Clamp to avoid out of bounds panic if the line is shorter
@@ -3706,6 +3720,41 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn visible_text_bytes_matches_cell_accounting_across_storage_and_edits() {
+        for text in [
+            "",
+            "plain ascii  ",
+            "界面 e\u{301} 👩\u{200d}💻  ",
+            "\u{301}a",
+        ] {
+            let mut line = Line::from_text(text, &CellAttributes::default(), 7, None);
+            for clustered in [false, true, false] {
+                if clustered {
+                    line.compress_for_scrollback();
+                    assert!(matches!(line.cells, CellStorage::C(_)));
+                } else {
+                    line.coerce_vec_storage();
+                    assert!(matches!(line.cells, CellStorage::V(_)));
+                }
+                let expected = line
+                    .visible_cells()
+                    .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.str().len()));
+                assert_eq!(line.visible_text_bytes(), expected, "{text:?}");
+                assert_eq!(line.visible_text_bytes(), Some(line.as_str().len()));
+            }
+
+            // A vector mutation must not leave a cached compressed-text count.
+            line.set_cell(0, Cell::new('界', CellAttributes::default()), 8);
+            let expected = line
+                .visible_cells()
+                .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.str().len()));
+            assert_eq!(line.visible_text_bytes(), expected);
+            line.compress_for_scrollback();
+            assert_eq!(line.visible_text_bytes(), expected);
+        }
+    }
 
     #[test]
     fn incomplete_logical_prefix_preserves_trailing_spaces_and_geometry() {

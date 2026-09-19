@@ -519,10 +519,9 @@ mod deferred_scrollback {
             let cells = line
                 .len()
                 .checked_mul(std::mem::size_of::<wezterm_term::Cell>())?;
-            line.visible_cells().try_fold(
-                cells.checked_add(std::mem::size_of::<Line>())?,
-                |bytes, cell| bytes.checked_add(cell.str().len()),
-            )
+            cells
+                .checked_add(std::mem::size_of::<Line>())?
+                .checked_add(line.visible_text_bytes()?)
         }
 
         /// The caller holds operation. Never hold state across backing IO.
