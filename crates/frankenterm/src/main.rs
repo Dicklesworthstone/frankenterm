@@ -8204,6 +8204,36 @@ enum BackupCommands {
 
 #[derive(Subcommand)]
 enum SnapshotCommands {
+    /// Enroll a new local recovery DEK using an existing private wrapping key
+    EnrollRecoveryKey {
+        #[arg(long)]
+        root: PathBuf,
+        /// Existing private regular file containing exactly 32 raw bytes; never generated or printed
+        #[arg(long)]
+        wrapping_key: PathBuf,
+        /// Independently selected namespace (64 hexadecimal digits)
+        #[arg(long)]
+        namespace_id: String,
+        /// Independently selected policy (64 hexadecimal digits)
+        #[arg(long)]
+        policy_id: String,
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+    /// Reopen and authenticate a local recovery-key enrollment, offline
+    VerifyRecoveryKey {
+        #[arg(long)]
+        root: PathBuf,
+        /// Existing private regular file containing exactly 32 raw bytes; never generated or printed
+        #[arg(long)]
+        wrapping_key: PathBuf,
+        #[arg(long)]
+        namespace_id: String,
+        #[arg(long)]
+        policy_id: String,
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
     /// Capture current session state to a snapshot
     Save {
         /// Snapshot trigger label: manual, event, pre_restart, pre_shutdown, shutdown, or startup
@@ -48864,6 +48894,13 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     }
 
     if let Some(Commands::Snapshot {
+        command: snapshot_command,
+    }) = command.as_ref()
+        && run_recovery_key_command(cx, snapshot_command).await?
+    {
+        return Ok(());
+    }
+    if let Some(Commands::Snapshot {
         command: SnapshotCommands::VerifyArtifact { path, format },
     }) = command.as_ref()
     {
@@ -79909,6 +79946,112 @@ fn print_checkpoint_artifact_receipt_plain(
     println!("  Running processes:    not preserved by this artifact");
 }
 
+async fn run_recovery_key_command(
+    cx: &frankenterm_core::cx::Cx,
+    command: &SnapshotCommands,
+) -> anyhow::Result<bool> {
+    use frankenterm_core::snapshot_engine::{enroll_recovery_key, open_recovery_key_enrollment};
+    use frankenterm_core::snapshot_representation::RecoveryWrapContext;
+    let (root, wrapping_key, namespace_id, policy_id, format, enroll) = match command {
+        SnapshotCommands::EnrollRecoveryKey {
+            root,
+            wrapping_key,
+            namespace_id,
+            policy_id,
+            format,
+        } => (root, wrapping_key, namespace_id, policy_id, format, true),
+        SnapshotCommands::VerifyRecoveryKey {
+            root,
+            wrapping_key,
+            namespace_id,
+            policy_id,
+            format,
+        } => (root, wrapping_key, namespace_id, policy_id, format, false),
+        _ => return Ok(false),
+    };
+    let output_format = resolve_snapshot_session_output_format(format);
+    let parse_id = |value: &str| -> anyhow::Result<[u8; 32]> {
+        let mut result = [0; 32];
+        if value.len() != 64 || !value.is_ascii() {
+            anyhow::bail!("recovery enrollment identifiers require 64 hexadecimal digits");
+        }
+        for (byte, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let high = char::from(pair[0]).to_digit(16);
+            let low = char::from(pair[1]).to_digit(16);
+            let (Some(high), Some(low)) = (high, low) else {
+                anyhow::bail!("recovery enrollment identifiers require 64 hexadecimal digits");
+            };
+            *byte = ((high << 4) | low) as u8;
+        }
+        Ok(result)
+    };
+    let (Ok(namespace_id), Ok(policy_id)) = (parse_id(namespace_id), parse_id(policy_id)) else {
+        emit_snapshot_session_error(
+            output_format,
+            "recovery_key_context_invalid",
+            "Namespace and policy must each contain exactly 64 hexadecimal digits. No enrollment was attempted.",
+        )?;
+        std::process::exit(1);
+    };
+    let context = RecoveryWrapContext {
+        namespace_id,
+        policy_id,
+    };
+    let root = root.clone();
+    let wrapping_key = wrapping_key.clone();
+    let result = run_cli_blocking_with_cx(cx, "local recovery key enrollment", move || {
+        Ok(if enroll {
+            enroll_recovery_key(&root, &wrapping_key, &context)
+        } else {
+            open_recovery_key_enrollment(&root, &wrapping_key, &context).map(|(receipt, _)| receipt)
+        })
+    })
+    .await;
+    let receipt = match result {
+        Ok(Ok(receipt)) => receipt,
+        failure => {
+            use frankenterm_core::snapshot_engine::RecoveryKeyEnrollmentError;
+            let (code, message) = match failure {
+                Ok(Err(RecoveryKeyEnrollmentError::AlreadyExists)) => (
+                    "recovery_key_root_exists",
+                    "Enrollment root already exists and was preserved. Verify the existing enrollment or choose a new root.",
+                ),
+                Ok(Err(RecoveryKeyEnrollmentError::Incomplete)) => (
+                    "recovery_key_enrollment_incomplete",
+                    "Enrollment durability is incomplete. Preserve the files and run verify-recovery-key before use; if verification remains incomplete, select a new root.",
+                ),
+                Ok(Err(RecoveryKeyEnrollmentError::Rejected)) => (
+                    "recovery_key_enrollment_rejected",
+                    "Enrollment authority or expected context was rejected. Check the root, namespace, policy, and wrapping-key authority.",
+                ),
+                Ok(Err(RecoveryKeyEnrollmentError::Key(_))) => (
+                    "recovery_key_file_rejected",
+                    "Key or receipt admission failed. Check private regular-file permissions, file sizes, and wrapping-key authority.",
+                ),
+                _ => (
+                    "recovery_key_enrollment_unavailable",
+                    "Enrollment operation did not complete. Inspect the selected root before retrying; completion is unverified.",
+                ),
+            };
+            emit_snapshot_session_error(output_format, code, message)?;
+            std::process::exit(1);
+        }
+    };
+    let payload = serde_json::json!({
+        "operation": if enroll { "enroll_recovery_key" } else { "verify_recovery_key" },
+        "status": "local_enrollment_verified",
+        "independent_custody_verified": false,
+        "live_recovery_verified": false,
+        "receipt": receipt,
+    });
+    if !print_snapshot_session_structured_output(&payload, output_format)? {
+        println!(
+            "Local recovery-key enrollment verified. Independent custody and live recovery remain unverified."
+        );
+    }
+    Ok(true)
+}
+
 async fn run_verify_checkpoint_scrollback_artifact_command(
     cx: &frankenterm_core::cx::Cx,
     path: &Path,
@@ -80493,6 +80636,11 @@ async fn handle_snapshot_command(
                     &publication.receipt,
                 );
             }
+        }
+
+        command @ (SnapshotCommands::EnrollRecoveryKey { .. }
+        | SnapshotCommands::VerifyRecoveryKey { .. }) => {
+            run_recovery_key_command(&cx, &command).await?;
         }
 
         SnapshotCommands::VerifyArtifact { path, format } => {

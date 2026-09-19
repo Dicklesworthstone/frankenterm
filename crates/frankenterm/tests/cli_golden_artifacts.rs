@@ -21,6 +21,262 @@ use tempfile::TempDir;
 const INCIDENT_SECRET: &str = "sk-abc123456789012345678901234567890123456789012345678901";
 const INCIDENT_PANE_ID: u64 = 4_242;
 
+#[cfg(unix)]
+#[test]
+fn recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process() {
+    use frankenterm_core::snapshot_engine::open_recovery_key_enrollment;
+    use frankenterm_core::snapshot_representation::{
+        EncryptedRecoveryObject, ExpectedContext, ObjectMetadata, RecoveryObjectKind,
+        RecoveryWrapContext, decode_recovery_object, encode_recovery_object,
+    };
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
+
+    let context = RecoveryWrapContext {
+        namespace_id: [0x31; 32],
+        policy_id: [0x32; 32],
+    };
+    let metadata = ObjectMetadata::single(
+        [0x33; 32],
+        RecoveryObjectKind::TerminalCheckpoint,
+        1,
+        None,
+        1,
+    );
+    let expected = ExpectedContext::from_metadata(&metadata);
+    const PAYLOAD: &[u8] = b"actual encrypted enrollment reopen artifact: terminal state";
+    if let Some(path) = std::env::var_os("FT_ENROLLMENT_DECRYPT_CHILD") {
+        let path = PathBuf::from(path);
+        let (_, key) = open_recovery_key_enrollment(
+            &path.join("enrolled"),
+            &path.join("authority.key"),
+            &context,
+        )
+        .expect("fresh process opens enrollment");
+        let bytes =
+            fs::read(path.join("artifact.encrypted")).expect("read actual encrypted artifact");
+        let object = EncryptedRecoveryObject::from_bytes(&bytes).expect("parse encrypted artifact");
+        let decoded = decode_recovery_object(&object, &expected, &key, None)
+            .expect("decrypt with enrolled key in fresh process");
+        assert_eq!(decoded.plaintext(), PAYLOAD);
+        println!("FRESH_ENROLLMENT_DECRYPT_OK");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix(".ft-enrollment-cli-")
+        .tempdir_in(fs::canonicalize("/tmp").unwrap())
+        .expect("test directory");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let kek = [0x61; 32];
+    let key_path = dir.path().join("authority.key");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_path)
+        .unwrap();
+    file.write_all(&kek).unwrap();
+    file.sync_all().unwrap();
+    let root = dir.path().join("enrolled");
+    let run = |operation: &str, root: &Path, authority: &Path, namespace: &str| {
+        Command::cargo_bin("ft")
+            .unwrap()
+            .timeout(std::time::Duration::from_secs(15))
+            .env("HOME", dir.path())
+            .env("FT_WORKSPACE", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env_remove("FRANKENTERM_CONFIG_FILE")
+            .env_remove("WEZTERM_UNIX_SOCKET")
+            .args(["snapshot", operation, "--root"])
+            .arg(root)
+            .arg("--wrapping-key")
+            .arg(authority)
+            .args([
+                "--namespace-id",
+                namespace,
+                "--policy-id",
+                &"32".repeat(32),
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let enrollment = run("enroll-recovery-key", &root, &key_path, &"31".repeat(32));
+    assert!(
+        enrollment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrollment.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&enrollment.stdout).unwrap();
+    assert_eq!(receipt["status"], "local_enrollment_verified");
+    assert_eq!(receipt["live_recovery_verified"], false);
+    let (_, key) = open_recovery_key_enrollment(&root, &key_path, &context).unwrap();
+    let object = encode_recovery_object(PAYLOAD, metadata, &key, None).unwrap();
+    fs::write(
+        dir.path().join("artifact.encrypted"),
+        object.to_bytes().unwrap(),
+    )
+    .unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process",
+            "--nocapture",
+        ])
+        .env("FT_ENROLLMENT_DECRYPT_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stdout).contains("FRESH_ENROLLMENT_DECRYPT_OK"));
+    let verification = run("verify-recovery-key", &root, &key_path, &"31".repeat(32));
+    assert!(
+        verification.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verification.stderr)
+    );
+    for output in [&enrollment, &verification, &child] {
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(
+                !bytes
+                    .windows(32)
+                    .any(|window| window == kek || window == key.as_bytes())
+            );
+            let text = String::from_utf8_lossy(bytes);
+            for secret in [&kek, key.as_bytes()] {
+                let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+                assert!(!text.contains(&hex));
+            }
+        }
+    }
+    let before = fs::read(root.join("recovery-key.wrapped")).unwrap();
+    let partial = dir.path().join("partial");
+    fs::create_dir(&partial).unwrap();
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o700)).unwrap();
+    let partial_key = partial.join("recovery-key.wrapped");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&partial_key)
+        .unwrap();
+    file.write_all(&before).unwrap();
+    file.sync_all().unwrap();
+    let incomplete = run("verify-recovery-key", &partial, &key_path, &"31".repeat(32));
+    assert!(!incomplete.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&incomplete.stdout).unwrap()["error_code"],
+        "recovery_key_enrollment_incomplete"
+    );
+    assert!(
+        !run("enroll-recovery-key", &partial, &key_path, &"31".repeat(32))
+            .status
+            .success()
+    );
+    assert_eq!(before, fs::read(partial_key).unwrap());
+    let conflict = run("enroll-recovery-key", &root, &key_path, &"31".repeat(32));
+    assert!(!conflict.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&conflict.stdout).unwrap()["error_code"],
+        "recovery_key_root_exists"
+    );
+    let invalid = run(
+        "enroll-recovery-key",
+        &dir.path().join("not-created"),
+        &key_path,
+        "bad",
+    );
+    assert!(!invalid.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid.stdout).unwrap()["error_code"],
+        "recovery_key_context_invalid"
+    );
+    assert!(!dir.path().join("not-created").exists());
+    assert_eq!(before, fs::read(root.join("recovery-key.wrapped")).unwrap());
+    assert!(
+        !run("verify-recovery-key", &root, &key_path, &"34".repeat(32))
+            .status
+            .success()
+    );
+    let wrong = dir.path().join("wrong.key");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&wrong)
+        .unwrap();
+    file.write_all(&[0x62; 32]).unwrap();
+    file.sync_all().unwrap();
+    assert!(
+        !run("verify-recovery-key", &root, &wrong, &"31".repeat(32))
+            .status
+            .success()
+    );
+    let alias = dir.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    assert!(
+        !run("verify-recovery-key", &alias, &key_path, &"31".repeat(32))
+            .status
+            .success()
+    );
+    assert!(
+        !run(
+            "verify-recovery-key",
+            &root.join("../enrolled"),
+            &key_path,
+            &"31".repeat(32)
+        )
+        .status
+        .success()
+    );
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !run("verify-recovery-key", &root, &key_path, &"31".repeat(32))
+            .status
+            .success()
+    );
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !run("verify-recovery-key", &root, &key_path, &"31".repeat(32))
+            .status
+            .success()
+    );
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let fifo = dir.path().join("authority.fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let rejected = run("verify-recovery-key", &root, &fifo, &"31".repeat(32));
+        assert!(!rejected.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rejected.stdout).unwrap()["error_code"],
+            "recovery_key_file_rejected"
+        );
+    }
+    let hardlink = dir.path().join("authority-alias.key");
+    fs::hard_link(&key_path, &hardlink).unwrap();
+    assert!(
+        !run("verify-recovery-key", &root, &key_path, &"31".repeat(32))
+            .status
+            .success()
+    );
+    assert!(
+        !dir.path().join(".ft/ft.db").exists(),
+        "offline commands must not create a database"
+    );
+}
+
 fn setup_workspace() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
     let ft_dir = dir.path().join(".ft");

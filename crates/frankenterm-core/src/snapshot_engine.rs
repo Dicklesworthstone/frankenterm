@@ -11794,6 +11794,246 @@ fn read_checkpoint_artifact_from_parent_bounded_with_hook(
 pub enum RecoveryKeyFileStage {
     WrappingKey,
     WrappedKey,
+    EnrollmentReceipt,
+}
+
+const RECOVERY_ENROLLMENT_RECEIPT_BYTES: usize = 112;
+const RECOVERY_ENROLLMENT_RECEIPT: &str = "enrollment.receipt";
+const RECOVERY_ENROLLMENT_RECEIPT_STAGE: &str = "enrollment.receipt.staging";
+const RECOVERY_ENROLLMENT_WRAPPED_KEY: &str = "recovery-key.wrapped";
+
+/// Public identifiers only. Local enrollment does not establish independent
+/// custody, running-process restoration, or a live publication schedule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryKeyEnrollmentReceipt {
+    pub namespace_id: [u8; 32],
+    pub policy_id: [u8; 32],
+    pub recovery_key_id: [u8; 8],
+    pub authority_id: [u8; 32],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryKeyEnrollmentError {
+    #[error("recovery enrollment authority or context rejected")]
+    Rejected,
+    #[error("recovery enrollment root already exists; preserved unchanged")]
+    AlreadyExists,
+    #[error("recovery enrollment incomplete; retained files must not be used or overwritten")]
+    Incomplete,
+    #[error("recovery enrollment key admission failed: {0}")]
+    Key(#[from] EnrolledRecoveryKeyError),
+}
+
+/// Create one immutable local enrollment under an explicitly selected, absent
+/// root. The independently supplied KEK is never generated, copied, or emitted.
+pub fn enroll_recovery_key(
+    root: &Path,
+    kek_path: &Path,
+    context: &crate::snapshot_representation::RecoveryWrapContext,
+) -> Result<RecoveryKeyEnrollmentReceipt, RecoveryKeyEnrollmentError> {
+    enroll_recovery_key_with_hook(root, kek_path, context, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryEnrollmentWriteStage {
+    WrappedDurable,
+    ReceiptFileSync,
+    ReceiptPublished,
+}
+
+fn enroll_recovery_key_with_hook(
+    root: &Path,
+    kek_path: &Path,
+    context: &crate::snapshot_representation::RecoveryWrapContext,
+    mut before_stage: impl FnMut(RecoveryEnrollmentWriteStage) -> std::io::Result<()>,
+) -> Result<RecoveryKeyEnrollmentReceipt, RecoveryKeyEnrollmentError> {
+    use crate::snapshot_representation::{RecoveryKey, RecoveryWrappingKey, wrap_recovery_key};
+    let rejected = |_| RecoveryKeyEnrollmentError::Rejected;
+    let kek = read_enrolled_key_file::<32>(kek_path, RecoveryKeyFileStage::WrappingKey, || {})?;
+    let authority = RecoveryWrappingKey::from_bytes(*kek).map_err(rejected)?;
+    let key = RecoveryKey::generate().map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    let wrapped = wrap_recovery_key(&key, &authority, context).map_err(rejected)?;
+    let receipt = RecoveryKeyEnrollmentReceipt {
+        namespace_id: context.namespace_id,
+        policy_id: context.policy_id,
+        recovery_key_id: key.key_id(),
+        authority_id: authority.authority_id(),
+    };
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(root, false)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    create_checkpoint_artifact_private_directory(&parent, &leaf).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            RecoveryKeyEnrollmentError::AlreadyExists
+        } else {
+            RecoveryKeyEnrollmentError::Rejected
+        }
+    })?;
+    // Once the root exists, every failure is explicitly incomplete. Never
+    // remove residue or pretend it is safe to retry by replacing files.
+    let mut publish = || -> Result<(), CheckpointScrollbackArtifactError> {
+        use cap_fs_ext::DirExt as _;
+        revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+        let directory = parent.open_dir_nofollow(&leaf)?;
+        validate_checkpoint_artifact_final_directory_authority(&directory)?;
+        let write_new = |name: &str, bytes: &[u8]| -> std::io::Result<cap_std::fs::File> {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = directory.open_with(name, &options)?;
+            file.write_all(bytes)?;
+            Ok(file)
+        };
+        write_new(RECOVERY_ENROLLMENT_WRAPPED_KEY, &wrapped.to_bytes())?.sync_all()?;
+        sync_checkpoint_artifact_directory(&directory)?;
+        sync_checkpoint_artifact_directory(&parent)?;
+        before_stage(RecoveryEnrollmentWriteStage::WrappedDurable)?;
+        revalidate_checkpoint_artifact_parent(root, &directory)?;
+        let mut bytes = [0; RECOVERY_ENROLLMENT_RECEIPT_BYTES];
+        bytes[..8].copy_from_slice(b"FTENR001");
+        bytes[8..40].copy_from_slice(&receipt.namespace_id);
+        bytes[40..72].copy_from_slice(&receipt.policy_id);
+        bytes[72..80].copy_from_slice(&receipt.recovery_key_id);
+        bytes[80..112].copy_from_slice(&receipt.authority_id);
+        let receipt_file = write_new(RECOVERY_ENROLLMENT_RECEIPT_STAGE, &bytes)?;
+        before_stage(RecoveryEnrollmentWriteStage::ReceiptFileSync)?;
+        receipt_file.sync_all()?;
+        publish_checkpoint_artifact_noreplace(
+            &directory,
+            Path::new(RECOVERY_ENROLLMENT_RECEIPT_STAGE),
+            Path::new(RECOVERY_ENROLLMENT_RECEIPT),
+        )?;
+        before_stage(RecoveryEnrollmentWriteStage::ReceiptPublished)?;
+        sync_checkpoint_artifact_directory(&directory)?;
+        sync_checkpoint_artifact_directory(&parent)?;
+        revalidate_checkpoint_artifact_parent(root, &directory)?;
+        revalidate_checkpoint_artifact_parent(&parent_path, &parent)?;
+        Ok(())
+    };
+    publish().map_err(|_| RecoveryKeyEnrollmentError::Incomplete)?;
+    Ok(receipt)
+}
+
+/// Reopen an enrollment using operator-supplied namespace/policy and actual KEK
+/// identity. The wrapper is never used as its own trust anchor.
+pub fn open_recovery_key_enrollment(
+    root: &Path,
+    kek_path: &Path,
+    context: &crate::snapshot_representation::RecoveryWrapContext,
+) -> Result<
+    (
+        RecoveryKeyEnrollmentReceipt,
+        crate::snapshot_representation::RecoveryKey,
+    ),
+    RecoveryKeyEnrollmentError,
+> {
+    open_recovery_key_enrollment_with_hook(root, kek_path, context, || {})
+}
+
+fn open_recovery_key_enrollment_with_hook(
+    root: &Path,
+    kek_path: &Path,
+    context: &crate::snapshot_representation::RecoveryWrapContext,
+    mut around_child_reads: impl FnMut(),
+) -> Result<
+    (
+        RecoveryKeyEnrollmentReceipt,
+        crate::snapshot_representation::RecoveryKey,
+    ),
+    RecoveryKeyEnrollmentError,
+> {
+    use crate::snapshot_representation::{
+        ExpectedRecoveryWrapContext, RecoveryWrappingKey, WRAPPED_RECOVERY_KEY_BYTES,
+        WrappedRecoveryKey, unwrap_recovery_key,
+    };
+    use cap_fs_ext::DirExt as _;
+    let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(root, false)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    let directory = parent
+        .open_dir_nofollow(&leaf)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    validate_checkpoint_artifact_final_directory_authority(&directory)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    #[cfg(unix)]
+    if cap_std::fs::MetadataExt::mode(
+        &directory
+            .dir_metadata()
+            .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?,
+    ) & 0o077
+        != 0
+    {
+        return Err(RecoveryKeyEnrollmentError::Rejected);
+    }
+    around_child_reads();
+    match directory.symlink_metadata(RECOVERY_ENROLLMENT_RECEIPT) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RecoveryKeyEnrollmentError::Incomplete);
+        }
+        Err(_) => return Err(RecoveryKeyEnrollmentError::Rejected),
+        Ok(_) => {}
+    }
+    let bytes = read_enrolled_key_file_from_parent::<RECOVERY_ENROLLMENT_RECEIPT_BYTES>(
+        &directory,
+        Path::new(RECOVERY_ENROLLMENT_RECEIPT),
+        RecoveryKeyFileStage::EnrollmentReceipt,
+        true,
+        || {},
+    )?;
+    let mut receipt = RecoveryKeyEnrollmentReceipt {
+        namespace_id: [0; 32],
+        policy_id: [0; 32],
+        recovery_key_id: [0; 8],
+        authority_id: [0; 32],
+    };
+    receipt.namespace_id.copy_from_slice(&bytes[8..40]);
+    receipt.policy_id.copy_from_slice(&bytes[40..72]);
+    receipt.recovery_key_id.copy_from_slice(&bytes[72..80]);
+    receipt.authority_id.copy_from_slice(&bytes[80..112]);
+    let kek = read_enrolled_key_file::<32>(kek_path, RecoveryKeyFileStage::WrappingKey, || {})?;
+    let authority =
+        RecoveryWrappingKey::from_bytes(*kek).map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    if &bytes[..8] != b"FTENR001"
+        || receipt.namespace_id != context.namespace_id
+        || receipt.policy_id != context.policy_id
+        || receipt.authority_id != authority.authority_id()
+    {
+        return Err(RecoveryKeyEnrollmentError::Rejected);
+    }
+    let wrapped = read_enrolled_key_file_from_parent::<WRAPPED_RECOVERY_KEY_BYTES>(
+        &directory,
+        Path::new(RECOVERY_ENROLLMENT_WRAPPED_KEY),
+        RecoveryKeyFileStage::WrappedKey,
+        true,
+        || {},
+    )?;
+    let wrapped = WrappedRecoveryKey::from_bytes(wrapped.as_slice())
+        .map_err(EnrolledRecoveryKeyError::from)?;
+    let key = unwrap_recovery_key(
+        &wrapped,
+        &authority,
+        &ExpectedRecoveryWrapContext {
+            namespace_id: context.namespace_id,
+            policy_id: context.policy_id,
+            recovery_key_id: receipt.recovery_key_id,
+            authority_id: authority.authority_id(),
+        },
+    )
+    .map_err(EnrolledRecoveryKeyError::from)?;
+    around_child_reads();
+    sync_checkpoint_artifact_directory(&directory)
+        .and_then(|()| sync_checkpoint_artifact_directory(&parent))
+        .map_err(|_| RecoveryKeyEnrollmentError::Incomplete)?;
+    revalidate_checkpoint_artifact_parent(root, &directory)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)
+        .map_err(|_| RecoveryKeyEnrollmentError::Rejected)?;
+    Ok((receipt, key))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -11847,13 +12087,29 @@ fn read_enrolled_key_file<const N: usize>(
     }
     let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)
         .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
+    let bytes = read_enrolled_key_file_from_parent(&parent, &leaf, stage, false, after_read)?;
+    revalidate_checkpoint_artifact_parent(&parent_path, &parent)
+        .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?;
+    Ok(bytes)
+}
+
+fn read_enrolled_key_file_from_parent<const N: usize>(
+    parent: &cap_std::fs::Dir,
+    leaf: &Path,
+    stage: RecoveryKeyFileStage,
+    synchronize: bool,
+    after_read: impl FnOnce(),
+) -> Result<zeroize::Zeroizing<[u8; N]>, EnrolledRecoveryKeyError> {
+    if !cfg!(unix) {
+        return Err(EnrolledRecoveryKeyError::UnsupportedPlatform);
+    }
     let options = crate::snapshot_publication::snapshot_read_options();
     let mut file = parent
-        .open_with(&leaf, &options)
+        .open_with(leaf, &options)
         .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
     let before = validate_checkpoint_artifact_file_metadata(
         &parent
-            .symlink_metadata(&leaf)
+            .symlink_metadata(leaf)
             .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?,
         &file
             .metadata()
@@ -11876,9 +12132,13 @@ fn read_enrolled_key_file<const N: usize>(
         return Err(EnrolledRecoveryKeyError::InvalidSize(stage));
     }
     after_read();
+    if synchronize {
+        file.sync_all()
+            .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
+    }
     let after = validate_checkpoint_artifact_file_metadata(
         &parent
-            .symlink_metadata(&leaf)
+            .symlink_metadata(leaf)
             .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?,
         &file
             .metadata()
@@ -11889,8 +12149,6 @@ fn read_enrolled_key_file<const N: usize>(
     if before != after {
         return Err(EnrolledRecoveryKeyError::Changed(stage));
     }
-    revalidate_checkpoint_artifact_parent(&parent_path, &parent)
-        .map_err(|_| EnrolledRecoveryKeyError::Changed(stage))?;
     Ok(bytes)
 }
 
@@ -16924,6 +17182,152 @@ mod tests {
                 .unwrap();
         }
         directory
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_enrollment_pinned_children_do_not_follow_root_aba_swap() {
+        let dir = checkpoint_artifact_test_directory();
+        let kek = dir.path().join("authority.key");
+        write_private_checkpoint_artifact_test_file(&kek, &[0x63; 32]);
+        let root = dir.path().join("enrolled");
+        let other = dir.path().join("other");
+        let saved = dir.path().join("saved");
+        let context = crate::snapshot_representation::RecoveryWrapContext {
+            namespace_id: [0x64; 32],
+            policy_id: [0x65; 32],
+        };
+        let original = enroll_recovery_key(&root, &kek, &context).unwrap();
+        let replacement = enroll_recovery_key(&other, &kek, &context).unwrap();
+        let mut swapped = false;
+        let (receipt, key) = open_recovery_key_enrollment_with_hook(&root, &kek, &context, || {
+            if !swapped {
+                std::fs::rename(&root, &saved).unwrap();
+                std::fs::rename(&other, &root).unwrap();
+                swapped = true;
+            } else {
+                std::fs::rename(&root, &other).unwrap();
+                std::fs::rename(&saved, &root).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(receipt, original);
+        assert_eq!(key.key_id(), original.recovery_key_id);
+        assert_ne!(key.key_id(), replacement.recovery_key_id);
+        assert_eq!(
+            open_recovery_key_enrollment(&other, &kek, &context)
+                .unwrap()
+                .0,
+            replacement
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_enrollment_receipt_sync_failure_never_publishes_final_receipt() {
+        let dir = checkpoint_artifact_test_directory();
+        let kek = dir.path().join("authority.key");
+        write_private_checkpoint_artifact_test_file(&kek, &[0x63; 32]);
+        let root = dir.path().join("enrolled");
+        let context = crate::snapshot_representation::RecoveryWrapContext {
+            namespace_id: [0x64; 32],
+            policy_id: [0x65; 32],
+        };
+        let result = enroll_recovery_key_with_hook(&root, &kek, &context, |stage| {
+            if stage == RecoveryEnrollmentWriteStage::ReceiptFileSync {
+                Err(std::io::Error::other("injected receipt sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(RecoveryKeyEnrollmentError::Incomplete)
+        ));
+        let staged = std::fs::read(root.join(RECOVERY_ENROLLMENT_RECEIPT_STAGE)).unwrap();
+        assert_eq!(staged.len(), RECOVERY_ENROLLMENT_RECEIPT_BYTES);
+        assert!(!root.join(RECOVERY_ENROLLMENT_RECEIPT).exists());
+        assert!(matches!(
+            open_recovery_key_enrollment(&root, &kek, &context),
+            Err(RecoveryKeyEnrollmentError::Incomplete)
+        ));
+        assert_eq!(
+            staged,
+            std::fs::read(root.join(RECOVERY_ENROLLMENT_RECEIPT_STAGE)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_enrollment_postrename_sync_failure_can_reopen_durably() {
+        let dir = checkpoint_artifact_test_directory();
+        let kek = dir.path().join("authority.key");
+        write_private_checkpoint_artifact_test_file(&kek, &[0x63; 32]);
+        let root = dir.path().join("enrolled");
+        let context = crate::snapshot_representation::RecoveryWrapContext {
+            namespace_id: [0x64; 32],
+            policy_id: [0x65; 32],
+        };
+        let result = enroll_recovery_key_with_hook(&root, &kek, &context, |stage| {
+            if stage == RecoveryEnrollmentWriteStage::ReceiptPublished {
+                Err(std::io::Error::other(
+                    "injected postrename directory sync failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(RecoveryKeyEnrollmentError::Incomplete)
+        ));
+        let retained = std::fs::read(root.join(RECOVERY_ENROLLMENT_RECEIPT)).unwrap();
+        let (receipt, key) = open_recovery_key_enrollment(&root, &kek, &context).unwrap();
+        assert_eq!(receipt.recovery_key_id, key.key_id());
+        assert_eq!(
+            retained,
+            std::fs::read(root.join(RECOVERY_ENROLLMENT_RECEIPT)).unwrap()
+        );
+        assert!(matches!(
+            enroll_recovery_key(&root, &kek, &context),
+            Err(RecoveryKeyEnrollmentError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_enrollment_interrupted_before_receipt_preserves_incomplete_root() {
+        let dir = checkpoint_artifact_test_directory();
+        let kek = dir.path().join("authority.key");
+        write_private_checkpoint_artifact_test_file(&kek, &[0x63; 32]);
+        let root = dir.path().join("enrolled");
+        let context = crate::snapshot_representation::RecoveryWrapContext {
+            namespace_id: [0x64; 32],
+            policy_id: [0x65; 32],
+        };
+        let result = enroll_recovery_key_with_hook(&root, &kek, &context, |_| {
+            Err(std::io::Error::other(
+                "injected failure after durable wrapped key",
+            ))
+        });
+        assert!(matches!(
+            result,
+            Err(RecoveryKeyEnrollmentError::Incomplete)
+        ));
+        let retained = std::fs::read(root.join(RECOVERY_ENROLLMENT_WRAPPED_KEY)).unwrap();
+        assert!(!root.join(RECOVERY_ENROLLMENT_RECEIPT).exists());
+        assert!(matches!(
+            open_recovery_key_enrollment(&root, &kek, &context),
+            Err(RecoveryKeyEnrollmentError::Incomplete)
+        ));
+        assert!(matches!(
+            enroll_recovery_key(&root, &kek, &context),
+            Err(RecoveryKeyEnrollmentError::AlreadyExists)
+        ));
+        assert_eq!(
+            retained,
+            std::fs::read(root.join(RECOVERY_ENROLLMENT_WRAPPED_KEY)).unwrap()
+        );
     }
 
     #[test]
