@@ -8632,7 +8632,7 @@ mod tests {
         drop(successor_registration);
         drop(bound_successor_registration);
         assert!(successor_mux.remove_tab_local_only_if_same(&successor_tab));
-        assert!(successor_mux.domain_was_detached_if_guard(&registered_successor_domain));
+        assert!(successor_mux.domain_was_detached_if_same(&registered_successor_domain));
         drop(successor_tab);
         drop(successor_pane);
         drop(successor_coordinator);

@@ -2725,7 +2725,7 @@ mod tests {
         };
         pane.checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 1,
-            publication,
+            publication: publication.clone(),
             catalog_generation: 1,
         };
         let Some(RecoverySplitNode::Split { left, .. }) =
