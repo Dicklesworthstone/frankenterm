@@ -5161,6 +5161,7 @@ impl Drop for LocalPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_term::config::ScrollbackSpillSink;
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug, Default)]
