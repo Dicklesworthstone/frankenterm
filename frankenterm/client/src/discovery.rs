@@ -679,21 +679,26 @@ fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
     let mut socks = discover_gui_socks_direct(&resolved_dir);
     if resolved_dir != runtime_dir {
         for sock in discover_gui_socks_direct(runtime_dir) {
-            if !socks.contains(&sock) {
+            if !socks.iter().any(|entry| entry.path == sock.path) {
                 socks.push(sock);
             }
         }
     }
-    socks
+    // Preserve the oldest-instance policy across both directories, not just
+    // within each directory before concatenating their results.
+    socks.sort_by(|a, b| a.age.cmp(&b.age).reverse());
+    log::trace!("{:?}", socks);
+    socks.into_iter().map(|entry| entry.path).collect()
 }
 
-fn discover_gui_socks_direct(runtime_dir: &Path) -> Vec<PathBuf> {
-    #[derive(Debug)]
-    struct Entry {
-        path: PathBuf,
-        age: Duration,
-    }
-    let mut socks: Vec<Entry> = vec![];
+#[derive(Debug)]
+struct GuiSocketEntry {
+    path: PathBuf,
+    age: Duration,
+}
+
+fn discover_gui_socks_direct(runtime_dir: &Path) -> Vec<GuiSocketEntry> {
+    let mut socks = vec![];
 
     /// Get an idea of the age of the entry.
     /// Some filesystems don't support reporting `created`,
@@ -739,16 +744,14 @@ fn discover_gui_socks_direct(runtime_dir: &Path) -> Vec<PathBuf> {
                             continue;
                         }
 
-                        socks.push(Entry { path, age });
+                        socks.push(GuiSocketEntry { path, age });
                     }
                 }
             }
         }
     }
 
-    socks.sort_by(|a, b| a.age.cmp(&b.age).reverse());
-    log::trace!("{:?}", socks);
-    socks.into_iter().map(|e| e.path).collect()
+    socks
 }
 
 #[cfg(unix)]
