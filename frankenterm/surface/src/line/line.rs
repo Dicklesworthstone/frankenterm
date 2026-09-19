@@ -2161,7 +2161,18 @@ impl MonospaceKpCostModel {
         } else {
             self.lookahead_limit
         };
-        token_count.saturating_mul(lookahead)
+        // The last `lookahead` starts have only lookahead, lookahead-1,
+        // ..., 1 successors. Counting a full lookahead for each rejects
+        // bounded plans unnecessarily. Divide before multiplying so the
+        // triangular term saturates only when its actual value overflows.
+        let tail = if lookahead % 2 == 0 {
+            (lookahead / 2).saturating_mul(lookahead.saturating_add(1))
+        } else {
+            lookahead.saturating_mul(lookahead / 2 + 1)
+        };
+        (token_count - lookahead)
+            .saturating_mul(lookahead)
+            .saturating_add(tail)
     }
 
     /// Whether the DP engine should fall back to deterministic greedy wrapping.
@@ -5359,6 +5370,30 @@ mod tests {
     }
 
     #[test]
+    fn kp_transition_bound_matches_finite_endpoint_enumeration() {
+        for token_count in 0..=200usize {
+            for lookahead_limit in [0, 1, 2, 3, 63, 64, 65, 200, 201] {
+                let model = MonospaceKpCostModel {
+                    lookahead_limit,
+                    ..MonospaceKpCostModel::terminal_default()
+                };
+                let enumerated: usize = (0..token_count)
+                    .map(|start| (start + 1..=token_count).take(lookahead_limit).count())
+                    .sum();
+                assert_eq!(model.estimated_dp_states(token_count), enumerated);
+            }
+        }
+        let mut model = MonospaceKpCostModel::terminal_default();
+        assert_eq!(model.estimated_dp_states(158), 8096);
+        assert!(!model.should_fallback(158));
+        assert!(model.should_fallback(160));
+        model.lookahead_limit = usize::MAX;
+        assert_eq!(model.estimated_dp_states(usize::MAX), usize::MAX);
+        model.lookahead_limit = 1;
+        assert_eq!(model.estimated_dp_states(usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn kp_candidate_tiebreak_is_deterministic_on_fixed_corpora() {
         let corpus_a = vec![
             MonospaceBreakCandidate {
@@ -5481,6 +5516,72 @@ mod tests {
         assert_eq!(plan.break_offsets.last(), Some(&tokens.len()));
         assert!(plan.evaluated_states > 0);
         assert!(plan.evaluated_states <= model.max_dp_states);
+    }
+
+    #[test]
+    fn bounded_wrap_frozen_unicode_record_fits_default_budget() {
+        let text = "FT_RECORD_00000 A  B\u{a0}C\u{2003}D e\u{301} 界面 🚀 0123456789 abcdefghijklmnopqrstuvwxyz 0123456789 abcdefghijklmnopqrstuvwxyz 0123456789 abcdefghijklmnopqrstuvwxyz FT_END_00000";
+        let model = MonospaceKpCostModel::terminal_default();
+        let tokens = cells_from_text(text);
+        for width in [60, 70, 80, 86, 100, 120, 137] {
+            let plan = bounded_monospace_wrap_plan(&tokens, width, model);
+            assert_eq!(plan.mode, MonospaceWrapMode::Dp);
+            assert!(plan.evaluated_states <= model.estimated_dp_states(tokens.len()));
+            assert!(plan.evaluated_states <= model.max_dp_states);
+            let line: Line = text.into();
+            let geometry = LineWrapGeometry::capture(&line, 4096).unwrap();
+            let report = line.wrap_with_report(width, SEQ_ZERO, model);
+            let reconstructed: String = report
+                .lines
+                .iter()
+                .map(|line| line.as_str().into_owned())
+                .collect();
+            assert_eq!(reconstructed, text);
+            assert!(report.scorecard.selected_total_cost <= report.scorecard.greedy_total_cost);
+            let mut scratch = LineWrapWidthPrefixScratch::default();
+            let bound = geometry
+                .planning_bytes_upper_bound(width, model, &scratch)
+                .unwrap();
+            assert_eq!(
+                geometry.row_count_with_budget(width, model, &mut scratch, bound - 1),
+                None
+            );
+            assert_eq!(scratch.capacity(), 0, "refusal must not allocate scratch");
+            assert_eq!(
+                geometry.row_count_with_budget(width, model, &mut scratch, bound),
+                Some(report.lines.len())
+            );
+        }
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn frozen_unicode_history_reuses_geometry_without_reusing_record_text() {
+        let _guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        memoized_wrap_point_cache_clear_for_test();
+        let model = MonospaceKpCostModel::terminal_default();
+        for width in [60, 70, 80, 86, 100, 120, 137] {
+            WRAP_PLANNER_CALLS.with(|calls| calls.set(0));
+            for record in 0..10_000 {
+                let text = format!(
+                    "FT_RECORD_{record:05} A  B\u{a0}C\u{2003}D e\u{301} 界面 🚀 0123456789 abcdefghijklmnopqrstuvwxyz 0123456789 abcdefghijklmnopqrstuvwxyz 0123456789 abcdefghijklmnopqrstuvwxyz FT_END_{record:05}"
+                );
+                let line: Line = text.as_str().into();
+                let report = line.wrap_with_report(width, SEQ_ZERO, model);
+                assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+                let reconstructed: String = report
+                    .lines
+                    .iter()
+                    .map(|line| line.as_str().into_owned())
+                    .collect();
+                assert_eq!(reconstructed, text);
+            }
+            // Another concurrent test may have populated this geometry first;
+            // either way the 10k records require at most one planner call here.
+            WRAP_PLANNER_CALLS.with(|calls| assert!(calls.get() <= 1));
+        }
     }
 
     #[test]
