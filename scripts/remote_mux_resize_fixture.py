@@ -67,7 +67,9 @@ def write_bounded(data, deadline):
 
 
 def run(args):
-    if getattr(args, "arm", "resize") == "echo":
+    if getattr(args, "arm", "resize") == "swarm-echo":
+        run_swarm_echo(args)
+    elif getattr(args, "arm", "resize") == "echo":
         run_echo(args)
     else:
         run_resize(args)
@@ -173,7 +175,7 @@ def run_echo(args):
     pending_in = bytearray()
 
     # Pre-generate structured stream record template
-    # 128 bytes per record: 22-byte prefix + 104-byte payload + 2-byte \r\n
+    # 122 bytes per record: 16-byte prefix + 104-byte payload + 2-byte \r\n
     stream_payload = (b"0123456789abcdef" * 6) + b"01234567"
 
     try:
@@ -328,6 +330,93 @@ def run_echo(args):
     finally:
         os.set_blocking(1, original_blocking_1)
         os.set_blocking(0, original_blocking_0)
+        termios.tcsetattr(0, termios.TCSANOW, original)
+
+
+def noise_record(sequence):
+    if type(sequence) is not int or not 0 <= sequence < 10**16:
+        raise ValueError("invalid noise record sequence")
+    return f"FT_NOISE {sequence:016d} 0123456789abcdef FT_END\r\n".encode("ascii")
+
+
+def run_swarm_echo(args):
+    """Separate bounded noise producers and a quiet, strictly ordered echo PTY."""
+    if not os.isatty(0) or not os.isatty(1):
+        raise RuntimeError("fixture requires an explicitly owned real PTY")
+    role = args.swarm_role
+    pane = int(os.environ["WEZTERM_PANE"])
+    owner_path = args.owner if role == "interactive" else f"{args.owner}-{pane}.json"
+    identity = {"pid": os.getpid(), "parent_pid": os.getppid(), "pane_id": pane,
+                "arm": "swarm-echo", "role": role,
+                "linux_start_ticks": process_identity(os.getpid())["start_ticks"]}
+    write_new(owner_path, json.dumps(identity, sort_keys=True) + "\n")
+    original = termios.tcgetattr(0)
+    blocking = [os.get_blocking(fd) for fd in (0, 1)]
+    deadline = time.monotonic() + args.timeout_seconds
+    pending_in, pending_out = bytearray(), bytearray()
+    streaming = False
+    sequence = probes = written = received = 0
+    try:
+        tty.setraw(0)
+        os.set_blocking(0, False)
+        os.set_blocking(1, False)
+        write_bounded(f"FT_SWARM_READY {role}\r\n".encode(), deadline)
+        write_new(owner_path + ".ready", json.dumps(identity) + "\n")
+        while time.monotonic() < deadline:
+            if streaming and len(pending_out) < 16384:
+                while len(pending_out) < 32768:
+                    pending_out.extend(noise_record(sequence))
+                    sequence += 1
+            readable, writable, _ = select.select([0], [1] if pending_out else [], [], 0.005)
+            if readable:
+                try:
+                    chunk = os.read(0, 4096)
+                except (BlockingIOError, InterruptedError):
+                    chunk = None
+                if chunk == b"":
+                    raise RuntimeError("owned PTY closed before EXIT")
+                if chunk:
+                    received += len(chunk)
+                    if received > 65536:
+                        raise ValueError("swarm input exceeded 64 KiB")
+                    pending_in.extend(chunk)
+                while b"\n" in pending_in:
+                    command, _, rest = pending_in.partition(b"\n")
+                    pending_in = bytearray(rest)
+                    if command == b"START_STREAM swarm_session_001" and role == "noise" and not streaming and sequence == 0:
+                        streaming = True
+                    elif command == f"PROBE swarm_trial_{probes:04d}".encode() and role == "interactive" and probes < 1000:
+                        pending_out.extend(f"FT_PROBE swarm_trial_{probes:04d}\r\n".encode())
+                        probes += 1
+                    elif command == b"EXIT swarm_exit" and ((role == "noise" and streaming) or (role == "interactive" and probes == 1000)):
+                        # Settlement is outside the counted interval. No final
+                        # producer counter is credited as concurrent ingestion.
+                        write_bounded(pending_out, min(deadline, time.monotonic() + 5))
+                        written += len(pending_out)
+                        final = dict(identity, status="completed", probes_served=probes,
+                                     records_generated=sequence, bytes_written=written,
+                                     record_bytes=len(noise_record(0)))
+                        write_new(owner_path + ".final", json.dumps(final, sort_keys=True) + "\n")
+                        return
+                    else:
+                        raise ValueError("unexpected swarm command or command order")
+                if len(pending_in) > 256 or len(pending_out) > 65536:
+                    raise ValueError("swarm pending buffer exceeded cap")
+            if writable and pending_out:
+                try:
+                    count = os.write(1, pending_out[:16384])
+                except (BlockingIOError, InterruptedError):
+                    continue
+                if count <= 0:
+                    raise RuntimeError("swarm output made no progress")
+                del pending_out[:count]
+                written += count
+                if written > 256 * 1024 * 1024:
+                    raise ValueError("swarm producer exceeded 256 MiB lifetime cap")
+        raise TimeoutError("swarm PTY lifetime deadline expired")
+    finally:
+        for fd, mode in enumerate(blocking):
+            os.set_blocking(fd, mode)
         termios.tcsetattr(0, termios.TCSANOW, original)
 
 
@@ -732,6 +821,12 @@ def measure(args):
     write_new(corpus_path, corpus(10000))
     config_path = root / "frankenterm.toml"
     config_text = 'scrollback_lines = 50000\ninitial_rows = 24\ninitial_cols = 80\n'
+    script = pathlib.Path(__file__).resolve()
+    if args.arm == "swarm-echo":
+        noise_command = [sys.executable, str(script), "run", "--arm", "swarm-echo",
+                         "--swarm-role", "noise", "--corpus", str(corpus_path),
+                         "--owner", str(root / "noise-owner"), "--timeout-seconds", "900"]
+        config_text += "default_prog = " + json.dumps(noise_command) + "\n"
     if getattr(args, "mux_socket_buffer_bytes", None) is not None:
         config_text += f'mux_socket_buffer_size = {args.mux_socket_buffer_bytes}\n'
     if getattr(args, "mux_parser_buffer_bytes", None) is not None:
@@ -755,8 +850,8 @@ def measure(args):
     script = pathlib.Path(__file__).resolve()
     argv = [str(binaries[1]), "--config-file", str(config_path), "--daemonize=false",
             "--cwd", str(root), "--", sys.executable, str(script), "run"]
-    if getattr(args, "arm", "resize") == "echo":
-        argv.extend(["--arm", "echo"])
+    if args.arm in ("echo", "swarm-echo"):
+        argv.extend(["--arm", args.arm])
     argv.extend(["--corpus", str(corpus_path), "--owner", str(root / "pane-owner.json"),
                  "--timeout-seconds", "900"])
     owned = OwnedProcesses()
@@ -768,8 +863,8 @@ def measure(args):
                "binary_sha256": {str(p): file_sha256(p)
                                   for p in [*binaries, client]},
                "fixture_sha256": file_sha256(script)}
-    if getattr(args, "arm", "resize") == "echo":
-        receipt["arm"] = "echo"
+    if args.arm in ("echo", "swarm-echo"):
+        receipt["arm"] = args.arm
     configuration_experiment = {}
     if getattr(args, "mux_socket_buffer_bytes", None) is not None:
         configuration_experiment["mux_socket_buffer_bytes"] = args.mux_socket_buffer_bytes
@@ -812,8 +907,8 @@ def measure(args):
             raise TimeoutError("owned mux and corpus startup deadline expired")
         owner = json.loads((root / "pane-owner.json").read_text())
         ready = json.loads((root / "pane-owner.json.ready").read_text())
-        if getattr(args, "arm", "resize") == "echo":
-            if owner.get("arm") != "echo" or ready.get("arm") != "echo":
+        if args.arm in ("echo", "swarm-echo"):
+            if owner.get("arm") != args.arm or ready.get("arm") != args.arm:
                 raise RuntimeError("fixture readiness/echo receipt mismatch")
         else:
             expected_digest = file_sha256(corpus_path)
@@ -822,14 +917,46 @@ def measure(args):
         owned.remember_descendants()
         receipt["fixture_custody"] = owned.require_fixture(owner, server.pid, binaries[2].resolve())
         receipt["owned_process_identities"] = list(owned.identities.values())
-        write_new(root / "custody.json", json.dumps(receipt["fixture_custody"], indent=2) + "\n")
-        write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
-        if getattr(args, "arm", "resize") == "echo":
+        if args.arm == "swarm-echo":
+            client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
+                           str(panes[0]["tab_id"]), str(corpus_path), "1000", "swarm-echo"]
+            with (root / "setup.jsonl").open("xb") as stdout, (root / "setup.stderr").open("xb") as stderr:
+                setup = subprocess.run(client_argv, cwd=root, env=dict(env, FT_SWARM_SETUP_ONLY="1"),
+                                       stdout=stdout, stderr=stderr, timeout=30)
+            if setup.returncode != 0:
+                raise RuntimeError("swarm pane setup failed")
+            spawned = [json.loads(line) for line in (root / "setup.jsonl").read_text().splitlines()]
+            noise_ids = [row.get("pane_id") for row in spawned]
+            if (len(noise_ids) != 4 or any(type(pane) is not int for pane in noise_ids)
+                    or len(set(noise_ids)) != 4 or panes[0]["pane_id"] in noise_ids
+                    or any(row.get("event") != "swarm_spawn" for row in spawned)):
+                raise RuntimeError("invalid swarm setup pane identities")
+            receipt["noise_fixture_custody"] = {}
+            deadline = time.monotonic() + 30
+            for pane in noise_ids:
+                path = root / f"noise-owner-{pane}.json"
+                while not pathlib.Path(str(path) + ".ready").exists():
+                    owned.remember_descendants()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("noise readiness deadline expired")
+                    time.sleep(0.05)
+                noise_owner = json.loads(path.read_text())
+                noise_ready = json.loads(pathlib.Path(str(path) + ".ready").read_text())
+                if (noise_owner != noise_ready or noise_owner.get("pane_id") != pane
+                        or noise_owner.get("arm") != "swarm-echo" or noise_owner.get("role") != "noise"):
+                    raise RuntimeError("noise fixture identity/readiness mismatch")
+                receipt["noise_fixture_custody"][str(pane)] = owned.require_fixture(
+                    noise_owner, server.pid, binaries[2].resolve())
+            receipt["owned_process_identities"] = list(owned.identities.values())
+        elif args.arm == "echo":
             client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
                            str(panes[0]["tab_id"]), str(corpus_path), "1000", "echo"]
         else:
             client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
                            str(panes[0]["tab_id"]), str(corpus_path), "20"]
+        write_new(root / "custody.json", json.dumps({"interactive": receipt["fixture_custody"],
+                  "noise": receipt.get("noise_fixture_custody", {})}, indent=2) + "\n")
+        write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
         receipt["client_argv"] = client_argv
         with (root / "trials.jsonl").open("xb") as stdout, (root / "client.stderr").open("xb") as stderr:
             trial = subprocess.run(client_argv, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=600)
@@ -841,7 +968,19 @@ def measure(args):
         rows = [json.loads(line) for line in trace_bytes.splitlines()]
         if trial.returncode != 0:
             raise RuntimeError("real mux baseline client failed")
-        if getattr(args, "arm", "resize") == "echo":
+        if args.arm == "swarm-echo":
+            final_paths = [root / "pane-owner.json.final"] + [root / f"noise-owner-{pane}.json.final" for pane in noise_ids]
+            deadline = time.monotonic() + 5
+            while not all(path.exists() for path in final_paths):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("swarm final fixture receipts missing")
+                time.sleep(0.05)
+            finals = [json.loads(path.read_text()) for path in final_paths]
+            validate_swarm_measurements(rows, finals, receipt)
+            receipt["swarm_result"] = rows[-1]
+            receipt["samples"] = 1000
+            receipt["status"] = "passed"
+        elif args.arm == "echo":
             receipt_file = root / "pane-owner.json.final"
             deadline = time.monotonic() + 5.0
             fixture_receipt = None
@@ -892,8 +1031,9 @@ def main():
     parser.add_argument("--bin-dir")
     parser.add_argument("--client")
     parser.add_argument("--artifact-dir")
-    parser.add_argument("--arm", choices=("resize", "echo"), default="resize",
+    parser.add_argument("--arm", choices=("resize", "echo", "swarm-echo"), default="resize",
                         help="diagnostic arm: default resize or opt-in echo (ft-4p4uo)")
+    parser.add_argument("--swarm-role", choices=("interactive", "noise"), default="interactive")
     parser.add_argument("--profile-phases", action="store_true",
                         help="instrumentation arm only; emit sampler-clock phase intervals")
     parser.add_argument("--records", type=int, default=10000)
