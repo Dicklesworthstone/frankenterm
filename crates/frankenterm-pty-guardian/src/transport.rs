@@ -4896,6 +4896,7 @@ mod tests {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0x41; 32])
                     .expect("nonzero checkpoint identity"),
+                capture_generation: generation,
                 next_sequence,
                 previous_record_digest,
             },
@@ -5704,6 +5705,7 @@ mod tests {
         let replay = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id,
+                capture_generation: 1,
                 next_sequence: 1,
                 previous_record_digest: [0; 32],
             },

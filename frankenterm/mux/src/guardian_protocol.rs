@@ -116,7 +116,7 @@ const CHECKPOINT_STAGE_CHUNK_FIXED_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES 
 const CHECKPOINT_STAGE_ACK_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES + 16;
 const CHECKPOINT_STAGE_REPLY_BYTES: usize = 116;
 const REPLAY_CURSOR_BYTES: usize = 160;
-const REPLAY_OPEN_REQUEST_BYTES: usize = 92;
+const REPLAY_OPEN_REQUEST_BYTES: usize = 100;
 const REPLAY_CONTINUE_REQUEST_BYTES: usize = 8 + REPLAY_CURSOR_BYTES;
 const REPLAY_ACK_BYTES: usize = 168;
 const REPLAY_ACK_REPLY_BYTES: usize = 132;
@@ -132,7 +132,7 @@ const REPLAY_GAP_BYTES: usize = 32;
 const REPLAY_COMPACTED_BYTES: usize = 32 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 16;
 const REPLAY_SNAPSHOT_EXPIRED_BYTES: usize = 16;
 const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 2;
-const REPLAY_WIRE_VERSION: u16 = 1;
+const REPLAY_WIRE_VERSION: u16 = 2;
 const REPLAY_CURSOR_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-cursor.v1";
 const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
 const REPLAY_RECORD_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
@@ -3603,9 +3603,13 @@ pub enum GuardianReplaySelectorV1 {
     LatestCompatible,
     ExactCheckpoint {
         checkpoint_id: GuardianCheckpointIdentityDigest,
+        /// Disambiguates identical checkpoint content captured by successor leases.
+        capture_generation: u64,
     },
     Resume {
         checkpoint_id: GuardianCheckpointIdentityDigest,
+        /// The capture owner of the checkpoint already held by the consumer.
+        capture_generation: u64,
         next_sequence: u64,
         previous_record_digest: [u8; 32],
     },
@@ -3651,18 +3655,24 @@ impl GuardianReplayRequestV1 {
                 payload.extend_from_slice(&wait_millis.to_be_bytes());
                 match selector {
                     GuardianReplaySelectorV1::LatestCompatible => {
-                        payload.extend_from_slice(&[0; 72]);
+                        payload.extend_from_slice(&[0; 80]);
                     }
-                    GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id } => {
+                    GuardianReplaySelectorV1::ExactCheckpoint {
+                        checkpoint_id,
+                        capture_generation,
+                    } => {
                         payload.extend_from_slice(&checkpoint_id.0);
+                        payload.extend_from_slice(&capture_generation.to_be_bytes());
                         payload.extend_from_slice(&[0; 40]);
                     }
                     GuardianReplaySelectorV1::Resume {
                         checkpoint_id,
+                        capture_generation,
                         next_sequence,
                         previous_record_digest,
                     } => {
                         payload.extend_from_slice(&checkpoint_id.0);
+                        payload.extend_from_slice(&capture_generation.to_be_bytes());
                         payload.extend_from_slice(&next_sequence.to_be_bytes());
                         payload.extend_from_slice(&previous_record_digest);
                     }
@@ -3696,7 +3706,7 @@ impl GuardianReplayRequestV1 {
         }
         let request = match payload[6] {
             1 if payload.len() == REPLAY_OPEN_REQUEST_BYTES => {
-                if payload[88..92].iter().any(|byte| *byte != 0) {
+                if payload[96..100].iter().any(|byte| *byte != 0) {
                     return Err(GuardianProtocolError::InvalidOperationPayload);
                 }
                 let max_plaintext_bytes = read_u32(payload, 8)?;
@@ -3704,11 +3714,13 @@ impl GuardianReplayRequestV1 {
                 let wait_millis = read_u16(payload, 14)?;
                 let mut checkpoint_id = [0; 32];
                 checkpoint_id.copy_from_slice(&payload[16..48]);
-                let next_sequence = read_u64(payload, 48)?;
+                let capture_generation = read_u64(payload, 48)?;
+                let next_sequence = read_u64(payload, 56)?;
                 let mut previous_record_digest = [0; 32];
-                previous_record_digest.copy_from_slice(&payload[56..88]);
+                previous_record_digest.copy_from_slice(&payload[64..96]);
                 let selector = match payload[7] {
                     1 if digest_is_zero(checkpoint_id)
+                        && capture_generation == 0
                         && next_sequence == 0
                         && digest_is_zero(previous_record_digest) =>
                     {
@@ -3720,11 +3732,13 @@ impl GuardianReplayRequestV1 {
                                 checkpoint_id,
                             )
                             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+                            capture_generation,
                         }
                     }
                     3 => GuardianReplaySelectorV1::Resume {
                         checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
                             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
+                        capture_generation,
                         next_sequence,
                         previous_record_digest,
                     },
@@ -3762,6 +3776,18 @@ impl GuardianReplayRequestV1 {
                     || max_records > GUARDIAN_MAX_REPLAY_RECORDS
                     || wait_millis > GUARDIAN_MAX_REPLAY_WAIT_MILLIS
                 {
+                    return Err(GuardianProtocolError::InvalidOperationPayload);
+                }
+                if matches!(
+                    selector,
+                    GuardianReplaySelectorV1::ExactCheckpoint {
+                        capture_generation: 0,
+                        ..
+                    } | GuardianReplaySelectorV1::Resume {
+                        capture_generation: 0,
+                        ..
+                    }
+                ) {
                     return Err(GuardianProtocolError::InvalidOperationPayload);
                 }
                 if let GuardianReplaySelectorV1::Resume {
@@ -5764,11 +5790,16 @@ impl GuardianReplayPageDelivery {
                         GuardianReplayPageBodyDelivery::Gap { .. },
                     ) => {}
                     (
-                        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
+                        GuardianReplaySelectorV1::ExactCheckpoint {
+                            checkpoint_id,
+                            capture_generation,
+                        },
                         GuardianReplayPageBodyDelivery::CheckpointChunk(chunk),
-                    ) if chunk.offset == 0 && chunk.descriptor.checkpoint_id == checkpoint_id => {}
+                    ) if chunk.offset == 0
+                        && chunk.descriptor.checkpoint_id == checkpoint_id
+                        && chunk.descriptor.capture_generation == capture_generation => {}
                     (
-                        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
+                        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id, .. },
                         GuardianReplayPageBodyDelivery::Compacted {
                             requested_checkpoint,
                             ..
@@ -5778,9 +5809,14 @@ impl GuardianReplayPageDelivery {
                         GuardianReplaySelectorV1::ExactCheckpoint { .. },
                         GuardianReplayPageBodyDelivery::Gap { .. },
                     ) => {}
+                    // Resume pages contain journal records, not a checkpoint descriptor.
+                    // The producer must select the authenticated (id, capture generation)
+                    // pair before opening its snapshot; sequence validation then binds
+                    // the page to the consumer's checkpoint output boundary.
                     (
                         GuardianReplaySelectorV1::Resume {
                             checkpoint_id: _,
+                            capture_generation: _,
                             next_sequence,
                             previous_record_digest,
                         },
@@ -5792,6 +5828,7 @@ impl GuardianReplayPageDelivery {
                     (
                         GuardianReplaySelectorV1::Resume {
                             checkpoint_id,
+                            capture_generation: _,
                             next_sequence,
                             previous_record_digest,
                         },
@@ -18551,7 +18588,7 @@ mod tests {
             Ok(continue_request)
         );
         let mut noncanonical_open = open_wire;
-        noncanonical_open[88] = 1;
+        noncanonical_open[96] = 1;
         assert_eq!(
             GuardianReplayRequestV1::decode(&noncanonical_open),
             Err(GuardianProtocolError::InvalidOperationPayload)
@@ -18668,6 +18705,71 @@ mod tests {
     }
 
     #[test]
+    fn replay_selectors_require_capture_generation_and_version_two() {
+        let checkpoint_id = GuardianCheckpointIdentityDigest::from_bytes([0x91; 32]).unwrap();
+        for selector in [
+            GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id,
+                capture_generation: 7,
+            },
+            GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                capture_generation: 7,
+                next_sequence: 8,
+                previous_record_digest: [0x55; 32],
+            },
+        ] {
+            let request = GuardianReplayRequestV1::Open {
+                selector,
+                max_plaintext_bytes: 4_096,
+                max_records: 4,
+                wait_millis: 0,
+            };
+            let wire = request.encode().unwrap();
+            assert_eq!(wire.len(), 100);
+            assert_eq!(&wire[4..6], &2_u16.to_be_bytes());
+            assert_eq!(GuardianReplayRequestV1::decode(&wire), Ok(request));
+
+            let mut zero_generation = wire.clone();
+            zero_generation[48..56].fill(0);
+            assert_eq!(
+                GuardianReplayRequestV1::decode(&zero_generation),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            );
+            let zero_selector = match selector {
+                GuardianReplaySelectorV1::ExactCheckpoint { .. } => {
+                    GuardianReplaySelectorV1::ExactCheckpoint {
+                        checkpoint_id,
+                        capture_generation: 0,
+                    }
+                }
+                _ => GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
+                    capture_generation: 0,
+                    next_sequence: 8,
+                    previous_record_digest: [0x55; 32],
+                },
+            };
+            assert_eq!(
+                GuardianReplayRequestV1::Open {
+                    selector: zero_selector,
+                    max_plaintext_bytes: 4_096,
+                    max_records: 4,
+                    wait_millis: 0,
+                }
+                .encode(),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            );
+            let mut old_version = wire;
+            old_version[4..6].copy_from_slice(&1_u16.to_be_bytes());
+            assert_eq!(
+                GuardianReplayRequestV1::decode(&old_version),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            );
+        }
+    }
+
+    #[test]
     fn replay_output_page_round_trip_is_ordered_consuming_and_digest_bound() {
         let guardian = id(87);
         let mux = id(88);
@@ -18681,6 +18783,7 @@ mod tests {
         let replay = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id: descriptor.checkpoint_id(),
+                capture_generation: descriptor.capture_generation(),
                 next_sequence: 8,
                 previous_record_digest: [0x55; 32],
             },
@@ -18818,6 +18921,7 @@ mod tests {
         let too_small_replay = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id: descriptor.checkpoint_id(),
+                capture_generation: descriptor.capture_generation(),
                 next_sequence: 8,
                 previous_record_digest: [0x55; 32],
             },
@@ -18993,6 +19097,7 @@ mod tests {
         let exact_payload = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::ExactCheckpoint {
                 checkpoint_id: descriptor.checkpoint_id(),
+                capture_generation: descriptor.capture_generation(),
             },
             max_plaintext_bytes: 4_096,
             max_records: 4,
@@ -19012,6 +19117,32 @@ mod tests {
             &exact_payload,
         );
         let exact = authenticate(&exact_envelope);
+        let wrong_capture_payload = GuardianReplayRequestV1::Open {
+            selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: descriptor.checkpoint_id(),
+                capture_generation: descriptor.capture_generation() + 1,
+            },
+            max_plaintext_bytes: 4_096,
+            max_records: 4,
+            wait_millis: 0,
+        }
+        .encode()
+        .unwrap();
+        let wrong_capture = authenticate(&request(
+            GuardianOperation::Replay,
+            guardian,
+            mux,
+            id(111),
+            Some(pane),
+            generation,
+            0,
+            None,
+            &wrong_capture_payload,
+        ));
+        assert!(matches!(
+            GuardianResponseEnvelope::replay_page(&wrong_capture, checkpoint_page(0)),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        ));
         let exact_response =
             GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(0)).unwrap();
         let exact_frame = encode_guardian_response(&secret(), &exact_response).unwrap();
@@ -19051,6 +19182,7 @@ mod tests {
         let requested_exact_payload = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::ExactCheckpoint {
                 checkpoint_id: requested_checkpoint,
+                capture_generation: descriptor.capture_generation(),
             },
             max_plaintext_bytes: 4_096,
             max_records: 4,
@@ -19129,6 +19261,7 @@ mod tests {
         let resume_payload = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id: descriptor.checkpoint_id(),
+                capture_generation: descriptor.capture_generation(),
                 next_sequence: 8,
                 previous_record_digest: [0x55; 32],
             },

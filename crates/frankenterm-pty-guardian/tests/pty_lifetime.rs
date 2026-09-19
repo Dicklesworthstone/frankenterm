@@ -224,6 +224,7 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
         GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id,
+                capture_generation: 1,
                 next_sequence: 1,
                 previous_record_digest: [0; 32],
             },
@@ -264,6 +265,7 @@ fn replay_resume_wait_wakes_on_durable_output_and_expires_at_its_deadline() -> a
         GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id,
+                capture_generation: 1,
                 next_sequence: 2,
                 previous_record_digest: [0x6b; 32],
             },

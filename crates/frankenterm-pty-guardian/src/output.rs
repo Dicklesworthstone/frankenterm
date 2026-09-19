@@ -4757,12 +4757,19 @@ fn guardian_replay_open_snapshot(
                 has_evidence(member) && member.metadata.replay_semantics_id == semantics
             })
         }
-        GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id }
-        | GuardianReplaySelectorV1::Resume { checkpoint_id, .. } => {
-            scan.published.iter().position(|member| {
-                has_evidence(member) && member.metadata.checkpoint_id == checkpoint_id.into_bytes()
-            })
+        GuardianReplaySelectorV1::ExactCheckpoint {
+            checkpoint_id,
+            capture_generation,
         }
+        | GuardianReplaySelectorV1::Resume {
+            checkpoint_id,
+            capture_generation,
+            ..
+        } => scan.published.iter().position(|member| {
+            has_evidence(member)
+                && member.metadata.checkpoint_id == checkpoint_id.into_bytes()
+                && member.metadata.capture_generation == capture_generation
+        }),
     };
     let mut selected_genesis_origin = None;
     let selected_index = if let Some(index) = selected_index {
@@ -4801,9 +4808,17 @@ fn guardian_replay_open_snapshot(
             GuardianReplaySelectorV1::LatestCompatible => {
                 member.metadata.replay_semantics_id == current_replay_identity_digest()
             }
-            GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id }
-            | GuardianReplaySelectorV1::Resume { checkpoint_id, .. } => {
+            GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id,
+                capture_generation,
+            }
+            | GuardianReplaySelectorV1::Resume {
+                checkpoint_id,
+                capture_generation,
+                ..
+            } => {
                 member.metadata.checkpoint_id == checkpoint_id.into_bytes()
+                    && member.metadata.capture_generation == capture_generation
             }
         };
         if !matches_selector {
@@ -11537,7 +11552,10 @@ fn checkpoint_catalog_validate_chain(
                 prior.metadata.identity.generation.checked_add(1)
                     != Some(member.metadata.identity.generation)
             })
-            || !checkpoints.insert(member.metadata.checkpoint_id)
+            || !checkpoints.insert((
+                member.metadata.checkpoint_id,
+                member.metadata.capture_generation,
+            ))
             || !adoption_effects.insert(member.metadata.adoption_effect_id)
             || previous.is_some_and(|prior| {
                 member.metadata.capture_generation < prior.metadata.capture_generation
@@ -11553,7 +11571,8 @@ fn checkpoint_catalog_validate_chain(
         // An output boundary identifies the consumed journal prefix, not the
         // entire terminal model. A resize can publish another authenticated
         // checkpoint at that prefix. The predecessor chain and unique
-        // checkpoint/effect identities still determine publication order.
+        // checkpoint-generation/effect identities still determine publication
+        // order. An authenticated successor may capture identical content.
         previous = Some(member);
     }
     Ok(())
@@ -12615,6 +12634,7 @@ fn checkpoint_catalog_publish_sealed_stage(
     let scan = checkpoint_catalog_scan(inner, scope)?;
     if let Some(existing) = scan.published.iter().find(|member| {
         member.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
+            && member.metadata.capture_generation == shape.descriptor.capture_generation()
     }) {
         if existing.metadata.checkpoint_id == shape.descriptor.checkpoint_id().into_bytes()
             && existing.metadata.boundary_id == shape.descriptor.boundary_id().into_bytes()
@@ -14681,6 +14701,59 @@ mod tests {
             "successor cannot acknowledge predecessor capture authority"
         );
         store.apply_ack_from_committed_catalog(original_ack, original_mux)?;
+        // A live successor must be able to select either historical capture,
+        // even when their content-addressed checkpoint IDs are identical.
+        for (capture_generation, selected_id) in
+            [(1_u64, original_checkpoint_id), (2, checkpoint_id)]
+        {
+            let replay = checkpoint_catalog_replay_request(
+                guardian,
+                successor_mux,
+                Uuid::from_u128(0xac250 + u128::from(capture_generation)),
+                pane,
+                2,
+                GuardianReplayRequestV1::Open {
+                    selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                        checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(selected_id)?,
+                        capture_generation,
+                    },
+                    max_plaintext_bytes: 64 * 1024,
+                    max_records: 4,
+                    wait_millis: 0,
+                },
+            )?;
+            let page =
+                store.apply_replay(&replay, state.preflight_replay(&replay)?, Some(&journal))?;
+            let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = page.into_body() else {
+                return Err("exact historical replay did not return its checkpoint".into());
+            };
+            assert_eq!(chunk.descriptor().capture_generation(), capture_generation);
+            assert_eq!(chunk.descriptor().checkpoint_id().into_bytes(), selected_id);
+        }
+        let future_replay = checkpoint_catalog_replay_request(
+            guardian,
+            successor_mux,
+            Uuid::from_u128(0xac253),
+            pane,
+            2,
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::ExactCheckpoint {
+                    checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)?,
+                    capture_generation: 3,
+                },
+                max_plaintext_bytes: 64 * 1024,
+                max_records: 4,
+                wait_millis: 0,
+            },
+        )?;
+        assert!(matches!(
+            store.apply_replay(
+                &future_replay,
+                state.preflight_replay(&future_replay)?,
+                Some(&journal),
+            ),
+            Err(GuardianCheckpointStageStoreError::CandidateAbsent)
+        ));
         drop(journal);
         drop(store);
         drop(pipeline);
@@ -15671,6 +15744,7 @@ mod tests {
         let open = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::ExactCheckpoint {
                 checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)?,
+                capture_generation: generation,
             },
             max_plaintext_bytes: maximum_plaintext_bytes,
             max_records: 4,
@@ -18207,8 +18281,14 @@ mod tests {
 
         let mut duplicate_checkpoint = second;
         duplicate_checkpoint.metadata.checkpoint_id = first.metadata.checkpoint_id;
-        let mut checkpoint_replay = vec![first, duplicate_checkpoint];
+        let mut checkpoint_replay = vec![first.clone(), duplicate_checkpoint.clone()];
         assert!(checkpoint_catalog_validate_chain(&mut checkpoint_replay).is_err());
+        duplicate_checkpoint.metadata.capture_generation = 2;
+        duplicate_checkpoint.metadata.adoption_mux_incarnation = Uuid::from_u128(0x301);
+        duplicate_checkpoint.metadata.adoption_sequence = 1;
+        let mut successor_adoption = vec![first, duplicate_checkpoint];
+        checkpoint_catalog_validate_chain(&mut successor_adoption)
+            .expect("authenticated successor can publish unchanged checkpoint content");
     }
 
     #[test]

@@ -3620,6 +3620,7 @@ impl GuardianReplayBoundary {
 struct VerifiedGuardianReplayRestore {
     inert_terminal: GuardianRestoredTerminal,
     checkpoint_id: GuardianCheckpointIdentityDigest,
+    capture_generation: u64,
     boundary: GuardianReplayBoundary,
 }
 
@@ -3746,6 +3747,7 @@ fn consume_one_guardian_replay_snapshot(
         selector: selected.map_or(GuardianReplaySelectorV1::LatestCompatible, |checkpoint| {
             GuardianReplaySelectorV1::ExactCheckpoint {
                 checkpoint_id: checkpoint.checkpoint_id,
+                capture_generation: checkpoint.generation,
             }
         }),
         max_plaintext_bytes: maximum_record_bytes,
@@ -3937,6 +3939,7 @@ fn consume_one_guardian_replay_snapshot(
                         "verified terminal disappeared before activation",
                     ))?,
                     checkpoint_id,
+                    capture_generation: expected_descriptor.capture_generation(),
                     boundary: current,
                 });
             }
@@ -4048,6 +4051,7 @@ struct GuardianReplayTailReader {
     transport: Box<dyn GuardianReplayTransport>,
     identity: GuardianPaneLeaseIdentity,
     checkpoint_id: GuardianCheckpointIdentityDigest,
+    capture_generation: u64,
     boundary: GuardianReplayBoundary,
     cursor: Option<GuardianReplayCursorV1>,
     pending_replay: Option<(Uuid, GuardianReplayRequestV1)>,
@@ -4088,6 +4092,7 @@ impl GuardianReplayTailReader {
         transport: Box<dyn GuardianReplayTransport>,
         identity: GuardianPaneLeaseIdentity,
         checkpoint_id: GuardianCheckpointIdentityDigest,
+        capture_generation: u64,
         boundary: GuardianReplayBoundary,
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianProxyError> {
@@ -4107,6 +4112,7 @@ impl GuardianReplayTailReader {
             transport,
             identity,
             checkpoint_id,
+            capture_generation,
             boundary,
             cursor: None,
             pending_replay: None,
@@ -4134,6 +4140,7 @@ impl GuardianReplayTailReader {
             GuardianReplayRequestV1::Open {
                 selector: GuardianReplaySelectorV1::Resume {
                     checkpoint_id: self.checkpoint_id,
+                    capture_generation: self.capture_generation,
                     next_sequence: self.boundary.next_sequence,
                     previous_record_digest: self.boundary.previous_record_digest,
                 },
@@ -5732,6 +5739,7 @@ impl GuardianProxyStaging {
             replay_transport,
             identity,
             verified.checkpoint_id,
+            verified.capture_generation,
             verified.boundary,
             limits,
         )?;
@@ -10667,13 +10675,14 @@ mod tests {
             assert!(matches!(
                 state.requests.first(),
                 Some((_, GuardianReplayRequestV1::Open {
-                    selector: GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
+                    selector: GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id, capture_generation },
                     ..
-                })) if *checkpoint_id == expected.checkpoint_id
+                })) if *checkpoint_id == expected.checkpoint_id && *capture_generation == expected.generation
             ));
             if control == 0 {
                 let restored = result.expect("exact selected checkpoint must restore");
                 assert_eq!(restored.checkpoint_id, selected.checkpoint_id);
+                assert_eq!(restored.capture_generation, selected.generation);
                 assert_eq!(state.acks.len(), 2);
             } else {
                 assert!(
@@ -10766,6 +10775,31 @@ mod tests {
             }
         );
         assert_eq!(restored.checkpoint_id, descriptor.checkpoint_id());
+        assert_eq!(restored.capture_generation, descriptor.capture_generation());
+        assert_ne!(restored.capture_generation, identity().generation());
+        let tail = GuardianReplayTailReader::new(
+            Box::new(FakeReplayTransport {
+                state: Arc::clone(&state),
+            }),
+            identity(),
+            restored.checkpoint_id,
+            restored.capture_generation,
+            restored.boundary,
+            TerminalCheckpointLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            tail.request(),
+            GuardianReplayRequestV1::Open {
+                selector: GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
+                    capture_generation,
+                    ..
+                },
+                ..
+            } if checkpoint_id == descriptor.checkpoint_id()
+                && capture_generation == descriptor.capture_generation()
+        ));
         restored.inert_terminal.checkpoint().unwrap();
         let state = state.lock();
         assert_eq!(state.acks.len(), 2);
@@ -11507,6 +11541,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11556,6 +11591,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11600,6 +11636,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11657,6 +11694,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11708,6 +11746,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11755,6 +11794,7 @@ mod tests {
             }),
             identity(),
             fixture.descriptor.checkpoint_id(),
+            fixture.descriptor.capture_generation(),
             boundary,
             TerminalCheckpointLimits::default(),
         )
@@ -11813,6 +11853,7 @@ mod tests {
         let resume = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes([0x61; 32]).unwrap(),
+                capture_generation: 1,
                 next_sequence: 1,
                 previous_record_digest: [0; 32],
             },

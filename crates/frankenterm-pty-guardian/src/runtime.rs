@@ -4993,6 +4993,7 @@ mod tests {
         let replay = GuardianReplayRequestV1::Open {
             selector: GuardianReplaySelectorV1::Resume {
                 checkpoint_id,
+                capture_generation: generation,
                 next_sequence,
                 previous_record_digest,
             },
