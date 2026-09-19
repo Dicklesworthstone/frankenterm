@@ -166,20 +166,58 @@ impl Drop for GuiMuxSubscription {
 // alias modulo 4096; a collision can request an unnecessary paint, but cannot
 // suppress a visible pane's output. Lifecycle authority never enters it.
 const OUTPUT_INTEREST_WORDS: usize = 64;
-struct PendingMuxOutput([AtomicU64; OUTPUT_INTEREST_WORDS]);
+struct PendingMuxOutput {
+    interest: [AtomicU64; OUTPUT_INTEREST_WORDS],
+    invalidations: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MuxOutputInvalidations(u64);
+
+impl MuxOutputInvalidations {
+    const PALETTE: u64 = 1;
+    const IMAGE: u64 = 2;
+}
 
 impl PendingMuxOutput {
     fn new() -> Self {
-        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+        Self {
+            interest: std::array::from_fn(|_| AtomicU64::new(0)),
+            invalidations: AtomicU64::new(0),
+        }
+    }
+
+    fn record_notification(&self, notification: &MuxNotification) -> bool {
+        let (pane_id, invalidation) = match notification {
+            MuxNotification::PaneOutput(pane_id) => (*pane_id, 0),
+            MuxNotification::Alert {
+                pane_id,
+                alert: Alert::PaletteChanged,
+            } => (*pane_id, MuxOutputInvalidations::PALETTE),
+            MuxNotification::Alert {
+                pane_id,
+                alert: Alert::ImageAltText { .. },
+            } => (*pane_id, MuxOutputInvalidations::IMAGE),
+            _ => return false,
+        };
+        self.invalidations.fetch_or(invalidation, Ordering::AcqRel);
+        self.record(pane_id);
+        true
+    }
+
+    fn take_invalidations(&self) -> MuxOutputInvalidations {
+        // Consume before reading current pane state. Arrivals during delivery
+        // retain a successor cause and wake rather than being cleared by ack.
+        MuxOutputInvalidations(self.invalidations.swap(0, Ordering::AcqRel))
     }
 
     fn record(&self, pane_id: PaneId) {
         let bit = pane_id % (OUTPUT_INTEREST_WORDS * 64);
-        self.0[bit / 64].fetch_or(1_u64 << (bit % 64), Ordering::AcqRel);
+        self.interest[bit / 64].fetch_or(1_u64 << (bit % 64), Ordering::AcqRel);
     }
 
     fn take(&self) -> [u64; OUTPUT_INTEREST_WORDS] {
-        std::array::from_fn(|index| self.0[index].swap(0, Ordering::AcqRel))
+        std::array::from_fn(|index| self.interest[index].swap(0, Ordering::AcqRel))
     }
 
     fn includes(interest: &[u64; OUTPUT_INTEREST_WORDS], pane_id: PaneId) -> bool {
@@ -460,6 +498,7 @@ pub enum TermWindowNotif {
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
         interest: [u64; OUTPUT_INTEREST_WORDS],
+        invalidations: MuxOutputInvalidations,
         title_refresh: Option<PendingMuxTitleRefresh>,
         reconcile: bool,
         actions: Arc<::window::AdmittedWindowActions>,
@@ -4381,6 +4420,11 @@ impl TermWindow {
         cause: RenderInvalidationCause,
         window: &Window,
     ) {
+        self.invalidate_shape_cache_state(cause);
+        window.invalidate();
+    }
+
+    fn invalidate_shape_cache_state(&mut self, cause: RenderInvalidationCause) {
         let cause = cause.for_shape_notification();
         self.invalidate_render_caches(cause);
         self.invalidate_modal();
@@ -4394,7 +4438,6 @@ impl TermWindow {
             }
             _ => self.mark_all_panes_dirty(),
         }
-        window.invalidate();
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -4586,6 +4629,7 @@ impl TermWindow {
                 mux_owner,
                 mux_window_id,
                 interest,
+                invalidations,
                 title_refresh,
                 reconcile,
                 actions,
@@ -4601,6 +4645,19 @@ impl TermWindow {
                 if reconcile {
                     self.prune_tab_state_to_live_window();
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                    actions.request_repaint();
+                }
+                if invalidations.0 & MuxOutputInvalidations::PALETTE != 0 {
+                    self.invalidate_shape_cache_state(RenderInvalidationCause::Palette);
+                    // Palette changes invalidate window-wide caches even when
+                    // the originating pane is not currently visible.
+                    actions.request_repaint();
+                }
+                if invalidations.0 & MuxOutputInvalidations::IMAGE != 0 {
+                    self.record_render_invalidation(RenderInvalidationCause::Image);
+                    // Cause and pane bits can be consumed by adjacent refreshes
+                    // during concurrent publication. The cause itself must
+                    // retain a repaint even if its pane bit was already read.
                     actions.request_repaint();
                 }
                 if let Some(title_refresh) = title_refresh {
@@ -5545,10 +5602,9 @@ impl TermWindow {
                 ) {
                     return keep;
                 }
-                if let MuxNotification::PaneOutput(pane_id) = &n {
+                if callback_output_interest.record_notification(&n) {
                     // Full means an equivalent refresh is already retained.
                     // No pane-removal lease or historical event is coalesced.
-                    callback_output_interest.record(*pane_id);
                     return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
                 }
                 let reconcile = Self::mux_notification_reconciles_window(&n, mux_window_id);
@@ -5670,6 +5726,7 @@ impl TermWindow {
                             TermWindowNotif::MuxOutputRefresh {
                                 mux_owner: output_mux.clone(),
                                 mux_window_id,
+                                invalidations: output_interest.take_invalidations(),
                                 interest: output_interest.take(),
                                 reconcile: pending_reconciliation.swap(false, Ordering::AcqRel),
                                 title_refresh: retained_title_refresh
@@ -10315,6 +10372,27 @@ mod tests {
         let mask = pending.take();
         assert!(!super::PendingMuxOutput::includes(&mask, 8));
         assert!(super::PendingMuxOutput::includes(&mask, 7 + 4096));
+        assert!(pending.record_notification(&mux::MuxNotification::Alert {
+            pane_id: 7,
+            alert: super::Alert::PaletteChanged,
+        }));
+        let in_flight = pending.take_invalidations();
+        assert!(pending.record_notification(&mux::MuxNotification::Alert {
+            pane_id: 7,
+            alert: super::Alert::ImageAltText {
+                image_id: 3,
+                text: "successor".into()
+            },
+        }));
+        assert_eq!(in_flight.0, super::MuxOutputInvalidations::PALETTE);
+        assert_eq!(
+            pending.take_invalidations().0,
+            super::MuxOutputInvalidations::IMAGE
+        );
+        assert_eq!(
+            pending.take_invalidations(),
+            super::MuxOutputInvalidations::default()
+        );
     }
 
     #[test]
@@ -10668,7 +10746,7 @@ mod tests {
             MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
             SimpleExecutor, try_reserve_main_thread,
         };
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let owner = Arc::new(mux::Mux::new(None));
         mux::Mux::set_mux(&owner);
@@ -10731,6 +10809,8 @@ mod tests {
         let target = *left;
         let admitted_alerts = Arc::new(AtomicUsize::new(0));
         let callback_admitted_alerts = Arc::clone(&admitted_alerts);
+        let output_interest = Arc::new(super::PendingMuxOutput::new());
+        let callback_interest = Arc::clone(&output_interest);
         let (pending, receive) = flume::bounded(1);
         let lifetime = Arc::new(());
         let callback_lifetime = Arc::clone(&lifetime);
@@ -10753,7 +10833,7 @@ mod tests {
                 ) {
                     return keep;
                 }
-                if matches!(notification, mux::MuxNotification::PaneOutput(998_401)) {
+                if callback_interest.record_notification(&notification) {
                     return !matches!(
                         pending.try_send(()),
                         Err(flume::TrySendError::Disconnected(_))
@@ -10817,6 +10897,22 @@ mod tests {
             owner.notify(mux::MuxNotification::Alert { pane_id, alert });
         }
         assert_eq!(admitted_alerts.load(Ordering::Acquire), 0);
+        for alert in [
+            Alert::PaletteChanged,
+            Alert::ImageAltText {
+                image_id: 19,
+                text: "retained image".into(),
+            },
+        ] {
+            owner.notify(mux::MuxNotification::Alert {
+                pane_id: 998_401,
+                alert,
+            });
+        }
+        assert!(
+            weak_lifetime.upgrade().is_some(),
+            "invalidation retired subscriber"
+        );
         for pane_id in [998_401, 998_402] {
             for event in [
                 mux::SynchronizedOutputEvent::Depth {
@@ -10852,6 +10948,8 @@ mod tests {
         assert_eq!(exec.queue_snapshot().depth, 0);
         let delivered = Arc::new(AtomicUsize::new(0));
         let worker_delivered = Arc::clone(&delivered);
+        let observed_invalidations = Arc::new(AtomicU64::new(0));
+        let worker_invalidations = Arc::clone(&observed_invalidations);
         let worker = std::thread::spawn(move || {
             promise::spawn::block_on(super::run_mux_output_refresh(
                 receive,
@@ -10859,7 +10957,12 @@ mod tests {
                 || true,
                 |reservation| {
                     let delivered = Arc::clone(&worker_delivered);
+                    let causes = output_interest.take_invalidations();
+                    let interest = output_interest.take();
+                    let observed = Arc::clone(&worker_invalidations);
                     reservation.spawn(async move {
+                        assert!(super::PendingMuxOutput::includes(&interest, 998_401));
+                        observed.fetch_or(causes.0, Ordering::AcqRel);
                         delivered.fetch_add(1, Ordering::AcqRel);
                     })
                 },
@@ -10867,6 +10970,20 @@ mod tests {
             ))
         });
         drop(occupying);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::Acquire) == 0 || exec.admission_snapshot().active_tasks != 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "invalidation did not recover capacity"
+            );
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            observed_invalidations.load(Ordering::Acquire),
+            super::MuxOutputInvalidations::PALETTE | super::MuxOutputInvalidations::IMAGE
+        );
         for alert in [
             Alert::Bell,
             Alert::SetUserVar {
@@ -10897,7 +11014,7 @@ mod tests {
         // after the preceding full-queue synchronized-output traffic.
         owner.notify(mux::MuxNotification::PaneOutput(998_401));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while delivered.load(Ordering::Acquire) == 0 {
+        while delivered.load(Ordering::Acquire) < 2 {
             assert!(
                 Instant::now() < deadline,
                 "subscription lost subsequent pane output"
