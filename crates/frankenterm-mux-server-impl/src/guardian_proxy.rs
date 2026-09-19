@@ -10437,6 +10437,75 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_query_retry_stops_on_terminal_error_and_persistent_io() {
+        struct RefusingQuery {
+            calls: usize,
+            terminal: bool,
+            request_id: Uuid,
+            upload_id: Uuid,
+            descriptor: GuardianCheckpointDescriptorV1,
+        }
+        impl GuardianCheckpointStageTransport for RefusingQuery {
+            fn checkpoint_stage(
+                &mut self,
+                request_id: Uuid,
+                request: GuardianCheckpointStageRequestV1,
+            ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
+                self.calls += 1;
+                assert_eq!(request_id, self.request_id);
+                assert_eq!(request.kind(), GuardianCheckpointStageKindV1::Query);
+                assert_eq!(request.upload_id(), self.upload_id);
+                assert_eq!(request.descriptor(), self.descriptor);
+                if self.terminal {
+                    Err(GuardianProxyError::CheckpointStageQuarantined)
+                } else {
+                    Err(GuardianProxyError::Client(GuardianClientError::Io(
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "worker unavailable"),
+                    )))
+                }
+            }
+        }
+        let fixture = capture_record_checkpoint_fixture();
+        let mut transport = RefusingQuery {
+            calls: 0,
+            terminal: true,
+            request_id: id(0x1_100_000),
+            upload_id: id(0x1_100_001),
+            descriptor: fixture.descriptor,
+        };
+        let query = |transport: &mut RefusingQuery| {
+            query_guardian_checkpoint_stage(
+                transport,
+                GuardianCheckpointScopeV1::Pane {
+                    pane_id: identity().pane_id(),
+                    generation: identity().generation(),
+                },
+                id(0x1_100_001),
+                fixture.descriptor,
+                GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+                id(0x1_100_000),
+            )
+        };
+        assert!(matches!(
+            query(&mut transport),
+            Err(GuardianProxyError::CheckpointStageQuarantined)
+        ));
+        assert_eq!(
+            transport.calls, 1,
+            "terminal failures must never be retried"
+        );
+        transport.calls = 0;
+        transport.terminal = false;
+        assert!(
+            matches!(query(&mut transport), Err(GuardianProxyError::Client(GuardianClientError::Io(error))) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        assert!(
+            (1..=32).contains(&transport.calls),
+            "persistent failure must exhaust its finite admission budget"
+        );
+    }
+
+    #[test]
     fn checkpoint_stage_lost_replies_query_exactly_without_duplicate_committed_chunks() {
         let fixture = capture_record_checkpoint_fixture();
         let descriptor = fixture.descriptor;
