@@ -3315,6 +3315,20 @@ fn prepare_legacy_render_enqueue(
     per_pane: &Arc<Mutex<PerPane>>,
     force_with_input_dispatch_serial: Option<InputSerial>,
 ) -> anyhow::Result<Option<(GetPaneRenderChangesResponse, LegacyRenderEnqueueGuard)>> {
+    Ok(prepare_legacy_render(pane, per_pane, force_with_input_dispatch_serial, false)?.enqueue)
+}
+
+struct PreparedLegacyRender {
+    enqueue: Option<(GetPaneRenderChangesResponse, LegacyRenderEnqueueGuard)>,
+    observation: Option<GetPaneRenderChangesResponse>,
+}
+
+fn prepare_legacy_render(
+    pane: &CurrentPane<'_>,
+    per_pane: &Arc<Mutex<PerPane>>,
+    force_with_input_dispatch_serial: Option<InputSerial>,
+    observe: bool,
+) -> anyhow::Result<PreparedLegacyRender> {
     let pane_id = pane.pane_id();
     let (prior_baseline, prior_revision) = {
         let mut state = lock_per_pane_or_retire(per_pane, "preparing the legacy render baseline")?;
@@ -3378,7 +3392,29 @@ fn prepare_legacy_render_enqueue(
                 state.baseline.seqno = source_query;
                 state.baseline_revision = next_revision;
             }
-            Ok(None)
+            // Retain this exact validated observation before notification or
+            // transport callbacks can change the shared baseline.
+            let observation = observe.then(|| {
+                let baseline = &state.baseline;
+                GetPaneRenderChangesResponse {
+                    pane_id,
+                    mouse_grabbed: baseline.mouse_grabbed,
+                    alt_screen_active: baseline.alt_screen_active,
+                    cursor_position: baseline.cursor_position,
+                    dimensions: baseline.dimensions,
+                    tiered_scrollback_status: baseline.tiered_scrollback_status,
+                    dirty_lines: Vec::new(),
+                    title: baseline.title.clone(),
+                    working_dir: baseline.working_dir.clone().map(Into::into),
+                    bonus_lines: Vec::new().into(),
+                    input_serial: None,
+                    seqno: baseline.seqno,
+                }
+            });
+            Ok(PreparedLegacyRender {
+                enqueue: None,
+                observation,
+            })
         }
         SurfacePreparation::Changes(prepared) => {
             let PreparedSurfaceChanges {
@@ -3398,7 +3434,11 @@ fn prepare_legacy_render_enqueue(
                 prior_baseline,
                 installed_revision,
             );
-            Ok(Some((response, rollback)))
+            let observation = observe.then(|| response.clone());
+            Ok(PreparedLegacyRender {
+                enqueue: Some((response, rollback)),
+                observation,
+            })
         }
     }
 }
@@ -4495,13 +4535,11 @@ fn push_pane_changes_with_observation(
     per_pane: Arc<Mutex<PerPane>>,
     observe: bool,
 ) -> anyhow::Result<Option<GetPaneRenderChangesResponse>> {
-    let pane_id = pane.pane_id();
-    let source_start = observe.then(|| pane.get_current_seqno());
-    let mut observation = None;
-    if let Some((resp, rollback_guard)) = prepare_legacy_render_enqueue(pane, &per_pane, None)? {
-        if observe {
-            observation = Some(resp.clone());
-        }
+    let PreparedLegacyRender {
+        enqueue,
+        observation,
+    } = prepare_legacy_render(pane, &per_pane, None, observe)?;
+    if let Some((resp, rollback_guard)) = enqueue {
         let send_result = sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
@@ -4629,42 +4667,10 @@ fn push_pane_changes_with_observation(
             next_notification_batch = Some(batch);
         }
     }
-    if let Some(source_start) = source_start {
-        let response = match observation {
-            Some(response) => response,
-            None => {
-                let state = lock_per_pane_or_retire(&per_pane, "sampling a render poll reply")?;
-                let baseline = &state.baseline;
-                GetPaneRenderChangesResponse {
-                    pane_id,
-                    mouse_grabbed: baseline.mouse_grabbed,
-                    alt_screen_active: baseline.alt_screen_active,
-                    cursor_position: baseline.cursor_position,
-                    dimensions: baseline.dimensions,
-                    tiered_scrollback_status: baseline.tiered_scrollback_status,
-                    dirty_lines: Vec::new(),
-                    title: baseline.title.clone(),
-                    working_dir: baseline.working_dir.clone().map(Into::into),
-                    bonus_lines: Vec::new().into(),
-                    input_serial: None,
-                    seqno: baseline.seqno,
-                }
-            }
-        };
-        let source_end = pane.get_current_seqno();
-        if source_start == SequenceNo::MAX
-            || response.seqno == SequenceNo::MAX
-            || source_end == SequenceNo::MAX
-        {
-            return Err(PaneRenderPreparationError::TerminalSequenceExhausted.into());
-        }
-        if source_start != response.seqno || response.seqno != source_end {
-            return Err(PaneRenderPreparationError::SourceChanged.into());
-        }
-        Ok(Some(response))
-    } else {
-        Ok(None)
-    }
+    // Preparation already validated one coherent source interval. Output that
+    // arrives after capture belongs to the next poll, and must not invalidate
+    // this reply or require another blocking terminal-lock acquisition.
+    Ok(observation)
 }
 
 /// A pane input mutation is authoritative once its pane method succeeds.
@@ -19931,16 +19937,16 @@ mod tests {
     }
 
     #[test]
-    fn correlated_render_poll_refuses_mutation_after_render_enqueue() {
-        assert_correlated_render_poll_refuses_mutation_after_enqueue(false);
+    fn correlated_render_poll_preserves_snapshot_after_render_enqueue() {
+        assert_correlated_render_poll_preserves_snapshot_after_enqueue(false);
     }
 
     #[test]
-    fn coherent_render_poll_still_refuses_mutation_after_render_enqueue() {
-        assert_correlated_render_poll_refuses_mutation_after_enqueue(true);
+    fn coherent_render_poll_preserves_snapshot_after_render_enqueue() {
+        assert_correlated_render_poll_preserves_snapshot_after_enqueue(true);
     }
 
-    fn assert_correlated_render_poll_refuses_mutation_after_enqueue(coherent: bool) {
+    fn assert_correlated_render_poll_preserves_snapshot_after_enqueue(coherent: bool) {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -19976,13 +19982,11 @@ mod tests {
         drain_simple_executor(&executor);
         let response = take_response(&captured);
         assert_eq!(response.serial, 41);
-        let error = expect_error_response(
-            &response.pdu,
-            GetPaneRenderChanges::IDENT,
-            MuxErrorCode::RESOURCE_BUSY,
-        );
-        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
-        assert_eq!(error.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        let Pdu::GetPaneRenderChangesResponse(snapshot) = response.pdu else {
+            panic!("output after capture must not invalidate the coherent response");
+        };
+        assert_eq!(snapshot.seqno, 11);
+        assert_eq!(pane.state.lock().unwrap().seqno, 12);
         assert!(captured.lock().unwrap().is_empty());
         handler.process_one(DecodedPdu {
             serial: 42,
@@ -20000,6 +20004,65 @@ mod tests {
         assert!(captured.lock().unwrap().is_empty());
         drop(handler);
         drain_simple_executor(&executor);
+    }
+
+    #[test]
+    fn coherent_no_change_poll_retains_capture_before_notification_callbacks() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.coherent_surface.store(true, Ordering::Release);
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let (sender, _) = capturing_sender();
+        registration
+            .try_with_current(|current| {
+                maybe_push_pane_changes(&current, sender, Arc::clone(&per_pane))
+            })
+            .unwrap()
+            .unwrap();
+        let original_title = per_pane.lock().unwrap().baseline.title.clone();
+        per_pane
+            .lock()
+            .unwrap()
+            .notifications
+            .push(Alert::PaletteChanged)
+            .unwrap();
+        let sender = PduSender::new({
+            let pane = Arc::clone(&pane);
+            let per_pane = Arc::clone(&per_pane);
+            move |pdu, _| {
+                assert!(matches!(pdu.pdu, Pdu::SetPalette(_)));
+                let mut source = pane.state.lock().unwrap();
+                source.seqno = 12;
+                source.title = "after-notification".to_string();
+                let mut state = per_pane.lock().unwrap();
+                state.baseline.seqno = 12;
+                state.baseline.title = source.title.clone();
+                state.baseline_revision += 1;
+                Ok(())
+            }
+        });
+        let captured = registration
+            .try_with_current(|current| {
+                push_pane_changes_with_observation(&current, sender, Arc::clone(&per_pane), true)
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.seqno, 11);
+        assert_eq!(captured.title, original_title);
+        assert!(captured.dirty_lines.is_empty());
+        assert_eq!(captured.bonus_lines.lines().count(), 0);
+        let (sender, _) = capturing_sender();
+        let next = registration
+            .try_with_current(|current| {
+                push_pane_changes_with_observation(&current, sender, Arc::clone(&per_pane), true)
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seqno, 12);
+        assert_eq!(next.title, "after-notification");
     }
 
     #[test]
