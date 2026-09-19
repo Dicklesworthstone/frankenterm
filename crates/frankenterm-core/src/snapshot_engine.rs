@@ -11620,7 +11620,7 @@ fn acquire_checkpoint_artifact_publication_lock(
     parent: &cap_std::fs::Dir,
 ) -> Result<std::fs::File, CheckpointScrollbackArtifactError> {
     let lock_leaf = Path::new(CHECKPOINT_SCROLLBACK_PUBLICATION_LOCK);
-    let mut options = cap_std::fs::OpenOptions::new();
+    let mut options = crate::snapshot_publication::snapshot_read_options();
     options
         .read(true)
         .write(true)
@@ -11740,8 +11740,7 @@ fn read_checkpoint_artifact_from_parent_bounded_with_hook(
     synchronize_file: bool,
     after_read: impl FnOnce(),
 ) -> Result<Vec<u8>, CheckpointScrollbackArtifactError> {
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    let options = crate::snapshot_publication::snapshot_read_options();
     let mut file = parent.open_with(leaf, &options)?;
     let before = validate_checkpoint_artifact_file_metadata(
         &parent.symlink_metadata(leaf)?,
@@ -11848,13 +11847,7 @@ fn read_enrolled_key_file<const N: usize>(
     }
     let (parent, leaf, parent_path) = checkpoint_artifact_parent_and_leaf(path, false)
         .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
-    }
+    let options = crate::snapshot_publication::snapshot_read_options();
     let mut file = parent
         .open_with(&leaf, &options)
         .map_err(|_| EnrolledRecoveryKeyError::Unavailable(stage))?;
@@ -12001,8 +11994,7 @@ fn checkpoint_artifact_existing_target_matches(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    let options = crate::snapshot_publication::snapshot_read_options();
     let mut file = parent.open_with(leaf, &options)?;
     if !checkpoint_artifact_open_file_matches_expected(parent, leaf, &mut file, bytes, true)? {
         return Err(CheckpointScrollbackArtifactError::AlreadyExists);
@@ -12119,7 +12111,7 @@ fn open_or_resume_checkpoint_artifact_staging(
     let (mut file, created) = match parent.open_with(staging, &create) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut existing = cap_std::fs::OpenOptions::new();
+            let mut existing = crate::snapshot_publication::snapshot_read_options();
             existing.read(true).write(true).follow(FollowSymlinks::No);
             (parent.open_with(staging, &existing)?, false)
         }
@@ -16845,6 +16837,55 @@ mod tests {
             assert_eq!(checkpoint_seq, Some(2));
             assert_eq!(last_output_at, Some(1_002));
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkpoint_artifact_fifo_reads_and_adoption_do_not_wait_for_writers() {
+        let directory = checkpoint_artifact_test_directory();
+        let regular = directory.path().join("regular");
+        write_private_checkpoint_artifact_test_file(&regular, b"regular artifact");
+        assert_eq!(
+            read_checkpoint_artifact_bounded(&regular, 64).unwrap(),
+            b"regular artifact"
+        );
+        let fifo = directory.path().join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let worker_path = fifo.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let read_rejected = matches!(
+                read_checkpoint_artifact_bounded(&worker_path, 64),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            );
+            let (parent, leaf, _) =
+                checkpoint_artifact_parent_and_leaf(&worker_path, false).unwrap();
+            let adoption_rejected = matches!(
+                checkpoint_artifact_existing_target_matches(&parent, &leaf, b"artifact"),
+                Err(CheckpointScrollbackArtifactError::InvalidArtifact(_))
+            );
+            tx.send(read_rejected && adoption_rejected).unwrap();
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(2));
+        // Unblock only this fixture's FIFO after recording a timeout failure.
+        let _unblocker = outcome.is_err().then(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .unwrap()
+        });
+        worker.join().unwrap();
+        assert_eq!(
+            outcome,
+            Ok(true),
+            "artifact FIFO admission blocked or failed"
+        );
     }
 
     fn write_private_checkpoint_artifact_test_file(path: &Path, bytes: &[u8]) {

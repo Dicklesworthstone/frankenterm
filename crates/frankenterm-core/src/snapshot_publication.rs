@@ -507,6 +507,20 @@ fn validate_object_id(id: &str) -> Result<(), PublicationError> {
     Ok(())
 }
 
+/// Opening a FIFO must not block before descriptor type/ownership validation.
+/// O_NONBLOCK does not change regular-file reads; callers still validate the
+/// opened descriptor before reading any bytes.
+pub(crate) fn snapshot_read_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    options
+}
+
 /// Check security attributes on opened file handle.
 fn check_opened_file_security(file: &File, path: &Path) -> Result<u64, PublicationError> {
     let metadata = file.metadata().map_err(|e| PublicationError::io(path, e))?;
@@ -1156,7 +1170,7 @@ impl SnapshotPublicationStore {
         let lock_leaf = ".publication.lock";
         let lock_path = self.root_path.join(lock_leaf);
 
-        let mut opts = OpenOptions::new();
+        let mut opts = snapshot_read_options();
         opts.read(true)
             .write(true)
             .create(true)
@@ -1427,8 +1441,7 @@ impl SnapshotPublicationStore {
         validate_object_id(object_id)?;
         let filename = format!("{object_id}.obj");
         let path = self.root_path.join(OBJECTS_DIR_NAME).join(&filename);
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
+        let options = snapshot_read_options();
         let mut file = self
             .objects_dir
             .open_with(&filename, &options)
@@ -1579,8 +1592,7 @@ impl SnapshotPublicationStore {
         let _publication_lock = self.acquire_publication_lock()?;
 
         // Check if object already exists
-        let mut open_opts = OpenOptions::new();
-        open_opts.read(true).follow(FollowSymlinks::No);
+        let open_opts = snapshot_read_options();
         match self.objects_dir.open_with(&target_name, &open_opts) {
             Ok(existing_file) => {
                 let actual_len = check_opened_file_security(&existing_file, &target_full_path)?;
@@ -1762,8 +1774,7 @@ impl SnapshotPublicationStore {
         let target_name = format!("{object_id}.obj");
         let target_path = self.root_path.join(OBJECTS_DIR_NAME).join(&target_name);
 
-        let mut opts = OpenOptions::new();
-        opts.read(true).follow(FollowSymlinks::No);
+        let opts = snapshot_read_options();
 
         let file = self
             .objects_dir
@@ -1788,8 +1799,7 @@ impl SnapshotPublicationStore {
         let target_name = format!("{object_id}.obj");
         let target_path = self.root_path.join(OBJECTS_DIR_NAME).join(&target_name);
 
-        let mut opts = OpenOptions::new();
-        opts.read(true).follow(FollowSymlinks::No);
+        let opts = snapshot_read_options();
 
         match self.objects_dir.open_with(&target_name, &opts) {
             Ok(file) => {
@@ -1847,8 +1857,7 @@ impl SnapshotPublicationStore {
             let slot_filename = slot.filename();
             let slot_path = self.root_path.join(ROOTS_DIR_NAME).join(slot_filename);
 
-            let mut opts = OpenOptions::new();
-            opts.read(true).follow(FollowSymlinks::No);
+            let opts = snapshot_read_options();
 
             let file_result = self.roots_dir.open_with(slot_filename, &opts);
             match file_result {
@@ -2167,8 +2176,7 @@ impl SnapshotPublicationStore {
                         .root_path
                         .join(ROOTS_DIR_NAME)
                         .join(candidate.slot.filename());
-                    let mut options = OpenOptions::new();
-                    options.read(true).follow(FollowSymlinks::No);
+                    let options = snapshot_read_options();
                     let candidate_file = self
                         .roots_dir
                         .open_with(candidate.slot.filename(), &options)
@@ -2534,8 +2542,7 @@ impl SnapshotPublicationStore {
         for slot in [RootSlot::SlotA, RootSlot::SlotB] {
             let name = Self::discovery_name(slot);
             let path = self.root_path.join(GENERATIONS_DIR_NAME).join(name);
-            let mut options = OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
+            let options = snapshot_read_options();
             let result = match self.generations_dir.open_with(name, &options) {
                 Ok(mut file) => check_opened_file_security(&file, &path)
                     .and_then(|len| {
@@ -2578,8 +2585,7 @@ impl SnapshotPublicationStore {
         // Bind discovery to the exact committed outer bytes, including framing
         // and predecessor header, rather than merely an equal generation.
         let committed_path = self.root_path.join(ROOTS_DIR_NAME).join(slot.filename());
-        let mut committed_options = OpenOptions::new();
-        committed_options.read(true).follow(FollowSymlinks::No);
+        let committed_options = snapshot_read_options();
         let mut committed_file = self
             .roots_dir
             .open_with(slot.filename(), &committed_options)
@@ -2630,8 +2636,7 @@ impl SnapshotPublicationStore {
         )?;
         let name = Self::discovery_name(slot);
         let path = self.root_path.join(GENERATIONS_DIR_NAME).join(name);
-        let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
+        let options = snapshot_read_options();
         match self.generations_dir.open_with(name, &options) {
             Ok(mut existing) => {
                 let len = check_opened_file_security(&existing, &path)?;
@@ -2847,6 +2852,104 @@ mod tests {
 
         let read_back = store.read_object("obj-001").unwrap();
         assert_eq!(read_back, payload_bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_objects_roots_and_discovery_are_rejected_without_waiting_for_writers() {
+        let temp = private_test_directory();
+        let store =
+            SnapshotPublicationStore::open(temp.path(), PublicationLimits::default()).unwrap();
+        let request = GenerationRootPublishRequest {
+            generation: 1,
+            publisher_id: "fifo-regression".to_owned(),
+            predecessor: None,
+            manifest_bytes: b"regular root remains readable".to_vec(),
+            created_at_ms: 1,
+        };
+        let published = store
+            .publish_generation_root(&request, &AcceptAllVerifier)
+            .unwrap();
+        let corrupt_slot = match published.slot {
+            RootSlot::SlotA => RootSlot::SlotB,
+            RootSlot::SlotB => RootSlot::SlotA,
+        };
+        let paths = [
+            temp.path().join(OBJECTS_DIR_NAME).join("fifo.obj"),
+            temp.path()
+                .join(ROOTS_DIR_NAME)
+                .join(corrupt_slot.filename()),
+            temp.path()
+                .join(GENERATIONS_DIR_NAME)
+                .join(DISCOVERY_SLOT_A),
+        ];
+        for path in &paths {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reads_rejected = [
+                store.read_object("fifo"),
+                store.read_object_bounded("fifo", 64),
+            ]
+            .into_iter()
+            .all(|result| matches!(result, Err(PublicationError::InsecurePermissions { .. })));
+            let presence_rejected = matches!(
+                store.has_object("fifo"),
+                Err(PublicationError::InsecurePermissions { .. })
+            );
+            let payload = b"cannot adopt FIFO".to_vec();
+            let adoption_rejected = matches!(
+                store.publish_object(&RecoveryObjectPayload {
+                    object_id: "fifo".to_owned(),
+                    expected_sha256: sha256_hex(&payload),
+                    ciphertext_bytes: payload,
+                }),
+                Err(PublicationError::InsecurePermissions { .. })
+            );
+            let (roots, root_errors) = store.inspect_root_candidates().unwrap();
+            let (discoveries, discovery_errors) = store
+                .inspect_repair_discovery("fifo-test", &[1; 32], &[2; 32])
+                .unwrap();
+            let correct = reads_rejected
+                && presence_rejected
+                && adoption_rejected
+                && roots.len() == 1
+                && roots[0].manifest_bytes == request.manifest_bytes
+                && root_errors.len() == 1
+                && root_errors[0].slot == corrupt_slot
+                && discoveries.is_empty()
+                && discovery_errors.len() == 1;
+            tx.send(correct).unwrap();
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // A regressed blocking open must fail the test without leaving a hung
+        // worker. Only after the deadline, supply writers for our own FIFOs.
+        let _unblockers: Vec<_> = if outcome.is_err() {
+            paths
+                .iter()
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        worker.join().unwrap();
+        assert_eq!(
+            outcome,
+            Ok(true),
+            "FIFO admission blocked or accepted a non-file"
+        );
     }
 
     #[test]
