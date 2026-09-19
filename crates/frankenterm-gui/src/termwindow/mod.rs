@@ -1194,11 +1194,28 @@ enum EventState {
     /// The event is running, and we have another one ready to
     /// run once it completes
     InProgressWithQueued(Arc<()>, Option<PaneId>),
-    /// Accepted successor waiting for its callback/completion admission pair.
+    /// Accepted event waiting for its callback/completion admission pair.
     Queued(Option<PaneId>),
 }
 
 impl EventState {
+    fn retain_initial_after_rejection(
+        &mut self,
+        pane_id: Option<PaneId>,
+        rejected: &promise::spawn::MainThreadReservationOutcome,
+        retry: &WindowEventRetryRequest,
+    ) {
+        if matches!(self, Self::None)
+            && matches!(
+                rejected,
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(_)
+            )
+        {
+            *self = Self::Queued(pane_id);
+            retry.request();
+        }
+    }
+
     fn complete_and_request(
         &mut self,
         generation: &Arc<()>,
@@ -6228,6 +6245,12 @@ impl TermWindow {
         {
             Ok(pair) => pair,
             Err(rejected) => {
+                if let Some(retry) = &self.window_event_retry {
+                    self.event_states
+                        .entry(name.clone())
+                        .or_insert(EventState::None)
+                        .retain_initial_after_rejection(pane_id, &rejected, retry);
+                }
                 log::error!("window Lua event admission refused: {rejected:?}");
                 return false;
             }
@@ -10529,6 +10552,20 @@ mod tests {
         ) {
             return;
         }
+        exercise_window_event_retry_after_held_completion(false);
+    }
+
+    #[test]
+    fn initial_window_event_retries_after_full_admission_without_external_wake() {
+        if run_scheduler_test_in_child(
+            "initial_window_event_retries_after_full_admission_without_external_wake",
+        ) {
+            return;
+        }
+        exercise_window_event_retry_after_held_completion(true);
+    }
+
+    fn exercise_window_event_retry_after_held_completion(initial: bool) {
         use promise::spawn::{
             MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
             SimpleExecutor, try_reserve_main_thread,
@@ -10542,15 +10579,26 @@ mod tests {
         let (callback, completion) = super::reserve_window_event_admission().unwrap();
         let identity = callback.admission_receipt();
         let generation = Arc::new(());
-        let state = Arc::new(Mutex::new(super::EventState::InProgressWithQueued(
-            Arc::clone(&generation),
-            Some(17),
-        )));
+        let state = Arc::new(Mutex::new(if initial {
+            super::EventState::None
+        } else {
+            super::EventState::InProgressWithQueued(Arc::clone(&generation), Some(17))
+        }));
         let (wake, receive) = flume::bounded(1);
         let retry = super::WindowEventRetryRequest {
             pending: Arc::new(AtomicBool::new(false)),
             wake,
         };
+        if initial {
+            state.lock().unwrap().retain_initial_after_rejection(
+                Some(17),
+                &MainThreadReservationOutcome::SchedulerUnavailable,
+                &retry,
+            );
+            assert!(matches!(*state.lock().unwrap(), super::EventState::None));
+            assert!(!retry.pending.load(Ordering::Acquire));
+            assert!(receive.is_empty());
+        }
         let (release, held) = flume::bounded(1);
         let finish_state = Arc::clone(&state);
         let finish_retry = retry.clone();
@@ -10558,11 +10606,37 @@ mod tests {
             finish: Some(move |again| {
                 completion
                     .spawn(async move {
-                        finish_state.lock().unwrap().complete_and_request(
-                            &generation,
-                            again,
-                            &finish_retry,
-                        );
+                        if initial {
+                            // The held native task leaves only one slot: the
+                            // callback reservation succeeds, but its completion
+                            // cannot. Retain the first request using the same
+                            // rejection transition as production scheduling.
+                            let rejected = super::reserve_window_event_admission()
+                                .err()
+                                .expect("held completion must refuse the callback pair");
+                            assert!(matches!(
+                                *rejected,
+                                MainThreadReservationOutcome::RetryableFull(_)
+                            ));
+                            finish_state.lock().unwrap().retain_initial_after_rejection(
+                                Some(17),
+                                &rejected,
+                                &finish_retry,
+                            );
+                            // A second request must neither replace the accepted
+                            // pane nor consume another retained queue slot.
+                            finish_state.lock().unwrap().retain_initial_after_rejection(
+                                Some(99),
+                                &rejected,
+                                &finish_retry,
+                            );
+                        } else {
+                            finish_state.lock().unwrap().complete_and_request(
+                                &generation,
+                                again,
+                                &finish_retry,
+                            );
+                        }
                         // This is the actual production state transition while
                         // the old completion task still consumes its Render slot.
                         held.recv_async().await.unwrap();
