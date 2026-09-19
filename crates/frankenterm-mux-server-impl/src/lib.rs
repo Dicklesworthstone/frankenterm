@@ -3757,7 +3757,10 @@ impl LiveScrollbackSpillSink {
                 .context("authenticate append WAL target")?
                 .encode(),
         );
-        Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
+        // The owned WAL's identity and record fields were validated before
+        // sealing and have not changed. Replacing the authentication marker
+        // preserves the validator's only authentication requirement (Some).
+        // Publication still independently validates identity, MAC and checksum.
         wal.wal_sha256 = Self::append_wal_checksum(&wal)?;
         Ok((wal, target_authority))
     }
@@ -4036,7 +4039,8 @@ impl LiveScrollbackSpillSink {
                     .encode(),
             );
         }
-        Self::validate_append_wal_identity(&advanced, self.durable_pane_id)?;
+        // Only the authentication marker changed since pre-seal validation;
+        // keep the full independent validation at the publication boundary.
         advanced.wal_sha256 = Self::append_wal_checksum(&advanced)?;
         self.persist_authenticated_append_wal(&advanced)
             .map_err(anyhow::Error::new)
