@@ -540,6 +540,27 @@ type WindowEventAdmission = (
 );
 
 #[derive(Clone)]
+pub struct UserVarEventOwner {
+    mux: Weak<Mux>,
+    window_id: MuxWindowId,
+    pane: Arc<dyn Pane>,
+}
+
+impl UserVarEventOwner {
+    fn is_current(&self) -> bool {
+        self.mux.upgrade().is_some_and(|owner| {
+            Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
+                && owner
+                    .get_pane(self.pane.pane_id())
+                    .is_some_and(|pane| Arc::ptr_eq(&pane, &self.pane))
+                && owner
+                    .resolve_pane_id(self.pane.pane_id())
+                    .is_some_and(|(_, window_id, _)| window_id == self.window_id)
+        })
+    }
+}
+
+#[derive(Clone)]
 struct WindowEventRetryRequest {
     pending: Arc<AtomicBool>,
     wake: flume::Sender<()>,
@@ -805,6 +826,7 @@ pub enum TermWindowNotif {
         /// has finished cleaning its numeric pane-keyed state.
         pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
         pending_title_refresh: Option<PendingMuxTitleRefresh>,
+        user_var_admission: Option<(UserVarEventOwner, Mutex<Option<WindowEventAdmission>>)>,
     },
     /// A level-triggered refresh of current state, with no historical pane ID
     /// or lifecycle payload to replay after a delayed delivery.
@@ -1263,15 +1285,22 @@ impl<F: FnOnce(bool)> Drop for WindowEventCompletion<F> {
 
 fn reserve_window_event_admission()
 -> Result<WindowEventAdmission, Box<promise::spawn::MainThreadReservationOutcome>> {
+    reserve_lua_event_admission(8 * 1024)
+}
+
+fn reserve_lua_event_admission(
+    callback_bytes: usize,
+) -> Result<WindowEventAdmission, Box<promise::spawn::MainThreadReservationOutcome>> {
     use promise::spawn::{
         MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
     };
-    let callback = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8 * 1024) {
-        MainThreadReservationOutcome::Reserved(reservation) => reservation,
-        rejected => {
-            return Err(Box::new(rejected));
-        }
-    };
+    let callback =
+        match try_reserve_main_thread(MainThreadServiceClass::Interactive, callback_bytes) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                return Err(Box::new(rejected));
+            }
+        };
     match try_reserve_main_thread(MainThreadServiceClass::Render, 4 * 1024) {
         MainThreadReservationOutcome::Reserved(completion) => {
             let first = callback.admission_receipt();
@@ -1286,6 +1315,75 @@ fn reserve_window_event_admission()
         }
         rejected => Err(Box::new(rejected)),
     }
+}
+
+fn reserve_mux_payload_admission(
+    notification: &MuxNotification,
+) -> anyhow::Result<(
+    promise::spawn::MainThreadSpawnReservation,
+    Option<promise::spawn::MainThreadSpawnReservation>,
+)> {
+    if let MuxNotification::Alert {
+        alert: Alert::SetUserVar { name, value },
+        ..
+    } = notification
+    {
+        // Account for the owned allocations, including spare capacity, before
+        // accepting the historical payload. The fixed estimate covers the Lua
+        // callback machinery; its dynamic strings are additional retained bytes.
+        let bytes = name
+            .capacity()
+            .checked_add(value.capacity())
+            .and_then(|bytes| bytes.checked_add(8 * 1024))
+            .ok_or_else(|| anyhow!("user-variable callback byte estimate overflow"))?;
+        let (callback, completion) = reserve_lua_event_admission(bytes)
+            .map_err(|rejected| anyhow!("user-variable admission refused: {rejected:?}"))?;
+        return Ok((completion, Some(callback)));
+    }
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Render,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            Ok((reservation, None))
+        }
+        rejected => Err(anyhow!("mux payload admission refused: {rejected:?}")),
+    }
+}
+
+fn spawn_admitted_user_var_event<F, C>(
+    admission: WindowEventAdmission,
+    owner: UserVarEventOwner,
+    future: F,
+    finish: C,
+) -> promise::spawn::MainThreadSpawnedTask<anyhow::Result<()>>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + 'static,
+    C: FnOnce(promise::spawn::MainThreadSpawnReservation) + 'static,
+{
+    let (callback, completion) = admission;
+    let completion = WindowEventCompletion {
+        finish: Some(move |_| finish(completion)),
+        again: false,
+    };
+    callback.spawn_local(async move {
+        let _completion = completion;
+        if !owner.is_current() {
+            return Ok(());
+        }
+        let result = future.await;
+        if result.is_err() {
+            log::error!("user-var-changed callback preparation failed");
+        }
+        result
+    })
+}
+
+fn mux_payload_delivery_cancelled(dead: &AtomicBool, has_prepaid_user_var: bool) -> bool {
+    // Retiring ingress after a later admission failure cannot revoke an
+    // already accepted historical payload. Its exact owners are checked at
+    // native dispatch and again before invoking Lua.
+    dead.load(Ordering::Relaxed) && !has_prepaid_user_var
 }
 
 /// Aggregate snapshot of per-pane dirty-line bitmap telemetry
@@ -5002,6 +5100,7 @@ impl TermWindow {
                             mux_owner: Arc::downgrade(&owner),
                             pane_removal_cleanup: None,
                             pending_title_refresh: None,
+                            user_var_admission: None,
                         },
                         window,
                     )
@@ -5068,6 +5167,7 @@ impl TermWindow {
                 mux_owner,
                 pane_removal_cleanup,
                 pending_title_refresh,
+                user_var_admission,
             } => {
                 let Some(notification_owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -5086,7 +5186,25 @@ impl TermWindow {
                         alert: Alert::SetUserVar { name, value },
                         pane_id,
                     } => {
-                        self.emit_user_var_event(pane_id, name, value);
+                        let Some((owner, admission)) = user_var_admission else {
+                            log::error!(
+                                "user-variable event arrived without prepaid Lua admission"
+                            );
+                            return Ok(());
+                        };
+                        if owner.window_id != self.mux_window_id || !owner.is_current() {
+                            log::debug!(
+                                "discarding user-variable event for a retired pane/window owner"
+                            );
+                            return Ok(());
+                        }
+                        let Some(admission) =
+                            admission.into_inner().unwrap_or_else(|p| p.into_inner())
+                        else {
+                            log::error!("user-variable prepaid admission was already consumed");
+                            return Ok(());
+                        };
+                        self.emit_user_var_event(pane_id, name, value, owner, admission);
                     }
                     MuxNotification::WindowTitleChanged { .. }
                     | MuxNotification::Alert {
@@ -5318,19 +5436,7 @@ impl TermWindow {
                 }
             }
             TermWindowNotif::EmitStatusUpdate => {
-                let _ = self.poll_idle_scheduler();
-                self.emit_status_event();
-                // Lua callbacks may intentionally leave unchanged status text
-                // alone. Their setters must not be responsible for keeping the
-                // periodic event alive. The deadline guard coalesces early or
-                // duplicate notifications with an already pending timer.
-                self.schedule_next_status_update();
-                // ft-kciew: drive the quad-buffer policy's idle
-                // shrink consideration on the same cadence as the
-                // status timer. No-op while a resize gesture is
-                // active or the configured idle threshold (default
-                // 1s) has not yet elapsed since the gesture ended.
-                self.tick_quad_buffer_shrink();
+                self.handle_status_update();
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let pane = Mux::try_get()
@@ -5566,6 +5672,20 @@ impl TermWindow {
         }
     }
 
+    fn handle_status_update(&mut self) {
+        let _ = self.poll_idle_scheduler();
+        self.emit_status_event();
+        // Lua callbacks may intentionally leave unchanged status text alone.
+        // Their setters must not be responsible for keeping the periodic event
+        // alive. The deadline guard coalesces early or duplicate notifications
+        // with an already pending timer.
+        self.schedule_next_status_update();
+        // ft-kciew: drive the quad-buffer policy's idle shrink consideration on
+        // the status cadence. This is a no-op during resize or before the
+        // configured idle threshold has elapsed.
+        self.tick_quad_buffer_shrink();
+    }
+
     /// Keep local overlays usable while terminal input waits for saved layout
     /// restoration. A delayed delivery must still belong to this exact window.
     fn pane_input_ready(&self, pane: &Arc<dyn Pane>) -> bool {
@@ -5751,10 +5871,12 @@ impl TermWindow {
             Option<PaneRemovalCleanupLease>,
             Option<PendingMuxTitleRefresh>,
             promise::spawn::MainThreadSpawnReservation,
+            Option<(promise::spawn::MainThreadSpawnReservation, Arc<dyn Pane>)>,
         ),
     ) -> bool {
-        let (pane_removal_cleanup, pending_title_refresh, reservation) = deferred_authority;
-        if dead.load(Ordering::Relaxed) {
+        let (pane_removal_cleanup, pending_title_refresh, reservation, user_var_callback) =
+            deferred_authority;
+        if mux_payload_delivery_cancelled(dead, user_var_callback.is_some()) {
             // Subscription cancelled asynchronously
             return false;
         }
@@ -5881,6 +6003,27 @@ impl TermWindow {
             }
         }
 
+        if let Some((callback, pane)) = user_var_callback {
+            let mux_owner = Arc::downgrade(&mux);
+            let owner = UserVarEventOwner {
+                mux: mux_owner.clone(),
+                window_id: mux_window_id,
+                pane,
+            };
+            window
+                .notify_with_reservation_factory(reservation, move |completion| {
+                    TermWindowNotif::MuxNotification {
+                        notification: n,
+                        mux_owner,
+                        pane_removal_cleanup,
+                        pending_title_refresh,
+                        user_var_admission: Some((owner, Mutex::new(Some((callback, completion))))),
+                    }
+                })
+                .detach();
+            return true;
+        }
+
         window
             .notify_with_reservation(
                 TermWindowNotif::MuxNotification {
@@ -5888,6 +6031,7 @@ impl TermWindow {
                     mux_owner: Arc::downgrade(&mux),
                     pane_removal_cleanup,
                     pending_title_refresh,
+                    user_var_admission: None,
                 },
                 reservation,
                 None,
@@ -6056,11 +6200,29 @@ impl TermWindow {
                     );
                     return true;
                 }
-                match promise::spawn::try_reserve_main_thread(
-                    promise::spawn::MainThreadServiceClass::Render,
-                    4 * 1024,
-                ) {
-                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                let user_var_pane = if let MuxNotification::Alert {
+                    pane_id,
+                    alert: Alert::SetUserVar { .. },
+                } = &n {
+                    let pane_owner = mux.upgrade();
+                    let pane = match pane_owner.as_ref().and_then(|mux| mux.resolve_pane_id(*pane_id)) {
+                        Some((_, window_id, _)) if window_id != mux_window_id => return true,
+                        Some(_) => pane_owner.and_then(|mux| mux.get_pane(*pane_id)),
+                        None => None,
+                    };
+                    let Some(pane) = pane else {
+                        log::error!("cannot accept user-variable history without its exact pane owner");
+                        dead.store(true, Ordering::Release);
+                        unsubscribe_requested.store(true, Ordering::Release);
+                        return false;
+                    };
+                    Some(pane)
+                } else {
+                    None
+                };
+                match reserve_mux_payload_admission(&n) {
+                    Ok((reservation, user_var_callback)) => {
+                        let user_var_callback = user_var_callback.zip(user_var_pane);
                         reservation
                             .handoff_to_main_thread_local(move |reservation| {
                                 if !Self::mux_pane_output_event_callback(
@@ -6069,7 +6231,7 @@ impl TermWindow {
                                     mux_window_id,
                                     &dead,
                                     &mux,
-                                    (pane_removal_cleanup, None, reservation),
+                                    (pane_removal_cleanup, None, reservation, user_var_callback),
                                 ) {
                                     dead.store(true, Ordering::Release);
                                     unsubscribe_requested.store(true, Ordering::Release);
@@ -6085,7 +6247,7 @@ impl TermWindow {
                             .detach();
                         true
                     }
-                    rejected => {
+                    Err(rejected) => {
                         metrics::counter!(
                             "gui.mux_notification_admission",
                             "outcome" => "terminal_rejection"
@@ -6789,8 +6951,15 @@ impl TermWindow {
         return window_id == self.mux_window_id;
     }
 
-    fn emit_user_var_event(&mut self, pane_id: PaneId, name: String, value: String) {
-        if !self.window_contains_pane(pane_id) {
+    fn emit_user_var_event(
+        &mut self,
+        pane_id: PaneId,
+        name: String,
+        value: String,
+        owner: UserVarEventOwner,
+        admission: WindowEventAdmission,
+    ) {
+        if owner.pane.pane_id() != pane_id || !owner.is_current() {
             return;
         }
 
@@ -6824,23 +6993,38 @@ impl TermWindow {
                 }
             }
 
-            window
-                .window
-                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    term_window.update_title();
-                })));
-
             Ok(())
         }
 
-        schedule_existing_termwindow_future(
-            promise::spawn::MainThreadServiceClass::Interactive,
-            8 * 1024,
-            "user-variable Lua event",
+        let mux_window_id = self.mux_window_id;
+        let finish_window = window.window.clone();
+        let finish_owner = owner.clone();
+        spawn_admitted_user_var_event(
+            admission,
+            owner,
             config::with_lua_config_on_main_thread(move |lua| {
                 do_event(lua, name, value, window, pane)
             }),
-        );
+            move |completion| {
+                let actions = Arc::new(::window::AdmittedWindowActions::default());
+                let native_actions = Arc::clone(&actions);
+                finish_window
+                    .notify_with_reservation(
+                        TermWindowNotif::Apply(Box::new(move |term_window| {
+                            if term_window.mux_window_id == mux_window_id
+                                && finish_owner.is_current()
+                            {
+                                term_window.handle_status_update();
+                                term_window.update_title_impl(Some(&actions));
+                            }
+                        })),
+                        completion,
+                        Some(native_actions),
+                    )
+                    .detach();
+            },
+        )
+        .detach();
     }
 
     /// Called by window:set_right_status after the status has
@@ -10546,6 +10730,283 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn user_var_admission_accounts_for_owned_payload_and_returns_partial_pair() {
+        if run_scheduler_test_in_child(
+            "user_var_admission_accounts_for_owned_payload_and_returns_partial_pair",
+        ) {
+            return;
+        }
+        use promise::spawn::{MainThreadAdmissionLimits, MainThreadServiceClass, SimpleExecutor};
+        let mut name = String::with_capacity(257);
+        name.push_str("agent-state");
+        let mut value = String::with_capacity(513);
+        value.push_str("waiting-for-input");
+        let callback_bytes = 8 * 1024 + name.capacity() + value.capacity();
+        let notification = super::MuxNotification::Alert {
+            pane_id: 17,
+            alert: super::Alert::SetUserVar { name, value },
+        };
+        for fits in [false, true] {
+            let exec = SimpleExecutor::try_with_limits(
+                MainThreadAdmissionLimits::new(2, callback_bytes + 4096 - usize::from(!fits), 0, 0)
+                    .unwrap(),
+            )
+            .unwrap();
+            let admission = super::reserve_mux_payload_admission(&notification);
+            if fits {
+                let (completion, callback) = admission.unwrap();
+                let callback = callback.unwrap();
+                assert_eq!(
+                    callback.admission_receipt().estimated_bytes.get(),
+                    callback_bytes
+                );
+                assert_eq!(
+                    callback.admission_receipt().service_class,
+                    MainThreadServiceClass::Interactive
+                );
+                assert_eq!(
+                    completion.admission_receipt().service_class,
+                    MainThreadServiceClass::Render
+                );
+                assert_eq!(completion.admission_receipt().estimated_bytes.get(), 4096);
+                assert_eq!(exec.admission_snapshot().active_tasks, 2);
+                drop((callback, completion));
+            } else {
+                assert!(
+                    admission.is_err(),
+                    "dynamic payload bytes must affect admission"
+                );
+            }
+            assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    struct GuiTestChild(Arc<dyn mux::pane::Pane>);
+
+    #[cfg(unix)]
+    impl Drop for GuiTestChild {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    #[cfg(unix)]
+    fn new_gui_test_pane(pane_id: usize, durable: [u8; 16]) -> GuiTestChild {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize::default(),
+            Arc::new(config::TermConfig::new_for_pane(
+                pane_id,
+                pane_id,
+                durable,
+                "sync subscription test".to_owned(),
+            )),
+            "FrankenTerm",
+            "sync-subscription-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        GuiTestChild(Arc::new(mux::localpane::LocalPane::new(
+            pane_id,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            pane_id,
+            durable,
+            "sync subscription test".to_owned(),
+        )))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_var_prepaid_delivery_survives_saturation_and_unpolled_cancel() {
+        if run_scheduler_test_in_child(
+            "user_var_prepaid_delivery_survives_saturation_and_unpolled_cancel",
+        ) {
+            return;
+        }
+        exercise_prepaid_user_var_delivery(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_var_prepaid_delivery_rejects_replaced_mux_owner() {
+        if run_scheduler_test_in_child("user_var_prepaid_delivery_rejects_replaced_mux_owner") {
+            return;
+        }
+        exercise_prepaid_user_var_delivery(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_var_prepaid_delivery_rejects_reused_pane_id() {
+        if run_scheduler_test_in_child("user_var_prepaid_delivery_rejects_reused_pane_id") {
+            return;
+        }
+        exercise_prepaid_user_var_delivery(false, true);
+    }
+
+    #[cfg(unix)]
+    fn exercise_prepaid_user_var_delivery(replace_owner: bool, replace_pane: bool) {
+        use mux::Mux;
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for cancel in [false, true] {
+            let owner = Arc::new(Mux::new(None));
+            Mux::set_mux(&owner);
+            let _activity = mux::activity::Activity::new_for_mux(&owner);
+            let window = owner.new_empty_window(None, None);
+            let window_id = *window;
+            let child = new_gui_test_pane(998_450, [0x50; 16]);
+            let pane = Arc::clone(&child.0);
+            let tab = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
+            tab.assign_pane(&pane);
+            owner.add_tab_and_active_pane(&tab).unwrap();
+            owner.add_tab_to_window(&tab, window_id).unwrap();
+            let mut extra_children = Vec::new();
+            if replace_pane {
+                // Keep the window alive across removal of the original pane.
+                let anchor = new_gui_test_pane(998_451, [0x51; 16]);
+                let anchor_tab =
+                    Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
+                anchor_tab.assign_pane(&anchor.0);
+                owner.add_tab_and_active_pane(&anchor_tab).unwrap();
+                owner.add_tab_to_window(&anchor_tab, window_id).unwrap();
+                extra_children.push(anchor);
+            }
+            let exec = SimpleExecutor::try_with_limits(
+                MainThreadAdmissionLimits::new(3, 32 * 1024, 0, 0).unwrap(),
+            )
+            .unwrap();
+            let notification = super::MuxNotification::Alert {
+                pane_id: pane.pane_id(),
+                alert: super::Alert::SetUserVar {
+                    name: "agent-state".to_string(),
+                    value: "waiting-for-input".to_string(),
+                },
+            };
+            let (completion, callback) =
+                super::reserve_mux_payload_admission(&notification).unwrap();
+            let callback = callback.unwrap();
+            let occupied = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+                MainThreadReservationOutcome::Reserved(permit) => permit,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            assert!(matches!(
+                try_reserve_main_thread(MainThreadServiceClass::Interactive, 8192),
+                MainThreadReservationOutcome::RetryableFull(_)
+            ));
+            let delivered = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let callback_count = Arc::clone(&delivered);
+            let completion_count = Arc::clone(&completed);
+            let event_owner = super::UserVarEventOwner {
+                mux: Arc::downgrade(&owner),
+                window_id,
+                pane,
+            };
+            assert!(event_owner.is_current());
+            let finish_owner = event_owner.clone();
+            let ingress_dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let delivery_dead = Arc::clone(&ingress_dead);
+            // The native factory transfers its existing Render permit into
+            // the handler. Exercise that same affine handoff under saturation.
+            completion
+                .handoff_to_main_thread_local(move |completion| {
+                    if super::mux_payload_delivery_cancelled(&delivery_dead, true) {
+                        return;
+                    }
+                    let task = super::spawn_admitted_user_var_event(
+                        (callback, completion),
+                        event_owner,
+                        async move {
+                            let super::MuxNotification::Alert {
+                                alert: super::Alert::SetUserVar { name, value },
+                                ..
+                            } = notification
+                            else {
+                                panic!("wrong historical payload")
+                            };
+                            assert_eq!(name, "agent-state");
+                            assert_eq!(value, "waiting-for-input");
+                            callback_count.fetch_add(1, Ordering::AcqRel);
+                            Ok(())
+                        },
+                        move |completion| {
+                            completion
+                                .spawn_local(async move {
+                                    if finish_owner.is_current() {
+                                        completion_count.fetch_add(1, Ordering::AcqRel);
+                                    }
+                                })
+                                .detach();
+                        },
+                    );
+                    if cancel {
+                        drop(task);
+                    } else {
+                        task.detach();
+                    }
+                })
+                .detach();
+            // A later failed payload admission retires the ingress subscriber
+            // before this accepted payload executes. It must still be delivered.
+            ingress_dead.store(true, Ordering::Release);
+            assert!(super::mux_payload_delivery_cancelled(&ingress_dead, false));
+            let replacement = Arc::new(Mux::new(None));
+            if replace_owner {
+                Mux::set_mux(&replacement);
+            }
+            if replace_pane {
+                owner.remove_pane(998_450);
+                let replacement = new_gui_test_pane(998_450, [0x52; 16]);
+                let replacement_tab =
+                    Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
+                replacement_tab.assign_pane(&replacement.0);
+                owner.add_tab_and_active_pane(&replacement_tab).unwrap();
+                owner
+                    .add_tab_to_window(&replacement_tab, window_id)
+                    .unwrap();
+                assert!(Arc::ptr_eq(
+                    &owner.get_pane(998_450).unwrap(),
+                    &replacement.0
+                ));
+                assert!(!Arc::ptr_eq(&child.0, &replacement.0));
+                extra_children.push(replacement);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while exec.admission_snapshot().active_tasks != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "prepaid user-variable delivery stalled"
+                );
+                let _ = exec.try_tick().unwrap();
+            }
+            assert_eq!(
+                delivered.load(Ordering::Acquire),
+                usize::from(!cancel && !replace_owner && !replace_pane)
+            );
+            assert_eq!(
+                completed.load(Ordering::Acquire),
+                usize::from(!replace_owner && !replace_pane)
+            );
+            drop(occupied);
+            assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        }
+    }
+
+    #[test]
     fn queued_window_event_retries_after_held_completion_without_external_wake() {
         if run_scheduler_test_in_child(
             "queued_window_event_retries_after_held_completion_without_external_wake",
@@ -11332,7 +11793,6 @@ mod tests {
         ) {
             return;
         }
-        use mux::pane::Pane;
         use promise::spawn::{
             MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
             SimpleExecutor, try_reserve_main_thread,
@@ -11344,51 +11804,17 @@ mod tests {
         let _activity = mux::activity::Activity::new_for_mux(&owner);
         let left = owner.new_empty_window(None, None);
         let right = owner.new_empty_window(None, None);
-        struct RetireChild(Arc<dyn Pane>);
-        impl Drop for RetireChild {
-            fn drop(&mut self) {
-                self.0.kill();
-            }
-        }
         let mut children = Vec::new();
         for (pane_id, window_id) in [(998_401, *left), (998_402, *right)] {
             let size = wezterm_term::TerminalSize::default();
-            let pair = portable_pty::native_pty_system()
-                .openpty(portable_pty::PtySize::default())
-                .unwrap();
-            let writer = pair.master.take_writer().unwrap();
             let durable = if pane_id == 998_401 {
                 [0x41; 16]
             } else {
                 [0x42; 16]
             };
-            let terminal = wezterm_term::Terminal::new(
-                size,
-                Arc::new(config::TermConfig::new_for_pane(
-                    pane_id,
-                    pane_id,
-                    durable,
-                    "sync subscription test".to_owned(),
-                )),
-                "FrankenTerm",
-                "sync-subscription-test",
-                Box::new(Vec::<u8>::new()),
-            );
-            let child = pair
-                .slave
-                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
-                .unwrap();
-            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
-                pane_id,
-                terminal,
-                child,
-                pair.master,
-                writer,
-                pane_id,
-                durable,
-                "sync subscription test".to_owned(),
-            ));
-            children.push(RetireChild(Arc::clone(&pane)));
+            let child = new_gui_test_pane(pane_id, durable);
+            let pane = Arc::clone(&child.0);
+            children.push(child);
             let tab = Arc::new(mux::tab::Tab::new(&size));
             tab.assign_pane(&pane);
             owner.add_tab_and_active_pane(&tab).unwrap();
