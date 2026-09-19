@@ -2,9 +2,9 @@
   "schema_version": "ft.security.redaction_hygiene.v1",
   "category": "security/redaction-hygiene",
   "produced_by_bead": "ft-7h5da.1.5",
-  "generated_at": "2026-09-12T11:13:10Z",
+  "generated_at": "2026-09-19T22:13:49Z",
   "status": "scoped_remote_tests_passed_release_qualification_pending",
-  "summary": "Catalog-versioned ingest and atomic offline redaction maintenance passed retained remote regression tests. Final release source, signed bundle and native qualification remain pending. This file does not certify deployment corpus cleanliness.",
+  "summary": "Atomic offline redaction maintenance, catalog identity and backup roundtrip passed retained remote regression tests on the recorded source. An owned RC46 native smoke database separately demonstrates ingest catalog stamping. Final candidate execution and signed release qualification remain pending. This file does not certify deployment corpus cleanliness.",
   "attestation_manifest_slot": {
     "category": "security/redaction-hygiene",
     "path": "docs/security/redaction-hygiene.json",
@@ -97,27 +97,68 @@
     "claim": "Scoped remote maintenance, catalog and backup regression proof; release manifest remains deferred until producing-bead bundle qualification completes.",
     "not_claimed": "No whole-corpus cleanliness claim: scans are per-segment, resumed scans exclude earlier rows, and catalog coverage is finite. Tantivy rebuild_requested records required external work; no rebuild is queued or performed. mmap mirrors, archived backups and external indexes are not certified by a SQLite maintenance receipt.",
     "required_proofs": ["redact_backfill::tests", "redactor::tests::catalog_identity_changes_with_expression_order_and_family", "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip", "attestation_manifest_schema::redaction_hygiene_attestation_matches_live_catalog"],
-    "retained_current_source_receipts": [
+    "retained_remote_receipts": [
       {
-        "transcript": "rch-ts1-atomic-producers-1115.log",
-        "transcript_sha256": "44484d8cb0cb55d861a10c44e9cf6e2ac0d7193e8dd54b9b24f6b225bfaac45f",
-        "source_hash_inventory": "atomic-producers-1115-remote.sha256",
+        "transcript": "/Volumes/USB_NVME/ft-release-20260915/rc40-redaction-proof-rch.log",
+        "transcript_sha256": "fc06d8cbe5925c4f697d67216954e5750a5f3d0fb1f271c131b6f52ff75d7f0a",
         "worker": "ts1",
-        "source_snapshot": "/home/ubuntu/rch/frankenterm/af0a3623dafdf604",
-        "base_commit": "f2b406a46474e29e5ade7a35c26a19d94dd32d08",
-        "implementation_commit": "8ae0a83ddd0286207b66633cbeef980b8321284f",
-        "source_scope": "Thirteen explicit overlays; redactor.rs, backup.rs and redactor/Cargo.toml match the implementation commit. redact_backfill.rs differs only by a corrected catalog-identity comment.",
-        "completed_at": "2026-09-12T10:50:14Z",
+        "base_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+        "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
+        "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
+        "source_mode": "clean_baseline_empty_overlay",
+        "target": "x86_64-unknown-linux-gnu",
+        "profile": "test-recovery",
+        "features": ["default", "mcp", "mcp-client", "vendored"],
+        "test_filter": "redact",
         "passed_tests": {
-          "redact_backfill": 17,
-          "core_redactor": 99,
-          "backup": 91,
-          "standalone_redactor_total": 123,
-          "attestation_manifest_schema_total": 31
+          "core_library_filtered_total": 530,
+          "attestation_manifest_schema_filtered_total": 1
         },
-        "aggregate_exit_code": 101,
-        "aggregate_limit": "Four unrelated core failures prevented an aggregate pass. The named redaction, backup and manifest-schema tests passed; this receipt does not upgrade the whole batch."
+        "failed_tests": 0,
+        "ignored_tests": 0,
+        "exit_code": 0,
+        "scope": "Filtered library suite includes catalog expression/order controls, real SQLite backfill/purge receipts, rollback and dry-run controls, and backup roundtrip. The named live-catalog attestation test also passed. This is not a whole-workspace or release-profile pass."
+      },
+      {
+        "transcript": "/Volumes/USB_NVME/ft-release-20260915/rc40-redaction-backup-proof-rch.log",
+        "transcript_sha256": "8eb5b98ba1f5c0dc23b07a4031d618e90de577b250e76003e0ce42b86ad4ad13",
+        "worker": "ts1",
+        "base_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+        "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
+        "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
+        "source_mode": "clean_baseline_empty_overlay",
+        "target": "x86_64-unknown-linux-gnu",
+        "profile": "test-recovery",
+        "features": ["default", "mcp", "mcp-client", "vendored"],
+        "exact_test": "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip",
+        "passed_tests": 1,
+        "failed_tests": 0,
+        "ignored_tests": 0,
+        "exit_code": 0
       }
-    ]
+    ],
+    "scoped_source_comparison": {
+      "verified_at": "2026-09-19T22:13:49Z",
+      "tested_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+      "compared_checkout_commit": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
+      "unchanged_files": [
+        "crates/frankenterm-core/src/redact_backfill.rs",
+        "crates/frankenterm-core/src/redactor.rs",
+        "crates/frankenterm-core/src/backup.rs",
+        "crates/frankenterm-core/tests/attestation_manifest_schema.rs"
+      ],
+      "method": "git diff from the tested commit to the checkout returned no changes for these four files",
+      "limit": "Source equality is limited to the listed files. Dependencies, the rest of the workspace, final RC47 binaries and native execution are not qualified by this comparison."
+    },
+    "native_ingest_receipt": {
+      "path": "/Volumes/USB_NVME/ft-release-20260915/rc46-native-ingest-catalog-stamp.json",
+      "sha256": "a2c61bd5f2b9e3ff605ac9ea44ed20572c5f2a12ae1263a1db2c4a05b19fb861",
+      "source_revision": "53f815807b390df83637356d4b4c8d8e821fa4eb",
+      "dsr_run_id": "bdb9e11f-0091-4391-ad4b-8daeccf163f8",
+      "stamped_rows": 3,
+      "maintenance_receipts": 0,
+      "scope": "Owned RC46 native DSR smoke database only; all three captured rows carry the catalog fingerprint above. No backfill or purge was performed. The diagnostic DSR build later timed out during packaging and is not a publishable release."
+    },
+    "release_qualification": "Pending producing-bead bundle build/verify, manifest completeness, and final candidate DSR qualification. Referenced external receipts must be retained with the release evidence; this artifact alone does not embed their bytes."
   }
 }

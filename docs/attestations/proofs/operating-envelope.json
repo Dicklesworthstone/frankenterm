@@ -3,7 +3,7 @@
   "kind": "operating-envelope-convergence-attestation",
   "category": "proofs/robot-contracts",
   "release_version": "0.0.0-substrate",
-  "generated_at": "2026-09-12T11:17:36Z",
+  "generated_at": "2026-09-19T22:14:08Z",
   "produced_by_bead": "ft-booek.7",
   "status": "passed_scoped_remote_pending_bundle_verification",
   "proof_categories": [4, 5],
@@ -131,6 +131,8 @@
   ],
   "static_validation": {
     "status": "pass",
+    "verified_at": "2026-09-19T22:14:08Z",
+    "checkout_head": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
     "command": "bash tests/e2e/test_operating_envelope_fixture_manifest.sh --json",
     "summary": {
       "valid_fixture_count": 6,
@@ -140,16 +142,66 @@
       "proof_calendar_invalid_case_count": 6,
       "retained_run_case_count": 10
     },
-    "local_cargo_counted": false
+    "local_cargo_counted": false,
+    "active_bead_dependency_cycle_count": 0,
+    "boundary": "Static fixture and retained-run record-shape validation only. The shell constructs ten synthetic retained-run examples; it does not execute ten live service scenarios. The remote Rust harness separately executes the real read-only planner against controlled source snapshots."
   },
   "rch_proof": {
     "status": "passed_operating_envelope_scope",
     "remote_required": true,
     "local_cargo_counted": false,
-    "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-booek7-cod10-target cargo test -p frankenterm-core --lib operating_envelope",
-    "requested_target_dir": "/tmp/ft-booek7-cod10-target",
+    "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-rc40-operating-envelope cargo test -j 1 --profile test-recovery --target x86_64-unknown-linux-gnu -p frankenterm-core --no-default-features --lib --test operating_envelope_schema --locked operating_envelope -- --nocapture",
+    "requested_target_dir": "/tmp/ft-rc40-operating-envelope",
     "blocking_reason": null,
     "current_evidence": {
+      "worker": "vmi1227854",
+      "worker_host": "root@109.123.245.77",
+      "job": "j-30023644042232722",
+      "platform": "Linux x86_64",
+      "base_sha": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
+      "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
+      "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
+      "source_identity_authority": "The retained RCH transcript ends with a clean-overlay receipt binding the base, overlay fingerprint and source tree. The tree object exists in the local repository and was compared read-only with the current scoped source.",
+      "remote_target_dir": "/var/tmp/ft-rch-proof.PWbxQPza/frankenterm/.rch-target-vmi1227854-pool-69c6f828614b0641c0378d677dbd816a",
+      "scope_comparison": {
+        "verified_at": "2026-09-19T22:14:08Z",
+        "checkout_head": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
+        "result": "no_scoped_changes_against_recorded_remote_tree",
+        "paths": [
+          "crates/frankenterm-core/src/operating_envelope.rs",
+          "crates/frankenterm-core/tests/operating_envelope_schema.rs",
+          "fixtures/operating-envelope",
+          "tests/e2e/test_operating_envelope_fixture_manifest.sh",
+          "docs/json-schema/ft-operating-envelope.json",
+          "docs/json-schema/ft-operating-envelope-proof-calendar.json",
+          "docs/robot-contracts/operating-envelope.md",
+          "docs/attestations/proofs/resource-cockpit-target-class.json"
+        ],
+        "boundary": "This comparison establishes unchanged scoped bytes, not unchanged transitive dependencies or execution of the RC47 source/artifacts."
+      },
+      "runs": [
+        {
+          "log": "/Volumes/USB_NVME/ft-release-20260915/rc40-operating-envelope-rch.log",
+          "log_sha256": "e77dab5fe3be465877a69eff27b8f3624ee83ef1b0a5c3838c8a97b4c2eb6577",
+          "command": "env CARGO_HOME=/root/.cargo TMPDIR=/var/tmp RUSTUP_TOOLCHAIN=nightly-2026-08-31 CARGO_INCREMENTAL=0 cargo test -j 1 --profile test-recovery --target x86_64-unknown-linux-gnu -p frankenterm-core --no-default-features --lib --test operating_envelope_schema --locked operating_envelope --config 'build.build-dir=\"/var/tmp/ft-rch-proof.PWbxQPza/frankenterm/.rch-target-vmi1227854-pool-69c6f828614b0641c0378d677dbd816a\"' -- --nocapture",
+          "cargo_reached_remote": true,
+          "tests_reached": true,
+          "filtered_library_passed": 44,
+          "operating_envelope_library_passed": 41,
+          "adapter_consumer_library_passed": 3,
+          "operating_envelope_schema_passed": 3,
+          "failed": 0,
+          "ignored": 0,
+          "remote_command_exit_code": 0,
+          "aggregate_verdict": "passed_selected_rc40_operating_envelope_library_and_schema_tests",
+          "finished_at": "2026-09-18T18:21:54Z"
+        }
+      ],
+      "release_ready": false,
+      "remaining_closeout": "Preserve the verified RC40 log in the final evidence bundle, complete manifest wiring/completeness and final-artifact development bundle round-trip, then bind final source/profile/targets through DSR. This retained scoped RC40 execution does not claim RC47 runtime qualification, live service mutation, or target-class capacity."
+    },
+    "historical_september_evidence": {
+      "receipt_availability": "Referenced September 12 log and scope-receipt paths are absent in the current workspace; their historical results were not reverified and are superseded by current_evidence.",
       "worker": "ts1",
       "worker_host": "ubuntu@100.74.254.33",
       "platform": "Linux x86_64",
@@ -237,6 +289,11 @@
       "exit 143"
     ]
   },
+  "source_inventory_verification": {
+    "verified_at": "2026-09-19T22:14:08Z",
+    "checkout_head": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
+    "boundary": "Inventory hashes describe current on-disk dependencies, not additional runtime proof. Manifest, completeness test, README and checklist changed since the prior inventory and were refreshed. The manifest still defers this slot; any later manifest or dependency edit requires another inventory refresh before final bundle verification."
+  },
   "source_artifacts": [
     {
       "path": "docs/json-schema/ft-operating-envelope.json",
@@ -301,26 +358,26 @@
     {
       "path": "docs/attestations/manifest.json",
       "media_type": "application/json",
-      "sha256": "f98ae570dc007a7e05924b7fdbc93b69fb2a13a6f2246b2881998d0ea78c5313",
-      "size_bytes": 17070
+      "sha256": "cc525bd9861a0a1d6c8de62a0b0ab3cf0c505d6e2c2561eeb787f4c2f781741b",
+      "size_bytes": 18062
     },
     {
       "path": "crates/frankenterm-core/tests/attestation_manifest_completeness.rs",
       "media_type": "text/plain",
-      "sha256": "bb4cf8d84b99345efe1da5927add8cfdb2a18a181c5ba9c1296db910b1ccb265",
-      "size_bytes": 37728
+      "sha256": "368c46d9d72e7256500c325321187efd4f789a382b84b3c03173414db5eec7be",
+      "size_bytes": 40097
     },
     {
       "path": "README.md",
       "media_type": "text/markdown",
-      "sha256": "bbcd1a0dd354975a5c888f738eab195577fa13cb825151979e3d21fb9cee1ee7",
-      "size_bytes": 285300
+      "sha256": "171da9f5812c4a6f319e1aaf361a24fe0023c73e1c89a723f087699666bf1dd5",
+      "size_bytes": 285307
     },
     {
       "path": "docs/release/attestation-checklist.md",
       "media_type": "text/markdown",
-      "sha256": "a883e741f92b81b4fffd9e7cec5aecef0ea557591c5c9e6068fb02b7fa958a96",
-      "size_bytes": 16473
+      "sha256": "3c3fc54c44a8e2450373d92f7d6b2712e5cdee93858fdf5721d1ffa1b2a50aac",
+      "size_bytes": 19143
     }
   ],
   "release_bundle": {
@@ -329,8 +386,14 @@
     "manifest_slot_path": "docs/attestations/proofs/operating-envelope.json",
     "required_category": true,
     "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles.",
+    "final_artifact_verification": {
+      "status": "pending",
+      "canonical_slot_deferred": true,
+      "publisher_authenticated": false,
+      "release_ready": false
+    },
     "development_verification": {
-      "status": "passed_for_prior_artifact_bytes",
+      "status": "historical_report_for_prior_artifact_bytes_not_reverified",
       "build_exit_code": 0,
       "verify_exit_code": 0,
       "artifact_count": 30,
@@ -343,7 +406,7 @@
       "verification_mode": "development_integrity",
       "publisher_authenticated": false,
       "release_ready": false,
-      "boundary": "This retained unsigned round-trip predates the present evidence update and verifies the artifact bytes then bundled, not this edited file. Rebuild and reverify after final artifact/manifest freeze. Refresh the nested manifest digest when the Doctor slot or any other manifest entry changes; two deferred slots still prevent release qualification."
+      "boundary": "This historical unsigned round-trip was reported for prior artifact bytes. Its temporary receipt paths are not present in the current workspace and were not reverified; it does not verify this edited file. Rebuild and reverify after final artifact/manifest freeze. Refresh the nested manifest digest when any manifest entry changes. Four current canonical deferred slots still prevent strict-deferred release qualification."
     }
   }
 }
