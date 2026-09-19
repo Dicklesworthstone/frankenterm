@@ -10670,6 +10670,48 @@ impl TestRpcPeer {
         Ok(request)
     }
 
+    pub(crate) async fn respond_next_lines(
+        &self,
+        lines: Vec<(wezterm_term::StableRowIndex, wezterm_term::Line)>,
+    ) -> anyhow::Result<()> {
+        let message = self
+            .receiver
+            .recv()
+            .await
+            .context("test line RPC queue closed")?;
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = message
+        else {
+            bail!("expected test line RPC");
+        };
+        anyhow::ensure!(lease.matches(binding), "test line RPC lease mismatch");
+        let prepared = lease
+            .claim_for_reader()?
+            .context("test line RPC cancelled")?;
+        let response = match prepared.pdu() {
+            Pdu::GetLinesAtLayout(request) => {
+                Pdu::GetLinesAtLayoutResponse(GetLinesAtLayoutResponse {
+                    pane_id: request.pane_id,
+                    layout: request.layout,
+                    lines: lines.into(),
+                })
+            }
+            Pdu::GetLines(request) => Pdu::GetLinesResponse(GetLinesResponse {
+                pane_id: request.pane_id,
+                lines: lines.into(),
+            }),
+            other => bail!("unexpected test line RPC {}", other.pdu_name()),
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(response)))
+            .await
+            .map_err(|_| anyhow!("test line RPC caller retired"))?;
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.receiver.is_empty()

@@ -210,7 +210,9 @@ enum ClientTopologySessionError {
     ReservedIdentity,
     #[error("remote mux session identity changed; a fresh domain attachment is required")]
     Changed,
-    #[error("remote topology dialect changed without proof of session continuity; a fresh domain attachment is required")]
+    #[error(
+        "remote topology dialect changed without proof of session continuity; a fresh domain attachment is required"
+    )]
     DialectChanged,
 }
 
@@ -235,6 +237,7 @@ pub struct ClientInner {
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     pub(crate) resize_coordinator: Arc<ClientResizeCoordinator>,
+    pub(crate) fetch_retry_coordinator: Arc<crate::pane::FetchRetryCoordinator>,
     pending_window_titles: Mutex<HashMap<(WindowId, WindowId), Arc<AtomicBool>>>,
     topology_session: Mutex<ClientTopologySessionState>,
     layout_tab_owners: Mutex<HashMap<TabId, WindowId>>,
@@ -1128,7 +1131,7 @@ fn resolve_pane_arena_entry(
                     entry.size,
                     &entry.title,
                     entry.alt_screen_active,
-                ));
+                )?);
                 local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
                 pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
                 pane
@@ -1149,7 +1152,7 @@ fn resolve_pane_arena_entry(
             entry.size,
             &entry.title,
             entry.alt_screen_active,
-        ));
+        )?);
         local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
         pending.new_panes.push((entry.pane_id, Arc::clone(&pane)));
         pane
@@ -1783,6 +1786,7 @@ impl ClientInner {
             focused_remote_pane_id: Mutex::new(None),
             reliable_input_queue: ReliableInputQueue::new(),
             resize_coordinator: ClientResizeCoordinator::new(),
+            fetch_retry_coordinator: crate::pane::FetchRetryCoordinator::new(),
             pending_window_titles: Mutex::new(HashMap::new()),
             topology_session: Mutex::new(ClientTopologySessionState::Unbound),
             layout_tab_owners: Mutex::new(HashMap::new()),
@@ -1899,6 +1903,7 @@ impl ClientInner {
         self.client.revoke_domain_reconnect();
         self.reliable_input_queue.detach_domain(&self.detached);
         self.resize_coordinator.detach(&self.detached);
+        self.fetch_retry_coordinator.detach();
     }
 
     pub(crate) fn start_resize_retry_driver(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -4124,7 +4129,7 @@ impl ClientDomain {
                                     entry.size,
                                     &entry.title,
                                     entry.alt_screen_active,
-                                ));
+                                )?);
                                 mux.add_pane(&pane).with_context(|| {
                                     format!("register remote pane {} in mux", entry.pane_id)
                                 })?;
@@ -4153,7 +4158,7 @@ impl ClientDomain {
                             entry.size,
                             &entry.title,
                             entry.alt_screen_active,
-                        ));
+                        )?);
                         log::debug!(
                             "domain: {} attaching to remote pane {:?} -> local pane_id {}",
                             inner.local_domain_id,
@@ -4361,7 +4366,7 @@ impl ClientDomain {
                             entry.size,
                             &entry.title,
                             entry.alt_screen_active,
-                        ));
+                        )?);
                         local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
                         pane
                     }
@@ -4383,7 +4388,7 @@ impl ClientDomain {
                     entry.size,
                     &entry.title,
                     entry.alt_screen_active,
-                ));
+                )?);
                 local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
                 pane
             };
@@ -6165,15 +6170,18 @@ mod tests {
         mux.add_tab_no_panes(&tab)
             .expect("rollback fixture tab must register");
         let inner = test_client_inner(70_001);
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
-            &inner,
-            70_002,
-            51,
-            61,
-            TerminalSize::default(),
-            "rollback pane",
-            false,
-        ));
+        let pane: Arc<dyn Pane> = Arc::new(
+            ClientPane::new(
+                &inner,
+                70_002,
+                51,
+                61,
+                TerminalSize::default(),
+                "rollback pane",
+                false,
+            )
+            .unwrap(),
+        );
         mux.add_pane(&pane)
             .expect("rollback fixture pane must register");
         let registration = mux

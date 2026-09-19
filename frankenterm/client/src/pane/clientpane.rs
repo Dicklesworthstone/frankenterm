@@ -3328,7 +3328,11 @@ impl ClientPane {
         size: TerminalSize,
         title: &str,
         alt_screen_active: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        // A pane is not published unless its render-fetch retry wake already
+        // owns independent capacity. Render saturation cannot admit this later.
+        client.fetch_retry_coordinator.ensure_started()?;
+        let (fetch_retry_wake, fetch_retry_rx) = async_channel::bounded(1);
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
         let reliable_input_pane_authority = Arc::new(Mutex::new(None));
         let reliable_pane_write_delivery = ReliablePaneWriteDelivery::new();
@@ -3372,14 +3376,19 @@ impl ClientPane {
                     alt_screen_active,
                     fetch_limiter,
                     weak_renderable.clone(),
+                    fetch_retry_wake,
                 )),
             })
         });
+        let weak_renderable = Arc::downgrade(&renderable);
+        client
+            .fetch_retry_coordinator
+            .register(local_pane_id, (weak_renderable, fetch_retry_rx))?;
 
         let config = configuration();
         let palette: ColorPalette = config.resolved_palette.clone().into();
 
-        Self {
+        Ok(Self {
             client: Arc::clone(client),
             mouse,
             remote_pane_id,
@@ -3404,7 +3413,7 @@ impl ClientPane {
             reliable_input_pane_authority,
             mux_registration,
             resize_delivery: Arc::new(Mutex::new(ResizeDeliveryState::default())),
-        }
+        })
     }
 
     pub(crate) fn prepare_render_application_bootstrap(
@@ -5444,21 +5453,24 @@ mod tests {
         local_pane_id: PaneId,
         remote_pane_id: PaneId,
     ) -> Arc<ClientPane> {
-        let pane = Arc::new(ClientPane::new(
-            inner,
-            local_pane_id,
-            23,
-            remote_pane_id,
-            TerminalSize {
-                cols: 80,
-                rows: 24,
-                pixel_width: 800,
-                pixel_height: 480,
-                dpi: 96,
-            },
-            "shell",
-            false,
-        ));
+        let pane = Arc::new(
+            ClientPane::new(
+                inner,
+                local_pane_id,
+                23,
+                remote_pane_id,
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                "shell",
+                false,
+            )
+            .unwrap(),
+        );
         pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
             .expect("test pane should prepare its committed render connection");
         pane
@@ -9039,9 +9051,7 @@ mod tests {
             pixel_height: 480,
             dpi: 96,
         };
-        let pane = Arc::new(ClientPane::new(
-            &inner, 40, 23, 29, old_size, "shell", false,
-        ));
+        let pane = Arc::new(ClientPane::new(&inner, 40, 23, 29, old_size, "shell", false).unwrap());
         let rpc = inner.client.rpc_scope();
         pane.prepare_render_application_bootstrap(&rpc).unwrap();
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
@@ -9100,21 +9110,24 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
-        let pane = Arc::new(ClientPane::new(
-            &inner,
-            31,
-            23,
-            29,
-            TerminalSize {
-                cols: 80,
-                rows: 24,
-                pixel_width: 800,
-                pixel_height: 480,
-                dpi: 96,
-            },
-            "shell",
-            false,
-        ));
+        let pane = Arc::new(
+            ClientPane::new(
+                &inner,
+                31,
+                23,
+                29,
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                "shell",
+                false,
+            )
+            .unwrap(),
+        );
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_for_mux)
             .expect("render-delta test pane should register");
@@ -9166,21 +9179,24 @@ mod tests {
         let first_mux = Arc::new(Mux::new(None));
         let second_mux = Arc::new(Mux::new(None));
         let inner = test_client_inner(17);
-        let pane = Arc::new(ClientPane::new(
-            &inner,
-            33,
-            23,
-            29,
-            TerminalSize {
-                cols: 80,
-                rows: 24,
-                pixel_width: 800,
-                pixel_height: 480,
-                dpi: 96,
-            },
-            "shell",
-            false,
-        ));
+        let pane = Arc::new(
+            ClientPane::new(
+                &inner,
+                33,
+                23,
+                29,
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                "shell",
+                false,
+            )
+            .unwrap(),
+        );
 
         assert!(
             Arc::ptr_eq(pane.mux_registration_slot(), pane.mux_registration_slot()),
@@ -9231,21 +9247,24 @@ mod tests {
         .expect("test mux subscription should allocate an identifier");
 
         let inner = test_client_inner(17);
-        let pane = Arc::new(ClientPane::new(
-            &inner,
-            32,
-            23,
-            29,
-            TerminalSize {
-                cols: 80,
-                rows: 24,
-                pixel_width: 800,
-                pixel_height: 480,
-                dpi: 96,
-            },
-            "shell",
-            false,
-        ));
+        let pane = Arc::new(
+            ClientPane::new(
+                &inner,
+                32,
+                23,
+                29,
+                TerminalSize {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    dpi: 96,
+                },
+                "shell",
+                false,
+            )
+            .unwrap(),
+        );
         let pane_for_mux: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_for_mux)
             .expect("unilateral-alert test pane should register");

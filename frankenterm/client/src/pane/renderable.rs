@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::future::Future;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -164,6 +164,116 @@ struct FetchIdentity {
 
 #[derive(Clone, Debug)]
 struct FetchToken(Arc<FetchIdentity>);
+
+struct DeferredLineFetch {
+    rows: RangeSet<StableRowIndex>,
+    token: FetchToken,
+    registration: PaneRegistrationHandle,
+    rpc: RpcGenerationScope,
+    layout: LineReadLayout,
+    queue_id: NonZeroU64,
+    scheduler_generation: NonZeroU64,
+}
+
+type FetchRetryOwner = (
+    Weak<parking_lot::Mutex<RenderableState>>,
+    async_channel::Receiver<()>,
+    CancelDeferredFetches,
+);
+
+struct CancelDeferredFetches(Weak<parking_lot::Mutex<RenderableState>>);
+
+impl Drop for CancelDeferredFetches {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.upgrade() {
+            owner.lock().inner.borrow_mut().cancel_deferred_fetches();
+        }
+    }
+}
+
+/// One independently admitted driver per domain, not one scheduler slot per
+/// pane. Pane futures retain only weak ownership and their bounded wake channel.
+pub(crate) struct FetchRetryCoordinator {
+    pending: parking_lot::Mutex<HashMap<PaneId, FetchRetryOwner>>,
+    started: parking_lot::Mutex<bool>,
+    wake_tx: async_channel::Sender<()>,
+    wake_rx: async_channel::Receiver<()>,
+}
+
+impl FetchRetryCoordinator {
+    pub(crate) fn new() -> Arc<Self> {
+        let (wake_tx, wake_rx) = async_channel::bounded(1);
+        Arc::new(Self {
+            pending: parking_lot::Mutex::new(HashMap::new()),
+            started: parking_lot::Mutex::new(false),
+            wake_tx,
+            wake_rx,
+        })
+    }
+
+    pub(crate) fn ensure_started(self: &Arc<Self>) -> anyhow::Result<()> {
+        let mut started = self.started.lock();
+        anyhow::ensure!(!self.wake_tx.is_closed(), "render fetch domain is detached");
+        if !*started {
+            let reservation = promise::spawn::try_reserve_background_task(4 * 1024)?;
+            let coordinator = Arc::clone(self);
+            reservation.spawn(async move { coordinator.run().await });
+            *started = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn register(
+        &self,
+        pane_id: PaneId,
+        owner: (
+            Weak<parking_lot::Mutex<RenderableState>>,
+            async_channel::Receiver<()>,
+        ),
+    ) -> anyhow::Result<()> {
+        let mut pending = self.pending.lock();
+        anyhow::ensure!(!self.wake_tx.is_closed(), "render fetch domain is detached");
+        pending.retain(|_, (owner, _, _)| owner.strong_count() != 0);
+        anyhow::ensure!(
+            !pending.contains_key(&pane_id),
+            "duplicate render fetch pane owner"
+        );
+        let cancel = CancelDeferredFetches(owner.0.clone());
+        pending.insert(pane_id, (owner.0, owner.1, cancel));
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(async_channel::TrySendError::Full(())) => Ok(()),
+            Err(async_channel::TrySendError::Closed(())) => {
+                pending.remove(&pane_id);
+                anyhow::bail!("render fetch domain detached during pane admission")
+            }
+        }
+    }
+
+    pub(crate) fn detach(&self) {
+        self.wake_tx.close();
+    }
+
+    async fn run(&self) {
+        let mut active = futures::stream::FuturesUnordered::new();
+        loop {
+            for (_, (owner, wake, cancel)) in std::mem::take(&mut *self.pending.lock()) {
+                active.push(RenderableInner::run_fetch_retries(owner, wake, cancel));
+            }
+            if active.is_empty() {
+                if self.wake_rx.recv().await.is_err() {
+                    return;
+                }
+            } else {
+                let notified = self.wake_rx.recv();
+                let completed = active.next();
+                pin_mut!(notified, completed);
+                if matches!(select(notified, completed).await, Either::Left((Err(_), _))) {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 impl FetchToken {
     fn new(started_at: Instant) -> Self {
@@ -440,6 +550,8 @@ pub struct RenderableInner {
     implicit_hyperlink_rules: Vec<Rule>,
 
     fetch_limiter: RateLimiter,
+    fetch_retry_wake: async_channel::Sender<()>,
+    deferred_fetches: Vec<DeferredLineFetch>,
 
     last_send_time: Instant,
     pub last_recv_time: Instant,
@@ -500,6 +612,7 @@ impl RenderableInner {
         alt_screen_active: bool,
         fetch_limiter: RateLimiter,
         renderable: Weak<parking_lot::Mutex<RenderableState>>,
+        fetch_retry_wake: async_channel::Sender<()>,
     ) -> Self {
         let now = Instant::now();
         let config = configuration();
@@ -530,6 +643,8 @@ impl RenderableInner {
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
+            fetch_retry_wake,
+            deferred_fetches: Vec::new(),
             last_send_time: now,
             last_recv_time: now,
             last_late_dirty: now,
@@ -547,6 +662,7 @@ impl RenderableInner {
 
     pub fn registration_did_bind(&mut self) {
         self.poll_in_progress.store(false, Ordering::Release);
+        self.cancel_deferred_fetches();
 
         let capacity = self.lines.cap();
         let mut stale_lines = LruCache::new(capacity);
@@ -1675,6 +1791,175 @@ impl RenderableInner {
         true
     }
 
+    fn retain_exact_fetch_rows(&self, rows: &mut RangeSet<StableRowIndex>, token: &FetchToken) {
+        let mut retained = RangeSet::new();
+        // Iterate the bounded cache, not a potentially huge requested range.
+        for (row, entry) in self.lines.iter() {
+            if rows.contains(*row)
+                && matches!(entry, LineEntry::Fetching(current) | LineEntry::LineAndFetching(_, current)
+                    if current.same_request(token))
+            {
+                retained.add(*row);
+            }
+        }
+        *rows = retained;
+    }
+
+    fn prune_deferred_fetches(&mut self) {
+        if self.deferred_fetches.is_empty() {
+            return;
+        }
+        let by_token: HashMap<_, _> = self
+            .deferred_fetches
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| (Arc::as_ptr(&intent.token.0), index))
+            .collect();
+        let mut retained = vec![RangeSet::new(); self.deferred_fetches.len()];
+        // One cache traversal for the whole queue, even under pressure with a
+        // distinct token for every row. Never rescan N cache rows per intent.
+        for (row, entry) in self.lines.iter() {
+            let (LineEntry::Fetching(token) | LineEntry::LineAndFetching(_, token)) = entry else {
+                continue;
+            };
+            if let Some(index) = by_token.get(&Arc::as_ptr(&token.0)) {
+                if self.deferred_fetches[*index].rows.contains(*row) {
+                    retained[*index].add(*row);
+                }
+            }
+        }
+        for (intent, rows) in self.deferred_fetches.iter_mut().zip(retained) {
+            intent.rows = rows;
+        }
+        self.deferred_fetches
+            .retain(|intent| !intent.rows.is_empty());
+    }
+
+    fn cancel_deferred_fetches(&mut self) {
+        for intent in std::mem::take(&mut self.deferred_fetches) {
+            self.release_exact_fetch_reservations(&intent.rows, &intent.token);
+        }
+    }
+
+    async fn run_fetch_retries(
+        owner: Weak<parking_lot::Mutex<RenderableState>>,
+        wake: async_channel::Receiver<()>,
+        cancel: CancelDeferredFetches,
+    ) {
+        let _cancel_on_domain_detach = cancel;
+        while wake.recv().await.is_ok() {
+            let mut delay = Duration::from_millis(5);
+            loop {
+                let expected = {
+                    let Some(state) = owner.upgrade() else { return };
+                    let state = state.lock();
+                    let mut inner = state.inner.borrow_mut();
+                    if inner.dead || inner.client.is_detached() {
+                        inner.cancel_deferred_fetches();
+                        return;
+                    }
+                    inner.prune_deferred_fetches();
+                    let Some(intent) = inner.deferred_fetches.first() else {
+                        break;
+                    };
+                    (intent.queue_id, intent.scheduler_generation)
+                };
+                let reservation = match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    64 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation)
+                        if {
+                            let receipt = reservation.admission_receipt();
+                            (receipt.queue_id, receipt.scheduler_generation) == expected
+                        } =>
+                    {
+                        reservation
+                    }
+                    promise::spawn::MainThreadReservationOutcome::RetryableFull(rejected)
+                        if (rejected.queue_id, rejected.scheduler_generation) == expected =>
+                    {
+                        promise::spawn::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_millis(100));
+                        continue;
+                    }
+                    _ => {
+                        if let Some(state) = owner.upgrade() {
+                            let state = state.lock();
+                            let mut inner = state.inner.borrow_mut();
+                            let mut pending = std::mem::take(&mut inner.deferred_fetches);
+                            pending.retain(|intent| {
+                                if (intent.queue_id, intent.scheduler_generation) == expected {
+                                    inner.release_exact_fetch_reservations(
+                                        &intent.rows,
+                                        &intent.token,
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            inner.deferred_fetches = pending;
+                        }
+                        break;
+                    }
+                };
+                let owner = owner.clone();
+                let (done_tx, done_rx) = async_channel::bounded::<()>(1);
+                reservation
+                    .handoff_to_main_thread_local(move |reservation| {
+                        let _done = done_tx;
+                        let Some(state) = owner.upgrade() else { return };
+                        let state = state.lock();
+                        let mut inner = state.inner.borrow_mut();
+                        inner.prune_deferred_fetches();
+                        if inner.deferred_fetches.is_empty() {
+                            return;
+                        }
+                        let first = &inner.deferred_fetches[0];
+                        if (first.queue_id, first.scheduler_generation) != expected {
+                            return;
+                        }
+                        let intent = inner.deferred_fetches.remove(0);
+                        let registration_is_current = inner
+                            .mux_registration
+                            .load()
+                            .is_some_and(|current| current.same_registration(&intent.registration));
+                        if inner.dead
+                            || inner.client.is_detached()
+                            || !registration_is_current
+                            || !intent.rpc.is_available()
+                            || !intent.rpc.same_generation(&inner.client.client.rpc_scope())
+                            || (intent.queue_id, intent.scheduler_generation) != expected
+                        {
+                            inner.release_exact_fetch_reservations(&intent.rows, &intent.token);
+                            return;
+                        }
+                        if !inner.admit_fetched_layout(intent.layout, &intent.rows, &intent.token) {
+                            // A resize may already have painted while these rows
+                            // still carried fetch tokens. Release the lock before
+                            // requesting a new paint under the exact pane owner.
+                            drop(inner);
+                            drop(state);
+                            intent.registration.try_with_current_output(|_| ());
+                            return;
+                        }
+                        inner.schedule_fetch_lines_reserved(
+                            intent.rows,
+                            intent.token,
+                            reservation,
+                            Some((intent.registration, intent.rpc, intent.layout)),
+                        );
+                    })
+                    .detach();
+                // One handoff at a time. Sender drop also acknowledges cancellation
+                // by scheduler retirement, without requiring another admission.
+                let _ = done_rx.recv().await;
+                delay = Duration::from_millis(5);
+            }
+        }
+    }
+
     fn schedule_fetch_lines(
         &mut self,
         to_fetch: RangeSet<StableRowIndex>,
@@ -1692,6 +1977,48 @@ impl RenderableInner {
             64 * 1024,
         ) {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            promise::spawn::MainThreadReservationOutcome::RetryableFull(rejection) => {
+                let Some(registration) = self.mux_registration.load() else {
+                    self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
+                    return;
+                };
+                let rpc = self.client.client.rpc_scope();
+                self.prune_deferred_fetches();
+                let mut rows = to_fetch;
+                self.retain_exact_fetch_rows(&mut rows, &fetch_token);
+                if !rows.is_empty() {
+                    if let Some(pending) = self
+                        .deferred_fetches
+                        .iter_mut()
+                        .find(|pending| pending.token.same_request(&fetch_token))
+                    {
+                        pending.rows.add_set(&rows);
+                    } else {
+                        self.deferred_fetches.push(DeferredLineFetch {
+                            rows,
+                            token: fetch_token,
+                            registration,
+                            rpc,
+                            layout: LineReadLayout {
+                                seqno: self.seqno,
+                                dimensions: self.dimensions,
+                            },
+                            queue_id: rejection.queue_id,
+                            scheduler_generation: rejection.scheduler_generation,
+                        });
+                    }
+                    match self.fetch_retry_wake.try_send(()) {
+                        Ok(()) | Err(async_channel::TrySendError::Full(())) => {}
+                        Err(async_channel::TrySendError::Closed(())) => {
+                            // The driver is part of pane lifetime, so closure is
+                            // terminal, never a promise of a later repaint.
+                            self.dead = true;
+                            self.cancel_deferred_fetches();
+                        }
+                    }
+                }
+                return;
+            }
             rejected => {
                 self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
                 log::error!(
@@ -1701,6 +2028,16 @@ impl RenderableInner {
             }
         };
 
+        self.schedule_fetch_lines_reserved(to_fetch, fetch_token, reservation, None);
+    }
+
+    fn schedule_fetch_lines_reserved(
+        &mut self,
+        to_fetch: RangeSet<StableRowIndex>,
+        fetch_token: FetchToken,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        authority: Option<(PaneRegistrationHandle, RpcGenerationScope, LineReadLayout)>,
+    ) {
         let Some(registration) = self.mux_registration.load() else {
             for range in to_fetch.iter() {
                 for stable_row in range.clone() {
@@ -1726,21 +2063,39 @@ impl RenderableInner {
 
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let rpc = client.client.rpc_scope();
+        let (registration, rpc, layout) = authority.unwrap_or_else(|| {
+            (
+                registration,
+                client.client.rpc_scope(),
+                LineReadLayout {
+                    seqno: self.seqno,
+                    dimensions: self.dimensions,
+                },
+            )
+        });
         let Some(codec_version) = rpc.agreed_codec_version() else {
             // An unnegotiated connection is not an older peer. Wait for its
             // actual authority rather than sending one unfenced bootstrap read.
             self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
             return;
         };
-        let layout = LineReadLayout {
-            seqno: self.seqno,
-            dimensions: self.dimensions,
-        };
         let fenced = codec_version >= GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION;
 
         reservation
             .spawn_local(async move {
+                if registration.try_with_current(|_| ()).is_none() {
+                    return Self::apply_lines(
+                        registration,
+                        renderable,
+                        rpc,
+                        Err(anyhow::anyhow!(
+                            "line fetch pane registration retired before dispatch"
+                        )),
+                        to_fetch,
+                        fetch_token,
+                        layout,
+                    );
+                }
                 let result = if fenced {
                     rpc.get_lines_at_layout(GetLinesAtLayout {
                         pane_id: remote_pane_id,
@@ -3976,7 +4331,8 @@ mod tests {
             },
             "hyperlink-test",
             false,
-        );
+        )
+        .unwrap();
         Arc::clone(&pane.renderable)
     }
 
@@ -5586,6 +5942,175 @@ mod tests {
 
         assert!(matches!(inner.lines.peek(&0), Some(LineEntry::Stale(_))));
         assert!(inner.lines.peek(&1).is_none());
+    }
+
+    fn exercise_render_fetch_retry(retire_rpc: bool, replace_token: bool, cancel_unpolled: bool) {
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor,
+        };
+        let scope = crate::MuxTestScope::enter();
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 256 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(mux::Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(751),
+            ClientDomainConfig::Unix(UnixDomain {
+                name: "fetch-retry-test".into(),
+                ..UnixDomain::default()
+            }),
+        );
+        let client = Arc::new(ClientInner::new(751, client, None, None, false));
+        let pane = Arc::new(
+            ClientPane::new(
+                &client,
+                753,
+                757,
+                761,
+                wezterm_term::TerminalSize::default(),
+                "fetch",
+                false,
+            )
+            .unwrap(),
+        );
+        let registered: Arc<dyn mux::pane::Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        while executor.try_tick().unwrap() {}
+        assert!(!peer.is_empty(), "binding must produce its palette RPC");
+        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty());
+
+        let blockers: Vec<_> = (0..2)
+            .map(|_| {
+                match promise::spawn::try_reserve_main_thread(
+                    MainThreadServiceClass::Render,
+                    64 * 1024,
+                ) {
+                    MainThreadReservationOutcome::Reserved(permit) => permit,
+                    other => panic!("expected capacity before saturation: {other:?}"),
+                }
+            })
+            .collect();
+        let token = FetchToken::new(Instant::now());
+        let successor = FetchToken::new(Instant::now());
+        {
+            let state = pane.renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.lines.put(0, LineEntry::Fetching(token.clone()));
+            let mut requested = rangeset::RangeSet::new();
+            requested.add(0);
+            inner.schedule_fetch_lines(requested.clone(), token.clone());
+            inner.schedule_fetch_lines(requested, token.clone());
+            assert_eq!(inner.deferred_fetches.len(), 1, "same token must coalesce");
+            assert!(
+                matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&token))
+            );
+            if replace_token {
+                inner.lines.put(0, LineEntry::Fetching(successor.clone()));
+            }
+        }
+        assert!(
+            peer.is_empty(),
+            "full scheduler must not dispatch a line RPC"
+        );
+        if retire_rpc {
+            peer.replace_ready_generation(&client.client, codec::CODEC_VERSION)
+                .unwrap();
+        }
+        if cancel_unpolled {
+            let (_wake_tx, wake_rx) = async_channel::bounded(1);
+            let owner = Arc::downgrade(&pane.renderable);
+            // Construct the actual production future but never poll it. Its
+            // already-owned guard must still release accepted token state.
+            drop(super::RenderableInner::run_fetch_retries(
+                owner.clone(),
+                wake_rx,
+                super::CancelDeferredFetches(owner),
+            ));
+            let state = pane.renderable.lock();
+            let inner = state.inner.borrow();
+            assert!(inner.deferred_fetches.is_empty());
+            assert!(inner.lines.peek(&0).is_none());
+            assert!(peer.is_empty());
+            return;
+        }
+        drop(blockers);
+        // No extra get_lines/paint/PaneOutput call: only the pre-admitted driver
+        // may turn the released slot into an actual wire read.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            if retire_rpc || replace_token {
+                if pane
+                    .renderable
+                    .lock()
+                    .inner
+                    .borrow()
+                    .deferred_fetches
+                    .is_empty()
+                {
+                    break;
+                }
+            } else if !peer.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained fetch wake did not make progress"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if retire_rpc || replace_token {
+            assert!(peer.is_empty(), "obsolete authority must not dispatch");
+            let state = pane.renderable.lock();
+            let inner = state.inner.borrow();
+            if replace_token {
+                assert!(
+                    matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&successor))
+                );
+            } else {
+                assert!(inner.lines.peek(&0).is_none());
+            }
+        } else {
+            promise::spawn::block_on(peer.respond_next_lines(vec![(0, Line::with_width(17, 0))]))
+                .unwrap();
+            loop {
+                while executor.try_tick().unwrap() {}
+                if matches!(pane.renderable.lock().inner.borrow().lines.peek(&0), Some(LineEntry::Line(line)) if line.len() == 17)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "retried response did not reach render cache"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[test]
+    fn full_render_scheduler_retries_quiet_pane_fetch_without_new_output() {
+        exercise_render_fetch_retry(false, false, false);
+    }
+
+    #[test]
+    fn deferred_render_fetch_does_not_cross_rpc_generation() {
+        exercise_render_fetch_retry(true, false, false);
+    }
+
+    #[test]
+    fn deferred_render_fetch_preserves_replacement_token() {
+        exercise_render_fetch_retry(false, true, false);
+    }
+
+    #[test]
+    fn unpolled_render_fetch_driver_cancellation_releases_exact_tokens() {
+        exercise_render_fetch_retry(false, false, true);
     }
 
     #[test]
