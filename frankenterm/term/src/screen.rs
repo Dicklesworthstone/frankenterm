@@ -10690,7 +10690,26 @@ pub(crate) mod tests {
             .take(32)
             .all(|(source, _)| source.end - source.start == 2));
         let start = indexed.first_row();
-        let expected = indexed.lines().cloned().collect::<Vec<_>>();
+        let mut expected = indexed.lines().cloned().collect::<Vec<_>>();
+        // Owned hydration materializes resident rows, while the synchronous
+        // reader preserves their source storage. Check their full cells and
+        // sequence, then use that exact resident representation in the oracle.
+        let resident_offset = usize::try_from(screen.phys_to_stable_row_index(0) - start).unwrap();
+        assert_eq!(expected.len() - resident_offset, screen.lines.len());
+        for (hydrated, resident) in expected[resident_offset..].iter_mut().zip(&screen.lines) {
+            assert_eq!(
+                hydrated
+                    .visible_cells()
+                    .map(|cell| cell.as_cell())
+                    .collect::<Vec<_>>(),
+                resident
+                    .visible_cells()
+                    .map(|cell| cell.as_cell())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(hydrated.current_seqno(), resident.current_seqno());
+            *hydrated = resident.clone();
+        }
         sink.requests.lock().unwrap().clear();
         let (first, actual) =
             screen.lines_in_stable_range(start..start + expected.len() as StableRowIndex);
@@ -10702,8 +10721,12 @@ pub(crate) mod tests {
     #[cfg(feature = "use_serde")]
     #[test]
     fn synchronous_cold_text_rejects_overfill_and_stops_at_missing_prefix() {
-        let (mut screen, sink) = cold_prefetch_fixture(32);
+        // The bad sink must be able to exceed the reader's 32-row request;
+        // max_batch_rows=32 would silently cap away this negative control.
+        let (mut screen, sink) = cold_prefetch_fixture(33);
         sink.overfill.store(true, Ordering::Relaxed);
+        assert_eq!(sink.load_scrollback_lines(0..32).len(), 33);
+        sink.requests.lock().unwrap().clear();
         assert!(screen.lines_in_stable_range(0..65).1.is_empty());
         assert_eq!(*sink.requests.lock().unwrap(), [0..32]);
         sink.overfill.store(false, Ordering::Relaxed);
