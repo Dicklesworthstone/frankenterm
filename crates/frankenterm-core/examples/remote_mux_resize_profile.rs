@@ -44,6 +44,7 @@ mod measured {
 
     const TEXT_CAP: usize = 16 * 1024 * 1024;
     const SETTLE: Duration = Duration::from_secs(5);
+    const SWARM_VIEWPORT_ROWS: usize = 24;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ProfileArm {
@@ -110,6 +111,12 @@ mod measured {
     fn noise_record_bytes() -> u64 {
         // Includes CRLF on the producer wire, not the rendered row separator.
         b"FT_NOISE 0000000000000000 0123456789abcdef FT_END\r\n".len() as u64
+    }
+
+    fn swarm_ready(text: &str, role: &str) -> bool {
+        let marker = format!("FT_SWARM_READY {role}");
+        text.lines()
+            .any(|line| line.trim_end_matches(' ') == marker)
     }
 
     fn latest_noise_sequence(text: &str) -> Result<u64> {
@@ -959,7 +966,7 @@ mod measured {
                                 command: None,
                                 command_dir: None,
                                 size: TerminalSize {
-                                    rows: 24,
+                                    rows: SWARM_VIEWPORT_ROWS,
                                     cols: 80,
                                     pixel_width: 0,
                                     pixel_height: 0,
@@ -1009,17 +1016,17 @@ mod measured {
                 loop {
                     let text = probe_text(
                         client
-                            .get_text_tail_with_cx(&cx, *pane, 4096, Some(20))
+                            // Startup emits READY at row zero, while the rest
+                            // of the allocated viewport is still blank. A
+                            // shorter tail excludes that first-row marker.
+                            .get_text_tail_with_cx(&cx, *pane, 4096, Some(SWARM_VIEWPORT_ROWS))
                             .await?,
                     )?;
                     ensure!(
                         Instant::now() < deadline,
                         "swarm readiness deadline expired"
                     );
-                    if text
-                        .lines()
-                        .any(|line| line.trim_end_matches(' ') == format!("FT_SWARM_READY {role}"))
-                    {
+                    if swarm_ready(&text, role) {
                         break;
                     }
                     sleep_with_cx(&cx, Duration::from_millis(10))
@@ -1388,6 +1395,51 @@ mod measured {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn swarm_readiness_includes_first_row_of_short_terminal_content() {
+            #[derive(Debug)]
+            struct ReadyConfig;
+            impl frankenterm_term::TerminalConfiguration for ReadyConfig {
+                fn color_palette(&self) -> frankenterm_term::color::ColorPalette {
+                    frankenterm_term::color::ColorPalette::default()
+                }
+            }
+            for role in ["interactive", "noise"] {
+                let mut terminal = frankenterm_term::Terminal::new(
+                    TerminalSize {
+                        rows: SWARM_VIEWPORT_ROWS,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                        dpi: 0,
+                    },
+                    std::sync::Arc::new(ReadyConfig),
+                    "FrankenTerm",
+                    "swarm-ready-regression",
+                    Box::new(Vec::new()),
+                );
+                terminal.advance_bytes(format!("FT_SWARM_READY {role}\r\n"));
+                let rows = terminal.screen().scrollback_rows();
+                assert_eq!(rows, SWARM_VIEWPORT_ROWS);
+                let read_tail = |count| {
+                    terminal
+                        .screen()
+                        .lines_in_phys_range(rows - count..rows)
+                        .iter()
+                        .map(|line| line.as_str().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let old_tail = read_tail(20);
+                assert!(old_tail.trim().is_empty());
+                assert!(!swarm_ready(&old_tail, role));
+                let full_viewport = read_tail(SWARM_VIEWPORT_ROWS);
+                assert!(full_viewport.len() <= 4096);
+                assert!(swarm_ready(&full_viewport, role));
+                assert!(!swarm_ready(&full_viewport, "wrong-role"));
+            }
+        }
 
         #[test]
         fn swarm_parsed_counter_excludes_partial_and_uncertain_records() {

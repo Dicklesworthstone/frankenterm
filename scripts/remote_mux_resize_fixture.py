@@ -35,7 +35,8 @@ def corpus(records):
 
 
 def write_new(path, data):
-    with pathlib.Path(path).open("x", encoding="utf-8", newline="") as output:
+    with open(path, "x", encoding="utf-8", newline="",
+              opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
         output.write(data)
         output.flush()
         os.fsync(output.fileno())
