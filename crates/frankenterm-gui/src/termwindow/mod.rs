@@ -384,13 +384,13 @@ pub enum TermWindowNotif {
         interest: [u64; OUTPUT_INTEREST_WORDS],
         title_refresh: Option<PendingMuxTitleRefresh>,
         reconcile: bool,
-        actions: Arc<window::AdmittedWindowActions>,
+        actions: Arc<::window::AdmittedWindowActions>,
     },
     RenderWake {
         ticket: RenderWakeTicket,
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
-        actions: Arc<window::AdmittedWindowActions>,
+        actions: Arc<::window::AdmittedWindowActions>,
     },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
@@ -5383,7 +5383,7 @@ impl TermWindow {
                         let mux_window_id = *output_mux_window_id
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let actions = Arc::new(window::AdmittedWindowActions::default());
+                        let actions = Arc::new(::window::AdmittedWindowActions::default());
                         output_window.notify_with_reservation(
                             TermWindowNotif::MuxOutputRefresh {
                                 mux_owner: output_mux.clone(),
@@ -5418,7 +5418,7 @@ impl TermWindow {
                     let mux_window_id = *render_mux_window_id
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    let actions = Arc::new(window::AdmittedWindowActions::default());
+                    let actions = Arc::new(::window::AdmittedWindowActions::default());
                     render_window.notify_with_reservation(
                         TermWindowNotif::RenderWake {
                             ticket,
@@ -6030,7 +6030,7 @@ impl TermWindow {
         self.update_title_impl(None);
     }
 
-    fn update_title_impl(&mut self, admitted: Option<&window::AdmittedWindowActions>) {
+    fn update_title_impl(&mut self, admitted: Option<&::window::AdmittedWindowActions>) {
         let Some(mux) = self.mux_or_log("update window title") else {
             return;
         };
@@ -9706,7 +9706,7 @@ mod tests {
                         title
                             .expect("title refresh must survive saturation")
                             .begin_refresh();
-                        let actions = window::AdmittedWindowActions::default();
+                        let actions = ::window::AdmittedWindowActions::default();
                         actions.set_title("obsolete title".to_string());
                         actions.set_title("latest title".to_string());
                         actions.request_repaint();
