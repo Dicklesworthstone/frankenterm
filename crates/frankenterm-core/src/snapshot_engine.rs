@@ -61,7 +61,7 @@ pub struct WholeMuxPublicationIdentity {
     pub predecessor: Option<crate::snapshot_publication::PredecessorBinding>,
     /// Semantic image digest, distinct from the predecessor ciphertext hash.
     pub predecessor_image_digest: Option<[u8; 32]>,
-    /// Caller-enrolled existing guardian custody token for predecessor verification.
+    /// Caller-enrolled custody for candidate successor lineage and predecessor verification.
     pub existing_guardian_custody: Option<std::path::PathBuf>,
 }
 
