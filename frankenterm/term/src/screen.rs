@@ -258,18 +258,16 @@ impl std::error::Error for ColdReadGeometryUnavailable {}
 
 /// A transient metadata lock conflict, rather than missing or invalid source
 /// authority. Only an off-thread owner may wait and retry this refusal.
-#[cfg(feature = "use_serde")]
+/// Nonblocking tier usage also returns this error without serialization enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColdReadMetadataBusy;
 
-#[cfg(feature = "use_serde")]
 impl std::fmt::Display for ColdReadMetadataBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("cold history metadata is busy")
     }
 }
 
-#[cfg(feature = "use_serde")]
 impl std::error::Error for ColdReadMetadataBusy {}
 
 /// The captured source interval was invalidated before historical IO began.
@@ -366,7 +364,15 @@ struct ColdGeometryIndex {
     sink: Arc<dyn crate::config::ScrollbackSpillSink>,
     interval: crate::config::ScrollbackInterval,
     source: Range<StableRowIndex>,
-    rows: VecDeque<ColdGeometryRow>,
+    pages: VecDeque<Arc<ColdGeometryPage>>,
+    head_skip: usize,
+    geometry_bytes: usize,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+struct ColdGeometryPage {
+    rows: Vec<ColdGeometryRow>,
     geometry_bytes: usize,
 }
 
@@ -374,43 +380,74 @@ struct ColdGeometryIndex {
 #[derive(Debug)]
 struct ColdGeometrySnapshot {
     source: Range<StableRowIndex>,
-    rows: Vec<ColdGeometryRow>,
+    pages: Vec<Arc<ColdGeometryPage>>,
+    head_skip: usize,
+    row_count: usize,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdGeometrySnapshot {
+    fn rows(&self) -> impl Iterator<Item = &ColdGeometryRow> {
+        self.pages
+            .iter()
+            .flat_map(|page| page.rows.iter())
+            .skip(self.head_skip)
+            .take(self.row_count)
+    }
 }
 
 #[cfg(feature = "use_serde")]
 impl ColdGeometryIndex {
+    const PAGE_ROWS: usize = 256;
+
     fn append(&mut self, row: StableRowIndex, line: &Line) -> Option<()> {
         let retained = self.interval.rows()?;
         let end = row.checked_add(1)?;
         if row != self.source.end || retained.end != end || retained.start > row {
             return None;
         }
-        while self.source.start < retained.start && !self.rows.is_empty() {
-            let removed = self.rows.pop_front()?;
-            self.geometry_bytes = self.geometry_bytes.checked_sub(
-                removed.geometry.retained_bytes() + 2 * std::mem::size_of::<usize>(),
-            )?;
-            self.source.start += 1;
+        // A newly rebuilt index may cover only a suffix of retained history.
+        // Keep that incomplete-source boundary until retention catches up.
+        let retained_start = retained.start.max(self.source.start);
+        self.head_skip = self
+            .head_skip
+            .checked_add(usize::try_from(retained_start.checked_sub(self.source.start)?).ok()?)?;
+        while let Some(front) = self.pages.front() {
+            if self.head_skip < front.rows.len() {
+                break;
+            }
+            self.head_skip -= front.rows.len();
+            self.geometry_bytes = self.geometry_bytes.checked_sub(front.geometry_bytes)?;
+            self.pages.pop_front();
         }
-        if self.rows.len() >= ScreenLineRead::MAX_INDEX_SOURCE_ROWS {
+        self.source.start = retained_start;
+        if usize::try_from(row.checked_sub(self.source.start)?).ok()?
+            >= ScreenLineRead::MAX_INDEX_SOURCE_ROWS
+        {
             return None;
         }
-        let capacity = if self.rows.len() == self.rows.capacity() {
-            self.rows
-                .capacity()
-                .max(32)
-                .checked_mul(2)?
-                .min(ScreenLineRead::MAX_INDEX_SOURCE_ROWS)
+        let new_page = self
+            .pages
+            .back()
+            .is_none_or(|page| page.rows.len() == Self::PAGE_ROWS);
+        let capacity = if new_page && self.pages.len() == self.pages.capacity() {
+            self.pages.capacity().max(1).checked_mul(2)?
         } else {
-            self.rows.capacity()
+            self.pages.capacity()
         };
-        let peak_capacity = if capacity > self.rows.capacity() {
-            capacity.checked_add(self.rows.capacity())?
+        let peak_capacity = if capacity > self.pages.capacity() {
+            capacity.checked_add(self.pages.capacity())?
         } else {
             capacity
         };
+        // Charge full page capacity, including a retained partial head. A
+        // snapshot shares sealed pages; appending only copies a bounded tail.
+        let page_bytes = std::mem::size_of::<ColdGeometryPage>()
+            + 2 * std::mem::size_of::<usize>()
+            + Self::PAGE_ROWS * std::mem::size_of::<ColdGeometryRow>();
         let overhead = peak_capacity
-            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+            .checked_mul(std::mem::size_of::<Arc<ColdGeometryPage>>())?
+            .checked_add((self.pages.len() + 1).checked_mul(page_bytes)?)?
             .checked_add(std::mem::size_of::<Self>())?
             .checked_add(2 * std::mem::size_of::<usize>())?;
         let available = ScreenLineRead::MAX_INDEX_METADATA_BYTES
@@ -429,16 +466,41 @@ impl ColdGeometryIndex {
         if bytes > available {
             return None;
         }
-        if capacity > self.rows.capacity() {
-            self.rows
-                .try_reserve_exact(capacity - self.rows.len())
+        if capacity > self.pages.capacity() {
+            self.pages
+                .try_reserve_exact(capacity - self.pages.len())
                 .ok()?;
-            if self.rows.capacity() > capacity {
+            if self.pages.capacity() > capacity {
                 return None;
             }
         }
+        if new_page || Arc::get_mut(self.pages.back_mut()?).is_none() {
+            let mut rows = Vec::new();
+            rows.try_reserve_exact(Self::PAGE_ROWS).ok()?;
+            if rows.capacity() > Self::PAGE_ROWS {
+                return None;
+            }
+            let geometry_bytes = if new_page {
+                0
+            } else {
+                let tail = self.pages.back()?;
+                rows.extend(tail.rows.iter().cloned());
+                tail.geometry_bytes
+            };
+            let page = Arc::new(ColdGeometryPage {
+                rows,
+                geometry_bytes,
+            });
+            if new_page {
+                self.pages.push_back(page);
+            } else {
+                *self.pages.back_mut()? = page;
+            }
+        }
+        let tail = Arc::get_mut(self.pages.back_mut()?)?;
         self.geometry_bytes = self.geometry_bytes.checked_add(bytes)?;
-        self.rows.push_back(ColdGeometryRow {
+        tail.geometry_bytes = tail.geometry_bytes.checked_add(bytes)?;
+        tail.rows.push(ColdGeometryRow {
             geometry: Arc::new(geometry),
             wrapped: line.last_cell_was_wrapped(),
         });
@@ -1035,8 +1097,7 @@ impl ScreenLineRead {
             std::mem::size_of::<ColdVisualLayout>() + 2 * std::mem::size_of::<usize>();
         let entry_bytes = std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
         let Some(maximum_bytes) = snapshot
-            .rows
-            .len()
+            .row_count
             .checked_mul(entry_bytes)
             .and_then(|bytes| bytes.checked_add(header_bytes))
         else {
@@ -1046,7 +1107,7 @@ impl ScreenLineRead {
             return Ok(None);
         }
         let mut groups = Vec::new();
-        if groups.try_reserve_exact(snapshot.rows.len()).is_err() {
+        if groups.try_reserve_exact(snapshot.row_count).is_err() {
             return Ok(None);
         }
         let metadata_bytes = header_bytes + groups.capacity() * entry_bytes;
@@ -1073,7 +1134,7 @@ impl ScreenLineRead {
         let mut scratch = LineWrapWidthPrefixScratch::default();
         let mut counts =
             ColdGeometryRowCounts::new(self.witness.cols, self.wrap_policy.kp_cost_model);
-        for (offset, captured) in snapshot.rows.iter().enumerate() {
+        for (offset, captured) in snapshot.rows().enumerate() {
             anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
             let scratch_bytes = scratch
                 .capacity()
@@ -1208,7 +1269,7 @@ impl ScreenLineRead {
                 target: "frankenterm_term::screen::reflow_profile",
                 "cold_geometry_stages cols={} source_rows={} groups={} plans={} reuses={} total_us={}",
                 self.witness.cols,
-                snapshot.rows.len(),
+                snapshot.row_count,
                 groups.len(),
                 counts.plans,
                 counts.reuses,
@@ -3910,31 +3971,36 @@ impl Screen {
             return None;
         }
         let skip = usize::try_from(retained.start.checked_sub(index.source.start)?).ok()?;
-        let count = index.rows.len().checked_sub(skip)?;
-        if count == 0 || count > budget.work_left {
+        let count = usize::try_from(frontier.checked_sub(retained.start)?).ok()?;
+        let absolute_skip = index.head_skip.checked_add(skip)?;
+        let page_skip = absolute_skip / ColdGeometryIndex::PAGE_ROWS;
+        let page_count = index.pages.len().checked_sub(page_skip)?;
+        if count == 0 || page_count > budget.work_left {
             return None;
         }
-        let bytes = count
-            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+        let bytes = page_count
+            .checked_mul(std::mem::size_of::<Arc<ColdGeometryPage>>())?
             .checked_add(std::mem::size_of::<ColdGeometrySnapshot>())?;
         if bytes > budget.bytes_left {
             return None;
         }
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(count).ok()?;
-        let actual_bytes = rows
+        let mut pages = Vec::new();
+        pages.try_reserve_exact(page_count).ok()?;
+        let actual_bytes = pages
             .capacity()
-            .checked_mul(std::mem::size_of::<ColdGeometryRow>())?
+            .checked_mul(std::mem::size_of::<Arc<ColdGeometryPage>>())?
             .checked_add(std::mem::size_of::<ColdGeometrySnapshot>())?;
         if actual_bytes > budget.bytes_left {
             return None;
         }
-        rows.extend(index.rows.iter().skip(skip).cloned());
-        budget.work_left -= count;
+        pages.extend(index.pages.iter().skip(page_skip).cloned());
+        budget.work_left -= page_count;
         budget.bytes_left -= actual_bytes;
         Some(ColdGeometrySnapshot {
             source: retained.start..frontier,
-            rows,
+            pages,
+            head_skip: absolute_skip % ColdGeometryIndex::PAGE_ROWS,
+            row_count: count,
         })
     }
 
@@ -5545,7 +5611,8 @@ impl Screen {
                 sink,
                 interval: interval.clone(),
                 source: row..row,
-                rows: VecDeque::new(),
+                pages: VecDeque::new(),
+                head_skip: 0,
                 geometry_bytes: 0,
             });
         }
@@ -12041,6 +12108,158 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn admitted_geometry_pages_preserve_snapshots_across_append_and_eviction() {
+        fn capture(screen: &Screen) -> ColdGeometrySnapshot {
+            let index = screen.cold_geometry_index.as_ref().unwrap();
+            let mut budget = LineReadCaptureBudget::default();
+            let work_before = budget.work_left;
+            let snapshot = screen
+                .capture_cold_geometry(&index.sink, &index.interval, index.source.end, &mut budget)
+                .unwrap();
+            assert_eq!(work_before - budget.work_left, snapshot.pages.len());
+            assert_eq!(snapshot.rows().count(), snapshot.row_count);
+            let mut refused = LineReadCaptureBudget {
+                bytes_left: ScreenLineRead::MAX_PAYLOAD_BYTES,
+                work_left: snapshot.pages.len() - 1,
+            };
+            assert!(
+                screen
+                    .capture_cold_geometry(
+                        &index.sink,
+                        &index.interval,
+                        index.source.end,
+                        &mut refused,
+                    )
+                    .is_none()
+            );
+            snapshot
+        }
+        let mut terminal = crate::Terminal::new(
+            test_size(4, 8, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 700,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(Arc::new(TestColdScrollbackSink::default())),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "geometry-page-isolation",
+            Box::new(std::io::sink()),
+        );
+        for _ in 0..600 {
+            terminal.advance_bytes(b"x\r\n");
+        }
+        let before = capture(terminal.screen());
+        let expected: Vec<_> = before.rows().map(|row| row.geometry.clone()).collect();
+        assert_ne!(
+            before.pages.last().unwrap().rows.len(),
+            ColdGeometryIndex::PAGE_ROWS
+        );
+        for _ in 0..200 {
+            terminal.advance_bytes(b"yyyy\r\n");
+        }
+        let partial = capture(terminal.screen());
+        assert!(partial.head_skip > 0);
+        assert!(Arc::ptr_eq(&before.pages[0], &partial.pages[0]));
+        assert!(!Arc::ptr_eq(&before.pages[2], &partial.pages[2]));
+        for _ in 0..800 {
+            terminal.advance_bytes(b"zz\r\n");
+        }
+        let after = capture(terminal.screen());
+        assert!(after.source.start > before.source.end);
+        assert_eq!(
+            before
+                .rows()
+                .map(|row| row.geometry.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let index = terminal.screen().cold_geometry_index.as_ref().unwrap();
+        assert_eq!(
+            index.geometry_bytes,
+            index
+                .pages
+                .iter()
+                .map(|page| page.geometry_bytes)
+                .sum::<usize>()
+        );
+        assert!(
+            index.pages.len() <= 4,
+            "evicted pages must leave the live index"
+        );
+
+        // Optional geometry can be dropped independently of durable history.
+        // Rebuilding must retain a partial suffix, without authorizing it as a
+        // complete index until older uncaptured rows have all been evicted.
+        terminal.screen_mut().cold_geometry_index = None;
+        terminal.advance_bytes(b"new\r\n");
+        let screen = terminal.screen();
+        let partial = screen.cold_geometry_index.as_ref().unwrap();
+        assert!(partial.source.start > partial.interval.rows().unwrap().start);
+        assert!(screen
+            .capture_cold_geometry(
+                &partial.sink,
+                &partial.interval,
+                partial.source.end,
+                &mut LineReadCaptureBudget::default(),
+            )
+            .is_none());
+        for _ in 0..800 {
+            terminal.advance_bytes(b"ok\r\n");
+        }
+        let recovered = capture(terminal.screen());
+        assert!(recovered.row_count > 0);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_above_capture_row_budget_avoids_payload_fallback() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(4, 8, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 100_000,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "large-cold-geometry-test",
+            Box::new(std::io::sink()),
+        );
+        for _ in 0..65_550 {
+            terminal.advance_bytes(b"x\r\n");
+        }
+        terminal.resize(test_size(4, 7, 96));
+        let screen = terminal.screen();
+        let index = screen
+            .cold_geometry_index
+            .as_ref()
+            .expect("short rows must retain their admitted geometry");
+        assert!(index.source.end - index.source.start > 65_536);
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let plan = screen.capture_line_read(0..1).unwrap();
+        assert!(plan.layout.is_none(), "the width changed");
+        assert!(
+            plan.geometry.is_some(),
+            "a one-row viewport must not decode the entire cold history merely because its compact index exceeds 65536 rows"
+        );
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let ready = plan.hydrate(|| false).unwrap();
+        assert_eq!(ready.lines().next().unwrap().as_str(), "x");
+        assert!(sink.batch_reads.load(Ordering::Relaxed) <= 1);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn admitted_geometry_native_parser_corpus_avoids_history_reads() {
         const PARAGRAPHS: usize = 10_000;
         let sink = Arc::new(TestColdScrollbackSink::default());
@@ -12092,7 +12311,7 @@ pub(crate) mod tests {
         assert!(screen.stored_physical_layout.is_none());
         let plan = screen.capture_line_read(0..1).unwrap();
         assert!(plan.layout.is_none());
-        assert!(plan.geometry.as_ref().unwrap().rows.len() >= PARAGRAPHS * 3);
+        assert!(plan.geometry.as_ref().unwrap().row_count >= PARAGRAPHS * 3);
         sink.batch_reads.store(0, Ordering::Relaxed);
         COLD_GEOMETRY_COUNT_REUSES.with(|n| n.set(0));
         let (geometry, _) = plan
@@ -12470,7 +12689,7 @@ pub(crate) mod tests {
         assert_eq!(budget.work_left, 65_536);
         let mut budget = LineReadCaptureBudget {
             bytes_left: ScreenLineRead::MAX_PAYLOAD_BYTES,
-            work_left: 5,
+            work_left: 0,
         };
         assert!(screen
             .capture_cold_geometry(&trait_sink, &interval, 6, &mut budget)
