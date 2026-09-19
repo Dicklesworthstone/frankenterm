@@ -1019,6 +1019,25 @@ pub enum ScrollbackIntervalCapture {
     Unavailable,
 }
 
+/// Nonblocking snapshot of cold-tier scrollback usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ScrollbackUsage {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+/// Outcome of attempting to capture cold-tier scrollback usage without blocking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackUsageCapture {
+    Ready(ScrollbackUsage),
+    /// Sink state or lock is currently held across IO or another operation.
+    Busy,
+    /// Nonblocking usage capture is not supported by this sink backend.
+    Unsupported,
+    /// Poisoned or indeterminate state cannot provide trustworthy counts.
+    Unavailable,
+}
+
 /// Ownership admission, optionally bound to the exact append-only interval
 /// under the same mutation guard as the admitted row. This is not durability
 /// or authenticated decode evidence. An unwitnessed admission remains readable
@@ -1053,6 +1072,16 @@ pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
     /// remain unavailable until authoritative reopen/reconciliation.
     fn try_capture_scrollback_interval(&self) -> ScrollbackIntervalCapture {
         ScrollbackIntervalCapture::Unavailable
+    }
+
+    /// Nonblocking coherent retained row count and byte count.
+    ///
+    /// Implementations must not call blocking metadata getters, wait for locks
+    /// held across IO, or scan rows. Sinks that do not implement nonblocking
+    /// usage return `ScrollbackUsageCapture::Unsupported` (the default).
+    /// They must not return false zero counts or call blocking getters.
+    fn try_capture_scrollback_usage(&self) -> ScrollbackUsageCapture {
+        ScrollbackUsageCapture::Unsupported
     }
 
     /// Retain a row that just left the in-memory hot tier.

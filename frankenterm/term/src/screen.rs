@@ -7626,9 +7626,51 @@ impl Screen {
         self.last_viewport_first_reflow_us
     }
 
+    /// Returns a nonblocking snapshot of tiered scrollback state.
+    ///
+    /// If an external cold sink is present, its coherent usage is probed
+    /// without blocking. Lock contention returns `Err(ColdReadMetadataBusy)`.
+    /// Unsupported or untrustworthy usage returns `Ok(None)` instead of false
+    /// zero counts; this telemetry is not cold-read or recovery authority.
+    pub fn try_tiered_scrollback_status(
+        &self,
+    ) -> Result<Option<TieredScrollbackStatus>, ColdReadMetadataBusy> {
+        let (cold_sink_retained_lines, cold_sink_retained_bytes) =
+            if let Some(sink) = self.config.scrollback_spill_sink() {
+                match sink.try_capture_scrollback_usage() {
+                    crate::config::ScrollbackUsageCapture::Ready(usage) => {
+                        (usage.rows, usage.bytes)
+                    }
+                    crate::config::ScrollbackUsageCapture::Busy => {
+                        return Err(ColdReadMetadataBusy);
+                    }
+                    crate::config::ScrollbackUsageCapture::Unsupported
+                    | crate::config::ScrollbackUsageCapture::Unavailable => return Ok(None),
+                }
+            } else {
+                (0, 0)
+            };
+
+        Ok(Some(self.tiered_scrollback_status_with_usage(
+            cold_sink_retained_lines,
+            cold_sink_retained_bytes,
+        )))
+    }
+
     /// Returns a stable snapshot of the tiered scrollback state for telemetry,
     /// diagnostics, and future GUI surfaces.
     pub fn tiered_scrollback_status(&self) -> TieredScrollbackStatus {
+        self.tiered_scrollback_status_with_usage(
+            self.cold_sink_retained_rows(),
+            self.cold_sink_retained_bytes(),
+        )
+    }
+
+    fn tiered_scrollback_status_with_usage(
+        &self,
+        cold_sink_retained_lines: usize,
+        cold_sink_retained_bytes: usize,
+    ) -> TieredScrollbackStatus {
         let tier = self.config.scrollback_tier_config();
         let tiering_enabled = self.allow_scrollback && tier.enabled;
         let configured_scrollback_rows = if self.allow_scrollback {
@@ -7658,8 +7700,8 @@ impl Screen {
             warm_spill_bytes_total: self.scrollback_tiering.warm_spill_bytes_total,
             cold_spill_lines_total: self.scrollback_tiering.cold_spill_lines_total,
             cold_spill_bytes_total: self.scrollback_tiering.cold_spill_bytes_total,
-            cold_sink_retained_lines: self.cold_sink_retained_rows(),
-            cold_sink_retained_bytes: self.cold_sink_retained_bytes(),
+            cold_sink_retained_lines,
+            cold_sink_retained_bytes,
             cold_worker_peak_backlog_depth: self.cold_scrollback_worker.peak_backlog_depth(),
             cold_worker_completion_throughput_lines_per_sec: self
                 .cold_scrollback_worker
@@ -10424,6 +10466,9 @@ pub(crate) mod tests {
             }
             self.inner.try_capture_scrollback_interval()
         }
+        fn try_capture_scrollback_usage(&self) -> crate::config::ScrollbackUsageCapture {
+            self.inner.try_capture_scrollback_usage()
+        }
         fn store_scrollback_line(&self, row: StableRowIndex, line: &Line, limit: usize) -> bool {
             self.inner.store_scrollback_line(row, line, limit)
         }
@@ -11000,6 +11045,17 @@ pub(crate) mod tests {
                     .zip(state.1.last_key_value())
                     .map(|((first, _), (last, _))| *first..*last + 1);
                 state.0.capture(range)
+            }
+            fn try_capture_scrollback_usage(&self) -> crate::config::ScrollbackUsageCapture {
+                let Ok(state) = self.state.try_lock() else {
+                    return crate::config::ScrollbackUsageCapture::Busy;
+                };
+                let count = state.1.len();
+                let bytes = state.1.values().map(Screen::estimate_line_bytes).sum();
+                crate::config::ScrollbackUsageCapture::Ready(crate::config::ScrollbackUsage {
+                    rows: count,
+                    bytes,
+                })
             }
         }
         let sink = Arc::new(Sink {
@@ -12914,6 +12970,21 @@ pub(crate) mod tests {
             identity.capture(range)
         }
 
+        fn try_capture_scrollback_usage(&self) -> crate::config::ScrollbackUsageCapture {
+            if self.force_busy_probe.load(Ordering::Relaxed) {
+                return crate::config::ScrollbackUsageCapture::Busy;
+            }
+            let Ok(rows) = self.rows.try_lock() else {
+                return crate::config::ScrollbackUsageCapture::Busy;
+            };
+            let count = rows.len();
+            let bytes = rows.values().map(Screen::estimate_line_bytes).sum();
+            crate::config::ScrollbackUsageCapture::Ready(crate::config::ScrollbackUsage {
+                rows: count,
+                bytes,
+            })
+        }
+
         fn store_scrollback_line(
             &self,
             stable_row: StableRowIndex,
@@ -13197,6 +13268,13 @@ pub(crate) mod tests {
 
         fn retained_scrollback_bytes(&self) -> usize {
             0
+        }
+
+        fn try_capture_scrollback_usage(&self) -> crate::config::ScrollbackUsageCapture {
+            crate::config::ScrollbackUsageCapture::Ready(crate::config::ScrollbackUsage {
+                rows: 0,
+                bytes: 0,
+            })
         }
 
         fn snapshot_scrollback(

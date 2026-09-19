@@ -1708,7 +1708,10 @@ impl Pane for LocalPane {
         let mouse_grabbed = term.is_mouse_grabbed();
         let alt_screen_active = term.is_alt_screen_active();
 
-        let tiered_scrollback_status = Some(term.screen().tiered_scrollback_status().into());
+        let tiered_scrollback_status = match term.screen().try_tiered_scrollback_status() {
+            Ok(status) => status.map(Into::into),
+            Err(busy) => return Some(Err(busy)),
+        };
 
         let cursor_position = terminal_get_cursor_position(&mut term);
 
@@ -5199,6 +5202,28 @@ mod tests {
                     .zip(rows.1.last_key_value())
                     .map(|((&first, _), (&last, _))| first..last + 1),
             )
+        }
+
+        fn try_capture_scrollback_usage(
+            &self,
+        ) -> frankenterm_term::config::ScrollbackUsageCapture {
+            use frankenterm_term::config::ScrollbackUsageCapture;
+            if self.unavailable.load(Ordering::Acquire) {
+                return ScrollbackUsageCapture::Unsupported;
+            }
+            if self.busy.load(Ordering::Acquire) {
+                self.busy_observations.fetch_add(1, Ordering::Release);
+                return ScrollbackUsageCapture::Busy;
+            }
+            let Some(rows) = self.rows.try_lock() else {
+                return ScrollbackUsageCapture::Busy;
+            };
+            let count = rows.1.len();
+            let bytes = rows.1.values().map(|l| l.scan_line().len()).sum();
+            ScrollbackUsageCapture::Ready(frankenterm_term::config::ScrollbackUsage {
+                rows: count,
+                bytes,
+            })
         }
 
         fn store_scrollback_line(&self, row: StableRowIndex, line: &Line, limit: usize) -> bool {
@@ -10100,6 +10125,21 @@ mod tests {
             self.rows.lock().unwrap().len() * 80
         }
 
+        fn try_capture_scrollback_usage(
+            &self,
+        ) -> frankenterm_term::config::ScrollbackUsageCapture {
+            let Ok(rows) = self.rows.try_lock() else {
+                return frankenterm_term::config::ScrollbackUsageCapture::Busy;
+            };
+            let count = rows.len();
+            frankenterm_term::config::ScrollbackUsageCapture::Ready(
+                frankenterm_term::config::ScrollbackUsage {
+                    rows: count,
+                    bytes: count * 80,
+                },
+            )
+        }
+
         fn try_capture_scrollback_interval(
             &self,
         ) -> frankenterm_term::config::ScrollbackIntervalCapture {
@@ -10577,7 +10617,27 @@ mod tests {
             );
         }
 
-        // 4. Uncontended call succeeds
+        // 4. Cold sink busy refusal
+        {
+            let (cold_pane, _mux, _reg, sink, _token) = cold_resize_fixture(false);
+            sink.busy.store(true, Ordering::Release);
+            let result = cold_pane.capture_surface_snapshot(0);
+            assert!(
+                matches!(
+                    result,
+                    Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                ),
+                "cold sink busy must return Some(Err(ColdReadMetadataBusy))"
+            );
+            sink.busy.store(false, Ordering::Release);
+            let result = cold_pane.capture_surface_snapshot(0);
+            assert!(result.is_some() && result.as_ref().unwrap().is_ok());
+            let snap = result.unwrap().unwrap();
+            let status = snap.tiered_scrollback_status.expect("tiered status ready");
+            assert_eq!(status.cold_sink_retained_lines, sink.retained_scrollback_rows());
+        }
+
+        // 5. Uncontended call succeeds
         let result = pane.capture_surface_snapshot(0);
         assert!(result.is_some() && result.as_ref().unwrap().is_ok());
     }
@@ -10661,6 +10721,13 @@ mod tests {
         // Viewport lines must capture resident rows only
         assert_eq!(snap.dimensions.viewport_rows, 2);
         assert_eq!(snap.viewport_lines.1.len(), 2);
+        assert_eq!(
+            snap.tiered_scrollback_status
+                .as_ref()
+                .expect("tiered status")
+                .cold_sink_retained_lines,
+            sink.retained_scrollback_rows()
+        );
 
         // Zero cold storage payload reads must have been attempted
         let reads_after = sink.payload_reads.load(Ordering::Relaxed);

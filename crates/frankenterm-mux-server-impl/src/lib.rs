@@ -393,7 +393,7 @@ mod deferred_scrollback {
         ScrollbackClearCommit, ScrollbackIntervalCapture, ScrollbackIntervalIdentity,
         ScrollbackPrefix, ScrollbackReplaceCommit, ScrollbackSnapshot,
         ScrollbackSnapshotGeneration, ScrollbackSnapshotLimits, ScrollbackSpillError,
-        ScrollbackSpillSink,
+        ScrollbackSpillSink, ScrollbackUsage, ScrollbackUsageCapture,
     };
     use wezterm_term::{Line, StableRowIndex};
 
@@ -594,6 +594,29 @@ mod deferred_scrollback {
                 _ => return ScrollbackIntervalCapture::Unavailable,
             };
             state.interval_identity.capture(rows)
+        }
+
+        fn try_capture_scrollback_usage(&self) -> ScrollbackUsageCapture {
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(TryLockError::WouldBlock) => return ScrollbackUsageCapture::Busy,
+                Err(TryLockError::Poisoned(_)) => return ScrollbackUsageCapture::Unavailable,
+            };
+            if state.publication_uncertain {
+                return ScrollbackUsageCapture::Unavailable;
+            }
+            let rows = match (state.oldest, state.newest_exclusive) {
+                (Some(oldest), Some(newest)) => {
+                    let Some(rows) = newest.checked_sub(oldest).and_then(|r| usize::try_from(r).ok()) else {
+                        return ScrollbackUsageCapture::Unavailable;
+                    };
+                    rows
+                }
+                (None, _) => 0,
+                (Some(_), None) => return ScrollbackUsageCapture::Unavailable,
+            };
+            let bytes = state.durable_bytes.saturating_add(state.pending_bytes);
+            ScrollbackUsageCapture::Ready(ScrollbackUsage { rows, bytes })
         }
 
         fn store_scrollback_line(
@@ -1104,6 +1127,87 @@ mod deferred_scrollback {
                 .map(|row| row.charged_bytes)
                 .sum::<usize>()
         );
+    }
+
+    #[test]
+    fn deferred_scrollback_usage_exact_counts_and_unavailable_states() {
+        use wezterm_term::CellAttributes;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let line1 = Line::from_text("first line", &CellAttributes::blank(), 0, None);
+        let line2 = Line::from_text("second line", &CellAttributes::blank(), 1, None);
+
+        // Initially empty
+        let ScrollbackUsageCapture::Ready(initial_usage) =
+            deferred.try_capture_scrollback_usage()
+        else {
+            panic!("initial usage must be ready");
+        };
+        assert_eq!(initial_usage.rows, 0);
+        assert_eq!(initial_usage.bytes, 0);
+
+        // Store two lines
+        assert!(deferred.store_scrollback_line(0, &line1, 10));
+        assert!(deferred.store_scrollback_line(1, &line2, 10));
+
+        // Before flush: pending in memory
+        let ScrollbackUsageCapture::Ready(pending_usage) =
+            deferred.try_capture_scrollback_usage()
+        else {
+            panic!("usage with pending lines must be ready");
+        };
+        assert_eq!(pending_usage.rows, 2);
+        assert!(pending_usage.bytes > 0);
+        assert_eq!(pending_usage.bytes, deferred.retained_scrollback_bytes());
+
+        // Flush lines to durable store
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 2);
+
+        // After flush: durable in backing
+        let ScrollbackUsageCapture::Ready(flushed_usage) =
+            deferred.try_capture_scrollback_usage()
+        else {
+            panic!("usage after flush must be ready");
+        };
+        assert_eq!(flushed_usage.rows, 2);
+        assert_eq!(flushed_usage.bytes, backing.retained_scrollback_bytes());
+
+        // 1. Held-state regression: when state lock is held (as during IO operations),
+        // try_capture_scrollback_usage must return Busy immediately without blocking.
+        {
+            let _held = deferred.state.lock().unwrap();
+            assert_eq!(
+                deferred.try_capture_scrollback_usage(),
+                ScrollbackUsageCapture::Busy,
+                "held state lock must yield Busy usage"
+            );
+        }
+
+        // Lock released: usage is Ready again
+        assert_eq!(
+            deferred.try_capture_scrollback_usage(),
+            ScrollbackUsageCapture::Ready(flushed_usage)
+        );
+
+        // Indeterminate publication cannot be described as transient contention.
+        deferred.state.lock().unwrap().publication_uncertain = true;
+        assert_eq!(
+            deferred.try_capture_scrollback_usage(),
+            ScrollbackUsageCapture::Unavailable,
+            "uncertain publication must not fabricate counts"
+        );
+        deferred.state.lock().unwrap().publication_uncertain = false;
+        deferred.clear_scrollback().unwrap();
+
+        // After clear completion: usage is Ready and reset to 0
+        let ScrollbackUsageCapture::Ready(cleared_usage) =
+            deferred.try_capture_scrollback_usage()
+        else {
+            panic!("usage after clear must be ready");
+        };
+        assert_eq!(cleared_usage.rows, 0);
+        assert_eq!(cleared_usage.bytes, 0);
     }
 }
 
