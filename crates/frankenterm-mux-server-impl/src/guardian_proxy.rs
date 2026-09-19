@@ -4714,7 +4714,7 @@ impl GuardianProxyLeasePlan {
                         "successor image has no acknowledged custody selector",
                     ))?
                     .into();
-            if expected.broker_incarnation != custody.context().broker_incarnation {
+            if expected.broker_incarnation != custody.broker_incarnation() {
                 return Err(GuardianProxyError::InvalidConfiguration(
                     "successor custody broker lineage mismatch",
                 ));

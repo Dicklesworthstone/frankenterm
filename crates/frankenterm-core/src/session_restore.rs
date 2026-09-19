@@ -6947,7 +6947,7 @@ impl WholeMuxRecoveryVerifier {
         if let Some(expected) = acknowledged_successor {
             let expected: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 =
                 (*expected).into();
-            if expected.broker_incarnation != custody.context().broker_incarnation {
+            if expected.broker_incarnation != custody.broker_incarnation() {
                 return Err(fail());
             }
             let successor =

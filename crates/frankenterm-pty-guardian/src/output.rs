@@ -755,6 +755,12 @@ impl GuardianDurableSpawnCustodyV1 {
         self.context.scope()
     }
 
+    /// Nonsecret broker identity recovered from authenticated Spawn custody.
+    /// This comparison value grants no lease or access to the stored secret.
+    pub const fn broker_incarnation(&self) -> Uuid {
+        self.context.broker_incarnation
+    }
+
     /// Reopen an acknowledged, protected checkpoint using existing private
     /// custody and catalog bytes only. This grants offline verification, never
     /// a writer lease or permission to rotate a later successor generation.
@@ -12803,6 +12809,10 @@ mod tests {
         let store = pipeline.checkpoint_stage_store();
         let recovered = store.lookup_spawn_custody(scope)?;
         let context = recovered.context();
+        assert_eq!(
+            recovered.broker_incarnation(),
+            spawn_custody_context().broker_incarnation
+        );
         let open_birth = |guardian, owner, pane, effect, build| {
             GuardianDurableSpawnCustodyV1::open_existing_for_birth(
                 &directory.join("guardian.token"),
