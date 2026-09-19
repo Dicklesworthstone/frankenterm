@@ -79975,7 +79975,7 @@ async fn run_recovery_key_command(
         if value.len() != 64 || !value.is_ascii() {
             anyhow::bail!("recovery enrollment identifiers require 64 hexadecimal digits");
         }
-        for (byte, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        for (byte, pair) in result.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
             let high = char::from(pair[0]).to_digit(16);
             let low = char::from(pair[1]).to_digit(16);
             let (Some(high), Some(low)) = (high, low) else {
