@@ -3405,7 +3405,7 @@ mod tests {
 
     #[test]
     fn gui_retained_pane_state_budget_rejects_zero_and_accepts_large_fleets() {
-        use wezterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+        use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
         for limit in [0_u64, 1, 4096, 65_536] {
             let mut values = std::collections::BTreeMap::new();
             values.insert(
