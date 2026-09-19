@@ -3655,7 +3655,14 @@ impl LocalPane {
                     sink = current;
                     match result {
                         frankenterm_term::DeferredScrollbackTrim::Settled { moved: false } => {
-                            return
+                            if needs_flush {
+                                return;
+                            }
+                            // Resize/configuration may settle the overflow
+                            // between yielded slices. Earlier slices still
+                            // own queued rows that must reach durability.
+                            needs_flush = true;
+                            false
                         }
                         frankenterm_term::DeferredScrollbackTrim::Yielded => {
                             needs_flush = false;
@@ -10088,6 +10095,8 @@ mod tests {
         generation: std::sync::Mutex<frankenterm_term::config::ScrollbackSnapshotGeneration>,
         mutate_on_snapshot: std::sync::atomic::AtomicBool,
         snapshot_probe: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        deferred: std::sync::atomic::AtomicBool,
+        flushed_rows: AtomicUsize,
     }
 
     impl std::fmt::Debug for MuxCheckpointTestSink {
@@ -10109,6 +10118,8 @@ mod tests {
                 ),
                 mutate_on_snapshot: std::sync::atomic::AtomicBool::new(false),
                 snapshot_probe: std::sync::Mutex::new(None),
+                deferred: std::sync::atomic::AtomicBool::new(false),
+                flushed_rows: AtomicUsize::new(0),
             }
         }
 
@@ -10119,6 +10130,16 @@ mod tests {
     }
 
     impl frankenterm_term::config::ScrollbackSpillSink for MuxCheckpointTestSink {
+        fn requires_scrollback_flush(&self) -> bool {
+            self.deferred.load(Ordering::SeqCst)
+        }
+
+        fn flush_scrollback(&self) -> Result<(), frankenterm_term::config::ScrollbackSpillError> {
+            self.flushed_rows
+                .store(self.rows.lock().unwrap().len(), Ordering::SeqCst);
+            Ok(())
+        }
+
         fn clear_scrollback(
             &self,
         ) -> Result<
@@ -10284,6 +10305,64 @@ mod tests {
             [0x88; 16],
             "legacy-test-pane".to_string(),
         )
+    }
+
+    #[test]
+    fn deferred_scrollback_flushes_when_overflow_settles_between_slices() {
+        #[derive(Debug)]
+        struct SettlingConfig(Arc<MuxCheckpointTestSink>);
+
+        impl TerminalConfiguration for SettlingConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+
+            fn scrollback_size(&self) -> usize {
+                2048
+            }
+
+            fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+                // Model a configuration change at the slice boundary without
+                // scheduler timing: the first slice admits 16 rows, then the
+                // new hot budget accommodates every remaining resident row.
+                let settled = !self.0.deferred.load(Ordering::SeqCst)
+                    || self.0.rows.lock().unwrap().len() >= 16;
+                frankenterm_term::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: if settled { 1000 } else { 1 },
+                    warm_max_bytes: 0,
+                }
+            }
+
+            fn scrollback_spill_sink(
+                &self,
+            ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let mut terminal = Terminal::new(
+            term_size(80, 4),
+            Arc::new(SettlingConfig(sink.clone())),
+            "FrankenTerm",
+            "deferred-settlement-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for row in 0..50 {
+            terminal.advance_bytes(format!("row-{row:02}\r\n").as_bytes());
+        }
+        assert!(sink.rows.lock().unwrap().is_empty());
+        sink.deferred.store(true, Ordering::SeqCst);
+        let pane = make_legacy_test_pane(786, terminal);
+        pane.drain_scrollback_outside_terminal(sink.clone());
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 16, "one geometry slice must have been queued");
+        assert_eq!(sink.flushed_rows.load(Ordering::SeqCst), rows.len());
+        for (index, (stable_row, line)) in rows.iter().enumerate() {
+            assert_eq!(*stable_row, index as StableRowIndex);
+            assert_eq!(line.as_str().trim_end(), format!("row-{index:02}"));
+        }
     }
 
     fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
