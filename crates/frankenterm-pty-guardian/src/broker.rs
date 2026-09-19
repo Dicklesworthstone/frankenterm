@@ -4320,6 +4320,15 @@ impl BrokerLiveSpawnV1 {
         let Some(attachment) = attachment else {
             return Ok(None);
         };
+        if matches!(
+            self.adoption.pane.status().lifecycle,
+            BrokerPaneLifecycleV1::Quarantined(_)
+        ) {
+            // A failed Claim/ACK can retain pending_successor for diagnosis.
+            // Its later connection EOF must preserve the original quarantine
+            // cause and attachment fence, just as the pane-level EOF path does.
+            return Err(BrokerError::Quarantined);
+        }
         if self
             .pending_successor
             .as_ref()
