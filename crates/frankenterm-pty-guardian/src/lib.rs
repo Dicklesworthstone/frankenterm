@@ -88,8 +88,9 @@ pub use broker::{
 pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
 #[cfg(unix)]
 pub use output::{
-    GuardianCheckpointAdoptionSelectorV1, GuardianDurableSpawnCustodyV1,
-    GuardianDurableSuccessorCustodyV1, GuardianReopenedCheckpointV1,
+    GuardianCheckpointAdoptionSelectorV1, GuardianDurableRecoveryClaimIntentV1,
+    GuardianDurableSpawnCustodyV1, GuardianDurableSuccessorCustodyV1,
+    GuardianRecoveryClaimAdmission, GuardianReopenedCheckpointV1,
 };
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};

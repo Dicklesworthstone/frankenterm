@@ -2052,6 +2052,29 @@ pub struct GuardianClaimedPaneLease {
     successor_claim: Option<GuardianAcknowledgedSuccessorClaim>,
 }
 
+/// An authenticated historical Claim result. It is deliberately not accepted
+/// by pane writers: the owner may have retired since this reply was recorded.
+pub struct GuardianClaimResolution {
+    client: GuardianClient,
+    pane_id: Uuid,
+    generation: u64,
+    successor_claim: Option<GuardianAcknowledgedSuccessorClaim>,
+}
+
+impl GuardianClaimResolution {
+    pub const fn acknowledged_successor_claim(&self) -> Option<GuardianAcknowledgedSuccessorClaim> {
+        self.successor_claim
+    }
+
+    pub fn authenticate_attachment(self) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        let mut lease = self
+            .client
+            .attach(self.pane_id, self.generation, Uuid::new_v4())?;
+        lease.successor_claim = self.successor_claim;
+        Ok(lease)
+    }
+}
+
 /// Nonsecret selector authority minted only by a successful custody-backed Claim.
 #[derive(Clone, Copy)]
 pub struct GuardianAcknowledgedSuccessorClaim {
@@ -2302,11 +2325,21 @@ impl GuardianSuccessorRotationClient {
         request_id: Uuid,
         handoff_id: Uuid,
     ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        self.resolve_mux_successor(custody, request_id, handoff_id)?
+            .authenticate_attachment()
+    }
+
+    pub fn resolve_mux_successor(
+        self,
+        custody: crate::output::GuardianDurableSuccessorCustodyV1,
+        request_id: Uuid,
+        handoff_id: Uuid,
+    ) -> Result<GuardianClaimResolution, GuardianClientError> {
         let context = custody.context();
         let payload = custody
             .into_mux_rotation_payload()
             .map_err(|_| GuardianClientError::Setup(GuardianServiceError::OutputInitialization))?;
-        self.client.claim_with_payload(
+        self.client.resolve_claim_with_payload(
             context.pane_id,
             context.lease_generation,
             request_id,
@@ -2458,6 +2491,23 @@ impl GuardianClient {
         )
     }
 
+    /// Resolve the exact operation history without asserting current ownership.
+    pub fn resolve_claim(
+        self,
+        pane_id: Uuid,
+        observed_generation: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+    ) -> Result<GuardianClaimResolution, GuardianClientError> {
+        self.resolve_claim_with_payload(
+            pane_id,
+            observed_generation,
+            request_id,
+            effect_id,
+            Zeroizing::new(Vec::new()),
+        )
+    }
+
     /// Transfer an initial pane using possession of its existing private
     /// custody capability. This does not publish a mux pane or a topology.
     pub fn claim_mux_successor(
@@ -2466,21 +2516,49 @@ impl GuardianClient {
         request_id: Uuid,
         handoff_id: Uuid,
     ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        self.resolve_mux_successor(custody, request_id, handoff_id)?
+            .authenticate_attachment()
+    }
+
+    pub fn resolve_mux_successor(
+        self,
+        custody: crate::output::GuardianDurableSpawnCustodyV1,
+        request_id: Uuid,
+        handoff_id: Uuid,
+    ) -> Result<GuardianClaimResolution, GuardianClientError> {
         let pane_id = custody.context().pane_id;
         let payload = custody
             .into_mux_rotation_payload()
             .map_err(|_| GuardianClientError::Setup(GuardianServiceError::OutputInitialization))?;
-        self.claim_with_payload(pane_id, 1, request_id, handoff_id, payload)
+        self.resolve_claim_with_payload(pane_id, 1, request_id, handoff_id, payload)
     }
 
     fn claim_with_payload(
-        mut self,
+        self,
         pane_id: Uuid,
         observed_generation: u64,
         request_id: Uuid,
         effect_id: Uuid,
         payload: Zeroizing<Vec<u8>>,
     ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        self.resolve_claim_with_payload(
+            pane_id,
+            observed_generation,
+            request_id,
+            effect_id,
+            payload,
+        )?
+        .authenticate_attachment()
+    }
+
+    fn resolve_claim_with_payload(
+        mut self,
+        pane_id: Uuid,
+        observed_generation: u64,
+        request_id: Uuid,
+        effect_id: Uuid,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> Result<GuardianClaimResolution, GuardianClientError> {
         if pane_id.is_nil() {
             return Err(GuardianClientError::Protocol(
                 GuardianProtocolError::ZeroIdentity("pane"),
@@ -2524,11 +2602,10 @@ impl GuardianClient {
         {
             return Err(GuardianClientError::UnexpectedReply);
         }
-        Ok(GuardianClaimedPaneLease {
+        Ok(GuardianClaimResolution {
             client: self,
             pane_id,
             generation,
-            next_sequence,
             successor_claim,
         })
     }

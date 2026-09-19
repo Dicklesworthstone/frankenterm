@@ -2855,6 +2855,148 @@ impl GuardianSuccessorCustodyContextV1 {
     }
 }
 
+/// Immutable outer recovery operation. These identities describe an intended
+/// Claim; neither this record nor a historical reply grants a live lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianRecoveryClaimIntentV1 {
+    pub root_envelope_sha256: [u8; 32],
+    pub image_digest: [u8; 32],
+    pub checkpoint_id: [u8; 32],
+    pub guardian_build: [u8; 32],
+    pub predecessor_mux_build: [u8; 32],
+    pub target_mux_build: [u8; 32],
+    pub image_generation: u64,
+    pub source_generation: u64,
+    pub predecessor_generation: u64,
+    pub adoption_sequence: u64,
+    pub pane_id: Uuid,
+    pub guardian_incarnation: Uuid,
+    pub parent_request_id: Uuid,
+    pub predecessor_mux_incarnation: Uuid,
+    pub target_mux_incarnation: Uuid,
+    pub request_id: Uuid,
+    pub effect_id: Uuid,
+    pub adoption_effect_id: Uuid,
+}
+
+const RECOVERY_CLAIM_INTENT_DOMAIN: &[u8] = b"frankenterm.guardian-recovery-claim-intent.v1\0";
+const RECOVERY_CLAIM_INTENT_PLAINTEXT_BYTES: usize = 352;
+pub const GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES: usize =
+    RECOVERY_CLAIM_INTENT_PLAINTEXT_BYTES + 24 + 16;
+
+impl GuardianRecoveryClaimIntentV1 {
+    fn encode(
+        self,
+    ) -> Result<[u8; RECOVERY_CLAIM_INTENT_PLAINTEXT_BYTES], GuardianSpawnCustodyError> {
+        if [
+            self.root_envelope_sha256,
+            self.image_digest,
+            self.checkpoint_id,
+            self.guardian_build,
+            self.predecessor_mux_build,
+            self.target_mux_build,
+        ]
+        .iter()
+        .any(|digest| *digest == [0; 32])
+            || [
+                self.pane_id,
+                self.guardian_incarnation,
+                self.predecessor_mux_incarnation,
+                self.target_mux_incarnation,
+                self.request_id,
+                self.effect_id,
+                self.adoption_effect_id,
+            ]
+            .iter()
+            .any(Uuid::is_nil)
+            || self.image_generation == 0
+            || self.source_generation == 0
+            || self.adoption_sequence == 0
+            || self.predecessor_generation < self.source_generation
+            || self.predecessor_generation == u64::MAX
+            || self.target_mux_incarnation == self.predecessor_mux_incarnation
+            || self.parent_request_id.is_nil()
+                != (self.predecessor_generation == self.source_generation)
+        {
+            return Err(GuardianSpawnCustodyError::InvalidIdentity);
+        }
+        let mut bytes = [0; RECOVERY_CLAIM_INTENT_PLAINTEXT_BYTES];
+        let mut cursor = 0;
+        for digest in [
+            self.root_envelope_sha256,
+            self.image_digest,
+            self.checkpoint_id,
+            self.guardian_build,
+            self.predecessor_mux_build,
+            self.target_mux_build,
+        ] {
+            bytes[cursor..cursor + 32].copy_from_slice(&digest);
+            cursor += 32;
+        }
+        for number in [
+            self.image_generation,
+            self.source_generation,
+            self.predecessor_generation,
+            self.adoption_sequence,
+        ] {
+            bytes[cursor..cursor + 8].copy_from_slice(&number.to_le_bytes());
+            cursor += 8;
+        }
+        for id in [
+            self.pane_id,
+            self.guardian_incarnation,
+            self.parent_request_id,
+            self.predecessor_mux_incarnation,
+            self.target_mux_incarnation,
+            self.request_id,
+            self.effect_id,
+            self.adoption_effect_id,
+        ] {
+            bytes[cursor..cursor + 16].copy_from_slice(id.as_bytes());
+            cursor += 16;
+        }
+        Ok(bytes)
+    }
+
+    fn decode(mut bytes: &[u8]) -> Result<Self, GuardianSpawnCustodyError> {
+        fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], GuardianSpawnCustodyError> {
+            let value = bytes
+                .get(..N)
+                .ok_or(GuardianSpawnCustodyError::Authentication)?;
+            let value = value
+                .try_into()
+                .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+            *bytes = &bytes[N..];
+            Ok(value)
+        }
+        let intent = Self {
+            root_envelope_sha256: take(&mut bytes)?,
+            image_digest: take(&mut bytes)?,
+            checkpoint_id: take(&mut bytes)?,
+            guardian_build: take(&mut bytes)?,
+            predecessor_mux_build: take(&mut bytes)?,
+            target_mux_build: take(&mut bytes)?,
+            image_generation: u64::from_le_bytes(take(&mut bytes)?),
+            source_generation: u64::from_le_bytes(take(&mut bytes)?),
+            predecessor_generation: u64::from_le_bytes(take(&mut bytes)?),
+            adoption_sequence: u64::from_le_bytes(take(&mut bytes)?),
+            pane_id: Uuid::from_bytes(take(&mut bytes)?),
+            guardian_incarnation: Uuid::from_bytes(take(&mut bytes)?),
+            parent_request_id: Uuid::from_bytes(take(&mut bytes)?),
+            predecessor_mux_incarnation: Uuid::from_bytes(take(&mut bytes)?),
+            target_mux_incarnation: Uuid::from_bytes(take(&mut bytes)?),
+            request_id: Uuid::from_bytes(take(&mut bytes)?),
+            effect_id: Uuid::from_bytes(take(&mut bytes)?),
+            adoption_effect_id: Uuid::from_bytes(take(&mut bytes)?),
+        };
+        if !bytes.is_empty() {
+            return Err(GuardianSpawnCustodyError::Authentication);
+        }
+        intent.encode()?;
+        Ok(intent)
+    }
+}
+
 /// Typed checkpoint and Spawn-custody encryption backed by the guardian output key.
 /// No key bytes, generic AAD, or caller-selected nonce are exposed. Custody uses
 /// a distinct domain and fresh random nonces; it cannot mint checkpoint receipts.
@@ -2867,6 +3009,35 @@ pub struct GuardianCheckpointCipher {
 }
 
 impl GuardianCheckpointCipher {
+    pub fn seal_recovery_claim_intent(
+        &self,
+        intent: GuardianRecoveryClaimIntentV1,
+    ) -> Result<[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES], GuardianSpawnCustodyError> {
+        let plaintext = Zeroizing::new(intent.encode()?);
+        let (nonce, ciphertext) = self
+            .output_cipher
+            .seal_guardian_metadata(plaintext.as_slice(), RECOVERY_CLAIM_INTENT_DOMAIN)
+            .map_err(|_| GuardianSpawnCustodyError::Encryption)?;
+        let mut bytes = [0; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES];
+        bytes[..24].copy_from_slice(&nonce);
+        bytes[24..].copy_from_slice(&ciphertext);
+        Ok(bytes)
+    }
+
+    pub fn open_recovery_claim_intent(
+        &self,
+        bytes: &[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES],
+    ) -> Result<GuardianRecoveryClaimIntentV1, GuardianSpawnCustodyError> {
+        let nonce = bytes[..24]
+            .try_into()
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        let plaintext = self
+            .output_cipher
+            .open_guardian_metadata(nonce, &bytes[24..], RECOVERY_CLAIM_INTENT_DOMAIN)
+            .map_err(|_| GuardianSpawnCustodyError::Authentication)?;
+        GuardianRecoveryClaimIntentV1::decode(&plaintext)
+    }
+
     pub fn seal_successor_custody(
         &self,
         context: GuardianSuccessorCustodyContextV1,
@@ -5643,6 +5814,7 @@ mod tests {
     ];
 
     const PERSISTED_RECORD_TYPES: &[&str] = &[
+        "GuardianRecoveryClaimIntentV1",
         "GuardianSpawnCustodyScopeV1",
         "GuardianSpawnCaptureProvenanceV1",
         "GuardianSuccessorCustodyContextV1",
@@ -9730,6 +9902,72 @@ mod tests {
     }
 
     #[test]
+    fn recovery_claim_intent_authenticates_builds_lineage_and_operation_ids() {
+        let intent = GuardianRecoveryClaimIntentV1 {
+            root_envelope_sha256: [1; 32],
+            image_digest: [2; 32],
+            checkpoint_id: [3; 32],
+            guardian_build: [4; 32],
+            predecessor_mux_build: [5; 32],
+            target_mux_build: [6; 32],
+            image_generation: 1,
+            source_generation: 2,
+            predecessor_generation: 2,
+            adoption_sequence: 7,
+            pane_id: Uuid::from_bytes([8; 16]),
+            guardian_incarnation: Uuid::from_bytes([9; 16]),
+            parent_request_id: Uuid::nil(),
+            predecessor_mux_incarnation: Uuid::from_bytes([10; 16]),
+            target_mux_incarnation: Uuid::from_bytes([11; 16]),
+            request_id: Uuid::from_bytes([12; 16]),
+            effect_id: Uuid::from_bytes([13; 16]),
+            adoption_effect_id: Uuid::from_bytes([14; 16]),
+        };
+        let cipher = checkpoint_stage_cipher(0x41);
+        let bytes = cipher.seal_recovery_claim_intent(intent).unwrap();
+        assert_eq!(cipher.open_recovery_claim_intent(&bytes).unwrap(), intent);
+        assert!(checkpoint_stage_cipher(0x42)
+            .open_recovery_claim_intent(&bytes)
+            .is_err());
+        for index in 0..bytes.len() {
+            let mut changed = bytes;
+            changed[index] ^= 1;
+            assert!(
+                cipher.open_recovery_claim_intent(&changed).is_err(),
+                "byte {index}"
+            );
+        }
+        assert!(cipher
+            .seal_recovery_claim_intent(GuardianRecoveryClaimIntentV1 {
+                target_mux_build: [0; 32],
+                ..intent
+            })
+            .is_err());
+        assert!(cipher
+            .seal_recovery_claim_intent(GuardianRecoveryClaimIntentV1 {
+                predecessor_generation: 3,
+                ..intent
+            })
+            .is_err());
+        let child = GuardianRecoveryClaimIntentV1 {
+            parent_request_id: intent.request_id,
+            predecessor_mux_incarnation: intent.target_mux_incarnation,
+            target_mux_incarnation: Uuid::from_bytes([15; 16]),
+            predecessor_mux_build: intent.target_mux_build,
+            predecessor_generation: 3,
+            request_id: Uuid::from_bytes([16; 16]),
+            effect_id: Uuid::from_bytes([17; 16]),
+            ..intent
+        };
+        assert_eq!(
+            cipher
+                .open_recovery_claim_intent(&cipher.seal_recovery_claim_intent(child).unwrap())
+                .unwrap(),
+            child
+        );
+    }
+
+    #[test]
     fn successor_custody_authenticates_every_owner_and_handoff_byte() {
         let owner = GuardianSuccessorCustodyOwnerV1 {
             guardian_incarnation: Uuid::from_bytes([1; 16]),
@@ -11686,6 +11924,8 @@ mod tests {
 
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
+            "seal_recovery_claim_intent:pub:GuardianRecoveryClaimIntentV1",
+            "open_recovery_claim_intent:pub:u8",
             "seal_successor_custody:pub:GuardianSuccessorCustodyContextV1,u8",
             "open_successor_custody_record:pub:u8",
             "open_spawn_custody_record:pub:u8",
@@ -11725,6 +11965,14 @@ mod tests {
 
         sort_authority_methods(&mut inventory.cipher_method_surfaces);
         let mut expected_cipher_method_surfaces = vec![
+            expected_authority_method(
+                "GuardianCheckpointCipher", "pub", false,
+                "fn seal_recovery_claim_intent(&self, intent: GuardianRecoveryClaimIntentV1) -> Result<[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES], GuardianSpawnCustodyError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher", "pub", false,
+                "fn open_recovery_claim_intent(&self, bytes: &[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES]) -> Result<GuardianRecoveryClaimIntentV1, GuardianSpawnCustodyError>",
+            ),
             expected_authority_method(
                 "GuardianCheckpointCipher", "pub", false,
                 "fn seal_successor_custody(&self, context: GuardianSuccessorCustodyContextV1, secret: &[u8; 32]) -> Result<[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES], GuardianSpawnCustodyError>",
@@ -12428,6 +12676,11 @@ mod tests {
         assert_eq!(
             inventory.persisted_record_derives,
             vec![
+                "GuardianRecoveryClaimIntentV1:Clone".to_owned(),
+                "GuardianRecoveryClaimIntentV1:Copy".to_owned(),
+                "GuardianRecoveryClaimIntentV1:Debug".to_owned(),
+                "GuardianRecoveryClaimIntentV1:Eq".to_owned(),
+                "GuardianRecoveryClaimIntentV1:PartialEq".to_owned(),
                 "GuardianSpawnCaptureProvenanceV1:Clone".to_owned(),
                 "GuardianSpawnCaptureProvenanceV1:Copy".to_owned(),
                 "GuardianSpawnCaptureProvenanceV1:Debug".to_owned(),

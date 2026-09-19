@@ -518,6 +518,27 @@ struct GuardianCheckpointStageStoreInner {
     custody_publication_cut: std::sync::atomic::AtomicU8,
 }
 
+/// Authenticated durable intent, not a Claim acknowledgement or live lease.
+pub struct GuardianDurableRecoveryClaimIntentV1 {
+    context: mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1,
+}
+
+/// Process-lifetime exclusion for one original pane lineage. The immutable
+/// custody inode is locked independently of the directory publication lock.
+/// Possessing this guard does not grant a guardian lease.
+pub struct GuardianRecoveryClaimAdmission {
+    store: GuardianCheckpointStageStore,
+    context: GuardianSpawnCustodyContextV1,
+    _custody_file: File,
+    custody_identity: FileIdentity,
+}
+
+impl GuardianDurableRecoveryClaimIntentV1 {
+    pub const fn context(&self) -> mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1 {
+        self.context
+    }
+}
+
 /// Explicit adoption selector for offline checkpoint reopen.
 ///
 /// Disambiguates unchanged-content successor checkpoints by binding both the
@@ -761,6 +782,157 @@ impl GuardianDurableSpawnCustodyV1 {
         self.context.broker_incarnation
     }
 
+    /// Exclude a second recovery attempt without holding the publication
+    /// directory lock over RPC. Dropping the final owner releases the lock;
+    /// process death releases it in the kernel.
+    pub fn admit_recovery(
+        self,
+    ) -> Result<GuardianRecoveryClaimAdmission, GuardianCheckpointStageStoreError> {
+        let file = self.store.with_exclusive_directory(|inner| {
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            let path = spawn_custody_path(inner, &self.context);
+            let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+            let metadata = file.metadata().map_err(|error| {
+                GuardianCheckpointStageStoreError::io("recovery-admission-metadata", error)
+            })?;
+            validate_private_file_metadata(&metadata, Some(GUARDIAN_SPAWN_CUSTODY_BYTES as u64))?;
+            let identity =
+                FileIdentity::capture(&metadata, Some(GUARDIAN_SPAWN_CUSTODY_BYTES as u64));
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .map_err(|error| {
+                    GuardianCheckpointStageStoreError::io("recovery-admission-lock", error.into())
+                })?;
+            validate_file_identity_at(&inner.directory, &inner.directory_path, &path, identity)?;
+            Ok((file, identity))
+        })?;
+        Ok(GuardianRecoveryClaimAdmission {
+            store: self.store,
+            context: self.context,
+            _custody_file: file.0,
+            custody_identity: file.1,
+        })
+    }
+}
+
+impl GuardianRecoveryClaimAdmission {
+    /// Revalidate the pinned original authority before each network effect.
+    /// This local exclusion is advisory; only guardian state authorizes Claim.
+    pub fn validate(&self) -> Result<(), GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            validate_file_identity_at(
+                &inner.directory,
+                &inner.directory_path,
+                &spawn_custody_path(inner, &self.context),
+                self.custody_identity,
+            )?;
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            Ok(())
+        })
+    }
+
+    /// Persist before issuing any recovery Claim. A retry adopts the original
+    /// target/request/effect identities; it cannot replace an ambiguous intent.
+    pub fn prepare_recovery_claim_intent(
+        &self,
+        proposed: mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1,
+        allow_create: bool,
+    ) -> Result<GuardianDurableRecoveryClaimIntentV1, GuardianCheckpointStageStoreError> {
+        use mux::guardian_checkpoint::GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES;
+        if proposed.pane_id != self.context.pane_id
+            || proposed.guardian_incarnation != self.context.guardian_incarnation
+            || proposed.guardian_build != self.context.guardian_build
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        let context = self.store.with_exclusive_directory(|inner| {
+            validate_file_identity_at(
+                &inner.directory,
+                &inner.directory_path,
+                &spawn_custody_path(inner, &self.context),
+                self.custody_identity,
+            )?;
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            let name = format!(
+                "recovery-claim-v1-{}-{}-{}.bin",
+                checksum_hex(proposed.root_envelope_sha256),
+                proposed.pane_id,
+                proposed.parent_request_id
+            );
+            if name.len() > inner.name_max {
+                return Err(GuardianCheckpointStageStoreError::NameLimit);
+            }
+            let path = inner.directory_path.join(&name);
+            match read_synced_custody_bytes::<GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES>(inner, &path) {
+                Ok(bytes) => {
+                    let stored = inner.cipher.open_recovery_claim_intent(&bytes)?;
+                    let expected = mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1 {
+                        target_mux_incarnation: stored.target_mux_incarnation,
+                        request_id: stored.request_id,
+                        effect_id: stored.effect_id,
+                        ..proposed
+                    };
+                    return if stored == expected {
+                        Ok(stored)
+                    } else {
+                        Err(GuardianCheckpointStageStoreError::Conflict)
+                    };
+                }
+                Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
+                    source,
+                    ..
+                })) if source.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if !allow_create {
+                return Err(GuardianCheckpointStageStoreError::CandidateAbsent);
+            }
+            // Share the existing stage admission pool, including interrupted
+            // intent writes. Publication renames its stage, without a second
+            // link, so one file and its full ciphertext are the peak charge.
+            let census = checkpoint_stage_census(inner)?;
+            if census.total_files >= inner.policy.max_stage_files
+                || census
+                    .total_bytes
+                    .checked_add(GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES as u64)
+                    .is_none_or(|bytes| bytes > inner.policy.max_stage_bytes)
+            {
+                return Err(GuardianCheckpointStageStoreError::Capacity);
+            }
+            let bytes = inner.cipher.seal_recovery_claim_intent(proposed)?;
+            let staging = inner
+                .directory_path
+                .join(format!("{name}.pending-{}", Uuid::new_v4()));
+            if staging
+                .file_name()
+                .ok_or(GuardianCheckpointStageStoreError::Conflict)?
+                .len()
+                > inner.name_max
+            {
+                return Err(GuardianCheckpointStageStoreError::NameLimit);
+            }
+            checkpoint_catalog_publish_file_with_staging(
+                inner,
+                &path,
+                &bytes,
+                "recovery-claim-write",
+                "recovery-claim-stage-sync",
+                &staging,
+            )?;
+            let stored = inner
+                .cipher
+                .open_recovery_claim_intent(&read_synced_custody_bytes::<
+                    GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES,
+                >(inner, &path)?)?;
+            if stored != proposed {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
+            Ok(stored)
+        })?;
+        Ok(GuardianDurableRecoveryClaimIntentV1 { context })
+    }
+}
+
+impl GuardianDurableSpawnCustodyV1 {
     /// Reopen an acknowledged, protected checkpoint using existing private
     /// custody and catalog bytes only. This grants offline verification, never
     /// a writer lease or permission to rotate a later successor generation.
@@ -6183,8 +6355,27 @@ fn checkpoint_stage_census(
     let mut uploads = BTreeSet::new();
     let mut semantic_names = BTreeSet::new();
     let mut total_bytes = 0_u64;
+    let mut recovery_files = 0_usize;
     for name in read_directory_names(&inner.directory)? {
         let raw = name.as_bytes();
+        if raw.starts_with(b"recovery-claim-v1-") {
+            let path = inner.directory_path.join(&name);
+            let file = open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+            let metadata = file.metadata().map_err(|error| {
+                GuardianCheckpointStageStoreError::io("recovery-intent-census", error)
+            })?;
+            validate_private_file_metadata(&metadata, None)?;
+            total_bytes = total_bytes
+                .checked_add(metadata.len())
+                .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
+            recovery_files += 1;
+            if recovery_files + entries.len() > inner.policy.max_stage_files
+                || total_bytes > inner.policy.max_stage_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::Capacity);
+            }
+            continue;
+        }
         // Stage uploads and the immutable published catalog intentionally
         // share one pinned directory. The catalog owns the narrower
         // `checkpoint-catalog-` namespace and validates every such entry in
@@ -6212,7 +6403,7 @@ fn checkpoint_stage_census(
         total_bytes = total_bytes
             .checked_add(metadata.len())
             .ok_or(GuardianCheckpointStageStoreError::Capacity)?;
-        if entries.len() >= inner.policy.max_stage_files
+        if recovery_files + entries.len() >= inner.policy.max_stage_files
             || total_bytes > inner.policy.max_stage_bytes
         {
             return Err(GuardianCheckpointStageStoreError::Capacity);
@@ -6236,7 +6427,7 @@ fn checkpoint_stage_census(
         .validate(&inner.directory)
         .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     Ok(CheckpointStageCensus {
-        total_files: entries.len(),
+        total_files: recovery_files + entries.len(),
         entries,
         uploads,
         total_bytes,
@@ -11997,7 +12188,7 @@ fn checkpoint_catalog_publish_file_with_staging(
     file.seek(SeekFrom::Start(before.len()))
         .map_err(|error| GuardianCheckpointStageStoreError::io(write_site, error))?;
     #[cfg(test)]
-    if write_site == "spawn-custody-write" {
+    if matches!(write_site, "spawn-custody-write" | "recovery-claim-write") {
         let cut = inner
             .custody_publication_cut
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -12048,7 +12239,7 @@ fn checkpoint_catalog_publish_file_with_staging(
         },
     )?;
     #[cfg(test)]
-    if write_site == "spawn-custody-write"
+    if matches!(write_site, "spawn-custody-write" | "recovery-claim-write")
         && inner
             .custody_publication_cut
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -12690,6 +12881,265 @@ mod tests {
             wire_ack_generation: 0,
             secret_lease_generation: 1,
         }
+    }
+
+    #[test]
+    fn recovery_claim_store_preserves_ids_and_rejects_changed_build_or_inode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use mux::guardian_checkpoint::GuardianRecoveryClaimIntentV1;
+        let (directory, poll, pipeline) =
+            pipeline_with_policy("ft-recovery-intent-", OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let original = store.persist_spawn_custody(&context, &[0x93; 32])?;
+        let custody_path = spawn_custody_path(&store.inner, &context);
+        let admission = original.admit_recovery()?;
+        let intent = GuardianRecoveryClaimIntentV1 {
+            root_envelope_sha256: [1; 32],
+            image_digest: [2; 32],
+            checkpoint_id: [3; 32],
+            guardian_build: context.guardian_build,
+            predecessor_mux_build: context.mux_build,
+            target_mux_build: [6; 32],
+            image_generation: 1,
+            source_generation: 1,
+            predecessor_generation: 1,
+            adoption_sequence: 1,
+            pane_id: context.pane_id,
+            guardian_incarnation: context.guardian_incarnation,
+            parent_request_id: Uuid::nil(),
+            predecessor_mux_incarnation: context.mux_incarnation,
+            target_mux_incarnation: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            effect_id: Uuid::new_v4(),
+            adoption_effect_id: Uuid::new_v4(),
+        };
+        let retained = admission.prepare_recovery_claim_intent(intent, true)?;
+        assert_eq!(retained.context(), intent);
+        assert!(
+            store
+                .lookup_spawn_custody(context.scope())?
+                .admit_recovery()
+                .is_err()
+        );
+        drop(admission);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        let (_poll, pipeline) = reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let admission = store
+            .lookup_spawn_custody(context.scope())?
+            .admit_recovery()?;
+        let retry = GuardianRecoveryClaimIntentV1 {
+            target_mux_incarnation: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            effect_id: Uuid::new_v4(),
+            ..intent
+        };
+        assert_eq!(
+            admission
+                .prepare_recovery_claim_intent(retry, false)?
+                .context(),
+            intent
+        );
+        // An upgrade needs explicit new authority. It may not reinterpret
+        // the old ambiguous operation under a different compiled build.
+        assert!(
+            admission
+                .prepare_recovery_claim_intent(
+                    GuardianRecoveryClaimIntentV1 {
+                        target_mux_build: [7; 32],
+                        ..retry
+                    },
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            admission
+                .prepare_recovery_claim_intent(
+                    GuardianRecoveryClaimIntentV1 {
+                        predecessor_mux_build: [8; 32],
+                        ..retry
+                    },
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            admission
+                .prepare_recovery_claim_intent(
+                    GuardianRecoveryClaimIntentV1 {
+                        image_digest: [9; 32],
+                        ..retry
+                    },
+                    true
+                )
+                .is_err()
+        );
+        let before = read_directory_names(&store.inner.directory)?;
+        let bytes = std::fs::read(&custody_path)?;
+        let retained_custody = custody_path.with_extension("retained-original");
+        std::fs::rename(&custody_path, &retained_custody)?;
+        let mut replacement = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &custody_path,
+        )?;
+        replacement.write_all(&bytes)?;
+        replacement.sync_all()?;
+        assert!(admission.validate().is_err());
+        assert!(
+            admission
+                .prepare_recovery_claim_intent(
+                    GuardianRecoveryClaimIntentV1 {
+                        root_envelope_sha256: [10; 32],
+                        ..retry
+                    },
+                    true
+                )
+                .is_err()
+        );
+        assert_eq!(
+            read_directory_names(&store.inner.directory)?.len(),
+            before.len() + 1,
+            "replaced inode must not cause an additional intent write"
+        );
+        assert_eq!(std::fs::read(retained_custody)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_claim_interrupted_writes_share_stage_quota_on_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use mux::guardian_checkpoint::{
+            GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES, GuardianRecoveryClaimIntentV1,
+        };
+        let (directory, poll, pipeline) = pipeline_with_policy(
+            "ft-recovery-intent-quota-",
+            OutputSegmentPolicy::production(),
+        )?;
+        let store = pipeline.checkpoint_stage_store();
+        let context = spawn_custody_context();
+        let admission = store
+            .persist_spawn_custody(&context, &[0x93; 32])?
+            .admit_recovery()?;
+        let intent = GuardianRecoveryClaimIntentV1 {
+            root_envelope_sha256: [1; 32],
+            image_digest: [2; 32],
+            checkpoint_id: [3; 32],
+            guardian_build: context.guardian_build,
+            predecessor_mux_build: context.mux_build,
+            target_mux_build: [6; 32],
+            image_generation: 1,
+            source_generation: 1,
+            predecessor_generation: 1,
+            adoption_sequence: 1,
+            pane_id: context.pane_id,
+            guardian_incarnation: context.guardian_incarnation,
+            parent_request_id: Uuid::nil(),
+            predecessor_mux_incarnation: context.mux_incarnation,
+            target_mux_incarnation: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            effect_id: Uuid::new_v4(),
+            adoption_effect_id: Uuid::new_v4(),
+        };
+        store.interrupt_spawn_custody_publication_for_test(2);
+        assert!(
+            admission
+                .prepare_recovery_claim_intent(intent, true)
+                .is_err()
+        );
+        let failed = checkpoint_stage_census(&store.inner)?;
+        assert_eq!(failed.total_files, 1);
+        assert_eq!(
+            failed.total_bytes,
+            (GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES / 2) as u64
+        );
+        drop(admission);
+        drop(store);
+        drop(pipeline);
+        drop(poll);
+        let (_poll, pipeline) = reopen_pipeline(&directory, OutputSegmentPolicy::production())?;
+        let store = pipeline.checkpoint_stage_store();
+        let admission = store
+            .lookup_spawn_custody(context.scope())?
+            .admit_recovery()?;
+        assert_eq!(
+            checkpoint_stage_census(&store.inner)?.total_bytes,
+            failed.total_bytes
+        );
+        assert_eq!(
+            admission
+                .prepare_recovery_claim_intent(intent, true)?
+                .context(),
+            intent
+        );
+        let existing = checkpoint_stage_census(&store.inner)?;
+        assert_eq!(existing.total_files, 2);
+        let retained_path = store
+            .inner
+            .directory_path
+            .join("recovery-claim-v1-retained.pending");
+        let retained = create_private_file_new_at(
+            &store.inner.directory,
+            &store.inner.directory_path,
+            &retained_path,
+        )?;
+        // Sparse retained bytes exercise the logical-byte policy without
+        // allocating a giant test buffer or pretending physical block usage.
+        retained.set_len(
+            store.inner.policy.max_stage_bytes
+                - existing.total_bytes
+                - GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES as u64,
+        )?;
+        retained.sync_all()?;
+        let next = GuardianRecoveryClaimIntentV1 {
+            root_envelope_sha256: [4; 32],
+            ..intent
+        };
+        assert_eq!(
+            admission
+                .prepare_recovery_claim_intent(next, true)?
+                .context(),
+            next
+        );
+        assert_eq!(
+            checkpoint_stage_census(&store.inner)?.total_bytes,
+            store.inner.policy.max_stage_bytes
+        );
+        let before = read_directory_names(&store.inner.directory)?.len();
+        retained.set_len(retained.metadata()?.len() + 1)?;
+        retained.sync_all()?;
+        assert!(matches!(
+            checkpoint_stage_census(&store.inner),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        assert!(matches!(
+            admission.prepare_recovery_claim_intent(
+                GuardianRecoveryClaimIntentV1 {
+                    root_envelope_sha256: [5; 32],
+                    ..intent
+                },
+                true
+            ),
+            Err(GuardianCheckpointStageStoreError::Capacity)
+        ));
+        assert_eq!(read_directory_names(&store.inner.directory)?.len(), before);
+        assert_eq!(
+            admission
+                .prepare_recovery_claim_intent(intent, false)?
+                .context(),
+            intent
+        );
+        assert_eq!(
+            admission
+                .prepare_recovery_claim_intent(next, false)?
+                .context(),
+            next
+        );
+        Ok(())
     }
 
     #[test]
