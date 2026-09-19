@@ -14467,6 +14467,18 @@ mod tests {
     #[test]
     fn successor_checkpoint_reopen_preserves_birth_custody_and_authenticated_capture_owner()
     -> Result<(), Box<dyn std::error::Error>> {
+        exercise_successor_checkpoint_reopen(false)
+    }
+
+    #[test]
+    fn unchanged_successor_checkpoint_reopens_both_authenticated_adoptions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        exercise_successor_checkpoint_reopen(true)
+    }
+
+    fn exercise_successor_checkpoint_reopen(
+        unchanged_content: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (directory, poll, pipeline) = pipeline_with_policy(
             "ft-successor-custody-reopen-",
             OutputSegmentPolicy::production(),
@@ -14481,8 +14493,9 @@ mod tests {
         drop(store.persist_spawn_custody(&context, &Zeroizing::new([0x93; 32]))?);
         let journal = pipeline.prepare_pane(guardian, pane)?;
         let mut state = checkpoint_catalog_claimed_protocol_state(guardian, original_mux, pane)?;
-        checkpoint_catalog_stage_and_publish(
-            &pipeline,
+        let original_receipt = durable_commit(&pipeline, pane, &journal, b"original")?;
+        let original_terminal = checkpoint_catalog_test_terminal(b"original");
+        let (original_checkpoint_id, _) = checkpoint_catalog_stage_and_publish_checkpoint(
             &store,
             &journal,
             &mut state,
@@ -14492,8 +14505,8 @@ mod tests {
             1,
             1,
             0xac210,
-            b"original",
-            b"original",
+            original_receipt,
+            &original_terminal,
         )?;
         let claim = checkpoint_catalog_authenticate_request(
             GuardianOperation::Claim,
@@ -14509,8 +14522,17 @@ mod tests {
         state.apply_effect_transactionally(&claim, |_| {
             GuardianEffectOutcome::<std::convert::Infallible>::Applied
         })?;
-        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish(
-            &pipeline,
+        let successor_receipt = if unchanged_content {
+            original_receipt
+        } else {
+            durable_commit(&pipeline, pane, &journal, b"-successor")?
+        };
+        let successor_terminal = if unchanged_content {
+            &original_terminal
+        } else {
+            &checkpoint_catalog_test_terminal(b"original-successor")
+        };
+        let (checkpoint_id, _) = checkpoint_catalog_stage_and_publish_checkpoint(
             &store,
             &journal,
             &mut state,
@@ -14520,9 +14542,14 @@ mod tests {
             2,
             1,
             0xac230,
-            b"-successor",
-            b"original-successor",
+            successor_receipt,
+            successor_terminal,
         )?;
+        if unchanged_content {
+            assert_eq!(checkpoint_id, original_checkpoint_id);
+        } else {
+            assert_ne!(checkpoint_id, original_checkpoint_id);
+        }
         let identity_base = 0xac230_u128;
         let expected_adoption_effect_id = Uuid::from_u128(identity_base + 3);
         let expected_adoption_sequence = 1_u64;
@@ -14546,7 +14573,10 @@ mod tests {
             let member = catalog
                 .published
                 .iter()
-                .find(|member| member.metadata.checkpoint_id == checkpoint_id)
+                .find(|member| {
+                    member.metadata.checkpoint_id == checkpoint_id
+                        && member.metadata.capture_generation == 2
+                })
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
             assert_eq!(
                 member.metadata.adoption_effect_id, expected_adoption_effect_id,
@@ -14594,10 +14624,86 @@ mod tests {
             "the original owner cannot finalize its successor's checkpoint"
         );
         store.apply_ack_from_committed_catalog(ack()?, successor_mux)?;
+        // Preserve and acknowledge the historical generation independently;
+        // the successor ACK must never stand in for its predecessor's ACK.
+        let original_ack = store.with_exclusive_directory(|inner| {
+            let catalog =
+                checkpoint_catalog_scan(inner, CheckpointCatalogScope::Pane { pane_id: pane })?;
+            assert_eq!(catalog.published.len(), 2, "both adoptions remain on disk");
+            let member = catalog
+                .published
+                .iter()
+                .find(|member| {
+                    member.metadata.checkpoint_id == original_checkpoint_id
+                        && member.metadata.capture_generation == 1
+                })
+                .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
+            let bytes = checkpoint_catalog_read_file(
+                inner,
+                &member.candidate_path,
+                member.candidate_file_identity,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&bytes)?;
+            let record = candidate
+                .records
+                .first()
+                .ok_or(GuardianCheckpointStageStoreError::Poisoned)?;
+            let plaintext = inner.cipher.open(
+                &record.context(),
+                record,
+                u32::try_from(CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?,
+            )?;
+            let begin = GuardianCheckpointStageRequestV1::decode(&plaintext)?;
+            GuardianCheckpointStageRequestV1::ack(
+                begin.scope(),
+                begin.upload_id(),
+                begin.descriptor(),
+                begin.chunk_bytes(),
+                member.metadata.completion_id,
+            )
+            .map_err(Into::into)
+        })?;
+        let wrong_owner_original_ack = GuardianCheckpointStageRequestV1::ack(
+            original_ack.scope(),
+            original_ack.upload_id(),
+            original_ack.descriptor(),
+            original_ack.chunk_bytes(),
+            original_ack
+                .completion_id()
+                .expect("ACK retains completion identity"),
+        )?;
+        assert!(
+            store
+                .apply_ack_from_committed_catalog(wrong_owner_original_ack, successor_mux)
+                .is_err(),
+            "successor cannot acknowledge predecessor capture authority"
+        );
+        store.apply_ack_from_committed_catalog(original_ack, original_mux)?;
         drop(journal);
         drop(store);
         drop(pipeline);
         drop(poll);
+        let original_selector = GuardianCheckpointAdoptionSelectorV1 {
+            checkpoint_id: original_checkpoint_id,
+            capturing_mux_incarnation: original_mux,
+            capture_generation: 1,
+            adoption_effect_id: Uuid::from_u128(0xac213),
+            adoption_sequence: 1,
+        };
+        let original_witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
+            .reopen_checkpoint(original_selector)?;
+        assert_eq!(original_witness.generation(), 1);
+        assert_eq!(original_witness.capturing_mux_incarnation(), original_mux);
+        assert_eq!(
+            original_witness.effect_id(),
+            original_selector.adoption_effect_id
+        );
+        assert_eq!(
+            original_witness.sequence(),
+            original_selector.adoption_sequence
+        );
         let witness = GuardianDurableSpawnCustodyV1::open_existing(&token, scope)?
             .reopen_checkpoint(selector)?;
         assert_eq!(witness.scope(), scope);

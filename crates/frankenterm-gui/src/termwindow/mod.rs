@@ -11793,13 +11793,12 @@ mod tests {
             Err(super::GuiPaneAdmissionError::Retired)
         );
         mux.notify(mux::MuxNotification::PaneOutput(other.pane_id()));
-        assert_eq!(
-            output_seen.load(Ordering::Acquire),
-            1,
-            "full removal must not terminate the actual subscriber"
-        );
+        // PaneOutput first traverses the mux's scheduled lifecycle drain;
+        // notify returning does not mean subscribers have received it yet.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while deliveries.load(Ordering::Acquire) < 4 || exec.admission_snapshot().active_tasks != 0
+        while output_seen.load(Ordering::Acquire) == 0
+            || deliveries.load(Ordering::Acquire) < 4
+            || exec.admission_snapshot().active_tasks != 0
         {
             assert!(
                 Instant::now() < deadline,
@@ -11808,6 +11807,11 @@ mod tests {
             let _ = exec.try_tick().unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(
+            output_seen.load(Ordering::Acquire),
+            1,
+            "full removal must not terminate or duplicate the actual subscriber"
+        );
         alive.store(false, Ordering::Release);
         cleanup.wake();
         let deadline = Instant::now() + Duration::from_secs(5);
