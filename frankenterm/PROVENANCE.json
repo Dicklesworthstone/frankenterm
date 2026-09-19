@@ -155,22 +155,22 @@
         "chore": 2,
         "cleanup": 2,
         "cosmetic": 20,
-        "feat": 53,
-        "fix": 101,
+        "feat": 54,
+        "fix": 104,
         "other": 17,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 35
+        "test": 36
       },
-      "fork_side_commit_count": 243,
+      "fork_side_commit_count": 248,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-19T00:50:14-04:00",
-        "sha": "735f576c3db066b74e2d6f071cc1b3ab1db86250",
-        "subject": "test(gui): format socket assertion diagnostics on Rust 2018"
+        "classification": "fix",
+        "committed_at": "2026-09-19T12:40:53-04:00",
+        "sha": "b1bf90f241f449bb849276d8d2c983734b5acdda",
+        "subject": "fix(client): admit replacement pane fetch retry owners independently"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,21 +641,21 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 198,
-        "fix": 254,
+        "fix": 257,
         "other": 51,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 101
+        "test": 102
       },
-      "fork_side_commit_count": 675,
+      "fork_side_commit_count": 679,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-19T05:46:47-04:00",
-        "sha": "b6b9b79f7b0d26e21cce74e2d9b46c518d8b2289",
-        "subject": "fix(scrollback): flush yielded rows after overflow settles"
+        "committed_at": "2026-09-19T12:43:21-04:00",
+        "sha": "ebbd1854bdcdd038f00d506099b1fc47aa4c9aef",
+        "subject": "fix(mux): reject stale child-exit prune admission"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -709,20 +709,20 @@
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
         "cosmetic": 5,
-        "feat": 8,
-        "fix": 22,
+        "feat": 9,
+        "fix": 23,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 4,
         "test": 8
       },
-      "fork_side_commit_count": 55,
+      "fork_side_commit_count": 57,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-18T14:28:54-04:00",
-        "sha": "b9aeb164b63208c2de299110f028a7d8b30cfb20",
-        "subject": "test(promise): expose Unix gates on reactor socket imports"
+        "classification": "fix",
+        "committed_at": "2026-09-19T11:55:18-04:00",
+        "sha": "d0d2f539d48d117c530fb19be7964c4350136741",
+        "subject": "fix(gui): retain render wake ownership through native delivery"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -1037,21 +1037,21 @@
         "cleanup": 1,
         "cosmetic": 8,
         "docs": 2,
-        "feat": 15,
-        "fix": 94,
+        "feat": 18,
+        "fix": 96,
         "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 148,
+      "fork_side_commit_count": 153,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-17T17:56:46-04:00",
-        "sha": "2da82db41403319501c87dd3754e0e6abffe7166",
-        "subject": "fix(macos): deliver the final live-resize gesture boundary"
+        "committed_at": "2026-09-19T12:12:00-04:00",
+        "sha": "2325774fa8ff38d26cf04fc461421aca150dcfad",
+        "subject": "fix(gui): apply native title and reconciliation under retained admission"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,7 +1064,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2791,
+  "fork_side_commit_total": 2807,
   "generated_at": "2026-09-19T10:06:56.946876Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
