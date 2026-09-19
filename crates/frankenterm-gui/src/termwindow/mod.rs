@@ -354,6 +354,7 @@ pub enum TermWindowNotif {
     FinishWindowEvent {
         name: String,
         again: bool,
+        generation: Arc<()>,
     },
     GetConfigOverrides(Sender<wezterm_dynamic::Value>),
     SetConfigOverrides(wezterm_dynamic::Value),
@@ -754,15 +755,80 @@ pub struct TabState {
 /// We don't want to queue more than 1 event at a time,
 /// so we use this enum to allow for at most 1 executing
 /// and 1 pending event.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum EventState {
     /// The event is not running
     None,
     /// The event is running
-    InProgress,
+    InProgress(Arc<()>),
     /// The event is running, and we have another one ready to
     /// run once it completes
-    InProgressWithQueued(Option<PaneId>),
+    InProgressWithQueued(Arc<()>, Option<PaneId>),
+}
+
+impl EventState {
+    /// Release only the callback which actually owns this running slot.
+    fn complete(&mut self, generation: &Arc<()>, again: bool) -> Option<Option<PaneId>> {
+        let current = match self {
+            Self::InProgress(current) | Self::InProgressWithQueued(current, _) => current,
+            Self::None => return None,
+        };
+        if !Arc::ptr_eq(current, generation) {
+            return None;
+        }
+        match std::mem::replace(self, Self::None) {
+            Self::InProgressWithQueued(_, pane) if again => Some(pane),
+            _ => None,
+        }
+    }
+}
+
+/// Constructed before the callback future, so cancellation before its first
+/// poll and all error returns still deliver the already-admitted completion.
+struct WindowEventCompletion<F: FnOnce(bool)> {
+    finish: Option<F>,
+    again: bool,
+}
+
+impl<F: FnOnce(bool)> Drop for WindowEventCompletion<F> {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            finish(self.again);
+        }
+    }
+}
+
+fn reserve_window_event_admission() -> Option<(
+    promise::spawn::MainThreadSpawnReservation,
+    promise::spawn::MainThreadSpawnReservation,
+)> {
+    use promise::spawn::{
+        MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
+    };
+    let callback = match try_reserve_main_thread(MainThreadServiceClass::Interactive, 8 * 1024) {
+        MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            log::error!("window Lua callback admission refused: {rejected:?}");
+            return None;
+        }
+    };
+    match try_reserve_main_thread(MainThreadServiceClass::Render, 4 * 1024) {
+        MainThreadReservationOutcome::Reserved(completion) => {
+            let first = callback.admission_receipt();
+            let second = completion.admission_receipt();
+            if (first.queue_id, first.scheduler_generation)
+                != (second.queue_id, second.scheduler_generation)
+            {
+                log::error!("window Lua admission pair crossed scheduler generations");
+                return None;
+            }
+            Some((callback, completion))
+        }
+        rejected => {
+            log::error!("window Lua completion admission refused: {rejected:?}");
+            None
+        }
+    }
 }
 
 /// Aggregate snapshot of per-pane dirty-line bitmap telemetry
@@ -4316,8 +4382,12 @@ impl TermWindow {
                     .map_err(chan_err)
                     .context("send GetEffectiveConfig response")?;
             }
-            TermWindowNotif::FinishWindowEvent { name, again } => {
-                self.finish_window_event(&name, again);
+            TermWindowNotif::FinishWindowEvent {
+                name,
+                again,
+                generation,
+            } => {
+                self.finish_window_event(&name, again, &generation);
             }
             TermWindowNotif::GetConfigOverrides(tx) => {
                 tx.try_send(self.config_overrides.clone())
@@ -5487,9 +5557,9 @@ impl TermWindow {
         self.emit_window_event("update-status", None);
     }
 
-    fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
+    fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) -> bool {
         let Some(window) = GuiWin::try_new(self) else {
-            return;
+            return false;
         };
         let pane = match pane_id {
             Some(pane_id) => Mux::try_get().and_then(|mux| mux.get_pane(pane_id)),
@@ -5499,19 +5569,43 @@ impl TermWindow {
             Some(pane) => pane,
             None => match self.get_active_pane_or_overlay() {
                 Some(pane) => pane,
-                None => return,
+                None => return false,
             },
         };
         let pane = MuxPane(pane.pane_id());
         let name = name.to_string();
+        let Some((callback, completion)) = reserve_window_event_admission() else {
+            return false;
+        };
+        let generation = Arc::new(());
+        let finish_generation = Arc::clone(&generation);
+        let finish_name = name.clone();
+        let finish_window = window.window.clone();
+        let completion = WindowEventCompletion {
+            finish: Some(move |again| {
+                finish_window
+                    .notify_with_reservation(
+                        TermWindowNotif::FinishWindowEvent {
+                            name: finish_name,
+                            again,
+                            generation: finish_generation,
+                        },
+                        completion,
+                        None,
+                    )
+                    .detach();
+            }),
+            again: true,
+        };
 
-        async fn do_event(
+        async fn do_event<F: FnOnce(bool)>(
             lua: Option<Rc<mlua::Lua>>,
             name: String,
             window: GuiWin,
             pane: MuxPane,
+            mut completion: WindowEventCompletion<F>,
         ) -> anyhow::Result<()> {
-            let again = if let Some(lua) = lua {
+            if let Some(lua) = lua {
                 let args = lua.pack_multi((window.clone(), pane))?;
 
                 if let Err(err) =
@@ -5519,49 +5613,36 @@ impl TermWindow {
                 {
                     log::error!("while processing {} event: {:#}", name, err);
                 }
-                true
             } else {
-                false
-            };
-
-            window
-                .window
-                .notify(TermWindowNotif::FinishWindowEvent { name, again });
+                completion.again = false;
+            }
 
             Ok(())
         }
 
-        schedule_existing_termwindow_future(
-            promise::spawn::MainThreadServiceClass::Interactive,
-            8 * 1024,
-            "window Lua event",
-            config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane)),
-        );
+        self.event_states
+            .insert(name.clone(), EventState::InProgress(generation));
+        callback
+            .spawn_local(config::with_lua_config_on_main_thread(move |lua| {
+                do_event(lua, name, window, pane, completion)
+            }))
+            .detach();
+        true
     }
 
     /// Called as part of finishing up a callout to lua.
     /// If again==false it means that there isn't a lua config
     /// to execute against, so we should just mark as done.
     /// Otherwise, if there is a queued item, schedule it now.
-    fn finish_window_event(&mut self, name: &str, again: bool) {
-        let state = self
+    fn finish_window_event(&mut self, name: &str, again: bool, generation: &Arc<()>) {
+        let next = self
             .event_states
-            .entry(name.to_string())
-            .or_insert(EventState::None);
-        if again {
-            match state {
-                EventState::InProgress => {
-                    *state = EventState::None;
-                }
-                EventState::InProgressWithQueued(pane) => {
-                    let pane = *pane;
-                    *state = EventState::InProgress;
-                    self.schedule_window_event(name, pane);
-                }
-                EventState::None => {}
-            }
-        } else {
-            *state = EventState::None;
+            .get_mut(name)
+            .and_then(|state| state.complete(generation, again));
+        if let Some(pane) = next {
+            // Completion released this generation before starting its queued
+            // successor. A refusal leaves None, never a stranded InProgress.
+            self.schedule_window_event(name, pane);
         }
     }
 
@@ -5575,13 +5656,13 @@ impl TermWindow {
             .entry(name.to_string())
             .or_insert(EventState::None);
         match state {
-            EventState::InProgress => {
+            EventState::InProgress(generation) => {
                 // Flag that we want to run again when the currently
                 // executing event calls finish_window_event().
-                *state = EventState::InProgressWithQueued(pane_id);
+                *state = EventState::InProgressWithQueued(Arc::clone(generation), pane_id);
                 return;
             }
-            EventState::InProgressWithQueued(other_pane) => {
+            EventState::InProgressWithQueued(_, other_pane) => {
                 // We've already got one copy executing and another
                 // pending dispatch, so don't queue another.
                 if pane_id != *other_pane {
@@ -5598,7 +5679,6 @@ impl TermWindow {
             }
             EventState::None => {
                 // Nothing pending, so schedule a call now
-                *state = EventState::InProgress;
                 self.schedule_window_event(name, pane_id);
             }
         }
@@ -9672,6 +9752,151 @@ mod tests {
         webgpu_repair_failure_stage,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn window_event_completion_survives_full_queue_error_and_unpolled_cancel() {
+        if run_scheduler_test_in_child(
+            "window_event_completion_survives_full_queue_error_and_unpolled_cancel",
+        ) {
+            return;
+        }
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        // Refuse the pair atomically from the event owner's perspective: the
+        // callback permit must be returned if completion cannot be admitted.
+        let one = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 16 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(super::reserve_window_event_admission().is_none());
+        assert_eq!(one.admission_snapshot().active_tasks, 0);
+        drop(one);
+
+        for cancel_before_poll in [true, false] {
+            let exec = SimpleExecutor::try_with_limits(
+                MainThreadAdmissionLimits::new(3, 16 * 1024, 0, 0).unwrap(),
+            )
+            .unwrap();
+            let (callback, completion) = super::reserve_window_event_admission().unwrap();
+            let generation = Arc::new(());
+            let state = Arc::new(Mutex::new(super::EventState::InProgressWithQueued(
+                Arc::clone(&generation),
+                Some(17),
+            )));
+            let next = Arc::new(Mutex::new(None));
+            let completed_state = Arc::clone(&state);
+            let completed_next = Arc::clone(&next);
+            let completed_generation = Arc::clone(&generation);
+            let guard = super::WindowEventCompletion {
+                finish: Some(move |again| {
+                    completion
+                        .spawn(async move {
+                            *completed_next.lock().unwrap() = completed_state
+                                .lock()
+                                .unwrap()
+                                .complete(&completed_generation, again);
+                        })
+                        .detach();
+                }),
+                again: true,
+            };
+            let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+                MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            assert!(matches!(
+                try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
+                MainThreadReservationOutcome::RetryableFull(_)
+            ));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let callback_polls = Arc::clone(&polls);
+            let task = callback.spawn(async move {
+                let _completion = guard;
+                callback_polls.fetch_add(1, Ordering::AcqRel);
+                // Same early-return path as a Lua argument-packing failure.
+                Err::<(), _>("callback failed before explicit completion")
+            });
+            if cancel_before_poll {
+                drop(task);
+            } else {
+                task.detach();
+            }
+            for _ in 0..16 {
+                let _ = exec.try_tick().unwrap();
+                if next.lock().unwrap().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(
+                polls.load(Ordering::Acquire),
+                usize::from(!cancel_before_poll)
+            );
+            assert_eq!(*next.lock().unwrap(), Some(Some(17)));
+            assert!(matches!(*state.lock().unwrap(), super::EventState::None));
+            drop(occupying);
+
+            // An admitted successor runs, and a late completion carrying the
+            // previous identity cannot clear it or its queued work.
+            let (successor, completion) = super::reserve_window_event_admission().unwrap();
+            let successor_generation = Arc::new(());
+            *state.lock().unwrap() =
+                super::EventState::InProgress(Arc::clone(&successor_generation));
+            let successor_state = Arc::clone(&state);
+            let successor_ran = Arc::new(AtomicUsize::new(0));
+            let ran = Arc::clone(&successor_ran);
+            successor
+                .spawn(async move {
+                    let mut state = successor_state.lock().unwrap();
+                    assert_eq!(state.complete(&generation, true), None);
+                    assert!(matches!(&*state, super::EventState::InProgress(current)
+                    if Arc::ptr_eq(current, &successor_generation)));
+                    ran.fetch_add(1, Ordering::AcqRel);
+                    drop(state);
+                    completion
+                        .spawn(async move {
+                            successor_state
+                                .lock()
+                                .unwrap()
+                                .complete(&successor_generation, false);
+                        })
+                        .detach();
+                })
+                .detach();
+            for _ in 0..16 {
+                let _ = exec.try_tick().unwrap();
+            }
+            assert_eq!(successor_ran.load(Ordering::Acquire), 1);
+            assert!(matches!(*state.lock().unwrap(), super::EventState::None));
+            assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        }
+
+        let exec = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let (callback, completion) = super::reserve_window_event_admission().unwrap();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::clone(&delivered);
+        let guard = super::WindowEventCompletion {
+            finish: Some(move |_| {
+                completion
+                    .spawn(async move {
+                        completed.fetch_add(1, Ordering::AcqRel);
+                    })
+                    .detach();
+            }),
+            again: true,
+        };
+        drop(callback);
+        drop(exec);
+        drop(guard); // Retired scheduler cancels; Drop must not panic or revive it.
+        assert_eq!(delivered.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn mux_output_interest_never_loses_visible_panes_or_in_flight_successors() {
