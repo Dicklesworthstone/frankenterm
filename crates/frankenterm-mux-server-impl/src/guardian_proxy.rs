@@ -3643,6 +3643,7 @@ fn consume_one_guardian_replay_snapshot(
     expected_size: PtySize,
     config: Arc<dyn TerminalConfiguration>,
     limits: TerminalCheckpointLimits,
+    selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
     let maximum_record_bytes = u32::try_from(limits.max_replay_record_bytes)
         .unwrap_or(u32::MAX)
@@ -3656,7 +3657,11 @@ fn consume_one_guardian_replay_snapshot(
         .unwrap_or(u16::MAX)
         .min(GUARDIAN_MAX_REPLAY_RECORDS);
     let mut request = GuardianReplayRequestV1::Open {
-        selector: GuardianReplaySelectorV1::LatestCompatible,
+        selector: selected.map_or(GuardianReplaySelectorV1::LatestCompatible, |checkpoint| {
+            GuardianReplaySelectorV1::ExactCheckpoint {
+                checkpoint_id: checkpoint.checkpoint_id,
+            }
+        }),
         max_plaintext_bytes: maximum_record_bytes,
         max_records: maximum_page_records,
         wait_millis: 0,
@@ -3684,6 +3689,9 @@ fn consume_one_guardian_replay_snapshot(
                     ));
                 }
                 let observed_descriptor = chunk.descriptor();
+                if let Some(selected) = selected {
+                    selected.validate_descriptor(observed_descriptor)?;
+                }
                 validate_checkpoint_descriptor_for_proxy(
                     observed_descriptor,
                     page_identity,
@@ -3904,6 +3912,7 @@ fn consume_guardian_replay_for_restore(
     expected_size: PtySize,
     config: Arc<dyn TerminalConfiguration>,
     limits: TerminalCheckpointLimits,
+    selected: Option<SelectedRecoveryCheckpoint>,
 ) -> Result<VerifiedGuardianReplayRestore, GuardianProxyError> {
     for attempt in 0..GUARDIAN_RESTORE_REOPEN_ATTEMPTS {
         match consume_one_guardian_replay_snapshot(
@@ -3912,6 +3921,7 @@ fn consume_guardian_replay_for_restore(
             expected_size,
             Arc::clone(&config),
             limits,
+            selected,
         ) {
             Err(GuardianProxyError::ReplaySnapshotExpired)
                 if attempt + 1 < GUARDIAN_RESTORE_REOPEN_ATTEMPTS =>
@@ -4490,6 +4500,48 @@ impl GuardianReplayReaderSlot {
     }
 }
 
+/// An exact checkpoint selected from an authenticated whole-mux image.
+/// Only `prepare_from_recovery` mints this authority in production; neither
+/// caller-supplied provenance nor a digest alone authorizes replay selection.
+#[derive(Clone, Copy)]
+struct SelectedRecoveryCheckpoint {
+    pane_id: Uuid,
+    generation: u64,
+    checkpoint_id: GuardianCheckpointIdentityDigest,
+    boundary_id: [u8; 32],
+    payload_digest: [u8; 32],
+    payload_bytes: u64,
+}
+
+impl SelectedRecoveryCheckpoint {
+    fn validate_descriptor(
+        self,
+        descriptor: GuardianCheckpointDescriptorV1,
+    ) -> Result<(), GuardianProxyError> {
+        if descriptor.checkpoint_id() != self.checkpoint_id
+            || descriptor.boundary_id().into_bytes() != self.boundary_id
+            || descriptor.durable_pane_id() != Some(self.pane_id)
+            || descriptor.capture_generation() != self.generation
+            || descriptor.terminal_payload_digest() != self.payload_digest
+            || descriptor.total_bytes() != self.payload_bytes
+        {
+            return Err(GuardianProxyError::ReplayInvariant(
+                "guardian replay differs from the selected whole-mux checkpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_attach(self, pane_id: Uuid, generation: u64) -> Result<(), GuardianProxyError> {
+        if pane_id != self.pane_id || self.generation.checked_add(1) != Some(generation) {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "recovery attachment differs from the selected pane and successor generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Pre-Claim validation and transport authority for one guardian proxy lease.
 ///
 /// Construction validates the PTY configuration and authenticates a client
@@ -4506,6 +4558,7 @@ pub struct GuardianProxyLeasePlan {
     client: GuardianClient,
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
     build_authenticated: bool,
+    selected_checkpoint: Option<SelectedRecoveryCheckpoint>,
 }
 
 impl fmt::Debug for GuardianProxyLeasePlan {
@@ -4528,9 +4581,63 @@ impl GuardianProxyLeasePlan {
         token_path: &Path,
         size: PtySize,
         census: Arc<GuardianCensusCoordinator>,
-        provenance: &frankenterm_core::mux_recovery_image::RecoverySpawnCustody,
+        recovery: &frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+        durable_pane_id: Uuid,
     ) -> Result<Self, GuardianProxyError> {
-        use frankenterm_core::mux_recovery_image::RecoverySpawnCustody;
+        use frankenterm_core::mux_recovery_image::{CheckpointAuthority, RecoverySpawnCustody};
+        let pane = recovery
+            .image()
+            .panes
+            .iter()
+            .find(|pane| Uuid::parse_str(&pane.pane_uuid).ok() == Some(durable_pane_id))
+            .ok_or(GuardianProxyError::InvalidConfiguration(
+                "selected recovery image has no matching pane",
+            ))?;
+        if u16::try_from(pane.size.rows) != Ok(size.rows)
+            || u16::try_from(pane.size.cols) != Ok(size.cols)
+            || u16::try_from(pane.size.pixel_width) != Ok(size.pixel_width)
+            || u16::try_from(pane.size.pixel_height) != Ok(size.pixel_height)
+        {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "recovery PTY geometry differs from the selected image",
+            ));
+        }
+        let CheckpointAuthority::Guardian {
+            guardian_generation,
+            publication,
+            ..
+        } = &pane.checkpoint.authority
+        else {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "model-only checkpoint cannot authorize a live guardian restore",
+            ));
+        };
+        let payload = recovery
+            .checkpoint_payload(&pane.checkpoint.checkpoint_ref.object_id)
+            .ok_or(GuardianProxyError::InvalidConfiguration(
+                "selected recovery checkpoint has no validated payload",
+            ))?;
+        let (payload_bytes, payload_digest) =
+            mux::guardian_checkpoint::terminal_payload_identity(payload).map_err(|_| {
+                GuardianProxyError::InvalidConfiguration(
+                    "selected recovery checkpoint payload has no guardian identity",
+                )
+            })?;
+        let selected = SelectedRecoveryCheckpoint {
+            pane_id: durable_pane_id,
+            generation: *guardian_generation,
+            checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(
+                publication.checkpoint_identity,
+            )
+            .map_err(|_| {
+                GuardianProxyError::InvalidConfiguration(
+                    "selected recovery checkpoint identity is invalid",
+                )
+            })?,
+            boundary_id: publication.output_boundary_identity,
+            payload_digest,
+            payload_bytes,
+        };
         let RecoverySpawnCustody::Original {
             broker_lineage,
             guardian_incarnation,
@@ -4542,13 +4649,17 @@ impl GuardianProxyLeasePlan {
             spawn_effect_id,
             current_mux_incarnation,
             current_lease_generation,
-        } = provenance
+        } = &pane.spawn_custody
         else {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "legacy pane has no original guardian custody",
             ));
         };
         if *current_lease_generation != 1
+            // ubs:ignore[rust.security.constant-time-compare] — Lease generations are public custody metadata, not secrets; the selected image is already authenticated.
+            || *current_lease_generation != selected.generation
+            // ubs:ignore[rust.security.constant-time-compare] — Pane UUIDs are public custody identities, not secret authentication material.
+            || *pane_id != selected.pane_id
             || current_mux_incarnation != original_mux_incarnation
             || *current_mux_incarnation == census.mux_incarnation()
         {
@@ -4572,8 +4683,10 @@ impl GuardianProxyLeasePlan {
                     "original guardian custody is missing or unauthenticated",
                 )
             })?;
-        Self::prepare_with_build(socket_path, token_path, size, census, true)?
-            .with_spawn_custody(custody)
+        let mut plan = Self::prepare_with_build(socket_path, token_path, size, census, true)?
+            .with_spawn_custody(custody)?;
+        plan.selected_checkpoint = Some(selected);
+        Ok(plan)
     }
 
     /// Validate local proxy state and authenticate the exact pre-Claim client.
@@ -4616,6 +4729,7 @@ impl GuardianProxyLeasePlan {
             client,
             spawn_custody: None,
             build_authenticated,
+            selected_checkpoint: None,
         })
     }
 
@@ -4675,6 +4789,9 @@ impl GuardianProxyLeasePlan {
             .ok_or(GuardianProxyError::Client(GuardianClientError::Protocol(
                 GuardianProtocolError::GenerationExhausted,
             )))?;
+        if let Some(selected) = self.selected_checkpoint {
+            selected.validate_attach(pane_id, generation)?;
+        }
         let identity = GuardianPaneLeaseIdentity::new(
             self.client.guardian_incarnation(),
             self.client.mux_incarnation(),
@@ -4695,6 +4812,7 @@ impl GuardianProxyLeasePlan {
             client,
             spawn_custody,
             build_authenticated: _,
+            selected_checkpoint,
         } = self;
         let pending = Box::new(GuardianPendingClaim {
             socket_path: socket_path.clone(),
@@ -4763,6 +4881,7 @@ impl GuardianProxyLeasePlan {
             census,
         )?;
         staging.spawn_custody = spawn_custody;
+        staging.selected_checkpoint = selected_checkpoint;
         Ok(staging)
     }
 
@@ -4774,6 +4893,9 @@ impl GuardianProxyLeasePlan {
         generation: u64,
         request_id: Uuid,
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
+        if let Some(selected) = self.selected_checkpoint {
+            selected.validate_attach(pane_id, generation)?;
+        }
         let identity = GuardianPaneLeaseIdentity::new(
             self.client.guardian_incarnation(),
             self.client.mux_incarnation(),
@@ -4794,6 +4916,7 @@ impl GuardianProxyLeasePlan {
             client,
             spawn_custody,
             build_authenticated: _,
+            selected_checkpoint,
         } = self;
         let claimed_lease = client
             .attach(pane_id, generation, request_id)
@@ -4808,6 +4931,7 @@ impl GuardianProxyLeasePlan {
             census,
         )?;
         staging.spawn_custody = spawn_custody;
+        staging.selected_checkpoint = selected_checkpoint;
         Ok(staging)
     }
 }
@@ -4820,6 +4944,7 @@ impl GuardianProxyLeasePlan {
 /// reader before any caller can construct a pane.
 pub struct GuardianProxyStaging {
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    selected_checkpoint: Option<SelectedRecoveryCheckpoint>,
     actor: SharedGuardianPaneLeaseActor,
     census: Arc<GuardianCensusCoordinator>,
     reader_slot: Arc<GuardianReplayReaderSlot>,
@@ -5073,6 +5198,7 @@ impl GuardianProxyStaging {
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
             spawn_custody: None,
+            selected_checkpoint: None,
             replay_transport: None,
             checkpoint_publisher,
             lease_rollback,
@@ -5126,6 +5252,7 @@ impl GuardianProxyStaging {
             expected_size,
             config,
             limits,
+            self.selected_checkpoint,
         )?;
         let tail = GuardianReplayTailReader::new(
             replay_transport,
@@ -7047,7 +7174,8 @@ mod tests {
                 pixel_height: size.pixel_height as u16,
             },
             successor_census,
-            &restored_pane.spawn_custody,
+            &validated,
+            provenance.original.pane_id,
         )
         .unwrap();
         assert!(
@@ -7349,6 +7477,8 @@ mod tests {
         )
         .unwrap();
         let restored_pane = &restored.pane_terminals[&(pane_id as u64)];
+        assert_eq!(restored_pane.rows as usize, size.rows);
+        assert_eq!(restored_pane.cols as usize, size.cols);
 
         let child_pid_path = directory.join("child-pid");
         let post_successor = directory.join("post-successor");
@@ -7492,7 +7622,8 @@ mod tests {
                     pixel_height: size.pixel_height as u16,
                 },
                 Arc::clone(&successor_coordinator),
-                &restored_pane.spawn_custody,
+                &validated,
+                provenance.original.pane_id,
             )
             .unwrap();
             match successor_plan.claim(
@@ -9310,6 +9441,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selected_recovery_checkpoint_binds_exact_replay_before_acknowledgement() {
+        let fixture = capture_record_checkpoint_fixture();
+        let selected = SelectedRecoveryCheckpoint {
+            pane_id: identity().pane_id(),
+            generation: fixture.descriptor.capture_generation(),
+            checkpoint_id: fixture.descriptor.checkpoint_id(),
+            boundary_id: fixture.descriptor.boundary_id().into_bytes(),
+            payload_digest: fixture.descriptor.terminal_payload_digest(),
+            payload_bytes: fixture.descriptor.total_bytes(),
+        };
+        for control in 0..7 {
+            let mut expected = selected;
+            match control {
+                0 => {}
+                1 => {
+                    expected.checkpoint_id =
+                        GuardianCheckpointIdentityDigest::from_bytes([0x82; 32]).unwrap();
+                }
+                2 => expected.boundary_id = [0x83; 32],
+                3 => expected.payload_digest = [0x84; 32],
+                4 => expected.payload_bytes += 1,
+                5 => expected.generation += 1,
+                6 => expected.pane_id = id(0x85),
+                _ => unreachable!(),
+            }
+            let state = Arc::new(Mutex::new(FakeReplayState {
+                pages: checkpoint_and_complete_pages(
+                    fixture.descriptor,
+                    fixture.checkpoint.clone(),
+                ),
+                replay_io_failures: 0,
+                ack_io_failures: 0,
+                requests: Vec::new(),
+                acks: Vec::new(),
+            }));
+            let mut transport = FakeReplayTransport {
+                state: Arc::clone(&state),
+            };
+            let result = consume_one_guardian_replay_snapshot(
+                &mut transport,
+                identity(),
+                size(24, 80),
+                test_terminal_config(),
+                TerminalCheckpointLimits::default(),
+                Some(expected),
+            );
+            let state = state.lock();
+            assert!(matches!(
+                state.requests.first(),
+                Some((_, GuardianReplayRequestV1::Open {
+                    selector: GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id },
+                    ..
+                })) if *checkpoint_id == expected.checkpoint_id
+            ));
+            if control == 0 {
+                let restored = result.expect("exact selected checkpoint must restore");
+                assert_eq!(restored.checkpoint_id, selected.checkpoint_id);
+                assert_eq!(state.acks.len(), 2);
+            } else {
+                assert!(
+                    matches!(result, Err(GuardianProxyError::ReplayInvariant(_))),
+                    "control {control} must reject a different selected checkpoint"
+                );
+                assert!(
+                    state.acks.is_empty(),
+                    "control {control} acknowledged wrong cut"
+                );
+            }
+        }
+        assert!(
+            selected
+                .validate_attach(selected.pane_id, selected.generation + 1)
+                .is_ok()
+        );
+        assert!(
+            selected
+                .validate_attach(id(0x86), selected.generation + 1)
+                .is_err()
+        );
+        assert!(
+            selected
+                .validate_attach(selected.pane_id, selected.generation)
+                .is_err()
+        );
+        let exhausted = SelectedRecoveryCheckpoint {
+            generation: u64::MAX,
+            ..selected
+        };
+        assert!(exhausted.validate_attach(selected.pane_id, 0).is_err());
+    }
+
     fn genesis_checkpoint_fixture() -> (GuardianCheckpointDescriptorV1, Zeroizing<Vec<u8>>) {
         let terminal = Terminal::new(
             TerminalSize {
@@ -9356,6 +9579,7 @@ mod tests {
             size(24, 80),
             test_terminal_config(),
             TerminalCheckpointLimits::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -9405,7 +9629,8 @@ mod tests {
                     identity(),
                     size(24, 80),
                     test_terminal_config(),
-                    TerminalCheckpointLimits::default()
+                    TerminalCheckpointLimits::default(),
+                    None,
                 ),
                 Err(GuardianProxyError::LeaseIdentityMismatch)
             ));
@@ -9439,6 +9664,7 @@ mod tests {
                 expected_size,
                 test_terminal_config(),
                 TerminalCheckpointLimits::default(),
+                None,
             )
             .expect_err("mismatched genesis geometry cannot activate");
             if pixel_mismatch {
@@ -9495,7 +9721,8 @@ mod tests {
                 identity(),
                 size(24, 80),
                 test_terminal_config(),
-                TerminalCheckpointLimits::default()
+                TerminalCheckpointLimits::default(),
+                None,
             ),
             Err(GuardianProxyError::ReplayInvariant(
                 "terminal replay witness does not match the consumed checkpoint and suffix"
