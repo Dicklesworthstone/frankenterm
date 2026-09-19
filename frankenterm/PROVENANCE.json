@@ -640,7 +640,7 @@
         "cleanup": 3,
         "cosmetic": 30,
         "docs": 6,
-        "feat": 198,
+        "feat": 201,
         "fix": 257,
         "other": 51,
         "refactor": 11,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 102
       },
-      "fork_side_commit_count": 679,
+      "fork_side_commit_count": 682,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-19T12:43:21-04:00",
-        "sha": "ebbd1854bdcdd038f00d506099b1fc47aa4c9aef",
-        "subject": "fix(mux): reject stale child-exit prune admission"
+        "classification": "feat",
+        "committed_at": "2026-09-19T14:36:06-04:00",
+        "sha": "55db0f0ede5f424427484f495a12b2944af11e1e",
+        "subject": "feat(guardian): restore successor rotation from acknowledged custody"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -897,19 +897,19 @@
         "docs": 2,
         "feat": 58,
         "fix": 120,
-        "other": 58,
+        "other": 59,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 64
+        "test": 66
       },
-      "fork_side_commit_count": 333,
+      "fork_side_commit_count": 336,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-19T05:38:21-04:00",
-        "sha": "29e8b194e93974340943ae28980f37afffaf7a3e",
-        "subject": "perf(scrollback): yield terminal lock between geometry slices"
+        "classification": "test",
+        "committed_at": "2026-09-19T14:48:18-04:00",
+        "sha": "b2b25901625ed2bf9880e95f99fa058334483950",
+        "subject": "test(term): assert the exact cold-read request without ambiguous range array"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1038,20 +1038,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 18,
-        "fix": 96,
+        "fix": 97,
         "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 153,
+      "fork_side_commit_count": 154,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-19T12:12:00-04:00",
-        "sha": "2325774fa8ff38d26cf04fc461421aca150dcfad",
-        "subject": "fix(gui): apply native title and reconciliation under retained admission"
+        "committed_at": "2026-09-19T13:51:49-04:00",
+        "sha": "ba8765cc322e359126618e56970eb3bfb3103626",
+        "subject": "fix(gui): retain queued Lua successors through bounded admission retry"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2807,
-  "generated_at": "2026-09-19T10:06:56.946876Z",
+  "fork_side_commit_total": 2814,
+  "generated_at": "2026-09-19T18:49:52.382645Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
