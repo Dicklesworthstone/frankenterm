@@ -233,7 +233,7 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 44,
-        "fix": 49,
+        "fix": 50,
         "other": 10,
         "refactor": 5,
         "rename": 1,
@@ -241,13 +241,13 @@
         "security-fix": 2,
         "test": 15
       },
-      "fork_side_commit_count": 142,
+      "fork_side_commit_count": 143,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-19T16:23:13-04:00",
-        "sha": "a60d8b88d822d67ad3f3b36869127a68342e7cdd",
-        "subject": "feat(gui): bound retained pane state and treat missing panes as gone"
+        "classification": "fix",
+        "committed_at": "2026-09-19T16:44:11-04:00",
+        "sha": "39fc550e04053440dfd8aafd523daaa60c90e917",
+        "subject": "fix(config): use renamed dynamic crate in pane budget test"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -641,21 +641,21 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 202,
-        "fix": 257,
+        "fix": 258,
         "other": 51,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 102
+        "test": 103
       },
-      "fork_side_commit_count": 684,
+      "fork_side_commit_count": 686,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "refactor",
-        "committed_at": "2026-09-19T16:31:12-04:00",
-        "sha": "ccd86165e942a785c41f515ac0404bc2b41b5c81",
-        "subject": "refactor(guardian): test recovery-intent digest zeros with contains"
+        "classification": "fix",
+        "committed_at": "2026-09-19T17:35:02-04:00",
+        "sha": "541b7409216233a699d6f794309d3822dda46080",
+        "subject": "fix(recovery): qualify unchanged checkpoint adoptions by capture generation"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -901,15 +901,15 @@
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 66
+        "test": 67
       },
-      "fork_side_commit_count": 337,
+      "fork_side_commit_count": 338,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-19T16:23:15-04:00",
-        "sha": "18d3b53dc759036d86ab849caf4b9d78c35f8b37",
-        "subject": "perf(term): page cold geometry instead of one VecDeque of rows"
+        "classification": "test",
+        "committed_at": "2026-09-19T16:44:42-04:00",
+        "sha": "60a8695a25f1562cdaf0eeb100b705cf031216e5",
+        "subject": "test(term): verify ragged cold-history viewport parity after resize"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2818,
-  "generated_at": "2026-09-19T20:35:23.170482Z",
+  "fork_side_commit_total": 2822,
+  "generated_at": "2026-09-19T21:41:41.039575Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
