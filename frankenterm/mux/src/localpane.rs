@@ -10086,10 +10086,6 @@ mod tests {
             }
         }
 
-        fn add_row(&self, row: StableRowIndex, line: Line) {
-            self.rows.lock().unwrap().push((row, line));
-        }
-
         fn advance_identity(&self) {
             *self.identity.lock().unwrap() =
                 frankenterm_term::config::ScrollbackIntervalIdentity::default();
@@ -10097,6 +10093,15 @@ mod tests {
     }
 
     impl frankenterm_term::config::ScrollbackSpillSink for MuxCheckpointTestSink {
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            panic!("checkpoint capture must not clear its source scrollback")
+        }
+
         fn store_scrollback_line(
             &self,
             stable_row: StableRowIndex,
@@ -10228,7 +10233,7 @@ mod tests {
         fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
             frankenterm_term::config::ScrollbackTierConfig {
                 enabled: true,
-                hot_lines: 5,
+                hot_lines: 1,
                 warm_max_bytes: 0,
             }
         }
@@ -10255,18 +10260,23 @@ mod tests {
         )
     }
 
+    fn seed_checkpoint_cold_rows(terminal: &mut Terminal, rows: &[&str]) {
+        for row in rows {
+            terminal.advance_bytes(row.as_bytes());
+            terminal.advance_bytes(b"\r\n");
+        }
+        // Scroll past the one retained hot history row through the actual
+        // parser and spill path, then position visible output at the top.
+        terminal.advance_bytes(b"\x1b[24;1H");
+        for _ in 0..=rows.len() {
+            terminal.advance_bytes(b"\r\n");
+        }
+        terminal.advance_bytes(b"\x1b[1;1H");
+    }
+
     #[test]
     fn test_legacy_terminal_checkpoint_positive_roundtrip() {
         let sink = Arc::new(MuxCheckpointTestSink::new());
-        let blank_attr = termwiz::cell::CellAttributes::blank();
-        sink.add_row(
-            0,
-            Line::from_text("cold scrollback line 0", &blank_attr, 1, None),
-        );
-        sink.add_row(
-            1,
-            Line::from_text("cold scrollback line 1", &blank_attr, 1, None),
-        );
 
         let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
             sink: Arc::clone(&sink),
@@ -10280,7 +10290,11 @@ mod tests {
             Box::new(Vec::<u8>::new()),
         );
 
-        terminal.screen_mut().stable_row_index_offset = 2;
+        seed_checkpoint_cold_rows(
+            &mut terminal,
+            &["cold scrollback line 0", "cold scrollback line 1"],
+        );
+        assert_eq!(sink.retained_scrollback_rows(), 2);
 
         terminal.advance_bytes("\x1b[1;31mPrimary \u{1F980} Crab\x1b[0m\r\n".as_bytes());
         terminal.advance_bytes(b"\x1b[?2004h");
@@ -10294,7 +10308,7 @@ mod tests {
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = Vec::new();
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10314,7 +10328,7 @@ mod tests {
         let checkpoint = validated.checkpoint();
 
         // 1. Both screens preserved
-        assert_eq!(checkpoint.primary_lines_count(), 26);
+        assert_eq!(checkpoint.primary_lines_count(), 27);
         assert_eq!(checkpoint.alternate_lines_count(), 24);
         assert!(checkpoint.is_alternate_screen_active());
 
@@ -10339,12 +10353,12 @@ mod tests {
         assert_eq!(checkpoint.alternate_cell_text(0, 10), Some("\u{26A1}"));
 
         // 6. Styled cells & Unicode preserved on primary screen
-        assert_eq!(checkpoint.primary_cell_text(2, 0), Some("P"));
+        assert_eq!(checkpoint.primary_cell_text(3, 0), Some("P"));
         assert_eq!(
-            checkpoint.primary_cell_intensity(2, 0),
+            checkpoint.primary_cell_intensity(3, 0),
             Some(termwiz::cell::Intensity::Bold)
         );
-        assert_eq!(checkpoint.primary_cell_text(2, 8), Some("\u{1F980}"));
+        assert_eq!(checkpoint.primary_cell_text(3, 8), Some("\u{1F980}"));
     }
 
     #[test]
@@ -10355,7 +10369,7 @@ mod tests {
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = vec![Action::Print('h'), Action::Print('i')];
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10376,6 +10390,9 @@ mod tests {
         }
 
         // Under DrainAndApply policy, pending actions are applied and drained
+        let ground = parser
+            .recovery_ground_boundary()
+            .expect("parser remains at recovery ground after the refused capture");
         let result = pane.capture_legacy_terminal_checkpoint_with_policy(
             authority,
             &mut pending,
@@ -10397,7 +10414,7 @@ mod tests {
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = Vec::new();
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10414,9 +10431,6 @@ mod tests {
     #[test]
     fn test_legacy_terminal_checkpoint_rejects_stale_cold_generation() {
         let sink = Arc::new(MuxCheckpointTestSink::new());
-        let blank_attr = termwiz::cell::CellAttributes::blank();
-        let line0 = Line::from_text("cold row 0", &blank_attr, 1, None);
-        sink.add_row(0, line0);
         sink.mutate_on_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -10431,14 +10445,15 @@ mod tests {
             "stale-cold-test",
             Box::new(Vec::<u8>::new()),
         );
-        terminal.screen_mut().stable_row_index_offset = 1;
+        seed_checkpoint_cold_rows(&mut terminal, &["cold row 0"]);
+        assert_eq!(sink.retained_scrollback_rows(), 1);
 
         let pane = make_legacy_test_pane(780, terminal);
 
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = Vec::new();
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10455,9 +10470,6 @@ mod tests {
     #[test]
     fn test_legacy_terminal_checkpoint_lock_release_causal() {
         let sink = Arc::new(MuxCheckpointTestSink::new());
-        let blank_attr = termwiz::cell::CellAttributes::blank();
-        let line0 = Line::from_text("cold row 0", &blank_attr, 1, None);
-        sink.add_row(0, line0);
 
         let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
             sink: Arc::clone(&sink),
@@ -10470,7 +10482,8 @@ mod tests {
             "causal-lock-test",
             Box::new(Vec::<u8>::new()),
         );
-        terminal.screen_mut().stable_row_index_offset = 1;
+        seed_checkpoint_cold_rows(&mut terminal, &["cold row 0"]);
+        assert_eq!(sink.retained_scrollback_rows(), 1);
 
         let pane = Arc::new(make_legacy_test_pane(781, terminal));
 
@@ -10490,7 +10503,7 @@ mod tests {
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = Vec::new();
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10509,10 +10522,6 @@ mod tests {
     fn test_legacy_terminal_checkpoint_cold_reflow_roundtrip() {
         let sink = Arc::new(MuxCheckpointTestSink::new());
         let blank_attr = termwiz::cell::CellAttributes::blank();
-        sink.add_row(
-            0,
-            Line::from_text("unreflowed cold row 0", &blank_attr, 1, None),
-        );
 
         let config: Arc<dyn TerminalConfiguration> = Arc::new(MuxCheckpointTestConfig {
             sink: Arc::clone(&sink),
@@ -10525,7 +10534,8 @@ mod tests {
             "cold-reflow-test",
             Box::new(Vec::<u8>::new()),
         );
-        terminal.screen_mut().stable_row_index_offset = 1;
+        seed_checkpoint_cold_rows(&mut terminal, &["unreflowed cold row 0"]);
+        assert_eq!(sink.retained_scrollback_rows(), 1);
 
         let frankenterm_term::config::ScrollbackIntervalCapture::Ready(interval) =
             sink.try_capture_scrollback_interval()
@@ -10550,7 +10560,7 @@ mod tests {
         let authority = ModelParserCaptureAuthority::issue();
         let limits = TerminalCheckpointLimits::default();
         let mut pending = Vec::new();
-        let mut parser = termwiz::escape::parser::Parser::new();
+        let parser = termwiz::escape::parser::Parser::new();
         let ground = parser
             .recovery_ground_boundary()
             .expect("fresh parser must be at recovery ground");
@@ -10566,7 +10576,7 @@ mod tests {
         let checkpoint = validated.checkpoint();
 
         // Verify that the replacement from cold_row_fragments was applied
-        assert_eq!(checkpoint.primary_lines_count(), 25);
+        assert_eq!(checkpoint.primary_lines_count(), 26);
         assert_eq!(checkpoint.primary_cold_prefix_lines(), 1);
         // Cell (0, 0) should be 'r' from "reflowed", not 'u' from "unreflowed"
         assert_eq!(checkpoint.primary_cell_text(0, 0), Some("r"));
