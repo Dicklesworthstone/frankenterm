@@ -10728,7 +10728,11 @@ pub(crate) mod tests {
         assert_eq!(sink.load_scrollback_lines(0..32).len(), 33);
         sink.requests.lock().unwrap().clear();
         assert!(screen.lines_in_stable_range(0..65).1.is_empty());
-        assert_eq!(*sink.requests.lock().unwrap(), [0..32]);
+        {
+            let requests = sink.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0], 0..32);
+        }
         sink.overfill.store(false, Ordering::Relaxed);
         sink.requests.lock().unwrap().clear();
         let expected = screen.lines_in_stable_range(0..32).1;
