@@ -200,7 +200,7 @@ impl crate::TermWindow {
         );
         let palette = self.palette().clone();
         let content = if height >= metrics.cell_size.height as f32 {
-            ElementContent::Text("Waiting for GUI capacity".to_owned())
+            ElementContent::Text("Loading pane…".to_owned())
         } else {
             ElementContent::Children(Vec::new())
         };
