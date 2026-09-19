@@ -361,7 +361,7 @@ impl crate::TermWindow {
         config: &ConfigHandle,
         target: VisualBellTarget,
     ) -> Option<f32> {
-        let mut per_pane = self.pane_state(pane.pane_id());
+        let mut per_pane = self.pane_state(pane.pane_id())?;
         if let Some(ringing) = per_pane.bell_start {
             if config.visual_bell.target == target {
                 let mut color_ease = ColorEase::new(

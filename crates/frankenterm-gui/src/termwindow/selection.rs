@@ -450,7 +450,9 @@ impl super::TermWindow {
                             let now = std::time::Instant::now();
                             if now >= deadline {
                                 window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
-                                    let mut state = tw.pane_state(pane_id);
+                                    let Some(mut state) = tw.pane_state(pane_id) else {
+                                        return;
+                                    };
                                     if state
                                         .pending_selection_start
                                         .as_ref()
@@ -470,16 +472,19 @@ impl super::TermWindow {
                             backoff = (backoff * 3 / 2).min(std::time::Duration::from_millis(50));
 
                             window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
-                                let is_pending = tw
-                                    .pane_state(pane_id)
-                                    .pending_selection_start
-                                    .as_ref()
-                                    .is_some_and(|p| p.deadline == deadline);
+                                let is_pending = tw.pane_state(pane_id).is_some_and(|state| {
+                                    state
+                                        .pending_selection_start
+                                        .as_ref()
+                                        .is_some_and(|p| p.deadline == deadline)
+                                });
                                 if !is_pending {
                                     return;
                                 }
                                 if std::time::Instant::now() >= deadline {
-                                    let mut state = tw.pane_state(pane_id);
+                                    let Some(mut state) = tw.pane_state(pane_id) else {
+                                        return;
+                                    };
                                     state.pending_selection_start = None;
                                     drop(state);
                                     if let Some(window) = tw.window.as_ref() {
@@ -562,12 +567,14 @@ impl super::TermWindow {
 
     fn mouse_selection_authority(&self, pane: &Arc<dyn Pane>) -> Option<SelectionAuthority> {
         let current = self.selection_frame_stamp(pane);
-        let state = self.pane_state(pane.pane_id());
+        let state = self.pane_state(pane.pane_id())?;
         let mouse = state.mouse_selection_frame?;
         (state.selection_frame.for_mouse(current) == Some(mouse)).then_some(mouse.authority)
     }
-    pub fn selection(&self, pane_id: PaneId) -> RefMut<'_, Selection> {
-        RefMut::map(self.pane_state(pane_id), |state| &mut state.selection)
+    pub fn selection(&self, pane_id: PaneId) -> Option<RefMut<'_, Selection>> {
+        Some(RefMut::map(self.pane_state(pane_id)?, |state| {
+            &mut state.selection
+        }))
     }
 
     pub fn update_selection(
@@ -591,7 +598,9 @@ impl super::TermWindow {
         update: impl FnOnce(&mut Selection),
     ) {
         let pane_id = pane.pane_id();
-        let mut selection = self.selection(pane_id).clone();
+        let Some(mut selection) = self.selection(pane_id).map(|selection| selection.clone()) else {
+            return;
+        };
         {
             update(&mut selection);
             selection.seqno = current_seqno;
@@ -611,13 +620,16 @@ impl super::TermWindow {
     pub fn selection_authority_is_current(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = SelectionAuthority::capture(&**pane);
         self.synchronize_native_selection(pane, current);
-        self.selection(pane.pane_id()).is_authorized_by(current)
+        self.selection(pane.pane_id())
+            .is_some_and(|selection| selection.is_authorized_by(current))
     }
 
     pub fn selection_authority_has_changed(&self, pane: &Arc<dyn Pane>) -> bool {
         let current = SelectionAuthority::capture(&**pane);
         !self.synchronize_native_selection(pane, current)
-            && self.selection(pane.pane_id()).is_invalidated_by(current)
+            && self
+                .selection(pane.pane_id())
+                .is_some_and(|selection| selection.is_invalidated_by(current))
     }
 
     fn capture_native_selection(
@@ -647,22 +659,27 @@ impl super::TermWindow {
             || desired.rectangular
             || (desired.origin.is_none() && desired.range.is_none())
         {
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             state.pending_native_selection = None;
             state.selection = desired;
             return;
         }
         // A newer gesture supersedes any deferred clipboard operation.
-        self.pane_state(pane.pane_id()).pending_native_selection =
+        let Some(mut state) = self.pane_state(pane.pane_id()) else {
+            return;
+        };
+        state.pending_native_selection =
             Some(crate::selection::PendingNativeSelection::new(desired));
+        drop(state);
         self.retry_pending_native_selection(pane);
     }
 
     pub(super) fn retry_pending_native_selection(&self, pane: &Arc<dyn Pane>) {
         let Some(mut pending) = self
             .pane_state(pane.pane_id())
-            .pending_native_selection
-            .take()
+            .and_then(|mut state| state.pending_native_selection.take())
         else {
             return;
         };
@@ -679,14 +696,21 @@ impl super::TermWindow {
         }
         if pending.committed {
             self.selection_authority_is_current(pane);
-            let current = self.selection(pane.pane_id()).clone();
+            let Some(current) = self
+                .selection(pane.pane_id())
+                .map(|selection| selection.clone())
+            else {
+                return;
+            };
             let same = match (current.native_anchor(), pending.desired.native_anchor()) {
                 (Some(current), Some(expected)) => current == expected,
                 (None, None) => current == pending.desired,
                 _ => false,
             };
             if !same {
-                self.pane_state(pane.pane_id()).pending_native_selection = None;
+                if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                    state.pending_native_selection = None;
+                }
                 return;
             }
             pending.desired = current;
@@ -704,7 +728,9 @@ impl super::TermWindow {
             }
         };
         let result = {
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             let result = pending.try_commit(&mut state.selection, capture);
             if matches!(
                 result,
@@ -719,7 +745,9 @@ impl super::TermWindow {
             result
         };
         if result.is_none() {
-            self.pane_state(pane.pane_id()).pending_native_selection = Some(pending);
+            if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                state.pending_native_selection = Some(pending);
+            }
             return;
         }
         if let Some(crate::selection::NativeSelectionCommit::Applied { needs_repaint }) = result {
@@ -741,8 +769,9 @@ impl super::TermWindow {
                             }
                         }
                         Ok(None) => {
-                            self.pane_state(pane.pane_id()).pending_native_selection =
-                                Some(pending);
+                            if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                                state.pending_native_selection = Some(pending);
+                            }
                         }
                         Err(reason) => {
                             frankenterm_toast_notification::persistent_toast_notification(
@@ -976,7 +1005,9 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         destination: config::keyassignment::ClipboardCopyDestination,
     ) -> bool {
-        let mut state = self.pane_state(pane.pane_id());
+        let Some(mut state) = self.pane_state(pane.pane_id()) else {
+            return false;
+        };
         if let Some(pending) = state.pending_selection_start.as_mut() {
             pending.released = true;
             pending.copy = Some(destination);
@@ -1019,13 +1050,19 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         current: Option<SelectionAuthority>,
     ) -> bool {
-        if !self.selection(pane.pane_id()).is_invalidated_by(current) {
+        if !self
+            .selection(pane.pane_id())
+            .is_some_and(|selection| selection.is_invalidated_by(current))
+        {
             return false;
         }
         let Some(local) = pane.downcast_ref::<mux::localpane::LocalPane>() else {
             return false;
         };
-        let Some(token) = self.selection(pane.pane_id()).native_anchor().cloned() else {
+        let Some(token) = self
+            .selection(pane.pane_id())
+            .and_then(|selection| selection.native_anchor().cloned())
+        else {
             return false;
         };
         let Some((floor, sequence, dimensions, points)) = local.selection_anchor_snapshot(&token)
@@ -1037,8 +1074,9 @@ impl super::TermWindow {
             return true;
         }
         if let Some((points, authority)) = points.zip(resolved) {
-            self.selection(pane.pane_id())
-                .rebase_native_anchor(points, authority, sequence);
+            if let Some(mut selection) = self.selection(pane.pane_id()) {
+                selection.rebase_native_anchor(points, authority, sequence);
+            }
         }
         false
     }
@@ -1047,16 +1085,21 @@ impl super::TermWindow {
     pub fn selection_lines(&self, pane: &Arc<dyn Pane>) -> Vec<Line> {
         let expected = SelectionAuthority::capture(&**pane);
         self.synchronize_native_selection(pane, expected);
-        if !self.selection(pane.pane_id()).is_authorized_by(expected) {
+        if !self
+            .selection(pane.pane_id())
+            .is_some_and(|selection| selection.is_authorized_by(expected))
+        {
             return Vec::new();
         }
-        let rectangular = self.selection(pane.pane_id()).rectangular;
-        let result = if let Some(sel) = self
-            .selection(pane.pane_id())
-            .range
-            .as_ref()
-            .map(|r| r.normalize())
-        {
+        let Some((rectangular, range)) = self.selection(pane.pane_id()).map(|selection| {
+            (
+                selection.rectangular,
+                selection.range.as_ref().map(|r| r.normalize()),
+            )
+        }) else {
+            return Vec::new();
+        };
+        let result = if let Some(sel) = range {
             selected_lines_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular)
         } else {
             Vec::new()
@@ -1077,11 +1120,11 @@ impl super::TermWindow {
     fn try_selection_text(&self, pane: &Arc<dyn Pane>) -> Option<String> {
         let expected = SelectionAuthority::capture(&**pane);
         self.synchronize_native_selection(pane, expected);
-        if expected.is_none() || !self.selection(pane.pane_id()).is_authorized_by(expected) {
+        if expected.is_none() || !self.selection(pane.pane_id())?.is_authorized_by(expected) {
             return None;
         }
         let (rectangular, sel) = {
-            let selection = self.selection(pane.pane_id());
+            let selection = self.selection(pane.pane_id())?;
             let Some(sel) = selection.range.as_ref().map(|r| r.normalize()) else {
                 return Some(String::new());
             };
@@ -1102,6 +1145,9 @@ impl super::TermWindow {
     }
 
     pub fn begin_selection_drag(&mut self, pane: &Arc<dyn Pane>) {
+        if self.admit_gui_pane(pane.pane_id()).is_none() {
+            return;
+        }
         self.active_selection_drag_button = self.current_mouse_event.as_ref().and_then(|event| {
             super::mouseevent::selection_gesture_button(&event.kind, &self.current_mouse_buttons)
         });
@@ -1111,7 +1157,9 @@ impl super::TermWindow {
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
         self.clear_selection_drag();
         {
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             state.pending_selection_start = None;
             state.pending_native_selection = None;
             state.selection.clear();
@@ -1136,12 +1184,20 @@ impl super::TermWindow {
         )>,
     ) -> bool {
         // Even a deferred first motion is a drag, not a hyperlink click.
-        self.pane_state(pane.pane_id()).suppress_selection_link = true;
+        let Some(mut state) = self.pane_state(pane.pane_id()) else {
+            return false;
+        };
+        state.suppress_selection_link = true;
+        drop(state);
 
         if let Some((_auth, pos, row)) = retained {
-            let observed_frame = self.pane_state(pane.pane_id()).mouse_selection_frame;
+            let observed_frame = self
+                .pane_state(pane.pane_id())
+                .and_then(|state| state.mouse_selection_frame);
             let frame = observed_frame.or_else(|| self.selection_frame_stamp(pane));
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return false;
+            };
             if let Some(pending) = state.pending_selection_start.as_mut() {
                 if let Some(frame) = frame {
                     pending.retain_endpoint(frame, pos, row, None);
@@ -1151,8 +1207,7 @@ impl super::TermWindow {
 
         let had_pending_start = self
             .pane_state(pane.pane_id())
-            .pending_selection_start
-            .is_some();
+            .is_some_and(|state| state.pending_selection_start.is_some());
         self.retry_pending_selection_start(pane);
         if had_pending_start {
             // A successful retry already applies the retained motion once.
@@ -1160,8 +1215,7 @@ impl super::TermWindow {
             // exhaust; this is one invalidation per motion, not a paint loop.
             if self
                 .pane_state(pane.pane_id())
-                .pending_selection_start
-                .is_some()
+                .is_some_and(|state| state.pending_selection_start.is_some())
             {
                 if let Some(window) = self.window.as_ref() {
                     window.invalidate();
@@ -1171,12 +1225,18 @@ impl super::TermWindow {
         }
         self.retry_pending_native_selection(pane);
         self.selection_authority_is_current(pane);
-        let pending_desired = self
-            .pane_state(pane.pane_id())
-            .pending_native_selection
-            .as_ref()
-            .map(|pending| pending.desired.clone());
-        let mut desired = pending_desired.unwrap_or_else(|| self.selection(pane.pane_id()).clone());
+        let pending_desired = self.pane_state(pane.pane_id()).and_then(|state| {
+            state
+                .pending_native_selection
+                .as_ref()
+                .map(|pending| pending.desired.clone())
+        });
+        let Some(mut desired) = pending_desired.or_else(|| {
+            self.selection(pane.pane_id())
+                .map(|selection| selection.clone())
+        }) else {
+            return false;
+        };
         let current_source = SelectionAuthority::capture_source(&**pane);
         let current = current_source.map(|(authority, _, _)| authority);
         if desired.is_invalidated_by(current) {
@@ -1188,19 +1248,26 @@ impl super::TermWindow {
             && pane.downcast_ref::<mux::localpane::LocalPane>().is_some()
             && current_source.is_some()
         {
-            let (position, y) = match retained
-                .map(|(_, position, row)| (position, row))
-                .or_else(|| self.pane_state(pane.pane_id()).mouse_terminal_coords)
-            {
-                Some(coords) => coords,
-                None => return false,
-            };
+            let (position, y) =
+                match retained
+                    .map(|(_, position, row)| (position, row))
+                    .or_else(|| {
+                        self.pane_state(pane.pane_id())
+                            .and_then(|state| state.mouse_terminal_coords)
+                    }) {
+                    Some(coords) => coords,
+                    None => return false,
+                };
 
-            let observed_frame = self.pane_state(pane.pane_id()).mouse_selection_frame;
+            let observed_frame = self
+                .pane_state(pane.pane_id())
+                .and_then(|state| state.mouse_selection_frame);
             // Computing a frame reads viewport state from the same RefCell.
             // Release the first borrow before using that fallback.
             let frame = observed_frame.or_else(|| self.selection_frame_stamp(pane));
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return false;
+            };
             let button = self
                 .active_selection_drag_button
                 .unwrap_or(window::MousePress::Left);
@@ -1241,7 +1308,9 @@ impl super::TermWindow {
             // Output/parser contention or autoscroll can outrun presentation.
             // Wait for a usable frame without discarding the drag's anchor.
             if retained.is_none() {
-                let mut state = self.pane_state(pane.pane_id());
+                let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                    return false;
+                };
                 if let (Some(frame), Some(coordinate), Some(end), Some(button)) = (
                     state.mouse_selection_frame,
                     desired.origin,
@@ -1275,8 +1344,10 @@ impl super::TermWindow {
         desired.seqno = sequence;
         let (position, y) = match retained
             .map(|(_, position, row)| (position, row))
-            .or(self.pane_state(pane.pane_id()).mouse_terminal_coords)
-        {
+            .or_else(|| {
+                self.pane_state(pane.pane_id())
+                    .and_then(|state| state.mouse_terminal_coords)
+            }) {
             Some(coords) => coords,
             None => return false,
         };
@@ -1409,14 +1480,19 @@ impl super::TermWindow {
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {
         {
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             state.pending_selection_start = None;
             state.pending_native_selection = None;
             state.suppress_selection_link = false;
         }
         let expected = self.mouse_selection_authority(pane);
         if expected.is_some() {
-            let (x, y) = match self.pane_state(pane.pane_id()).mouse_terminal_coords {
+            let (x, y) = match self
+                .pane_state(pane.pane_id())
+                .and_then(|state| state.mouse_terminal_coords)
+            {
                 Some(coords) => (coords.0.column, coords.1),
                 None => return,
             };
@@ -1426,7 +1502,9 @@ impl super::TermWindow {
         }
         {
             let pending = {
-                let state = self.pane_state(pane.pane_id());
+                let Some(state) = self.pane_state(pane.pane_id()) else {
+                    return;
+                };
                 state
                     .mouse_selection_frame
                     .zip(state.mouse_terminal_coords)
@@ -1440,8 +1518,10 @@ impl super::TermWindow {
                         )
                     })
             };
-            self.selection(pane.pane_id()).clear();
-            let mut state = self.pane_state(pane.pane_id());
+            let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
+            state.selection.clear();
             state.pending_selection_start = pending;
             if let Some(p) = state.pending_selection_start.as_mut() {
                 if self
@@ -1461,8 +1541,7 @@ impl super::TermWindow {
     pub fn retry_pending_selection_start(&mut self, pane: &Arc<dyn Pane>) {
         let Some(pending) = self
             .pane_state(pane.pane_id())
-            .pending_selection_start
-            .clone()
+            .and_then(|state| state.pending_selection_start.clone())
         else {
             return;
         };
@@ -1475,11 +1554,17 @@ impl super::TermWindow {
                 || self.active_selection_drag_button != Some(pending.button)
                 || !self.current_mouse_buttons.contains(&pending.button))
         {
-            self.pane_state(pane.pane_id()).pending_selection_start = None;
+            if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                state.pending_selection_start = None;
+            }
             return;
         }
         let current = self.selection_frame_stamp(pane);
-        let resolved = pending.resolve(current, &self.pane_state(pane.pane_id()).selection_frame);
+        let Some(state) = self.pane_state(pane.pane_id()) else {
+            return;
+        };
+        let resolved = pending.resolve(current, &state.selection_frame);
+        drop(state);
         match resolved {
             crate::selection::PendingSelectionResolution::Ready => {}
             crate::selection::PendingSelectionResolution::Wait => return,
@@ -1524,7 +1609,9 @@ impl super::TermWindow {
                     wake,
                 ) {
                     Ok(Some(read)) => {
-                        let mut state = self.pane_state(pane.pane_id());
+                        let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                            return;
+                        };
                         if let Some(p) = state.pending_selection_start.as_mut() {
                             if self
                                 .arm_selection_start_deadline(pane.pane_id(), p)
@@ -1573,7 +1660,9 @@ impl super::TermWindow {
                 || pending.deadline != read_guard.deadline()
             {
                 drop(read_guard);
-                let mut state = self.pane_state(pane.pane_id());
+                let Some(mut state) = self.pane_state(pane.pane_id()) else {
+                    return;
+                };
                 if let Some(p) = state.pending_selection_start.as_mut() {
                     p.read = None;
                 }
@@ -1651,7 +1740,9 @@ impl super::TermWindow {
             drop(read_guard);
 
             // 6. Commit candidate selection
-            self.pane_state(pane.pane_id()).pending_selection_start = None;
+            if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                state.pending_selection_start = None;
+            }
             let mut desired = Selection::default();
             desired.origin = Some(pending.coordinate);
             desired.range = Some(payload.range);
@@ -1677,7 +1768,9 @@ impl super::TermWindow {
             return;
         }
 
-        self.pane_state(pane.pane_id()).pending_selection_start = None;
+        if let Some(mut state) = self.pane_state(pane.pane_id()) {
+            state.pending_selection_start = None;
+        }
         let SelectionX::Cell(x) = pending.coordinate.x else {
             return;
         };
@@ -1688,7 +1781,9 @@ impl super::TermWindow {
             x,
             pending.coordinate.y,
         ) {
-            self.pane_state(pane.pane_id()).pending_selection_start = Some(pending);
+            if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                state.pending_selection_start = Some(pending);
+            }
             return;
         }
         // The retained endpoint belongs to this exact displayed gesture;
@@ -1701,11 +1796,12 @@ impl super::TermWindow {
                     Some((pending.frame.authority, position, row)),
                 )
             {
-                if !self
-                    .selection(pane.pane_id())
-                    .is_invalidated_by(SelectionAuthority::capture(&**pane))
-                {
-                    self.pane_state(pane.pane_id()).pending_selection_start = Some(pending);
+                if !self.selection(pane.pane_id()).is_some_and(|selection| {
+                    selection.is_invalidated_by(SelectionAuthority::capture(&**pane))
+                }) {
+                    if let Some(mut state) = self.pane_state(pane.pane_id()) {
+                        state.pending_selection_start = Some(pending);
+                    }
                 }
                 return;
             }
@@ -1716,7 +1812,9 @@ impl super::TermWindow {
         {
             // Copy starts at the current coherent source, but selected-row
             // mutation is judged against the frame where the gesture began.
-            self.selection(pane.pane_id()).seqno = pending.frame.source_sequence;
+            if let Some(mut selection) = self.selection(pane.pane_id()) {
+                selection.seqno = pending.frame.source_sequence;
+            }
         }
         if let Some(destination) = pending.copy {
             self.defer_pending_selection_copy(pane, destination);

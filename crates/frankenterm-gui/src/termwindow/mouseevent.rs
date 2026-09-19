@@ -163,8 +163,10 @@ impl super::TermWindow {
                     // Mark release before ending drag protection, but resolve
                     // only after this event's final coordinates are captured.
                     if let Some(pane_id) = self.active_selection_drag_pane {
-                        if let Some(pending) =
-                            self.pane_state(pane_id).pending_selection_start.as_mut()
+                        if let Some(pending) = self
+                            .pane_state(pane_id)
+                            .as_deref_mut()
+                            .and_then(|state| state.pending_selection_start.as_mut())
                         {
                             pending.released = true;
                             pending.paint_retries_remaining = 3;
@@ -828,6 +830,9 @@ impl super::TermWindow {
             }
         }
 
+        if self.admit_gui_pane(pane.pane_id()).is_none() {
+            return;
+        }
         if capture_mouse {
             self.current_mouse_capture = Some(MouseCapture::TerminalPane(pane.pane_id()));
         }
@@ -879,7 +884,9 @@ impl super::TermWindow {
             .as_ref()
             .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
         let mouse_selection_frame = {
-            let state = self.pane_state(pane.pane_id());
+            let Some(state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             state
                 .selection_frame
                 .for_mouse(current_selection_frame)
@@ -899,7 +906,9 @@ impl super::TermWindow {
         );
 
         {
-            let mut pane_state = self.pane_state(pane.pane_id());
+            let Some(mut pane_state) = self.pane_state(pane.pane_id()) else {
+                return;
+            };
             pane_state.mouse_selection_frame = mouse_selection_frame;
             if let Some(pending) = pane_state.pending_selection_start.as_mut() {
                 if let Some((frame, stable_row)) = mouse_selection_frame.zip(stable_row) {

@@ -150,6 +150,276 @@ struct GuiMuxSubscription {
     dead: Arc<AtomicBool>,
 }
 
+/// Credits belong to a GUI owner, not the mux. Live GUI state and retired
+/// state awaiting cleanup consume the same credit; another window's budget
+/// never depends on this owner's progress.
+struct GuiPaneCleanupOwner {
+    capacity: AtomicUsize,
+    slots: Mutex<HashMap<PaneId, GuiPaneCleanupSlot>>,
+    owner: Mutex<Weak<Mux>>,
+    wake: Mutex<Option<flume::Sender<()>>>,
+    admission_pending: AtomicBool,
+    retry_pending: AtomicBool,
+    allocation_pending: AtomicBool,
+    retired: AtomicBool,
+    subscribed: AtomicBool,
+}
+
+struct GuiPaneCleanupSlot {
+    registration: mux::PaneRegistrationHandle,
+    state: GuiPaneCleanupState,
+}
+
+enum GuiPaneCleanupState {
+    Live,
+    Pending(PaneRemovalCleanupLease),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuiPaneAdmissionError {
+    Retired,
+    Full,
+    Allocation,
+}
+
+impl GuiPaneCleanupOwner {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: AtomicUsize::new(capacity),
+            slots: Mutex::new(HashMap::new()),
+            owner: Mutex::new(
+                Mux::try_get()
+                    .as_ref()
+                    .map(Arc::downgrade)
+                    .unwrap_or_default(),
+            ),
+            wake: Mutex::new(None),
+            admission_pending: AtomicBool::new(false),
+            retry_pending: AtomicBool::new(false),
+            allocation_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            subscribed: AtomicBool::new(false),
+        }
+    }
+
+    fn bind(&self, owner: &Arc<Mux>, wake: flume::Sender<()>) {
+        *lock_termwindow_mutex(&self.owner, "GUI cleanup mux owner") = Arc::downgrade(owner);
+        *lock_termwindow_mutex(&self.wake, "GUI cleanup wake") = Some(wake);
+    }
+
+    fn open_admission(&self) {
+        self.subscribed.store(true, Ordering::Release);
+    }
+
+    fn wake(&self) {
+        if let Some(wake) = lock_termwindow_mutex(&self.wake, "GUI cleanup wake").as_ref() {
+            let _ = wake.try_send(());
+        }
+    }
+
+    fn is_current_mux(&self) -> bool {
+        let owner = lock_termwindow_mutex(&self.owner, "GUI cleanup mux owner").upgrade();
+        owner.is_some_and(|owner| {
+            Mux::try_get().is_some_and(|current| Arc::ptr_eq(&owner, &current))
+        })
+    }
+
+    fn retire_after_gui_cleanup(&self) {
+        lock_termwindow_mutex(&self.wake, "GUI cleanup wake").take();
+        let mut slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        self.retired.store(true, Ordering::Release);
+        let retired = std::mem::take(&mut *slots);
+        drop(slots);
+        drop(retired);
+    }
+
+    fn record_notification(
+        &self,
+        notification: &MuxNotification,
+        cleanup: Option<PaneRemovalCleanupLease>,
+    ) -> bool {
+        let MuxNotification::PaneRemoved(pane_id) = notification else {
+            return false;
+        };
+        if let Some(lease) = cleanup {
+            self.retain_removal(*pane_id, lease);
+        } else {
+            log::error!("PaneRemoved lacked exact cleanup authority for pane {pane_id}");
+        }
+        true
+    }
+
+    fn credit_returned(&self) {
+        if self.admission_pending.swap(false, Ordering::AcqRel) {
+            self.wake();
+        }
+    }
+
+    fn update_capacity(&self, capacity: usize) {
+        let slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        let previous = self.capacity.swap(capacity, Ordering::AcqRel);
+        drop(slots);
+        if capacity > previous {
+            self.credit_returned();
+        }
+    }
+
+    fn live_registrations(&self) -> Vec<mux::PaneRegistrationHandle> {
+        lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots")
+            .values()
+            .filter(|slot| matches!(slot.state, GuiPaneCleanupState::Live))
+            .map(|slot| slot.registration.clone())
+            .collect()
+    }
+
+    fn release_live(&self, registration: &mux::PaneRegistrationHandle) {
+        let mut slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        if slots.get(&registration.pane_id()).is_some_and(|slot| {
+            slot.registration.same_registration(registration)
+                && matches!(slot.state, GuiPaneCleanupState::Live)
+        }) {
+            slots.remove(&registration.pane_id());
+        }
+        drop(slots);
+        self.credit_returned();
+    }
+
+    fn admit(
+        &self,
+        registration: &mux::PaneRegistrationHandle,
+    ) -> Result<(), GuiPaneAdmissionError> {
+        if self.retired.load(Ordering::Acquire) || !self.subscribed.load(Ordering::Acquire) {
+            return Err(GuiPaneAdmissionError::Retired);
+        }
+        let owner = lock_termwindow_mutex(&self.owner, "GUI cleanup mux owner")
+            .upgrade()
+            .ok_or(GuiPaneAdmissionError::Retired)?;
+        if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)) {
+            return Err(GuiPaneAdmissionError::Retired);
+        }
+        let pane = owner
+            .get_pane(registration.pane_id())
+            .ok_or(GuiPaneAdmissionError::Retired)?;
+        if !owner
+            .capture_pane_registration(&pane)
+            .is_some_and(|current| current.same_registration(registration))
+        {
+            return Err(GuiPaneAdmissionError::Retired);
+        }
+        // The operation lease excludes removal fanout until insertion is
+        // visible. Do not acquire mux locks while the slots lock is held.
+        registration
+            .try_with_current(|_| {
+                let mut slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+                if self.retired.load(Ordering::Acquire) {
+                    return Err(GuiPaneAdmissionError::Retired);
+                }
+                if let Some(slot) = slots.get(&registration.pane_id()) {
+                    return if slot.registration.same_registration(registration)
+                        && matches!(slot.state, GuiPaneCleanupState::Live)
+                    {
+                        Ok(())
+                    } else {
+                        Err(GuiPaneAdmissionError::Retired)
+                    };
+                }
+                if slots.len() >= self.capacity.load(Ordering::Acquire) {
+                    // Publish while holding the credit lock, so returning the
+                    // final occupied credit cannot race past this retained wake.
+                    self.admission_pending.store(true, Ordering::Release);
+                    self.allocation_pending.store(false, Ordering::Release);
+                    return Err(GuiPaneAdmissionError::Full);
+                }
+                if slots.try_reserve(1).is_err() {
+                    self.allocation_pending.store(true, Ordering::Release);
+                    drop(slots);
+                    self.wake();
+                    return Err(GuiPaneAdmissionError::Allocation);
+                }
+                self.allocation_pending.store(false, Ordering::Release);
+                slots.insert(
+                    registration.pane_id(),
+                    GuiPaneCleanupSlot {
+                        registration: registration.clone(),
+                        state: GuiPaneCleanupState::Live,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap_or(Err(GuiPaneAdmissionError::Retired))
+    }
+
+    /// Called only by authoritative removal fanout while the exact numeric-ID
+    /// fence is held. An uninterested owner has no state to clean.
+    fn retain_removal(&self, pane_id: PaneId, lease: PaneRemovalCleanupLease) -> bool {
+        let mut slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        let Some(slot) = slots.get_mut(&pane_id) else {
+            drop(slots);
+            lease.complete();
+            return false;
+        };
+        if matches!(slot.state, GuiPaneCleanupState::Live) {
+            slot.state = GuiPaneCleanupState::Pending(lease);
+            drop(slots);
+        } else {
+            // Repeated fanout is already covered by the original retained
+            // obligation. Drop outside our lock: lease release enters mux.
+            drop(slots);
+            drop(lease);
+        }
+        self.wake();
+        true
+    }
+
+    fn pending_registration(&self) -> Option<mux::PaneRegistrationHandle> {
+        let slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        slots
+            .values()
+            .find(|slot| matches!(slot.state, GuiPaneCleanupState::Pending(_)))
+            .map(|slot| slot.registration.clone())
+    }
+
+    fn service_one(
+        &self,
+        cleanup: impl FnOnce(PaneId) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        let Some(registration) = self.pending_registration() else {
+            return Ok(false);
+        };
+        self.retry_pending.store(false, Ordering::Release);
+        if let Err(error) = cleanup(registration.pane_id()) {
+            self.retry_pending.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.complete(&registration);
+        Ok(true)
+    }
+
+    fn complete(&self, registration: &mux::PaneRegistrationHandle) {
+        let mut slots = lock_termwindow_mutex(&self.slots, "GUI pane cleanup slots");
+        let removed = if slots.get(&registration.pane_id()).is_some_and(|slot| {
+            slot.registration.same_registration(registration)
+                && matches!(slot.state, GuiPaneCleanupState::Pending(_))
+        }) {
+            slots.remove(&registration.pane_id())
+        } else {
+            None
+        };
+        drop(slots);
+        if let Some(GuiPaneCleanupSlot {
+            state: GuiPaneCleanupState::Pending(lease),
+            ..
+        }) = removed
+        {
+            lease.complete();
+            self.credit_returned();
+        }
+        if self.pending_registration().is_some() {
+            self.wake();
+        }
+    }
+}
+
 impl Drop for GuiMuxSubscription {
     fn drop(&mut self) {
         self.dead.store(true, Ordering::Release);
@@ -259,6 +529,7 @@ async fn run_mux_output_refresh(
         promise::spawn::MainThreadSpawnReservation,
     ) -> promise::spawn::MainThreadSpawnedTask<()>,
     events: Option<WindowEventRetryDelivery>,
+    cleanup: Option<&GuiPaneCleanupOwner>,
 ) {
     while pending.recv_async().await.is_ok() {
         let mut delay = Duration::from_millis(10);
@@ -319,8 +590,13 @@ async fn run_mux_output_refresh(
                     }
                     // Completion includes native invalidation and permit
                     // release, not merely consumption of the GUI payload.
-                    let _ = deliver(reservation).into_task().fallible().await;
-                    if retry_event {
+                    let delivered = deliver(reservation).into_task().fallible().await;
+                    let retry_cleanup = cleanup.is_some_and(|cleanup| {
+                        cleanup.retry_pending.load(Ordering::Acquire)
+                            || cleanup.allocation_pending.load(Ordering::Acquire)
+                            || (delivered.is_none() && cleanup.pending_registration().is_some())
+                    });
+                    if retry_event || retry_cleanup {
                         sleep(delay).await;
                         delay = delay.saturating_mul(2).min(Duration::from_millis(250));
                         continue;
@@ -1517,6 +1793,7 @@ pub struct TermWindow {
 
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
+    pane_cleanup: Arc<GuiPaneCleanupOwner>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
     window_background: Vec<LoadedBackgroundLayer>,
@@ -1572,6 +1849,7 @@ pub struct TermWindow {
     window_event_retry: Option<WindowEventRetryRequest>,
     last_window_event_retry: Option<String>,
     mux_subscription: Option<GuiMuxSubscription>,
+    pane_cleanup_subscription: Option<GuiMuxSubscription>,
     /// Gate for the iter-dirty render-pass clean-line accounting
     /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
     /// wiring marks PTY, cursor, selection, and whole-screen events
@@ -2386,7 +2664,15 @@ impl TermWindow {
         &mut self,
         pane_id: PaneId,
         visible_rows: usize,
-    ) -> &mut render::dirty_lines::DirtyLineBitmap {
+    ) -> Option<&mut render::dirty_lines::DirtyLineBitmap> {
+        if !self.pane_cleanup.is_current_mux() {
+            return None;
+        }
+        if !lock_termwindow_mutex(&self.pane_cleanup.slots, "GUI pane cleanup slots")
+            .contains_key(&pane_id)
+        {
+            self.admit_gui_pane(pane_id)?;
+        }
         let bitmap = self
             .dirty_lines
             .entry(pane_id)
@@ -2401,7 +2687,7 @@ impl TermWindow {
         if self.damage_generation.exhausted {
             bitmap.mark_all();
         }
-        bitmap
+        Some(bitmap)
     }
 
     /// Drop the bitmap for a pane that has been closed. Without
@@ -2635,8 +2921,9 @@ impl TermWindow {
         &mut self,
         pane_id: u64,
         state: TerminalState,
-    ) -> frankenterm_core::triple_buffer::PublishOutcome {
-        self.triple_buffer_panes.publish(pane_id, state)
+    ) -> Option<frankenterm_core::triple_buffer::PublishOutcome> {
+        self.admit_gui_pane(usize::try_from(pane_id).ok()?)?;
+        Some(self.triple_buffer_panes.publish(pane_id, state))
     }
 
     /// Drop any explicitly published triple-buffer foundation state and
@@ -2658,8 +2945,11 @@ impl TermWindow {
         &mut self,
         pane_id: u64,
         snapshot: frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot,
-    ) {
+    ) -> anyhow::Result<()> {
+        self.admit_gui_pane(usize::try_from(pane_id)?)
+            .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
         self.triple_buffer_pane_health.insert(pane_id, snapshot);
+        Ok(())
     }
 
     /// Translate and retain an explicitly supplied watchdog health view. No
@@ -2669,11 +2959,11 @@ impl TermWindow {
         pane_id: u64,
         health: &frankenterm_core::watchdoged_triple_buffer::WatchdogedHealth,
         last_force_recycle_ts_ms: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         self.record_pane_health_snapshot(
             pane_id,
             pane_health_snapshot_from_watchdoged_health(pane_id, health, last_force_recycle_ts_ms),
-        );
+        )
     }
 
     /// Per ft-gso6n: drop the stored health snapshot for a closed
@@ -3835,6 +4125,9 @@ impl TermWindow {
             last_scroll_info: RenderableDimensions::default(),
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
+            pane_cleanup: Arc::new(GuiPaneCleanupOwner::new(
+                config.gui_retained_pane_state_limit,
+            )),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             active_selection_drag_pane: None,
@@ -3854,6 +4147,7 @@ impl TermWindow {
             window_event_retry: None,
             last_window_event_retry: None,
             mux_subscription: None,
+            pane_cleanup_subscription: None,
             // Per ft-gwzrm: live dirty sources are wired, and the
             // render path only records a clean-line skip after a
             // cached quad list was actually reused.
@@ -4642,6 +4936,27 @@ impl TermWindow {
                 {
                     return Ok(());
                 }
+                // Leave the lease in its prepaid slot throughout cleanup. A
+                // cancelled native task never dequeues it, and an unwinding
+                // handler cannot accidentally release the numeric-ID fence.
+                let pane_cleanup = Arc::clone(&self.pane_cleanup);
+                let cleanup_result = pane_cleanup.service_one(|pane_id| {
+                    self.dispatch_notif(
+                        TermWindowNotif::MuxNotification {
+                            notification: MuxNotification::PaneRemoved(pane_id),
+                            mux_owner: Arc::downgrade(&owner),
+                            pane_removal_cleanup: None,
+                            pending_title_refresh: None,
+                        },
+                        window,
+                    )
+                });
+                if let Err(error) = cleanup_result {
+                    log::error!("retained GUI pane cleanup failed; owner will retry: {error:#}");
+                }
+                // Empty retained wakes include credit returns: retry visible
+                // state admission through the ordinary paced native repaint.
+                actions.request_repaint();
                 if reconcile {
                     self.prune_tab_state_to_live_window();
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
@@ -4777,8 +5092,9 @@ impl TermWindow {
                         log::trace!("Ding! (this is the bell) in pane {}", pane_id);
                         self.emit_window_event("bell", Some(pane_id));
 
-                        let mut per_pane = self.pane_state(pane_id);
-                        per_pane.bell_start.replace(Instant::now());
+                        if let Some(mut per_pane) = self.pane_state(pane_id) {
+                            per_pane.bell_start.replace(Instant::now());
+                        }
                         window.invalidate();
                     }
                     MuxNotification::Alert {
@@ -4929,84 +5245,7 @@ impl TermWindow {
                             );
                             return Ok(());
                         }
-                        // ft-mpc9b.1.2: drop the pane's dirty-line
-                        // bitmap. Without this the HashMap leaks an
-                        // entry per closed pane over the session
-                        // lifetime.
-                        self.forget_dirty_lines_for_pane(pane_id);
-                        // Per ft-kyail: also drop the pane's live
-                        // triple-buffer owner and retained health
-                        // snapshot. Both are keyed by the substrate's
-                        // u64 PaneId; cast from the mux's usize PaneId
-                        // here.
-                        self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(
-                            pane_id,
-                        ));
-                        self.forget_sync_output_state_for_pane(pane_id);
-                        self.semantic_zones.remove(&pane_id);
-                        self.agent_pane_states.remove(&pane_id);
-                        self.line_quad_cache
-                            .borrow_mut()
-                            .remove_keys_where(|key| key.pane_id == pane_id);
-                        self.line_state_cache
-                            .borrow_mut()
-                            .remove_where(|_, state| state.pane_id == pane_id);
-                        let overlay_to_remove = self
-                            .pane_state
-                            .borrow_mut()
-                            .remove(&pane_id)
-                            .and_then(|state| state.overlay);
-                        if let Some(overlay) = overlay_to_remove {
-                            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
-                        }
-                        let detached_retired_overlays = {
-                            let mut detached = Vec::new();
-                            for (owner_pane_id, state) in self.pane_state.borrow_mut().iter_mut() {
-                                if state
-                                    .overlay
-                                    .as_ref()
-                                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
-                                {
-                                    if let Some(overlay) = state.overlay.take() {
-                                        detached.push((OverlaySlot::Pane(*owner_pane_id), overlay));
-                                    }
-                                }
-                            }
-                            for (tab_id, state) in self.tab_state.borrow_mut().iter_mut() {
-                                if state
-                                    .overlay
-                                    .as_ref()
-                                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
-                                {
-                                    if let Some(overlay) = state.overlay.take() {
-                                        detached.push((OverlaySlot::Tab(*tab_id), overlay));
-                                    }
-                                }
-                            }
-                            detached
-                        };
-                        let detached_retired_overlay = !detached_retired_overlays.is_empty();
-                        for (slot, overlay) in detached_retired_overlays {
-                            Self::retire_overlay_registration(slot, overlay);
-                        }
-                        let captured_pane_id = match self.current_mouse_capture.as_ref() {
-                            Some(MouseCapture::TerminalPane(captured_pane_id)) => {
-                                Some(*captured_pane_id)
-                            }
-                            Some(MouseCapture::UI) | None => None,
-                        };
-                        let mouse_cleanup = frankenterm_gui::removed_pane_mouse_cleanup(
-                            captured_pane_id,
-                            self.active_selection_drag_pane,
-                            pane_id,
-                        );
-                        if mouse_cleanup.clear_terminal_capture {
-                            self.current_mouse_capture = None;
-                            self.current_mouse_buttons.clear();
-                        }
-                        if mouse_cleanup.clear_selection_drag {
-                            self.clear_selection_drag();
-                        }
+                        let detached_retired_overlay = self.cleanup_gui_pane_state(pane_id);
                         self.prune_tab_state_to_live_window();
                         if detached_retired_overlay {
                             window.invalidate();
@@ -5119,6 +5358,74 @@ impl TermWindow {
         self.last_tab_state_prune_revision.set(None);
     }
 
+    /// Remove every local reference before returning the exact-registration
+    /// cleanup credit. Also used when a still-live pane moves to another window.
+    fn cleanup_gui_pane_state(&mut self, pane_id: PaneId) -> bool {
+        self.forget_dirty_lines_for_pane(pane_id);
+        self.forget_terminal_state_buffer_for_pane(terminal_pane_id_to_u64(pane_id));
+        self.forget_sync_output_state_for_pane(pane_id);
+        self.semantic_zones.remove(&pane_id);
+        self.agent_pane_states.remove(&pane_id);
+        self.line_quad_cache
+            .borrow_mut()
+            .remove_keys_where(|key| key.pane_id == pane_id);
+        self.line_state_cache
+            .borrow_mut()
+            .remove_where(|_, state| state.pane_id == pane_id);
+        let overlay = self
+            .pane_state
+            .borrow_mut()
+            .remove(&pane_id)
+            .and_then(|state| state.overlay);
+        if let Some(overlay) = overlay {
+            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+        }
+        let mut detached = Vec::new();
+        for (owner, state) in self.pane_state.borrow_mut().iter_mut() {
+            if state
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+            {
+                if let Some(overlay) = state.overlay.take() {
+                    detached.push((OverlaySlot::Pane(*owner), overlay));
+                }
+            }
+        }
+        for (tab, state) in self.tab_state.borrow_mut().iter_mut() {
+            if state
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+            {
+                if let Some(overlay) = state.overlay.take() {
+                    detached.push((OverlaySlot::Tab(*tab), overlay));
+                }
+            }
+        }
+        let detached_overlay = !detached.is_empty();
+        for (slot, overlay) in detached {
+            Self::retire_overlay_registration(slot, overlay);
+        }
+        let captured = match self.current_mouse_capture.as_ref() {
+            Some(MouseCapture::TerminalPane(id)) => Some(*id),
+            Some(MouseCapture::UI) | None => None,
+        };
+        let cleanup = frankenterm_gui::removed_pane_mouse_cleanup(
+            captured,
+            self.active_selection_drag_pane,
+            pane_id,
+        );
+        if cleanup.clear_terminal_capture {
+            self.current_mouse_capture = None;
+            self.current_mouse_buttons.clear();
+        }
+        if cleanup.clear_selection_drag {
+            self.clear_selection_drag();
+        }
+        detached_overlay
+    }
+
     /// Reconcile GUI-only tab state with the exact mux window-order revision.
     /// Stale overlay panes are removed only after the tab-state borrow is
     /// released, because mux removal can synchronously enqueue notifications.
@@ -5130,9 +5437,9 @@ impl TermWindow {
             return;
         };
         let revision = mux_window.order_revision();
-        if self.last_tab_state_prune_revision.get() == Some(revision) {
-            return;
-        }
+        // Pane moves can change membership without changing tab order. Always
+        // reconcile pane credits on these structural wakes, even at the same
+        // tab-order revision.
         let live_tab_ids = mux_window
             .iter()
             .map(|tab| tab.tab_id())
@@ -5154,6 +5461,35 @@ impl TermWindow {
 
         for (slot, overlay) in stale_overlays {
             Self::retire_overlay_registration(slot, overlay);
+        }
+        for registration in self.pane_cleanup.live_registrations() {
+            let pane_id = registration.pane_id();
+            if mux
+                .resolve_pane_id(pane_id)
+                .is_some_and(|(_, window, _)| window == self.mux_window_id)
+            {
+                continue;
+            }
+            // Active overlays need their own registration credit even though
+            // they aren't members of the mux tab's normal pane topology.
+            if self.pane_state.borrow().values().any(|state| {
+                state
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+            }) || self.tab_state.borrow().values().any(|state| {
+                state
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.pane.pane_id() == pane_id)
+            }) {
+                continue;
+            }
+            // GUI callbacks are serialized; retain the credit until all local
+            // state is gone. If retirement races this cleanup, release_live
+            // leaves its Pending lease intact for the removal handler.
+            self.cleanup_gui_pane_state(pane_id);
+            self.pane_cleanup.release_live(&registration);
         }
     }
 
@@ -5544,6 +5880,41 @@ impl TermWindow {
             rejected => anyhow::bail!("reserving GUI pane-output scheduler owner: {rejected:?}"),
         };
         let (output_tx, output_rx) = flume::bounded(1);
+        self.pane_cleanup.bind(&mux, output_tx.clone());
+        let cleanup_dead = Arc::new(AtomicBool::new(false));
+        let cleanup_callback_dead = Arc::clone(&cleanup_dead);
+        let cleanup_owner = Arc::clone(&self.pane_cleanup);
+        let cleanup_mux = Arc::downgrade(&mux);
+        let cleanup_sync_state = Arc::clone(&self.sync_output_state);
+        let cleanup_window_id = Arc::clone(&mux_window_id);
+        let cleanup_id = mux
+            .subscribe_with_pane_removal_cleanup(move |notification, lease| {
+                if cleanup_callback_dead.load(Ordering::Acquire) {
+                    return false;
+                }
+                if matches!(&notification, MuxNotification::PaneRemoved(_)) {
+                    let window_id =
+                        *lock_termwindow_mutex(&cleanup_window_id, "GUI cleanup window ID");
+                    if fold_gui_sync_notification(
+                        &cleanup_mux,
+                        window_id,
+                        &cleanup_sync_state,
+                        &notification,
+                        lease.as_ref(),
+                    ) == Some(false)
+                    {
+                        return false;
+                    }
+                    cleanup_owner.record_notification(&notification, lease);
+                }
+                true
+            })
+            .context("registering prepaid GUI pane cleanup authority")?;
+        self.pane_cleanup_subscription = Some(GuiMuxSubscription {
+            owner: Arc::downgrade(&mux),
+            id: Arc::new(AtomicUsize::new(cleanup_id)),
+            dead: Arc::clone(&cleanup_dead),
+        });
         let event_retry_pending = Arc::new(AtomicBool::new(false));
         self.window_event_retry = Some(WindowEventRetryRequest {
             pending: Arc::clone(&event_retry_pending),
@@ -5554,7 +5925,7 @@ impl TermWindow {
         let output_window = window.clone();
         let output_mux = Arc::downgrade(&mux);
         let output_mux_window_id = Arc::clone(&mux_window_id);
-        let output_dead = Arc::clone(&dead);
+        let output_dead = Arc::clone(&cleanup_dead);
         let (render_ready, render_receive) = flume::bounded(1);
         let render_pending = Arc::new(Mutex::new(None));
         let render_requests = RenderWakeRequests {
@@ -5564,7 +5935,7 @@ impl TermWindow {
         let render_window = window.clone();
         let render_mux = Arc::downgrade(&mux);
         let render_mux_window_id = Arc::clone(&mux_window_id);
-        let render_dead = Arc::clone(&dead);
+        let render_dead = Arc::clone(&cleanup_dead);
         let allocated_subscription_id = mux
             .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
                 if dead.load(Ordering::Relaxed) {
@@ -5601,6 +5972,13 @@ impl TermWindow {
                     pane_removal_cleanup.as_ref(),
                 ) {
                     return keep;
+                }
+                if matches!(&n, MuxNotification::PaneRemoved(_)) {
+                    // Removal authority belongs to the separate infallible
+                    // subscriber, which survives this payload subscriber's
+                    // admission failure. No GUI removal state is held here.
+                    if let Some(lease) = pane_removal_cleanup { lease.complete(); }
+                    return true;
                 }
                 if callback_output_interest.record_notification(&n) {
                     // Full means an equivalent refresh is already retained.
@@ -5688,6 +6066,7 @@ impl TermWindow {
             id: Arc::clone(&subscription_id),
             dead: owner_dead,
         });
+        self.pane_cleanup.open_admission();
         let (output_abort, output_registration) = AbortHandle::new_pair();
         let event_window = output_window.clone();
         let event_mux = output_mux.clone();
@@ -5711,6 +6090,7 @@ impl TermWindow {
                 })
             }),
         };
+        let output_cleanup = Arc::clone(&self.pane_cleanup);
         output_worker.spawn(async move {
             let _ = Abortable::new(
                 run_mux_output_refresh(
@@ -5740,6 +6120,7 @@ impl TermWindow {
                         )
                     },
                     Some(event_delivery),
+                    Some(&output_cleanup),
                 ),
                 output_registration,
             )
@@ -5975,6 +6356,7 @@ impl TermWindow {
         // provide an atomic/delegating override.
         let last_observed_source_end = self
             .pane_state(pane_id)
+            .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?
             .render_dirty
             .last_observed_source_end();
         let (source_end, dirty) = frame.map_or_else(
@@ -5987,6 +6369,7 @@ impl TermWindow {
             |frame| (frame.source_sequence, frame.dirty.clone()),
         );
         self.pane_state(pane_id)
+            .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?
             .render_dirty
             .advance_after_query(source_end);
 
@@ -5999,7 +6382,9 @@ impl TermWindow {
         // DirtyLineBitmap::mark per its existing contract.
         let viewport_rows = dims.viewport_rows;
         if !dirty.is_empty() {
-            let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
+            let bitmap = self
+                .dirty_lines_for_pane(pane_id, viewport_rows)
+                .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
             mark_stable_row_ranges_dirty(bitmap, viewport, dirty.iter().cloned());
             // Per ft-i6k6u: tag the mark with its source so the
             // substrate's per-source aggregator attributes
@@ -6015,7 +6400,9 @@ impl TermWindow {
             // Coordinate invalidation is independent of visible damage and
             // must also cancel an active drag anchored in the old layout.
             let has_selection_anchor = {
-                let selection = self.selection(pane_id);
+                let selection = self
+                    .selection(pane_id)
+                    .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
                 selection.origin.is_some() || selection.range.is_some()
             };
             let selection_authority = frame.map_or_else(
@@ -6029,9 +6416,11 @@ impl TermWindow {
             }
             let authority_changed = self
                 .selection(pane_id)
-                .is_invalidated_by(selection_authority);
+                .is_some_and(|selection| selection.is_invalidated_by(selection_authority));
             if has_selection_anchor && authority_changed {
-                self.selection(pane_id).clear();
+                if let Some(mut selection) = self.selection(pane_id) {
+                    selection.clear();
+                }
                 if self.active_selection_drag_pane == Some(pane_id) {
                     self.clear_selection_drag();
                 }
@@ -6044,7 +6433,9 @@ impl TermWindow {
             // and we want to allow it to retain the selection it made!
 
             let (selection_range, selection_seqno) = {
-                let selection = self.selection(pane_id);
+                let selection = self
+                    .selection(pane_id)
+                    .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
                 (selection.range, selection.seqno)
             };
             let (clear_selection, cleared_rows) = if let Some(selection_range) = selection_range {
@@ -6119,9 +6510,11 @@ impl TermWindow {
                 )
             {
                 self.clear_selection_drag();
-                self.selection(pane.pane_id()).clear();
-                self.selection(pane.pane_id()).seqno =
-                    frame.map_or_else(|| pane.get_current_seqno(), |frame| frame.source_sequence);
+                if let Some(mut selection) = self.selection(pane.pane_id()) {
+                    selection.clear();
+                    selection.seqno = frame
+                        .map_or_else(|| pane.get_current_seqno(), |frame| frame.source_sequence);
+                }
 
                 // Per ft-camu6: selection-clear is a per-row event
                 // — mark every row that was previously selected so
@@ -6129,7 +6522,9 @@ impl TermWindow {
                 // selection-fg highlight. Stable rows again
                 // translated to visible indices via viewport.
                 if let Some(rows) = cleared_rows {
-                    let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
+                    let bitmap = self
+                        .dirty_lines_for_pane(pane_id, viewport_rows)
+                        .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
                     mark_stable_rows_dirty(bitmap, viewport, rows);
                     self.record_dirty_event(
                         frankenterm_core::dirty_line_telemetry::DirtyEventSource::SelectionChange,
@@ -6173,6 +6568,8 @@ impl TermWindow {
         };
         let config = config_with_accessibility_palette(config);
         self.config = config.clone();
+        self.pane_cleanup
+            .update_capacity(config.gui_retained_pane_state_limit);
         self.refresh_frame_budget_reduce_motion_state();
         self.palette.take();
 
@@ -7367,6 +7764,9 @@ impl TermWindow {
 
     /// Returns the Prompt semantic zones
     fn get_semantic_prompt_zones(&mut self, pane: &Arc<dyn Pane>) -> &[StableRowIndex] {
+        if self.admit_gui_pane(pane.pane_id()).is_none() {
+            return &[];
+        }
         let cache = self
             .semantic_zones
             .entry(pane.pane_id())
@@ -7971,11 +8371,15 @@ impl TermWindow {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let suppress_link = {
-                    let mut state = self.pane_state(pane.pane_id());
+                    let mut state = self
+                        .pane_state(pane.pane_id())
+                        .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
                     state.pending_selection_start = None;
                     std::mem::take(&mut state.suppress_selection_link)
                 };
-                let had_selection = self.selection(pane.pane_id()).range.is_some();
+                let had_selection = self
+                    .selection(pane.pane_id())
+                    .is_some_and(|selection| selection.range.is_some());
                 if had_selection && !self.selection_authority_is_current(pane) {
                     if self.selection_authority_has_changed(pane) {
                         self.clear_selection(pane);
@@ -8001,7 +8405,9 @@ impl TermWindow {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 {
-                    let mut state = self.pane_state(pane.pane_id());
+                    let mut state = self
+                        .pane_state(pane.pane_id())
+                        .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
                     state.pending_selection_start = None;
                     state.suppress_selection_link = false;
                 }
@@ -8042,8 +8448,8 @@ impl TermWindow {
                         self.assign_overlay_for_pane(pane.pane_id(), search);
                     }
                     self.pane_state(pane.pane_id())
-                        .overlay
-                        .as_mut()
+                        .as_deref_mut()
+                        .and_then(|state| state.overlay.as_mut())
                         .map(|overlay| {
                             overlay.key_table_state.activate(KeyTableArgs {
                                 name: "search_mode",
@@ -8092,8 +8498,8 @@ impl TermWindow {
                         self.assign_overlay_for_pane(pane.pane_id(), copy);
                     }
                     self.pane_state(pane.pane_id())
-                        .overlay
-                        .as_mut()
+                        .as_deref_mut()
+                        .and_then(|state| state.overlay.as_mut())
                         .map(|overlay| {
                             overlay.key_table_state.activate(KeyTableArgs {
                                 name: "copy_mode",
@@ -9003,10 +9409,45 @@ impl TermWindow {
         }
     }
 
-    pub fn pane_state(&self, pane_id: PaneId) -> RefMut<'_, PaneState> {
-        RefMut::map(self.pane_state.borrow_mut(), |state| {
+    fn admit_gui_pane(&self, pane_id: PaneId) -> Option<mux::PaneRegistrationHandle> {
+        let mux = Mux::try_get()?;
+        let owner =
+            lock_termwindow_mutex(&self.pane_cleanup.owner, "GUI cleanup mux owner").upgrade()?;
+        if !Arc::ptr_eq(&mux, &owner) {
+            return None;
+        }
+        let pane = mux.get_pane(pane_id)?;
+        let registration = mux.capture_pane_registration(&pane)?;
+        match self.pane_cleanup.admit(&registration) {
+            Ok(()) => Some(registration),
+            Err(reason) => {
+                log::debug!("GUI pane state admission refused for {pane_id}: {reason:?}");
+                None
+            }
+        }
+    }
+
+    pub fn pane_state(&self, pane_id: PaneId) -> Option<RefMut<'_, PaneState>> {
+        if !self.pane_cleanup.is_current_mux() {
+            return None;
+        }
+        // An already owned entry remains safe while its exact removal lease
+        // is pending. Don't reacquire registration-operation locks for every
+        // selection/viewport access during one frame, and don't interrupt a
+        // frame merely because its pane retired before GUI cleanup runs.
+        let state = self.pane_state.borrow_mut();
+        if state.contains_key(&pane_id) {
+            return Some(RefMut::map(state, |state| {
+                state
+                    .get_mut(&pane_id)
+                    .expect("checked existing pane state")
+            }));
+        }
+        drop(state);
+        self.admit_gui_pane(pane_id)?;
+        Some(RefMut::map(self.pane_state.borrow_mut(), |state| {
             state.entry(pane_id).or_insert_with(PaneState::default)
-        })
+        }))
     }
 
     pub fn tab_state(&self, tab_id: TabId) -> RefMut<'_, TabState> {
@@ -9054,7 +9495,7 @@ impl TermWindow {
     }
 
     pub fn get_viewport(&self, pane_id: PaneId) -> Option<StableRowIndex> {
-        self.pane_state(pane_id).viewport
+        self.pane_state(pane_id).and_then(|state| state.viewport)
     }
 
     pub fn set_viewport(
@@ -9076,7 +9517,9 @@ impl TermWindow {
         };
 
         let viewport_changed = {
-            let mut state = self.pane_state(pane_id);
+            let Some(mut state) = self.pane_state(pane_id) else {
+                return;
+            };
             if pos != state.viewport {
                 state.viewport = pos;
 
@@ -9099,8 +9542,9 @@ impl TermWindow {
             if frankenterm_gui::checked_stable_row_range_from_top(viewport, dims.viewport_rows)
                 .is_some()
             {
-                self.dirty_lines_for_pane(pane_id, dims.viewport_rows)
-                    .mark_all();
+                if let Some(bitmap) = self.dirty_lines_for_pane(pane_id, dims.viewport_rows) {
+                    bitmap.mark_all();
+                }
                 self.record_dirty_event(
                     frankenterm_core::dirty_line_telemetry::DirtyEventSource::Viewport,
                 );
@@ -9174,9 +9618,7 @@ impl TermWindow {
             let pane = tab.get_active_pane()?;
             let pane_id = pane.pane_id();
             self.pane_state(pane_id)
-                .overlay
-                .as_ref()
-                .map(|overlay| overlay.pane.clone())
+                .and_then(|state| state.overlay.as_ref().map(|overlay| overlay.pane.clone()))
                 .or_else(|| Some(pane))
         }
     }
@@ -9287,8 +9729,13 @@ impl TermWindow {
         } else {
             let mut panes = tab.iter_panes();
             for p in &mut panes {
-                if let Some(overlay) = self.pane_state(p.pane.pane_id()).overlay.as_ref() {
-                    p.pane = Arc::clone(&overlay.pane);
+                if let Some(overlay) = self.pane_state(p.pane.pane_id()).and_then(|state| {
+                    state
+                        .overlay
+                        .as_ref()
+                        .map(|overlay| Arc::clone(&overlay.pane))
+                }) {
+                    p.pane = overlay;
                 }
             }
             let mut floating = tab
@@ -9657,8 +10104,20 @@ impl TermWindow {
             Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
             return;
         }
+        if self.admit_gui_pane(pane_id).is_none()
+            || self.admit_gui_pane(overlay.pane.pane_id()).is_none()
+        {
+            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+            log::error!("cannot assign pane overlay: GUI state admission is pending");
+            return;
+        }
         self.cancel_overlay_for_pane(pane_id);
-        let replaced = self.pane_state(pane_id).overlay.replace(overlay);
+        let Some(mut state) = self.pane_state(pane_id) else {
+            Self::retire_overlay_registration(OverlaySlot::Pane(pane_id), overlay);
+            return;
+        };
+        let replaced = state.overlay.replace(overlay);
+        drop(state);
         debug_assert!(replaced.is_none(), "old pane overlay must be retired first");
         self.update_title();
     }
@@ -9685,6 +10144,11 @@ impl TermWindow {
             Self::retire_overlay_registration(OverlaySlot::Tab(tab_id), overlay);
             return;
         }
+        if self.admit_gui_pane(overlay.pane.pane_id()).is_none() {
+            Self::retire_overlay_registration(OverlaySlot::Tab(tab_id), overlay);
+            log::error!("cannot assign tab overlay: GUI state admission is pending");
+            return;
+        }
         self.cancel_overlay_for_tab(tab_id, None);
         let replaced = self.tab_state(tab_id).overlay.replace(overlay);
         debug_assert!(replaced.is_none(), "old tab overlay must be retired first");
@@ -9692,14 +10156,26 @@ impl TermWindow {
     }
 
     pub fn assign_overlay_for_pane(&mut self, pane_id: PaneId, pane: Arc<dyn Pane>) {
+        if self.admit_gui_pane(pane_id).is_none() || self.admit_gui_pane(pane.pane_id()).is_none() {
+            log::error!("cannot assign pane overlay: GUI state admission is pending");
+            return;
+        }
         self.cancel_overlay_for_pane(pane_id);
         let overlay = Self::prepare_overlay_state(OverlaySlot::Pane(pane_id), pane);
-        let replaced = self.pane_state(pane_id).overlay.replace(overlay);
+        let Some(mut state) = self.pane_state(pane_id) else {
+            return;
+        };
+        let replaced = state.overlay.replace(overlay);
+        drop(state);
         debug_assert!(replaced.is_none(), "old pane overlay must be retired first");
         self.update_title();
     }
 
     pub fn assign_overlay(&mut self, tab_id: TabId, overlay: Arc<dyn Pane>) {
+        if self.admit_gui_pane(overlay.pane_id()).is_none() {
+            log::error!("cannot assign tab overlay: GUI state admission is pending");
+            return;
+        }
         self.cancel_overlay_for_tab(tab_id, None);
         let overlay = Self::prepare_overlay_state(OverlaySlot::Tab(tab_id), overlay);
         let replaced = self.tab_state(tab_id).overlay.replace(overlay);
@@ -9727,9 +10203,20 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        self.mux_subscription.take();
+        self.pane_cleanup_subscription.take();
         self.clear_all_overlays();
         self.background_load.cancel();
         self.release_render_resources_before_window();
+        let pane_ids: Vec<_> =
+            lock_termwindow_mutex(&self.pane_cleanup.slots, "GUI pane cleanup slots")
+                .keys()
+                .copied()
+                .collect();
+        for pane_id in pane_ids {
+            self.cleanup_gui_pane_state(pane_id);
+        }
+        self.pane_cleanup.retire_after_gui_cleanup();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {
                 fe.forget_known_window(&window);
@@ -9740,6 +10227,8 @@ impl Drop for TermWindow {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::sync::Arc;
     #[test]
     fn fallback_completion_burst_coalesces_through_handler_until_font_read() {
         let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -10157,6 +10646,7 @@ mod tests {
                         })
                     }),
                 }),
+                None,
             ));
         });
         attempts.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -10467,6 +10957,7 @@ mod tests {
                     })
                 },
                 None,
+                None,
             ));
         });
         attempts.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -10568,6 +11059,7 @@ mod tests {
             || true,
             |_| panic!("old subscription must not migrate into a replacement scheduler"),
             None,
+            None,
         ));
         assert_eq!(replacement.admission_snapshot().active_tasks, 0);
         assert_eq!(replacement.queue_snapshot().depth, 0);
@@ -10582,6 +11074,7 @@ mod tests {
             identity,
             || true,
             |_| panic!("old subscription must retire even when replacement is full"),
+            None,
             None,
         ));
         drop(occupying);
@@ -10967,6 +11460,7 @@ mod tests {
                     })
                 },
                 None,
+                None,
             ))
         });
         drop(occupying);
@@ -11029,11 +11523,252 @@ mod tests {
         assert!(weak_lifetime.upgrade().is_none());
         assert!(!owner.unsubscribe(id));
         worker.join().unwrap();
+        exercise_retained_pane_cleanup_under_pressure(
+            &owner,
+            &children[0].0,
+            &children[1].0,
+            &exec,
+        );
         left.cancel();
         right.cancel();
         drop(exec);
         drop(children);
         mux::Mux::shutdown();
+    }
+
+    #[cfg(unix)]
+    fn exercise_retained_pane_cleanup_under_pressure(
+        mux: &Arc<mux::Mux>,
+        original: &Arc<dyn mux::pane::Pane>,
+        other: &Arc<dyn mux::pane::Pane>,
+        exec: &promise::spawn::SimpleExecutor,
+    ) {
+        use promise::spawn::{
+            MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let first = mux.capture_pane_registration(original).unwrap();
+        let second = mux.capture_pane_registration(other).unwrap();
+        let cleanup = Arc::new(super::GuiPaneCleanupOwner::new(1));
+        let independent = Arc::new(super::GuiPaneCleanupOwner::new(1));
+        let (wake, receive) = flume::bounded(1);
+        cleanup.bind(mux, wake);
+        assert_eq!(
+            cleanup.admit(&first),
+            Err(super::GuiPaneAdmissionError::Retired),
+            "state cannot publish before cleanup subscription exists"
+        );
+        let independent_callback = Arc::clone(&independent);
+        let independent_id = mux
+            .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+                if matches!(notification, mux::MuxNotification::PaneRemoved(_)) {
+                    independent_callback.record_notification(&notification, cleanup);
+                }
+                true
+            })
+            .unwrap();
+        independent.open_admission();
+        independent.admit(&second).unwrap();
+        independent.update_capacity(2);
+        independent.admit(&first).unwrap();
+        independent.update_capacity(1);
+        assert_eq!(
+            independent.slots.lock().unwrap().len(),
+            2,
+            "a lower reloaded limit must not evict accepted state"
+        );
+        independent.admit(&first).unwrap();
+        independent.release_live(&first);
+        let output_seen = Arc::new(AtomicUsize::new(0));
+        let callback_seen = Arc::clone(&output_seen);
+        let callback_cleanup = Arc::clone(&cleanup);
+        let id = mux
+            .subscribe_with_pane_removal_cleanup(move |notification, lease| {
+                if matches!(notification, mux::MuxNotification::PaneRemoved(_)) {
+                    return callback_cleanup.record_notification(&notification, lease);
+                }
+                if matches!(notification, mux::MuxNotification::PaneOutput(_)) {
+                    callback_seen.fetch_add(1, Ordering::AcqRel);
+                    callback_cleanup.wake();
+                }
+                true
+            })
+            .unwrap();
+        let subscription = super::GuiMuxSubscription {
+            owner: Arc::downgrade(mux),
+            id: Arc::new(AtomicUsize::new(id)),
+            dead: Arc::new(AtomicBool::new(false)),
+        };
+        cleanup.open_admission();
+        cleanup.admit(&first).unwrap();
+        let payload_subscription = mux
+            .subscribe_with_pane_removal_cleanup(|notification, _| {
+                if matches!(
+                    notification,
+                    mux::MuxNotification::Alert {
+                        alert: super::Alert::Bell,
+                        ..
+                    }
+                ) {
+                    return matches!(
+                        try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
+                        MainThreadReservationOutcome::Reserved(_)
+                    );
+                }
+                true
+            })
+            .unwrap();
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected full-queue control: {other:?}"),
+        };
+        let identity = occupying.admission_receipt();
+        assert!(matches!(
+            try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
+        mux.notify(mux::MuxNotification::Alert {
+            pane_id: first.pane_id(),
+            alert: super::Alert::Bell,
+        });
+        assert!(
+            !mux.unsubscribe(payload_subscription),
+            "full payload admission must exercise actual general-subscriber retirement"
+        );
+        mux.remove_pane_if_same(first.pane_id(), original);
+        assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 1);
+        assert!(
+            mux.add_pane(original).is_err(),
+            "same numeric ID must remain fenced while GUI delivery is full"
+        );
+        assert_eq!(
+            cleanup.admit(&second),
+            Err(super::GuiPaneAdmissionError::Full)
+        );
+        assert!(cleanup.admission_pending.load(Ordering::Acquire));
+        assert!(
+            independent.admit(&second).is_ok(),
+            "one window's stalled cleanup must not reject another window's current pane"
+        );
+        assert!(
+            cleanup
+                .service_one(|_| anyhow::bail!("cleanup failed before completion"))
+                .is_err()
+        );
+        assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 1);
+        assert!(
+            mux.add_pane(original).is_err(),
+            "failed cleanup must retain its exact fence"
+        );
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let worker_deliveries = Arc::clone(&deliveries);
+        let worker_cleanup = Arc::clone(&cleanup);
+        let worker_mux = Arc::clone(mux);
+        let successor = second.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker_alive = Arc::clone(&alive);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(
+                receive,
+                identity,
+                || worker_alive.load(Ordering::Acquire),
+                |reservation| {
+                    let cleanup = Arc::clone(&worker_cleanup);
+                    let deliveries = Arc::clone(&worker_deliveries);
+                    let mux = Arc::clone(&worker_mux);
+                    let successor = successor.clone();
+                    reservation.spawn(async move {
+                        let ordinal = deliveries.fetch_add(1, Ordering::AcqRel);
+                        if ordinal == 0 {
+                            assert!(
+                                cleanup
+                                    .service_one(|_| anyhow::bail!("one handler failure"))
+                                    .is_err()
+                            );
+                            assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 1);
+                        } else if ordinal == 1 {
+                            assert!(
+                                cleanup
+                                    .service_one(|_| {
+                                        assert_eq!(
+                                            mux.pane_removal_cleanup_snapshot().outstanding_leases,
+                                            1
+                                        );
+                                        assert_eq!(
+                                            cleanup.admit(&successor),
+                                            Err(super::GuiPaneAdmissionError::Full)
+                                        );
+                                        Ok(())
+                                    })
+                                    .unwrap()
+                            );
+                            assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 0);
+                        } else {
+                            cleanup.admit(&successor).expect(
+                                "credit-return wake must autonomously admit retained visible state",
+                            );
+                        }
+                    })
+                },
+                None,
+                Some(&worker_cleanup),
+            ));
+        });
+        drop(occupying);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deliveries.load(Ordering::Acquire) < 3 || exec.admission_snapshot().active_tasks != 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup or credit-return wake was lost"
+            );
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            cleanup.admit(&first),
+            Err(super::GuiPaneAdmissionError::Retired)
+        );
+        mux.notify(mux::MuxNotification::PaneOutput(other.pane_id()));
+        assert_eq!(
+            output_seen.load(Ordering::Acquire),
+            1,
+            "full removal must not terminate the actual subscriber"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deliveries.load(Ordering::Acquire) < 4 || exec.admission_snapshot().active_tasks != 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "subsequent owned output did not deliver"
+            );
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        alive.store(false, Ordering::Release);
+        cleanup.wake();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "cleanup worker did not retire");
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().unwrap();
+        // Exact live release cannot release a different retained registration.
+        cleanup.release_live(&first);
+        assert_eq!(cleanup.slots.lock().unwrap().len(), 1);
+        cleanup.release_live(&second);
+        assert!(cleanup.slots.lock().unwrap().is_empty());
+        drop(subscription);
+        assert!(!mux.unsubscribe(id));
+        cleanup.retire_after_gui_cleanup();
+        assert!(mux.unsubscribe(independent_id));
+        independent.retire_after_gui_cleanup();
+        assert_eq!(
+            cleanup.admit(&second),
+            Err(super::GuiPaneAdmissionError::Retired)
+        );
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
     }
 
     // SimpleExecutor owns a process-global scheduler. Run these tests in their

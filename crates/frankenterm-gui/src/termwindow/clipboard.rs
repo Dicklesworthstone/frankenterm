@@ -198,7 +198,11 @@ impl TermWindow {
         }
         self.assign_overlay_for_pane_with_ticket(target.pane_id(), overlay, ticket.clone());
         let mut attached = false;
-        if let Some(overlay) = self.pane_state(target.pane_id()).overlay.as_mut() {
+        if let Some(overlay) = self
+            .pane_state(target.pane_id())
+            .as_deref_mut()
+            .and_then(|state| state.overlay.as_mut())
+        {
             if overlay.cancellation_ticket.matches(&ticket) {
                 overlay.osc52_request = Some(request.clone());
                 attached = true;

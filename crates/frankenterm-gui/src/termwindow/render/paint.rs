@@ -270,25 +270,32 @@ impl crate::TermWindow {
             self.retry_pending_native_selection(&pos.pane);
             let retry = self
                 .pane_state(pos.pane.pane_id())
-                .pending_native_selection
-                .as_mut()
-                .is_some_and(|pending| pending.take_paint_retry());
+                .is_some_and(|mut state| {
+                    state
+                        .pending_native_selection
+                        .as_mut()
+                        .is_some_and(|pending| pending.take_paint_retry())
+                });
             if retry {
                 self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }
-            let copy_deadline = self
-                .pane_state(pos.pane.pane_id())
-                .pending_native_selection
-                .as_ref()
-                .and_then(|pending| pending.text_copy.as_ref().map(|copy| copy.wake_at()));
+            let copy_deadline = self.pane_state(pos.pane.pane_id()).and_then(|state| {
+                state
+                    .pending_native_selection
+                    .as_ref()
+                    .and_then(|pending| pending.text_copy.as_ref().map(|copy| copy.wake_at()))
+            });
             if let Some(deadline) = copy_deadline {
                 self.schedule_animation_wake(deadline);
             }
             let retry = self
                 .pane_state(pos.pane.pane_id())
-                .pending_selection_start
-                .as_mut()
-                .is_some_and(|pending| pending.take_paint_retry());
+                .is_some_and(|mut state| {
+                    state
+                        .pending_selection_start
+                        .as_mut()
+                        .is_some_and(|pending| pending.take_paint_retry())
+                });
             if retry {
                 self.schedule_animation_wake(Instant::now() + Duration::from_millis(16));
             }

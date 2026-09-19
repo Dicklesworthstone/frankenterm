@@ -607,6 +607,19 @@ pub struct Config {
     #[dynamic(default = "default_mux_tmux_max_output_queue_items_per_pane")]
     pub mux_tmux_max_output_queue_items_per_pane: usize,
 
+    /// Maximum exact pane registrations retaining GUI state in one window,
+    /// including retired panes awaiting cleanup. This is an entry-count bound,
+    /// separate from cache byte budgets. New GUI state waits for local cleanup
+    /// credit; other windows and mux pane creation remain independent. Increase
+    /// for windows displaying larger fleets. Reloading a larger limit wakes
+    /// waiting state; lowering it preserves accepted entries until cleanup and
+    /// blocks new entries above the limit. Must be non-zero. Default: 4096.
+    #[dynamic(
+        default = "default_gui_retained_pane_state_limit",
+        validate = "validate_gui_retained_pane_state_limit"
+    )]
+    pub gui_retained_pane_state_limit: usize,
+
     /// Maximum bytes one tmux pane may write during a fair output-drain
     /// quantum before another ready pane runs. Default: 256KB (262144).
     #[dynamic(default = "default_mux_tmux_output_write_quantum_bytes")]
@@ -2119,6 +2132,18 @@ fn default_mux_output_parser_buffer_size() -> usize {
     128 * 1024
 }
 
+fn default_gui_retained_pane_state_limit() -> usize {
+    4096
+}
+
+fn validate_gui_retained_pane_state_limit(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("gui_retained_pane_state_limit must be non-zero".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_mux_output_parser_buffer_size(value: &usize) -> Result<(), String> {
     if *value == 0 {
         Err("mux_output_parser_buffer_size must be non-zero".to_string())
@@ -3376,6 +3401,28 @@ mod tests {
     #[test]
     fn validate_mux_output_parser_buffer_size_zero_rejected() {
         assert!(validate_mux_output_parser_buffer_size(&0).is_err());
+    }
+
+    #[test]
+    fn gui_retained_pane_state_budget_rejects_zero_and_accepts_large_fleets() {
+        use wezterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+        for limit in [0_u64, 1, 4096, 65_536] {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert(
+                Value::String("gui_retained_pane_state_limit".into()),
+                Value::U64(limit),
+            );
+            let result =
+                Config::from_dynamic(&Value::Object(values.into()), FromDynamicOptions::default());
+            if limit == 0 {
+                assert!(result.is_err(), "zero must fail configuration loading");
+            } else {
+                assert_eq!(
+                    result.unwrap().gui_retained_pane_state_limit,
+                    limit as usize
+                );
+            }
+        }
     }
 
     #[test]

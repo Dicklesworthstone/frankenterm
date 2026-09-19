@@ -1804,11 +1804,12 @@ fn quick_select_action_is_current(
     instance_token: &Arc<()>,
     accepted_run_id: usize,
 ) -> bool {
-    let overlay_pane = term_window
-        .pane_state(pane_id)
-        .overlay
-        .as_ref()
-        .map(|overlay| Arc::clone(&overlay.pane));
+    let overlay_pane = term_window.pane_state(pane_id).and_then(|state| {
+        state
+            .overlay
+            .as_ref()
+            .map(|overlay| Arc::clone(&overlay.pane))
+    });
     let Some(overlay_pane) = overlay_pane else {
         return false;
     };
@@ -1841,7 +1842,9 @@ fn close_quick_select_overlay_if_current(
             )
         });
     if is_current {
-        let mut state = term_window.pane_state(pane_id);
+        let Some(mut state) = term_window.pane_state(pane_id) else {
+            return;
+        };
         state.overlay.take();
         drop(state);
         if let Some(window) = term_window.window.as_ref() {
@@ -1855,11 +1858,12 @@ fn restart_quick_select_after_stale_action(
     pane_id: PaneId,
     instance_token: &Arc<()>,
 ) {
-    let overlay_pane = term_window
-        .pane_state(pane_id)
-        .overlay
-        .as_ref()
-        .map(|overlay| Arc::clone(&overlay.pane));
+    let overlay_pane = term_window.pane_state(pane_id).and_then(|state| {
+        state
+            .overlay
+            .as_ref()
+            .map(|overlay| Arc::clone(&overlay.pane))
+    });
     if let Some(overlay_pane) = overlay_pane {
         if let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>() {
             let mut renderer = search_overlay.renderer.lock();
@@ -2328,11 +2332,12 @@ fn advance_quick_select_accepted_action(
     if !quick_select_action_is_current(term_window, pane_id, instance_token, accepted_run_id) {
         return;
     }
-    let overlay_pane = term_window
-        .pane_state(pane_id)
-        .overlay
-        .as_ref()
-        .map(|overlay| Arc::clone(&overlay.pane));
+    let overlay_pane = term_window.pane_state(pane_id).and_then(|state| {
+        state
+            .overlay
+            .as_ref()
+            .map(|overlay| Arc::clone(&overlay.pane))
+    });
     let Some(overlay_pane) = overlay_pane else {
         return;
     };
@@ -3864,7 +3869,7 @@ impl QuickSelectRenderable {
                 let pane_id = pane.pane_id();
                 let mut outcome = Some(outcome);
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
+                    let Some(state) = term_window.pane_state(pane_id) else { return; };
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(search_overlay) =
                             overlay.pane.downcast_ref::<QuickSelectOverlay>()
@@ -4049,7 +4054,9 @@ impl QuickSelectRenderable {
                     return anyhow::Result::<()>::Ok(());
                 }
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
+                    let Some(state) = term_window.pane_state(pane_id) else {
+                        return;
+                    };
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(search_overlay) =
                             overlay.pane.downcast_ref::<QuickSelectOverlay>()
@@ -4224,9 +4231,7 @@ impl QuickSelectRenderable {
 
                 let overlay_pane = term_window
                     .pane_state(pane_id)
-                    .overlay
-                    .as_ref()
-                    .map(|overlay| Arc::clone(&overlay.pane));
+                    .and_then(|state| state.overlay.as_ref().map(|overlay| Arc::clone(&overlay.pane)));
                 if let Some(overlay_pane) = overlay_pane {
                     if let Some(search_overlay) = overlay_pane.downcast_ref::<QuickSelectOverlay>()
                     {

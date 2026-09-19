@@ -63,7 +63,9 @@ fn close_copy_overlay_if_current(
     instance_token: &Arc<()>,
 ) {
     let removed = {
-        let mut state = term_window.pane_state(pane_id);
+        let Some(mut state) = term_window.pane_state(pane_id) else {
+            return;
+        };
         let is_current = state
             .overlay
             .as_ref()
@@ -1202,7 +1204,9 @@ impl CopyRenderable {
                     return anyhow::Result::<()>::Ok(());
                 }
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
+                    let Some(state) = term_window.pane_state(pane_id) else {
+                        return;
+                    };
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                             let mut r = copy_overlay.render.lock();
@@ -1375,7 +1379,7 @@ impl CopyRenderable {
                 let pane_id = pane.pane_id();
                 let mut outcome = Some(outcome);
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
+                    let Some(state) = term_window.pane_state(pane_id) else { return; };
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                             let mut renderer = copy_overlay.render.lock();
@@ -1438,7 +1442,9 @@ impl CopyRenderable {
                     return anyhow::Result::<()>::Ok(());
                 }
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    let state = term_window.pane_state(pane_id);
+                    let Some(state) = term_window.pane_state(pane_id) else {
+                        return;
+                    };
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                             let mut renderer = copy_overlay.render.lock();
@@ -1941,7 +1947,9 @@ impl CopyRenderable {
         let pane_id = self.delegate.pane_id();
 
         window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-            let mut state = term_window.pane_state(pane_id);
+            let Some(mut state) = term_window.pane_state(pane_id) else {
+                return;
+            };
             if let Some(overlay) = state.overlay.as_mut() {
                 if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                     let editing_search = copy_overlay.render.lock().editing_search;

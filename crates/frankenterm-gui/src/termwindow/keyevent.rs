@@ -247,7 +247,11 @@ impl super::TermWindow {
         mods: Modifiers,
         only_key_bindings: OnlyKeyBindings,
     ) -> Option<(KeyTableEntry, Option<String>)> {
-        if let Some(overlay) = self.pane_state(pane.pane_id()).overlay.as_mut() {
+        if let Some(overlay) = self
+            .pane_state(pane.pane_id())
+            .as_deref_mut()
+            .and_then(|state| state.overlay.as_mut())
+        {
             if let Some((entry, table_name)) = overlay.key_table_state.lookup_key(
                 &self.input_map,
                 keycode,
@@ -453,7 +457,9 @@ impl super::TermWindow {
                     if did_encode {
                         if is_down
                             && !keycode.is_modifier()
-                            && self.pane_state(pane.pane_id()).overlay.is_none()
+                            && self
+                                .pane_state(pane.pane_id())
+                                .is_some_and(|state| state.overlay.is_none())
                         {
                             self.maybe_scroll_to_bottom_for_input(&pane);
                         }
@@ -610,7 +616,11 @@ impl super::TermWindow {
         let mut name = None;
 
         if let Some(pane) = self.get_active_pane_or_overlay() {
-            if let Some(overlay) = self.pane_state(pane.pane_id()).overlay.as_mut() {
+            if let Some(overlay) = self
+                .pane_state(pane.pane_id())
+                .as_deref_mut()
+                .and_then(|state| state.overlay.as_mut())
+            {
                 name = overlay
                     .key_table_state
                     .current_table()
@@ -759,7 +769,9 @@ impl super::TermWindow {
                 if res.is_ok() {
                     if window_key.key_is_down
                         && !key.is_modifier()
-                        && self.pane_state(pane.pane_id()).overlay.is_none()
+                        && self
+                            .pane_state(pane.pane_id())
+                            .is_some_and(|state| state.overlay.is_none())
                     {
                         self.maybe_scroll_to_bottom_for_input(&pane);
                     }

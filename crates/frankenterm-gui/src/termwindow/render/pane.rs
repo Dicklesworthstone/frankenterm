@@ -175,6 +175,72 @@ fn tiled_grid_dirty_rect_from_bitmap(
 }
 
 impl crate::TermWindow {
+    fn paint_pane_waiting_for_gui_state(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
+        use crate::termwindow::box_model::{Element, ElementColors, ElementContent, LayoutContext};
+        use config::{Dimension, DimensionContext};
+        let font = self.fonts.title_font()?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
+        let (left, top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let tab_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height()?
+        } else {
+            0.0
+        };
+        let width = pos.width as f32 * self.render_metrics.cell_size.width as f32;
+        let height = pos.height as f32 * self.render_metrics.cell_size.height as f32;
+        let bounds = euclid::rect(
+            left + border.left.get() as f32
+                + pos.left as f32 * self.render_metrics.cell_size.width as f32,
+            top + border.top.get() as f32
+                + tab_height
+                + pos.top as f32 * self.render_metrics.cell_size.height as f32,
+            width,
+            height,
+        );
+        let palette = self.palette().clone();
+        let content = if height >= metrics.cell_size.height as f32 {
+            ElementContent::Text("Waiting for GUI capacity".to_owned())
+        } else {
+            ElementContent::Children(Vec::new())
+        };
+        let element = Element::new(&font, content)
+            .min_width(Some(Dimension::Pixels(width)))
+            .max_width(Some(Dimension::Pixels(width)))
+            .min_height(Some(Dimension::Pixels(height)))
+            .colors(ElementColors {
+                bg: palette.background.to_linear().into(),
+                text: palette.foreground.to_linear().into(),
+                ..Default::default()
+            });
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
+        let computed = self.compute_element(
+            &LayoutContext {
+                width: DimensionContext {
+                    dpi: self.dimensions.dpi as f32,
+                    pixel_max: self.dimensions.pixel_width as f32,
+                    pixel_cell: metrics.cell_size.width as f32,
+                },
+                height: DimensionContext {
+                    dpi: self.dimensions.dpi as f32,
+                    pixel_max: self.dimensions.pixel_height as f32,
+                    pixel_cell: metrics.cell_size.height as f32,
+                },
+                bounds,
+                metrics: &metrics,
+                gl_state,
+                zindex: 1,
+            },
+            &element,
+        )?;
+        // This tile owns no pane-keyed cache or selection state. Other panes
+        // finish the same frame; a returned cleanup credit requests its redraw.
+        self.render_element(&computed, gl_state, None)
+    }
+
     fn focused_floating_pane_border_width(&self, pane_id: PaneId) -> Option<f32> {
         let mux = Mux::try_get()?;
         let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
@@ -235,13 +301,20 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
         let pane_id = pos.pane.pane_id();
+        if self.admit_gui_pane(pane_id).is_none() {
+            return self.paint_pane_waiting_for_gui_state(pos);
+        }
         let local = pos.pane.downcast_ref::<mux::localpane::LocalPane>();
         let mut native_frame = if let Some(local) = local {
             let damage_baseline = self
                 .pane_state(pane_id)
+                .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?
                 .render_dirty
                 .last_observed_source_end();
-            let selection_baseline = self.selection(pane_id).seqno;
+            let selection_baseline = self
+                .selection(pane_id)
+                .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?
+                .seqno;
             Some(
                 local
                     .try_capture_render_frame(
@@ -339,7 +412,9 @@ impl crate::TermWindow {
         if pos.is_active {
             if let Some(previous_cursor) = self.prev_cursor.update(&cursor) {
                 let viewport = current_viewport.unwrap_or(dims.physical_top);
-                let bitmap = self.dirty_lines_for_pane(pane_id, dims.viewport_rows);
+                let bitmap = self
+                    .dirty_lines_for_pane(pane_id, dims.viewport_rows)
+                    .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?;
                 crate::termwindow::mark_cursor_rows_dirty(
                     bitmap,
                     viewport,
@@ -588,7 +663,9 @@ impl crate::TermWindow {
         }
 
         let (selrange, rectangular) = {
-            let sel = self.selection(pos.pane.pane_id());
+            let sel = self
+                .selection(pos.pane.pane_id())
+                .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?;
             // Copy/search overlays deliberately keep the delegate pane's
             // selection authority, matching the dirty-invalidation exemption.
             let delegate_overlay = pos
@@ -952,11 +1029,14 @@ impl crate::TermWindow {
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         let selection_frame_after = self.selection_frame_stamp_for_position(&pos.pane, pos);
-        self.pane_state(pane_id).selection_frame.stage(
-            selection_frame_before,
-            selection_frame_after,
-            complete_selection_frame,
-        );
+        self.pane_state(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?
+            .selection_frame
+            .stage(
+                selection_frame_before,
+                selection_frame_after,
+                complete_selection_frame,
+            );
 
         Ok(())
     }
