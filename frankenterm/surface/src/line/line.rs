@@ -598,6 +598,27 @@ impl Line {
         cost_model: MonospaceKpCostModel,
         width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
     ) -> LineWrapLayout {
+        self.plan_wrap_with_trailing_space_policy(width, cost_model, width_prefix_scratch, false)
+    }
+
+    /// Wrap an incomplete logical prefix without discarding its final separator
+    /// cells. The continuation may live in a different scrollback tier.
+    pub fn plan_wrap_preserving_trailing_spaces(
+        self,
+        width: usize,
+        cost_model: MonospaceKpCostModel,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> LineWrapLayout {
+        self.plan_wrap_with_trailing_space_policy(width, cost_model, width_prefix_scratch, true)
+    }
+
+    fn plan_wrap_with_trailing_space_policy(
+        self,
+        width: usize,
+        cost_model: MonospaceKpCostModel,
+        width_prefix_scratch: &mut LineWrapWidthPrefixScratch,
+        preserve_trailing_spaces: bool,
+    ) -> LineWrapLayout {
         #[cfg(feature = "std")]
         let mut image_free = true;
         let cells = self.visible_cells();
@@ -606,7 +627,12 @@ impl Line {
             image_free &= !cell.attrs().has_image_attachments();
         });
         let mut cells: Vec<CellRef> = cells.collect();
-        if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
+        let end_idx = if preserve_trailing_spaces {
+            cells.len().checked_sub(1)
+        } else {
+            cells.iter().rposition(|c| c.str() != " ")
+        };
+        if let Some(end_idx) = end_idx {
             cells.truncate(end_idx + 1);
             #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
             let geometry_hash = compute_wrap_geometry_hash(self.bits, &cells);
@@ -2361,6 +2387,12 @@ impl LineWrapGeometry {
         self.physical_len
     }
 
+    /// Treat every captured cell as meaningful in an incomplete logical prefix.
+    /// Apply after joining its rows, before budgeting or counting its wrapping.
+    pub fn preserve_trailing_spaces(&mut self) {
+        self.trimmed_tokens = self.widths.len();
+    }
+
     /// Owned allocation plus the inline representation; an external Arc header
     /// and collection slots must be charged separately by their owner.
     pub fn retained_bytes(&self) -> usize {
@@ -3662,6 +3694,31 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn incomplete_logical_prefix_preserves_trailing_spaces_and_geometry() {
+        for text in ["abc def ", "abc def   ", "界面 e\u{301}  ", "        "] {
+            for cols in [1, 3, 4, 8] {
+                let line = Line::from_text(text, &CellAttributes::default(), 7, None);
+                let mut geometry = LineWrapGeometry::capture(&line, usize::MAX).unwrap();
+                geometry.preserve_trailing_spaces();
+                let model = MonospaceKpCostModel::terminal_default();
+                let layout = line.plan_wrap_preserving_trailing_spaces(
+                    cols,
+                    model,
+                    &mut LineWrapWidthPrefixScratch::default(),
+                );
+                let rows = layout.deferred_rows(0..layout.row_count(), 7);
+                let actual: String = rows.iter().map(|row| row.as_str().into_owned()).collect();
+                assert_eq!(actual, text, "incomplete prefix at width {cols}");
+                assert_eq!(
+                    geometry.row_count(cols, model, &mut LineWrapWidthPrefixScratch::default()),
+                    layout.row_count(),
+                    "geometry must count the preserved prefix at width {cols}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn leading_space_before_overwide_word_does_not_waste_a_row() {

@@ -619,6 +619,11 @@ impl std::io::Write for ColdReadCharge {
             })?;
         Ok(bytes.len())
     }
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        // Counting consumes the entire slice or refuses it without progress.
+        // Avoid the default writer's partial-write loop for every JSON token.
+        self.write(bytes).map(|_| ())
+    }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

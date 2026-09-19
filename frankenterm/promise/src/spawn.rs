@@ -4711,6 +4711,7 @@ mod tests {
     #[test]
     fn simple_executor_io_reactor_wakes_parked_owner_for_real_socket() {
         use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
 
         struct ForwardWake {
             task: std::task::Waker,
@@ -4727,7 +4728,7 @@ mod tests {
         assert!(asupersync::Cx::current().is_none());
         let exec = SimpleExecutor::with_io_runtime().unwrap();
         let owner = std::thread::current().id();
-        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
         let (woke, wake) = std::sync::mpsc::channel();
         let done = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -4812,6 +4813,8 @@ mod tests {
     #[cfg(all(feature = "async-asupersync", unix))]
     #[test]
     fn simple_executor_io_retires_pending_socket_on_owner_before_runtime() {
+        use std::os::unix::net::UnixStream;
+
         struct OnDrop(std::rc::Rc<std::cell::Cell<Option<ThreadId>>>);
         impl Drop for OnDrop {
             fn drop(&mut self) {
@@ -4822,7 +4825,7 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         let exec = SimpleExecutor::with_io_runtime().unwrap();
         let owner = std::thread::current().id();
-        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (reader, _writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
         let dropped = std::rc::Rc::new(std::cell::Cell::new(None));
         let retired = OnDrop(std::rc::Rc::clone(&dropped));
