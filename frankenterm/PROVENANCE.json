@@ -156,21 +156,21 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 53,
-        "fix": 99,
+        "fix": 101,
         "other": 17,
         "refactor": 5,
         "rename": 2,
         "runtime-swap": 4,
         "security-fix": 2,
-        "test": 34
+        "test": 35
       },
-      "fork_side_commit_count": 240,
+      "fork_side_commit_count": 243,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-18T03:27:44-04:00",
-        "sha": "f641252422104be1f327da7ac140fa989ac9fa66",
-        "subject": "style(client): order pane re-exports for pinned rustfmt"
+        "classification": "test",
+        "committed_at": "2026-09-19T00:50:14-04:00",
+        "sha": "735f576c3db066b74e2d6f071cc1b3ab1db86250",
+        "subject": "test(gui): format socket assertion diagnostics on Rust 2018"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 44,
-        "fix": 61,
+        "fix": 62,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 245,
+      "fork_side_commit_count": 246,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-11T01:41:54-04:00",
-        "sha": "61a25a181e500a1366f4acf688a86d43184fea68",
-        "subject": "fix(selection): retain wide glyph columns and trim wrapped endpoints"
+        "committed_at": "2026-09-18T20:27:37-04:00",
+        "sha": "68d383ee22b2838c093cc472f1b4e1ff1942e665",
+        "subject": "fix(mux): preserve typed read contention and bound safe retries"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -233,21 +233,21 @@
         "cleanup": 1,
         "cosmetic": 4,
         "feat": 43,
-        "fix": 47,
+        "fix": 49,
         "other": 10,
         "refactor": 5,
         "rename": 1,
         "runtime-swap": 8,
         "security-fix": 2,
-        "test": 14
+        "test": 15
       },
-      "fork_side_commit_count": 138,
+      "fork_side_commit_count": 141,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-15T19:33:53-04:00",
-        "sha": "3a5c133902cf7ec71bc9e285db2aab15ea354620",
-        "subject": "fix(config): match native events through parent path aliases"
+        "committed_at": "2026-09-19T01:15:29-04:00",
+        "sha": "d08be9d9f5dcde92be3e60a8ad4c07fd2ce937cc",
+        "subject": "fix(config): reject zero-sized mux parser buffers"
       },
       "name": "config",
       "path": "frankenterm/config",
@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 30,
         "docs": 6,
-        "feat": 196,
-        "fix": 249,
-        "other": 50,
+        "feat": 198,
+        "fix": 254,
+        "other": 51,
         "refactor": 11,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 96
+        "test": 101
       },
-      "fork_side_commit_count": 662,
+      "fork_side_commit_count": 675,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-18T13:42:52-04:00",
-        "sha": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
-        "subject": "style: apply remote workspace formatter corrections"
+        "classification": "fix",
+        "committed_at": "2026-09-19T05:46:47-04:00",
+        "sha": "b6b9b79f7b0d26e21cce74e2d9b46c518d8b2289",
+        "subject": "fix(scrollback): flush yielded rows after overflow settles"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 42,
-        "other": 29,
+        "fix": 43,
+        "other": 30,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
-        "test": 21
+        "test": 22
       },
-      "fork_side_commit_count": 122,
+      "fork_side_commit_count": 125,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-18T16:25:21-04:00",
-        "sha": "4154a6e6ca22252bc08da7fd2f2285e55026ba70",
-        "subject": "fix(term): preserve text across cold scrollback seams"
+        "classification": "other",
+        "committed_at": "2026-09-19T04:18:28-04:00",
+        "sha": "772d5994d4128c4e36b7a5fd7304c33350cfae1e",
+        "subject": "perf(scrollback): avoid segmenting compressed text for admission charges"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -895,21 +895,21 @@
         "cleanup": 3,
         "cosmetic": 15,
         "docs": 2,
-        "feat": 55,
-        "fix": 116,
-        "other": 57,
+        "feat": 58,
+        "fix": 120,
+        "other": 58,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 62
+        "test": 64
       },
-      "fork_side_commit_count": 323,
+      "fork_side_commit_count": 333,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-18T16:25:21-04:00",
-        "sha": "4154a6e6ca22252bc08da7fd2f2285e55026ba70",
-        "subject": "fix(term): preserve text across cold scrollback seams"
+        "classification": "other",
+        "committed_at": "2026-09-19T05:38:21-04:00",
+        "sha": "29e8b194e93974340943ae28980f37afffaf7a3e",
+        "subject": "perf(scrollback): yield terminal lock between geometry slices"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1064,8 +1064,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2758,
-  "generated_at": "2026-09-18T20:28:09.333206Z",
+  "fork_side_commit_total": 2791,
+  "generated_at": "2026-09-19T10:06:56.946876Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

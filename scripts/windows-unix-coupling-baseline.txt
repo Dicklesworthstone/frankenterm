@@ -74,6 +74,7 @@ frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(
 frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind replacement socket"));
 frankenterm/client/src/discovery.rs	drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
 frankenterm/client/src/discovery.rs	let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind live socket");
+frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&live_path).expect("bind socket");
 frankenterm/client/src/discovery.rs	let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
 frankenterm/client/src/discovery.rs	std::os::unix::fs::symlink(path, &name)
 frankenterm/client/src/discovery.rs	std::os::unix::net::UnixListener::bind(&socket).expect("bind original socket");
