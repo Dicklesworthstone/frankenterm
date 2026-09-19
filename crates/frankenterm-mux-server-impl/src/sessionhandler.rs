@@ -7007,6 +7007,19 @@ impl SessionHandler {
                                         )
                                     ) =>
                                 {
+                                    let cause = if matches!(
+                                        err.downcast_ref::<PaneRenderPreparationError>(),
+                                        Some(PaneRenderPreparationError::MetadataBusy)
+                                    ) {
+                                        "metadata_busy"
+                                    } else {
+                                        "source_changed"
+                                    };
+                                    metrics::counter!(
+                                        "mux.server.detached_render_capture_retry",
+                                        "cause" => cause
+                                    )
+                                    .increment(1);
                                     // The final output notification may already
                                     // be coalesced into this capture. Retain its
                                     // admitted permit and obligation until a
