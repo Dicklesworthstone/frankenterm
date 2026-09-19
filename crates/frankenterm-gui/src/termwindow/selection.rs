@@ -803,12 +803,17 @@ impl super::TermWindow {
             return Err("The text reader returned an incomplete selection.");
         }
         let mut rows = None;
-        let published = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
-            let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
-            let mut work = 65_536;
-            rows =
-                plans[0].try_clone_viewport_for_snapshot(requested.clone(), &mut bytes, &mut work);
-        });
+        let published = pane
+            .publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+                let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                let mut work = 65_536;
+                rows = plans[0].try_clone_viewport_for_snapshot(
+                    requested.clone(),
+                    &mut bytes,
+                    &mut work,
+                );
+            })
+            .unwrap_or(false);
         if !published {
             return Ok(None);
         }
@@ -1600,9 +1605,11 @@ impl super::TermWindow {
             };
 
             let mut published = false;
-            let ok = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
-                published = true;
-            });
+            let ok = pane
+                .publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+                    published = true;
+                })
+                .unwrap_or(false);
 
             if !ok || !published {
                 if pending.is_expired() {
@@ -3073,14 +3080,12 @@ mod tests {
                 _lines: &mut [&mut wezterm_term::Line],
             ) {
                 let mut published = false;
-                let ok = self.pane.publish_line_reads_at_layout(
-                    self.plans,
-                    self.sequence,
-                    self.dims,
-                    &mut || {
+                let ok = self
+                    .pane
+                    .publish_line_reads_at_layout(self.plans, self.sequence, self.dims, &mut || {
                         published = true;
-                    },
-                );
+                    })
+                    .unwrap_or(false);
                 self.ok = ok;
                 self.published = published;
                 self.ran = true;
@@ -3110,10 +3115,11 @@ mod tests {
 
         // 4b. Terminal lock is released: publication now succeeds exactly once
         let mut published_after_release = false;
-        let ok_after_release =
-            pane.publish_line_reads_at_layout(plans, sequence, dims, &mut || {
+        let ok_after_release = pane
+            .publish_line_reads_at_layout(plans, sequence, dims, &mut || {
                 published_after_release = true;
-            });
+            })
+            .unwrap_or(false);
         assert!(
             ok_after_release,
             "publication must succeed once terminal lock is released"
@@ -3135,9 +3141,11 @@ mod tests {
 
         // Publication MUST fail when validating stale plans / sequence
         let mut published_after = false;
-        let ok_after = pane.publish_line_reads_at_layout(plans, sequence, new_dims, &mut || {
-            published_after = true;
-        });
+        let ok_after = pane
+            .publish_line_reads_at_layout(plans, sequence, new_dims, &mut || {
+                published_after = true;
+            })
+            .unwrap_or(false);
         assert!(
             !ok_after,
             "publication must fail on stale sequence after pane mutation"
@@ -3149,10 +3157,11 @@ mod tests {
 
         // Publication MUST also fail even if caller passes new_sequence because content changed
         let mut published_with_new_seq = false;
-        let ok_with_new_seq =
-            pane.publish_line_reads_at_layout(plans, new_sequence, new_dims, &mut || {
+        let ok_with_new_seq = pane
+            .publish_line_reads_at_layout(plans, new_sequence, new_dims, &mut || {
                 published_with_new_seq = true;
-            });
+            })
+            .unwrap_or(false);
         assert!(
             !ok_with_new_seq,
             "publication with modified screen content must be rejected"

@@ -2383,6 +2383,15 @@ impl MuxRequestErrorContext {
             self.request_ident,
             GetLines::IDENT | GetLinesAtLayout::IDENT
         ) && error
+            .downcast_ref::<wezterm_term::screen::ColdReadMetadataBusy>()
+            .is_some()
+        {
+            return ErrorResponse::resource_busy(self.request_ident);
+        }
+        if matches!(
+            self.request_ident,
+            GetLines::IDENT | GetLinesAtLayout::IDENT
+        ) && error
             .downcast_ref::<wezterm_term::screen::ColdReadPayloadLimit>()
             .is_some()
         {
@@ -3031,6 +3040,8 @@ impl PaneRenderBaseline {
     ) -> SurfacePreparation {
         let line_layout_floor = pane
             .get_line_layout()
+            .ok()
+            .flatten()
             .map(|(floor, _)| floor)
             .or(self.line_layout_floor);
         let source_start = pane.get_current_seqno();
@@ -8673,14 +8684,16 @@ impl SessionHandler {
                         let captured = recover_line_read_callback(|| {
                             with_current_pane(&authority, &registration, |pane| {
                                 if let Some(layout) = layout {
-                                    if !pane.get_line_layout().is_some_and(|(floor, dimensions)| {
-                                        floor <= layout.seqno
-                                            && layout.seqno <= pane.get_current_seqno()
-                                            && mux::renderable::same_line_layout_geometry(
-                                                &dimensions,
-                                                &layout.dimensions,
-                                            )
-                                    }) {
+                                    if !pane.get_line_layout()?.is_some_and(
+                                        |(floor, dimensions)| {
+                                            floor <= layout.seqno
+                                                && layout.seqno <= pane.get_current_seqno()
+                                                && mux::renderable::same_line_layout_geometry(
+                                                    &dimensions,
+                                                    &layout.dimensions,
+                                                )
+                                        },
+                                    ) {
                                         pane.notify_lines_ready();
                                         return Err(anyhow!(
                                             "line read layout changed or unavailable"
@@ -8788,8 +8801,8 @@ impl SessionHandler {
                                                 layout.seqno,
                                                 layout.dimensions,
                                                 &mut publish,
-                                            ),
-                                            None => pane.publish_line_reads(plans, &mut publish),
+                                            )?,
+                                            None => pane.publish_line_reads(plans, &mut publish)?,
                                         };
                                         if layout.is_some() && !accepted {
                                             pane.notify_lines_ready();
@@ -12261,9 +12274,15 @@ mod tests {
             self.state.lock().unwrap().seqno
         }
 
-        fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
-            self.line_layout_floor
-                .map(|floor| (floor, self.state.lock().unwrap().dimensions))
+        fn get_line_layout(
+            &self,
+        ) -> Result<
+            Option<(SequenceNo, RenderableDimensions)>,
+            wezterm_term::screen::ColdReadMetadataBusy,
+        > {
+            Ok(self
+                .line_layout_floor
+                .map(|floor| (floor, self.state.lock().unwrap().dimensions)))
         }
 
         fn get_changed_since(
@@ -12828,6 +12847,28 @@ mod tests {
             }
             assert_eq!(response.request_ident, request_ident);
             assert!(!format!("{response:?}").contains("private"));
+            let busy = context.response_for_error(
+                &anyhow::Error::new(wezterm_term::screen::ColdReadMetadataBusy)
+                    .context("private metadata lock context"),
+            );
+            busy.validate().expect("finite contention projection");
+            let expected = if matches!(request_ident, GetLines::IDENT | GetLinesAtLayout::IDENT) {
+                MuxErrorCode::RESOURCE_BUSY
+            } else if request_ident == KillPane::IDENT {
+                MuxErrorCode::INDETERMINATE_MUTATION
+            } else {
+                MuxErrorCode::BACKEND_FAILURE
+            };
+            assert_eq!(busy.code, expected);
+            assert_eq!(busy.request_ident, request_ident);
+            assert!(!format!("{busy:?}").contains("private"));
+            assert_ne!(
+                context
+                    .response_for_error(&anyhow!("cold history metadata is busy"))
+                    .code,
+                MuxErrorCode::RESOURCE_BUSY,
+                "untyped backend text must not authorize contention retries",
+            );
         }
     }
 

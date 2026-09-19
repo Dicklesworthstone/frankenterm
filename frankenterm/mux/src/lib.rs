@@ -1814,6 +1814,7 @@ pub(crate) fn next_unique_usize_id(counter: &AtomicUsize, namespace: &'static st
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_add(1) else {
+            // ubs:ignore[rust.ownership.panic-macro] — Exhaustion must stop this infallible allocator before an identifier can alias a live object.
             panic!(
                 "{} identifier space exhausted; refusing to reuse an identifier",
                 namespace
@@ -4124,7 +4125,7 @@ mod pane_registration_handle {
             &self,
             reads: &[frankenterm_term::screen::ScreenLineRead],
             publish: &mut dyn FnMut(),
-        ) -> bool {
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
             self.pane.publish_line_reads(reads, publish)
         }
 
@@ -4150,10 +4151,13 @@ mod pane_registration_handle {
 
         pub fn get_line_layout(
             &self,
-        ) -> Option<(
-            termwiz::surface::SequenceNo,
-            crate::renderable::RenderableDimensions,
-        )> {
+        ) -> Result<
+            Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            frankenterm_term::screen::ColdReadMetadataBusy,
+        > {
             self.pane.get_line_layout()
         }
 
@@ -4163,7 +4167,7 @@ mod pane_registration_handle {
             expected_seqno: termwiz::surface::SequenceNo,
             expected_dimensions: crate::renderable::RenderableDimensions,
             publish: &mut dyn FnMut(),
-        ) -> bool {
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
             self.pane.publish_line_reads_at_layout(
                 reads,
                 expected_seqno,

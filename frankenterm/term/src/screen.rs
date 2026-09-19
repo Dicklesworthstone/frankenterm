@@ -241,7 +241,7 @@ impl std::error::Error for ColdReadGeometryUnavailable {}
 /// A transient metadata lock conflict, rather than missing or invalid source
 /// authority. Only an off-thread owner may wait and retry this refusal.
 #[cfg(feature = "use_serde")]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColdReadMetadataBusy;
 
 #[cfg(feature = "use_serde")]
@@ -618,11 +618,6 @@ impl std::io::Write for ColdReadCharge {
                 std::io::Error::other(ColdReadPayloadLimit)
             })?;
         Ok(bytes.len())
-    }
-    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        // Counting consumes the entire slice or refuses it without progress.
-        // Avoid the default writer's partial-write loop for every JSON token.
-        self.write(bytes).map(|_| ())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -3959,18 +3954,33 @@ impl Screen {
     /// Call under the terminal lock, in the same critical section as publication.
     #[cfg(feature = "use_serde")]
     pub fn validates_line_read(&self, read: &ScreenLineRead) -> bool {
-        read.complete
-            && read.row_count() == read.end.saturating_sub(read.first) as usize
-            && self.validates_line_read_source(read)
+        self.try_validate_line_read(read).unwrap_or(false)
+    }
+
+    /// Publication callers that can retry must distinguish transient metadata
+    /// contention from a read whose source is no longer valid. Paint callers
+    /// may use `validates_line_read` to defer either refusal.
+    #[cfg(feature = "use_serde")]
+    pub fn try_validate_line_read(
+        &self,
+        read: &ScreenLineRead,
+    ) -> Result<bool, ColdReadMetadataBusy> {
+        if !read.complete || read.row_count() != read.end.saturating_sub(read.first) as usize {
+            return Ok(false);
+        }
+        self.validates_line_read_source(read)
     }
 
     #[cfg(feature = "use_serde")]
-    fn validates_line_read_source(&self, read: &ScreenLineRead) -> bool {
+    fn validates_line_read_source(
+        &self,
+        read: &ScreenLineRead,
+    ) -> Result<bool, ColdReadMetadataBusy> {
         use crate::config::ScrollbackIntervalCapture;
         if !self.matches_coordinate_witness(&read.witness)
             || !self.same_cold_fragments(&read.fragments)
         {
-            return false;
+            return Ok(false);
         }
         if read.first < read.resident_first || read.layout.is_some() {
             if read.layout.as_ref().is_some_and(|layout| {
@@ -3980,7 +3990,7 @@ impl Screen {
                 // Canonical visual rows are anchored to the complete cold
                 // frontier. New source rows can have a different wrapped row
                 // count and shift even a closed prefix's visual origin.
-                return false;
+                return Ok(false);
             }
             if read.layout.as_ref().is_some_and(|layout| {
                 matches!(
@@ -3995,7 +4005,7 @@ impl Screen {
                 // The old bytes are retained, but this cached logical context
                 // ended at an open seam. Newly spilled rows may continue or
                 // close that same logical group; never certify its old end.
-                return false;
+                return Ok(false);
             }
             if read.layout_seqno != self.cold_visual_seqno {
                 // Another worker may have published while this read was in
@@ -4022,17 +4032,17 @@ impl Screen {
                             || now.extends(before)
                     });
                 if !compatible {
-                    return false;
+                    return Ok(false);
                 }
             }
             let Some((source, before)) = &read.cold else {
-                return false;
+                return Ok(false);
             };
             let Some(current) = self.config.scrollback_spill_sink() else {
-                return false;
+                return Ok(false);
             };
             if !Arc::ptr_eq(source, &current) {
-                return false;
+                return Ok(false);
             }
             match current.try_capture_scrollback_interval() {
                 ScrollbackIntervalCapture::Ready(now)
@@ -4047,18 +4057,19 @@ impl Screen {
                             .clone()
                             .unwrap_or(read.first..read.resident_first),
                     ) => {}
-                _ => return false,
+                ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+                _ => return Ok(false),
             }
         }
         if !read.resident.is_empty() {
             let Some(start) = self.stable_row_to_phys(read.resident_first) else {
-                return false;
+                return Ok(false);
             };
             if start
                 .checked_add(read.resident.len())
                 .is_none_or(|end| end > self.lines.len())
             {
-                return false;
+                return Ok(false);
             }
             if !self
                 .lines
@@ -4067,10 +4078,10 @@ impl Screen {
                 .zip(&read.resident)
                 .all(|(now, before)| now == before)
             {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Install only after all reads in a publication transaction validate.
@@ -4098,8 +4109,14 @@ impl Screen {
     }
 
     #[cfg(feature = "use_serde")]
-    pub fn validates_prepared_cold_layout(&self, prepared: &PreparedColdLayout) -> bool {
-        !prepared.installed && self.validates_line_read_source(&prepared.source)
+    pub fn validates_prepared_cold_layout(
+        &self,
+        prepared: &PreparedColdLayout,
+    ) -> Result<bool, ColdReadMetadataBusy> {
+        if prepared.installed {
+            return Ok(false);
+        }
+        self.validates_line_read_source(&prepared.source)
     }
 
     #[cfg(feature = "use_serde")]
@@ -4114,31 +4131,33 @@ impl Screen {
         &mut self,
         prepared: &mut PreparedColdLayout,
         seqno: SequenceNo,
-    ) -> bool {
-        if seqno == SequenceNo::MAX || !self.validates_prepared_cold_layout(prepared) {
-            return false;
+    ) -> Result<bool, ColdReadMetadataBusy> {
+        if seqno == SequenceNo::MAX || !self.validates_prepared_cold_layout(prepared)? {
+            return Ok(false);
         }
         prepared.retired_layout = self.replace_line_read_layout(&prepared.source, seqno);
         prepared.installed = true;
-        true
+        Ok(true)
     }
 
     /// Reconcile asynchronous retention/replacement with the terminal's wire
     /// sequence. The caller increments its sequence before publishing a pair.
     /// Busy is not an unchanged authority and must defer the observation.
     #[cfg(feature = "use_serde")]
-    pub fn refresh_cold_source_observation(&mut self) -> Option<bool> {
+    pub fn refresh_cold_source_observation(
+        &mut self,
+    ) -> Result<Option<bool>, ColdReadMetadataBusy> {
         let Some(sink) = self
             .config
             .scrollback_spill_sink()
             .filter(|_| self.allow_scrollback)
         else {
-            return Some(self.cold_source_observation.take().is_some());
+            return Ok(Some(self.cold_source_observation.take().is_some()));
         };
-        let crate::config::ScrollbackIntervalCapture::Ready(now) =
-            sink.try_capture_scrollback_interval()
-        else {
-            return None;
+        let now = match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(now) => now,
+            crate::config::ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+            crate::config::ScrollbackIntervalCapture::Unavailable => return Ok(None),
         };
         let changed = self
             .cold_source_observation
@@ -4159,7 +4178,7 @@ impl Screen {
             self.cold_index_budget_exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         }
         self.cold_source_observation = Some((sink, now));
-        Some(changed)
+        Ok(Some(changed))
     }
 
     #[cfg(feature = "use_serde")]
@@ -4920,6 +4939,7 @@ impl Screen {
         bidi_mode: BidiMode,
     ) -> Screen {
         Self::try_new(size, config, allow_scrollback, seqno, bidi_mode, false)
+            // ubs:ignore[rust.ownership.panic-macro] — This infallible constructor cannot return a partially allocated screen; recovery uses the fallible constructor.
             .unwrap_or_else(|()| panic!("unable to allocate terminal screen"))
     }
 
@@ -5963,6 +5983,7 @@ impl Screen {
             Self::hash_layout_line(&mut hasher, line);
         }
         line_count.hash(&mut hasher);
+        // ubs:ignore[rust.security.non-crypto-random] — This process-local layout cache fingerprint is neither a credential nor a cryptographic identity.
         hasher.finish()
     }
 
@@ -6213,6 +6234,7 @@ impl Screen {
         let mut hasher = DefaultHasher::new();
         let rebuild = self.rebuild_logical_lines_from_physical_inner(seqno, Some(&mut hasher));
         self.lines.len().hash(&mut hasher);
+        // ubs:ignore[rust.security.non-crypto-random] — This tuple carries a process-local layout cache fingerprint, not a security token.
         (
             rebuild.logical_lines,
             hasher.finish(),
@@ -6351,6 +6373,7 @@ impl Screen {
         if let Some(entry) = cache.as_mut() {
             if published_target_matches
                 || source_signature
+                    // ubs:ignore[rust.security.constant-time-compare] — These are public layout cache fingerprints, not secret authentication material.
                     .is_some_and(|signature| entry.source_signature == Some(signature))
             {
                 let entry = Arc::make_mut(entry);
@@ -10916,11 +10939,16 @@ pub(crate) mod tests {
             let _busy = sink.state.lock().unwrap();
             assert!(screen.capture_line_read(1..2).is_err());
             assert!(!screen.validates_line_read(&read));
+            assert_eq!(
+                screen.try_validate_line_read(&read),
+                Err(ColdReadMetadataBusy)
+            );
             assert!(
                 screen.capture_line_read(4..5).is_ok(),
                 "resident capture does not wait for backing IO"
             );
         }
+        assert_eq!(screen.try_validate_line_read(&read), Ok(true));
         sink.state.lock().unwrap().1.remove(&-1);
         assert!(
             !screen.validates_line_read(&read),
@@ -11124,17 +11152,20 @@ pub(crate) mod tests {
                 .is_err(),
             "seam remains explicitly unavailable until its atomic transaction"
         );
-        assert_eq!(screen.refresh_cold_source_observation(), Some(true));
-        assert_eq!(screen.refresh_cold_source_observation(), Some(false));
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(true)));
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(false)));
         sink.state.lock().unwrap().0 = ScrollbackIntervalIdentity::default();
         assert_eq!(
             screen.refresh_cold_source_observation(),
-            Some(true),
+            Ok(Some(true)),
             "same bounds with new source lineage changes wire authority"
         );
         {
             let _busy = sink.state.lock().unwrap();
-            assert_eq!(screen.refresh_cold_source_observation(), None);
+            assert_eq!(
+                screen.refresh_cold_source_observation(),
+                Err(ColdReadMetadataBusy)
+            );
         }
         // A full-index budget failure is a one-time optimization refusal,
         // not a permanent refusal of a small previously admissible read.
@@ -11156,7 +11187,7 @@ pub(crate) mod tests {
         }
         screen.stable_row_index_offset = 41;
         screen.physical_cols = 8;
-        assert_eq!(screen.refresh_cold_source_observation(), Some(true));
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(true)));
         let plan = screen.capture_line_read(40..41).unwrap();
         let failure = plan.failure_witness();
         assert!(plan
@@ -11194,7 +11225,7 @@ pub(crate) mod tests {
         }
         screen.physical_cols = 3;
         screen.stable_row_index_offset = 2;
-        screen.refresh_cold_source_observation().unwrap();
+        assert!(screen.refresh_cold_source_observation().unwrap().is_some());
         let initial = screen
             .capture_line_read(0..2)
             .unwrap()
@@ -11753,7 +11784,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!prepared.source.complete, "metadata is not a text receipt");
         assert!(!terminal.screen().validates_line_read(&prepared.source));
-        assert!(terminal.screen().validates_prepared_cold_layout(&prepared));
+        assert!(terminal
+            .screen()
+            .validates_prepared_cold_layout(&prepared)
+            .unwrap());
         let actual_layout = prepared.source.layout.as_ref().unwrap();
         let reference_layout = reference_read.layout.as_ref().unwrap();
         assert_eq!(actual_layout.source, reference_layout.source);
@@ -11762,15 +11796,20 @@ pub(crate) mod tests {
         let seqno = terminal.current_seqno().checked_add(1).unwrap();
         assert!(terminal
             .screen_mut()
-            .install_prepared_cold_layout(&mut prepared, seqno));
+            .install_prepared_cold_layout(&mut prepared, seqno)
+            .unwrap());
         assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
         assert_eq!(sink.single_reads.load(Ordering::Relaxed), 0);
         assert_eq!(terminal.screen().lines, before_rows);
         assert_eq!(terminal.cursor_pos(), before_cursor);
-        assert!(!terminal.screen().validates_prepared_cold_layout(&prepared));
+        assert!(!terminal
+            .screen()
+            .validates_prepared_cold_layout(&prepared)
+            .unwrap());
         assert!(!terminal
             .screen_mut()
-            .install_prepared_cold_layout(&mut prepared, seqno));
+            .install_prepared_cold_layout(&mut prepared, seqno)
+            .unwrap());
         let published = terminal
             .screen()
             .capture_line_read(reference_read.first_row()..reference_read.end)
@@ -11796,7 +11835,7 @@ pub(crate) mod tests {
                 .prepare_cold_layout(|| false)
                 .unwrap();
             assert!(!prepared.source.complete);
-            assert!(screen.validates_prepared_cold_layout(&prepared));
+            assert!(screen.validates_prepared_cold_layout(&prepared).unwrap());
             match mutation {
                 0 => sink.force_busy_probe.store(true, Ordering::Relaxed),
                 1 => *sink.interval_identity.lock().unwrap() = Default::default(),
@@ -11829,8 +11868,16 @@ pub(crate) mod tests {
             }
             let before_seqno = screen.cold_visual_seqno;
             let before_layout = screen.cold_visual_layout.clone();
-            assert!(!screen.validates_prepared_cold_layout(&prepared));
-            assert!(!screen.install_prepared_cold_layout(&mut prepared, 5));
+            let expected = if mutation == 0 {
+                Err(ColdReadMetadataBusy)
+            } else {
+                Ok(false)
+            };
+            assert_eq!(screen.validates_prepared_cold_layout(&prepared), expected);
+            assert_eq!(
+                screen.install_prepared_cold_layout(&mut prepared, 5),
+                expected
+            );
             assert!(!prepared.installed);
             assert_eq!(screen.cold_visual_seqno, before_seqno);
             assert!(match (&before_layout, &screen.cold_visual_layout) {
@@ -11840,8 +11887,14 @@ pub(crate) mod tests {
             });
             if mutation == 0 {
                 sink.force_busy_probe.store(false, Ordering::Relaxed);
-                assert!(screen.validates_prepared_cold_layout(&prepared));
-                assert!(screen.install_prepared_cold_layout(&mut prepared, 5));
+                let batch_reads = sink.batch_reads.load(Ordering::Relaxed);
+                let single_reads = sink.single_reads.load(Ordering::Relaxed);
+                assert!(screen.validates_prepared_cold_layout(&prepared).unwrap());
+                assert!(screen
+                    .install_prepared_cold_layout(&mut prepared, 5)
+                    .unwrap());
+                assert_eq!(sink.batch_reads.load(Ordering::Relaxed), batch_reads);
+                assert_eq!(sink.single_reads.load(Ordering::Relaxed), single_reads);
             }
         }
     }
@@ -11883,7 +11936,9 @@ pub(crate) mod tests {
             fallback.source.lines().cloned().collect::<Vec<_>>(),
             expected.lines().cloned().collect::<Vec<_>>()
         );
-        assert!(screen.install_prepared_cold_layout(&mut fallback, 3));
+        assert!(screen
+            .install_prepared_cold_layout(&mut fallback, 3)
+            .unwrap());
     }
 
     #[cfg(feature = "use_serde")]
@@ -11946,7 +12001,7 @@ pub(crate) mod tests {
             .unwrap()
             .prepare_cold_layout(|| false)
             .unwrap();
-        assert!(screen.install_prepared_cold_layout(&mut first, 3));
+        assert!(screen.install_prepared_cold_layout(&mut first, 3).unwrap());
         drop(first);
         let retired = Arc::downgrade(screen.cold_visual_layout.as_ref().unwrap());
         screen.resize(test_size(4, 7, 96), cursor, 4, false);
@@ -11955,12 +12010,12 @@ pub(crate) mod tests {
             .unwrap()
             .prepare_cold_layout(|| false)
             .unwrap();
-        assert!(screen.install_prepared_cold_layout(&mut next, 5));
+        assert!(screen.install_prepared_cold_layout(&mut next, 5).unwrap());
         assert!(Arc::ptr_eq(
             next.retired_layout.as_ref().unwrap(),
             &retired.upgrade().unwrap()
         ));
-        assert!(!screen.install_prepared_cold_layout(&mut next, 6));
+        assert!(!screen.install_prepared_cold_layout(&mut next, 6).unwrap());
         assert!(
             retired.upgrade().is_some(),
             "receipt retains replaced allocation"

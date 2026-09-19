@@ -1405,6 +1405,7 @@ struct TextReadDiagnostics {
     quota_reductions: u32,
     chunk_layout_retries: u32,
     final_source_retries: u32,
+    resource_busy_retries: u32,
 }
 
 impl TextReadDiagnostics {
@@ -1436,6 +1437,7 @@ impl Drop for TextReadDiagnostics {
             quota_reductions = self.quota_reductions,
             chunk_layout_retries = self.chunk_layout_retries,
             final_source_retries = self.final_source_retries,
+            resource_busy_retries = self.resource_busy_retries,
             "text transaction ended"
         );
     }
@@ -2607,18 +2609,42 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
-        let response = self
-            .send_request_with_cx(
-                cx,
-                Pdu::GetLines(GetLines {
-                    pane_id: pane_id as usize,
-                    lines,
-                }),
-            )
-            .await?;
-        match response {
-            Pdu::GetLinesResponse(payload) => Ok(payload),
-            other => self.unexpected_response("GetLinesResponse", &other, true),
+        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
+        let mut busy_retries = 0usize;
+        loop {
+            let response = self
+                .send_request_with_cx(
+                    cx,
+                    Pdu::GetLines(GetLines {
+                        pane_id: pane_id as usize,
+                        lines: lines.clone(),
+                    }),
+                )
+                .await;
+            let response = match response {
+                Err(DirectMuxError::RemoteRejection(error))
+                    if error.validate().is_ok()
+                        && error.request_ident == <GetLines as codec::PduWireIdent>::IDENT
+                        && error.effect == codec::MuxErrorEffect::NOT_APPLIED
+                        && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF =>
+                {
+                    if error.code == codec::MuxErrorCode::RESOURCE_BUSY
+                        && busy_retries < MAX_RESOURCE_BUSY_RETRIES
+                    {
+                        busy_retries += 1;
+                        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                            .await
+                            .map_err(|error| cancelled_mux_error("get_lines_backoff", error))?;
+                        continue;
+                    }
+                    return Err(DirectMuxError::RemoteRejection(error));
+                }
+                result => result?,
+            };
+            match response {
+                Pdu::GetLinesResponse(payload) => return Ok(payload),
+                other => return self.unexpected_response("GetLinesResponse", &other, true),
+            }
         }
     }
 
@@ -2659,8 +2685,10 @@ impl DirectMuxClient {
         tail: Option<usize>,
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+        const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
         let mut chunk_rows = 512isize;
         let mut retry_snapshot = None;
+        let mut busy_retries = 0usize;
         let mut diagnostics = TextReadDiagnostics {
             enabled: tracing::enabled!(target: "frankenterm::mux_text_diagnostics", tracing::Level::TRACE),
             connection_id: self.connection_id,
@@ -2668,6 +2696,7 @@ impl DirectMuxClient {
             quota_reductions: 0,
             chunk_layout_retries: 0,
             final_source_retries: 0,
+            resource_busy_retries: 0,
         };
         'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
@@ -2731,6 +2760,18 @@ impl DirectMuxClient {
                             && error.effect == codec::MuxErrorEffect::NOT_APPLIED
                             && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF =>
                     {
+                        if error.code == codec::MuxErrorCode::RESOURCE_BUSY
+                            && busy_retries < MAX_RESOURCE_BUSY_RETRIES
+                        {
+                            busy_retries += 1;
+                            diagnostics.resource_busy_retries += 1;
+                            let phase_started = diagnostics.start_phase();
+                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                                .await
+                                .map_err(|error| cancelled_mux_error("text_read_backoff", error))?;
+                            diagnostics.phase("busy_wait", phase_started);
+                            continue;
+                        }
                         if error.code == codec::MuxErrorCode::QUOTA_EXCEEDED
                             && chunk_end - start > 1
                         {
@@ -2780,11 +2821,13 @@ impl DirectMuxClient {
                         }
                         if matches!(
                             error.code,
-                            codec::MuxErrorCode::QUOTA_EXCEEDED
+                            codec::MuxErrorCode::RESOURCE_BUSY
+                                | codec::MuxErrorCode::QUOTA_EXCEEDED
                                 | codec::MuxErrorCode::BACKEND_FAILURE
                         ) {
                             // Quota reached one row, or a fresh observer proved
-                            // the backend refusal was not a changed snapshot.
+                            // the backend refusal was not a changed snapshot, or
+                            // resource busy exhausted its retry allowance.
                             return Ok(Err(error));
                         }
                         return Err(DirectMuxError::RemoteRejection(error));
@@ -7147,6 +7190,11 @@ mod tests {
 
     #[test]
     fn text_read_restarts_after_initial_stale_fence_or_final_source_change() {
+        if isolated_text_diagnostic_test(
+            "text_read_restarts_after_initial_stale_fence_or_final_source_change",
+        ) {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         for stale_first in [true, false] {
             let diagnostic_log = TextDiagnosticLog::default();
@@ -7234,6 +7282,11 @@ mod tests {
 
     #[test]
     fn text_read_refuses_incomplete_wrong_pane_or_wrong_layout_replies() {
+        if isolated_text_diagnostic_test(
+            "text_read_refuses_incomplete_wrong_pane_or_wrong_layout_replies",
+        ) {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         for (defect, reason) in [
             ("missing", "reply_row_count_mismatch"),
@@ -7348,6 +7401,60 @@ mod tests {
     #[derive(Clone, Default)]
     struct TextDiagnosticLog(Arc<StdMutex<Vec<u8>>>);
 
+    // These tests assert exact tracing output. Other libtest threads can first
+    // register the same callsites without a subscriber while our temporary
+    // subscriber is being installed, changing process-wide cached interest.
+    // Isolate that global registry, while retaining all real socket, retry and
+    // event assertions in the child. No global subscriber or assertion changes.
+    fn isolated_text_diagnostic_test(name: &str) -> bool {
+        use std::io::Read as _;
+        const CHILD_ENV: &str = "FT_MUX_TEXT_DIAGNOSTIC_CHILD";
+        let full_name = format!("vendored::mux_client::tests::{name}");
+        if std::env::var(CHILD_ENV).as_deref() == Ok(full_name.as_str()) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, &full_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated diagnostic test");
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let read = |pipe: Box<dyn std::io::Read + Send>| {
+            std::thread::spawn(move || {
+                let mut output = String::new();
+                pipe.take(1024 * 1024).read_to_string(&mut output).unwrap();
+                output
+            })
+        };
+        let stdout = read(Box::new(stdout));
+        let stderr = read(Box::new(stderr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated diagnostic test exceeded its deadline: {full_name}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        assert!(
+            status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                && stdout.contains(&format!("test {full_name} ... ok")),
+            "isolated diagnostic test failed: {status}\n{stdout}\n{stderr}"
+        );
+        true
+    }
+
     impl std::io::Write for TextDiagnosticLog {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
@@ -7449,6 +7556,11 @@ mod tests {
 
     #[test]
     fn text_read_one_row_quota_and_changing_snapshot_stop_boundedly() {
+        if isolated_text_diagnostic_test(
+            "text_read_one_row_quota_and_changing_snapshot_stop_boundedly",
+        ) {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         for quota in [true, false] {
             let diagnostic_log = TextDiagnosticLog::default();
@@ -7758,6 +7870,11 @@ mod tests {
 
     #[test]
     fn text_read_snapshot_churn_is_bounded_and_reuses_the_pool_connection() {
+        if isolated_text_diagnostic_test(
+            "text_read_snapshot_churn_is_bounded_and_reuses_the_pool_connection",
+        ) {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         for rejected_chunk in [false, true] {
             let diagnostic_log = TextDiagnosticLog::default();
@@ -8144,6 +8261,504 @@ mod tests {
                 "retry must recompute the suffix range against the updated layout"
             );
 
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_same_seq_dims_busy_then_valid_exact_rows_succeeds() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                    Pdu::GetLinesAtLayout(request) => {
+                        let count = seen.fetch_add(1, Ordering::SeqCst);
+                        if count == 0 {
+                            Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                GetLinesAtLayout::IDENT,
+                            ))
+                        } else {
+                            text_read_reply(request, "valid_exact")
+                        }
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap();
+            assert_eq!(
+                result,
+                MuxTextReadResult::Text(text_read_expected(0..3, "valid_exact"))
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                2,
+                "first busy followed by valid lines must succeed on exactly second request"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_repeated_busy_stops_bounded_at_retry_cap() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                    Pdu::GetLinesAtLayout(_) => {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                            GetLinesAtLayout::IDENT,
+                        ))
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+            let DirectMuxError::RemoteRejection(rejection) = error else {
+                panic!("expected typed RemoteRejection, got {error:?}");
+            };
+            assert_eq!(rejection.code, codec::MuxErrorCode::RESOURCE_BUSY);
+            assert_eq!(rejection.effect, codec::MuxErrorEffect::NOT_APPLIED);
+            assert_eq!(rejection.retry, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            rejection.validate().unwrap();
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                4,
+                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_wrong_request_refusal_does_not_retry() {
+        for rejection in [
+            codec::ErrorResponse::resource_busy(GetLines::IDENT),
+            codec::ErrorResponse::indeterminate_mutation(GetLinesAtLayout::IDENT, None),
+            codec::ErrorResponse::policy_rejected(GetLinesAtLayout::IDENT),
+        ] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let requests = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&requests);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetPaneRenderChanges(_) => text_read_state(7, 0, 3),
+                        Pdu::GetLinesAtLayout(_) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Pdu::ErrorResponse(rejection.clone())
+                        }
+                        other => panic!("unexpected text request {other:?}"),
+                    })
+                })
+                .await;
+
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        DirectMuxError::RemoteRejection(_)
+                            | DirectMuxError::RemoteRejectionRequestMismatch { .. }
+                    ),
+                    "refusal with wrong request/effect/retry must reject immediately"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "unauthorized or contradictory refusal must never retry"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn text_read_shared_busy_budget_cannot_reset_across_changed_snapshot() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let chunk_calls = Arc::new(AtomicUsize::new(0));
+            let chunk_seen = Arc::clone(&chunk_calls);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => {
+                        let count = chunk_seen.load(Ordering::SeqCst);
+                        if count < 2 {
+                            text_read_state(7, 0, 3)
+                        } else {
+                            text_read_state(8, 0, 3)
+                        }
+                    }
+                    Pdu::GetLinesAtLayout(request) => {
+                        let call = chunk_seen.fetch_add(1, Ordering::SeqCst);
+                        match call {
+                            // First snapshot (seqno 7):
+                            // Call 0: first busy refusal (busy_retries: 0 -> 1)
+                            0 => {
+                                assert_eq!(request.layout.seqno, 7);
+                                Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            }
+                            // Call 1: backend failure triggering snapshot restart
+                            1 => {
+                                assert_eq!(request.layout.seqno, 7);
+                                Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            }
+                            // Second snapshot (seqno 8):
+                            // Call 2: second busy refusal (busy_retries: 1 -> 2)
+                            2 => {
+                                assert_eq!(request.layout.seqno, 8);
+                                Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            }
+                            // Call 3: third busy refusal (busy_retries: 2 -> 3)
+                            3 => {
+                                assert_eq!(request.layout.seqno, 8);
+                                Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            }
+                            // Call 4: fourth busy refusal; budget is exhausted (3 retries used).
+                            // If allowance had reset upon the snapshot change, this would retry (call 5).
+                            // Because allowance is shared across the whole transaction,
+                            // the client must NOT retry here and must return the error.
+                            4 => {
+                                assert_eq!(request.layout.seqno, 8);
+                                Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                    GetLinesAtLayout::IDENT,
+                                ))
+                            }
+                            other => panic!(
+                                "unexpected extra chunk request {other} beyond shared busy cap"
+                            ),
+                        }
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+            let DirectMuxError::RemoteRejection(rejection) = error else {
+                panic!("expected typed RemoteRejection, got {error:?}");
+            };
+            assert_eq!(rejection.code, codec::MuxErrorCode::RESOURCE_BUSY);
+            assert_eq!(rejection.effect, codec::MuxErrorEffect::NOT_APPLIED);
+            assert_eq!(rejection.retry, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            rejection.validate().unwrap();
+            assert_eq!(
+                chunk_calls.load(Ordering::SeqCst),
+                5,
+                "shared budget must cap total busy retries at 3 across changed snapshots (no reset)"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn text_read_permanent_backend_samefence_still_fails() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let render_state_calls = Arc::new(AtomicUsize::new(0));
+            let chunk_calls = Arc::new(AtomicUsize::new(0));
+            let render_seen = Arc::clone(&render_state_calls);
+            let chunk_seen = Arc::clone(&chunk_calls);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetPaneRenderChanges(_) => {
+                        render_seen.fetch_add(1, Ordering::SeqCst);
+                        text_read_state(7, 0, 3)
+                    }
+                    Pdu::GetLinesAtLayout(_) => {
+                        chunk_seen.fetch_add(1, Ordering::SeqCst);
+                        Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                            GetLinesAtLayout::IDENT,
+                        ))
+                    }
+                    other => panic!("unexpected text request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client.get_text_with_cx(&cx, 9, 100_000).await.unwrap_err();
+            let DirectMuxError::RemoteRejection(rejection) = error else {
+                panic!("expected typed RemoteRejection, got {error:?}");
+            };
+            assert_eq!(rejection.code, codec::MuxErrorCode::BACKEND_FAILURE);
+            rejection.validate().unwrap();
+            assert_eq!(
+                chunk_calls.load(Ordering::SeqCst),
+                1,
+                "permanent backend failure with same fence must not blind retry chunk"
+            );
+            assert_eq!(
+                render_state_calls.load(Ordering::SeqCst),
+                2,
+                "must check second fence once to verify snapshot correlation"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn get_lines_busy_transient_then_success_succeeds() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetLines(request) => {
+                        assert_eq!(request.pane_id, 42);
+                        assert_eq!(request.lines.len(), 1);
+                        assert_eq!(request.lines[0], 0..5);
+                        let count = seen.fetch_add(1, Ordering::SeqCst);
+                        if count == 0 {
+                            Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(GetLines::IDENT))
+                        } else {
+                            let lines: Vec<(isize, frankenterm_term::Line)> = (0isize..5)
+                                .map(|row| {
+                                    let line = frankenterm_term::Line::from_text(
+                                        &format!("row {row} text"),
+                                        &termwiz::cell::CellAttributes::default(),
+                                        1,
+                                        None,
+                                    );
+                                    (row, line)
+                                })
+                                .collect();
+                            Pdu::GetLinesResponse(codec::GetLinesResponse {
+                                pane_id: request.pane_id,
+                                lines: lines.into(),
+                            })
+                        }
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let result = client
+                .get_lines_with_cx(&cx, 42, std::iter::once(0..5).collect())
+                .await
+                .unwrap();
+            assert_eq!(result.pane_id, 42);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                2,
+                "first busy followed by valid lines must succeed on exactly second request"
+            );
+            let (lines, _images) = result.lines.extract_data();
+            assert_eq!(lines.len(), 5);
+            for (idx, (row, line)) in lines.into_iter().enumerate() {
+                assert_eq!(row, idx as isize);
+                assert_eq!(line.as_str().as_ref(), &format!("row {idx} text"));
+            }
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn get_lines_repeated_busy_stops_bounded_at_retry_cap() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetLines(request) => {
+                        assert_eq!(request.pane_id, 42);
+                        assert_eq!(request.lines.len(), 1);
+                        assert_eq!(request.lines[0], 0..5);
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(GetLines::IDENT))
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client
+                .get_lines_with_cx(&cx, 42, std::iter::once(0..5).collect())
+                .await
+                .unwrap_err();
+            let DirectMuxError::RemoteRejection(rejection) = error else {
+                panic!("expected typed RemoteRejection, got {error:?}");
+            };
+            assert_eq!(rejection.code, codec::MuxErrorCode::RESOURCE_BUSY);
+            assert_eq!(rejection.effect, codec::MuxErrorEffect::NOT_APPLIED);
+            assert_eq!(rejection.retry, codec::MuxErrorRetry::SAFE_AFTER_BACKOFF);
+            rejection.validate().unwrap();
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                4,
+                "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+            );
+            drop(client);
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn get_lines_wrong_authority_refusal_does_not_retry() {
+        for rejection in [
+            codec::ErrorResponse::resource_busy(GetLinesAtLayout::IDENT),
+            codec::ErrorResponse::backend_failure(GetLines::IDENT),
+            codec::ErrorResponse::policy_rejected(GetLines::IDENT),
+            codec::ErrorResponse::indeterminate_mutation(GetLines::IDENT, None),
+        ] {
+            run_async_test(async move {
+                let cx = crate::cx::for_testing();
+                let requests = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&requests);
+                let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                    Some(match pdu {
+                        Pdu::GetLines(request) => {
+                            assert_eq!(request.pane_id, 42);
+                            assert_eq!(request.lines.len(), 1);
+                            assert_eq!(request.lines[0], 0..5);
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Pdu::ErrorResponse(rejection.clone())
+                        }
+                        other => panic!("unexpected request {other:?}"),
+                    })
+                })
+                .await;
+
+                let mut client =
+                    DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                        .await
+                        .unwrap();
+                let error = client
+                    .get_lines_with_cx(&cx, 42, std::iter::once(0..5).collect())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        DirectMuxError::RemoteRejection(_)
+                            | DirectMuxError::RemoteRejectionRequestMismatch { .. }
+                    ),
+                    "refusal with wrong request/effect/retry must reject without retry"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "unauthorized or non-retryable refusal must never retry"
+                );
+                drop(client);
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn get_lines_cancelled_with_busy_reply_does_not_retry() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let cancel_cx = cx.clone();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&requests);
+            let (_dir, path, server) = text_read_server(1, move |_, pdu| {
+                Some(match pdu {
+                    Pdu::GetLines(request) => {
+                        assert_eq!(request.pane_id, 42);
+                        assert_eq!(request.lines.len(), 1);
+                        assert_eq!(request.lines[0], 0..5);
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        cancel_cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("cancel get_lines with busy reply"),
+                        );
+                        Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(GetLines::IDENT))
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                })
+            })
+            .await;
+
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            let error = client
+                .get_lines_with_cx(&cx, 42, std::iter::once(0..5).collect())
+                .await
+                .unwrap_err();
+            assert_cancelled_mux_error(&error);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "cancellation with a busy reply must prevent further requests"
+            );
             drop(client);
             timeout(Duration::from_secs(5), server)
                 .await

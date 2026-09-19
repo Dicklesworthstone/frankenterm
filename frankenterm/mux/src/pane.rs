@@ -744,12 +744,13 @@ pub trait Pane: Downcast + Send + Sync {
     }
 
     /// Execute publication while the exact active Screen is still validated.
+    /// Contention is retryable; a stale source is a successful negative verdict.
     fn publish_line_reads(
         &self,
         _reads: &[frankenterm_term::screen::ScreenLineRead],
         _publish: &mut dyn FnMut(),
-    ) -> bool {
-        false
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        Ok(false)
     }
 
     /// Atomic, nonblocking observation of the last layout-changing sequence
@@ -757,8 +758,14 @@ pub trait Pane: Downcast + Send + Sync {
     /// raise the floor. Callers bind their observed render sequence at or
     /// above it; publication separately rejects future sequences.
     /// Unsupported pane kinds must not fabricate a pair from separate reads.
-    fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
-        None
+    /// `Err` is transient lock contention; `Ok(None)` is unavailable authority.
+    fn get_line_layout(
+        &self,
+    ) -> Result<
+        Option<(SequenceNo, RenderableDimensions)>,
+        frankenterm_term::screen::ColdReadMetadataBusy,
+    > {
+        Ok(None)
     }
 
     fn publish_line_reads_at_layout(
@@ -767,8 +774,8 @@ pub trait Pane: Downcast + Send + Sync {
         _expected_seqno: SequenceNo,
         _expected_dimensions: RenderableDimensions,
         _publish: &mut dyn FnMut(),
-    ) -> bool {
-        false
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        Ok(false)
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
