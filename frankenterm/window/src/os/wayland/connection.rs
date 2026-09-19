@@ -184,15 +184,14 @@ impl WaylandConnection {
     where
         F: FnOnce(&mut WaylandWindowInner) + Send + 'static,
     {
-        reservation
-            .spawn(async move {
-                let Some(connection) = Connection::get() else {
-                    return;
-                };
-                if let Some(handle) = connection.wayland().window_by_id(window) {
-                    f(&mut handle.borrow_mut());
-                }
-            })
+        reservation.spawn(async move {
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = connection.wayland().window_by_id(window) {
+                f(&mut handle.borrow_mut());
+            }
+        })
     }
 }
 

@@ -130,15 +130,14 @@ impl Connection {
     where
         F: FnOnce(&mut WindowInner) + Send + 'static,
     {
-        reservation
-            .spawn(async move {
-                let Some(conn) = Connection::get() else {
-                    return;
-                };
-                if let Some(handle) = conn.window_by_id(window_id) {
-                    f(&mut handle.borrow_mut());
-                }
-            })
+        reservation.spawn(async move {
+            let Some(conn) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = conn.window_by_id(window_id) {
+                f(&mut handle.borrow_mut());
+            }
+        })
     }
 }
 

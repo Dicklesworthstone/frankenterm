@@ -436,21 +436,6 @@ impl MainThreadSpawnReservation {
     where
         F: FnOnce(MainThreadSpawnReservation) + Send + 'static,
     {
-        self.handoff_to_main_thread_local_after(async { true }, factory)
-    }
-
-    /// Retain this exact admission across a cancellable readiness wait, then
-    /// transfer it to the main-thread callback. A false result retires the
-    /// work without calling the factory. Neither wake nor handoff re-admits.
-    pub fn handoff_to_main_thread_local_after<F, W>(
-        self,
-        wait: W,
-        factory: F,
-    ) -> MainThreadSpawnedTask<()>
-    where
-        F: FnOnce(MainThreadSpawnReservation) + Send + 'static,
-        W: Future<Output = bool> + Send + 'static,
-    {
         let admission = self.permit.receipt();
         let binding = Arc::clone(&self.binding);
         let wake_binding = Arc::clone(&binding);
@@ -461,9 +446,6 @@ impl MainThreadSpawnReservation {
         };
         let (runnable, task) = async_task::spawn(
             async move {
-                if !wait.await {
-                    return;
-                }
                 // The local task reuses this admission ticket. End bootstrap
                 // tracking before the factory registers that successor.
                 drop(registration);
@@ -3845,56 +3827,6 @@ mod tests {
         assert_eq!(exec.admission_snapshot().active_tasks, 0);
         assert_eq!(exec.queue_snapshot().depth, 0);
         assert!(exec.binding.registry.lock().unwrap().tasks.is_empty());
-    }
-
-    #[test]
-    fn delayed_handoff_retains_admission_until_ready_or_cancelled() {
-        let _lock = TEST_LOCK.lock().unwrap();
-        let exec = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 64, 0, 0).unwrap(),
-        )
-        .unwrap();
-        for ready in [true, false] {
-            let reservation = match try_reserve_main_thread(MainThreadServiceClass::Render, 32) {
-                MainThreadReservationOutcome::Reserved(reservation) => reservation,
-                other => panic!("expected reservation: {other:?}"),
-            };
-            let identity = reservation.admission_receipt();
-            let mut gate = crate::Promise::new();
-            let wait = gate.get_future().unwrap();
-            let ran = Arc::new(AtomicBool::new(false));
-            let ran_in_task = Arc::clone(&ran);
-            reservation
-                .handoff_to_main_thread_local_after(
-                    async move { wait.await.unwrap() },
-                    move |reservation| {
-                        assert_eq!(reservation.admission_receipt(), identity);
-                        reservation
-                            .spawn_local(async move {
-                                ran_in_task.store(true, Ordering::Release);
-                            })
-                            .detach();
-                    },
-                )
-                .detach();
-            assert!(exec.try_tick().unwrap());
-            assert_eq!(exec.queue_snapshot().depth, 0);
-            assert_eq!(exec.admission_snapshot().active_tasks, 1);
-            assert!(matches!(
-                try_reserve_main_thread(MainThreadServiceClass::Render, 32),
-                MainThreadReservationOutcome::RetryableFull(_)
-            ));
-            assert!(!ran.load(Ordering::Acquire));
-            assert!(gate.ok(ready));
-            assert!(exec.try_tick().unwrap());
-            if ready {
-                assert_eq!(exec.admission_snapshot().active_tasks, 1);
-                assert!(exec.try_tick().unwrap());
-            }
-            assert_eq!(ran.load(Ordering::Acquire), ready);
-            assert_eq!(exec.admission_snapshot().active_tasks, 0);
-            assert_eq!(exec.queue_snapshot().depth, 0);
-        }
     }
 
     #[test]

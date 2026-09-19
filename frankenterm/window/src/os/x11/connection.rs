@@ -1099,19 +1099,18 @@ impl XConnection {
     where
         F: FnOnce(&mut XWindowInner) + Send + 'static,
     {
-        reservation
-            .spawn(async move {
-                let Some(connection) = Connection::get() else {
-                    return;
-                };
-                if let Some(handle) = connection.x11().window_by_id(window) {
-                    let mut inner =
-                        lock_window_inner(&handle, "running admitted X11 window notification");
-                    if inner.window_id == window {
-                        f(&mut inner);
-                    }
+        reservation.spawn(async move {
+            let Some(connection) = Connection::get() else {
+                return;
+            };
+            if let Some(handle) = connection.x11().window_by_id(window) {
+                let mut inner =
+                    lock_window_inner(&handle, "running admitted X11 window notification");
+                if inner.window_id == window {
+                    f(&mut inner);
                 }
-            })
+            }
+        })
     }
 
     fn screen_from_focused_window(

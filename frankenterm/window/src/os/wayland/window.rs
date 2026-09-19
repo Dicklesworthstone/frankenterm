@@ -594,7 +594,9 @@ impl WindowOps for WaylandWindow {
         repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> promise::spawn::MainThreadSpawnedTask<()> {
         WaylandConnection::with_window_inner_reserved(self.0, reservation, move |inner| {
-            inner.events.dispatch(WindowEvent::Notification(Box::new(t)));
+            inner
+                .events
+                .dispatch(WindowEvent::Notification(Box::new(t)));
             if repaint.is_some_and(|request| request.load(std::sync::atomic::Ordering::Acquire)) {
                 inner.invalidate();
             }
