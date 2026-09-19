@@ -50,6 +50,9 @@ crates/frankenterm-pty-guardian/src/broker.rs	raw_fd: std::os::fd::RawFd,
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::fd::{AsFd, BorrowedFd};
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::fs::{PermissionsExt as _, symlink};
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::net::UnixStream as BlockingUnixStream;
+# Enrollment subprocess/permission negative controls are inside the function-level
+# #[cfg(unix)] gate; this import is beyond the eight-line lookback.
+crates/frankenterm/tests/cli_golden_artifacts.rs	use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
 crates/frankenterm-pty-guardian/src/broker.rs	use std::os::unix::prelude::AsRawFd as _;
 crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::ffi::OsStrExt;
 crates/frankenterm-pty-guardian/src/output.rs	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

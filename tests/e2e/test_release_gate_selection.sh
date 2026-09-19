@@ -173,5 +173,39 @@ ln -s "$GUARD_FIXTURE/missing-target" "$GUARD_FIXTURE/crates/frankenterm-core/sr
 git -C "$GUARD_FIXTURE" add crates
 expect_guard_exit 2 asupersync-real-read-failure real check_asupersync_test_only.sh
 
+# The generated-artifact gate must distinguish generator changes from existing
+# edits, including a private index that differs from the actual worktree.
+GENERATED_FIXTURE="$RUN_DIR/generated-artifacts"
+mkdir -p "$GENERATED_FIXTURE/scripts"
+cp "$ROOT/scripts/check_generated_artifacts.sh" "$GENERATED_FIXTURE/scripts/"
+printf 'committed\n' >"$GENERATED_FIXTURE/artifact"
+git -C "$GENERATED_FIXTURE" init -q -b main
+git -C "$GENERATED_FIXTURE" add scripts artifact
+git -C "$GENERATED_FIXTURE" -c user.name=GateTest -c user.email=gate@example.invalid \
+  -c core.hooksPath=/dev/null commit -qm fixture
+printf 'unrelated dirty bytes\n' >"$GENERATED_FIXTURE/artifact"
+printf 'existing untracked bytes\n' >"$GENERATED_FIXTURE/untracked"
+cat >"$GENERATED_FIXTURE/scripts/generate_schema_docs.sh" <<'SH'
+case "$GENERATOR_CASE" in
+  unchanged) printf 'schema validation output\n' ;;
+  tracked) printf 'regenerated\n' >artifact ;;
+  untracked) printf 'regenerated\n' >untracked ;;
+  create) printf 'new generated artifact\n' >new-artifact ;;
+  failure) echo 'intentional generator failure' >&2; exit 7 ;;
+esac
+SH
+for mode in unchanged tracked untracked create failure; do
+  actual=0
+  GENERATOR_CASE="$mode" bash "$GENERATED_FIXTURE/scripts/check_generated_artifacts.sh" \
+    >"$RUN_DIR/generated-$mode.log" 2>&1 || actual=$?
+  case "$mode" in unchanged) expected=0 ;; failure) expected=7 ;; *) expected=1 ;; esac
+  if [[ "$actual" -ne "$expected" ]]; then
+    cat "$RUN_DIR/generated-$mode.log" >&2
+    printf 'FAIL generated %s expected=%s actual=%s\n' "$mode" "$expected" "$actual" >&2
+    exit 1
+  fi
+  printf 'PASS generated %s exit=%s\n' "$mode" "$actual"
+done
+
 printf 'RELEASE_GATE_SELECTION_SUCCESS cases=%s production=passed artifacts=%s\n' "$count" "$RUN_DIR"
 )

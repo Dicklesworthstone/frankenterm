@@ -32,6 +32,29 @@ run_generator() {
 
 cd "$PROJECT_ROOT"
 
+# Compare worktree bytes, not the shared index: unrelated agent edits are not
+# generated drift. Include untracked contents so rewriting an already-untracked
+# generated file cannot pass merely because its filename stayed the same.
+snapshot() {
+    git --no-pager diff --binary HEAD -- || return $?
+    python3 - <<'PY'
+import hashlib
+import os
+import subprocess
+
+paths = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
+for path in sorted(filter(None, paths.split(b"\0"))):
+    if os.path.islink(path):
+        content = os.readlink(path)
+    else:
+        with open(path, "rb") as source:
+            content = source.read()
+    print(repr(path), hashlib.sha256(content).hexdigest())
+PY
+}
+
+before=$(snapshot)
+
 # Track whether any generator ran (informational only).
 ran_any=0
 
@@ -51,19 +74,13 @@ if [[ $ran_any -eq 0 ]]; then
     echo "[INFO] No generators found; drift check will still verify clean tree."
 fi
 
-# Fail if regeneration produced diffs.
-if ! git diff --exit-code >/dev/null; then
+# Fail if regeneration changed even an already-dirty generated artifact.
+after=$(snapshot)
+if [[ "$before" != "$after" ]]; then
     echo "[ERROR] Generated artifacts are out of date."
     echo "[ERROR] Run the generator scripts locally and commit the results."
-    git --no-pager diff
+    diff -u <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
     exit 1
 fi
 
-untracked=$(git ls-files --others --exclude-standard)
-if [[ -n "$untracked" ]]; then
-    echo "[ERROR] Generated artifacts created untracked files."
-    echo "$untracked"
-    exit 1
-fi
-
-echo "[INFO] Generated artifacts are up to date."
+echo "[INFO] Generators succeeded without changing worktree artifacts."
