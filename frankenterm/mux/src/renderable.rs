@@ -315,6 +315,26 @@ pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
     }
 }
 
+/// Implements authoritative nonblocking Pane dimensions for Terminal after a
+/// successful refresh under terminal lock.
+/// Does not re-probe storage after the caller has captured its layout floor.
+pub fn terminal_try_get_dimensions(term: &mut Terminal) -> Option<RenderableDimensions> {
+    let size = term.get_size();
+    let screen = term.screen();
+    let (scrollback_top, scrollback_rows) = screen.observed_scrollback_geometry()?;
+    Some(RenderableDimensions {
+        cols: screen.physical_cols,
+        viewport_rows: screen.physical_rows,
+        scrollback_rows,
+        physical_top: screen.visible_row_to_stable_row(0),
+        scrollback_top,
+        dpi: screen.dpi,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+        reverse_video: term.get_reverse_video(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +363,14 @@ mod tests {
             "semantic-render-test",
             Box::new(Vec::<u8>::new()),
         )
+    }
+
+    #[test]
+    fn terminal_try_get_dimensions_matches_infallible_for_in_memory_terminal() {
+        let mut term = semantic_test_terminal();
+        let dims = terminal_get_dimensions(&mut term);
+        let try_dims = terminal_try_get_dimensions(&mut term).expect("should return dimensions");
+        assert_eq!(dims, try_dims);
     }
 
     #[test]

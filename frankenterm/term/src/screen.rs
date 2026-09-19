@@ -4181,6 +4181,35 @@ impl Screen {
         Ok(Some(changed))
     }
 
+    /// Authoritative scrollback geometry derived from the active cold observation,
+    /// valid only after a successful refresh under terminal lock.
+    /// Row count is computed against live hot rows.
+    #[cfg(feature = "use_serde")]
+    pub fn observed_scrollback_geometry(&self) -> Option<(StableRowIndex, usize)> {
+        let hot_top = self.phys_to_stable_row_index(0);
+        let newest = self.phys_to_stable_row_index(self.lines.len());
+        let Some(sink) = self
+            .config
+            .scrollback_spill_sink()
+            .filter(|_| self.allow_scrollback)
+        else {
+            let rows = usize::try_from(newest.saturating_sub(hot_top)).unwrap_or(0);
+            return Some((hot_top, rows));
+        };
+        let (observed_sink, interval) = self.cold_source_observation.as_ref()?;
+        if !Arc::ptr_eq(observed_sink, &sink) {
+            return None;
+        }
+        let oldest = if let Some(layout) = self.cold_visual_layout_for_interval(interval) {
+            layout.visual.start
+        } else {
+            interval.rows().map(|rows| rows.start).unwrap_or(hot_top)
+        }
+        .min(hot_top);
+        let rows = usize::try_from(newest.saturating_sub(oldest)).unwrap_or(0);
+        Some((oldest, rows))
+    }
+
     #[cfg(feature = "use_serde")]
     pub fn install_line_read_layout(&mut self, read: &ScreenLineRead, seqno: SequenceNo) {
         drop(self.replace_line_read_layout(read, seqno));
@@ -4299,12 +4328,20 @@ impl Screen {
         // Avoid invoking a sink at all when the local coordinates are stale.
         self.cold_visual_layout_at_current_coordinates()?;
         let sink = self.config.scrollback_spill_sink()?;
-        let crate::config::ScrollbackIntervalCapture::Ready(interval) =
-            sink.try_capture_scrollback_interval()
-        else {
-            return None;
-        };
-        self.cold_visual_layout_for_interval(&interval)
+        match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(interval) => {
+                self.cold_visual_layout_for_interval(&interval)
+            }
+            crate::config::ScrollbackIntervalCapture::Busy => {
+                let (before_sink, interval) = self.cold_source_observation.as_ref()?;
+                if Arc::ptr_eq(before_sink, &sink) {
+                    self.cold_visual_layout_for_interval(interval)
+                } else {
+                    None
+                }
+            }
+            crate::config::ScrollbackIntervalCapture::Unavailable => None,
+        }
     }
 
     /// A capture already owns one coherent interval. Re-probing its sink here
@@ -5269,16 +5306,32 @@ impl Screen {
             return layout.visual.start;
         }
         let hot_top = self.phys_to_stable_row_index(0);
-        self.config
-            .scrollback_spill_sink()
-            .and_then(|sink| match sink.try_capture_scrollback_interval() {
-                crate::config::ScrollbackIntervalCapture::Ready(interval) => {
-                    interval.rows().map(|rows| rows.start)
+        let Some(sink) = self.config.scrollback_spill_sink() else {
+            return hot_top;
+        };
+        let oldest = match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(interval) => {
+                interval.rows().map(|rows| rows.start)
+            }
+            crate::config::ScrollbackIntervalCapture::Busy => {
+                #[cfg(feature = "use_serde")]
+                {
+                    if let Some((before_sink, interval)) = &self.cold_source_observation {
+                        if Arc::ptr_eq(before_sink, &sink) {
+                            interval.rows().map(|rows| rows.start)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
-                _ => None,
-            })
-            .unwrap_or(hot_top)
-            .min(hot_top)
+                #[cfg(not(feature = "use_serde"))]
+                None
+            }
+            crate::config::ScrollbackIntervalCapture::Unavailable => None,
+        };
+        oldest.unwrap_or(hot_top).min(hot_top)
     }
 
     fn estimate_line_bytes(line: &Line) -> usize {
@@ -8165,6 +8218,7 @@ impl Screen {
         #[cfg(feature = "use_serde")]
         {
             self.cold_row_fragments = None;
+            self.cold_source_observation = None;
         }
         self.invalidate_last_good_frame(LastGoodFrameTransition::ScrollbackErase, None);
         for _ in 0..to_clear {
@@ -17105,5 +17159,148 @@ pub(crate) mod tests {
             ResizeWrapGateStatus::Pass,
             "zero scored lines should not trigger any gate failure"
         );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn authoritative_geometry_preserves_busy_and_advances_on_real_eviction() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let source = Line::from_text("cold", &CellAttributes::blank(), 1, None);
+        // Plant cold rows -5..0 in the sink
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            for r in -5..0 {
+                rows.insert(r, source.clone());
+            }
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+
+        // Before refresh, direct legacy read queries sink directly and sees -5..3
+        assert_eq!(screen.scrollback_geometry(), (-5, 8));
+        assert_eq!(screen.scrollback_top_stable_row(), -5);
+
+        // Successful refresh establishes cached cold observation
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(true)));
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-5, 8)));
+        assert_eq!(screen.scrollback_geometry(), (-5, 8));
+
+        // Hold exact cold metadata lock on a background thread to simulate writer contention
+        let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sink_clone = sink.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = sink_clone.rows.lock().unwrap();
+            lock_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        lock_rx.recv().unwrap();
+
+        // While lock is held:
+        // 1. refresh_cold_source_observation returns Err(ColdReadMetadataBusy)
+        assert_eq!(
+            screen.refresh_cold_source_observation(),
+            Err(ColdReadMetadataBusy)
+        );
+        // 2. Infallible legacy reads fall back to identity-matched cached observation on Busy,
+        //    computing newest from live hot rows rather than fabricating eviction to hot_top (0)
+        assert_eq!(screen.scrollback_geometry(), (-5, 8));
+        assert_eq!(screen.scrollback_top_stable_row(), -5);
+
+        // Release the lock
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        // Plant real eviction: remove rows -5 and -4 from the sink
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.remove(&-5);
+            rows.remove(&-4);
+        }
+
+        // Direct legacy read after real eviction WITHOUT preceding try_capture refresh
+        // must see actual Ready eviction immediately!
+        assert_eq!(
+            screen.scrollback_geometry(),
+            (-3, 6),
+            "direct legacy read must reflect real eviction without requiring a preceding refresh"
+        );
+        assert_eq!(screen.scrollback_top_stable_row(), -3);
+
+        // Refresh updates the authoritative cached observation
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(true)));
+        assert_eq!(screen.observed_scrollback_geometry(), Some((-3, 6)));
+
+        // Scrollback erase clears observation and resets
+        screen.erase_scrollback().unwrap();
+        assert_eq!(screen.observed_scrollback_geometry(), None);
+        assert_eq!(screen.refresh_cold_source_observation(), Ok(Some(true)));
+        assert_eq!(screen.observed_scrollback_geometry(), Some((0, 3)));
+        assert_eq!(screen.scrollback_geometry(), (0, 3));
+
+        // When interval capture returns Unavailable, observed_scrollback_geometry returns None
+        #[derive(Debug)]
+        struct UnavailableSink;
+        impl crate::config::ScrollbackSpillSink for UnavailableSink {
+            fn try_capture_scrollback_interval(&self) -> crate::config::ScrollbackIntervalCapture {
+                crate::config::ScrollbackIntervalCapture::Unavailable
+            }
+            fn store_scrollback_line(&self, _: StableRowIndex, _: &Line, _: usize) -> bool {
+                false
+            }
+            fn load_scrollback_line(&self, _: StableRowIndex) -> Option<Line> {
+                None
+            }
+            fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+                None
+            }
+            fn retained_scrollback_rows(&self) -> usize {
+                0
+            }
+            fn retained_scrollback_bytes(&self) -> usize {
+                0
+            }
+            fn snapshot_scrollback(
+                &self,
+                _: StableRowIndex,
+                _: crate::config::ScrollbackSnapshotLimits,
+            ) -> Result<crate::config::ScrollbackSnapshot, crate::config::ScrollbackSpillError>
+            {
+                Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+            }
+            fn replace_scrollback_prefix(
+                &self,
+                _: Option<crate::config::ScrollbackSnapshotGeneration>,
+                _: crate::config::ScrollbackPrefix<'_>,
+                _: usize,
+            ) -> Result<crate::config::ScrollbackReplaceCommit, crate::config::ScrollbackSpillError>
+            {
+                Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+            }
+            fn clear_scrollback(
+                &self,
+            ) -> Result<crate::config::ScrollbackClearCommit, crate::config::ScrollbackSpillError>
+            {
+                Err(crate::config::ScrollbackSpillError::StorageUnavailable)
+            }
+        }
+        let mut unavail_screen = test_screen_with_config(
+            3,
+            8,
+            96,
+            TestTermConfig {
+                cold_sink: Some(Arc::new(UnavailableSink)),
+                ..TestTermConfig::default()
+            },
+        );
+        assert_eq!(unavail_screen.refresh_cold_source_observation(), Ok(None));
+        assert_eq!(unavail_screen.observed_scrollback_geometry(), None);
     }
 }

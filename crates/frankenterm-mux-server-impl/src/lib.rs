@@ -1384,6 +1384,122 @@ impl LiveScrollbackAppendWalV1 {
         }
         Ok(hasher.finalize().into())
     }
+
+    fn checksum_view(&self) -> LiveScrollbackAppendWalCanonicalView<'_> {
+        LiveScrollbackAppendWalCanonicalView {
+            schema: &self.schema,
+            durable_pane_id: &self.durable_pane_id,
+            ledger_pane_id: self.ledger_pane_id,
+            predecessor_content_epoch: &self.predecessor_content_epoch,
+            predecessor_revision: self.predecessor_revision,
+            predecessor_manifest_sha256: &self.predecessor_manifest_sha256,
+            target_content_epoch: &self.target_content_epoch,
+            target_revision: self.target_revision,
+            initial_stable_row: self.initial_stable_row,
+            newest_stable_row_exclusive: self.newest_stable_row_exclusive,
+            appended_stable_row: self.appended_stable_row,
+            appended_sequence: self.appended_sequence,
+            max_retained_rows: self.max_retained_rows,
+            target_oldest_sequence: self.target_oldest_sequence,
+            target_next_sequence: self.target_next_sequence,
+            target_record_count: self.target_record_count,
+            target_retained_record_bytes: self.target_retained_record_bytes,
+            encrypted_record_bytes: self.encrypted_record_bytes,
+            encrypted_record_sha256: &self.encrypted_record_sha256,
+            target_record_set_sha256: self.target_record_set_sha256.as_deref(),
+            predecessor_chain_anchor_sha256: self.predecessor_chain_anchor_sha256.as_deref(),
+            predecessor_chain_tail_sha256: self.predecessor_chain_tail_sha256.as_deref(),
+            target_chain_anchor_sha256: self.target_chain_anchor_sha256.as_deref(),
+            target_chain_tail_sha256: self.target_chain_tail_sha256.as_deref(),
+            evicted_record_count: self.evicted_record_count,
+            superseding_content_epoch: self.superseding_content_epoch.as_deref(),
+            superseding_revision: self.superseding_revision,
+            superseding_ledger_pane_id: self.superseding_ledger_pane_id,
+            superseding_manifest_sha256: self.superseding_manifest_sha256.as_deref(),
+            encrypted_record: &self.encrypted_record,
+            additional_encrypted_records: &self.additional_encrypted_records,
+            guardian_authentication: self.guardian_authentication.as_deref(),
+            wal_sha256: "",
+        }
+    }
+
+    fn authentication_view(&self) -> LiveScrollbackAppendWalCanonicalView<'_> {
+        LiveScrollbackAppendWalCanonicalView {
+            encrypted_record: "",
+            additional_encrypted_records: &[],
+            guardian_authentication: None,
+            ..self.checksum_view()
+        }
+    }
+}
+
+#[inline]
+#[must_use]
+fn is_empty_string_slice(slice: &[String]) -> bool {
+    slice.is_empty()
+}
+
+#[derive(Serialize)]
+struct LiveScrollbackAppendWalCanonicalView<'a> {
+    schema: &'a str,
+    durable_pane_id: &'a str,
+    ledger_pane_id: u64,
+    predecessor_content_epoch: &'a str,
+    predecessor_revision: u64,
+    predecessor_manifest_sha256: &'a str,
+    target_content_epoch: &'a str,
+    target_revision: u64,
+    initial_stable_row: wezterm_term::StableRowIndex,
+    newest_stable_row_exclusive: wezterm_term::StableRowIndex,
+    appended_stable_row: wezterm_term::StableRowIndex,
+    appended_sequence: u64,
+    max_retained_rows: u64,
+    target_oldest_sequence: u64,
+    target_next_sequence: u64,
+    target_record_count: u64,
+    target_retained_record_bytes: u64,
+    encrypted_record_bytes: u64,
+    encrypted_record_sha256: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_record_set_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_chain_anchor_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_chain_tail_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_chain_anchor_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_chain_tail_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evicted_record_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseding_content_epoch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseding_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseding_ledger_pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseding_manifest_sha256: Option<&'a str>,
+    encrypted_record: &'a str,
+    #[serde(skip_serializing_if = "is_empty_string_slice")]
+    additional_encrypted_records: &'a [String],
+    guardian_authentication: Option<&'a str>,
+    wal_sha256: &'static str,
+}
+
+struct Sha256Writer(Sha256);
+
+impl Write for Sha256Writer {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2735,18 +2851,15 @@ impl LiveScrollbackSpillSink {
     }
 
     fn append_wal_checksum(wal: &LiveScrollbackAppendWalV1) -> anyhow::Result<String> {
-        let mut canonical = wal.clone();
-        canonical.wal_sha256.clear();
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+        let view = wal.checksum_view();
+        let mut writer = Sha256Writer(Sha256::new());
+        serde_json::to_writer(&mut writer, &view)?;
+        Ok(hex::encode(writer.0.finalize()))
     }
 
     fn append_wal_authentication_bytes(wal: &LiveScrollbackAppendWalV1) -> anyhow::Result<Vec<u8>> {
-        let mut canonical = wal.clone();
-        canonical.encrypted_record.clear();
-        canonical.additional_encrypted_records.clear();
-        canonical.guardian_authentication = None;
-        canonical.wal_sha256.clear();
-        serde_json::to_vec(&canonical).context("serialize canonical scrollback append WAL")
+        let view = wal.authentication_view();
+        serde_json::to_vec(&view).context("serialize canonical scrollback append WAL")
     }
 
     fn append_wal_target_generation(
@@ -12990,6 +13103,134 @@ mod tests {
         assert!(!debug.contains("append-wal-recovered-target"));
         assert!(!debug.contains(&wal.encrypted_record));
         assert!(!debug.contains(&wal.guardian_authentication.clone().unwrap()));
+    }
+
+    fn legacy_append_wal_checksum_canonical_bytes_for_test(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut canonical = wal.clone();
+        canonical.wal_sha256.clear();
+        serde_json::to_vec(&canonical).context("serialize legacy canonical scrollback append WAL")
+    }
+
+    fn legacy_append_wal_checksum_for_test(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<String> {
+        let bytes = legacy_append_wal_checksum_canonical_bytes_for_test(wal)?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    fn legacy_append_wal_authentication_bytes_for_test(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut canonical = wal.clone();
+        canonical.encrypted_record.clear();
+        canonical.additional_encrypted_records.clear();
+        canonical.guardian_authentication = None;
+        canonical.wal_sha256.clear();
+        serde_json::to_vec(&canonical).context("serialize canonical scrollback append WAL")
+    }
+
+    fn assert_append_wal_borrowed_and_legacy_equivalence(
+        wal: &LiveScrollbackAppendWalV1,
+        scenario: &str,
+    ) {
+        // 1. Authentication bytes equivalence
+        let legacy_auth_bytes = legacy_append_wal_authentication_bytes_for_test(wal)
+            .unwrap_or_else(|e| panic!("{scenario}: legacy auth bytes failed: {e:#}"));
+        let borrowed_auth_bytes = LiveScrollbackSpillSink::append_wal_authentication_bytes(wal)
+            .unwrap_or_else(|e| panic!("{scenario}: borrowed auth bytes failed: {e:#}"));
+        assert_eq!(
+            borrowed_auth_bytes, legacy_auth_bytes,
+            "{scenario}: authentication bytes must match legacy bit-for-bit"
+        );
+
+        // 2. Checksum-view raw byte equivalence (not only digest)
+        let legacy_checksum_bytes = legacy_append_wal_checksum_canonical_bytes_for_test(wal)
+            .unwrap_or_else(|e| panic!("{scenario}: legacy checksum bytes failed: {e:#}"));
+        let borrowed_checksum_bytes =
+            serde_json::to_vec(&wal.checksum_view()).unwrap_or_else(|e| {
+                panic!("{scenario}: borrowed checksum view serialization failed: {e:#}")
+            });
+        assert_eq!(
+            borrowed_checksum_bytes, legacy_checksum_bytes,
+            "{scenario}: checksum view bytes must match legacy serialization bit-for-bit"
+        );
+
+        // 3. Streaming checksum hash equivalence
+        let legacy_checksum = legacy_append_wal_checksum_for_test(wal)
+            .unwrap_or_else(|e| panic!("{scenario}: legacy checksum failed: {e:#}"));
+        let borrowed_checksum = LiveScrollbackSpillSink::append_wal_checksum(wal)
+            .unwrap_or_else(|e| panic!("{scenario}: borrowed checksum failed: {e:#}"));
+        assert_eq!(
+            borrowed_checksum, legacy_checksum,
+            "{scenario}: streaming checksum digest must match legacy bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn append_wal_borrowed_views_match_legacy_canonical_serializations_exactly() {
+        // Variant 1: Legacy V1 schema WAL
+        let (_dir, _context, _sink, v1_wal, _appended) = legacy_v1_append_wal_fixture(240);
+        assert_eq!(v1_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1);
+        assert_append_wal_borrowed_and_legacy_equivalence(&v1_wal, "Variant 1 (V1 schema)");
+
+        // Variant 2: V2 single-row schema WAL
+        let (_dir, _context, _sink, v2_wal, _appended) = append_wal_fixture(241, 8);
+        assert_eq!(v2_wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+        assert_append_wal_borrowed_and_legacy_equivalence(&v2_wal, "Variant 2 (V2 single-row)");
+
+        // Variant 3: V3 multi-row batch schema WAL with additional encrypted records
+        let (_dir, _context, _sink, mut v3_wal, _appended) = append_wal_fixture(242, 8);
+        v3_wal.schema = LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3.to_string();
+        v3_wal.additional_encrypted_records = vec![
+            "batch-ciphertext-row-1-base64-payload".to_string(),
+            "batch-ciphertext-row-2-base64-payload".to_string(),
+            "batch-ciphertext-row-3-base64-payload".to_string(),
+        ];
+        assert_append_wal_borrowed_and_legacy_equivalence(&v3_wal, "Variant 3 (V3 batch)");
+
+        // Variant 4: Metadata variants (None vs Some for optional fields, supersession, eviction)
+        let mut modified = v2_wal.clone();
+        modified.guardian_authentication = None;
+        modified.evicted_record_count = Some(12);
+        modified.superseding_content_epoch = Some("aabbccdd11223344".to_string());
+        modified.superseding_revision = Some(99);
+        modified.superseding_ledger_pane_id = Some(777);
+        modified.superseding_manifest_sha256 =
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
+        modified.target_record_set_sha256 =
+            Some("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string());
+        assert_append_wal_borrowed_and_legacy_equivalence(
+            &modified,
+            "Variant 4 (metadata variants)",
+        );
+
+        // Variant 5: Escaping and non-ASCII characters in payload and metadata
+        let mut escaping_wal = v2_wal.clone();
+        escaping_wal.encrypted_record = "payload with quotes \" and backslash \\ and controls \n \r \t and non-ASCII: 界 e\u{301} 🦀 \u{1F469}\u{200D}\u{1F4BB} and null byte \0".to_string();
+        escaping_wal.additional_encrypted_records = vec![
+            "batch row \"quotes\" \\ backslash / slash \u{08} \u{0c} \n \r \t".to_string(),
+            "unicode glyphs: 日本語, 한글, العربية, עברית".to_string(),
+            "complex combining: a\u{0300}\u{0301}\u{0302}\u{0303}\u{0304}".to_string(),
+        ];
+        escaping_wal.guardian_authentication = Some("auth-\"escaped\"-\\test-\u{2764}".to_string());
+        escaping_wal.target_content_epoch = "epoch-\"with-quotes\"-and-backslash\\-äöü".to_string();
+        assert_append_wal_borrowed_and_legacy_equivalence(
+            &escaping_wal,
+            "Variant 5 (escaping/non-ASCII)",
+        );
+
+        // Tamper negative: Mutating any field causes borrowed checksum to detect mutation
+        // and both legacy and borrowed checksums remain identically divergent from untampered.
+        let v2_checksum = LiveScrollbackSpillSink::append_wal_checksum(&v2_wal).unwrap();
+        let mut tampered = v2_wal.clone();
+        tampered.appended_sequence = tampered.appended_sequence.checked_add(1).unwrap();
+        let tampered_checksum_borrowed =
+            LiveScrollbackSpillSink::append_wal_checksum(&tampered).unwrap();
+        let tampered_checksum_legacy = legacy_append_wal_checksum_for_test(&tampered).unwrap();
+        assert_eq!(tampered_checksum_borrowed, tampered_checksum_legacy);
+        assert_ne!(tampered_checksum_borrowed, v2_checksum);
     }
 
     #[test]

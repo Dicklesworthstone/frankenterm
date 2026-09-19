@@ -2381,7 +2381,7 @@ impl MuxRequestErrorContext {
         }
         if matches!(
             self.request_ident,
-            GetLines::IDENT | GetLinesAtLayout::IDENT
+            GetLines::IDENT | GetLinesAtLayout::IDENT | GetPaneRenderableDimensions::IDENT
         ) && error
             .downcast_ref::<wezterm_term::screen::ColdReadMetadataBusy>()
             .is_some()
@@ -2396,6 +2396,12 @@ impl MuxRequestErrorContext {
             .is_some()
         {
             return ErrorResponse::quota_exceeded(self.request_ident);
+        }
+        if self.request_ident == GetPaneRenderChanges::IDENT
+            && error.downcast_ref::<PaneRenderPreparationError>()
+                == Some(&PaneRenderPreparationError::MetadataBusy)
+        {
+            return ErrorResponse::resource_busy(self.request_ident);
         }
         if self.may_mutate {
             ErrorResponse::indeterminate_mutation(self.request_ident, self.object)
@@ -2850,6 +2856,7 @@ enum PaneRenderSettlement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaneRenderPreparationError {
     Busy,
+    MetadataBusy,
     Closed,
     AttemptIdentityExhausted,
     InputIdentityExhausted,
@@ -2870,6 +2877,7 @@ impl std::fmt::Display for PaneRenderPreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Busy => "another pane render preparation is already active",
+            Self::MetadataBusy => "pane render metadata is temporarily busy",
             Self::Closed => "pane render transaction state is closed",
             Self::AttemptIdentityExhausted => {
                 "pane render attempt identity exhausted before wrap or reuse"
@@ -3022,6 +3030,7 @@ struct PreparedSurfaceChanges {
 
 #[derive(Clone, Debug)]
 enum SurfacePreparation {
+    MetadataBusy,
     NoChange {
         source_start: SequenceNo,
         source_query: SequenceNo,
@@ -3038,13 +3047,14 @@ impl PaneRenderBaseline {
         force_with_input_dispatch_serial: Option<InputSerial>,
         force_for_atomic_effects: bool,
     ) -> SurfacePreparation {
-        let line_layout_floor = pane
-            .get_line_layout()
-            .ok()
-            .flatten()
-            .map(|(floor, _)| floor)
-            .or(self.line_layout_floor);
         let source_start = pane.get_current_seqno();
+        // Keep the geometry bound to the same cold metadata observation as
+        // its layout floor. Contention must not look like history eviction.
+        let (line_layout_floor, dims) = match pane.get_line_layout() {
+            Ok(Some((floor, dims))) => (Some(floor), dims),
+            Ok(None) => (self.line_layout_floor, pane.get_dimensions()),
+            Err(_) => return SurfacePreparation::MetadataBusy,
+        };
         let mut changed = false;
         let mouse_grabbed = pane.is_mouse_grabbed();
         if mouse_grabbed != self.mouse_grabbed {
@@ -3055,7 +3065,6 @@ impl PaneRenderBaseline {
             changed = true;
         }
 
-        let dims = pane.get_dimensions();
         if dims != self.dimensions {
             changed = true;
         }
@@ -3198,6 +3207,10 @@ impl PerPane {
             .baseline
             .prepare_surface_changes(pane, force_with_input_dispatch_serial, false)
         {
+            SurfacePreparation::MetadataBusy => {
+                self.mark_transactional_dirty();
+                Err(PaneRenderPreparationError::MetadataBusy)
+            }
             SurfacePreparation::StableRowRangeUnrepresentable => {
                 self.mark_transactional_dirty();
                 Err(PaneRenderPreparationError::StableRowRangeUnrepresentable)
@@ -3256,7 +3269,9 @@ fn prepare_legacy_render_enqueue(
             prepared.source_query,
             prepared.source_end,
         )),
-        SurfacePreparation::StableRowRangeUnrepresentable => None,
+        SurfacePreparation::MetadataBusy | SurfacePreparation::StableRowRangeUnrepresentable => {
+            None
+        }
     };
     if let Some((source_start, source_query, source_end)) = source_fence {
         if source_start == SequenceNo::MAX
@@ -3273,6 +3288,10 @@ fn prepare_legacy_render_enqueue(
     }
 
     match surface {
+        SurfacePreparation::MetadataBusy => {
+            state.mark_transactional_dirty();
+            Err(PaneRenderPreparationError::MetadataBusy.into())
+        }
         SurfacePreparation::StableRowRangeUnrepresentable => {
             state.mark_transactional_dirty();
             Err(PaneRenderPreparationError::StableRowRangeUnrepresentable.into())
@@ -3827,6 +3846,9 @@ impl PaneRenderPreparation {
         );
 
         let (source_start, source_query, source_end) = match &surface {
+            SurfacePreparation::MetadataBusy => {
+                return Err(PaneRenderPreparationError::MetadataBusy);
+            }
             SurfacePreparation::StableRowRangeUnrepresentable => {
                 return Err(PaneRenderPreparationError::StableRowRangeUnrepresentable);
             }
@@ -8480,7 +8502,10 @@ impl SessionHandler {
                             move || {
                                 with_current_pane(&authority, &registration, |pane| {
                                     let cursor_position = pane.get_cursor_position();
-                                    let dimensions = pane.get_dimensions();
+                                    let dimensions = match pane.get_line_layout()? {
+                                        Some((_, dimensions)) => dimensions,
+                                        None => pane.get_dimensions(),
+                                    };
                                     Ok(Pdu::GetPaneRenderableDimensionsResponse(
                                         GetPaneRenderableDimensionsResponse {
                                             pane_id,
@@ -12136,6 +12161,7 @@ mod tests {
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
         line_layout_floor: Option<SequenceNo>,
+        line_layout_busy: AtomicBool,
         cursor_line_start_override: Option<StableRowIndex>,
         writer_sink: ParkingMutex<FakePaneWriter>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
@@ -12156,6 +12182,7 @@ mod tests {
                 tiered_scrollback_status_probe: None,
                 seqno_on_dimensions: None,
                 line_layout_floor: None,
+                line_layout_busy: AtomicBool::new(false),
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(FakePaneWriter::default()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
@@ -12280,6 +12307,9 @@ mod tests {
             Option<(SequenceNo, RenderableDimensions)>,
             wezterm_term::screen::ColdReadMetadataBusy,
         > {
+            if self.line_layout_busy.load(Ordering::Acquire) {
+                return Err(wezterm_term::screen::ColdReadMetadataBusy);
+            }
             Ok(self
                 .line_layout_floor
                 .map(|floor| (floor, self.state.lock().unwrap().dimensions)))
@@ -12869,6 +12899,40 @@ mod tests {
                 MuxErrorCode::RESOURCE_BUSY,
                 "untyped backend text must not authorize contention retries",
             );
+        }
+    }
+
+    #[test]
+    fn render_metadata_busy_retry_is_bound_to_exact_read_request() {
+        for request_ident in [GetPaneRenderChanges::IDENT, Ping::IDENT, KillPane::IDENT] {
+            let context = MuxRequestErrorContext {
+                request_ident,
+                object: None,
+                may_mutate: request_ident == KillPane::IDENT,
+            };
+            let response = context.response_for_error(
+                &anyhow::Error::new(PaneRenderPreparationError::MetadataBusy)
+                    .context("private metadata context"),
+            );
+            response
+                .validate()
+                .expect("canonical render contention response");
+            assert_eq!(response.request_ident, request_ident);
+            if request_ident == GetPaneRenderChanges::IDENT {
+                assert_eq!(response.code, MuxErrorCode::RESOURCE_BUSY);
+                assert_eq!(response.effect, MuxErrorEffect::NOT_APPLIED);
+                assert_eq!(response.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+                assert_eq!(
+                    context
+                        .response_for_error(&anyhow!("pane render metadata is temporarily busy"))
+                        .code,
+                    MuxErrorCode::BACKEND_FAILURE
+                );
+            } else if request_ident == KillPane::IDENT {
+                assert_eq!(response.code, MuxErrorCode::INDETERMINATE_MUTATION);
+            } else {
+                assert_eq!(response.code, MuxErrorCode::BACKEND_FAILURE);
+            }
         }
     }
 
@@ -14615,6 +14679,49 @@ mod tests {
             }
             other => panic!("expected GetPaneRenderableDimensionsResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dimensions_request_retries_busy_metadata_without_publishing_hot_only_geometry() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let mut fake = FakePane::new(None);
+        fake.line_layout_floor = Some(9);
+        fake.state.lock().unwrap().dimensions.scrollback_top = -10_000;
+        fake.line_layout_busy.store(true, Ordering::Release);
+        let pane = Arc::new(fake);
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session(sender, SessionOwner::new(mux));
+
+        handler.process_one(DecodedPdu {
+            serial: 301,
+            pdu: Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id: 77 }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        let Pdu::ErrorResponse(error) = take_response(&captured).pdu else {
+            panic!("busy metadata must not produce a dimensions snapshot");
+        };
+        assert_eq!(error.code, MuxErrorCode::RESOURCE_BUSY);
+        assert_eq!(error.request_ident, GetPaneRenderableDimensions::IDENT);
+        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
+        error.validate().unwrap();
+
+        pane.line_layout_busy.store(false, Ordering::Release);
+        handler.process_one(DecodedPdu {
+            serial: 302,
+            pdu: Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id: 77 }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        let Pdu::GetPaneRenderableDimensionsResponse(response) = take_response(&captured).pdu
+        else {
+            panic!("released metadata must produce the exact dimensions snapshot");
+        };
+        assert_eq!(response.dimensions.scrollback_top, -10_000);
+        assert_eq!(pane.line_read_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -19802,6 +19909,65 @@ mod tests {
     }
 
     #[test]
+    fn legacy_render_metadata_busy_preserves_baseline_and_retries_exact_geometry() {
+        let mut fake = FakePane::new(None);
+        fake.line_layout_floor = Some(9);
+        fake.state.lock().unwrap().dimensions.scrollback_top = -10_000;
+        fake.line_layout_busy.store(true, Ordering::Release);
+        let fake = Arc::new(fake);
+        let pane: Arc<dyn Pane> = fake.clone();
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        registration
+            .try_with_current(|current| {
+                let error = match prepare_legacy_render_enqueue(&current, &per_pane, None) {
+                    Err(error) => error,
+                    Ok(_) => panic!("busy metadata must not publish geometry"),
+                };
+                assert_eq!(
+                    error.downcast_ref::<PaneRenderPreparationError>(),
+                    Some(&PaneRenderPreparationError::MetadataBusy)
+                );
+                assert_eq!(fake.line_read_count.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    per_pane.lock().unwrap().baseline,
+                    PaneRenderBaseline::default()
+                );
+
+                fake.line_layout_busy.store(false, Ordering::Release);
+                let (response, guard) = prepare_legacy_render_enqueue(&current, &per_pane, None)
+                    .expect("metadata released")
+                    .expect("initial geometry must be delivered");
+                assert_eq!(response.dimensions.scrollback_top, -10_000);
+                assert_eq!(per_pane.lock().unwrap().baseline.line_layout_floor, Some(9));
+                drop(guard);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_uses_dimensions_from_captured_layout_without_resampling() {
+        let mut fake = FakePane::new(None);
+        fake.line_layout_floor = Some(9);
+        fake.seqno_on_dimensions = Some(12);
+        fake.state.lock().unwrap().dimensions.scrollback_top = -10_000;
+        let pane: Arc<dyn Pane> = Arc::new(fake);
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        registration
+            .try_with_current(|current| {
+                let (response, guard) = prepare_legacy_render_enqueue(&current, &per_pane, None)
+                    .expect("captured geometry must not be independently resampled")
+                    .expect("initial geometry must be delivered");
+                assert_eq!(response.dimensions.scrollback_top, -10_000);
+                assert_eq!(response.seqno, 11);
+                drop(guard);
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn legacy_render_rejects_a_source_that_changes_during_snapshot() {
         let mut fake = FakePane::new(None);
         fake.seqno_on_dimensions = Some(12);
@@ -21922,6 +22088,46 @@ mod tests {
             "a pure no-effect settlement cannot advance the client baseline"
         );
         assert!(!state.transactional_dirty);
+    }
+
+    #[test]
+    fn transactional_metadata_busy_preserves_dirty_obligation_until_success() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let mut fake = FakePane::new(None);
+        fake.line_layout_floor = Some(9);
+        fake.state.lock().unwrap().dimensions.scrollback_top = -10_000;
+        fake.line_layout_busy.store(true, Ordering::Release);
+        let fake = Arc::new(fake);
+        let pane: Arc<dyn Pane> = fake.clone();
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        assert_eq!(
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .unwrap_err(),
+            PaneRenderPreparationError::MetadataBusy
+        );
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(state.baseline, PaneRenderBaseline::default());
+            assert!(state.transactional_dirty);
+            assert!(matches!(
+                state.transaction_phase,
+                PaneRenderTransactionPhase::Idle
+            ));
+        }
+        assert_eq!(fake.line_read_count.load(Ordering::Relaxed), 0);
+        fake.line_layout_busy.store(false, Ordering::Release);
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(Arc::clone(&per_pane), &registration, None)
+                .expect("released metadata must permit a fresh transaction"),
+        );
+        assert_eq!(prepared.surface.dimensions.scrollback_top, -10_000);
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        assert!(!per_pane.lock().unwrap().transactional_dirty);
     }
 
     #[test]

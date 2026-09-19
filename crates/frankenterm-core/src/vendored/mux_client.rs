@@ -5493,7 +5493,8 @@ fn is_retryable_render_rejection(error: &DirectMuxError) -> bool {
     matches!(error, DirectMuxError::RemoteRejection(error)
         if error.validate().is_ok()
             && error.request_ident == <GetPaneRenderChanges as codec::PduWireIdent>::IDENT
-            && error.code == codec::MuxErrorCode::BACKEND_FAILURE
+            && matches!(error.code,
+                codec::MuxErrorCode::BACKEND_FAILURE | codec::MuxErrorCode::RESOURCE_BUSY)
             && error.effect == codec::MuxErrorEffect::NOT_APPLIED
             && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF)
 }
@@ -11782,6 +11783,8 @@ mod tests {
         run_async_test(async {
             for (case, expected_requests) in [
                 ("recover", 2),
+                ("busy-recover", 2),
+                ("busy-persistent", 3),
                 ("never", 1),
                 ("effect", 1),
                 ("wrong-request", 1),
@@ -11829,7 +11832,7 @@ mod tests {
                                         requests <= expected_requests,
                                         "unexpected retry for {case}"
                                     );
-                                    if case == "recover" && requests == 2 {
+                                    if matches!(case, "recover" | "busy-recover") && requests == 2 {
                                         Pdu::GetPaneRenderChangesResponse(test_render_change(
                                             27,
                                             42,
@@ -11840,6 +11843,9 @@ mod tests {
                                             <GetPaneRenderChanges as PduWireIdent>::IDENT,
                                         );
                                         match case {
+                                            "busy-recover" | "busy-persistent" => {
+                                                rejection.code = codec::MuxErrorCode::RESOURCE_BUSY;
+                                            }
                                             "never" => {
                                                 rejection.code =
                                                     codec::MuxErrorCode::INVALID_REQUEST;
@@ -11894,7 +11900,7 @@ mod tests {
                     cx
                 };
                 let result = client.get_pane_render_changes_with_cx(&cx, 27).await;
-                if case == "recover" {
+                if matches!(case, "recover" | "busy-recover") {
                     assert_eq!(
                         result.expect("safe retry succeeds").title,
                         "fresh-after-retry"

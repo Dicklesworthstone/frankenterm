@@ -1616,7 +1616,10 @@ impl Pane for LocalPane {
         else {
             return Ok(None);
         };
-        Ok(Some((floor, terminal_get_dimensions(&mut term))))
+        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(None);
+        };
+        Ok(Some((floor, dimensions)))
     }
 
     fn publish_line_reads_at_layout(
@@ -1635,13 +1638,13 @@ impl Pane for LocalPane {
         else {
             return Ok(false);
         };
+        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(false);
+        };
         if expected_seqno == SequenceNo::MAX
             || expected_seqno < floor
             || expected_seqno > term.current_seqno()
-            || !crate::renderable::same_line_layout_geometry(
-                &terminal_get_dimensions(&mut term),
-                &expected_dimensions,
-            )
+            || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
         {
             return Ok(false);
         }
@@ -3109,11 +3112,8 @@ impl LocalPane {
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
             .ok()
             .flatten()?;
-        Some((
-            floor,
-            term.current_seqno(),
-            terminal_get_dimensions(&mut term),
-        ))
+        let dimensions = terminal_try_get_dimensions(&mut term)?;
+        Some((floor, term.current_seqno(), dimensions))
     }
 
     /// The source/layout checks and coordinate registration share one
@@ -3135,7 +3135,9 @@ impl LocalPane {
             .ok()
             .flatten()
             .ok_or(SelectionAnchorCaptureError::Busy)?;
-        if floor != expected_floor || terminal_get_dimensions(&mut term) != expected_dimensions {
+        let dimensions =
+            terminal_try_get_dimensions(&mut term).ok_or(SelectionAnchorCaptureError::Busy)?;
+        if floor != expected_floor || dimensions != expected_dimensions {
             return Err(SelectionAnchorCaptureError::SourceChanged);
         }
         let sequence = term.current_seqno();
@@ -3172,9 +3174,10 @@ impl LocalPane {
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
             .ok()
             .flatten()?;
+        let dimensions = terminal_try_get_dimensions(&mut term)?;
         let sequence = term.current_seqno();
         let points = term.screen().resolve_selection_anchor(anchor, sequence);
-        Some((floor, sequence, terminal_get_dimensions(&mut term), points))
+        Some((floor, sequence, dimensions, points))
     }
 
     pub fn try_capture_render_frame(
@@ -3205,7 +3208,7 @@ impl LocalPane {
             Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
                 .ok()
                 .flatten()?;
-        let dimensions = terminal_get_dimensions(&mut term);
+        let dimensions = terminal_try_get_dimensions(&mut term)?;
         // Scrollback eviction and clearing can invalidate a stored viewport
         // without a GUI scroll event. Normalize against this same observation;
         // requesting an evicted row would otherwise retry hydration forever.
@@ -5314,6 +5317,41 @@ mod tests {
             sink,
             ResizeCancellationToken::new(outcome.seq),
         )
+    }
+
+    #[test]
+    fn line_layout_preserves_busy_and_advances_on_real_eviction() {
+        let (pane, _mux, _registration, sink, _token) = cold_resize_fixture(false);
+        let (floor, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        assert!(dimensions.scrollback_rows > 0);
+        let locked_rows = sink.rows.lock();
+        assert_eq!(
+            pane.get_line_layout(),
+            Err(frankenterm_term::screen::ColdReadMetadataBusy)
+        );
+        assert!(pane.selection_source_snapshot().is_none());
+        assert_eq!(
+            pane.publish_line_reads_at_layout(&[], floor, dimensions, &mut || ()),
+            Err(frankenterm_term::screen::ColdReadMetadataBusy)
+        );
+        assert_eq!(
+            pane.get_dimensions().scrollback_top,
+            dimensions.scrollback_top
+        );
+        drop(locked_rows);
+        let (_, released) = pane.get_line_layout().unwrap().unwrap();
+        assert_eq!(released.scrollback_top, dimensions.scrollback_top);
+        let oldest = {
+            let mut rows = sink.rows.lock();
+            let oldest = *rows.1.first_key_value().unwrap().0;
+            rows.1.remove(&oldest);
+            oldest
+        };
+        assert!(pane.get_dimensions().scrollback_top > oldest);
+        let (_, evicted) = pane.get_line_layout().unwrap().unwrap();
+        assert!(evicted.scrollback_top > oldest);
+        sink.unavailable.store(true, Ordering::Release);
+        assert_eq!(pane.get_line_layout(), Ok(None));
     }
 
     fn cold_resize_read_all(pane: &LocalPane) -> anyhow::Result<String> {
