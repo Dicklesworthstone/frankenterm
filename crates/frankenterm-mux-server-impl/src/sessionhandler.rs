@@ -11056,14 +11056,6 @@ mod tests {
             MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
-        let blocker = match try_spawn_with_admission(
-            MainThreadServiceClass::Topology,
-            4 * 1024,
-            std::future::pending::<()>(),
-        ) {
-            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
-            outcome => panic!("expected scheduler blocker admission, got {outcome:?}"),
-        };
         let recorder = trace_recorder(1);
         let pane = Arc::new(FakePane::new_with_id(7_101, None));
         let mut harness = SampledReliableHarness::new_with_executor(
@@ -11074,6 +11066,26 @@ mod tests {
             42_101,
             executor,
         );
+        // Saturate request admission only after pane publication and the
+        // session's retained render owner have completed their initial polls.
+        assert_eq!(harness.executor.queue_snapshot().depth, 0);
+        assert_eq!(harness.executor.admission_snapshot().active_tasks, 1);
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected scheduler blocker admission, got {outcome:?}"),
+        };
+        assert_eq!(harness.executor.admission_snapshot().active_tasks, 2);
+        assert!(matches!(
+            try_reserve_main_thread(
+                MainThreadServiceClass::Input,
+                SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+            ),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
         let request = harness.request(101);
         let admission = harness.admission(&request);
         harness.dispatch(2, request, admission);
@@ -11091,6 +11103,8 @@ mod tests {
         assert_eq!(harness.pane.key_down_count(), 0);
         drop(blocker);
         assert!(harness.executor.try_tick().unwrap());
+        assert_eq!(harness.executor.admission_snapshot().active_tasks, 1);
+        assert_eq!(harness.pane.key_down_count(), 0);
         assert!(
             freeze_trace_events(&recorder).is_empty(),
             "scheduler-full retry must publish neither K4 nor K5"
@@ -11634,6 +11648,16 @@ mod tests {
             MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_tab: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_for_tab);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
+        drain_simple_executor(&executor);
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
         let blocker = match try_spawn_with_admission(
             MainThreadServiceClass::Topology,
             4 * 1024,
@@ -11642,13 +11666,14 @@ mod tests {
             MainThreadSpawnOutcome::Spawned(spawned) => spawned,
             outcome => panic!("expected test blocker admission, got {:?}", outcome),
         };
-        let pane = Arc::new(FakePane::new_with_id(7_007, None));
-        let pane_for_tab: Arc<dyn Pane> = pane.clone();
-        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
-        tab.assign_pane(&pane_for_tab);
-        let (mux, _mux_guard) = install_tab_with_window(&tab);
-        let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
+        assert_eq!(executor.admission_snapshot().active_tasks, 2);
+        assert!(matches!(
+            try_reserve_main_thread(
+                MainThreadServiceClass::Input,
+                SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+            ),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
 
         handler.process_one(DecodedPdu {
             serial: 915,
@@ -11675,13 +11700,16 @@ mod tests {
         error
             .validate()
             .expect("scheduler rejection must be canonical");
-        assert_eq!(executor.queue_snapshot().depth, 2);
+        // Only the blocker is runnable; the parked render owner still holds
+        // the second admission slot and input must not enqueue any work.
+        assert_eq!(executor.queue_snapshot().depth, 1);
         assert_eq!(executor.admission_snapshot().active_tasks, 2);
 
         drop(blocker);
         drain_simple_executor(&executor);
         assert_eq!(executor.queue_snapshot().depth, 0);
         assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        assert_eq!(pane.key_down_count(), 0);
     }
 
     #[test]
