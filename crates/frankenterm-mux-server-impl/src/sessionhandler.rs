@@ -19879,7 +19879,19 @@ mod tests {
             let pane = Arc::new(fake);
             let pane_dyn: Arc<dyn Pane> = pane.clone();
             mux.add_pane(&pane_dyn).unwrap();
-            let (sender, captured) = capturing_sender();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let bulk = Arc::new(Mutex::new(Vec::new()));
+            let sender = PduSender::new({
+                let captured = Arc::clone(&captured);
+                let bulk = Arc::clone(&bulk);
+                move |pdu, class| {
+                    match class {
+                        PduDeliveryClass::Control => captured.lock().unwrap().push(pdu),
+                        PduDeliveryClass::Bulk => bulk.lock().unwrap().push(pdu),
+                    }
+                    Ok(())
+                }
+            });
             let mut handler = SessionHandler::new_for_mux(sender, mux);
             handler.process_one(DecodedPdu {
                 serial: 43,
@@ -19900,6 +19912,7 @@ mod tests {
                 },
             );
             assert!(captured.lock().unwrap().is_empty());
+            assert!(bulk.lock().unwrap().is_empty());
             if !exhausted {
                 handler.process_one(DecodedPdu {
                     serial: 44,
@@ -19915,6 +19928,18 @@ mod tests {
                 };
                 assert_eq!(fresh.seqno, 12);
                 assert!(captured.lock().unwrap().is_empty());
+                assert_eq!(
+                    bulk.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|pdu| {
+                            pdu.serial == 0
+                                && pdu.pdu == Pdu::GetPaneRenderChangesResponse(fresh.clone())
+                        })
+                        .count(),
+                    1,
+                    "stable retry admits exactly one matching render delta"
+                );
             }
             drop(handler);
             drain_simple_executor(&executor);
