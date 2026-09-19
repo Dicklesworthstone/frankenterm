@@ -9066,12 +9066,7 @@ mod tests {
         let third_staging = loop {
             while executor.try_tick().unwrap() {}
             match prepare_third().and_then(|plan| {
-                plan.claim(
-                    provenance.original.pane_id,
-                    2,
-                    third_request,
-                    third_handoff,
-                )
+                plan.claim(provenance.original.pane_id, 2, third_request, third_handoff)
             }) {
                 Ok(staging) => break staging,
                 Err(GuardianProxyError::InvalidConfiguration(
