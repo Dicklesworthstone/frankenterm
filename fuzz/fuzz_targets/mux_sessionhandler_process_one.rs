@@ -298,7 +298,9 @@ fuzz_target!(|data: &[u8]| {
         ScopedMux::shutdown_current()
     };
     let (sender, captured) = capturing_sender();
-    let mut handler = SessionHandler::new_for_mux(sender, session_mux);
+    let Ok(mut handler) = SessionHandler::new_for_mux(sender, session_mux) else {
+        return;
+    };
 
     for frame in case.frames {
         handler.process_one(DecodedPdu {

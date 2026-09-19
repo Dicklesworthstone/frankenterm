@@ -6756,8 +6756,11 @@ where
     let trace_producer = config
         .trace_authority()
         .and_then(|authority| authority.claim_session(topology_stream_id));
-    let mut handler =
-        SessionHandler::new_for_session_with_topology_stream(pdu_sender, owner, topology_stream_id);
+    let mut handler = SessionHandler::new_for_session_with_topology_stream(
+        pdu_sender,
+        owner,
+        topology_stream_id,
+    )?;
 
     {
         let notification_route = TopologyNotificationRoute::new(authority.clone(), &mux, &topology);
@@ -9253,9 +9256,10 @@ mod tests {
 
     #[test]
     fn dispatch_client_request_rejects_reserved_zero_before_handler() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let topology = TopologyStreamCoordinator::new(
@@ -9309,9 +9313,10 @@ mod tests {
 
     #[test]
     fn dispatch_client_request_delegates_nonzero_serial_unchanged() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         let topology = idle_topology_coordinator();
 
         dispatch_client_request(
@@ -9336,9 +9341,10 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_wrong_wire_direction_before_handler_mutation() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         let topology = idle_topology_coordinator();
 
         let error = dispatch_client_request(
@@ -9357,9 +9363,10 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_retired_pdu95_before_handler_mutation() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         let topology = idle_topology_coordinator();
 
         let error = dispatch_client_request(
@@ -9378,6 +9385,7 @@ mod tests {
 
     #[test]
     fn dispatch_binds_sampled_input_to_its_exact_connection_stream() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
         let stream_id = TopologyStreamId::from_bytes([0x94; 16]);
@@ -9385,7 +9393,8 @@ mod tests {
             sender,
             SessionOwner::new(mux),
             stream_id,
-        );
+        )
+        .unwrap();
         let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, _terminal_rx) = DispatchTerminal::channel();
         let topology = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
@@ -9576,10 +9585,11 @@ mod tests {
 
     #[test]
     fn request_dispatch_admission_rejects_terminal_and_releases_before_response_reentry() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let rejected_mux = Arc::new(Mux::new(None));
         let (rejected_sender, rejected_responses) = capturing_pdu_sender();
         let mut rejected_handler =
-            SessionHandler::new_for_mux(rejected_sender, Arc::clone(&rejected_mux));
+            SessionHandler::new_for_mux(rejected_sender, Arc::clone(&rejected_mux)).unwrap();
         let rejected_topology = idle_topology_coordinator();
         rejected_topology.terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
         let rejected = dispatch_client_request_if_admitted(
@@ -9608,7 +9618,7 @@ mod tests {
             move |pdu, delivery_class| coordinator.queue_response(pdu, delivery_class)
         });
         let mux = Arc::new(Mux::new(None));
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
 
         let dispatched = dispatch_client_request_if_admitted(
             &mut handler,
@@ -11676,6 +11686,7 @@ mod tests {
 
     #[test]
     fn malformed_ordered_refresh_at_dispatch_revokes_authority_and_retained_successors() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
         let request = ordered_snapshot_request(true);
@@ -11713,7 +11724,7 @@ mod tests {
         );
 
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         let malformed = codec::ListPanesOrderedV1 {
             protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION.saturating_add(1),
             ..request.clone()
@@ -11760,6 +11771,7 @@ mod tests {
 
     #[test]
     fn rejected_pdu88_at_dispatch_is_sticky_terminal_and_revokes_inflight_fence() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
         let request = ordered_snapshot_request(true);
@@ -11777,7 +11789,7 @@ mod tests {
         assert!(coordinator.outbound_budget.snapshot().retained_bytes > 0);
 
         let (sender, captured) = capturing_pdu_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         let error = dispatch_client_request(
             &mut handler,
             &coordinator,
@@ -13225,6 +13237,7 @@ mod tests {
 
     #[test]
     fn process_async_treats_unexpected_eof_as_clean_disconnect() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(EofDispatchStream));
@@ -13279,6 +13292,7 @@ mod tests {
 
     #[test]
     fn process_async_treats_read_side_connection_reset_as_clean_disconnect() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(ReadErrorDispatchStream {
@@ -13337,6 +13351,7 @@ mod tests {
 
     #[test]
     fn process_async_propagates_readable_wait_failures() {
+        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(FailingReadableDispatchStream));
@@ -14601,6 +14616,7 @@ mod tests {
 
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
+            let _executor = promise::spawn::SimpleExecutor::new();
             let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
                 frame_prefix,
                 chunk_size,
@@ -14645,6 +14661,7 @@ mod tests {
 
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
+            let _executor = promise::spawn::SimpleExecutor::new();
             let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
                 malformed,
                 chunk_size,

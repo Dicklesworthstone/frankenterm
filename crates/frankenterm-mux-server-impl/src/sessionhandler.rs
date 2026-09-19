@@ -65,7 +65,7 @@ use promise::spawn::{
     MainThreadServiceClass, try_reserve_main_thread, try_reserve_main_thread_with_low_priority,
 };
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
@@ -2991,6 +2991,244 @@ struct TrackedPane {
     registration: Option<PaneRegistrationHandle>,
     state: Arc<Mutex<PerPane>>,
     push_state: Arc<AtomicUsize>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingPanePush {
+    tracked: TrackedPane,
+    ready_at: Instant,
+    retry_delay: std::time::Duration,
+}
+
+#[derive(Default)]
+struct PanePushQueue {
+    pending: HashMap<PaneId, PendingPanePush>,
+    order: VecDeque<PaneId>,
+    closed: bool,
+}
+
+struct PanePushCoordinator {
+    queue: Mutex<PanePushQueue>,
+    wake: frankenterm_core::runtime_async::mpsc::Sender<()>,
+}
+
+impl PanePushCoordinator {
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, PanePushQueue> {
+        match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                let mut queue = error.into_inner();
+                queue.closed = true;
+                for (_, pending) in queue.pending.drain() {
+                    pending
+                        .tracked
+                        .push_state
+                        .store(PANE_PUSH_IDLE, Ordering::Release);
+                }
+                queue.order.clear();
+                self.queue.clear_poison();
+                queue
+            }
+        }
+    }
+
+    fn enqueue(&self, pane_id: PaneId, pending: PendingPanePush) {
+        let mut queue = self.lock_queue();
+        if queue.closed || !pending.tracked.live.load(Ordering::Acquire) {
+            pending
+                .tracked
+                .push_state
+                .store(PANE_PUSH_IDLE, Ordering::Release);
+            drop(queue);
+            let _ = self.wake.try_send(());
+            return;
+        }
+        if !queue.pending.contains_key(&pane_id) {
+            queue.order.push_back(pane_id);
+            queue.pending.insert(pane_id, pending);
+        }
+        drop(queue);
+        // A full one-element wake channel already represents all pending bits.
+        let _ = self.wake.try_send(());
+    }
+
+    fn remove(&self, pane_id: PaneId) {
+        let mut queue = self.lock_queue();
+        if let Some(pending) = queue.pending.remove(&pane_id) {
+            pending
+                .tracked
+                .push_state
+                .store(PANE_PUSH_IDLE, Ordering::Release);
+            queue.order.retain(|id| *id != pane_id);
+        }
+        drop(queue);
+        let _ = self.wake.try_send(());
+    }
+
+    fn close(&self) {
+        let mut queue = self.lock_queue();
+        queue.closed = true;
+        for (_, pending) in queue.pending.drain() {
+            pending
+                .tracked
+                .push_state
+                .store(PANE_PUSH_IDLE, Ordering::Release);
+        }
+        queue.order.clear();
+        drop(queue);
+        let _ = self.wake.try_send(());
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        mut wake: frankenterm_core::runtime_async::mpsc::Receiver<()>,
+        sender: PduSender,
+        authority: SessionAuthority,
+    ) {
+        loop {
+            let (next, delay) = {
+                let mut queue = self.lock_queue();
+                if queue.closed {
+                    return;
+                }
+                let now = Instant::now();
+                let mut next = None;
+                let mut delay = None;
+                for _ in 0..queue.order.len() {
+                    let Some(id) = queue.order.pop_front() else {
+                        break;
+                    };
+                    let Some(pending) = queue.pending.get(&id) else {
+                        continue;
+                    };
+                    if pending.ready_at <= now {
+                        next = queue.pending.remove(&id).map(|pending| (id, pending));
+                        break;
+                    }
+                    let remaining = pending.ready_at.duration_since(now);
+                    delay = Some(delay.map_or(remaining, |current: std::time::Duration| {
+                        current.min(remaining)
+                    }));
+                    queue.order.push_back(id);
+                }
+                (next, delay)
+            };
+            let Some((pane_id, mut pending)) = next else {
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                if let Some(delay) = delay {
+                    let message = wake.recv(&cx);
+                    let timer = frankenterm_core::runtime_async::sleep(delay);
+                    futures::pin_mut!(message, timer);
+                    let _ = futures::future::select(message, timer).await;
+                } else if wake.recv(&cx).await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            let Some(registration) = pending.tracked.registration.as_ref() else {
+                continue;
+            };
+            let mut guard = PanePushStateGuard {
+                state: Arc::clone(&pending.tracked.push_state),
+                disarmed: false,
+            };
+            if !pending.tracked.live.load(Ordering::Acquire) {
+                continue;
+            }
+            pending
+                .tracked
+                .push_state
+                .store(PANE_PUSH_SCHEDULED, Ordering::Release);
+            let result = authority.try_run(|| {
+                registration
+                    .try_with_current(|pane| {
+                        maybe_push_pane_changes(
+                            &pane,
+                            sender.clone(),
+                            Arc::clone(&pending.tracked.state),
+                        )
+                    })
+                    .ok_or_else(|| anyhow!("pane registration {pane_id} is no longer current"))?
+            });
+            let retry = match result {
+                Ok(Ok(())) => {
+                    pending.retry_delay = std::time::Duration::from_millis(1);
+                    pending.ready_at = Instant::now();
+                    let dirty = pending
+                        .tracked
+                        .push_state
+                        .compare_exchange(
+                            PANE_PUSH_SCHEDULED,
+                            PANE_PUSH_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err();
+                    guard.disarmed = !dirty;
+                    dirty
+                }
+                Ok(Err(err))
+                    if matches!(
+                        err.downcast_ref::<PaneRenderPreparationError>(),
+                        Some(
+                            PaneRenderPreparationError::MetadataBusy
+                                | PaneRenderPreparationError::SourceChanged
+                        )
+                    ) =>
+                {
+                    let cause = if matches!(
+                        err.downcast_ref::<PaneRenderPreparationError>(),
+                        Some(PaneRenderPreparationError::MetadataBusy)
+                    ) {
+                        "metadata_busy"
+                    } else {
+                        "source_changed"
+                    };
+                    metrics::counter!("mux.server.detached_render_capture_retry", "cause" => cause)
+                        .increment(1);
+                    pending.ready_at = Instant::now() + pending.retry_delay;
+                    pending.retry_delay =
+                        (pending.retry_delay * 2).min(std::time::Duration::from_millis(16));
+                    true
+                }
+                Ok(Err(err)) | Err(err) => {
+                    log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                    false
+                }
+            };
+            if retry {
+                self.enqueue(pane_id, pending);
+                guard.disarmed = true;
+            }
+            drop(guard);
+            // One pane per poll: busy or continuously noisy panes cannot
+            // monopolize this session owner or overtake admitted input.
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+}
+
+struct PanePushCoordinatorGuard {
+    coordinator: Arc<PanePushCoordinator>,
+    authority: SessionAuthority,
+}
+
+impl Drop for PanePushCoordinatorGuard {
+    fn drop(&mut self) {
+        self.authority.retire();
+        self.coordinator.close();
+    }
 }
 
 const PANE_PUSH_IDLE: usize = 0;
@@ -3016,6 +3254,7 @@ impl TrackedPane {
             registration: Some(registration),
             state: Arc::new(Mutex::new(PerPane::default())),
             push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
+            live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 }
@@ -6719,6 +6958,8 @@ pub struct SessionHandler {
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
     per_pane: HashMap<PaneId, TrackedPane>,
+    push_coordinator: Option<Arc<PanePushCoordinator>>,
+    push_task: Option<promise::spawn::MainThreadSpawnedTask<()>>,
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
     client_input_activity_updates: usize,
@@ -6730,6 +6971,10 @@ pub struct SessionHandler {
 impl Drop for SessionHandler {
     fn drop(&mut self) {
         self.owner.retire();
+        if let Some(coordinator) = &self.push_coordinator {
+            coordinator.close();
+        }
+        drop(self.push_task.take());
         if let Some(client_id) = self.client_id.take() {
             unregister_owned_client(self.owner.mux(), &client_id);
         }
@@ -6742,11 +6987,14 @@ impl SessionHandler {
     /// Production and fuzz callers must provide the owning mux rather than
     /// consulting the process-global singleton. Deferred work therefore cannot
     /// be redirected if another mux is installed while the session is alive.
-    pub fn new_for_mux(to_write_tx: PduSender, mux: Arc<Mux>) -> Self {
+    pub fn new_for_mux(to_write_tx: PduSender, mux: Arc<Mux>) -> anyhow::Result<Self> {
         Self::new_for_session(to_write_tx, SessionOwner::new(mux))
     }
 
-    pub(crate) fn new_for_session(to_write_tx: PduSender, owner: SessionOwner) -> Self {
+    pub(crate) fn new_for_session(
+        to_write_tx: PduSender,
+        owner: SessionOwner,
+    ) -> anyhow::Result<Self> {
         let topology_stream_id = TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
         Self::new_for_session_with_topology_stream(to_write_tx, owner, topology_stream_id)
     }
@@ -6755,25 +7003,63 @@ impl SessionHandler {
         to_write_tx: PduSender,
         owner: SessionOwner,
         topology_stream_id: TopologyStreamId,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let reservation = match try_reserve_main_thread_with_low_priority(
+            MainThreadServiceClass::Render,
+            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => anyhow::bail!("cannot admit session render coordinator: {rejected:?}"),
+        };
+        let (wake_tx, wake_rx) = frankenterm_core::runtime_async::mpsc::channel(1);
+        let coordinator = Arc::new(PanePushCoordinator {
+            queue: Mutex::new(PanePushQueue::default()),
+            wake: wake_tx,
+        });
+        let guard = PanePushCoordinatorGuard {
+            coordinator: Arc::clone(&coordinator),
+            authority: owner.authority(),
+        };
+        let worker = Arc::clone(&coordinator);
+        let authority = owner.authority();
+        let sender = to_write_tx.clone();
+        let task = reservation.spawn_local(async move {
+            let _guard = guard;
+            worker.run(wake_rx, sender, authority).await;
+        });
+        Ok(Self {
             to_write_tx,
             owner,
             topology_stream_id,
             per_pane: HashMap::new(),
+            push_coordinator: Some(coordinator),
+            push_task: Some(task),
             client_id: None,
             #[cfg(test)]
             client_input_activity_updates: 0,
             #[cfg(test)]
             reliable_input_test_fault: ReliableInputTestFault::None,
             proxy_client_id: None,
-        }
+        })
     }
 
     #[cfg(test)]
     fn new(to_write_tx: PduSender) -> Self {
         let mux_owner = Mux::try_get().unwrap_or_else(|| Arc::new(Mux::new(None)));
-        Self::new_for_session(to_write_tx, SessionOwner::new(mux_owner))
+        // State-only unit tests exercise synchronous helpers without creating
+        // a scheduler. Production-equivalent tests use the fallible constructor.
+        Self {
+            to_write_tx,
+            owner: SessionOwner::new(mux_owner),
+            topology_stream_id: TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes()),
+            per_pane: HashMap::new(),
+            push_coordinator: None,
+            push_task: None,
+            client_id: None,
+            client_input_activity_updates: 0,
+            reliable_input_test_fault: ReliableInputTestFault::None,
+            proxy_client_id: None,
+        }
     }
 
     pub(crate) fn record_decoded_input_trace(
@@ -6831,6 +7117,7 @@ impl SessionHandler {
         registration: &PaneRegistrationHandle,
     ) -> Arc<Mutex<PerPane>> {
         let pane_id = registration.pane_id();
+        let coordinator = self.push_coordinator.as_ref();
         let tracked = self
             .per_pane
             .entry(pane_id)
@@ -6840,6 +7127,10 @@ impl SessionHandler {
                     .as_ref()
                     .is_some_and(|current| current.same_registration(registration));
                 if !is_same {
+                    tracked.live.store(false, Ordering::Release);
+                    if let Some(coordinator) = coordinator {
+                        coordinator.remove(pane_id);
+                    }
                     *tracked = TrackedPane::exact(registration.clone());
                 }
             })
@@ -6853,6 +7144,7 @@ impl SessionHandler {
             registration: None,
             state: Arc::new(Mutex::new(PerPane::default())),
             push_state: Arc::new(AtomicUsize::new(PANE_PUSH_IDLE)),
+            live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
         Arc::clone(&tracked.state)
     }
@@ -6880,6 +7172,12 @@ impl SessionHandler {
                 .is_none_or(|registration| registration.try_with_current(|_| ()).is_none())
         });
         if should_remove {
+            if let Some(tracked) = self.per_pane.get(&pane_id) {
+                tracked.live.store(false, Ordering::Release);
+            }
+            if let Some(coordinator) = &self.push_coordinator {
+                coordinator.remove(pane_id);
+            }
             self.per_pane.remove(&pane_id);
         }
     }
@@ -6892,6 +7190,12 @@ impl SessionHandler {
             .and_then(|tracked| tracked.registration.as_ref())
             .is_some_and(|current| current.same_registration(registration));
         if should_remove {
+            if let Some(tracked) = self.per_pane.get(&pane_id) {
+                tracked.live.store(false, Ordering::Release);
+            }
+            if let Some(coordinator) = &self.push_coordinator {
+                coordinator.remove(pane_id);
+            }
             self.per_pane.remove(&pane_id);
         }
     }
@@ -6917,7 +7221,7 @@ impl SessionHandler {
     /// `schedule_pane_push`, which intentionally creates first-use state.
     pub(crate) fn schedule_tracked_pane_push(&self, pane_id: PaneId) {
         if let Some(tracked) = self.per_pane.get(&pane_id) {
-            let Some(registration) = tracked.registration.clone() else {
+            let Some(_) = tracked.registration.as_ref() else {
                 return;
             };
             loop {
@@ -6935,150 +7239,20 @@ impl SessionHandler {
                     continue;
                 }
                 if current == PANE_PUSH_IDLE {
-                    Self::schedule_pane_push_with_state(
-                        self.to_write_tx.clone(),
-                        self.owner.authority(),
-                        registration,
-                        Arc::clone(&tracked.state),
-                        Arc::clone(&tracked.push_state),
-                    );
+                    if let Some(coordinator) = &self.push_coordinator {
+                        coordinator.enqueue(
+                            pane_id,
+                            PendingPanePush {
+                                tracked: tracked.clone(),
+                                ready_at: Instant::now(),
+                                retry_delay: std::time::Duration::from_millis(1),
+                            },
+                        );
+                    } else {
+                        tracked.push_state.store(PANE_PUSH_IDLE, Ordering::Release);
+                    }
                 }
                 return;
-            }
-        }
-    }
-
-    fn schedule_pane_push_with_state(
-        sender: PduSender,
-        authority: SessionAuthority,
-        registration: PaneRegistrationHandle,
-        per_pane: Arc<Mutex<PerPane>>,
-        push_state: Arc<AtomicUsize>,
-    ) {
-        let pane_id = registration.pane_id();
-        // Unsolicited render work must yield to input already admitted on the
-        // high-priority lane. The executor's bounded burst still advances it
-        // while input remains busy.
-        match try_reserve_main_thread_with_low_priority(
-            MainThreadServiceClass::Render,
-            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
-        ) {
-            MainThreadReservationOutcome::Reserved(reservation) => {
-                // Capture before spawning: cancellation before the first poll
-                // must release the producer's claim too.
-                let guard = PanePushStateGuard {
-                    state: Arc::clone(&push_state),
-                    disarmed: false,
-                };
-                reservation
-                    .spawn_local(async move {
-                        let mut guard = guard;
-                        let mut retry_delay = std::time::Duration::from_millis(1);
-                        loop {
-                            // This capture includes notifications that preceded
-                            // it. Only updates during capture require another pass.
-                            push_state.store(PANE_PUSH_SCHEDULED, Ordering::Release);
-                            let result = authority.try_run(|| {
-                                registration
-                                    .try_with_current(|pane| {
-                                        maybe_push_pane_changes(
-                                            &pane,
-                                            sender.clone(),
-                                            Arc::clone(&per_pane),
-                                        )
-                                    })
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                            "pane registration {} is no longer current",
-                                            pane_id
-                                        )
-                                    })?
-                            });
-                            match result {
-                                Ok(Ok(())) => {
-                                    retry_delay = std::time::Duration::from_millis(1);
-                                }
-                                Ok(Err(err))
-                                    if matches!(
-                                        err.downcast_ref::<PaneRenderPreparationError>(),
-                                        Some(
-                                            PaneRenderPreparationError::MetadataBusy
-                                                | PaneRenderPreparationError::SourceChanged
-                                        )
-                                    ) =>
-                                {
-                                    let cause = if matches!(
-                                        err.downcast_ref::<PaneRenderPreparationError>(),
-                                        Some(PaneRenderPreparationError::MetadataBusy)
-                                    ) {
-                                        "metadata_busy"
-                                    } else {
-                                        "source_changed"
-                                    };
-                                    metrics::counter!(
-                                        "mux.server.detached_render_capture_retry",
-                                        "cause" => cause
-                                    )
-                                    .increment(1);
-                                    // The final output notification may already
-                                    // be coalesced into this capture. Retain its
-                                    // admitted permit and obligation until a
-                                    // coherent capture succeeds or this exact
-                                    // authority retires; do not require output
-                                    // to arrive again to wake a stalled screen.
-                                    frankenterm_core::runtime_async::sleep(retry_delay).await;
-                                    retry_delay =
-                                        (retry_delay * 2).min(std::time::Duration::from_millis(16));
-                                    continue;
-                                }
-                                Ok(Err(err)) | Err(err) => {
-                                    log::error!(
-                                        "scheduled pane {pane_id} render push failed: {err:#}"
-                                    );
-                                    return;
-                                }
-                            }
-                            if push_state
-                                .compare_exchange(
-                                    PANE_PUSH_SCHEDULED,
-                                    PANE_PUSH_IDLE,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                guard.disarmed = true;
-                                return;
-                            }
-
-                            // Keep the admitted permit and yield once between
-                            // captures. Input can run without risking loss of a
-                            // dirty obligation to a second admission failure.
-                            let mut yielded = false;
-                            std::future::poll_fn(|cx| {
-                                if yielded {
-                                    std::task::Poll::Ready(())
-                                } else {
-                                    yielded = true;
-                                    cx.waker().wake_by_ref();
-                                    std::task::Poll::Pending
-                                }
-                            })
-                            .await;
-                        }
-                    })
-                    .detach();
-            }
-            rejected => {
-                push_state.store(PANE_PUSH_IDLE, Ordering::Release);
-                metrics::counter!(
-                    "mux.server.detached_render_admission",
-                    "outcome" => "rejected"
-                )
-                .increment(1);
-                log::error!(
-                    "pane {pane_id} render push was not admitted; cached pane state remains available for the next notification or explicit client poll: {rejected:?}"
-                );
             }
         }
     }
@@ -10265,7 +10439,8 @@ mod tests {
                 sender,
                 SessionOwner::new(Arc::clone(&mux)),
                 stream_id,
-            );
+            )
+            .unwrap();
             handler.process_one(DecodedPdu {
                 serial: 1,
                 pdu: Pdu::SetClientId(SetClientId {
@@ -10590,7 +10765,8 @@ mod tests {
             sender,
             SessionOwner::new(Arc::clone(&mux)),
             stream_id,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 913,
             pdu: Pdu::SetClientId(SetClientId {
@@ -10638,13 +10814,13 @@ mod tests {
         assert_eq!(queued.depth, 1, "the sampled key must own one runnable");
         assert_eq!(queued.capacity, executor.admission_snapshot().task_capacity);
         assert!(queued.oldest_enqueued_at.is_some());
-        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        assert_eq!(executor.admission_snapshot().active_tasks, 2);
         tick_until_response(&executor, &captured, 2);
         drain_simple_executor(&executor);
 
         assert_eq!(pane.key_down_count(), 1, "the key must be applied once");
         assert_eq!(executor.queue_snapshot().depth, 0);
-        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
         handler.process_one(DecodedPdu {
             serial: 915,
             pdu: Pdu::ReliableKeyEventV1(operational_retry),
@@ -10877,7 +11053,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let executor = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
         let blocker = match try_spawn_with_admission(
@@ -11455,7 +11631,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let executor = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
         let blocker = match try_spawn_with_admission(
@@ -11472,7 +11648,7 @@ mod tests {
         tab.assign_pane(&pane_for_tab);
         let (mux, _mux_guard) = install_tab_with_window(&tab);
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 915,
@@ -11499,13 +11675,13 @@ mod tests {
         error
             .validate()
             .expect("scheduler rejection must be canonical");
-        assert_eq!(executor.queue_snapshot().depth, 1);
-        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        assert_eq!(executor.queue_snapshot().depth, 2);
+        assert_eq!(executor.admission_snapshot().active_tasks, 2);
 
         drop(blocker);
-        assert!(executor.try_tick().unwrap());
+        drain_simple_executor(&executor);
         assert_eq!(executor.queue_snapshot().depth, 0);
-        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
     }
 
     #[test]
@@ -11514,7 +11690,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let executor = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
         let blocker = match try_spawn_with_admission(
@@ -11532,7 +11708,7 @@ mod tests {
         mux.add_pane(&pane_for_mux)
             .expect("register reliable-input saturation pane");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 916,
             pdu: Pdu::SetClientId(SetClientId {
@@ -11679,7 +11855,7 @@ mod tests {
         mux.add_pane(&pane_for_mux)
             .expect("register reliable pane-write test pane");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 1,
             pdu: Pdu::SetClientId(SetClientId {
@@ -11797,7 +11973,7 @@ mod tests {
         let pane_registration =
             ReliablePaneRegistrationIdentityV1::from_bytes(registration.wire_identity());
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 1,
             pdu: Pdu::SetClientId(SetClientId {
@@ -11935,7 +12111,7 @@ mod tests {
             .capture_pane_registration(&pane_for_mux)
             .expect("capture cancellation pane authority");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 1,
             pdu: Pdu::SetClientId(SetClientId {
@@ -11954,6 +12130,7 @@ mod tests {
         };
 
         handler.reliable_input_test_fault = ReliableInputTestFault::CancelAfterEnqueue;
+        drain_simple_executor(&executor);
         handler.process_one(DecodedPdu {
             serial: 2,
             pdu: Pdu::ReliablePaneWriteV1(request.clone()),
@@ -11995,7 +12172,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let executor = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+            MainThreadAdmissionLimits::new(2, 12 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
         let blocker = match try_spawn_with_admission(
@@ -12016,7 +12193,7 @@ mod tests {
             .capture_pane_registration(&pane_for_mux)
             .expect("capture saturation pane authority");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 1,
             pdu: Pdu::SetClientId(SetClientId {
@@ -12094,7 +12271,8 @@ mod tests {
             sender,
             SessionOwner::new(Arc::clone(&mux)),
             stream_id,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 914,
             pdu: Pdu::SetClientId(SetClientId {
@@ -14728,13 +14906,14 @@ mod tests {
 
     #[test]
     fn per_pane_cache_is_scoped_to_exact_registration() {
+        let _executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_001;
         let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
         mux.add_pane(&original).expect("register original pane");
         let (sender, _captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         let original_registration = handler
             .owner
             .authority()
@@ -14770,6 +14949,7 @@ mod tests {
 
     #[test]
     fn old_registration_candidate_ack_cannot_commit_replacement_state() {
+        let _executor = SimpleExecutor::new();
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_002;
@@ -14777,7 +14957,7 @@ mod tests {
         mux.add_pane(&original).expect("register original pane");
         let (sender, _captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         let original_registration = handler
             .owner
             .authority()
@@ -14826,6 +15006,7 @@ mod tests {
 
     #[test]
     fn old_registration_legacy_enqueue_ack_cannot_mutate_replacement_state() {
+        let _executor = SimpleExecutor::new();
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_003;
@@ -14833,7 +15014,7 @@ mod tests {
         mux.add_pane(&original).expect("register original pane");
         let (sender, _captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         let original_registration = handler
             .owner
             .authority()
@@ -14901,7 +15082,8 @@ mod tests {
         let mut handler = SessionHandler::new_for_session(
             sender,
             SessionOwner::new(Arc::clone(&originating_mux)),
-        );
+        )
+        .unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 301,
@@ -14938,7 +15120,7 @@ mod tests {
         let pane_dyn: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_dyn).unwrap();
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_session(sender, SessionOwner::new(mux));
+        let mut handler = SessionHandler::new_for_session(sender, SessionOwner::new(mux)).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 301,
@@ -14993,7 +15175,7 @@ mod tests {
             .expect("register unavailable pane");
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         render_callback_calls.store(0, Ordering::Relaxed);
 
         handler.process_one(DecodedPdu {
@@ -15055,7 +15237,7 @@ mod tests {
         mux.add_pane(&healthy).expect("register healthy pane");
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 402,
@@ -15124,7 +15306,7 @@ mod tests {
         );
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 403,
@@ -15176,7 +15358,7 @@ mod tests {
             .expect("capture original registration");
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 302,
@@ -15369,7 +15551,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label}: capture original registration"));
             let (sender, captured) = capturing_sender();
             let mut handler =
-                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)))
+                    .unwrap();
 
             handler.process_one(DecodedPdu {
                 serial: 10_000 + u64::try_from(case_index).expect("case index fits serial"),
@@ -15420,7 +15603,7 @@ mod tests {
             .expect("capture live pane registration");
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 303,
@@ -15543,7 +15726,7 @@ mod tests {
             .expect("register exact-generation key pane");
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         let client = test_client_id("admitted-key-generation", 41_010);
 
         handler.process_one(DecodedPdu {
@@ -15620,7 +15803,7 @@ mod tests {
         let client = test_client_id("forbidden-clipboard-activity", 41_009);
         let (sender, captured) = capturing_sender();
         let mut handler =
-            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
         handler.process_one(DecodedPdu {
             serial: 901,
             pdu: Pdu::SetClientId(SetClientId {
@@ -15703,7 +15886,8 @@ mod tests {
             sender,
             SessionOwner::new(Arc::clone(&mux)),
             current_stream,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 910,
             pdu: Pdu::SetClientId(SetClientId {
@@ -15840,7 +16024,8 @@ mod tests {
             sender,
             SessionOwner::new(Arc::clone(&mux)),
             stream_id,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 916,
             pdu: Pdu::SetClientId(SetClientId {
@@ -16173,7 +16358,7 @@ mod tests {
         armed.store(1, Ordering::Release);
 
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.process_one(DecodedPdu {
             serial: 121,
             pdu: Pdu::ListPanes(ListPanes {}),
@@ -16209,7 +16394,8 @@ mod tests {
             sender,
             SessionOwner::new(mux),
             stream_id,
-        );
+        )
+        .unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 122,
@@ -16705,7 +16891,8 @@ mod tests {
             sender,
             SessionOwner::new(mux),
             stream_id,
-        );
+        )
+        .unwrap();
 
         let request = ordered_snapshot_request(true);
         handler.process_one(DecodedPdu {
@@ -17413,7 +17600,8 @@ mod tests {
             sender,
             SessionOwner::new(mux),
             stream_id,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 123,
             pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
@@ -17452,7 +17640,8 @@ mod tests {
             sender,
             SessionOwner::new(mux),
             stream_id,
-        );
+        )
+        .unwrap();
         handler.process_one(DecodedPdu {
             serial: 124,
             pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
@@ -19926,7 +20115,7 @@ mod tests {
                 Ok(())
             }
         });
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         for (serial, seqno) in [(1, 11), (2, 12), (3, 12)] {
             if serial == 2 {
                 pane.state.lock().unwrap().seqno = seqno;
@@ -20008,7 +20197,7 @@ mod tests {
                 Ok(())
             }
         });
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         handler.process_one(DecodedPdu {
             serial: 41,
             pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
@@ -20129,7 +20318,7 @@ mod tests {
                     Ok(())
                 }
             });
-            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
             handler.process_one(DecodedPdu {
                 serial: 43,
                 pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
@@ -20192,7 +20381,7 @@ mod tests {
         let pane_dyn: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_dyn).unwrap();
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         handler.process_one(DecodedPdu {
             serial: 42,
             pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
@@ -22810,6 +22999,152 @@ mod tests {
     }
 
     #[test]
+    fn session_render_owner_delivers_final_output_with_initial_render_capacity_full() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(2, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_dyn).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
+        drain_simple_executor(&executor);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        let blocker = match try_reserve_main_thread_with_low_priority(
+            MainThreadServiceClass::Render,
+            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation.spawn_local(std::future::pending::<()>())
+            }
+            other => panic!("expected remaining Render slot, got {other:?}"),
+        };
+        assert!(matches!(
+            try_reserve_main_thread_with_low_priority(
+                MainThreadServiceClass::Render,
+                MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+            ),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
+        pane.state.lock().unwrap().seqno = 12;
+        handler.schedule_pane_push(pane.pane_id());
+        for _ in 0..100 {
+            handler.schedule_tracked_pane_push(pane.pane_id());
+        }
+        let coordinator = handler.push_coordinator.as_ref().unwrap();
+        assert_eq!(coordinator.queue.lock().unwrap().pending.len(), 1);
+        assert_eq!(coordinator.queue.lock().unwrap().order.len(), 1);
+        drain_simple_executor(&executor);
+        assert!(
+            captured.lock().unwrap().iter().any(|decoded| matches!(
+                &decoded.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.seqno == 12
+            )),
+            "the already-admitted owner must progress even before the blocker releases capacity"
+        );
+        assert!(coordinator.queue.lock().unwrap().pending.is_empty());
+        drop(blocker);
+        drain_simple_executor(&executor);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        drop(handler);
+        drain_simple_executor(&executor);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn session_render_owner_skips_busy_pane_and_retires_queued_registration() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        for replace in [false, true] {
+            let executor = SimpleExecutor::with_io_runtime().unwrap();
+            let mux = Arc::new(Mux::new(None));
+            let busy = Arc::new(FakePane::new_with_id(8_921, None));
+            busy.coherent_surface.store(true, Ordering::Release);
+            busy.line_layout_busy.store(true, Ordering::Release);
+            busy.state.lock().unwrap().title = "retired-busy-source".to_string();
+            let quiet: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(8_922, None));
+            let busy_dyn: Arc<dyn Pane> = busy.clone();
+            mux.add_pane(&busy_dyn).unwrap();
+            mux.add_pane(&quiet).unwrap();
+            let original = mux.capture_pane_registration(&busy_dyn).unwrap();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
+            handler.schedule_pane_push(busy.pane_id());
+            drain_simple_executor(&executor);
+            assert!(captured.lock().unwrap().is_empty());
+            assert_eq!(
+                handler
+                    .push_coordinator
+                    .as_ref()
+                    .unwrap()
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .len(),
+                1
+            );
+            handler.schedule_pane_push(quiet.pane_id());
+            drain_simple_executor(&executor);
+            assert!(busy.line_layout_busy.load(Ordering::Acquire));
+            assert!(captured.lock().unwrap().iter().any(|decoded| matches!(
+                &decoded.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.pane_id == quiet.pane_id()
+            )), "quiet final output must not wait for the busy sibling's lock");
+            let old_state = Arc::clone(&handler.per_pane[&busy.pane_id()].push_state);
+            assert!(original.retire_if_current());
+            if replace {
+                let replacement = Arc::new(FakePane::new_with_id(busy.pane_id(), None));
+                replacement.state.lock().unwrap().title = "replacement-source".to_string();
+                let replacement_dyn: Arc<dyn Pane> = replacement;
+                mux.add_pane(&replacement_dyn).unwrap();
+                handler.schedule_pane_push(replacement_dyn.pane_id());
+            } else {
+                handler.remove_per_pane_if_same(&original);
+            }
+            assert_eq!(old_state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+            busy.line_layout_busy.store(false, Ordering::Release);
+            drain_simple_executor(&executor);
+            let responses = captured.lock().unwrap();
+            assert!(!responses.iter().any(|decoded| matches!(
+                &decoded.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.title == "retired-busy-source"
+            )));
+            assert_eq!(responses.iter().filter(|decoded| matches!(
+                &decoded.pdu, Pdu::GetPaneRenderChangesResponse(response) if response.title == "replacement-source"
+            )).count(), usize::from(replace));
+            drop(responses);
+            drop(handler);
+            drain_simple_executor(&executor);
+        }
+    }
+
+    #[test]
+    fn session_render_owner_refuses_connection_without_capacity_and_clears_shutdown_work() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 4 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        mux.add_pane(&pane).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender.clone(), Arc::clone(&mux)).unwrap();
+        assert!(SessionHandler::new_for_mux(sender, mux).is_err());
+        handler.schedule_pane_push(pane.pane_id());
+        let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
+        let coordinator = Arc::clone(handler.push_coordinator.as_ref().unwrap());
+        // Drop before the owner's first poll, with a retained final update.
+        drop(handler);
+        assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_IDLE);
+        assert!(coordinator.queue.lock().unwrap().closed);
+        assert!(coordinator.queue.lock().unwrap().pending.is_empty());
+        drain_simple_executor(&executor);
+        assert!(captured.lock().unwrap().is_empty());
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
     fn detached_render_push_coalesces_burst_before_capture() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let mut callback_counts = Vec::new();
@@ -22825,7 +23160,7 @@ mod tests {
             }));
             mux.add_pane(&pane).unwrap();
             let (sender, captured) = capturing_sender();
-            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
             callbacks.store(0, Ordering::Relaxed);
             handler.schedule_pane_push(pane.pane_id());
             for _ in 1..notifications {
@@ -22898,7 +23233,7 @@ mod tests {
         mux.add_pane(&render).unwrap();
         mux.add_pane(&input_dyn).unwrap();
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         handler.schedule_pane_push(render.pane_id());
         let state = Arc::clone(&handler.per_pane[&render.pane_id()].push_state);
         *handler_slot.lock().unwrap() = Some(handler);
@@ -22942,7 +23277,7 @@ mod tests {
             let pane_dyn: Arc<dyn Pane> = pane.clone();
             mux.add_pane(&pane_dyn).unwrap();
             let (sender, captured) = capturing_sender();
-            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
             handler.schedule_pane_push(pane.pane_id());
             let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
             drain_simple_executor(&executor);
@@ -23014,7 +23349,7 @@ mod tests {
             let pane: Arc<dyn Pane> = Arc::new(fake);
             mux.add_pane(&pane).unwrap();
             let (sender, captured) = capturing_sender();
-            let mut handler = SessionHandler::new_for_mux(sender, mux);
+            let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
             handler.schedule_pane_push(pane.pane_id());
             let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
             let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -23048,7 +23383,7 @@ mod tests {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         mux.add_pane(&pane).unwrap();
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let mut handler = SessionHandler::new_for_mux(sender, mux).unwrap();
         handler.schedule_pane_push(pane.pane_id());
         let state = Arc::clone(&handler.per_pane[&pane.pane_id()].push_state);
         assert_eq!(state.load(Ordering::Acquire), PANE_PUSH_SCHEDULED);
@@ -23081,7 +23416,7 @@ mod tests {
             mux.add_pane(&render).unwrap();
             mux.add_pane(&input_dyn).unwrap();
             let (sender, captured) = capturing_sender();
-            let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+            let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
             if tracked {
                 let registration = mux.capture_pane_registration(&render).unwrap();
                 handler.per_pane_for_registration(&registration);
@@ -23150,7 +23485,7 @@ mod tests {
         mux.add_pane(&pane_dyn)
             .expect("register input ACK test pane");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 9_701,
@@ -23199,7 +23534,7 @@ mod tests {
         mux.add_pane(&pane_dyn)
             .expect("register paste dispatch-fence test pane");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
         let input_serial = InputSerial::now();
 
         handler.process_one(DecodedPdu {
@@ -23251,7 +23586,7 @@ mod tests {
         mux.add_pane(&pane_dyn)
             .expect("register paste ACK failure-path test pane");
         let (sender, captured) = capturing_sender();
-        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux)).unwrap();
 
         handler.process_one(DecodedPdu {
             serial: 9_703,
