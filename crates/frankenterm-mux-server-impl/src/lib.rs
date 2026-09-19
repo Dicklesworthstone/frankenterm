@@ -60,6 +60,9 @@ const LIVE_SCROLLBACK_LINE_RECORD_V2_ZSTD: &str = "ftsl2z:";
 const LIVE_SCROLLBACK_LINE_COMPRESS_MIN_BYTES: usize = 256;
 const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES: u64 = 16 * 1024 * 1024;
 const LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE: usize = 16 * 1024 * 1024;
+const EXACT_SCROLLBACK_ZSTD_MAGIC: &[u8; 8] = b"FTSLZ1\0\0";
+const EXACT_SCROLLBACK_ZSTD_HEADER_BYTES: usize = 12;
+const EXACT_SCROLLBACK_ZSTD_WINDOW_LOG: u32 = 17;
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V1: &str = "frankenterm.live-scrollback-manifest.v1";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V2: &str = "frankenterm.live-scrollback-manifest.v2";
 const LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3: &str = "frankenterm.live-scrollback-manifest.v3";
@@ -6402,11 +6405,100 @@ fn encode_exact_scrollback_line_record(
     identity: mux::guardian_output_journal::GuardianScrollbackRowIdentity,
 ) -> Option<String> {
     let plaintext = serialize_exact_semantic_scrollback_line(line)?;
+    let compressed = compress_exact_scrollback_plaintext(&plaintext);
+    let payload = compressed.as_deref().unwrap_or(&plaintext);
     cipher
-        .seal_scrollback_row(identity, &plaintext)
+        .seal_scrollback_row(identity, payload)
         .ok()?
         .encode()
         .ok()
+}
+
+/// Compress only the exact semantic bytes, before the existing AEAD boundary.
+/// Each frame is independent; the thread-local context only reuses workspace,
+/// never a dictionary from another row. Failed or unhelpful compression leaves
+/// the original representation intact.
+fn compress_exact_scrollback_plaintext(plaintext: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if plaintext.len() < 256 || plaintext.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+        return None;
+    }
+    std::thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    COMPRESSOR
+        .try_with(|slot| {
+            let mut slot = slot.try_borrow_mut().ok()?;
+            if slot.is_none() {
+                let mut compressor = zstd::bulk::Compressor::new(1).ok()?;
+                compressor
+                    .window_log(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)
+                    .ok()?;
+                *slot = Some(compressor);
+            }
+            let compressor = slot.as_mut()?;
+            let mut payload = Zeroizing::new(Vec::new());
+            payload.try_reserve_exact(plaintext.len()).ok()?;
+            payload.resize(plaintext.len(), 0);
+            let compressed_bytes = compressor
+                .compress_to_buffer(
+                    plaintext,
+                    &mut payload[EXACT_SCROLLBACK_ZSTD_HEADER_BYTES..],
+                )
+                .ok()?;
+            let encoded_bytes = EXACT_SCROLLBACK_ZSTD_HEADER_BYTES.checked_add(compressed_bytes)?;
+            if encoded_bytes >= plaintext.len() {
+                return None;
+            }
+            payload[..8].copy_from_slice(EXACT_SCROLLBACK_ZSTD_MAGIC);
+            payload[8..EXACT_SCROLLBACK_ZSTD_HEADER_BYTES]
+                .copy_from_slice(&u32::try_from(plaintext.len()).ok()?.to_le_bytes());
+            payload.truncate(encoded_bytes);
+            metrics::counter!("mux.scrollback.exact_compressed_rows").increment(1);
+            metrics::counter!("mux.scrollback.exact_compression_bytes_saved")
+                .increment((plaintext.len() - encoded_bytes) as u64);
+            Some(payload)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Called only after authenticating the encrypted row at its expected location.
+/// Bound frame input, declared expansion, actual output, and decoder workspace;
+/// a short frame, concatenated frame, or trailing bytes cannot become a row.
+fn expand_exact_scrollback_plaintext(
+    plaintext: Zeroizing<Vec<u8>>,
+    max_decoded_bytes: usize,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    if !plaintext.starts_with(EXACT_SCROLLBACK_ZSTD_MAGIC) {
+        return Ok(plaintext);
+    }
+    let encoded_size: [u8; 4] = plaintext
+        .get(8..EXACT_SCROLLBACK_ZSTD_HEADER_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("compressed semantic scrollback header is truncated"))?
+        .try_into()?;
+    let expected = usize::try_from(u32::from_le_bytes(encoded_size))?;
+    anyhow::ensure!(
+        expected <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE && plaintext.len() < expected,
+        "compressed semantic scrollback expansion is invalid"
+    );
+    if expected > max_decoded_bytes {
+        return Err(ScrollbackDecodedBudgetExceeded {
+            minimum_required: expected,
+        }
+        .into());
+    }
+    let mut decoder = zstd::Decoder::with_buffer(&plaintext[EXACT_SCROLLBACK_ZSTD_HEADER_BYTES..])?
+        .single_frame();
+    decoder.window_log_max(EXACT_SCROLLBACK_ZSTD_WINDOW_LOG)?;
+    let mut expanded = BoundedScrollbackPlaintext::new(expected);
+    std::io::copy(&mut decoder, &mut expanded)
+        .context("bounded expansion of authenticated semantic scrollback")?;
+    anyhow::ensure!(
+        expanded.bytes.len() == expected && decoder.finish().is_empty(),
+        "compressed semantic scrollback frame length or trailing bytes mismatch"
+    );
+    Ok(expanded.bytes)
 }
 
 fn serialize_exact_semantic_scrollback_line(
@@ -6566,7 +6658,8 @@ fn decode_scrollback_line_record_with_budget_status(
         }
     }
     let decoded_payload = if compressed {
-        let decoder = zstd::Decoder::new(payload.as_slice()).ok()?;
+        let mut decoder = zstd::Decoder::new(payload.as_slice()).ok()?;
+        decoder.window_log_max(24).ok()?;
         let mut decompressed = Vec::new();
         decoder
             .take(max_decoded_bytes.checked_add(1)?)
@@ -6648,7 +6741,9 @@ impl<'a> GuardianScrollbackCipherCache<'a> {
 
 #[derive(Debug, thiserror::Error)]
 #[error("scrollback row exceeds the remaining batch decoded-byte budget")]
-struct ScrollbackDecodedBudgetExceeded;
+struct ScrollbackDecodedBudgetExceeded {
+    minimum_required: usize,
+}
 
 fn decode_persisted_scrollback_line_with_limit(
     record: &str,
@@ -6671,7 +6766,10 @@ fn decode_persisted_scrollback_line_with_limit(
             "encrypted scrollback row exceeds the per-record decoded-byte limit"
         );
         if plaintext_bytes > max_decoded_bytes {
-            return Err(ScrollbackDecodedBudgetExceeded.into());
+            return Err(ScrollbackDecodedBudgetExceeded {
+                minimum_required: plaintext_bytes,
+            }
+            .into());
         }
         let stable_row = i64::try_from(stable_row)
             .map_err(|_| anyhow::anyhow!("stable row does not fit encrypted row identity"))?;
@@ -6689,6 +6787,7 @@ fn decode_persisted_scrollback_line_with_limit(
                     .unwrap_or(u32::MAX),
             )
             .context("authenticate semantic scrollback row at durable location")?;
+        let plaintext = expand_exact_scrollback_plaintext(plaintext, max_decoded_bytes)?;
         let decoded_bytes = plaintext.len();
         let mut reader = plaintext.as_slice();
         let mut semantic: ExactSemanticScrollbackLineV1 =
@@ -6741,7 +6840,10 @@ fn decode_persisted_scrollback_line_with_limit(
             &mut budget_exceeded,
         );
         if budget_exceeded {
-            return Err(ScrollbackDecodedBudgetExceeded.into());
+            return Err(ScrollbackDecodedBudgetExceeded {
+                minimum_required: max_decoded_bytes.saturating_add(1),
+            }
+            .into());
         }
         let (line, decoded_bytes) = decoded
             .ok_or_else(|| anyhow::anyhow!("legacy scrollback row failed bounded decoding"))?;
@@ -6759,7 +6861,10 @@ fn decode_persisted_scrollback_line_with_limit(
         "legacy text scrollback row exceeds the per-record decoded-byte limit"
     );
     if record.len() > max_decoded_bytes {
-        return Err(ScrollbackDecodedBudgetExceeded.into());
+        return Err(ScrollbackDecodedBudgetExceeded {
+            minimum_required: record.len(),
+        }
+        .into());
     }
     Ok((
         legacy_text_scrollback_line(record),
@@ -7593,7 +7698,23 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
                         seq,
                         remaining_decoded_bytes,
                     )
-                    .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
+                    .map_err(|error| {
+                        if let Some(budget) =
+                            error.downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                        {
+                            ScrollbackSpillError::ResourceLimit {
+                                resource: "decoded_bytes",
+                                observed: u64::try_from(
+                                    decoded_bytes.saturating_add(budget.minimum_required),
+                                )
+                                .unwrap_or(u64::MAX),
+                                maximum: u64::try_from(limits.max_decoded_bytes)
+                                    .unwrap_or(u64::MAX),
+                            }
+                        } else {
+                            ScrollbackSpillError::StorageUnavailable
+                        }
+                    })?;
                 if row_fidelity == DecodedScrollbackRecordFidelity::LegacyRedacted {
                     fidelity = ScrollbackSnapshotFidelity::LegacyRedacted;
                 }
@@ -10054,9 +10175,200 @@ mod tests {
     }
 
     #[test]
-    fn live_scrollback_batch_budget_limits_preserve_multirow_prefix() {
-        use mux::guardian_output_journal::GuardianEncryptedScrollbackRow;
+    fn exact_scrollback_compression_preserves_encrypted_semantics_and_budget() {
+        use mux::guardian_output_journal::{
+            GuardianEncryptedScrollbackRow, GuardianScrollbackRowIdentity,
+        };
 
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://checkpoint.example/compressed",
+            "compressed-row",
+        ))));
+        let mut line = Line::from_text(
+            "FT_STR_00000000 0123456789abcdef0123456789abcdef café 中文 e\u{301} 🙂  ",
+            &attrs,
+            42,
+            None,
+        );
+        line.set_cell_grapheme(0, "F", 2, attrs, 42);
+        line.set_last_cell_was_wrapped(true, 42);
+        let raw = serialize_exact_semantic_scrollback_line(&line).unwrap();
+        assert!(backing.store_scrollback_line(0, &line, 16));
+        let records = backing
+            .lock_store("compressed row test")
+            .unwrap()
+            .lines_range(backing.active_ledger_pane_id(), 0..1, 1, 1024 * 1024)
+            .unwrap();
+        let parsed = GuardianEncryptedScrollbackRow::parse(&records[0]).unwrap();
+        assert!(usize::try_from(parsed.plaintext_bytes()).unwrap() < raw.len());
+        let state = *backing.lock_state("compressed row identity").unwrap();
+        let keyring = backing.lock_keyring("compressed row decode").unwrap();
+        let mut cache = GuardianScrollbackCipherCache::new(&keyring);
+        let (decoded, charged, fidelity) = decode_persisted_scrollback_line_with_limit(
+            &records[0],
+            &mut cache,
+            backing.durable_pane_id,
+            state.content_epoch,
+            0,
+            0,
+            raw.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_exact_semantic_scrollback_line(&decoded).unwrap(),
+            raw
+        );
+        assert_eq!(
+            charged,
+            raw.len(),
+            "charge expanded semantics, not compressed ciphertext"
+        );
+        assert_eq!(fidelity, DecodedScrollbackRecordFidelity::ExactSemantic);
+        let error = decode_persisted_scrollback_line_with_limit(
+            &records[0],
+            &mut cache,
+            backing.durable_pane_id,
+            state.content_epoch,
+            0,
+            0,
+            raw.len() - 1,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                .is_some()
+        );
+        assert!(
+            decode_persisted_scrollback_line_with_limit(
+                &records[0],
+                &mut cache,
+                backing.durable_pane_id,
+                state.content_epoch,
+                1,
+                0,
+                raw.len(),
+            )
+            .is_err(),
+            "compression cannot weaken authenticated row location"
+        );
+
+        let cipher = keyring.cipher_for_key_id(parsed.key_id()).unwrap();
+        let old = cipher
+            .seal_scrollback_row(
+                GuardianScrollbackRowIdentity::new(
+                    backing.durable_pane_id,
+                    state.content_epoch,
+                    state.revision,
+                    0,
+                    0,
+                )
+                .unwrap(),
+                &raw,
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+        let (old_decoded, old_charge, _) = decode_persisted_scrollback_line_with_limit(
+            &old,
+            &mut cache,
+            backing.durable_pane_id,
+            state.content_epoch,
+            0,
+            0,
+            raw.len(),
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_exact_semantic_scrollback_line(&old_decoded).unwrap(),
+            raw
+        );
+        assert_eq!(old_charge, raw.len());
+        drop(cache);
+        drop(keyring);
+
+        let limits = wezterm_term::config::ScrollbackSnapshotLimits {
+            max_rows: 16,
+            max_stored_bytes: 1024 * 1024,
+            max_decoded_bytes: raw.len(),
+            max_physical_bytes: 1024 * 1024,
+        };
+        assert_eq!(
+            backing.snapshot_scrollback(1, limits).unwrap().rows().len(),
+            1
+        );
+        assert!(matches!(
+            backing.snapshot_scrollback(
+                1,
+                wezterm_term::config::ScrollbackSnapshotLimits {
+                    max_decoded_bytes: raw.len() - 1,
+                    ..limits
+                }
+            ),
+            Err(wezterm_term::config::ScrollbackSpillError::ResourceLimit {
+                resource: "decoded_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_scrollback_compression_rejects_invalid_frames_and_window_growth() {
+        let raw = vec![b'a'; 4096];
+        let encoded = compress_exact_scrollback_plaintext(&raw).unwrap();
+        assert_eq!(
+            *expand_exact_scrollback_plaintext(encoded.clone(), raw.len()).unwrap(),
+            raw
+        );
+        assert!(compress_exact_scrollback_plaintext(b"small raw payload").is_none());
+        let other = vec![b'b'; 4096];
+        let second = compress_exact_scrollback_plaintext(&other).unwrap();
+        assert_eq!(
+            *expand_exact_scrollback_plaintext(second, other.len()).unwrap(),
+            other
+        );
+        assert_eq!(
+            *expand_exact_scrollback_plaintext(encoded.clone(), raw.len()).unwrap(),
+            raw
+        );
+        assert!(
+            expand_exact_scrollback_plaintext(
+                Zeroizing::new(EXACT_SCROLLBACK_ZSTD_MAGIC.to_vec()),
+                raw.len()
+            )
+            .is_err()
+        );
+        for declared in [4095u32, 4097, u32::MAX] {
+            let mut malformed = encoded.clone();
+            malformed[8..12].copy_from_slice(&declared.to_le_bytes());
+            assert!(expand_exact_scrollback_plaintext(malformed, usize::MAX).is_err());
+        }
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(expand_exact_scrollback_plaintext(truncated, raw.len()).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(expand_exact_scrollback_plaintext(trailing, raw.len()).is_err());
+        let mut concatenated = encoded.clone();
+        concatenated.extend_from_slice(&encoded[EXACT_SCROLLBACK_ZSTD_HEADER_BYTES..]);
+        assert!(expand_exact_scrollback_plaintext(concatenated, raw.len()).is_err());
+
+        let wide = vec![b'w'; 1 << 18];
+        let mut compressor = zstd::bulk::Compressor::new(1).unwrap();
+        compressor.window_log(18).unwrap();
+        compressor.include_contentsize(false).unwrap();
+        let frame = compressor.compress(&wide).unwrap();
+        let mut oversized_window = Zeroizing::new(EXACT_SCROLLBACK_ZSTD_MAGIC.to_vec());
+        oversized_window.extend_from_slice(&u32::try_from(wide.len()).unwrap().to_le_bytes());
+        oversized_window.extend_from_slice(&frame);
+        assert!(expand_exact_scrollback_plaintext(oversized_window, wide.len()).is_err());
+    }
+
+    #[test]
+    fn live_scrollback_batch_budget_limits_preserve_multirow_prefix() {
         let (_dir, backing, _deferred) = deferred_test_sink();
         let line = Line::from_text(
             "real encrypted budget row",
@@ -10076,17 +10388,10 @@ mod tests {
             .iter()
             .map(|record| u64::try_from(record.len()).unwrap() + 1)
             .sum();
-        let decoded_budget = records[..2]
-            .iter()
-            .map(|record| {
-                usize::try_from(
-                    GuardianEncryptedScrollbackRow::parse(record)
-                        .unwrap()
-                        .plaintext_bytes(),
-                )
-                .unwrap()
-            })
-            .sum();
+        let decoded_budget = serialize_exact_semantic_scrollback_line(&line)
+            .unwrap()
+            .len()
+            * 2;
         assert_eq!(
             backing
                 .load_scrollback_lines_with_limits(0..4, stored_budget, usize::MAX)
