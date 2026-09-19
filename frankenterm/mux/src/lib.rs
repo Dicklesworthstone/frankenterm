@@ -4176,6 +4176,18 @@ mod pane_registration_handle {
             )
         }
 
+        pub fn capture_surface_snapshot(
+            &self,
+            baseline: termwiz::surface::SequenceNo,
+        ) -> Option<
+            Result<
+                crate::pane::PaneSurfaceSnapshot,
+                frankenterm_term::screen::ColdReadMetadataBusy,
+            >,
+        > {
+            self.pane.capture_surface_snapshot(baseline)
+        }
+
         pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
             self.pane.palette()
         }

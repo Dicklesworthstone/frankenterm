@@ -663,6 +663,24 @@ pub struct PaneTitleMetadata {
     pub has_unseen_output: bool,
 }
 
+/// Coherent observation of visible surface metadata, damage, and resident rows
+/// captured under a single terminal acquisition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneSurfaceSnapshot {
+    pub source_sequence: SequenceNo,
+    pub line_layout_floor: Option<SequenceNo>,
+    pub dimensions: RenderableDimensions,
+    pub mouse_grabbed: bool,
+    pub alt_screen_active: bool,
+    pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
+    pub cursor_position: StableCursorPosition,
+    pub title: String,
+    pub working_dir: Option<Url>,
+    pub dirty_lines: RangeSet<StableRowIndex>,
+    pub viewport_lines: (StableRowIndex, Vec<Line>),
+    pub cursor_lines: (StableRowIndex, Vec<Line>),
+}
+
 // `async_trait` keeps this trait object-safe by generating boxed `Future`
 // returns. The macro's own `#[must_use]` annotation duplicates the future's
 // intrinsic must-use contract under newer Clippy, so scope the compatibility
@@ -776,6 +794,22 @@ pub trait Pane: Downcast + Send + Sync {
         _publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
         Ok(false)
+    }
+
+    /// Observe terminal surface metadata, damage, and resident rows under one
+    /// nonblocking terminal acquisition. External title/CWD fallback resolution
+    /// may follow after releasing that guard.
+    ///
+    /// Backends that do not support atomic snapshot capture return `None` so
+    /// callers use the independently fenced reads. Exhausted sequence domains
+    /// may also use that path to preserve terminal rejection. `Some(Err(_))`
+    /// means a complete observation is currently unavailable; never substitute
+    /// a partial snapshot or read cold payloads while holding the terminal.
+    fn capture_surface_snapshot(
+        &self,
+        _baseline: SequenceNo,
+    ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
+        None
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);

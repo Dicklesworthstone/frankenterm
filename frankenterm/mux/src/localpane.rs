@@ -6,8 +6,8 @@ use crate::guardian_checkpoint::{
 use crate::pane::GuardianLiveOutputDelivery;
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveCheckpointPublisher,
-    GuardianLiveOutputReader, LogicalLine, Pane, PaneId, PaneTitleMetadata, Pattern, SearchResult,
-    WithPaneLines,
+    GuardianLiveOutputReader, LogicalLine, Pane, PaneId, PaneSurfaceSnapshot, PaneTitleMetadata,
+    Pattern, SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -1670,6 +1670,115 @@ impl Pane for LocalPane {
         }
         publish();
         Ok(true)
+    }
+
+    fn capture_surface_snapshot(
+        &self,
+        baseline: SequenceNo,
+    ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
+        let mut term = match self.terminal.try_lock() {
+            Some(term) => term,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+        #[cfg(feature = "disruptor-pane-io")]
+        self.drain_action_ring_locked(&mut term);
+
+        match self.tmux_domain.try_lock() {
+            Some(guard) if guard.is_some() => return None,
+            Some(_) => {}
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        }
+
+        let line_layout_floor =
+            match Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term) {
+                Ok(Some(floor)) => floor,
+                // Let the existing source-fence path retire an exhausted
+                // sequence domain instead of turning it into retryable busy.
+                Ok(None) if term.current_seqno() == SequenceNo::MAX => return None,
+                Ok(None) | Err(_) => {
+                    return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                }
+            };
+
+        let dimensions = match terminal_try_get_dimensions(&mut term) {
+            Some(dims) => dims,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+
+        let mouse_grabbed = term.is_mouse_grabbed();
+        let alt_screen_active = term.is_alt_screen_active();
+
+        let tiered_scrollback_status = Some(term.screen().tiered_scrollback_status().into());
+
+        let cursor_position = terminal_get_cursor_position(&mut term);
+
+        let source_sequence = term.current_seqno();
+
+        let damage_baseline = crate::pane::changed_since_query_baseline(baseline, source_sequence);
+
+        let viewport_range = match StableRowIndex::try_from(dimensions.viewport_rows)
+            .ok()
+            .and_then(|len| dimensions.physical_top.checked_add(len))
+        {
+            Some(end) => dimensions.physical_top..end,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+
+        let dirty_lines = terminal_get_dirty_lines(&mut term, viewport_range, damage_baseline);
+
+        let screen = term.screen();
+
+        let phys_start = match screen.stable_row_to_phys(dimensions.physical_top) {
+            Some(phys) => phys,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+        let phys_end = match phys_start.checked_add(dimensions.viewport_rows) {
+            Some(end) => end,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+        let lines = screen.lines_in_phys_range(phys_start..phys_end);
+        if lines.len() != dimensions.viewport_rows {
+            return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy));
+        }
+        let viewport_lines = (dimensions.physical_top, lines);
+
+        let cursor_phys = match screen.stable_row_to_phys(cursor_position.y) {
+            Some(phys) => phys,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+        let cursor_end = match cursor_phys.checked_add(1) {
+            Some(end) => end,
+            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+        };
+        let cursor_row_lines = screen.lines_in_phys_range(cursor_phys..cursor_end);
+        if cursor_row_lines.len() != 1 {
+            return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy));
+        }
+        let cursor_lines = (cursor_position.y, cursor_row_lines);
+
+        let raw_title = term.get_title().to_string();
+        let cached_cwd = term.get_current_dir().cloned();
+
+        drop(term);
+
+        let title = self.resolve_pane_title(raw_title);
+        let working_dir =
+            cached_cwd.or_else(|| self.divine_current_working_dir(CachePolicy::AllowStale));
+
+        Some(Ok(PaneSurfaceSnapshot {
+            source_sequence,
+            line_layout_floor: Some(line_layout_floor),
+            dimensions,
+            mouse_grabbed,
+            alt_screen_active,
+            tiered_scrollback_status,
+            cursor_position,
+            title,
+            working_dir,
+            dirty_lines,
+            viewport_lines,
+            cursor_lines,
+        }))
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -7527,6 +7636,11 @@ mod tests {
                 Ok(None)
             );
         }
+        let pane = make_legacy_test_pane(785, term);
+        assert!(
+            pane.capture_surface_snapshot(0).is_none(),
+            "sequence exhaustion must reach the terminal source-fence rejection, not retryable busy"
+        );
     }
 
     #[test]
@@ -10412,5 +10526,142 @@ mod disruptor_ring_keep_gate {
         assert_eq!(checkpoint.primary_cell_text(0, 0), Some("r"));
         assert_eq!(checkpoint.primary_cell_text(0, 1), Some("e"));
         assert_eq!(checkpoint.primary_cell_text(0, 2), Some("f"));
+    }
+
+    #[test]
+    fn capture_surface_snapshot_busy_refusal() {
+        let terminal = guardian_lifetime_test_terminal();
+        let pane = make_legacy_test_pane(783, terminal);
+
+        // 1. Terminal lock contention
+        {
+            let _guard = pane.terminal.lock();
+            let result = pane.capture_surface_snapshot(0);
+            assert!(
+                matches!(
+                    result,
+                    Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                ),
+                "terminal lock contention must return Some(Err(ColdReadMetadataBusy))"
+            );
+        }
+
+        // 2. Tmux domain lock contention
+        {
+            let _guard = pane.tmux_domain.lock();
+            let result = pane.capture_surface_snapshot(0);
+            assert!(
+                matches!(
+                    result,
+                    Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                ),
+                "tmux domain lock contention must return Some(Err(ColdReadMetadataBusy))"
+            );
+        }
+
+        // 3. Line layout observation lock contention
+        {
+            let _guard = pane.line_layout_observation.lock();
+            let result = pane.capture_surface_snapshot(0);
+            assert!(
+                matches!(
+                    result,
+                    Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                ),
+                "line layout observation lock contention must return Some(Err(ColdReadMetadataBusy))"
+            );
+        }
+
+        // 4. Uncontended call succeeds
+        let result = pane.capture_surface_snapshot(0);
+        assert!(result.is_some() && result.as_ref().unwrap().is_ok());
+    }
+
+    #[test]
+    fn capture_surface_snapshot_exact_resident_metadata_dirty_and_rows() {
+        let mut terminal = guardian_lifetime_test_terminal();
+        terminal.advance_bytes(b"hello world\r\nsecond line");
+        let pane = make_legacy_test_pane(784, terminal);
+
+        let snap1 = pane
+            .capture_surface_snapshot(0)
+            .expect("supported backend returns Some")
+            .expect("uncontended snapshot succeeds");
+
+        assert_eq!(snap1.dimensions.cols, 80);
+        assert_eq!(snap1.dimensions.viewport_rows, 24);
+        assert_eq!(snap1.source_sequence, pane.get_current_seqno());
+        assert!(!snap1.mouse_grabbed);
+        assert!(!snap1.alt_screen_active);
+        assert_eq!(snap1.cursor_position, pane.get_cursor_position());
+        assert_eq!(snap1.title, pane.get_title());
+        assert_eq!(
+            snap1.working_dir,
+            pane.get_current_working_dir(CachePolicy::AllowStale)
+        );
+
+        // Dirty lines for baseline 0 should contain rows 0 and 1
+        assert!(snap1.dirty_lines.contains(0));
+        assert!(snap1.dirty_lines.contains(1));
+
+        // Viewport lines should have physical_top as start row and 24 rows
+        assert_eq!(snap1.viewport_lines.0, snap1.dimensions.physical_top);
+        assert_eq!(snap1.viewport_lines.1.len(), 24);
+        assert!(snap1.viewport_lines.1[0]
+            .as_str()
+            .starts_with("hello world"));
+        assert!(snap1.viewport_lines.1[1]
+            .as_str()
+            .starts_with("second line"));
+
+        // Cursor lines should be at cursor_position.y
+        assert_eq!(snap1.cursor_lines.0, snap1.cursor_position.y);
+        assert_eq!(snap1.cursor_lines.1.len(), 1);
+
+        // Snapshot with baseline = current source sequence: no dirty lines
+        let snap2 = pane
+            .capture_surface_snapshot(snap1.source_sequence)
+            .unwrap()
+            .unwrap();
+        assert!(snap2.dirty_lines.is_empty());
+
+        // Advance output and verify only new rows are dirty
+        pane.terminal.lock().advance_bytes(b"\r\nthird line");
+        let snap3 = pane
+            .capture_surface_snapshot(snap1.source_sequence)
+            .unwrap()
+            .unwrap();
+        assert!(snap3.dirty_lines.contains(2));
+        assert!(!snap3.dirty_lines.contains(0));
+        assert_eq!(snap3.viewport_lines.1[2].as_str().trim_end(), "third line");
+    }
+
+    #[test]
+    fn capture_surface_snapshot_zero_cold_storage_reads() {
+        let (pane, _mux, _reg, sink, _token) = cold_resize_fixture(false);
+
+        // Verify fixture has cold rows stored in the sink
+        assert!(sink.retained_scrollback_rows() > 0);
+        let initial_reads = sink.payload_reads.load(Ordering::Relaxed);
+        assert_eq!(
+            initial_reads, 0,
+            "test sink must start with zero payload reads"
+        );
+
+        let snap = pane
+            .capture_surface_snapshot(0)
+            .expect("local pane supports capture_surface_snapshot")
+            .expect("capture succeeds");
+
+        // Viewport lines must capture resident rows only
+        assert_eq!(snap.dimensions.viewport_rows, 2);
+        assert_eq!(snap.viewport_lines.1.len(), 2);
+
+        // Zero cold storage payload reads must have been attempted
+        let reads_after = sink.payload_reads.load(Ordering::Relaxed);
+        assert_eq!(
+            reads_after, 0,
+            "capture_surface_snapshot must perform zero cold storage reads"
+        );
     }
 }

@@ -3074,20 +3074,37 @@ impl PaneRenderBaseline {
         force_with_input_dispatch_serial: Option<InputSerial>,
         force_for_atomic_effects: bool,
     ) -> SurfacePreparation {
-        let source_start = pane.get_current_seqno();
+        let mut snapshot = match pane.capture_surface_snapshot(self.seqno) {
+            Some(Ok(snapshot)) => Some(snapshot),
+            Some(Err(_)) => return SurfacePreparation::MetadataBusy,
+            None => None,
+        };
+        let source_start = snapshot.as_ref().map_or_else(
+            || pane.get_current_seqno(),
+            |snapshot| snapshot.source_sequence,
+        );
         // Keep the geometry bound to the same cold metadata observation as
         // its layout floor. Contention must not look like history eviction.
-        let (line_layout_floor, dims) = match pane.get_line_layout() {
-            Ok(Some((floor, dims))) => (Some(floor), dims),
-            Ok(None) => (self.line_layout_floor, pane.get_dimensions()),
-            Err(_) => return SurfacePreparation::MetadataBusy,
+        let (line_layout_floor, dims) = match snapshot.as_ref() {
+            Some(snapshot) => (snapshot.line_layout_floor, snapshot.dimensions),
+            None => match pane.get_line_layout() {
+                Ok(Some((floor, dims))) => (Some(floor), dims),
+                Ok(None) => (self.line_layout_floor, pane.get_dimensions()),
+                Err(_) => return SurfacePreparation::MetadataBusy,
+            },
         };
         let mut changed = false;
-        let mouse_grabbed = pane.is_mouse_grabbed();
+        let mouse_grabbed = snapshot.as_ref().map_or_else(
+            || pane.is_mouse_grabbed(),
+            |snapshot| snapshot.mouse_grabbed,
+        );
         if mouse_grabbed != self.mouse_grabbed {
             changed = true;
         }
-        let alt_screen_active = pane.is_alt_screen_active();
+        let alt_screen_active = snapshot.as_ref().map_or_else(
+            || pane.is_alt_screen_active(),
+            |snapshot| snapshot.alt_screen_active,
+        );
         if alt_screen_active != self.alt_screen_active {
             changed = true;
         }
@@ -3095,22 +3112,34 @@ impl PaneRenderBaseline {
         if dims != self.dimensions {
             changed = true;
         }
-        let tiered_scrollback_status = pane.get_tiered_scrollback_status();
+        let tiered_scrollback_status = snapshot.as_ref().map_or_else(
+            || pane.get_tiered_scrollback_status(),
+            |snapshot| snapshot.tiered_scrollback_status,
+        );
         if tiered_scrollback_status != self.tiered_scrollback_status {
             changed = true;
         }
 
-        let cursor_position = pane.get_cursor_position();
+        let cursor_position = snapshot.as_ref().map_or_else(
+            || pane.get_cursor_position(),
+            |snapshot| snapshot.cursor_position,
+        );
         if cursor_position != self.cursor_position {
             changed = true;
         }
 
-        let title = pane.get_title();
+        let title = snapshot.as_mut().map_or_else(
+            || pane.get_title(),
+            |snapshot| std::mem::take(&mut snapshot.title),
+        );
         if title != self.title {
             changed = true;
         }
 
-        let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
+        let working_dir = snapshot.as_mut().map_or_else(
+            || pane.get_current_working_dir(CachePolicy::AllowStale),
+            |snapshot| snapshot.working_dir.take(),
+        );
         if working_dir != self.working_dir {
             changed = true;
         }
@@ -3121,8 +3150,13 @@ impl PaneRenderBaseline {
         };
         // Capture the query fence and derive the regression/MAX-safe baseline
         // under the backend's terminal/cache lock where it has one.
-        let (source_query, mut all_dirty_lines) =
-            pane.get_changed_since_with_source_fence(viewport_range.clone(), self.seqno);
+        let (source_query, mut all_dirty_lines) = match snapshot.as_mut() {
+            Some(snapshot) => (
+                snapshot.source_sequence,
+                std::mem::take(&mut snapshot.dirty_lines),
+            ),
+            None => pane.get_changed_since_with_source_fence(viewport_range.clone(), self.seqno),
+        };
         if line_layout_floor != self.line_layout_floor {
             // A compact cold-map replacement may preserve viewport geometry.
             // Advertise the invalidation through the existing range protocol;
@@ -3142,12 +3176,18 @@ impl PaneRenderBaseline {
             return SurfacePreparation::NoChange {
                 source_start,
                 source_query,
-                source_end: pane.get_current_seqno(),
+                source_end: snapshot.as_ref().map_or_else(
+                    || pane.get_current_seqno(),
+                    |snapshot| snapshot.source_sequence,
+                ),
             };
         }
 
         // Figure out what we're going to send as dirty lines vs bonus lines
-        let (first_line, lines) = pane.get_lines(viewport_range);
+        let (first_line, lines) = snapshot.as_mut().map_or_else(
+            || pane.get_lines(viewport_range),
+            |snapshot| std::mem::take(&mut snapshot.viewport_lines),
+        );
         if stable_row_range_from_len(first_line, lines.len()).is_none() {
             return SurfacePreparation::StableRowRangeUnrepresentable;
         }
@@ -3168,7 +3208,10 @@ impl PaneRenderBaseline {
         let Some(cursor_range) = stable_row_range_from_len(cursor_position.y, 1) else {
             return SurfacePreparation::StableRowRangeUnrepresentable;
         };
-        let (cursor_line_idx, lines) = pane.get_lines(cursor_range);
+        let (cursor_line_idx, lines) = snapshot.as_mut().map_or_else(
+            || pane.get_lines(cursor_range),
+            |snapshot| std::mem::take(&mut snapshot.cursor_lines),
+        );
         if stable_row_range_from_len(cursor_line_idx, lines.len()).is_none() {
             return SurfacePreparation::StableRowRangeUnrepresentable;
         }
@@ -3187,7 +3230,10 @@ impl PaneRenderBaseline {
             }
         }
 
-        let source_end = pane.get_current_seqno();
+        let source_end = snapshot.as_ref().map_or_else(
+            || pane.get_current_seqno(),
+            |snapshot| snapshot.source_sequence,
+        );
         let mut baseline = self.clone();
         baseline.cursor_position = cursor_position;
         baseline.title.clone_from(&title);
@@ -12189,6 +12235,7 @@ mod tests {
         seqno_on_dimensions: Option<SequenceNo>,
         line_layout_floor: Option<SequenceNo>,
         line_layout_busy: AtomicBool,
+        coherent_surface: AtomicBool,
         cursor_line_start_override: Option<StableRowIndex>,
         writer_sink: ParkingMutex<FakePaneWriter>,
         mux_registration: Arc<mux::PaneRegistrationSlot>,
@@ -12210,6 +12257,7 @@ mod tests {
                 seqno_on_dimensions: None,
                 line_layout_floor: None,
                 line_layout_busy: AtomicBool::new(false),
+                coherent_surface: AtomicBool::new(false),
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(FakePaneWriter::default()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
@@ -12326,6 +12374,48 @@ mod tests {
 
         fn get_current_seqno(&self) -> SequenceNo {
             self.state.lock().unwrap().seqno
+        }
+
+        fn capture_surface_snapshot(
+            &self,
+            baseline: SequenceNo,
+        ) -> Option<
+            Result<mux::pane::PaneSurfaceSnapshot, wezterm_term::screen::ColdReadMetadataBusy>,
+        > {
+            if !self.coherent_surface.load(Ordering::Acquire) {
+                return None;
+            }
+            if self.line_layout_busy.load(Ordering::Acquire) {
+                return Some(Err(wezterm_term::screen::ColdReadMetadataBusy));
+            }
+            let state = self.state.lock().unwrap();
+            let cursor_row = state.cursor_position.y;
+            Some(Ok(mux::pane::PaneSurfaceSnapshot {
+                source_sequence: state.seqno,
+                line_layout_floor: self.line_layout_floor,
+                dimensions: state.dimensions,
+                mouse_grabbed: false,
+                alt_screen_active: state.alt_screen_active,
+                tiered_scrollback_status: state.tiered_scrollback_status,
+                cursor_position: state.cursor_position,
+                title: state.title.clone(),
+                working_dir: state.working_dir.clone(),
+                dirty_lines: if state.seqno > baseline {
+                    self.changed_lines.lock().unwrap().clone()
+                } else {
+                    RangeSet::new()
+                },
+                viewport_lines: (state.dimensions.physical_top, state.lines.clone()),
+                cursor_lines: (
+                    cursor_row,
+                    state
+                        .lines
+                        .get(cursor_row as usize)
+                        .cloned()
+                        .into_iter()
+                        .collect(),
+                ),
+            }))
         }
 
         fn get_line_layout(
@@ -19736,6 +19826,44 @@ mod tests {
     }
 
     #[test]
+    fn coherent_surface_matches_split_capture_without_reentering_line_getters() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.set_changed_line(0);
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        registration
+            .try_with_current(|current| {
+                let baseline = PaneRenderBaseline::default();
+                let SurfacePreparation::Changes(split) =
+                    baseline.prepare_surface_changes(&current, None, false)
+                else {
+                    panic!("initial split capture must contain a surface");
+                };
+                let prior_reads = pane.line_read_count.load(Ordering::Relaxed);
+                assert_eq!(prior_reads, 2);
+                pane.coherent_surface.store(true, Ordering::Release);
+                let SurfacePreparation::Changes(coherent) =
+                    baseline.prepare_surface_changes(&current, None, false)
+                else {
+                    panic!("coherent capture must contain the same surface");
+                };
+                assert_eq!(coherent.response, split.response);
+                assert_eq!(coherent.baseline, split.baseline);
+                assert_eq!(coherent.source_start, coherent.source_query);
+                assert_eq!(coherent.source_query, coherent.source_end);
+                assert_eq!(pane.line_read_count.load(Ordering::Relaxed), prior_reads);
+
+                pane.line_layout_busy.store(true, Ordering::Release);
+                assert!(matches!(
+                    baseline.prepare_surface_changes(&current, None, false),
+                    SurfacePreparation::MetadataBusy
+                ));
+                assert_eq!(pane.line_read_count.load(Ordering::Relaxed), prior_reads);
+            })
+            .expect("test pane registration remains current");
+    }
+
+    #[test]
     fn correlated_render_poll_reuses_delta_and_observes_unchanged_source_without_line_reads() {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let executor = SimpleExecutor::new();
@@ -19804,10 +19932,20 @@ mod tests {
 
     #[test]
     fn correlated_render_poll_refuses_mutation_after_render_enqueue() {
+        assert_correlated_render_poll_refuses_mutation_after_enqueue(false);
+    }
+
+    #[test]
+    fn coherent_render_poll_still_refuses_mutation_after_render_enqueue() {
+        assert_correlated_render_poll_refuses_mutation_after_enqueue(true);
+    }
+
+    fn assert_correlated_render_poll_refuses_mutation_after_enqueue(coherent: bool) {
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane = Arc::new(FakePane::new(None));
+        pane.coherent_surface.store(coherent, Ordering::Release);
         let pane_dyn: Arc<dyn Pane> = pane.clone();
         mux.add_pane(&pane_dyn).unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
