@@ -10909,6 +10909,7 @@ pub(crate) mod tests {
         #[derive(Debug)]
         struct Sink {
             state: Mutex<(ScrollbackIntervalIdentity, BTreeMap<StableRowIndex, Line>)>,
+            io_gate: Mutex<()>,
             reads: AtomicU64,
             synchronous_metadata_calls_remaining: AtomicU64,
             entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
@@ -10922,6 +10923,7 @@ pub(crate) mod tests {
                 if let Some(entered) = self.entered.lock().unwrap().take() {
                     entered.send(()).unwrap();
                 }
+                let _io_gate = self.io_gate.lock().unwrap();
                 self.state.lock().unwrap().1.get(&row).cloned()
             }
             fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
@@ -11000,6 +11002,7 @@ pub(crate) mod tests {
                     })
                     .collect(),
             )),
+            io_gate: Mutex::new(()),
             reads: AtomicU64::new(0),
             synchronous_metadata_calls_remaining: AtomicU64::new(0),
             entered: Mutex::new(None),
@@ -11071,7 +11074,10 @@ pub(crate) mod tests {
         let plan = screen.capture_line_read(2..5).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         *sink.entered.lock().unwrap() = Some(entered_tx);
-        let blocked_io = sink.state.lock().unwrap();
+        // Storage IO can block while its nonblocking interval metadata remains
+        // available. Holding `state` would instead refuse hydration at preflight
+        // and never exercise the owned plan's independence from Screen guards.
+        let blocked_io = sink.io_gate.lock().unwrap();
         let worker = std::thread::spawn(move || plan.hydrate(|| false));
         let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
         // Mutate the real Screen while storage is blocked: no terminal/Screen
