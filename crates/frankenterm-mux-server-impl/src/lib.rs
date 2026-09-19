@@ -607,7 +607,10 @@ mod deferred_scrollback {
             }
             let rows = match (state.oldest, state.newest_exclusive) {
                 (Some(oldest), Some(newest)) => {
-                    let Some(rows) = newest.checked_sub(oldest).and_then(|r| usize::try_from(r).ok()) else {
+                    let Some(rows) = newest
+                        .checked_sub(oldest)
+                        .and_then(|r| usize::try_from(r).ok())
+                    else {
                         return ScrollbackUsageCapture::Unavailable;
                     };
                     rows
@@ -1138,8 +1141,7 @@ mod deferred_scrollback {
         let line2 = Line::from_text("second line", &CellAttributes::blank(), 1, None);
 
         // Initially empty
-        let ScrollbackUsageCapture::Ready(initial_usage) =
-            deferred.try_capture_scrollback_usage()
+        let ScrollbackUsageCapture::Ready(initial_usage) = deferred.try_capture_scrollback_usage()
         else {
             panic!("initial usage must be ready");
         };
@@ -1151,8 +1153,7 @@ mod deferred_scrollback {
         assert!(deferred.store_scrollback_line(1, &line2, 10));
 
         // Before flush: pending in memory
-        let ScrollbackUsageCapture::Ready(pending_usage) =
-            deferred.try_capture_scrollback_usage()
+        let ScrollbackUsageCapture::Ready(pending_usage) = deferred.try_capture_scrollback_usage()
         else {
             panic!("usage with pending lines must be ready");
         };
@@ -1165,8 +1166,7 @@ mod deferred_scrollback {
         assert_eq!(backing.retained_scrollback_rows(), 2);
 
         // After flush: durable in backing
-        let ScrollbackUsageCapture::Ready(flushed_usage) =
-            deferred.try_capture_scrollback_usage()
+        let ScrollbackUsageCapture::Ready(flushed_usage) = deferred.try_capture_scrollback_usage()
         else {
             panic!("usage after flush must be ready");
         };
@@ -1176,10 +1176,18 @@ mod deferred_scrollback {
         // 1. Held-state regression: when state lock is held (as during IO operations),
         // try_capture_scrollback_usage must return Busy immediately without blocking.
         {
-            let _held = deferred.state.lock().unwrap();
+            let held = deferred.state.lock().unwrap();
+            let reading = Arc::clone(&deferred);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                tx.send(reading.try_capture_scrollback_usage()).unwrap();
+            });
+            let captured = rx.recv_timeout(std::time::Duration::from_millis(500));
+            drop(held);
+            reader.join().unwrap();
             assert_eq!(
-                deferred.try_capture_scrollback_usage(),
-                ScrollbackUsageCapture::Busy,
+                captured,
+                Ok(ScrollbackUsageCapture::Busy),
                 "held state lock must yield Busy usage"
             );
         }
@@ -1201,13 +1209,19 @@ mod deferred_scrollback {
         deferred.clear_scrollback().unwrap();
 
         // After clear completion: usage is Ready and reset to 0
-        let ScrollbackUsageCapture::Ready(cleared_usage) =
-            deferred.try_capture_scrollback_usage()
+        let ScrollbackUsageCapture::Ready(cleared_usage) = deferred.try_capture_scrollback_usage()
         else {
             panic!("usage after clear must be ready");
         };
         assert_eq!(cleared_usage.rows, 0);
         assert_eq!(cleared_usage.bytes, 0);
+
+        deferred.state.lock().unwrap().oldest = Some(1);
+        assert_eq!(
+            deferred.try_capture_scrollback_usage(),
+            ScrollbackUsageCapture::Unavailable,
+            "an incomplete retained interval must not turn into zero usage"
+        );
     }
 }
 
@@ -9380,7 +9394,7 @@ mod tests {
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
 
-    pub fn deferred_test_sink() -> (
+    pub(super) fn deferred_test_sink() -> (
         tempfile::TempDir,
         Arc<LiveScrollbackSpillSink>,
         Arc<deferred_scrollback::DeferredScrollbackSpillSink>,
@@ -9502,7 +9516,7 @@ mod tests {
 
     #[test]
     fn deferred_scrollback_interval_capture_is_busy_during_real_clear_io() {
-        use wezterm_term::config::ScrollbackIntervalCapture;
+        use wezterm_term::config::{ScrollbackIntervalCapture, ScrollbackUsageCapture};
         let (_dir, backing, deferred) = deferred_test_sink();
         let line = Line::from_text("clear contention", &CellAttributes::blank(), 5, None);
         assert!(deferred.store_scrollback_line(10, &line, 8));
@@ -9527,7 +9541,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let reading = Arc::clone(&deferred);
         let read = std::thread::spawn(move || {
-            tx.send(reading.try_capture_scrollback_interval()).unwrap();
+            tx.send((
+                reading.try_capture_scrollback_interval(),
+                reading.try_capture_scrollback_usage(),
+            ))
+            .unwrap();
         });
         let captured = rx.recv_timeout(std::time::Duration::from_millis(500));
         drop(lease);
@@ -9535,7 +9553,13 @@ mod tests {
         read.join().unwrap();
         assert!(entered, "clear entered backing IO with state locked");
         assert!(
-            matches!(captured, Ok(ScrollbackIntervalCapture::Busy)),
+            matches!(
+                captured,
+                Ok((
+                    ScrollbackIntervalCapture::Busy,
+                    ScrollbackUsageCapture::Busy
+                ))
+            ),
             "capture must finish before blocked IO is released: {captured:?}"
         );
         assert!(!deferred_interval(deferred.as_ref()).retains(&before, 10..11));

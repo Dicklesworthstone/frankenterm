@@ -7635,21 +7635,20 @@ impl Screen {
     pub fn try_tiered_scrollback_status(
         &self,
     ) -> Result<Option<TieredScrollbackStatus>, ColdReadMetadataBusy> {
-        let (cold_sink_retained_lines, cold_sink_retained_bytes) =
-            if let Some(sink) = self.config.scrollback_spill_sink() {
-                match sink.try_capture_scrollback_usage() {
-                    crate::config::ScrollbackUsageCapture::Ready(usage) => {
-                        (usage.rows, usage.bytes)
-                    }
-                    crate::config::ScrollbackUsageCapture::Busy => {
-                        return Err(ColdReadMetadataBusy);
-                    }
-                    crate::config::ScrollbackUsageCapture::Unsupported
-                    | crate::config::ScrollbackUsageCapture::Unavailable => return Ok(None),
+        let (cold_sink_retained_lines, cold_sink_retained_bytes) = if let Some(sink) =
+            self.config.scrollback_spill_sink()
+        {
+            match sink.try_capture_scrollback_usage() {
+                crate::config::ScrollbackUsageCapture::Ready(usage) => (usage.rows, usage.bytes),
+                crate::config::ScrollbackUsageCapture::Busy => {
+                    return Err(ColdReadMetadataBusy);
                 }
-            } else {
-                (0, 0)
-            };
+                crate::config::ScrollbackUsageCapture::Unsupported
+                | crate::config::ScrollbackUsageCapture::Unavailable => return Ok(None),
+            }
+        } else {
+            (0, 0)
+        };
 
         Ok(Some(self.tiered_scrollback_status_with_usage(
             cold_sink_retained_lines,

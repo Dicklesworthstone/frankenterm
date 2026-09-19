@@ -5204,9 +5204,7 @@ mod tests {
             )
         }
 
-        fn try_capture_scrollback_usage(
-            &self,
-        ) -> frankenterm_term::config::ScrollbackUsageCapture {
+        fn try_capture_scrollback_usage(&self) -> frankenterm_term::config::ScrollbackUsageCapture {
             use frankenterm_term::config::ScrollbackUsageCapture;
             if self.unavailable.load(Ordering::Acquire) {
                 return ScrollbackUsageCapture::Unsupported;
@@ -10125,9 +10123,7 @@ mod tests {
             self.rows.lock().unwrap().len() * 80
         }
 
-        fn try_capture_scrollback_usage(
-            &self,
-        ) -> frankenterm_term::config::ScrollbackUsageCapture {
+        fn try_capture_scrollback_usage(&self) -> frankenterm_term::config::ScrollbackUsageCapture {
             let Ok(rows) = self.rows.try_lock() else {
                 return frankenterm_term::config::ScrollbackUsageCapture::Busy;
             };
@@ -10634,7 +10630,10 @@ mod tests {
             assert!(result.is_some() && result.as_ref().unwrap().is_ok());
             let snap = result.unwrap().unwrap();
             let status = snap.tiered_scrollback_status.expect("tiered status ready");
-            assert_eq!(status.cold_sink_retained_lines, sink.retained_scrollback_rows());
+            assert_eq!(
+                status.cold_sink_retained_lines,
+                sink.retained_scrollback_rows()
+            );
         }
 
         // 5. Uncontended call succeeds
