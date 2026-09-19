@@ -150,7 +150,11 @@ fn recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process() {
             );
             let text = String::from_utf8_lossy(bytes);
             for secret in [&kek, key.as_bytes()] {
-                let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+                use std::fmt::Write as _;
+                let mut hex = String::with_capacity(secret.len() * 2);
+                for byte in secret {
+                    write!(&mut hex, "{byte:02x}").unwrap();
+                }
                 assert!(!text.contains(&hex));
             }
         }
