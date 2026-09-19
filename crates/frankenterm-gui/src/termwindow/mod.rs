@@ -4295,6 +4295,10 @@ impl TermWindow {
                     // output during this refresh can retain a successor ticket.
                     title_refresh.begin_refresh();
                     self.update_title_post_status();
+                    // A title/progress-only refresh can change the tab bar
+                    // without any pane output. Retain its native repaint under
+                    // this admission before the visibility check returns.
+                    repaint.store(true, Ordering::Release);
                 }
                 self.record_idle_event(idle_detector::IdleEvent::PtyData);
                 metrics::histogram!("mux.pane_output_event.rate").record(1.);
