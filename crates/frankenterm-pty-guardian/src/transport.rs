@@ -6161,16 +6161,40 @@ mod tests {
                 );
                 assert_eq!(entry.lease_generation, 3);
                 assert!(entry.lease_available && !entry.effects_disabled);
+                // The fixture admits four broker connections. Do not keep a
+                // diagnostic observer while opening another diagnostic owner:
+                // the remaining slots belong to the guardian's live pane I/O.
+                drop(observer);
+                let connect_diagnostic = |identity| {
+                    let deadline = std::time::Instant::now() + CLIENT_IO_TIMEOUT;
+                    loop {
+                        match BrokerControlClientV1::connect(
+                            &broker_socket,
+                            &broker_token,
+                            identity,
+                            origin_build,
+                        ) {
+                            Ok(client) => break client,
+                            Err(crate::broker::BrokerControlClientError::Io(error))
+                                if matches!(
+                                    error.kind(),
+                                    ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                                ) && std::time::Instant::now() < deadline =>
+                            {
+                                eprintln!(
+                                    "diagnostic broker connection awaiting retired slot: {:?}",
+                                    error.kind()
+                                );
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("diagnostic broker connection failed: {error:?}"),
+                        }
+                    }
+                };
                 let old_identity =
                     BrokerGuardianConnectionIdentityV1::new(guardian, ids[2], origin_build, build)
                         .unwrap();
-                let mut old_owner = BrokerControlClientV1::connect(
-                    &broker_socket,
-                    &broker_token,
-                    old_identity,
-                    origin_build,
-                )
-                .unwrap();
+                let mut old_owner = connect_diagnostic(old_identity);
                 let stale_ack = old_owner
                     .acknowledge_successor_claim(
                         crate::output::GuardianDurableSuccessorCustodyV1::open_existing(
@@ -6184,6 +6208,8 @@ mod tests {
                     crate::broker::BrokerSuccessorAcknowledgementV1::Quarantined,
                     "generation-2 ACK must not revive authority after generation 3 commits"
                 );
+                drop(old_owner);
+                let mut observer = connect_diagnostic(identity);
                 let after = observer.census().unwrap();
                 let unchanged = after
                     .entries()
