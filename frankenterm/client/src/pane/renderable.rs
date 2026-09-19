@@ -5944,7 +5944,16 @@ mod tests {
         assert!(inner.lines.peek(&1).is_none());
     }
 
-    fn exercise_render_fetch_retry(retire_rpc: bool, replace_token: bool, cancel_unpolled: bool) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum FetchRetryChange {
+        None,
+        RpcRetired,
+        TokenReplaced,
+        CancelUnpolled,
+        GeometryChanged,
+    }
+
+    fn exercise_render_fetch_retry(change: FetchRetryChange) {
         use promise::spawn::{
             MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
             SimpleExecutor,
@@ -5983,6 +5992,21 @@ mod tests {
         promise::spawn::block_on(peer.respond_next_unit()).unwrap();
         while executor.try_tick().unwrap() {}
         assert!(peer.is_empty());
+        let repaint_requests = Arc::new(AtomicUsize::new(0));
+        let observed_repaints = Arc::clone(&repaint_requests);
+        let weak_renderable = Arc::downgrade(&pane.renderable);
+        mux.subscribe(move |notification| {
+            if matches!(notification, mux::MuxNotification::PaneOutput(753)) {
+                let owner = weak_renderable.upgrade().expect("exact pane is alive");
+                assert!(
+                    owner.try_lock().is_some(),
+                    "repaint must run outside render lock"
+                );
+                observed_repaints.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .unwrap();
 
         let blockers: Vec<_> = (0..2)
             .map(|_| {
@@ -6009,28 +6033,45 @@ mod tests {
             assert!(
                 matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&token))
             );
-            if replace_token {
+            if change == FetchRetryChange::TokenReplaced {
                 inner.lines.put(0, LineEntry::Fetching(successor.clone()));
+            }
+            if change == FetchRetryChange::GeometryChanged {
+                inner.dimensions.cols += 1;
             }
         }
         assert!(
             peer.is_empty(),
             "full scheduler must not dispatch a line RPC"
         );
-        if retire_rpc {
+        if change == FetchRetryChange::RpcRetired {
             peer.replace_ready_generation(&client.client, codec::CODEC_VERSION)
                 .unwrap();
         }
-        if cancel_unpolled {
+        if change == FetchRetryChange::CancelUnpolled {
             let (_wake_tx, wake_rx) = async_channel::bounded(1);
             let owner = Arc::downgrade(&pane.renderable);
             // Construct the actual production future but never poll it. Its
             // already-owned guard must still release accepted token state.
-            drop(super::RenderableInner::run_fetch_retries(
+            let unpolled = super::RenderableInner::run_fetch_retries(
                 owner.clone(),
                 wake_rx,
                 super::CancelDeferredFetches(owner),
-            ));
+            );
+            let held_state = pane.renderable.lock();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let canceller = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                drop(unpolled);
+                done_tx.send(()).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.try_recv().is_err());
+            assert_eq!(held_state.inner.borrow().deferred_fetches.len(), 1);
+            drop(held_state);
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            canceller.join().unwrap();
             let state = pane.renderable.lock();
             let inner = state.inner.borrow();
             assert!(inner.deferred_fetches.is_empty());
@@ -6044,7 +6085,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             while executor.try_tick().unwrap() {}
-            if retire_rpc || replace_token {
+            if change == FetchRetryChange::GeometryChanged {
+                if repaint_requests.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+            } else if change != FetchRetryChange::None {
                 if pane
                     .renderable
                     .lock()
@@ -6064,16 +6109,19 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
-        if retire_rpc || replace_token {
+        if change != FetchRetryChange::None {
             assert!(peer.is_empty(), "obsolete authority must not dispatch");
             let state = pane.renderable.lock();
             let inner = state.inner.borrow();
-            if replace_token {
+            if change == FetchRetryChange::TokenReplaced {
                 assert!(
                     matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&successor))
                 );
             } else {
                 assert!(inner.lines.peek(&0).is_none());
+            }
+            if change == FetchRetryChange::GeometryChanged {
+                assert_eq!(repaint_requests.load(Ordering::SeqCst), 1);
             }
         } else {
             promise::spawn::block_on(peer.respond_next_lines(vec![(0, Line::with_width(17, 0))]))
@@ -6095,22 +6143,27 @@ mod tests {
 
     #[test]
     fn full_render_scheduler_retries_quiet_pane_fetch_without_new_output() {
-        exercise_render_fetch_retry(false, false, false);
+        exercise_render_fetch_retry(FetchRetryChange::None);
     }
 
     #[test]
     fn deferred_render_fetch_does_not_cross_rpc_generation() {
-        exercise_render_fetch_retry(true, false, false);
+        exercise_render_fetch_retry(FetchRetryChange::RpcRetired);
     }
 
     #[test]
     fn deferred_render_fetch_preserves_replacement_token() {
-        exercise_render_fetch_retry(false, true, false);
+        exercise_render_fetch_retry(FetchRetryChange::TokenReplaced);
     }
 
     #[test]
     fn unpolled_render_fetch_driver_cancellation_releases_exact_tokens() {
-        exercise_render_fetch_retry(false, false, true);
+        exercise_render_fetch_retry(FetchRetryChange::CancelUnpolled);
+    }
+
+    #[test]
+    fn deferred_render_fetch_geometry_change_wakes_exact_pane_without_obsolete_read() {
+        exercise_render_fetch_retry(FetchRetryChange::GeometryChanged);
     }
 
     #[test]
