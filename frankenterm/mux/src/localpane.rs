@@ -606,6 +606,13 @@ impl ChildExitPruneState {
         let Some(registration) = registration else {
             return;
         };
+        // The waiter may run after the pane (or its mux) was destroyed. Do
+        // not let an obsolete exit consume admission in a later scheduler
+        // phase. Keep the intent for a legitimate same-pane rebind, and still
+        // revalidate at dispatch because retirement can race this check.
+        if registration.try_with_current(|_| ()).is_none() {
+            return;
+        }
 
         let target_intent = {
             let mut tracker = self.tracker.lock();
@@ -5791,6 +5798,53 @@ mod tests {
             );
             assert!(queue.completion_reservation.is_none());
             assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        }
+
+        // Exercise the actual child-waiter bridge, including its late exit
+        // after retirement. Stale fixture teardown must not allocate a task
+        // that contaminates a later resize owner's exact permit accounting.
+        for retired in [false, true] {
+            let (pane, mux, registration, _sink, _token) = cold_resize_fixture(false);
+            let weak_owner = Arc::downgrade(&mux);
+            let prune = Arc::clone(&pane.child_exit_prune);
+            if retired {
+                assert!(registration.retire_if_current());
+            } else {
+                pane.kill();
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let child_exited = prune.tracker.lock().child_exited;
+                if child_exited && (retired || executor.queue_snapshot().depth != 0) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "child waiter failed to publish its exit"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Also cover a subsequent is_dead-style retry of that same slot.
+            prune.try_schedule();
+            assert_eq!(
+                executor.admission_snapshot().active_tasks,
+                usize::from(!retired)
+            );
+            assert_eq!(executor.queue_snapshot().depth, usize::from(!retired));
+            let mut dispatched = 0;
+            while executor.try_tick().unwrap() {
+                dispatched += 1;
+                assert!(dispatched <= 32, "child prune must have bounded fanout");
+            }
+            assert_eq!(prune.tracker.lock().has_pending_intent(), retired);
+            assert_eq!(executor.admission_snapshot().active_tasks, 0);
+            drop(registration);
+            drop(pane);
+            drop(mux);
+            assert!(
+                weak_owner.upgrade().is_none(),
+                "retained exit intent must not retain its mux"
+            );
         }
     }
 
