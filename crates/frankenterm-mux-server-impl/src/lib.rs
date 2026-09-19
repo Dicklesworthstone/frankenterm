@@ -5300,7 +5300,9 @@ impl LiveScrollbackSpillSink {
         {
             use std::os::unix::fs::OpenOptionsExt as _;
 
-            options.custom_flags(libc::O_NOFOLLOW);
+            // The pathname can change after the regular-file check. Opening a
+            // replacement FIFO must not block before descriptor validation.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options
             .open(path)
@@ -5429,7 +5431,9 @@ impl LiveScrollbackSpillSink {
         {
             use std::os::unix::fs::OpenOptionsExt as _;
 
-            options.custom_flags(libc::O_NOFOLLOW);
+            // A replacement FIFO must reach descriptor validation without
+            // waiting for a writer while the parser holds its mutation gate.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options
             .open(path)
