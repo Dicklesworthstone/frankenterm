@@ -22,6 +22,11 @@
 //!   conflicting residue fails closed with an error.
 //! - **No File Deletion**: Incomplete staging files or torn generation roots are strictly preserved on
 //!   disk for post-incident forensics.
+//! - **Cumulative Writer Quota**: The existing publication lock serializes logical file-byte and
+//!   retained-entry admission. An immutable private policy binds participating writers; retained
+//!   stages, orphan objects and metadata remain charged after reopen. Inactive-root replacement
+//!   reserves peak staging and discovery space before changing either root. This is not a physical
+//!   filesystem block quota, a retention policy, or protection against nonparticipating writers.
 //! - **Fail-Closed Fallback**: If the newest root slot is torn or fails verifier inspection, readers
 //!   seamlessly fall back to the intact predecessor root.
 //! - **No-Follow & No-Chmod Root Admission**: Root and child directory leaves reject symlinks.
@@ -91,6 +96,11 @@ pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_DIR_ENTRIES: usize = 1024;
 /// Default ceiling on diagnostic error records retained.
 pub const DEFAULT_MAX_ERROR_RECORDS: usize = 64;
+/// Store-wide logical file bytes, including retained staging and metadata.
+pub const DEFAULT_MAX_STORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_STORE_ENTRIES: usize = 16_384;
+const STORE_QUOTA_NAME: &str = ".storage-quota.v1";
+const STORE_QUOTA_BYTES: usize = 24;
 
 /// Maximum allowed byte size for the serialized envelope JSON header (64 KiB).
 pub const MAX_ENVELOPE_HEADER_BYTES: u64 = 64 * 1024;
@@ -107,6 +117,10 @@ static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Resource bounds enforced during publication and read operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationLimits {
+    /// Cumulative logical file bytes, not physical filesystem allocation.
+    pub max_store_bytes: u64,
+    /// Total retained entries across the root and its three fixed directories.
+    pub max_store_entries: usize,
     /// Maximum allowed bytes for a root manifest envelope payload.
     pub max_root_manifest_bytes: u64,
     /// Maximum allowed bytes for an individual recovery object.
@@ -131,6 +145,8 @@ impl PublicationLimits {
 impl Default for PublicationLimits {
     fn default() -> Self {
         Self {
+            max_store_bytes: DEFAULT_MAX_STORE_BYTES,
+            max_store_entries: DEFAULT_MAX_STORE_ENTRIES,
             max_root_manifest_bytes: DEFAULT_MAX_ROOT_MANIFEST_BYTES,
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
             max_dir_entries: DEFAULT_MAX_DIR_ENTRIES,
@@ -146,6 +162,19 @@ impl Default for PublicationLimits {
 /// Errors that can occur during recovery snapshot publication or selection.
 #[derive(Debug, Error)]
 pub enum PublicationError {
+    #[error(
+        "snapshot store capacity exhausted (bytes {used_bytes}+{requested_bytes}/{max_bytes}, entries {used_entries}+{requested_entries}/{max_entries})"
+    )]
+    StoreCapacity {
+        used_bytes: u64,
+        requested_bytes: u64,
+        max_bytes: u64,
+        used_entries: usize,
+        requested_entries: usize,
+        max_entries: usize,
+    },
+    #[error("snapshot store quota policy is malformed or differs from this writer")]
+    StoreQuotaPolicy,
     #[error("root envelope header exceeds its fixed byte limit")]
     HeaderTooLarge,
 
@@ -997,6 +1026,11 @@ impl SnapshotPublicationStore {
         root_path: impl Into<PathBuf>,
         limits: PublicationLimits,
     ) -> Result<Self, PublicationError> {
+        // Three fixed directories, the existing writer lock and policy must
+        // fit before any directory or lock inode is created.
+        if limits.max_store_bytes < STORE_QUOTA_BYTES as u64 || limits.max_store_entries < 5 {
+            return Err(PublicationError::StoreQuotaPolicy);
+        }
         let root_path = root_path.into();
 
         if root_path
@@ -1108,6 +1142,164 @@ impl SnapshotPublicationStore {
         &self.limits
     }
 
+    /// Recount disk state under the existing publication lock. Failed writes,
+    /// abandoned stages and orphan objects are charged exactly like live files.
+    /// This is a logical-byte quota; filesystem block/metadata allocation and
+    /// unrelated writers outside the protected store are not covered.
+    fn admit_store_growth(&self, bytes: u64, entries: usize) -> Result<(), PublicationError> {
+        let mut used_bytes = 0_u64;
+        let mut used_entries = 0_usize;
+        for (directory, name) in [
+            (&self.root_dir, ""),
+            (&self.objects_dir, OBJECTS_DIR_NAME),
+            (&self.roots_dir, ROOTS_DIR_NAME),
+            (&self.generations_dir, GENERATIONS_DIR_NAME),
+        ] {
+            let path = self.root_path.join(name);
+            verify_directory_security(directory, &path)?;
+            for entry in directory
+                .entries()
+                .map_err(|error| PublicationError::io(&path, error))?
+            {
+                used_entries = used_entries
+                    .checked_add(1)
+                    .ok_or(PublicationError::StoreQuotaPolicy)?;
+                if used_entries > self.limits.max_store_entries {
+                    return Err(PublicationError::StoreCapacity {
+                        used_bytes,
+                        requested_bytes: bytes,
+                        max_bytes: self.limits.max_store_bytes,
+                        used_entries,
+                        requested_entries: entries,
+                        max_entries: self.limits.max_store_entries,
+                    });
+                }
+                let entry = entry.map_err(|error| PublicationError::io(&path, error))?;
+                let leaf = entry.file_name();
+                let entry_path = path.join(&leaf);
+                let metadata = directory
+                    .symlink_metadata(&leaf)
+                    .map_err(|error| PublicationError::io(&entry_path, error))?;
+                if name.is_empty() && metadata.is_dir() {
+                    let pinned = if leaf == OBJECTS_DIR_NAME {
+                        &self.objects_dir
+                    } else if leaf == ROOTS_DIR_NAME {
+                        &self.roots_dir
+                    } else if leaf == GENERATIONS_DIR_NAME {
+                        &self.generations_dir
+                    } else {
+                        return Err(PublicationError::StoreQuotaPolicy);
+                    };
+                    #[cfg(unix)]
+                    {
+                        let actual = pinned
+                            .dir_metadata()
+                            .map_err(|error| PublicationError::io(&entry_path, error))?;
+                        if metadata.dev() != actual.dev() || metadata.ino() != actual.ino() {
+                            return Err(PublicationError::StoreQuotaPolicy);
+                        }
+                    }
+                    continue;
+                }
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(PublicationError::StoreQuotaPolicy);
+                }
+                let file = directory
+                    .open_with(&leaf, &snapshot_read_options())
+                    .map_err(|error| PublicationError::io(&entry_path, error))?;
+                let size = check_opened_file_security(&file, &entry_path)?;
+                #[cfg(unix)]
+                {
+                    let actual = file
+                        .metadata()
+                        .map_err(|error| PublicationError::io(&entry_path, error))?;
+                    if metadata.dev() != actual.dev()
+                        || metadata.ino() != actual.ino()
+                        || metadata.len() != size
+                    {
+                        return Err(PublicationError::StoreQuotaPolicy);
+                    }
+                }
+                used_bytes = used_bytes
+                    .checked_add(size)
+                    .ok_or(PublicationError::StoreQuotaPolicy)?;
+            }
+        }
+        if used_bytes
+            .checked_add(bytes)
+            .is_none_or(|total| total > self.limits.max_store_bytes)
+            || used_entries
+                .checked_add(entries)
+                .is_none_or(|total| total > self.limits.max_store_entries)
+        {
+            return Err(PublicationError::StoreCapacity {
+                used_bytes,
+                requested_bytes: bytes,
+                max_bytes: self.limits.max_store_bytes,
+                used_entries,
+                requested_entries: entries,
+                max_entries: self.limits.max_store_entries,
+            });
+        }
+        Ok(())
+    }
+
+    /// Install or verify immutable writer policy only at a mutation boundary,
+    /// under `.publication.lock`; read-only root selection never creates it.
+    fn admit_store_policy(&self) -> Result<(), PublicationError> {
+        let path = self.root_path.join(STORE_QUOTA_NAME);
+        let mut expected = [0_u8; STORE_QUOTA_BYTES];
+        expected[..8].copy_from_slice(b"FTQUOT01");
+        expected[8..16].copy_from_slice(&self.limits.max_store_bytes.to_le_bytes());
+        expected[16..24].copy_from_slice(
+            &u64::try_from(self.limits.max_store_entries)
+                .map_err(|_| PublicationError::StoreQuotaPolicy)?
+                .to_le_bytes(),
+        );
+        match self
+            .root_dir
+            .open_with(STORE_QUOTA_NAME, &snapshot_read_options())
+        {
+            Ok(mut file) => {
+                let len = check_opened_file_security(&file, &path)?;
+                if len != STORE_QUOTA_BYTES as u64 {
+                    return Err(PublicationError::StoreQuotaPolicy);
+                }
+                let bytes = read_file_bounded_exact(&mut file, len, len, &path)?;
+                if bytes != expected {
+                    return Err(PublicationError::StoreQuotaPolicy);
+                }
+                sync_adopted_file(&file, &self.root_dir, &path)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.admit_store_growth(STORE_QUOTA_BYTES as u64, 1)?;
+                let stage_name = generate_stage_name("quota");
+                let stage_path = self.root_path.join(&stage_name);
+                let mut options = OpenOptions::new();
+                options
+                    .write(true)
+                    .create_new(true)
+                    .follow(FollowSymlinks::No);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let mut file = self
+                    .root_dir
+                    .open_with(&stage_name, &options)
+                    .map_err(|error| PublicationError::io(&stage_path, error))?;
+                file.write_all(&expected)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| PublicationError::io(&stage_path, error))?;
+                Self::publish_object_noreplace(&self.root_dir, &stage_name, STORE_QUOTA_NAME)?;
+                sync_directory(&self.root_dir, &self.root_path)
+            }
+            Err(error) => Err(PublicationError::io(&path, error)),
+        }
+    }
+
     fn ensure_private_child_dir(
         parent: &Dir,
         name: &str,
@@ -1169,6 +1361,24 @@ impl SnapshotPublicationStore {
     pub fn acquire_publication_lock(&self) -> Result<PublicationLock, PublicationError> {
         let lock_leaf = ".publication.lock";
         let lock_path = self.root_path.join(lock_leaf);
+        match self.root_dir.symlink_metadata(lock_leaf) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Bootstrap only: no participating writer can mutate until
+                // this one fixed lock pathname exists. Charge its empty inode
+                // entry before creation; the locked scan charges it thereafter.
+                let admission = self.admit_store_growth(0, 1);
+                // Another publisher may have created the shared lock and
+                // started writing during this bootstrap scan. In that case
+                // discard the unlocked observation and use its existing lock.
+                match self.root_dir.symlink_metadata(lock_leaf) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => admission?,
+                    Err(error) => return Err(PublicationError::io(&lock_path, error)),
+                    Ok(_) => {}
+                }
+            }
+            Err(error) => return Err(PublicationError::io(&lock_path, error)),
+            Ok(_) => {}
+        }
 
         let mut opts = snapshot_read_options();
         opts.read(true)
@@ -1244,6 +1454,9 @@ impl SnapshotPublicationStore {
         stage_name: &str,
         target_name: &str,
     ) -> Result<(), PublicationError> {
+        // Atomic rename has one name both before and after publication: quota
+        // admission charges the stage entry once. Do not replace this with a
+        // hard-link fallback without reserving its additional transient name.
         use rustix::fs::{RenameFlags, renameat_with};
 
         let parent_file = objects_dir
@@ -1591,6 +1804,8 @@ impl SnapshotPublicationStore {
         // Acquire descriptor-bound cross-process publication lock covering check, stage, and rename
         let _publication_lock = self.acquire_publication_lock()?;
 
+        self.admit_store_policy()?;
+
         // Check if object already exists
         let open_opts = snapshot_read_options();
         match self.objects_dir.open_with(&target_name, &open_opts) {
@@ -1632,6 +1847,7 @@ impl SnapshotPublicationStore {
         }
 
         // Object does not exist. Write to a new staging file.
+        self.admit_store_growth(payload_len, 1)?;
         let stage_name = generate_stage_name(&computed_sha256[..8]);
         let stage_path = self.root_path.join(OBJECTS_DIR_NAME).join(&stage_name);
 
@@ -2030,6 +2246,8 @@ impl SnapshotPublicationStore {
         // 1. Acquire descriptor-bound cross-process publication lock covering inspect/CAS/verify/commit
         let _publication_lock = self.acquire_publication_lock()?;
 
+        self.admit_store_policy()?;
+
         // 2. Re-inspect existing candidates and determine verified active root
         //    (inside publication lock to avoid races with concurrent publishers)
         let (ordinary_candidates, _) = self.inspect_root_candidates()?;
@@ -2278,6 +2496,17 @@ impl SnapshotPublicationStore {
         }
 
         // 6. Stage file in roots directory
+        // Reserve peak staging, including discovery, before either root can
+        // change. No other participating writer can consume this headroom
+        // while the existing publication lock remains held.
+        self.admit_store_growth(
+            (envelope_bytes.len() as u64).saturating_add(if protection.is_some() {
+                MAX_DISCOVERY_BYTES as u64
+            } else {
+                0
+            }),
+            if protection.is_some() { 2 } else { 1 },
+        )?;
         let stage_name = generate_stage_name(&manifest_sha256[..8]);
         let stage_path = self.root_path.join(ROOTS_DIR_NAME).join(&stage_name);
 
@@ -2670,6 +2899,7 @@ impl SnapshotPublicationStore {
         }
         Self::checkpoint_publication(protection.cx)?;
         let stage_name = generate_stage_name("discovery");
+        self.admit_store_growth(bytes.len() as u64, 1)?;
         let stage_path = self.root_path.join(GENERATIONS_DIR_NAME).join(&stage_name);
         let mut stage_options = OpenOptions::new();
         stage_options
@@ -2789,6 +3019,527 @@ mod tests {
                 .unwrap();
         }
         directory
+    }
+
+    fn quota_object(name: &str, bytes: &[u8]) -> RecoveryObjectPayload {
+        RecoveryObjectPayload {
+            object_id: name.into(),
+            expected_sha256: sha256_hex(bytes),
+            ciphertext_bytes: bytes.to_vec(),
+        }
+    }
+
+    fn quota_root(
+        generation: u64,
+        object: &str,
+        previous: Option<&GenerationRootPublishRequest>,
+    ) -> GenerationRootPublishRequest {
+        GenerationRootPublishRequest {
+            generation,
+            publisher_id: "quota-test".into(),
+            predecessor: previous.map(|previous| PredecessorBinding {
+                expected_generation: previous.generation,
+                expected_hash: sha256_hex(&previous.manifest_bytes),
+            }),
+            manifest_bytes: object.as_bytes().to_vec(),
+            created_at_ms: generation,
+        }
+    }
+
+    fn quota_verify_object(
+        candidate: &RootSlotCandidate,
+        store: &SnapshotPublicationStore,
+    ) -> Result<RootSlotCandidate, PublicationError> {
+        let object = std::str::from_utf8(&candidate.manifest_bytes)
+            .map_err(|_| PublicationError::InvalidDiscovery("invalid test object reference"))?;
+        store.read_object(object)?;
+        Ok(candidate.clone())
+    }
+
+    struct QuotaTestChild(Option<std::process::Child>);
+
+    impl Drop for QuotaTestChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl QuotaTestChild {
+        fn finish(mut self) -> std::process::Output {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut timed_out = false;
+            let child = self.0.as_mut().unwrap();
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = self.0.take().unwrap().wait_with_output().unwrap();
+            assert!(
+                !timed_out,
+                "quota child exceeded deadline; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+    }
+
+    #[test]
+    fn store_quota_lock_bootstrap_charges_retained_entries_before_creation() {
+        let temp = private_test_directory();
+        let limits = PublicationLimits {
+            max_store_bytes: STORE_QUOTA_BYTES as u64,
+            max_store_entries: 5,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        for name in [".retained-one", ".retained-two"] {
+            store
+                .objects_dir
+                .open_with(name, &options)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        assert!(matches!(
+            store.publish_object(&quota_object("new", b"")),
+            Err(PublicationError::StoreCapacity { .. })
+        ));
+        assert!(!temp.path().join(".publication.lock").exists());
+        assert!(!temp.path().join(STORE_QUOTA_NAME).exists());
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(OBJECTS_DIR_NAME))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn store_quota_exact_bytes_and_entry_cap_allow_adoption_but_reject_growth() {
+        let temp = private_test_directory();
+        let limits = PublicationLimits {
+            max_store_bytes: STORE_QUOTA_BYTES as u64 + 8,
+            max_store_entries: 6, // three directories, lock, policy, object
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits.clone()).unwrap();
+        store.select_verified_roots(&quota_verify_object).unwrap();
+        assert!(
+            !temp.path().join(STORE_QUOTA_NAME).exists(),
+            "read-only selection must not install policy"
+        );
+        let object = quota_object("exact", b"12345678");
+        store.publish_object(&object).unwrap();
+        assert!(store.publish_object(&object).unwrap().was_already_present);
+        assert!(matches!(
+            store.publish_object(&quota_object("plus-one", b"9")),
+            Err(PublicationError::StoreCapacity { .. })
+        ));
+        assert_eq!(store.list_object_ids().unwrap(), vec!["exact"]);
+        let reopened = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        assert_eq!(reopened.read_object("exact").unwrap(), b"12345678");
+        assert!(matches!(
+            reopened.publish_object(&quota_object("zero-byte-entry", b"")),
+            Err(PublicationError::StoreCapacity { .. })
+        ));
+    }
+
+    #[test]
+    fn store_quota_cumulative_generations_reserve_peak_and_preserve_both_roots() {
+        let temp = private_test_directory();
+        let first = quota_root(1, "first", None);
+        let second = quota_root(2, "second", Some(&first));
+        let third = quota_root(3, "first", Some(&second));
+        let root_bytes = [&first, &second]
+            .into_iter()
+            .map(|request| {
+                encode_root_envelope(request, &sha256_hex(&request.manifest_bytes))
+                    .unwrap()
+                    .len() as u64
+            })
+            .sum::<u64>();
+        let limits = PublicationLimits {
+            max_store_bytes: STORE_QUOTA_BYTES as u64 + root_bytes + 16,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits.clone()).unwrap();
+        store
+            .publish_object(&quota_object("first", b"12345678"))
+            .unwrap();
+        store
+            .publish_generation_root(&first, &quota_verify_object)
+            .unwrap();
+        store
+            .publish_object(&quota_object("second", b"abcdefgh"))
+            .unwrap();
+        store
+            .publish_generation_root(&second, &quota_verify_object)
+            .unwrap();
+        let before_a =
+            std::fs::read(temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_A_NAME)).unwrap();
+        let before_b =
+            std::fs::read(temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME)).unwrap();
+        assert!(matches!(
+            store.publish_generation_root(&third, &quota_verify_object),
+            Err(PublicationError::StoreCapacity { .. })
+        ));
+        let reopened = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        let roots = reopened
+            .select_verified_roots(&quota_verify_object)
+            .unwrap();
+        assert_eq!(roots.current.unwrap().generation, 2);
+        assert_eq!(roots.previous.unwrap().generation, 1);
+        assert_eq!(
+            before_a,
+            std::fs::read(temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_A_NAME)).unwrap()
+        );
+        assert_eq!(
+            before_b,
+            std::fs::read(temp.path().join(ROOTS_DIR_NAME).join(ROOT_SLOT_B_NAME)).unwrap()
+        );
+    }
+
+    #[test]
+    fn store_quota_failed_verifier_stage_stays_charged_after_reopen() {
+        let temp = private_test_directory();
+        let first = quota_root(1, "first", None);
+        let missing = quota_root(2, "missing", Some(&first));
+        let root_bytes = [&first, &missing]
+            .into_iter()
+            .map(|request| {
+                encode_root_envelope(request, &sha256_hex(&request.manifest_bytes))
+                    .unwrap()
+                    .len() as u64
+            })
+            .sum::<u64>();
+        let limits = PublicationLimits {
+            max_store_bytes: STORE_QUOTA_BYTES as u64 + root_bytes + 8,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(temp.path(), limits.clone()).unwrap();
+        store
+            .publish_object(&quota_object("first", b"12345678"))
+            .unwrap();
+        store
+            .publish_generation_root(&first, &quota_verify_object)
+            .unwrap();
+        assert!(matches!(
+            store.publish_generation_root(&missing, &quota_verify_object),
+            Err(PublicationError::VerificationRejected { .. })
+        ));
+        let stages: Vec<_> = std::fs::read_dir(temp.path().join(ROOTS_DIR_NAME))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(STAGE_PREFIX)
+            })
+            .collect();
+        assert_eq!(stages.len(), 1);
+        let retained = std::fs::read(&stages[0]).unwrap();
+        assert!(!retained.is_empty());
+        let reopened = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+        assert!(matches!(
+            reopened.publish_object(&quota_object("extra", b"x")),
+            Err(PublicationError::StoreCapacity { .. })
+        ));
+        assert_eq!(retained, std::fs::read(&stages[0]).unwrap());
+        assert_eq!(
+            reopened
+                .select_verified_roots(&quota_verify_object)
+                .unwrap()
+                .current
+                .unwrap()
+                .generation,
+            1
+        );
+    }
+
+    #[test]
+    fn store_quota_encrypted_protected_root_exact_peak_and_plus_one() {
+        use crate::snapshot_representation::{
+            EncryptedRecoveryObject, ExpectedContext, ObjectMetadata, RecoveryKey,
+            RecoveryObjectKind, decode_recovery_object, encode_recovery_object,
+        };
+        for over_by in [0_u64, 1] {
+            let temp = private_test_directory();
+            let limits = PublicationLimits {
+                max_store_bytes: 2 * 1024 * 1024,
+                ..PublicationLimits::default()
+            };
+            let store = SnapshotPublicationStore::open(temp.path(), limits.clone()).unwrap();
+            let cx = Cx::for_testing();
+            let key = RecoveryKey::from_bytes([0x71; 32]).unwrap();
+            let repair_key = key.derive_repair_authentication_key().unwrap();
+            let root_id = [0x72; 32];
+            let namespace = "quota-protected";
+            let verifier = |candidate: &RootSlotCandidate,
+                            _: &SnapshotPublicationStore|
+             -> Result<
+                RootSlotCandidate,
+                crate::snapshot_representation::RepresentationError,
+            > {
+                let decoded = decode_recovery_object(
+                    &EncryptedRecoveryObject::from_bytes(&candidate.manifest_bytes)?,
+                    &ExpectedContext::single(
+                        root_id,
+                        RecoveryObjectKind::WholeMuxImage,
+                        candidate.generation,
+                        candidate.predecessor_generation,
+                    ),
+                    &key,
+                    None,
+                )?;
+                assert_eq!(decoded.plaintext(), b"encrypted quota root payload");
+                Ok(candidate.clone())
+            };
+            let mut predecessor = None;
+            let mut third = None;
+            for generation in 1..=3 {
+                let envelope = encode_recovery_object(
+                    b"encrypted quota root payload",
+                    ObjectMetadata::single(
+                        root_id,
+                        RecoveryObjectKind::WholeMuxImage,
+                        generation,
+                        (generation > 1).then_some(generation - 1),
+                        generation,
+                    ),
+                    &key,
+                    None,
+                )
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+                let request = GenerationRootPublishRequest {
+                    generation,
+                    publisher_id: "quota-protected".into(),
+                    predecessor,
+                    manifest_bytes: envelope,
+                    created_at_ms: generation,
+                };
+                if generation == 3 {
+                    third = Some(request);
+                    break;
+                }
+                let receipt = store
+                    .publish_repair_protected_generation_root(
+                        &cx,
+                        &request,
+                        namespace,
+                        root_id,
+                        repair_key.as_ref(),
+                        &verifier,
+                    )
+                    .unwrap();
+                predecessor = Some(PredecessorBinding {
+                    expected_generation: generation,
+                    expected_hash: receipt.sha256,
+                });
+            }
+            let third = third.unwrap();
+            let outer = encode_root_envelope(&third, &sha256_hex(&third.manifest_bytes)).unwrap();
+            // Persist the real repair closure first. The public retry below
+            // must adopt these exact immutable records, then admit the root
+            // and discovery peak; no synthetic capacity ledger is involved.
+            store
+                .prepare_persisted_repair(
+                    &cx,
+                    &outer,
+                    root_id,
+                    3,
+                    repair_key.as_ref(),
+                    RepairProtectionClass::Maximum,
+                )
+                .unwrap();
+            let used: u64 = ["", OBJECTS_DIR_NAME, ROOTS_DIR_NAME, GENERATIONS_DIR_NAME]
+                .into_iter()
+                .flat_map(|name| std::fs::read_dir(temp.path().join(name)).unwrap())
+                .map(|entry| entry.unwrap().metadata().unwrap())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .sum();
+            let requested = outer.len() as u64 + MAX_DISCOVERY_BYTES as u64;
+            let padding = limits
+                .max_store_bytes
+                .checked_sub(used + requested)
+                .unwrap()
+                + over_by;
+            store
+                .publish_object(&quota_object(
+                    "retained-orphan-padding",
+                    &vec![0x73; usize::try_from(padding).unwrap()],
+                ))
+                .unwrap();
+            let retained: Vec<_> = [
+                (ROOTS_DIR_NAME, ROOT_SLOT_A_NAME),
+                (ROOTS_DIR_NAME, ROOT_SLOT_B_NAME),
+                (GENERATIONS_DIR_NAME, DISCOVERY_SLOT_A),
+                (GENERATIONS_DIR_NAME, DISCOVERY_SLOT_B),
+            ]
+            .into_iter()
+            .map(|(directory, name)| {
+                let path = temp.path().join(directory).join(name);
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+            let result = store.publish_repair_protected_generation_root(
+                &cx,
+                &third,
+                namespace,
+                root_id,
+                repair_key.as_ref(),
+                &verifier,
+            );
+            if over_by == 0 {
+                assert_eq!(result.unwrap().generation, 3);
+                let selected = store.select_verified_roots(&verifier).unwrap();
+                assert_eq!(selected.current.unwrap().generation, 3);
+                assert_eq!(selected.previous.unwrap().generation, 2);
+                let (discovery, rejected) = store
+                    .inspect_repair_discovery(namespace, &root_id, repair_key.as_ref())
+                    .unwrap();
+                assert!(rejected.is_empty());
+                assert!(discovery.iter().any(|discovery| discovery.generation == 3));
+            } else {
+                match result {
+                    Err(PublicationError::StoreCapacity {
+                        used_bytes,
+                        requested_bytes,
+                        max_bytes,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            requested_bytes, requested,
+                            "must refuse root/discovery peak, not an earlier repair write"
+                        );
+                        assert_eq!(used_bytes + requested_bytes, max_bytes + 1);
+                    }
+                    other => panic!("expected exact plus-one peak refusal: {other:?}"),
+                }
+                for (path, bytes) in retained {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                let reopened = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
+                let selected = reopened.select_verified_roots(&verifier).unwrap();
+                assert_eq!(selected.current.unwrap().generation, 2);
+                assert_eq!(selected.previous.unwrap().generation, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn store_quota_concurrent_processes_share_policy_and_capacity() {
+        if let Some(root) = std::env::var_os("FT_STORE_QUOTA_CHILD_ROOT") {
+            let root = PathBuf::from(root);
+            let name = std::env::var("FT_STORE_QUOTA_CHILD_NAME").unwrap();
+            let mismatch = name == "mismatch";
+            let limits = PublicationLimits {
+                max_store_bytes: STORE_QUOTA_BYTES as u64 + if mismatch { 9 } else { 8 },
+                ..PublicationLimits::default()
+            };
+            let store = SnapshotPublicationStore::open(&root, limits).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let gate = root.parent().unwrap().join("writers-go");
+            while !gate.exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            loop {
+                match store.publish_object(&quota_object(&name, b"12345678")) {
+                    Ok(_) => {
+                        assert!(!mismatch);
+                        println!("QUOTA_CHILD_PUBLISHED");
+                        break;
+                    }
+                    Err(PublicationError::StoreCapacity { .. }) => {
+                        assert!(!mismatch);
+                        println!("QUOTA_CHILD_CAPACITY");
+                        break;
+                    }
+                    Err(PublicationError::StoreQuotaPolicy) => {
+                        assert!(mismatch);
+                        println!("QUOTA_CHILD_POLICY");
+                        break;
+                    }
+                    Err(PublicationError::PublicationBusy) => {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("unexpected child publication error: {error}"),
+                }
+            }
+            return;
+        }
+        let temp = private_test_directory();
+        let root = temp.path().join("store");
+        let limits = PublicationLimits {
+            max_store_bytes: STORE_QUOTA_BYTES as u64 + 8,
+            ..PublicationLimits::default()
+        };
+        let store = SnapshotPublicationStore::open(&root, limits).unwrap();
+        let spawn = |name: &str| {
+            QuotaTestChild(Some(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "snapshot_publication::tests::store_quota_concurrent_processes_share_policy_and_capacity", "--nocapture"])
+            .env("FT_STORE_QUOTA_CHILD_ROOT", &root).env("FT_STORE_QUOTA_CHILD_NAME", name)
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()))
+        };
+        let first = spawn("first");
+        let second = spawn("second");
+        std::fs::write(temp.path().join("writers-go"), b"go").unwrap();
+        let mut published = 0;
+        let mut capacity = 0;
+        for child in [first, second] {
+            let output = child.finish();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            published += usize::from(stdout.contains("QUOTA_CHILD_PUBLISHED"));
+            capacity += usize::from(stdout.contains("QUOTA_CHILD_CAPACITY"));
+        }
+        assert_eq!((published, capacity), (1, 1));
+        let before = store.list_object_ids().unwrap();
+        assert_eq!(before.len(), 1);
+        let mismatch = spawn("mismatch");
+        let matching = spawn("matching");
+        for (child, expected) in [
+            (mismatch, "QUOTA_CHILD_POLICY"),
+            (matching, "QUOTA_CHILD_CAPACITY"),
+        ] {
+            let output = child.finish();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+        }
+        assert_eq!(before, store.list_object_ids().unwrap());
+        assert_eq!(store.read_object(&before[0]).unwrap(), b"12345678");
     }
 
     /// Trivial verifier that accepts all structurally valid candidates.
@@ -4267,6 +5018,7 @@ mod tests {
             max_object_bytes: 64 * 1024,
             max_dir_entries: 1024,
             max_error_records: 64,
+            ..PublicationLimits::default()
         };
         let store = SnapshotPublicationStore::open(temp.path(), limits).unwrap();
         let verifier = AcceptAllVerifier;
