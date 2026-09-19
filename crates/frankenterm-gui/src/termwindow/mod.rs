@@ -496,6 +496,44 @@ impl PendingMuxOutput {
     }
 }
 
+/// State-derived notifications share the cleanup subscription's lifetime.
+/// Payload admission failure must not disconnect future rendering updates.
+struct RetainedMuxRefresh {
+    output: Arc<PendingMuxOutput>,
+    reconciliation: Arc<AtomicBool>,
+    title_pending: Arc<AtomicBool>,
+    title: Arc<Mutex<Option<PendingMuxTitleRefresh>>>,
+    wake: flume::Sender<()>,
+}
+
+impl RetainedMuxRefresh {
+    fn handles(notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        matches!(
+            notification,
+            MuxNotification::PaneOutput(_)
+                | MuxNotification::Alert {
+                    alert: Alert::PaletteChanged | Alert::ImageAltText { .. },
+                    ..
+                }
+        ) || TermWindow::mux_notification_reconciles_window(notification, window_id)
+            || TermWindow::mux_notification_only_refreshes_title(notification)
+    }
+
+    fn record(&self, notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        if !self.output.record_notification(notification) {
+            if TermWindow::mux_notification_reconciles_window(notification, window_id) {
+                self.reconciliation.store(true, Ordering::Release);
+            }
+            if let Some(ticket) = PendingMuxTitleRefresh::acquire(&self.title_pending) {
+                *self.title.lock().unwrap_or_else(|p| p.into_inner()) = Some(ticket);
+            } else {
+                metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
+            }
+        }
+        !matches!(self.wake.try_send(()), Err(TrySendError::Disconnected(_)))
+    }
+}
+
 type WindowEventAdmission = (
     promise::spawn::MainThreadSpawnReservation,
     promise::spawn::MainThreadSpawnReservation,
@@ -5859,10 +5897,7 @@ impl TermWindow {
         let callback_mux = Arc::downgrade(&mux);
         let pending_title_refresh = Arc::new(AtomicBool::new(false));
         let retained_title_refresh = Arc::new(Mutex::new(None));
-        let callback_title_refresh = Arc::clone(&retained_title_refresh);
         let pending_reconciliation = Arc::new(AtomicBool::new(false));
-        let callback_reconciliation = Arc::clone(&pending_reconciliation);
-        let sync_output_state = Arc::clone(&self.sync_output_state);
         // Reserve retry ownership before accepting the subscription. The
         // capacity-one channel stores only a level-triggered output bit;
         // structural notifications retain their existing ordered path below.
@@ -5880,6 +5915,14 @@ impl TermWindow {
             rejected => anyhow::bail!("reserving GUI pane-output scheduler owner: {rejected:?}"),
         };
         let (output_tx, output_rx) = flume::bounded(1);
+        let output_interest = Arc::new(PendingMuxOutput::new());
+        let retained_refresh = RetainedMuxRefresh {
+            output: Arc::clone(&output_interest),
+            reconciliation: Arc::clone(&pending_reconciliation),
+            title_pending: pending_title_refresh,
+            title: Arc::clone(&retained_title_refresh),
+            wake: output_tx.clone(),
+        };
         self.pane_cleanup.bind(&mux, output_tx.clone());
         let cleanup_dead = Arc::new(AtomicBool::new(false));
         let cleanup_callback_dead = Arc::clone(&cleanup_dead);
@@ -5892,20 +5935,23 @@ impl TermWindow {
                 if cleanup_callback_dead.load(Ordering::Acquire) {
                     return false;
                 }
+                let window_id = *lock_termwindow_mutex(&cleanup_window_id, "GUI cleanup window ID");
+                if !Self::mux_notification_targets_window(&notification, window_id) {
+                    return true;
+                }
+                if let Some(keep) = fold_gui_sync_notification(
+                    &cleanup_mux,
+                    window_id,
+                    &cleanup_sync_state,
+                    &notification,
+                    lease.as_ref(),
+                ) {
+                    return keep;
+                }
                 if matches!(&notification, MuxNotification::PaneRemoved(_)) {
-                    let window_id =
-                        *lock_termwindow_mutex(&cleanup_window_id, "GUI cleanup window ID");
-                    if fold_gui_sync_notification(
-                        &cleanup_mux,
-                        window_id,
-                        &cleanup_sync_state,
-                        &notification,
-                        lease.as_ref(),
-                    ) == Some(false)
-                    {
-                        return false;
-                    }
                     cleanup_owner.record_notification(&notification, lease);
+                } else if RetainedMuxRefresh::handles(&notification, window_id) {
+                    return retained_refresh.record(&notification, window_id);
                 }
                 true
             })
@@ -5920,8 +5966,6 @@ impl TermWindow {
             pending: Arc::clone(&event_retry_pending),
             wake: output_tx.clone(),
         });
-        let output_interest = Arc::new(PendingMuxOutput::new());
-        let callback_output_interest = Arc::clone(&output_interest);
         let output_window = window.clone();
         let output_mux = Arc::downgrade(&mux);
         let output_mux_window_id = Arc::clone(&mux_window_id);
@@ -5967,12 +6011,6 @@ impl TermWindow {
                 {
                     return keep;
                 }
-                if let Some(keep) = fold_gui_sync_notification(
-                    &callback_mux, mux_window_id, &sync_output_state, &n,
-                    pane_removal_cleanup.as_ref(),
-                ) {
-                    return keep;
-                }
                 if matches!(&n, MuxNotification::PaneRemoved(_)) {
                     // Removal authority belongs to the separate infallible
                     // subscriber, which survives this payload subscriber's
@@ -5980,26 +6018,12 @@ impl TermWindow {
                     if let Some(lease) = pane_removal_cleanup { lease.complete(); }
                     return true;
                 }
-                if callback_output_interest.record_notification(&n) {
-                    // Full means an equivalent refresh is already retained.
-                    // No pane-removal lease or historical event is coalesced.
-                    return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
-                }
-                let reconcile = Self::mux_notification_reconciles_window(&n, mux_window_id);
-                if reconcile {
-                    callback_reconciliation.store(true, Ordering::Release);
-                }
-                if reconcile || Self::mux_notification_only_refreshes_title(&n) {
-                    if let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) {
-                        *callback_title_refresh.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(ticket);
-                    } else {
-                        metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
-                    }
-                    // Title/status notifications describe current state, so
-                    // share the retained output wake instead of risking a
-                    // permanent unsubscribe at a second initial admission.
-                    return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
+                if matches!(&n, MuxNotification::SynchronizedOutput { .. })
+                    || RetainedMuxRefresh::handles(&n, mux_window_id)
+                {
+                    // The infallible retained-state subscriber owns these;
+                    // this payload subscription can retire independently.
+                    return true;
                 }
                 let window = window.clone();
                 let dead = dead.clone();
@@ -11546,13 +11570,25 @@ mod tests {
         use promise::spawn::{
             MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
         };
+        use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let first = mux.capture_pane_registration(original).unwrap();
         let second = mux.capture_pane_registration(other).unwrap();
         let cleanup = Arc::new(super::GuiPaneCleanupOwner::new(1));
         let independent = Arc::new(super::GuiPaneCleanupOwner::new(1));
         let (wake, receive) = flume::bounded(1);
-        cleanup.bind(mux, wake);
+        cleanup.bind(mux, wake.clone());
+        let retained_output = Arc::new(super::PendingMuxOutput::new());
+        let retained_title = Arc::new(Mutex::new(None));
+        let retained_reconciliation = Arc::new(AtomicBool::new(false));
+        let retained_refresh = super::RetainedMuxRefresh {
+            output: Arc::clone(&retained_output),
+            reconciliation: Arc::clone(&retained_reconciliation),
+            title_pending: Arc::new(AtomicBool::new(false)),
+            title: Arc::clone(&retained_title),
+            wake,
+        };
+        let retained_window = mux.resolve_pane_id(first.pane_id()).unwrap().1;
         assert_eq!(
             cleanup.admit(&first),
             Err(super::GuiPaneAdmissionError::Retired),
@@ -11589,7 +11625,9 @@ mod tests {
                 }
                 if matches!(notification, mux::MuxNotification::PaneOutput(_)) {
                     callback_seen.fetch_add(1, Ordering::AcqRel);
-                    callback_cleanup.wake();
+                }
+                if super::RetainedMuxRefresh::handles(&notification, retained_window) {
+                    return retained_refresh.record(&notification, retained_window);
                 }
                 true
             })
@@ -11635,6 +11673,27 @@ mod tests {
             !mux.unsubscribe(payload_subscription),
             "full payload admission must exercise actual general-subscriber retirement"
         );
+        // The actual payload subscriber is gone while the scheduler remains
+        // full. Rendering/title ingress must retain new work independently.
+        mux.notify(mux::MuxNotification::Alert {
+            pane_id: first.pane_id(),
+            alert: super::Alert::PaletteChanged,
+        });
+        mux.notify(mux::MuxNotification::WindowTitleChanged {
+            window_id: retained_window,
+            title: "after payload retirement".to_owned(),
+        });
+        mux.notify(mux::MuxNotification::WindowInvalidated(retained_window));
+        assert!(super::PendingMuxOutput::includes(
+            &retained_output.take(),
+            first.pane_id()
+        ));
+        assert_eq!(
+            retained_output.take_invalidations().0,
+            super::MuxOutputInvalidations::PALETTE
+        );
+        assert!(retained_title.lock().unwrap().is_some());
+        assert!(retained_reconciliation.load(Ordering::Acquire));
         mux.remove_pane_if_same(first.pane_id(), original);
         assert_eq!(mux.pane_removal_cleanup_snapshot().outstanding_leases, 1);
         assert!(
