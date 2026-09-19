@@ -680,6 +680,11 @@ def validate_echo_measurements(rows, fixture_receipt=None):
 
 def measure(args):
     """Run the bounded client against a newly created Linux-only mux instance."""
+    for name, value in (("mux-socket-buffer-bytes", getattr(args, "mux_socket_buffer_bytes", None)),
+                        ("mux-parser-buffer-bytes", getattr(args, "mux_parser_buffer_bytes", None))):
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or not 4096 <= value <= 1048576:
+                raise ValueError(f"{name} must be an integer between 4096 and 1048576 bytes")
     if not pathlib.Path("/proc/self/stat").exists():
         raise RuntimeError("remote measurement requires the Linux /proc identity contract")
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
@@ -726,10 +731,15 @@ def measure(args):
     corpus_path = root / "corpus.txt"
     write_new(corpus_path, corpus(10000))
     config_path = root / "frankenterm.toml"
-    write_new(config_path, 'scrollback_lines = 50000\ninitial_rows = 24\ninitial_cols = 80\n'
-              + '[[unix_domains]]\nname = "owned-remote-profile"\n'
-              + 'socket_path = ' + json.dumps(str(socket))
-              + '\nno_serve_automatically = true\n')
+    config_text = 'scrollback_lines = 50000\ninitial_rows = 24\ninitial_cols = 80\n'
+    if getattr(args, "mux_socket_buffer_bytes", None) is not None:
+        config_text += f'mux_socket_buffer_size = {args.mux_socket_buffer_bytes}\n'
+    if getattr(args, "mux_parser_buffer_bytes", None) is not None:
+        config_text += f'mux_output_parser_buffer_size = {args.mux_parser_buffer_bytes}\n'
+    config_text += ('[[unix_domains]]\nname = "owned-remote-profile"\n'
+                    + 'socket_path = ' + json.dumps(str(socket))
+                    + '\nno_serve_automatically = true\n')
+    write_new(config_path, config_text)
     ft_config = root / "ft.toml"
     write_new(ft_config, '[vendored]\nmux_socket_path = ' + json.dumps(str(socket)) + '\n')
     env = {"PATH": f"{binary_dir}:/usr/bin:/bin", "LANG": "C.UTF-8",
@@ -760,6 +770,15 @@ def measure(args):
                "fixture_sha256": file_sha256(script)}
     if getattr(args, "arm", "resize") == "echo":
         receipt["arm"] = "echo"
+    configuration_experiment = {}
+    if getattr(args, "mux_socket_buffer_bytes", None) is not None:
+        configuration_experiment["mux_socket_buffer_bytes"] = args.mux_socket_buffer_bytes
+        configuration_experiment["mux_socket_buffer_size"] = args.mux_socket_buffer_bytes
+    if getattr(args, "mux_parser_buffer_bytes", None) is not None:
+        configuration_experiment["mux_parser_buffer_bytes"] = args.mux_parser_buffer_bytes
+        configuration_experiment["mux_output_parser_buffer_size"] = args.mux_parser_buffer_bytes
+    if configuration_experiment:
+        receipt["configuration_experiment"] = configuration_experiment
     write_new(root / "env.json", json.dumps(receipt, indent=2) + "\n")
     try:
         with (root / "mux.stdout").open("xb") as stdout, (root / "mux.stderr").open("xb") as stderr:
@@ -879,11 +898,22 @@ def main():
                         help="instrumentation arm only; emit sampler-clock phase intervals")
     parser.add_argument("--records", type=int, default=10000)
     parser.add_argument("--timeout-seconds", type=int, default=600)
+    parser.add_argument("--mux-socket-buffer-bytes", type=int, default=None,
+                        help="measure-only experimental config override: mux_socket_buffer_size (4096..1048576)")
+    parser.add_argument("--mux-parser-buffer-bytes", type=int, default=None,
+                        help="measure-only experimental config override: mux_output_parser_buffer_size (4096..1048576)")
     args = parser.parse_args()
     if not 1 <= args.records <= 10000:
         parser.error("records must be between 1 and 10000")
     if not 10 <= args.timeout_seconds <= 1800:
         parser.error("timeout must be between 10 and 1800 seconds")
+    if args.mux_socket_buffer_bytes is not None and not 4096 <= args.mux_socket_buffer_bytes <= 1048576:
+        parser.error("--mux-socket-buffer-bytes must be between 4096 and 1048576")
+    if args.mux_parser_buffer_bytes is not None and not 4096 <= args.mux_parser_buffer_bytes <= 1048576:
+        parser.error("--mux-parser-buffer-bytes must be between 4096 and 1048576")
+    if args.mode != "measure":
+        if args.mux_socket_buffer_bytes is not None or args.mux_parser_buffer_bytes is not None:
+            parser.error("--mux-socket-buffer-bytes and --mux-parser-buffer-bytes are measure-only")
     if args.mode == "measure":
         if not all((args.bin_dir, args.client, args.artifact_dir)):
             parser.error("measure requires --bin-dir, --client, --artifact-dir")
