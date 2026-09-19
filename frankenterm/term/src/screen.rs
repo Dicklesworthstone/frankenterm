@@ -10736,7 +10736,7 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
-    fn owned_line_read_reuses_single_ready_interval_despite_later_busy_metadata() {
+    fn owned_line_read_reuses_capture_interval_and_rechecks_before_io() {
         let (screen, sink) = cold_prefetch_fixture(32);
         let canonical = screen.cold_visual_layout.as_ref().unwrap();
         assert!(!canonical.stored_physical());
@@ -10758,7 +10758,7 @@ pub(crate) mod tests {
         ] {
             sink.metadata_probes.store(0, Ordering::Relaxed);
             sink.metadata_probe_budget.store(1, Ordering::Relaxed);
-            let captured = screen.capture_line_read(requested).unwrap();
+            let captured = screen.capture_line_read(requested.clone()).unwrap();
             assert_eq!(
                 sink.metadata_probes.load(Ordering::Relaxed),
                 1,
@@ -10767,11 +10767,28 @@ pub(crate) mod tests {
             assert!(Arc::ptr_eq(captured.layout.as_ref().unwrap(), canonical));
             assert_eq!(captured.first_row(), row);
             sink.requests.lock().unwrap().clear();
+            assert!(captured
+                .hydrate(|| false)
+                .err()
+                .unwrap()
+                .is::<ColdReadMetadataBusy>());
+            assert!(
+                sink.requests.lock().unwrap().is_empty(),
+                "busy worker preflight must refuse before backing IO"
+            );
+
+            // A fresh attempt needs one capture probe and one worker probe.
+            // Neither stage may discard the canonical layout and reindex it.
+            sink.metadata_probes.store(0, Ordering::Relaxed);
+            sink.metadata_probe_budget.store(2, Ordering::Relaxed);
+            let captured = screen.capture_line_read(requested).unwrap();
+            assert!(Arc::ptr_eq(captured.layout.as_ref().unwrap(), canonical));
             let read = captured.hydrate(|| false).unwrap();
+            assert_eq!(sink.metadata_probes.load(Ordering::Relaxed), 2);
             assert_eq!(
                 sink.requests.lock().unwrap().as_slice(),
                 std::slice::from_ref(&(row..row + 1)),
-                "Busy after capture must not trigger a 65-group payload reindex"
+                "worker preflight must not trigger a 65-group payload reindex"
             );
             assert_eq!(
                 read.lines().next().unwrap().as_str(),
