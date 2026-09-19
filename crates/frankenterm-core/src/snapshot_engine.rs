@@ -525,6 +525,14 @@ pub fn publish_whole_mux_recovery(
         .with_mux_incarnation_id(expected.mux_incarnation_id.clone());
     let mut current_verifier =
         WholeMuxRecoveryVerifier::new_production(Arc::clone(&key), candidate_trusted);
+    // A successor's freshly published witness still needs its durable claim
+    // lineage checked against existing custody. Configure that authority for
+    // the candidate as well as the predecessor; an in-memory capture alone
+    // must not bypass the successor selector's encrypted-custody check.
+    #[cfg(unix)]
+    if let Some(token_path) = expected.existing_guardian_custody.as_ref() {
+        current_verifier = current_verifier.with_existing_guardian_custody(token_path.clone());
+    }
     let predecessor_trusted = WholeMuxTrustedIdentityConfig::new(expected.root_object_id)
         .with_session_id(expected.session_id.clone());
     let predecessor_verifier =
