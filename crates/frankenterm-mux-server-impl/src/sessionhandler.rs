@@ -19814,9 +19814,11 @@ mod tests {
         let sender = PduSender::new({
             let pane = Arc::clone(&pane);
             let captured = Arc::clone(&captured);
+            let mutate_once = AtomicBool::new(true);
             move |pdu, class| {
                 if class == PduDeliveryClass::Bulk
                     && matches!(&pdu.pdu, Pdu::GetPaneRenderChangesResponse(_))
+                    && mutate_once.swap(false, Ordering::AcqRel)
                 {
                     pane.state.lock().unwrap().seqno += 1;
                 }
@@ -19836,11 +19838,28 @@ mod tests {
         drain_simple_executor(&executor);
         let response = take_response(&captured);
         assert_eq!(response.serial, 41);
-        expect_error_response(
+        let error = expect_error_response(
             &response.pdu,
             GetPaneRenderChanges::IDENT,
-            MuxErrorCode::BACKEND_FAILURE,
+            MuxErrorCode::RESOURCE_BUSY,
         );
+        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(error.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        assert!(captured.lock().unwrap().is_empty());
+        handler.process_one(DecodedPdu {
+            serial: 42,
+            pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                pane_id: pane.pane_id(),
+            }),
+        });
+        drain_simple_executor(&executor);
+        let fresh = take_response(&captured);
+        assert_eq!(fresh.serial, 42);
+        let Pdu::GetPaneRenderChangesResponse(fresh) = fresh.pdu else {
+            panic!("a stable retry must return its fresh correlated observation");
+        };
+        assert_eq!(fresh.seqno, 12);
+        assert!(captured.lock().unwrap().is_empty());
         drop(handler);
         drain_simple_executor(&executor);
     }
@@ -19874,9 +19893,29 @@ mod tests {
             expect_error_response(
                 &response.pdu,
                 GetPaneRenderChanges::IDENT,
-                MuxErrorCode::BACKEND_FAILURE,
+                if exhausted {
+                    MuxErrorCode::BACKEND_FAILURE
+                } else {
+                    MuxErrorCode::RESOURCE_BUSY
+                },
             );
             assert!(captured.lock().unwrap().is_empty());
+            if !exhausted {
+                handler.process_one(DecodedPdu {
+                    serial: 44,
+                    pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                        pane_id: pane.pane_id(),
+                    }),
+                });
+                drain_simple_executor(&executor);
+                let fresh = take_response(&captured);
+                assert_eq!(fresh.serial, 44);
+                let Pdu::GetPaneRenderChangesResponse(fresh) = fresh.pdu else {
+                    panic!("a stable source must permit a fresh correlated observation");
+                };
+                assert_eq!(fresh.seqno, 12);
+                assert!(captured.lock().unwrap().is_empty());
+            }
             drop(handler);
             drain_simple_executor(&executor);
         }
