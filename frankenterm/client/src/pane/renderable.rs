@@ -191,6 +191,33 @@ impl Drop for CancelDeferredFetches {
     }
 }
 
+struct FetchRetryDriverOwner(Arc<FetchRetryCoordinator>);
+
+impl Drop for FetchRetryDriverOwner {
+    fn drop(&mut self) {
+        self.0.wake_tx.close();
+        // Register either observes closure, or publishes before this drain.
+        // Token cleanup acquires pane locks, so never run it under pending.
+        let pending = std::mem::take(&mut *self.0.pending.lock());
+        drop(pending);
+    }
+}
+
+struct AdmittedFetchRetryDriver {
+    reservation: promise::spawn::BackgroundSpawnReservation,
+    owner: FetchRetryDriverOwner,
+}
+
+impl AdmittedFetchRetryDriver {
+    fn spawn(self) {
+        self.reservation.spawn(Self::run(self.owner));
+    }
+
+    async fn run(owner: FetchRetryDriverOwner) {
+        owner.0.run().await;
+    }
+}
+
 /// One independently admitted driver per domain, not one scheduler slot per
 /// pane. Pane futures retain only weak ownership and their bounded wake channel.
 pub(crate) struct FetchRetryCoordinator {
@@ -212,15 +239,25 @@ impl FetchRetryCoordinator {
     }
 
     pub(crate) fn ensure_started(self: &Arc<Self>) -> anyhow::Result<()> {
-        let mut started = self.started.lock();
-        anyhow::ensure!(!self.wake_tx.is_closed(), "render fetch domain is detached");
-        if !*started {
-            let reservation = promise::spawn::try_reserve_background_task(4 * 1024)?;
-            let coordinator = Arc::clone(self);
-            reservation.spawn(async move { coordinator.run().await });
-            *started = true;
+        if let Some(driver) = self.prepare_driver()? {
+            driver.spawn();
         }
         Ok(())
+    }
+
+    fn prepare_driver(self: &Arc<Self>) -> anyhow::Result<Option<AdmittedFetchRetryDriver>> {
+        let mut started = self.started.lock();
+        anyhow::ensure!(!self.wake_tx.is_closed(), "render fetch domain is detached");
+        if *started {
+            return Ok(None);
+        }
+        let reservation = promise::spawn::try_reserve_background_task(4 * 1024)?;
+        let driver = AdmittedFetchRetryDriver {
+            reservation,
+            owner: FetchRetryDriverOwner(Arc::clone(self)),
+        };
+        *started = true;
+        Ok(Some(driver))
     }
 
     pub(crate) fn register(
@@ -243,7 +280,9 @@ impl FetchRetryCoordinator {
         match self.wake_tx.try_send(()) {
             Ok(()) | Err(async_channel::TrySendError::Full(())) => Ok(()),
             Err(async_channel::TrySendError::Closed(())) => {
-                pending.remove(&pane_id);
+                let cancelled = pending.remove(&pane_id);
+                drop(pending);
+                drop(cancelled);
                 anyhow::bail!("render fetch domain detached during pane admission")
             }
         }
@@ -256,7 +295,8 @@ impl FetchRetryCoordinator {
     async fn run(&self) {
         let mut active = futures::stream::FuturesUnordered::new();
         loop {
-            for (_, (owner, wake, cancel)) in std::mem::take(&mut *self.pending.lock()) {
+            let pending = std::mem::take(&mut *self.pending.lock());
+            for (_, (owner, wake, cancel)) in pending {
                 active.push(RenderableInner::run_fetch_retries(owner, wake, cancel));
             }
             if active.is_empty() {
@@ -5950,6 +5990,9 @@ mod tests {
         RpcRetired,
         TokenReplaced,
         CancelUnpolled,
+        CancelDomainUnpolled,
+        CancelDomainWithSuccessor,
+        DetachDomainBeforePoll,
         GeometryChanged,
     }
 
@@ -5973,6 +6016,25 @@ mod tests {
             }),
         );
         let client = Arc::new(ClientInner::new(751, client, None, None, false));
+        let cancel_domain = matches!(
+            change,
+            FetchRetryChange::CancelDomainUnpolled
+                | FetchRetryChange::CancelDomainWithSuccessor
+                | FetchRetryChange::DetachDomainBeforePoll
+        );
+        // Use the actual production reservation path, retaining its admitted
+        // owner before spawn so cancellation-before-first-poll is deterministic.
+        let admitted_domain_driver = if cancel_domain {
+            Some(
+                client
+                    .fetch_retry_coordinator
+                    .prepare_driver()
+                    .unwrap()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let pane = Arc::new(
             ClientPane::new(
                 &client,
@@ -6033,7 +6095,10 @@ mod tests {
             assert!(
                 matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&token))
             );
-            if change == FetchRetryChange::TokenReplaced {
+            if matches!(
+                change,
+                FetchRetryChange::TokenReplaced | FetchRetryChange::CancelDomainWithSuccessor
+            ) {
                 inner.lines.put(0, LineEntry::Fetching(successor.clone()));
             }
             if change == FetchRetryChange::GeometryChanged {
@@ -6048,35 +6113,86 @@ mod tests {
             peer.replace_ready_generation(&client.client, codec::CODEC_VERSION)
                 .unwrap();
         }
-        if change == FetchRetryChange::CancelUnpolled {
+        if change == FetchRetryChange::CancelUnpolled || cancel_domain {
             let (_wake_tx, wake_rx) = async_channel::bounded(1);
             let owner = Arc::downgrade(&pane.renderable);
             // Construct the actual production future but never poll it. Its
             // already-owned guard must still release accepted token state.
-            let unpolled = super::RenderableInner::run_fetch_retries(
-                owner.clone(),
-                wake_rx,
-                super::CancelDeferredFetches(owner),
-            );
+            let (unpolled, reservation): (
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+                Option<promise::spawn::BackgroundSpawnReservation>,
+            ) = if let Some(admitted) = admitted_domain_driver {
+                if change == FetchRetryChange::DetachDomainBeforePoll {
+                    client.fetch_retry_coordinator.detach();
+                }
+                (
+                    Box::pin(super::AdmittedFetchRetryDriver::run(admitted.owner)),
+                    Some(admitted.reservation),
+                )
+            } else {
+                (
+                    Box::pin(super::RenderableInner::run_fetch_retries(
+                        owner.clone(),
+                        wake_rx,
+                        super::CancelDeferredFetches(owner),
+                    )),
+                    None,
+                )
+            };
             let held_state = pane.renderable.lock();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let canceller = std::thread::spawn(move || {
                 entered_tx.send(()).unwrap();
                 drop(unpolled);
+                drop(reservation);
                 done_tx.send(()).unwrap();
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(done_rx.try_recv().is_err());
             assert_eq!(held_state.inner.borrow().deferred_fetches.len(), 1);
+            if cancel_domain {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if client.fetch_retry_coordinator.wake_tx.is_closed()
+                        && client
+                            .fetch_retry_coordinator
+                            .pending
+                            .try_lock()
+                            .is_some_and(|pending| pending.is_empty())
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancellation held pending lock while waiting for pane"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
             drop(held_state);
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             canceller.join().unwrap();
             let state = pane.renderable.lock();
             let inner = state.inner.borrow();
             assert!(inner.deferred_fetches.is_empty());
-            assert!(inner.lines.peek(&0).is_none());
+            if change == FetchRetryChange::CancelDomainWithSuccessor {
+                assert!(
+                    matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(current)) if current.same_request(&successor))
+                );
+            } else {
+                assert!(inner.lines.peek(&0).is_none());
+            }
             assert!(peer.is_empty());
+            if cancel_domain {
+                assert!(client.fetch_retry_coordinator.ensure_started().is_err());
+                let (_tx, rx) = async_channel::bounded(1);
+                assert!(client
+                    .fetch_retry_coordinator
+                    .register(763, (Arc::downgrade(&pane.renderable), rx))
+                    .is_err());
+                assert!(client.fetch_retry_coordinator.pending.lock().is_empty());
+            }
             return;
         }
         drop(blockers);
@@ -6164,6 +6280,21 @@ mod tests {
     #[test]
     fn deferred_render_fetch_geometry_change_wakes_exact_pane_without_obsolete_read() {
         exercise_render_fetch_retry(FetchRetryChange::GeometryChanged);
+    }
+
+    #[test]
+    fn unpolled_admitted_domain_fetch_driver_cancels_pending_and_rejects_new_owners() {
+        exercise_render_fetch_retry(FetchRetryChange::CancelDomainUnpolled);
+    }
+
+    #[test]
+    fn unpolled_admitted_domain_fetch_driver_preserves_successor_token() {
+        exercise_render_fetch_retry(FetchRetryChange::CancelDomainWithSuccessor);
+    }
+
+    #[test]
+    fn detached_unpolled_admitted_domain_fetch_driver_drains_pending_owners() {
+        exercise_render_fetch_retry(FetchRetryChange::DetachDomainBeforePoll);
     }
 
     #[test]
