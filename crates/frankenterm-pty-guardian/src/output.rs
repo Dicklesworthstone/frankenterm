@@ -14722,9 +14722,9 @@ mod tests {
                     wait_millis: 0,
                 },
             )?;
-            let page =
+            let delivery =
                 store.apply_replay(&replay, state.preflight_replay(&replay)?, Some(&journal))?;
-            let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = page.into_body() else {
+            let GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) = delivery.into_body() else {
                 return Err("exact historical replay did not return its checkpoint".into());
             };
             assert_eq!(chunk.descriptor().capture_generation(), capture_generation);
