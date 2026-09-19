@@ -13245,10 +13245,10 @@ mod tests {
 
     #[test]
     fn process_async_treats_unexpected_eof_as_clean_disconnect() {
-        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
-        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
+        // ScopedMux owns the global lock; keep it alive through executor teardown.
+        let _executor = promise::spawn::SimpleExecutor::new();
         let result = promise::spawn::block_on(process_async(EofDispatchStream));
         assert!(
             result.is_ok(),
@@ -13301,10 +13301,9 @@ mod tests {
 
     #[test]
     fn process_async_treats_read_side_connection_reset_as_clean_disconnect() {
-        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
-        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
+        let _executor = promise::spawn::SimpleExecutor::new();
         let result = promise::spawn::block_on(process_async(ReadErrorDispatchStream {
             kind: io::ErrorKind::ConnectionReset,
         }));
@@ -13361,10 +13360,9 @@ mod tests {
 
     #[test]
     fn process_async_propagates_readable_wait_failures() {
-        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
-        let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
+        let _executor = promise::spawn::SimpleExecutor::new();
         let result = promise::spawn::block_on(process_async(FailingReadableDispatchStream));
         let err = result.expect_err("readable wait failures must not be swallowed");
         let message = format!("{err:#}");
@@ -14625,7 +14623,6 @@ mod tests {
             let cut = 1 + (cut_seed % (encoded.len() - 1));
             let frame_prefix = encoded[..cut].to_vec();
 
-            let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let _executor = promise::spawn::SimpleExecutor::new();
@@ -14671,7 +14668,6 @@ mod tests {
                 malformed_len
             );
 
-            let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let _executor = promise::spawn::SimpleExecutor::new();
