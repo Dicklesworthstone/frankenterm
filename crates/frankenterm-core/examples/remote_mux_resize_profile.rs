@@ -115,9 +115,17 @@ mod measured {
     fn latest_noise_sequence(text: &str) -> Result<u64> {
         let mut latest = None;
         for line in text.lines() {
-            let Some(rest) = line.strip_prefix("FT_NOISE ") else { continue };
-            let Some(digits) = rest.strip_suffix(" 0123456789abcdef FT_END") else { continue };
-            ensure!(digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_digit()), "malformed noise counter");
+            let line = line.trim_end_matches(' ');
+            let Some(rest) = line.strip_prefix("FT_NOISE ") else {
+                continue;
+            };
+            let Some(digits) = rest.strip_suffix(" 0123456789abcdef FT_END") else {
+                continue;
+            };
+            ensure!(
+                digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_digit()),
+                "malformed noise counter"
+            );
             let sequence = digits.parse::<u64>()?;
             if let Some(previous) = latest {
                 ensure!(sequence == previous + 1, "discontinuous noise tail");
@@ -132,7 +140,8 @@ mod measured {
         // parsed. At baseline, the following record can also be partial.
         // Exclude both uncertain records; at the end credit only records
         // strictly preceding the newest complete printable record.
-        end.checked_sub(start).and_then(|delta| delta.checked_sub(2))
+        end.checked_sub(start)
+            .and_then(|delta| delta.checked_sub(2))
             .and_then(|records| records.checked_mul(noise_record_bytes()))
             .context("noise interval lacks fresh complete records or overflows")
     }
@@ -613,7 +622,9 @@ mod measured {
                     "resize" => ProfileArm::Resize,
                     "echo" => ProfileArm::Echo,
                     "swarm-echo" => ProfileArm::SwarmEcho,
-                    other => bail!("unrecognized profile arm: {other}; expected resize, echo or swarm-echo"),
+                    other => bail!(
+                        "unrecognized profile arm: {other}; expected resize, echo or swarm-echo"
+                    ),
                 }
             } else {
                 ProfileArm::Resize
@@ -920,9 +931,15 @@ mod measured {
             )
             .await?;
             let topology = client.list_panes_with_cx(&cx).await?;
-            ensure!(topology.floating_panes.is_empty(), "unexpected floating panes");
+            ensure!(
+                topology.floating_panes.is_empty(),
+                "unexpected floating panes"
+            );
             if std::env::var("FT_SWARM_SETUP_ONLY").as_deref() == Ok("1") {
-                ensure!(topology.tabs.len() == 1, "setup requires only the owned interactive pane");
+                ensure!(
+                    topology.tabs.len() == 1,
+                    "setup requires only the owned interactive pane"
+                );
                 match &topology.tabs[0] {
                     mux::tab::PaneNode::Leaf(pane) => ensure!(
                         pane.pane_id as u64 == self.pane && pane.tab_id as u64 == self.tab,
@@ -933,37 +950,82 @@ mod measured {
                 for _ in 0..4 {
                     // The private fixture config supplies an exact noise-only
                     // default_prog. No shell or production default is inherited.
-                    let spawned = client.spawn_v2_with_cx(&cx, codec::SpawnV2 {
-                        domain: config::keyassignment::SpawnTabDomain::DefaultDomain,
-                        window_id: None,
-                        command: None,
-                        command_dir: None,
-                        size: TerminalSize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0, dpi: 0 },
-                        workspace: "owned-swarm-profile".to_string(),
-                    }).await?;
+                    let spawned = client
+                        .spawn_v2_with_cx(
+                            &cx,
+                            codec::SpawnV2 {
+                                domain: config::keyassignment::SpawnTabDomain::DefaultDomain,
+                                window_id: None,
+                                command: None,
+                                command_dir: None,
+                                size: TerminalSize {
+                                    rows: 24,
+                                    cols: 80,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                    dpi: 0,
+                                },
+                                workspace: "owned-swarm-profile".to_string(),
+                            },
+                        )
+                        .await?;
                     emit(json!({"event":"swarm_spawn", "pane_id":spawned.pane_id,
                         "tab_id":spawned.tab_id}))?;
                 }
                 return Ok(());
             }
-            ensure!(topology.tabs.len() == 5, "swarm requires five owned unsplit tabs");
+            ensure!(
+                topology.tabs.len() == 5,
+                "swarm requires five owned unsplit tabs"
+            );
             let mut noise = Vec::new();
             let mut found_interactive = false;
             for tab in &topology.tabs {
-                let mux::tab::PaneNode::Leaf(pane) = tab else { bail!("unexpected split pane") };
+                let mux::tab::PaneNode::Leaf(pane) = tab else {
+                    bail!("unexpected split pane")
+                };
                 if pane.pane_id as u64 == self.pane {
-                    ensure!(pane.tab_id as u64 == self.tab && !found_interactive, "interactive identity mismatch");
+                    ensure!(
+                        pane.tab_id as u64 == self.tab && !found_interactive,
+                        "interactive identity mismatch"
+                    );
                     found_interactive = true;
                 } else {
                     noise.push(pane.pane_id as u64);
                 }
             }
             noise.sort_unstable();
-            ensure!(found_interactive && noise.len() == 4 && noise.windows(2).all(|w| w[0] != w[1]), "swarm pane identity mismatch");
+            ensure!(
+                found_interactive && noise.len() == 4 && noise.windows(2).all(|w| w[0] != w[1]),
+                "swarm pane identity mismatch"
+            );
             for pane in std::iter::once(&self.pane).chain(noise.iter()) {
-                let role = if *pane == self.pane { "interactive" } else { "noise" };
-                let text = probe_text(client.get_text_tail_with_cx(&cx, *pane, 4096, Some(20)).await?)?;
-                ensure!(text.lines().any(|line| line == format!("FT_SWARM_READY {role}")), "swarm readiness missing");
+                let role = if *pane == self.pane {
+                    "interactive"
+                } else {
+                    "noise"
+                };
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let text = probe_text(
+                        client
+                            .get_text_tail_with_cx(&cx, *pane, 4096, Some(20))
+                            .await?,
+                    )?;
+                    ensure!(
+                        Instant::now() < deadline,
+                        "swarm readiness deadline expired"
+                    );
+                    if text
+                        .lines()
+                        .any(|line| line.trim_end_matches(' ') == format!("FT_SWARM_READY {role}"))
+                    {
+                        break;
+                    }
+                    sleep_with_cx(&cx, Duration::from_millis(10))
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
             }
             emit(json!({"event":"contract", "arm":"swarm-echo", "version":1,
                 "trials":1000, "noise_panes":noise, "pane_id":self.pane, "tab_id":self.tab,
@@ -971,7 +1033,9 @@ mod measured {
                 "p99_budget_us":50000, "record_bytes":noise_record_bytes(),
                 "scope":"private Unix socket; quiet-pane echo during aggregate noise ingestion; excludes native display"}))?;
             for pane in &noise {
-                client.write_to_pane_with_cx(&cx, *pane, b"START_STREAM swarm_session_001\n".to_vec()).await?;
+                client
+                    .write_to_pane_with_cx(&cx, *pane, b"START_STREAM swarm_session_001\n".to_vec())
+                    .await?;
             }
             let mut observer = IncrementalPaneObserver::new(&mut client, &cx, self.pane).await?;
             let interval = Instant::now();
@@ -982,31 +1046,52 @@ mod measured {
                 let nonce = format!("swarm_trial_{trial:04}");
                 let started = Instant::now();
                 let send_start_us = interval.elapsed().as_micros();
-                client.write_to_pane_with_cx(&cx, self.pane, format!("PROBE {nonce}\n").into_bytes()).await?;
-                observer.wait_for_probe(&mut client, &cx, &nonce, SETTLE).await?;
-                let latency = started.elapsed().as_micros();
-                ensure!(started.elapsed() < SETTLE, "swarm probe exceeded five-second deadline");
+                client
+                    .write_to_pane_with_cx(&cx, self.pane, format!("PROBE {nonce}\n").into_bytes())
+                    .await?;
+                observer
+                    .wait_for_probe(&mut client, &cx, &nonce, SETTLE)
+                    .await?;
+                let observed_us = interval.elapsed().as_micros();
+                let latency = observed_us - send_start_us;
+                ensure!(
+                    started.elapsed() < SETTLE,
+                    "swarm probe exceeded five-second deadline"
+                );
                 latencies.push(latency);
-                emit(json!({"event":"swarm_echo_trial", "trial":trial, "nonce":nonce,
-                    "send_start_us":send_start_us, "observed_us":interval.elapsed().as_micros(),
-                    "latency_us":latency}))?;
+                emit(
+                    json!({"event":"swarm_echo_trial", "trial":trial, "nonce":nonce,
+                    "send_start_us":send_start_us, "observed_us":observed_us,
+                    "latency_us":latency}),
+                )?;
                 // Every sample lies strictly inside the first-send/last-echo
                 // interval. No post-trial drain contributes to throughput.
                 if trial % 10 == 0 {
                     let mut sequences = Vec::with_capacity(4);
                     for (index, pane) in noise.iter().enumerate() {
                         let request_start_us = interval.elapsed().as_micros();
-                        let text = probe_text(client.get_text_tail_with_cx(&cx, *pane, 4096, Some(20)).await?)?;
+                        let text = probe_text(
+                            client
+                                .get_text_tail_with_cx(&cx, *pane, 4096, Some(20))
+                                .await?,
+                        )?;
                         let sequence = latest_noise_sequence(&text)?;
                         if let Some(previous) = &previous_sequences {
-                            ensure!(sequence > previous[index], "noise ingestion stalled or regressed");
+                            ensure!(
+                                sequence > previous[index],
+                                "noise ingestion stalled or regressed"
+                            );
                         }
-                        emit(json!({"event":"noise_sample", "after_trial":trial, "pane_id":pane,
+                        emit(
+                            json!({"event":"noise_sample", "after_trial":trial, "pane_id":pane,
                             "request_start_us":request_start_us, "response_end_us":interval.elapsed().as_micros(),
-                            "last_complete_record":sequence}))?;
+                            "last_complete_record":sequence, "tail":text}),
+                        )?;
                         sequences.push(sequence);
                     }
-                    if first_sequences.is_none() { first_sequences = Some(sequences.clone()); }
+                    if first_sequences.is_none() {
+                        first_sequences = Some(sequences.clone());
+                    }
                     previous_sequences = Some(sequences);
                 }
             }
@@ -1015,19 +1100,28 @@ mod measured {
             let last = previous_sequences.context("missing final noise observation")?;
             let mut ingested = 0u64;
             for (start, end) in first.iter().zip(&last) {
-                ingested = ingested.checked_add(noise_ingested_lower_bound(*start, *end)?).context("aggregate byte overflow")?;
+                ingested = ingested
+                    .checked_add(noise_ingested_lower_bound(*start, *end)?)
+                    .context("aggregate byte overflow")?;
             }
             latencies.sort_unstable();
             let p99 = nearest_rank_percentile(&latencies, 0.99);
             let throughput = ingested as f64 * 1_000_000.0 / duration_us as f64 / (1024.0 * 1024.0);
-            ensure!(ingested >= 10 * 1024 * 1024 && throughput >= 10.0, "concurrent aggregate ingestion below 10 MiB/s: {throughput}");
+            ensure!(
+                ingested >= 10 * 1024 * 1024 && throughput >= 10.0,
+                "concurrent aggregate ingestion below 10 MiB/s: {throughput}"
+            );
             ensure!(p99 <= 50_000, "swarm p99 {p99}us exceeds 50ms");
             for pane in noise.iter().chain(std::iter::once(&self.pane)) {
-                client.write_to_pane_with_cx(&cx, *pane, b"EXIT swarm_exit\n".to_vec()).await?;
+                client
+                    .write_to_pane_with_cx(&cx, *pane, b"EXIT swarm_exit\n".to_vec())
+                    .await?;
             }
-            emit(json!({"event":"complete", "arm":"swarm-echo", "status":"passed",
+            emit(
+                json!({"event":"complete", "arm":"swarm-echo", "status":"passed",
                 "trials":1000, "duration_us":duration_us, "bytes_ingested_lower_bound":ingested,
-                "throughput_mb_s_lower_bound":throughput, "p99_echo_us":p99}))?;
+                "throughput_mb_s_lower_bound":throughput, "p99_echo_us":p99}),
+            )?;
             Ok(())
         }
 
@@ -1294,6 +1388,25 @@ mod measured {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn swarm_parsed_counter_excludes_partial_and_uncertain_records() {
+            let text = "FT_NOISE 0000000000000040 0123456789abcdef FT_END\nFT_NOISE 0000000000000041 0123456789abcdef FT_END\nFT_NOISE 0000000000000042 01234";
+            assert_eq!(latest_noise_sequence(text).unwrap(), 41);
+            assert_eq!(latest_noise_sequence("FT_NOISE 0000000000000041 0123456789abcdef FT_END                               \n").unwrap(), 41);
+            assert_eq!(
+                noise_ingested_lower_bound(10, 41).unwrap(),
+                29 * noise_record_bytes()
+            );
+            assert!(noise_ingested_lower_bound(41, 40).is_err());
+            assert!(noise_ingested_lower_bound(40, 41).is_err());
+            assert!(noise_ingested_lower_bound(0, u64::MAX).is_err());
+            assert!(latest_noise_sequence("FT_NOISE 0000000000000042 01234").is_err());
+            assert!(latest_noise_sequence("FT_NOISE 0000000000000040 0123456789abcdef FT_END\nFT_NOISE 0000000000000042 0123456789abcdef FT_END").is_err());
+            assert!(
+                latest_noise_sequence("FT_NOISE 00000000000000x0 0123456789abcdef FT_END").is_err()
+            );
+        }
 
         #[test]
         fn test_observer_pre_search_buffered() {

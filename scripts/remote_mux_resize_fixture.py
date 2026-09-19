@@ -339,6 +339,24 @@ def noise_record(sequence):
     return f"FT_NOISE {sequence:016d} 0123456789abcdef FT_END\r\n".encode("ascii")
 
 
+def parsed_noise_sequence(text):
+    if not isinstance(text, str) or len(text.encode("utf-8")) > 4096:
+        raise ValueError("invalid bounded noise tail")
+    latest = None
+    for line in text.splitlines():
+        line = line.rstrip(" ")
+        match = re.fullmatch(r"FT_NOISE ([0-9]{16}) 0123456789abcdef FT_END", line)
+        if match is None:
+            continue
+        sequence = int(match[1])
+        if latest is not None and sequence != latest + 1:
+            raise ValueError("discontinuous parsed noise tail")
+        latest = sequence
+    if latest is None:
+        raise ValueError("no complete parsed noise record")
+    return latest
+
+
 def run_swarm_echo(args):
     """Separate bounded noise producers and a quiet, strictly ordered echo PTY."""
     if not os.isatty(0) or not os.isatty(1):
@@ -365,7 +383,10 @@ def run_swarm_echo(args):
         while time.monotonic() < deadline:
             if streaming and len(pending_out) < 16384:
                 while len(pending_out) < 32768:
-                    pending_out.extend(noise_record(sequence))
+                    record = noise_record(sequence)
+                    if written + len(pending_out) + len(record) > 256 * 1024 * 1024:
+                        raise ValueError("swarm producer reached 256 MiB lifetime cap")
+                    pending_out.extend(record)
                     sequence += 1
             readable, writable, _ = select.select([0], [1] if pending_out else [], [], 0.005)
             if readable:
@@ -767,6 +788,105 @@ def validate_echo_measurements(rows, fixture_receipt=None):
             raise ValueError(f"fixture independently measured throughput {fixture_tp:.2f} MB/s below 10.0 MB/s requirement")
 
 
+def validate_swarm_measurements(rows, finals, custody):
+    """Recompute concurrent parsed-byte lower bounds; final writes are custody only."""
+    def integer(value, name, minimum=0):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"invalid {name}")
+        return value
+
+    if len(rows) != 1402 or len(finals) != 5:
+        raise ValueError("incomplete swarm measurement/fixture receipts")
+    contract = rows[0]
+    noise = contract.get("noise_panes", [])
+    if (contract.get("event") != "contract" or contract.get("arm") != "swarm-echo"
+            or contract.get("version") != 1 or contract.get("trials") != 1000
+            or contract.get("p99_budget_us") != 50000 or contract.get("min_throughput_mb_s") != 10.0
+            or contract.get("record_bytes") != len(noise_record(0)) or len(noise) != 4
+            or any(type(pane) is not int or pane < 0 for pane in noise)
+            or noise != sorted(set(noise)) or contract.get("pane_id") in noise):
+        raise ValueError("invalid swarm contract")
+    pane = integer(contract.get("pane_id"), "interactive pane")
+    server = integer(contract.get("server_pid"), "server PID", 2)
+    if custody.get("server_identity", {}).get("pid") != server:
+        raise ValueError("swarm server custody mismatch")
+    by_pane = {}
+    for final in finals:
+        fixture_pane = integer(final.get("pane_id"), "fixture pane")
+        if fixture_pane in by_pane:
+            raise ValueError("duplicate fixture receipt")
+        by_pane[fixture_pane] = final
+        role = "interactive" if fixture_pane == pane else "noise"
+        chain = (custody.get("fixture_custody", []) if role == "interactive"
+                 else custody.get("noise_fixture_custody", {}).get(str(fixture_pane), []))
+        if (not chain or final.get("arm") != "swarm-echo" or final.get("status") != "completed"
+                or final.get("role") != role or chain[0].get("pid") != final.get("pid")
+                or chain[0].get("start_ticks") != str(final.get("linux_start_ticks"))
+                or chain[-1].get("pid") != server
+                or chain[-1].get("start_ticks") != custody["server_identity"].get("start_ticks")):
+            raise ValueError("fixture final receipt lacks exact owned custody")
+        if role == "interactive":
+            if final.get("probes_served") != 1000:
+                raise ValueError("quiet fixture did not serve all probes")
+        else:
+            generated = integer(final.get("records_generated"), "generated record count", 1)
+            if (final.get("record_bytes") != len(noise_record(0)) or final.get("probes_served") != 0
+                    or final.get("bytes_written") != generated * len(noise_record(0))):
+                raise ValueError("noise final receipt byte accounting mismatch")
+    if set(by_pane) != {pane, *noise}:
+        raise ValueError("fixture pane set mismatch")
+    index, previous_time = 1, 0
+    sequences = {p: [] for p in noise}
+    latencies = []
+    for trial in range(1000):
+        row = rows[index]
+        index += 1
+        start = integer(row.get("send_start_us"), "probe start")
+        end = integer(row.get("observed_us"), "probe observation")
+        latency = integer(row.get("latency_us"), "probe latency")
+        if (row.get("event") != "swarm_echo_trial" or row.get("trial") != trial
+                or row.get("nonce") != f"swarm_trial_{trial:04d}"
+                or start < previous_time or end < start or latency != end - start
+                or latency >= 5_000_000):
+            raise ValueError("invalid ordered swarm probe")
+        previous_time = end
+        latencies.append(latency)
+        if trial % 10 == 0:
+            for noise_pane in noise:
+                sample = rows[index]
+                index += 1
+                start = integer(sample.get("request_start_us"), "noise request")
+                end = integer(sample.get("response_end_us"), "noise response")
+                seq = integer(sample.get("last_complete_record"), "parsed record")
+                prior = sequences[noise_pane]
+                if (sample.get("event") != "noise_sample" or sample.get("after_trial") != trial
+                        or sample.get("pane_id") != noise_pane or start < previous_time or end < start
+                        or seq != parsed_noise_sequence(sample.get("tail"))
+                        or (prior and seq <= prior[-1])
+                        or seq >= by_pane[noise_pane]["records_generated"]):
+                    raise ValueError("stale, forged, or out-of-interval noise observation")
+                prior.append(seq)
+                previous_time = end
+    complete = rows[index]
+    duration = integer(complete.get("duration_us"), "measurement duration", 1)
+    if (complete.get("event") != "complete" or complete.get("arm") != "swarm-echo"
+            or complete.get("status") != "passed" or complete.get("trials") != 1000
+            or duration < previous_time):
+        raise ValueError("invalid swarm completion interval")
+    deltas = [values[-1] - values[0] - 2 for values in sequences.values()]
+    if any(delta <= 0 for delta in deltas):
+        raise ValueError("insufficient fresh parsed noise records")
+    ingested = sum(deltas) * len(noise_record(0))
+    throughput = ingested * 1_000_000 / duration / (1024 * 1024)
+    p99 = nearest_rank_percentile(sorted(latencies), 0.99)
+    reported = complete.get("throughput_mb_s_lower_bound")
+    if (ingested < 10 * 1024 * 1024 or throughput < 10 or p99 > 50000
+            or complete.get("bytes_ingested_lower_bound") != ingested or complete.get("p99_echo_us") != p99
+            or type(reported) not in (int, float) or not math.isfinite(reported)
+            or abs(reported - throughput) > 1e-9 * max(1, throughput)):
+        raise ValueError("swarm byte/latency acceptance or recomputed result mismatch")
+
+
 def measure(args):
     """Run the bounded client against a newly created Linux-only mux instance."""
     for name, value in (("mux-socket-buffer-bytes", getattr(args, "mux_socket_buffer_bytes", None)),
@@ -954,8 +1074,9 @@ def measure(args):
         else:
             client_argv = [str(client), str(socket), str(server.pid), str(panes[0]["pane_id"]),
                            str(panes[0]["tab_id"]), str(corpus_path), "20"]
-        write_new(root / "custody.json", json.dumps({"interactive": receipt["fixture_custody"],
-                  "noise": receipt.get("noise_fixture_custody", {})}, indent=2) + "\n")
+        custody_artifact = ({"interactive": receipt["fixture_custody"], "noise": receipt["noise_fixture_custody"]}
+                            if args.arm == "swarm-echo" else receipt["fixture_custody"])
+        write_new(root / "custody.json", json.dumps(custody_artifact, indent=2) + "\n")
         write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
         receipt["client_argv"] = client_argv
         with (root / "trials.jsonl").open("xb") as stdout, (root / "client.stderr").open("xb") as stderr:
@@ -971,11 +1092,15 @@ def measure(args):
         if args.arm == "swarm-echo":
             final_paths = [root / "pane-owner.json.final"] + [root / f"noise-owner-{pane}.json.final" for pane in noise_ids]
             deadline = time.monotonic() + 5
-            while not all(path.exists() for path in final_paths):
+            while True:
+                try:
+                    finals = [json.loads(path.read_text()) for path in final_paths]
+                    break
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
                 if time.monotonic() >= deadline:
                     raise TimeoutError("swarm final fixture receipts missing")
                 time.sleep(0.05)
-            finals = [json.loads(path.read_text()) for path in final_paths]
             validate_swarm_measurements(rows, finals, receipt)
             receipt["swarm_result"] = rows[-1]
             receipt["samples"] = 1000
@@ -1023,9 +1148,96 @@ def measure(args):
         raise RuntimeError("baseline or owned-process cleanup failed")
 
 
+def test_swarm_receipt_contract():
+    """Short deterministic receipts test verification, never live performance."""
+    import copy
+    import unittest
+
+    class SwarmReceiptTests(unittest.TestCase):
+        def setUp(self):
+            self.custody = {"server_identity": {"pid": 50, "start_ticks": "10"},
+                            "noise_fixture_custody": {}}
+            self.finals = []
+            for pane in range(5):
+                identity = {"pid": 100 + pane, "start_ticks": str(20 + pane)}
+                chain = [identity, self.custody["server_identity"]]
+                if pane == 0:
+                    self.custody["fixture_custody"] = chain
+                else:
+                    self.custody["noise_fixture_custody"][str(pane)] = chain
+                self.finals.append({"pane_id": pane, "pid": 100 + pane,
+                                    "linux_start_ticks": str(20 + pane), "arm": "swarm-echo",
+                                    "status": "completed", "role": "interactive" if pane == 0 else "noise",
+                                    "probes_served": 1000 if pane == 0 else 0,
+                                    "records_generated": 100001, "record_bytes": len(noise_record(0)),
+                                    "bytes_written": 100001 * len(noise_record(0))})
+            self.rows = [{"event": "contract", "arm": "swarm-echo", "version": 1,
+                          "trials": 1000, "noise_panes": [1, 2, 3, 4], "pane_id": 0,
+                          "server_pid": 50, "p99_budget_us": 50000,
+                          "min_throughput_mb_s": 10.0, "record_bytes": len(noise_record(0))}]
+            clock = 0
+            for trial in range(1000):
+                self.rows.append({"event": "swarm_echo_trial", "trial": trial,
+                                  "nonce": f"swarm_trial_{trial:04d}", "send_start_us": clock,
+                                  "observed_us": clock + 100, "latency_us": 100})
+                clock += 100
+                if trial % 10 == 0:
+                    for pane in range(1, 5):
+                        self.rows.append({"event": "noise_sample", "after_trial": trial,
+                                          "pane_id": pane, "request_start_us": clock,
+                                          "response_end_us": clock + 100,
+                                          "last_complete_record": trial * 100 + 1,
+                                          "tail": noise_record(trial * 100 + 1).decode("ascii")})
+                        clock += 100
+            ingested = 4 * (99000 - 2) * len(noise_record(0))
+            self.rows.append({"event": "complete", "arm": "swarm-echo", "status": "passed",
+                              "trials": 1000, "duration_us": clock,
+                              "bytes_ingested_lower_bound": ingested,
+                              "throughput_mb_s_lower_bound": ingested * 1_000_000 / clock / (1024 * 1024),
+                              "p99_echo_us": 100})
+
+        def test_complete_contract(self):
+            validate_swarm_measurements(self.rows, self.finals, self.custody)
+            self.assertEqual(len(noise_record(0)), len(noise_record(999999)))
+            self.assertLess(len(noise_record(0)), 80)
+            self.assertEqual(parsed_noise_sequence(noise_record(41).decode().rstrip() + " " * 31 + "\n"), 41)
+
+        def test_forged_bytes_latency_and_missing_custody(self):
+            cases = [(0, "record_bytes", 128), (-1, "bytes_ingested_lower_bound", 2**63),
+                     (-1, "p99_echo_us", 0), (1, "latency_us", 0),
+                     (2, "last_complete_record", 100002), (2, "last_complete_record", 999),
+                     (2, "response_end_us", 2**63)]
+            for index, field, value in cases:
+                with self.subTest(field=field):
+                    rows = copy.deepcopy(self.rows)
+                    rows[index][field] = value
+                    with self.assertRaises(ValueError):
+                        validate_swarm_measurements(rows, self.finals, self.custody)
+            custody = copy.deepcopy(self.custody)
+            custody["noise_fixture_custody"].pop("4")
+            with self.assertRaises(ValueError):
+                validate_swarm_measurements(self.rows, self.finals, custody)
+
+        def test_stale_counter_and_final_bytes_cannot_manufacture_load(self):
+            rows = copy.deepcopy(self.rows)
+            for row in rows:
+                if row.get("event") == "noise_sample":
+                    row["last_complete_record"] = 1
+            with self.assertRaises(ValueError):
+                validate_swarm_measurements(rows, self.finals, self.custody)
+            finals = copy.deepcopy(self.finals)
+            finals[1]["bytes_written"] += 1
+            with self.assertRaises(ValueError):
+                validate_swarm_measurements(self.rows, finals, self.custody)
+
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(SwarmReceiptTests))
+    if not result.wasSuccessful():
+        raise RuntimeError("swarm receipt contract tests failed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "run", "measure"))
+    parser.add_argument("mode", choices=("prepare", "run", "measure", "self-test"))
     parser.add_argument("--corpus")
     parser.add_argument("--owner")
     parser.add_argument("--bin-dir")
@@ -1054,7 +1266,9 @@ def main():
     if args.mode != "measure":
         if args.mux_socket_buffer_bytes is not None or args.mux_parser_buffer_bytes is not None:
             parser.error("--mux-socket-buffer-bytes and --mux-parser-buffer-bytes are measure-only")
-    if args.mode == "measure":
+    if args.mode == "self-test":
+        test_swarm_receipt_contract()
+    elif args.mode == "measure":
         if not all((args.bin_dir, args.client, args.artifact_dir)):
             parser.error("measure requires --bin-dir, --client, --artifact-dir")
         measure(args)
