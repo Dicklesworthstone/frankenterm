@@ -10969,7 +10969,15 @@ mod tests {
                 Mux::set_mux(&replacement);
             }
             if replace_pane {
-                owner.remove_pane(998_450);
+                // Pane removal alone preserves its exact structural tab owner;
+                // the live Activity also deliberately suppresses pruning.
+                // Retire the tab through the public structural transaction while
+                // the queued event continues retaining the original pane Arc.
+                let retired_tab = owner.remove_tab(tab.tab_id()).unwrap();
+                assert!(Arc::ptr_eq(&retired_tab, &tab));
+                assert!(owner.get_tab(tab.tab_id()).is_none());
+                assert!(owner.get_pane(998_450).is_none());
+                drop(retired_tab);
                 let replacement = new_gui_test_pane(998_450, [0x52; 16]);
                 let replacement_tab =
                     Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
