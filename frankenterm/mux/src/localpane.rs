@@ -5174,6 +5174,8 @@ mod tests {
             BTreeMap<StableRowIndex, Line>,
         )>,
         busy: AtomicBool,
+        usage_busy: AtomicBool,
+        usage_unsupported: AtomicBool,
         unavailable: AtomicBool,
         busy_observations: AtomicUsize,
         witness_admission: AtomicBool,
@@ -5206,10 +5208,13 @@ mod tests {
 
         fn try_capture_scrollback_usage(&self) -> frankenterm_term::config::ScrollbackUsageCapture {
             use frankenterm_term::config::ScrollbackUsageCapture;
-            if self.unavailable.load(Ordering::Acquire) {
+            if self.usage_unsupported.load(Ordering::Acquire) {
                 return ScrollbackUsageCapture::Unsupported;
             }
-            if self.busy.load(Ordering::Acquire) {
+            if self.unavailable.load(Ordering::Acquire) {
+                return ScrollbackUsageCapture::Unavailable;
+            }
+            if self.busy.load(Ordering::Acquire) || self.usage_busy.load(Ordering::Acquire) {
                 self.busy_observations.fetch_add(1, Ordering::Release);
                 return ScrollbackUsageCapture::Busy;
             }
@@ -10616,7 +10621,10 @@ mod tests {
         // 4. Cold sink busy refusal
         {
             let (cold_pane, _mux, _reg, sink, _token) = cold_resize_fixture(false);
-            sink.busy.store(true, Ordering::Release);
+            // Layout admission still succeeds; only the subsequent usage
+            // observation is contended, reproducing the gap between probes.
+            sink.usage_busy.store(true, Ordering::Release);
+            assert!(matches!(cold_pane.get_line_layout(), Ok(Some(_))));
             let result = cold_pane.capture_surface_snapshot(0);
             assert!(
                 matches!(
@@ -10625,7 +10633,7 @@ mod tests {
                 ),
                 "cold sink busy must return Some(Err(ColdReadMetadataBusy))"
             );
-            sink.busy.store(false, Ordering::Release);
+            sink.usage_busy.store(false, Ordering::Release);
             let result = cold_pane.capture_surface_snapshot(0);
             assert!(result.is_some() && result.as_ref().unwrap().is_ok());
             let snap = result.unwrap().unwrap();
@@ -10634,6 +10642,11 @@ mod tests {
                 status.cold_sink_retained_lines,
                 sink.retained_scrollback_rows()
             );
+            sink.usage_unsupported.store(true, Ordering::Release);
+            let unsupported = cold_pane.capture_surface_snapshot(0).unwrap().unwrap();
+            assert!(unsupported.tiered_scrollback_status.is_none());
+            assert_eq!(unsupported.viewport_lines, snap.viewport_lines);
+            assert!(sink.retained_scrollback_rows() > 0);
         }
 
         // 5. Uncontended call succeeds

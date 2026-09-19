@@ -16686,6 +16686,7 @@ pub(crate) mod tests {
         }
 
         let status = screen.tiered_scrollback_status();
+        assert_eq!(screen.try_tiered_scrollback_status(), Ok(Some(status)));
         assert!(status.tiering_enabled);
         assert_eq!(status.configured_scrollback_rows, 10);
         assert_eq!(status.configured_hot_lines, 2);
