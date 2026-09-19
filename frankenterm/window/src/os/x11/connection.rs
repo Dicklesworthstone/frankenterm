@@ -1091,6 +1091,29 @@ impl XConnection {
         future
     }
 
+    pub(crate) fn with_window_inner_reserved<F>(
+        window: xcb::x::Window,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) where
+        F: FnOnce(&mut XWindowInner) + Send + 'static,
+    {
+        reservation
+            .spawn(async move {
+                let Some(connection) = Connection::get() else {
+                    return;
+                };
+                if let Some(handle) = connection.x11().window_by_id(window) {
+                    let mut inner =
+                        lock_window_inner(&handle, "running admitted X11 window notification");
+                    if inner.window_id == window {
+                        f(&mut inner);
+                    }
+                }
+            })
+            .detach();
+    }
+
     fn screen_from_focused_window(
         &self,
         by_name: &HashMap<String, ScreenInfo>,

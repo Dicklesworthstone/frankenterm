@@ -851,6 +851,22 @@ impl WindowOps for Window {
         });
     }
 
+    fn notify_with_reservation<T: Any + Send + Sync>(
+        &self,
+        t: T,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) {
+        Connection::with_window_inner_reserved(self.id, reservation, move |inner| {
+            if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
+                window_view
+                    .inner
+                    .borrow_mut()
+                    .events
+                    .dispatch(WindowEvent::Notification(Box::new(t)));
+            }
+        });
+    }
+
     fn close(&self) {
         Connection::with_window_inner(self.id, |inner| {
             inner.close();

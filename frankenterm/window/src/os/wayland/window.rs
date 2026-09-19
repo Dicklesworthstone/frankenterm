@@ -587,6 +587,16 @@ impl WindowOps for WaylandWindow {
         });
     }
 
+    fn notify_with_reservation<T: Any + Send + Sync>(
+        &self,
+        t: T,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) {
+        WaylandConnection::with_window_inner_reserved(self.0, reservation, move |inner| {
+            inner.events.dispatch(WindowEvent::Notification(Box::new(t)));
+        });
+    }
+
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         let reservation = crate::reserve_window_main_thread(

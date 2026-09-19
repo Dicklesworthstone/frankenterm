@@ -345,6 +345,16 @@ pub trait WindowOps {
     where
         Self: Sized;
 
+    /// Deliver a notification using capacity already owned by its producer.
+    /// The exact scheduler generation and service class survive the handoff;
+    /// this must never perform another fallible scheduler admission.
+    fn notify_with_reservation<T: Any + Send + Sync>(
+        &self,
+        t: T,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) where
+        Self: Sized;
+
     /// Setup opengl for rendering
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>>;
     /// Advise the window that a frame is finished

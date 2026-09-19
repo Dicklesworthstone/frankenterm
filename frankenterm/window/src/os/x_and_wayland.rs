@@ -261,6 +261,18 @@ impl WindowOps for Window {
         }
     }
 
+    fn notify_with_reservation<T: Any + Send + Sync>(
+        &self,
+        t: T,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) {
+        match self {
+            Self::X11(x) => x.notify_with_reservation(t, reservation),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.notify_with_reservation(t, reservation),
+        }
+    }
+
     fn hide(&self) {
         match self {
             Self::X11(x) => x.hide(),

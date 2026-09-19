@@ -144,6 +144,47 @@ lazy_static::lazy_static! {
 
 pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
+async fn run_mux_output_refresh(
+    pending: flume::Receiver<()>,
+    identity: promise::spawn::MainThreadAdmissionReceipt,
+    is_live: impl Fn() -> bool,
+    deliver: impl Fn(promise::spawn::MainThreadSpawnReservation, Sender<()>),
+) {
+    while pending.recv_async().await.is_ok() {
+        let mut delay = Duration::from_millis(10);
+        loop {
+            if pending.is_disconnected() || !is_live() {
+                return;
+            }
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Render,
+                4 * 1024,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    let receipt = reservation.admission_receipt();
+                    if receipt.queue_id != identity.queue_id
+                        || receipt.scheduler_generation != identity.scheduler_generation
+                    {
+                        return;
+                    }
+                    let (completion, completed) = flume::bounded(1);
+                    deliver(reservation, completion);
+                    // Sender drop acknowledges consumption or native window /
+                    // scheduler destruction. Never queue a second delivery
+                    // while the preceding native operation remains in flight.
+                    let _ = completed.recv_async().await;
+                    break;
+                }
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => {
+                    sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                }
+                _ => return,
+            }
+        }
+    }
+}
+
 /// One title refresh for one exact GUI subscription. The ticket travels through
 /// both scheduler hops, including Window::notify, so a burst cannot refill the
 /// queue between the mux callback and the actual window handler. That handler
@@ -286,6 +327,13 @@ pub enum TermWindowNotif {
         /// has finished cleaning its numeric pane-keyed state.
         pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
         pending_title_refresh: Option<PendingMuxTitleRefresh>,
+    },
+    /// A level-triggered refresh of current state, with no historical pane ID
+    /// or lifecycle payload to replay after a delayed delivery.
+    MuxOutputRefresh {
+        mux_owner: Weak<Mux>,
+        mux_window_id: MuxWindowId,
+        completion: Sender<()>,
     },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
@@ -4137,6 +4185,28 @@ impl TermWindow {
             } => {
                 self.cancel_overlay_for_tab_if_current(tab_id, Some(overlay_pane_id), &ticket);
             }
+            TermWindowNotif::MuxOutputRefresh {
+                mux_owner,
+                mux_window_id,
+                completion,
+            } => {
+                // Holding completion until after paint bounds the producer to
+                // one in-flight native operation plus one coalesced wake.
+                let _completion = completion;
+                let Some(owner) = mux_owner.upgrade() else {
+                    return Ok(());
+                };
+                if self.mux_window_id != mux_window_id
+                    || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
+                {
+                    return Ok(());
+                }
+                self.record_idle_event(idle_detector::IdleEvent::PtyData);
+                // We already own Render admission and run outside a native
+                // event-handler borrow. Do not queue another fallible native
+                // invalidate operation between this wake and paint.
+                self.paint_if_admitted(window)?;
+            }
             TermWindowNotif::MuxNotification {
                 notification: n,
                 mux_owner,
@@ -4796,9 +4866,10 @@ impl TermWindow {
         deferred_authority: (
             Option<PaneRemovalCleanupLease>,
             Option<PendingMuxTitleRefresh>,
+            promise::spawn::MainThreadSpawnReservation,
         ),
     ) -> bool {
-        let (pane_removal_cleanup, pending_title_refresh) = deferred_authority;
+        let (pane_removal_cleanup, pending_title_refresh, reservation) = deferred_authority;
         if dead.load(Ordering::Relaxed) {
             // Subscription cancelled asynchronously
             return false;
@@ -4926,12 +4997,15 @@ impl TermWindow {
             }
         }
 
-        window.notify(TermWindowNotif::MuxNotification {
-            notification: n,
-            mux_owner: Arc::downgrade(&mux),
-            pane_removal_cleanup,
-            pending_title_refresh,
-        });
+        window.notify_with_reservation(
+            TermWindowNotif::MuxNotification {
+                notification: n,
+                mux_owner: Arc::downgrade(&mux),
+                pane_removal_cleanup,
+                pending_title_refresh,
+            },
+            reservation,
+        );
 
         true
     }
@@ -4951,6 +5025,25 @@ impl TermWindow {
         let callback_unsubscribe_requested = Arc::clone(&unsubscribe_requested);
         let callback_mux = Arc::downgrade(&mux);
         let pending_title_refresh = Arc::new(AtomicBool::new(false));
+        // Reserve retry ownership before accepting the subscription. The
+        // capacity-one channel stores only a level-triggered output bit;
+        // structural notifications retain their existing ordered path below.
+        let output_worker = promise::spawn::try_reserve_background_task(4 * 1024)
+            .context("reserving GUI pane-output retry owner")?;
+        let output_identity = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation.admission_receipt()
+            }
+            rejected => anyhow::bail!("reserving GUI pane-output scheduler owner: {rejected:?}"),
+        };
+        let (output_tx, output_rx) = flume::bounded(1);
+        let output_window = window.clone();
+        let output_mux = Arc::downgrade(&mux);
+        let output_mux_window_id = Arc::clone(&mux_window_id);
+        let output_dead = Arc::clone(&dead);
         let allocated_subscription_id = mux
             .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
                 if dead.load(Ordering::Relaxed) {
@@ -4976,6 +5069,11 @@ impl TermWindow {
                 }
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
+                }
+                if matches!(&n, MuxNotification::PaneOutput(_)) {
+                    // Full means an equivalent refresh is already retained.
+                    // No pane-removal lease or historical event is coalesced.
+                    return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
                 }
                 let pending_title_refresh = if Self::mux_notification_only_refreshes_title(&n) {
                     let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) else {
@@ -5018,14 +5116,14 @@ impl TermWindow {
                 ) {
                     promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                         reservation
-                            .spawn(async move {
+                            .handoff_to_main_thread_local(move |reservation| {
                                 if !Self::mux_pane_output_event_callback(
                                     n,
                                     &window,
                                     mux_window_id,
                                     &dead,
                                     &mux,
-                                    (pane_removal_cleanup, pending_title_refresh),
+                                    (pane_removal_cleanup, pending_title_refresh, reservation),
                                 ) {
                                     dead.store(true, Ordering::Release);
                                     unsubscribe_requested.store(true, Ordering::Release);
@@ -5057,6 +5155,27 @@ impl TermWindow {
                 }
             })
             .context("allocating mux pane-update subscription")?;
+        output_worker.spawn(async move {
+            run_mux_output_refresh(
+                output_rx,
+                output_identity,
+                || !output_dead.load(Ordering::Acquire) && output_mux.upgrade().is_some(),
+                |reservation, completion| {
+                    let mux_window_id = *output_mux_window_id
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    output_window.notify_with_reservation(
+                        TermWindowNotif::MuxOutputRefresh {
+                            mux_owner: output_mux.clone(),
+                            mux_window_id,
+                            completion,
+                        },
+                        reservation,
+                    );
+                },
+            )
+            .await;
+        });
         subscription_id.store(allocated_subscription_id, Ordering::Release);
         if unsubscribe_requested.load(Ordering::Acquire) {
             let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
@@ -9251,6 +9370,79 @@ mod tests {
         webgpu_repair_failure_stage,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn mux_output_refresh_survives_saturation_without_an_unrelated_wake() {
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let exec = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected initial reservation: {other:?}"),
+        };
+        let identity = occupying.admission_receipt();
+        let (pending, receive) = flume::bounded(1);
+        for _ in 0..10_000 {
+            let _ = pending.try_send(());
+        }
+        assert_eq!(pending.len(), 1);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_worker = Arc::clone(&delivered);
+        let (attempted, attempts) = flume::bounded(2);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(
+                receive,
+                identity,
+                || {
+                    let _ = attempted.try_send(());
+                    true
+                },
+                |reservation, completion| {
+                    let delivered = Arc::clone(&delivered_worker);
+                    let receipt = reservation.admission_receipt();
+                    reservation
+                        .handoff_to_main_thread_local(move |reservation| {
+                            assert_eq!(reservation.admission_receipt(), receipt);
+                            reservation
+                                .spawn_local(async move {
+                                    delivered.fetch_add(1, Ordering::AcqRel);
+                                    drop(completion);
+                                })
+                                .detach();
+                        })
+                        .detach();
+                },
+            ));
+        });
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The second admission attempt is reachable only after an actual
+        // RetryableFull result and its delay, not merely worker startup.
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        assert_eq!(delivered.load(Ordering::Acquire), 0);
+        // No new producer event after capacity recovery: the retained request
+        // itself must make progress and survive the second scheduler hop.
+        drop(occupying);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "retained output wake was lost");
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(delivered.load(Ordering::Acquire), 1);
+        drop(pending);
+        worker.join().unwrap();
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
 
     #[test]
     fn failed_workspace_spawn_rolls_back_only_its_own_empty_selection() {

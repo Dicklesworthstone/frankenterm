@@ -2105,6 +2105,16 @@ impl WindowOps for XWindow {
         });
     }
 
+    fn notify_with_reservation<T: Any + Send + Sync>(
+        &self,
+        t: T,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) {
+        XConnection::with_window_inner_reserved(self.0, reservation, move |inner| {
+            inner.events.dispatch(WindowEvent::Notification(Box::new(t)));
+        });
+    }
+
     fn close(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.close();

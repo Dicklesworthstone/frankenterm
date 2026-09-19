@@ -175,6 +175,27 @@ impl WaylandConnection {
     }
 }
 
+impl WaylandConnection {
+    pub(crate) fn with_window_inner_reserved<F>(
+        window: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) where
+        F: FnOnce(&mut WaylandWindowInner) + Send + 'static,
+    {
+        reservation
+            .spawn(async move {
+                let Some(connection) = Connection::get() else {
+                    return;
+                };
+                if let Some(handle) = connection.wayland().window_by_id(window) {
+                    f(&mut handle.borrow_mut());
+                }
+            })
+            .detach();
+    }
+}
+
 impl ConnectionOps for WaylandConnection {
     fn name(&self) -> String {
         "Wayland".to_string()

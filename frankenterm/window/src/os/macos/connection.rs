@@ -121,6 +121,25 @@ impl Connection {
 
         future
     }
+
+    pub(crate) fn with_window_inner_reserved<F>(
+        window_id: usize,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+        f: F,
+    ) where
+        F: FnOnce(&mut WindowInner) + Send + 'static,
+    {
+        reservation
+            .spawn(async move {
+                let Some(conn) = Connection::get() else {
+                    return;
+                };
+                if let Some(handle) = conn.window_by_id(window_id) {
+                    f(&mut handle.borrow_mut());
+                }
+            })
+            .detach();
+    }
 }
 
 /// `/System/Library/CoreServices/SystemVersion.plist`
