@@ -8607,6 +8607,13 @@ impl Screen {
         let mut lines = Vec::with_capacity(resolved_len);
         let end = first + resolved_len as StableRowIndex;
         let mut stable_row = first;
+        // Share one bounded authenticated batch across adjacent logical groups.
+        // A group is often only one or two source rows; restarting the sink
+        // for every group repeats its filesystem and key authority checks.
+        #[cfg(feature = "use_serde")]
+        let mut cold_batch = Vec::new().into_iter();
+        #[cfg(feature = "use_serde")]
+        let mut cold_batch_next = 0;
         while stable_row < end {
             if let Some(phys) = self.stable_row_to_phys(stable_row) {
                 if let Some(line) = self.lines.get(phys) {
@@ -8626,24 +8633,43 @@ impl Screen {
                 .as_ref()
                 .filter(|layout| !layout.stored_physical() && layout.visual.contains(&stable_row))
             {
-                let Some((source, visual)) = layout
+                let group_index = layout
                     .groups
-                    .iter()
-                    .find(|(_, visual)| visual.contains(&stable_row))
-                else {
+                    .partition_point(|(_, visual)| visual.end <= stable_row);
+                let Some((source, visual)) = layout.groups.get(group_index) else {
                     break;
                 };
+                if !visual.contains(&stable_row) {
+                    break;
+                }
                 let mut source_row = source.start;
                 let mut logical: Option<Line> = None;
                 let mut tail_wrapped = false;
                 while source_row < source.end {
-                    let batch = sink.load_scrollback_lines(
-                        source_row..source.end.min(source_row.saturating_add(32)),
-                    );
-                    if batch.is_empty() || batch.len() > (source.end - source_row) as usize {
-                        return (first, lines);
+                    if cold_batch.len() == 0 {
+                        let limit = source_row.saturating_add(32);
+                        let mut batch_end = source.end.min(limit);
+                        for (next_source, next_visual) in &layout.groups[group_index + 1..] {
+                            if batch_end == limit
+                                || next_visual.start >= end
+                                || next_source.start != batch_end
+                            {
+                                break;
+                            }
+                            batch_end = next_source.end.min(limit);
+                        }
+                        let batch = sink.load_scrollback_lines(source_row..batch_end);
+                        if batch.is_empty() || batch.len() > (batch_end - source_row) as usize {
+                            return (first, lines);
+                        }
+                        cold_batch = batch.into_iter();
+                        cold_batch_next = source_row;
                     }
-                    for line in batch {
+                    while source_row < source.end && cold_batch.len() != 0 {
+                        if cold_batch_next != source_row {
+                            return (first, lines);
+                        }
+                        let line = cold_batch.next().expect("nonempty cold batch");
                         let mut line = cold_row_with_fragment(
                             self.cold_row_fragments.as_deref(),
                             source_row,
@@ -8659,6 +8685,7 @@ impl Screen {
                             logical = Some(line);
                         }
                         source_row += 1;
+                        cold_batch_next += 1;
                     }
                 }
                 let Some(logical) = logical else {
@@ -10594,6 +10621,102 @@ pub(crate) mod tests {
         );
         sink.requests.lock().unwrap().clear();
         (screen, sink)
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn synchronous_cold_text_batches_across_groups_and_preserves_resident_seam() {
+        for batch_rows in [32, 2] {
+            let (mut screen, sink) = cold_prefetch_fixture(batch_rows);
+            let mut expected = Vec::new();
+            // Independent one-group reads exercise the same wrap/fragment
+            // semantics without allowing reuse across logical boundaries.
+            for row in 0..68 {
+                let (first, rows) = screen.lines_in_stable_range(row..row + 1);
+                assert_eq!(first, row);
+                assert_eq!(rows.len(), 1);
+                expected.extend(rows);
+            }
+            assert_eq!(sink.requests.lock().unwrap().len(), 65);
+            sink.requests.lock().unwrap().clear();
+            let (first, actual) = screen.lines_in_stable_range(0..68);
+            assert_eq!(first, 0);
+            assert_eq!(
+                actual, expected,
+                "cold text and resident seam must be identical"
+            );
+            {
+                let requests = sink.requests.lock().unwrap();
+                assert_eq!(requests.len(), 65usize.div_ceil(batch_rows));
+                assert_eq!(requests.first(), Some(&(0..32)));
+                assert_eq!(requests.last(), Some(&(64..65)));
+            }
+            sink.requests.lock().unwrap().clear();
+            let (first, subset) = screen.lines_in_stable_range(5..38);
+            assert_eq!(first, 5);
+            assert_eq!(subset, expected[5..38]);
+            let requests = sink.requests.lock().unwrap();
+            assert_eq!(requests.len(), 33usize.div_ceil(batch_rows));
+            assert!(requests
+                .iter()
+                .all(|range| range.start >= 5 && range.end <= 38));
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn synchronous_cold_text_prefetch_preserves_soft_wrapped_groups() {
+        let (mut screen, sink) = cold_prefetch_fixture(32);
+        for row in (0..64).step_by(2) {
+            let mut line = sink.inner.rows.lock().unwrap()[&row].clone();
+            line.set_last_cell_was_wrapped(true, 3);
+            assert!(sink.store_scrollback_line(row, &line, 65));
+        }
+        // Rebuild exact layout authority after replacing the source wrap
+        // boundaries. Use the independent owned reader as the text oracle.
+        screen.cold_visual_layout = None;
+        let indexed = screen
+            .capture_line_read(0..68)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&indexed));
+        screen.install_line_read_layout(&indexed, 4);
+        let layout = screen.current_cold_visual_layout().unwrap();
+        assert_eq!(layout.groups.len(), 33);
+        assert!(layout
+            .groups
+            .iter()
+            .take(32)
+            .all(|(source, _)| source.end - source.start == 2));
+        let start = indexed.first_row();
+        let expected = indexed.lines().cloned().collect::<Vec<_>>();
+        sink.requests.lock().unwrap().clear();
+        let (first, actual) =
+            screen.lines_in_stable_range(start..start + expected.len() as StableRowIndex);
+        assert_eq!(first, start);
+        assert_eq!(actual, expected);
+        assert_eq!(sink.requests.lock().unwrap().len(), 3);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn synchronous_cold_text_rejects_overfill_and_stops_at_missing_prefix() {
+        let (mut screen, sink) = cold_prefetch_fixture(32);
+        sink.overfill.store(true, Ordering::Relaxed);
+        assert!(screen.lines_in_stable_range(0..65).1.is_empty());
+        assert_eq!(*sink.requests.lock().unwrap(), [0..32]);
+        sink.overfill.store(false, Ordering::Relaxed);
+        sink.requests.lock().unwrap().clear();
+        let expected = screen.lines_in_stable_range(0..32).1;
+        // Model an unavailable next record: a returned prefix must never be
+        // relabeled as later rows or skip across the failed boundary.
+        sink.inner.rows.lock().unwrap().remove(&32);
+        sink.requests.lock().unwrap().clear();
+        let (first, actual) = screen.lines_in_stable_range(0..65);
+        assert_eq!(first, 0);
+        assert_eq!(actual, expected);
+        assert_eq!(*sink.requests.lock().unwrap(), [0..32, 32..64]);
     }
 
     #[cfg(feature = "use_serde")]
