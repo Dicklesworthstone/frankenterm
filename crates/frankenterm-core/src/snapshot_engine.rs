@@ -13815,6 +13815,7 @@ mod tests {
                 },
                 current_mux_incarnation: uuid::Uuid::from_bytes([3; 16]),
                 current_lease_generation: 1,
+                acknowledged_successor: None,
             });
         let custody_error = publish_whole_mux_recovery(
             &cx,

@@ -2583,6 +2583,7 @@ pub struct GuardianSpawnCaptureProvenanceV1 {
     pub original: GuardianSpawnCustodyScopeV1,
     pub current_mux_incarnation: Uuid,
     pub current_lease_generation: u64,
+    pub acknowledged_successor: Option<GuardianSuccessorCustodyContextV1>,
 }
 
 #[derive(Debug, Error)]
@@ -2706,7 +2707,7 @@ const SPAWN_CUSTODY_HEADER_BYTES: usize = SPAWN_CUSTODY_DOMAIN.len() + 8 * 16 + 
 pub const GUARDIAN_SPAWN_CUSTODY_BYTES: usize = SPAWN_CUSTODY_HEADER_BYTES + 24 + 32 + 16;
 
 /// Exact authenticated owner provenance of one successor handoff.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GuardianSuccessorCustodyOwnerV1 {
     pub guardian_incarnation: Uuid,
     pub connection_id: Uuid,
@@ -2716,7 +2717,7 @@ pub struct GuardianSuccessorCustodyOwnerV1 {
 }
 
 /// Successor capability custody is distinct from the initial Spawn contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GuardianSuccessorCustodyContextV1 {
     pub broker_incarnation: Uuid,
     pub broker_lineage: Uuid,
@@ -5644,6 +5645,8 @@ mod tests {
     const PERSISTED_RECORD_TYPES: &[&str] = &[
         "GuardianSpawnCustodyScopeV1",
         "GuardianSpawnCaptureProvenanceV1",
+        "GuardianSuccessorCustodyContextV1",
+        "GuardianSuccessorCustodyOwnerV1",
     ];
 
     #[derive(Clone, Debug, PartialEq)]
@@ -12439,6 +12442,20 @@ mod tests {
                 "GuardianSpawnCustodyScopeV1:Eq".to_owned(),
                 "GuardianSpawnCustodyScopeV1:PartialEq".to_owned(),
                 "GuardianSpawnCustodyScopeV1:Serialize".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Clone".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Copy".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Debug".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Deserialize".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Eq".to_owned(),
+                "GuardianSuccessorCustodyContextV1:PartialEq".to_owned(),
+                "GuardianSuccessorCustodyContextV1:Serialize".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Clone".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Copy".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Debug".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Deserialize".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Eq".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:PartialEq".to_owned(),
+                "GuardianSuccessorCustodyOwnerV1:Serialize".to_owned(),
             ]
         );
 

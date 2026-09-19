@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 3;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 4;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -782,7 +782,89 @@ pub enum RecoverySpawnCustody {
         spawn_effect_id: uuid::Uuid,
         current_mux_incarnation: uuid::Uuid,
         current_lease_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acknowledged_successor: Option<RecoverySuccessorCustody>,
     },
+}
+
+/// Public identities selecting encrypted custody, never the capability secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCustodyOwner {
+    pub guardian_incarnation: uuid::Uuid,
+    pub connection_id: uuid::Uuid,
+    pub mux_incarnation: uuid::Uuid,
+    pub guardian_build: [u8; 32],
+    pub mux_build: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySuccessorCustody {
+    pub broker_incarnation: uuid::Uuid,
+    pub broker_lineage: uuid::Uuid,
+    pub broker_build: [u8; 32],
+    pub predecessor: RecoveryCustodyOwner,
+    pub successor: RecoveryCustodyOwner,
+    pub pane_id: uuid::Uuid,
+    pub handoff_id: uuid::Uuid,
+    pub ack_id: uuid::Uuid,
+    pub lease_generation: u64,
+    pub rebind_from_connection: uuid::Uuid,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl From<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>
+    for RecoverySuccessorCustody
+{
+    fn from(c: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1) -> Self {
+        let owner =
+            |o: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1| RecoveryCustodyOwner {
+                guardian_incarnation: o.guardian_incarnation,
+                connection_id: o.connection_id,
+                mux_incarnation: o.mux_incarnation,
+                guardian_build: o.guardian_build,
+                mux_build: o.mux_build,
+            };
+        Self {
+            broker_incarnation: c.broker_incarnation,
+            broker_lineage: c.broker_lineage,
+            broker_build: c.broker_build,
+            predecessor: owner(c.predecessor),
+            successor: owner(c.successor),
+            pane_id: c.pane_id,
+            handoff_id: c.handoff_id,
+            ack_id: c.ack_id,
+            lease_generation: c.lease_generation,
+            rebind_from_connection: c.rebind_from_connection,
+        }
+    }
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl From<RecoverySuccessorCustody>
+    for mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1
+{
+    fn from(c: RecoverySuccessorCustody) -> Self {
+        let owner =
+            |o: RecoveryCustodyOwner| mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                guardian_incarnation: o.guardian_incarnation,
+                connection_id: o.connection_id,
+                mux_incarnation: o.mux_incarnation,
+                guardian_build: o.guardian_build,
+                mux_build: o.mux_build,
+            };
+        Self {
+            broker_incarnation: c.broker_incarnation,
+            broker_lineage: c.broker_lineage,
+            broker_build: c.broker_build,
+            predecessor: owner(c.predecessor),
+            successor: owner(c.successor),
+            pane_id: c.pane_id,
+            handoff_id: c.handoff_id,
+            ack_id: c.ack_id,
+            lease_generation: c.lease_generation,
+            rebind_from_connection: c.rebind_from_connection,
+        }
+    }
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -805,6 +887,7 @@ impl From<Option<mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>>
             spawn_effect_id: scope.effect_id,
             current_mux_incarnation: value.current_mux_incarnation,
             current_lease_generation: value.current_lease_generation,
+            acknowledged_successor: value.acknowledged_successor.map(Into::into),
         }
     }
 }
@@ -998,7 +1081,10 @@ impl MuxRecoveryImage {
                 found: self.header.magic,
             });
         }
-        if self.header.schema_version != MUX_RECOVERY_IMAGE_SCHEMA_VERSION {
+        if !matches!(
+            self.header.schema_version,
+            3 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
+        ) {
             return Err(MuxRecoveryImageError::UnsupportedSchemaVersion(
                 self.header.schema_version,
             ));
@@ -1322,6 +1408,7 @@ impl MuxRecoveryImage {
                 spawn_effect_id,
                 current_mux_incarnation,
                 current_lease_generation,
+                acknowledged_successor,
             } = &pane.spawn_custody
             {
                 if [
@@ -1355,6 +1442,39 @@ impl MuxRecoveryImage {
                     return Err(MuxRecoveryImageError::InvalidAuthority {
                         pane_id: pane.pane_id,
                         reason: "original Spawn provenance does not match captured pane and current owner",
+                    });
+                }
+                if let Some(c) = acknowledged_successor {
+                    if self.header.schema_version < 4
+                        || c.broker_incarnation.is_nil()
+                        || c.handoff_id.is_nil()
+                        || c.ack_id.is_nil()
+                        || c.broker_lineage != *broker_lineage
+                        || c.broker_build != *broker_build
+                        || c.pane_id != *pane_id
+                        || c.lease_generation != *current_lease_generation
+                        || c.lease_generation <= 1
+                        || c.successor.mux_incarnation != *current_mux_incarnation
+                        || c.successor.guardian_incarnation != *guardian_incarnation
+                        || c.successor.guardian_build != *guardian_build
+                        || c.successor.connection_id.is_nil()
+                        || c.successor.mux_build == [0; 32]
+                        || c.predecessor.guardian_incarnation != *guardian_incarnation
+                        || c.predecessor.guardian_build != *guardian_build
+                        || c.predecessor.connection_id.is_nil()
+                        || c.predecessor.mux_incarnation.is_nil()
+                        || c.predecessor.mux_build == [0; 32]
+                        || c.predecessor.mux_incarnation == c.successor.mux_incarnation
+                    {
+                        return Err(MuxRecoveryImageError::InvalidAuthority {
+                            pane_id: pane.pane_id,
+                            reason: "successor custody differs from captured current owner",
+                        });
+                    }
+                } else if self.header.schema_version >= 4 && *current_lease_generation > 1 {
+                    return Err(MuxRecoveryImageError::InvalidAuthority {
+                        pane_id: pane.pane_id,
+                        reason: "successor capture requires acknowledged custody selector",
                     });
                 }
             }
@@ -2601,6 +2721,7 @@ mod tests {
             spawn_effect_id: uuid::Uuid::from_u128(11),
             current_mux_incarnation: publication.mux_incarnation,
             current_lease_generation: 1,
+            acknowledged_successor: None,
         };
         pane.checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 1,
@@ -2619,6 +2740,117 @@ mod tests {
         image.image_digest = image.compute_digest().unwrap();
         let bytes = image.to_canonical_json().unwrap();
         assert_eq!(MuxRecoveryImage::from_json_slice(&bytes).unwrap(), image);
+
+        // Schema 3 had no successor field. Its already-signed bytes must not
+        // acquire even a JSON null on decode/re-encode. Check a generation-two
+        // image, which is readable history but lacks repeat-rotation authority.
+        let mut legacy = image.clone();
+        legacy.header.schema_version = 3;
+        if let RecoverySpawnCustody::Original {
+            original_mux_incarnation,
+            current_lease_generation,
+            ..
+        } = &mut legacy.panes[0].spawn_custody
+        {
+            *original_mux_incarnation = uuid::Uuid::from_u128(13);
+            *current_lease_generation = 2;
+        }
+        if let CheckpointAuthority::Guardian {
+            guardian_generation,
+            ..
+        } = &mut legacy.panes[0].checkpoint.authority
+        {
+            *guardian_generation = 2;
+        }
+        // Freeze the schema-3 custody shape independently of the current enum.
+        // Adding, reordering, or emitting null for the new field must change
+        // this comparison rather than silently regenerating historical bytes.
+        #[derive(Serialize)]
+        enum Schema3Custody {
+            Original {
+                broker_lineage: uuid::Uuid,
+                guardian_incarnation: uuid::Uuid,
+                original_mux_incarnation: uuid::Uuid,
+                broker_build: [u8; 32],
+                guardian_build: [u8; 32],
+                original_mux_build: [u8; 32],
+                pane_id: uuid::Uuid,
+                spawn_effect_id: uuid::Uuid,
+                current_mux_incarnation: uuid::Uuid,
+                current_lease_generation: u64,
+            },
+        }
+        let old_custody_bytes = serde_json::to_vec(&Schema3Custody::Original {
+            broker_lineage: uuid::Uuid::from_u128(10),
+            guardian_incarnation: uuid::Uuid::from_u128(1),
+            original_mux_incarnation: uuid::Uuid::from_u128(13),
+            broker_build: [1; 32],
+            guardian_build: [2; 32],
+            original_mux_build: [3; 32],
+            pane_id: uuid::Uuid::from_u128(9),
+            spawn_effect_id: uuid::Uuid::from_u128(11),
+            current_mux_incarnation: uuid::Uuid::from_u128(2),
+            current_lease_generation: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&legacy.panes[0].spawn_custody).unwrap(),
+            old_custody_bytes
+        );
+        legacy.image_digest = legacy.compute_digest().unwrap();
+        let historical_bytes = legacy.to_canonical_json().unwrap();
+        assert!(
+            !std::str::from_utf8(&historical_bytes)
+                .unwrap()
+                .contains("acknowledged_successor")
+        );
+        let reopened = MuxRecoveryImage::from_json_slice(&historical_bytes).unwrap();
+        assert_eq!(reopened.image_digest, legacy.image_digest);
+        assert_eq!(reopened.compute_digest().unwrap(), legacy.image_digest);
+        assert_eq!(reopened.to_canonical_json().unwrap(), historical_bytes);
+        legacy.header.schema_version = 4;
+        legacy.image_digest = legacy.compute_digest().unwrap();
+        assert!(matches!(
+            legacy.validate(),
+            Err(MuxRecoveryImageError::InvalidAuthority { .. })
+        ));
+        let owner = RecoveryCustodyOwner {
+            guardian_incarnation: publication.guardian_incarnation,
+            connection_id: uuid::Uuid::from_u128(14),
+            mux_incarnation: publication.mux_incarnation,
+            guardian_build: [2; 32],
+            mux_build: [3; 32],
+        };
+        if let RecoverySpawnCustody::Original {
+            acknowledged_successor,
+            ..
+        } = &mut legacy.panes[0].spawn_custody
+        {
+            *acknowledged_successor = Some(RecoverySuccessorCustody {
+                broker_incarnation: uuid::Uuid::from_u128(15),
+                broker_lineage: uuid::Uuid::from_u128(10),
+                broker_build: [1; 32],
+                predecessor: RecoveryCustodyOwner {
+                    connection_id: uuid::Uuid::from_u128(16),
+                    mux_incarnation: uuid::Uuid::from_u128(13),
+                    ..owner
+                },
+                successor: owner,
+                pane_id: durable_id,
+                handoff_id: uuid::Uuid::from_u128(17),
+                ack_id: uuid::Uuid::from_u128(18),
+                lease_generation: 2,
+                rebind_from_connection: uuid::Uuid::nil(),
+            });
+        }
+        legacy.image_digest = legacy.compute_digest().unwrap();
+        legacy.validate().unwrap();
+        legacy.header.schema_version = 3;
+        legacy.image_digest = legacy.compute_digest().unwrap();
+        assert!(matches!(
+            legacy.validate(),
+            Err(MuxRecoveryImageError::InvalidAuthority { .. })
+        ));
 
         if let RecoverySpawnCustody::Original {
             current_mux_incarnation,
