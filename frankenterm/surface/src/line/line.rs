@@ -3702,6 +3702,7 @@ impl<'a> From<&'a str> for Line {
 mod tests {
     use super::*;
     use crate::SEQ_ZERO;
+    use alloc::borrow::ToOwned;
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
