@@ -6077,7 +6077,7 @@ mod tests {
                     64 * 1024,
                 ) {
                     MainThreadReservationOutcome::Reserved(permit) => permit,
-                    other => panic!("expected capacity before saturation: {other:?}"),
+                    other => panic!("expected capacity before saturation: {:?}", other),
                 }
             })
             .collect();
