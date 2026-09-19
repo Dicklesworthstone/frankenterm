@@ -563,6 +563,15 @@ impl GuardianDurableSuccessorCustodyV1 {
             .lookup_successor_custody(scope)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_existing_for_reconnect(
+        token_path: &Path,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        GuardianDurableSpawnCustodyV1::open_existing_store(token_path)?
+            .lookup_successor_custody_for_reconnect(scope)
+    }
+
     pub(crate) fn into_mux_rotation_payload(
         self,
     ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {

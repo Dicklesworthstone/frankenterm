@@ -6397,9 +6397,9 @@ mod tests {
             drop(retry);
             if std::env::var_os("FT_ROTATION_TEST_REPEATED").is_some() {
                 let birth = contexts[index];
-                let store = GuardianDurableSpawnCustodyV1::open_existing_store(&token).unwrap();
-                let custody = store
-                    .lookup_successor_custody_for_reconnect(
+                let custody =
+                    crate::output::GuardianDurableSuccessorCustodyV1::open_existing_for_reconnect(
+                        &token,
                         mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1 {
                             broker_incarnation: birth.broker_incarnation,
                             broker_lineage: lineage,
