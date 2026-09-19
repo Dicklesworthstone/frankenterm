@@ -6915,7 +6915,12 @@ impl WholeMuxRecoveryVerifier {
                 "existing guardian custody/catalog/ACK does not authenticate the manifest entry"
                     .to_owned(),
         };
-        let crate::mux_recovery_image::RecoverySpawnCustody::Original {
+        let crate::mux_recovery_image::RecoverySpawnCustody::Original(custody) =
+            &pane.spawn_custody
+        else {
+            return Err(fail());
+        };
+        let crate::mux_recovery_image::RecoveryOriginalCustody {
             broker_lineage,
             guardian_incarnation,
             original_mux_incarnation,
@@ -6926,10 +6931,7 @@ impl WholeMuxRecoveryVerifier {
             spawn_effect_id,
             acknowledged_successor,
             ..
-        } = &pane.spawn_custody
-        else {
-            return Err(fail());
-        };
+        } = custody.as_ref();
         let scope = mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1 {
             broker_lineage: *broker_lineage,
             guardian_incarnation: *guardian_incarnation,
@@ -7360,10 +7362,8 @@ impl WholeMuxRecoveryVerifier {
                         #[cfg(not(unix))]
                         if matches!(
                             &pane.spawn_custody,
-                            crate::mux_recovery_image::RecoverySpawnCustody::Original {
-                                acknowledged_successor: Some(_),
-                                ..
-                            }
+                            crate::mux_recovery_image::RecoverySpawnCustody::Original(custody)
+                                if custody.acknowledged_successor.is_some()
                         ) {
                             return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
                                 pane_id: pane.pane_id as u64,
@@ -7375,10 +7375,8 @@ impl WholeMuxRecoveryVerifier {
                         #[cfg(unix)]
                         if matches!(
                             &pane.spawn_custody,
-                            crate::mux_recovery_image::RecoverySpawnCustody::Original {
-                                acknowledged_successor: Some(_),
-                                ..
-                            }
+                            crate::mux_recovery_image::RecoverySpawnCustody::Original(custody)
+                                if custody.acknowledged_successor.is_some()
                         ) {
                             self.reopen_manifest_guardian_capture(
                                 pane,
@@ -7470,7 +7468,7 @@ impl WholeMuxRecoveryVerifier {
                                         current_mux_incarnation: witness.capturing_mux_incarnation(),
                                         current_lease_generation: witness.generation(),
                                         acknowledged_successor: match &pane.spawn_custody {
-                                            crate::mux_recovery_image::RecoverySpawnCustody::Original { acknowledged_successor, .. } => acknowledged_successor.map(Into::into),
+                                            crate::mux_recovery_image::RecoverySpawnCustody::Original(custody) => custody.acknowledged_successor.map(Into::into),
                                             crate::mux_recovery_image::RecoverySpawnCustody::Absent => None,
                                         },
                                     },

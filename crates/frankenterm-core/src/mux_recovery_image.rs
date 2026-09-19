@@ -771,20 +771,24 @@ pub struct RecoveryPane {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoverySpawnCustody {
     Absent,
-    Original {
-        broker_lineage: uuid::Uuid,
-        guardian_incarnation: uuid::Uuid,
-        original_mux_incarnation: uuid::Uuid,
-        broker_build: [u8; 32],
-        guardian_build: [u8; 32],
-        original_mux_build: [u8; 32],
-        pane_id: uuid::Uuid,
-        spawn_effect_id: uuid::Uuid,
-        current_mux_incarnation: uuid::Uuid,
-        current_lease_generation: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        acknowledged_successor: Option<RecoverySuccessorCustody>,
-    },
+    Original(Box<RecoveryOriginalCustody>),
+}
+
+/// Boxed provenance keeps absent custody small without changing its wire shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryOriginalCustody {
+    pub broker_lineage: uuid::Uuid,
+    pub guardian_incarnation: uuid::Uuid,
+    pub original_mux_incarnation: uuid::Uuid,
+    pub broker_build: [u8; 32],
+    pub guardian_build: [u8; 32],
+    pub original_mux_build: [u8; 32],
+    pub pane_id: uuid::Uuid,
+    pub spawn_effect_id: uuid::Uuid,
+    pub current_mux_incarnation: uuid::Uuid,
+    pub current_lease_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_successor: Option<RecoverySuccessorCustody>,
 }
 
 /// Public identities selecting encrypted custody, never the capability secret.
@@ -876,7 +880,7 @@ impl From<Option<mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>>
             return Self::Absent;
         };
         let scope = value.original;
-        Self::Original {
+        Self::Original(Box::new(RecoveryOriginalCustody {
             broker_lineage: scope.broker_lineage,
             guardian_incarnation: scope.guardian_incarnation,
             original_mux_incarnation: scope.mux_incarnation,
@@ -888,7 +892,7 @@ impl From<Option<mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>>
             current_mux_incarnation: value.current_mux_incarnation,
             current_lease_generation: value.current_lease_generation,
             acknowledged_successor: value.acknowledged_successor.map(Into::into),
-        }
+        }))
     }
 }
 
@@ -1397,20 +1401,20 @@ impl MuxRecoveryImage {
             }
 
             // Authority validation
-            if let RecoverySpawnCustody::Original {
-                broker_lineage,
-                guardian_incarnation,
-                original_mux_incarnation,
-                broker_build,
-                guardian_build,
-                original_mux_build,
-                pane_id,
-                spawn_effect_id,
-                current_mux_incarnation,
-                current_lease_generation,
-                acknowledged_successor,
-            } = &pane.spawn_custody
-            {
+            if let RecoverySpawnCustody::Original(custody) = &pane.spawn_custody {
+                let RecoveryOriginalCustody {
+                    broker_lineage,
+                    guardian_incarnation,
+                    original_mux_incarnation,
+                    broker_build,
+                    guardian_build,
+                    original_mux_build,
+                    pane_id,
+                    spawn_effect_id,
+                    current_mux_incarnation,
+                    current_lease_generation,
+                    acknowledged_successor,
+                } = custody.as_ref();
                 if [
                     broker_lineage,
                     guardian_incarnation,
@@ -2699,6 +2703,10 @@ mod tests {
 
     #[test]
     fn original_spawn_authority_uses_captured_compact_mux_identity() {
+        assert!(
+            std::mem::size_of::<RecoverySpawnCustody>() <= 2 * std::mem::size_of::<usize>(),
+            "absent custody must not reserve the full provenance payload"
+        );
         let mut image = make_valid_test_image();
         let publication = test_guardian_publication();
         let incarnation = hex::encode(publication.mux_incarnation.as_bytes());
@@ -2710,7 +2718,7 @@ mod tests {
         let pane = &mut image.panes[0];
         pane.pane_uuid = durable_id.to_string();
         pane.checkpoint.pane_uuid = durable_id.to_string();
-        pane.spawn_custody = RecoverySpawnCustody::Original {
+        pane.spawn_custody = RecoverySpawnCustody::Original(Box::new(RecoveryOriginalCustody {
             broker_lineage: uuid::Uuid::from_u128(10),
             guardian_incarnation: publication.guardian_incarnation,
             original_mux_incarnation: publication.mux_incarnation,
@@ -2722,7 +2730,7 @@ mod tests {
             current_mux_incarnation: publication.mux_incarnation,
             current_lease_generation: 1,
             acknowledged_successor: None,
-        };
+        }));
         pane.checkpoint.authority = CheckpointAuthority::Guardian {
             guardian_generation: 1,
             publication: publication.clone(),
@@ -2746,14 +2754,9 @@ mod tests {
         // image, which is readable history but lacks repeat-rotation authority.
         let mut legacy = image.clone();
         legacy.header.schema_version = 3;
-        if let RecoverySpawnCustody::Original {
-            original_mux_incarnation,
-            current_lease_generation,
-            ..
-        } = &mut legacy.panes[0].spawn_custody
-        {
-            *original_mux_incarnation = uuid::Uuid::from_u128(13);
-            *current_lease_generation = 2;
+        if let RecoverySpawnCustody::Original(custody) = &mut legacy.panes[0].spawn_custody {
+            custody.original_mux_incarnation = uuid::Uuid::from_u128(13);
+            custody.current_lease_generation = 2;
         }
         if let CheckpointAuthority::Guardian {
             guardian_generation,
@@ -2821,12 +2824,8 @@ mod tests {
             guardian_build: [2; 32],
             mux_build: [3; 32],
         };
-        if let RecoverySpawnCustody::Original {
-            acknowledged_successor,
-            ..
-        } = &mut legacy.panes[0].spawn_custody
-        {
-            *acknowledged_successor = Some(RecoverySuccessorCustody {
+        if let RecoverySpawnCustody::Original(custody) = &mut legacy.panes[0].spawn_custody {
+            custody.acknowledged_successor = Some(RecoverySuccessorCustody {
                 broker_incarnation: uuid::Uuid::from_u128(15),
                 broker_lineage: uuid::Uuid::from_u128(10),
                 broker_build: [1; 32],
@@ -2852,12 +2851,8 @@ mod tests {
             Err(MuxRecoveryImageError::InvalidAuthority { .. })
         ));
 
-        if let RecoverySpawnCustody::Original {
-            current_mux_incarnation,
-            ..
-        } = &mut image.panes[0].spawn_custody
-        {
-            *current_mux_incarnation = uuid::Uuid::from_u128(12);
+        if let RecoverySpawnCustody::Original(custody) = &mut image.panes[0].spawn_custody {
+            custody.current_mux_incarnation = uuid::Uuid::from_u128(12);
         }
         image.image_digest = image.compute_digest().unwrap();
         assert!(matches!(

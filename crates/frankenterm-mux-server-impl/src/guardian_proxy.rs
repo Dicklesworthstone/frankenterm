@@ -947,7 +947,9 @@ impl GuardianPendingClaim {
             self.size,
             Box::new(transport),
         );
-        actor._recovery_admission = self.recovery_admission.clone();
+        actor
+            ._recovery_admission
+            .clone_from(&self.recovery_admission);
         Ok(Some(Arc::new(Mutex::new(actor))))
     }
 }
@@ -4728,7 +4730,12 @@ impl GuardianProxyLeasePlan {
             payload_digest,
             payload_bytes,
         };
-        let RecoverySpawnCustody::Original {
+        let RecoverySpawnCustody::Original(custody) = &pane.spawn_custody else {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "legacy pane has no original guardian custody",
+            ));
+        };
+        let frankenterm_core::mux_recovery_image::RecoveryOriginalCustody {
             broker_lineage,
             guardian_incarnation,
             original_mux_incarnation,
@@ -4740,12 +4747,7 @@ impl GuardianProxyLeasePlan {
             current_mux_incarnation,
             current_lease_generation,
             acknowledged_successor,
-        } = &pane.spawn_custody
-        else {
-            return Err(GuardianProxyError::InvalidConfiguration(
-                "legacy pane has no original guardian custody",
-            ));
-        };
+        } = custody.as_ref();
         if *current_lease_generation != selected.generation
             // ubs:ignore[rust.security.constant-time-compare] — Pane UUIDs are public custody identities, not secret authentication material.
             || *pane_id != selected.pane_id
@@ -4934,7 +4936,7 @@ impl GuardianProxyLeasePlan {
             let initial = scope.mux_incarnation == self.client.mux_incarnation();
             let expected_generation = self
                 .successor_custody
-                .map_or(u64::from(!initial), |c| c.lease_generation);
+                .map_or_else(|| u64::from(!initial), |c| c.lease_generation);
             if scope.pane_id != pane_id || observed_generation != expected_generation {
                 return Err(GuardianProxyError::InvalidConfiguration(
                     "custody does not match initial birth or first successor claim",
@@ -7442,17 +7444,13 @@ mod tests {
                         captured_at_epoch_ms: timestamp,
                         parser_seqno: None,
                     };
-            } else if let RecoverySpawnCustody::Original {
-                current_lease_generation,
-                current_mux_incarnation,
-                guardian_incarnation,
-                ..
-            } = &mut changed.panes[0].spawn_custody
+            } else if let RecoverySpawnCustody::Original(custody) =
+                &mut changed.panes[0].spawn_custody
             {
                 match control {
-                    1 => *current_lease_generation += 1,
-                    2 => *current_mux_incarnation = Uuid::new_v4(),
-                    _ => *guardian_incarnation = Uuid::new_v4(),
+                    1 => custody.current_lease_generation += 1,
+                    2 => custody.current_mux_incarnation = Uuid::new_v4(),
+                    _ => custody.guardian_incarnation = Uuid::new_v4(),
                 }
             }
             changed.image_digest = changed.compute_digest().unwrap();
@@ -8466,13 +8464,15 @@ mod tests {
         // selector into acknowledged custody. No failed candidate changes roots.
         for control in 0..7 {
             let mut changed = gen2_image.clone();
-            let frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original {
-                acknowledged_successor: Some(c),
-                ..
-            } = &mut changed.panes[0].spawn_custody
+            let frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original(custody) =
+                &mut changed.panes[0].spawn_custody
             else {
                 panic!("gen2 custody selector");
             };
+            let c = custody
+                .acknowledged_successor
+                .as_mut()
+                .expect("gen2 successor");
             match control {
                 0 => c.ack_id = Uuid::new_v4(),
                 1 => c.handoff_id = Uuid::new_v4(),
@@ -9275,11 +9275,12 @@ mod tests {
         assert_eq!(recovery.image().panes.len(), 1);
         let pane = &recovery.image().panes[0];
         let original = match &pane.spawn_custody {
-            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original {
-                guardian_incarnation,
-                ..
-            } => *guardian_incarnation,
-            _ => panic!("fixture requires actual guardian provenance"),
+            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original(custody) => {
+                custody.guardian_incarnation
+            }
+            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Absent => {
+                panic!("fixture requires actual guardian provenance")
+            }
         };
         let mux = Mux::new(None);
         let owner = Uuid::from_bytes(mux.topology_snapshot_authority().unwrap().0.as_bytes());
@@ -9323,27 +9324,21 @@ mod tests {
     ) -> (Arc<Mux>, Arc<dyn Pane>) {
         let pane = &recovery.image().panes[0];
         let original = match &pane.spawn_custody {
-            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original {
-                broker_lineage,
-                guardian_incarnation,
-                original_mux_incarnation,
-                broker_build,
-                guardian_build,
-                original_mux_build,
-                pane_id,
-                spawn_effect_id,
-                ..
-            } => GuardianSpawnCustodyScopeV1 {
-                broker_lineage: *broker_lineage,
-                guardian_incarnation: *guardian_incarnation,
-                mux_incarnation: *original_mux_incarnation,
-                broker_build: *broker_build,
-                guardian_build: *guardian_build,
-                mux_build: *original_mux_build,
-                pane_id: *pane_id,
-                effect_id: *spawn_effect_id,
-            },
-            _ => panic!("fixture requires actual guardian provenance"),
+            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original(custody) => {
+                GuardianSpawnCustodyScopeV1 {
+                    broker_lineage: custody.broker_lineage,
+                    guardian_incarnation: custody.guardian_incarnation,
+                    mux_incarnation: custody.original_mux_incarnation,
+                    broker_build: custody.broker_build,
+                    guardian_build: custody.guardian_build,
+                    mux_build: custody.original_mux_build,
+                    pane_id: custody.pane_id,
+                    effect_id: custody.spawn_effect_id,
+                }
+            }
+            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Absent => {
+                panic!("fixture requires actual guardian provenance")
+            }
         };
         let domain =
             Arc::new(GuardianDomain::new(&mux, socket.to_path_buf(), token.to_path_buf()).unwrap());
