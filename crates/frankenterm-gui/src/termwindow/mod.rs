@@ -364,6 +364,7 @@ pub enum TermWindowNotif {
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
         interest: [u64; OUTPUT_INTEREST_WORDS],
+        title_refresh: Option<PendingMuxTitleRefresh>,
         repaint: Arc<AtomicBool>,
     },
     RenderWake {
@@ -4278,6 +4279,7 @@ impl TermWindow {
                 mux_owner,
                 mux_window_id,
                 interest,
+                title_refresh,
                 repaint,
             } => {
                 let Some(owner) = mux_owner.upgrade() else {
@@ -4287,6 +4289,12 @@ impl TermWindow {
                     || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
                 {
                     return Ok(());
+                }
+                if let Some(title_refresh) = title_refresh {
+                    // Release the single-flight bit before reading live state;
+                    // output during this refresh can retain a successor ticket.
+                    title_refresh.begin_refresh();
+                    self.update_title_post_status();
                 }
                 self.record_idle_event(idle_detector::IdleEvent::PtyData);
                 metrics::histogram!("mux.pane_output_event.rate").record(1.);
@@ -5130,6 +5138,8 @@ impl TermWindow {
         let callback_unsubscribe_requested = Arc::clone(&unsubscribe_requested);
         let callback_mux = Arc::downgrade(&mux);
         let pending_title_refresh = Arc::new(AtomicBool::new(false));
+        let retained_title_refresh = Arc::new(Mutex::new(None));
+        let callback_title_refresh = Arc::clone(&retained_title_refresh);
         // Reserve retry ownership before accepting the subscription. The
         // capacity-one channel stores only a level-triggered output bit;
         // structural notifications retain their existing ordered path below.
@@ -5195,27 +5205,18 @@ impl TermWindow {
                     callback_output_interest.record(*pane_id);
                     return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
                 }
-                let pending_title_refresh = if Self::mux_notification_only_refreshes_title(&n) {
+                if Self::mux_notification_only_refreshes_title(&n) {
                     let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) else {
                         metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
                         return true;
                     };
-                    Some(ticket)
-                } else {
-                    None
-                };
-                let n = if pending_title_refresh.is_some() {
-                    // Every admitted event in this group only refreshes the
-                    // title/status from live mux state. Route that refresh to
-                    // this exact window: an unrelated tab event must not win
-                    // the ticket, be filtered later, and erase a local update.
-                    MuxNotification::WindowTitleChanged {
-                        window_id: mux_window_id,
-                        title: String::new(),
-                    }
-                } else {
-                    n
-                };
+                    *callback_title_refresh.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(ticket);
+                    // Title/status notifications describe current state, so
+                    // share the retained output wake instead of risking a
+                    // permanent unsubscribe at a second initial admission.
+                    return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
+                }
                 let window = window.clone();
                 let dead = dead.clone();
                 let subscription_id = Arc::clone(&callback_subscription_id);
@@ -5243,7 +5244,7 @@ impl TermWindow {
                                     mux_window_id,
                                     &dead,
                                     &mux,
-                                    (pane_removal_cleanup, pending_title_refresh, reservation),
+                                    (pane_removal_cleanup, None, reservation),
                                 ) {
                                     dead.store(true, Ordering::Release);
                                     unsubscribe_requested.store(true, Ordering::Release);
@@ -5292,6 +5293,10 @@ impl TermWindow {
                                 mux_owner: output_mux.clone(),
                                 mux_window_id,
                                 interest: output_interest.take(),
+                                title_refresh: retained_title_refresh
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .take(),
                                 repaint: Arc::clone(&repaint),
                             },
                             reservation,
