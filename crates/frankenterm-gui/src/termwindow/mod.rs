@@ -174,7 +174,7 @@ async fn run_mux_output_refresh(
     pending: flume::Receiver<()>,
     identity: promise::spawn::MainThreadAdmissionReceipt,
     is_live: impl Fn() -> bool,
-    deliver: impl Fn(promise::spawn::MainThreadSpawnReservation, Sender<()>),
+    deliver: impl Fn(promise::spawn::MainThreadSpawnReservation) -> promise::spawn::MainThreadSpawnedTask<()>,
 ) {
     while pending.recv_async().await.is_ok() {
         let mut delay = Duration::from_millis(10);
@@ -193,15 +193,17 @@ async fn run_mux_output_refresh(
                     {
                         return;
                     }
-                    let (completion, completed) = flume::bounded(1);
-                    deliver(reservation, completion);
-                    // Sender drop acknowledges consumption or native window /
-                    // scheduler destruction. Never queue a second delivery
-                    // while the preceding native operation remains in flight.
-                    let _ = completed.recv_async().await;
+                    // Completion includes native invalidation and permit
+                    // release, not merely consumption of the GUI payload.
+                    let _ = deliver(reservation).into_task().fallible().await;
                     break;
                 }
-                promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => {
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(rejected) => {
+                    if rejected.queue_id != identity.queue_id
+                        || rejected.scheduler_generation != identity.scheduler_generation
+                    {
+                        return;
+                    }
                     sleep(delay).await;
                     delay = delay.saturating_mul(2).min(Duration::from_millis(250));
                 }
@@ -361,14 +363,12 @@ pub enum TermWindowNotif {
         mux_window_id: MuxWindowId,
         interest: [u64; OUTPUT_INTEREST_WORDS],
         repaint: Arc<AtomicBool>,
-        completion: Sender<()>,
     },
     RenderWake {
         ticket: RenderWakeTicket,
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
         repaint: Arc<AtomicBool>,
-        completion: Sender<()>,
     },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
@@ -2129,7 +2129,7 @@ impl TermWindow {
         reason: RenderWakeReason,
         due: Instant,
     ) -> Option<RenderWakeTicket> {
-        let Some(window) = self.window.clone() else {
+        let Some(_window) = self.window.as_ref() else {
             log::debug!("cannot schedule render wake for detached window");
             return None;
         };
@@ -2821,7 +2821,7 @@ async fn run_render_wakes(
     pending: Arc<Mutex<Option<RenderWakeRequest>>>,
     identity: promise::spawn::MainThreadAdmissionReceipt,
     is_live: impl Fn() -> bool,
-    deliver: impl Fn(RenderWakeTicket, promise::spawn::MainThreadSpawnReservation, Sender<()>),
+    deliver: impl Fn(RenderWakeTicket, promise::spawn::MainThreadSpawnReservation) -> promise::spawn::MainThreadSpawnedTask<()>,
 ) {
     while ready.recv_async().await.is_ok() {
         let request = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -2845,7 +2845,12 @@ async fn run_render_wakes(
                             && receipt.scheduler_generation == identity.scheduler_generation)
                             .then_some(reservation);
                     }
-                    promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => {
+                    promise::spawn::MainThreadReservationOutcome::RetryableFull(rejected) => {
+                        if rejected.queue_id != identity.queue_id
+                            || rejected.scheduler_generation != identity.scheduler_generation
+                        {
+                            return None;
+                        }
                         sleep(delay).await;
                         delay = delay.saturating_mul(2).min(Duration::from_millis(250));
                     }
@@ -2855,9 +2860,7 @@ async fn run_render_wakes(
         }, registration).await;
         match admitted {
             Ok(Some(reservation)) => {
-                let (completion, completed) = flume::bounded(1);
-                deliver(ticket, reservation, completion);
-                let _ = completed.recv_async().await;
+                let _ = deliver(ticket, reservation).into_task().fallible().await;
             }
             Ok(None) => return,
             Err(_) => {} // superseded/cancelled exact ticket; take its successor
@@ -4227,9 +4230,7 @@ impl TermWindow {
                 mux_owner,
                 mux_window_id,
                 repaint,
-                completion,
             } => {
-                let _completion = completion;
                 let Some(owner) = mux_owner.upgrade() else {
                     return Ok(());
                 };
@@ -4255,11 +4256,7 @@ impl TermWindow {
                 mux_window_id,
                 interest,
                 repaint,
-                completion,
             } => {
-                // Holding completion until after paint bounds the producer to
-                // one in-flight native operation plus one coalesced wake.
-                let _completion = completion;
                 let Some(owner) = mux_owner.upgrade() else {
                     return Ok(());
                 };
@@ -4268,13 +4265,13 @@ impl TermWindow {
                 {
                     return Ok(());
                 }
+                self.record_idle_event(idle_detector::IdleEvent::PtyData);
+                metrics::histogram!("mux.pane_output_event.rate").record(1.);
                 if !self.get_panes_to_render().iter().any(|pane| {
                     PendingMuxOutput::includes(&interest, pane.pane.pane_id())
                 }) {
                     return Ok(());
                 }
-                self.record_idle_event(idle_detector::IdleEvent::PtyData);
-                metrics::histogram!("mux.pane_output_event.rate").record(1.);
                 if self.resizes_pending == 0
                     && self.webgpu.is_some()
                     && self.render_recovery_state.mark_native_frame_ready()
@@ -5086,7 +5083,7 @@ impl TermWindow {
             },
             reservation,
             None,
-        );
+        ).detach();
 
         true
     }
@@ -5115,7 +5112,7 @@ impl TermWindow {
             .context("reserving GUI render-wake retry owner")?;
         let output_identity = match promise::spawn::try_reserve_main_thread(
             promise::spawn::MainThreadServiceClass::Render,
-            4 * 1024,
+            8 * 1024,
         ) {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                 reservation.admission_receipt()
@@ -5256,7 +5253,7 @@ impl TermWindow {
                 output_rx,
                 output_identity,
                 || !output_dead.load(Ordering::Acquire) && output_mux.upgrade().is_some(),
-                |reservation, completion| {
+                |reservation| {
                     let mux_window_id = *output_mux_window_id
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5267,11 +5264,10 @@ impl TermWindow {
                             mux_window_id,
                             interest: output_interest.take(),
                             repaint: Arc::clone(&repaint),
-                            completion,
                         },
                         reservation,
                         Some(repaint),
-                    );
+                    )
                 },
             )
             .await;
@@ -5282,7 +5278,7 @@ impl TermWindow {
                 render_pending,
                 output_identity,
                 || !render_dead.load(Ordering::Acquire) && render_mux.upgrade().is_some(),
-                |ticket, reservation, completion| {
+                |ticket, reservation| {
                     let mux_window_id = *render_mux_window_id
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
@@ -5293,11 +5289,10 @@ impl TermWindow {
                             mux_owner: render_mux.clone(),
                             mux_window_id,
                             repaint: Arc::clone(&repaint),
-                            completion,
                         },
                         reservation,
                         Some(repaint),
-                    );
+                    )
                 },
             )
             .await;
@@ -9520,6 +9515,9 @@ mod tests {
 
     #[test]
     fn mux_output_refresh_survives_saturation_without_an_unrelated_wake() {
+        if run_scheduler_test_in_child("mux_output_refresh_survives_saturation_without_an_unrelated_wake") {
+            return;
+        }
         use promise::spawn::{
             MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
             SimpleExecutor, try_reserve_main_thread,
@@ -9553,22 +9551,13 @@ mod tests {
                     let _ = attempted.try_send(());
                     true
                 },
-                |reservation, completion| {
+                |reservation| {
                     let delivered = Arc::clone(&delivered_worker);
                     let delivery_released = delivery_released.clone();
-                    let receipt = reservation.admission_receipt();
-                    reservation
-                        .handoff_to_main_thread_local(move |reservation| {
-                            assert_eq!(reservation.admission_receipt(), receipt);
-                            reservation
-                                .spawn_local(async move {
-                                    delivered.fetch_add(1, Ordering::AcqRel);
-                                    delivery_released.recv_async().await.unwrap();
-                                    drop(completion);
-                                })
-                                .detach();
-                        })
-                        .detach();
+                    reservation.spawn(async move {
+                        delivered.fetch_add(1, Ordering::AcqRel);
+                        delivery_released.recv_async().await.unwrap();
+                    })
                 },
             ));
         });
@@ -9580,7 +9569,7 @@ mod tests {
         assert_eq!(exec.queue_snapshot().depth, 0);
         assert_eq!(delivered.load(Ordering::Acquire), 0);
         // No new producer event after capacity recovery: the retained request
-        // itself must make progress and survive the second scheduler hop.
+        // itself must make progress through the admitted native operation.
         drop(occupying);
         let deadline = Instant::now() + Duration::from_secs(5);
         while delivered.load(Ordering::Acquire) == 0 {
@@ -9626,10 +9615,129 @@ mod tests {
             receive,
             identity,
             || true,
-            |_, _| panic!("old subscription must not migrate into a replacement scheduler"),
+            |_| panic!("old subscription must not migrate into a replacement scheduler"),
         ));
         assert_eq!(replacement.admission_snapshot().active_tasks, 0);
         assert_eq!(replacement.queue_snapshot().depth, 0);
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected replacement reservation: {other:?}"),
+        };
+        let (pending, receive) = flume::bounded(1);
+        pending.send(()).unwrap();
+        promise::spawn::block_on(super::run_mux_output_refresh(
+            receive,
+            identity,
+            || true,
+            |_| panic!("old subscription must retire even when replacement is full"),
+        ));
+        drop(occupying);
+    }
+
+    #[test]
+    fn render_wake_recovers_capacity_and_cancels_distant_owner_timer() {
+        if run_scheduler_test_in_child("render_wake_recovers_capacity_and_cancels_distant_owner_timer") {
+            return;
+        }
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        let exec = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8192, 0, 0).unwrap(),
+        ).unwrap();
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 8192) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected occupying reservation: {other:?}"),
+        };
+        let identity = occupying.admission_receipt();
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (ready, receive) = flume::bounded(1);
+        let mut state = super::RenderWakeState::default();
+        let queue = |state: &mut super::RenderWakeState, due| {
+            let super::RenderWakePlan::Schedule { ticket, registration, .. } =
+                state.plan(super::RenderWakeReason::Animation, due, Instant::now())
+            else { panic!("expected new exact timer"); };
+            *pending.lock().unwrap() = Some(super::RenderWakeRequest { ticket, due, registration });
+            let _ = ready.try_send(());
+            ticket
+        };
+        let distant = queue(&mut state, Instant::now() + Duration::from_secs(3600));
+        let (attempted, attempts) = flume::bounded(2);
+        let (delivered, deliveries) = flume::bounded(1);
+        let (finished, finish) = flume::bounded(1);
+        let worker_pending = std::sync::Arc::clone(&pending);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_render_wakes(
+                receive, worker_pending, identity,
+                || { let _ = attempted.try_send(()); true },
+                |ticket, reservation| {
+                    let delivered = delivered.clone();
+                    reservation.spawn(async move { delivered.send(ticket).unwrap(); })
+                },
+            ));
+            finished.send(()).unwrap();
+        });
+        // Wait until the worker has taken the distant request, so the earlier
+        // successor must interrupt an actual registered sleeper.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.lock().unwrap().is_some() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let earlier = queue(&mut state, Instant::now());
+        assert_ne!(earlier, distant);
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(deliveries.is_empty());
+        drop(occupying);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let delivered = loop {
+            if let Ok(ticket) = deliveries.try_recv() { break ticket; }
+            assert!(Instant::now() < deadline, "timer lost its capacity recovery wake");
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(delivered, earlier);
+        assert_eq!(state.dispatch(distant), super::RenderWakeDispatch::Stale);
+        assert_eq!(state.dispatch(earlier), super::RenderWakeDispatch::Fired(super::RenderWakeReason::Animation));
+        queue(&mut state, Instant::now() + Duration::from_secs(3600));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.lock().unwrap().is_some() {
+            assert!(Instant::now() < deadline);
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // These are the window's two owned fields: dropping them must cancel
+        // the sleeper and close the receiver without waiting for its due time.
+        drop(state);
+        drop(ready);
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+    }
+
+    // SimpleExecutor owns a process-global scheduler. Run these tests in their
+    // own process so parallel frontend tests cannot replace their generation.
+    fn run_scheduler_test_in_child(name: &str) -> bool {
+        let marker = "FT_GUI_SCHEDULER_TEST_CHILD";
+        if std::env::var(marker).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(format!("termwindow::tests::{name}"))
+            .args(["--exact", "--nocapture"])
+            .env(marker, name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated scheduler regression failed or selected no test: {name}\n{stdout}\n{stderr}"
+        );
+        true
     }
 
     #[test]

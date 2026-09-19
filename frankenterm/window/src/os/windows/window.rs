@@ -994,13 +994,13 @@ impl WindowOps for Window {
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
         repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) {
+    ) -> promise::spawn::MainThreadSpawnedTask<()> {
         Connection::with_window_inner_reserved(self.0, reservation, move |inner| {
             inner.events.dispatch(WindowEvent::Notification(Box::new(t)));
             if repaint.is_some_and(|request| request.load(std::sync::atomic::Ordering::Acquire)) {
                 Window(inner.hwnd).invalidate();
             }
-        });
+        })
     }
 
     fn close(&self) {

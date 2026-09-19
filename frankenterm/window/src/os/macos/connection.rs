@@ -126,7 +126,8 @@ impl Connection {
         window_id: usize,
         reservation: promise::spawn::MainThreadSpawnReservation,
         f: F,
-    ) where
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
         F: FnOnce(&mut WindowInner) + Send + 'static,
     {
         reservation
@@ -138,7 +139,6 @@ impl Connection {
                     f(&mut handle.borrow_mut());
                 }
             })
-            .detach();
     }
 }
 

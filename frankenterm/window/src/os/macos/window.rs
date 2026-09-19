@@ -856,7 +856,7 @@ impl WindowOps for Window {
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
         repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) {
+    ) -> promise::spawn::MainThreadSpawnedTask<()> {
         Connection::with_window_inner_reserved(self.id, reservation, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                 window_view
@@ -868,7 +868,7 @@ impl WindowOps for Window {
             if repaint.is_some_and(|request| request.load(std::sync::atomic::Ordering::Acquire)) {
                 inner.invalidate();
             }
-        });
+        })
     }
 
     fn close(&self) {

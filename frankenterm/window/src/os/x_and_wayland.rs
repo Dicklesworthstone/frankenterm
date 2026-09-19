@@ -266,7 +266,7 @@ impl WindowOps for Window {
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
         repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) {
+    ) -> promise::spawn::MainThreadSpawnedTask<()> {
         match self {
             Self::X11(x) => x.notify_with_reservation(t, reservation, repaint),
             #[cfg(feature = "wayland")]

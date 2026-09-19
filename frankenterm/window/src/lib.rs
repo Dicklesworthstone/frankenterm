@@ -348,12 +348,16 @@ pub trait WindowOps {
     /// Deliver a notification using capacity already owned by its producer.
     /// The exact scheduler generation and service class survive the handoff;
     /// this must never perform another fallible scheduler admission.
+    /// If the handler sets `repaint`, request a natively paced repaint before
+    /// completing the returned task. Awaiting that task includes both handler
+    /// execution and the repaint request, not presentation of the frame.
     fn notify_with_reservation<T: Any + Send + Sync>(
         &self,
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
         repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) where
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
         Self: Sized;
 
     /// Setup opengl for rendering

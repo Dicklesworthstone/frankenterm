@@ -1095,7 +1095,8 @@ impl XConnection {
         window: xcb::x::Window,
         reservation: promise::spawn::MainThreadSpawnReservation,
         f: F,
-    ) where
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
         F: FnOnce(&mut XWindowInner) + Send + 'static,
     {
         reservation
@@ -1111,7 +1112,6 @@ impl XConnection {
                     }
                 }
             })
-            .detach();
     }
 
     fn screen_from_focused_window(

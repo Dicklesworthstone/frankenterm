@@ -180,7 +180,8 @@ impl WaylandConnection {
         window: usize,
         reservation: promise::spawn::MainThreadSpawnReservation,
         f: F,
-    ) where
+    ) -> promise::spawn::MainThreadSpawnedTask<()>
+    where
         F: FnOnce(&mut WaylandWindowInner) + Send + 'static,
     {
         reservation
@@ -192,7 +193,6 @@ impl WaylandConnection {
                     f(&mut handle.borrow_mut());
                 }
             })
-            .detach();
     }
 }
 
