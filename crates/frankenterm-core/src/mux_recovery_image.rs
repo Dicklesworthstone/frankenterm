@@ -1540,6 +1540,14 @@ impl MuxRecoveryImage {
         let mut global_placed_pane_ids = HashSet::new();
 
         for window in &self.topology.windows {
+            // WindowOrderRevision reserves MAX as an exhaustion sentinel;
+            // MAX - 1 remains a valid captured state even though it cannot
+            // admit another ordered-window mutation.
+            if window.order_revision == u64::MAX {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "window order revision is the reserved exhaustion sentinel",
+                ));
+            }
             if !seen_window_ids.insert(window.window_id) {
                 return Err(MuxRecoveryImageError::DuplicateWindowId(window.window_id));
             }
@@ -2923,6 +2931,25 @@ mod tests {
         assert_eq!(
             image.validate().unwrap_err(),
             MuxRecoveryImageError::DuplicateStableTabId(expected)
+        );
+    }
+
+    #[test]
+    fn window_recovery_order_revision_rejects_only_reserved_exhaustion_sentinel() {
+        let mut image = make_valid_test_image();
+        for revision in [0, 1, u64::MAX - 1] {
+            image.topology.windows[0].order_revision = revision;
+            image.image_digest = image.compute_digest().unwrap();
+            image.validate().unwrap();
+        }
+
+        image.topology.windows[0].order_revision = u64::MAX;
+        image.image_digest = image.compute_digest().unwrap();
+        assert_eq!(
+            image.validate().unwrap_err(),
+            MuxRecoveryImageError::InvalidCapturedTopology(
+                "window order revision is the reserved exhaustion sentinel"
+            )
         );
     }
 
