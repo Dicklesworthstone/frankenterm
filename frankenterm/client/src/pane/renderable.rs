@@ -221,7 +221,7 @@ impl AdmittedFetchRetryDriver {
 /// One independently admitted driver per domain, not one scheduler slot per
 /// pane. Pane futures retain only weak ownership and their bounded wake channel.
 pub(crate) struct FetchRetryCoordinator {
-    pending: parking_lot::Mutex<HashMap<PaneId, FetchRetryOwner>>,
+    pending: parking_lot::Mutex<HashMap<(PaneId, usize), FetchRetryOwner>>,
     started: parking_lot::Mutex<bool>,
     wake_tx: async_channel::Sender<()>,
     wake_rx: async_channel::Receiver<()>,
@@ -268,19 +268,23 @@ impl FetchRetryCoordinator {
             async_channel::Receiver<()>,
         ),
     ) -> anyhow::Result<()> {
+        // Local pane IDs can be reused while a retired pane remains alive.
+        // Retain allocation identity as well: the stored Weak prevents address
+        // reuse until this exact pending owner has been drained or cancelled.
+        let owner_id = (pane_id, owner.0.as_ptr() as usize);
         let mut pending = self.pending.lock();
         anyhow::ensure!(!self.wake_tx.is_closed(), "render fetch domain is detached");
         pending.retain(|_, (owner, _, _)| owner.strong_count() != 0);
         anyhow::ensure!(
-            !pending.contains_key(&pane_id),
+            !pending.contains_key(&owner_id),
             "duplicate render fetch pane owner"
         );
         let cancel = CancelDeferredFetches(owner.0.clone());
-        pending.insert(pane_id, (owner.0, owner.1, cancel));
+        pending.insert(owner_id, (owner.0, owner.1, cancel));
         match self.wake_tx.try_send(()) {
             Ok(()) | Err(async_channel::TrySendError::Full(())) => Ok(()),
             Err(async_channel::TrySendError::Closed(())) => {
-                let cancelled = pending.remove(&pane_id);
+                let cancelled = pending.remove(&owner_id);
                 drop(pending);
                 drop(cancelled);
                 anyhow::bail!("render fetch domain detached during pane admission")
@@ -5992,6 +5996,7 @@ mod tests {
         CancelUnpolled,
         CancelDomainUnpolled,
         CancelDomainWithSuccessor,
+        CancelDomainWithReplacementPane,
         DetachDomainBeforePoll,
         GeometryChanged,
     }
@@ -6020,6 +6025,7 @@ mod tests {
             change,
             FetchRetryChange::CancelDomainUnpolled
                 | FetchRetryChange::CancelDomainWithSuccessor
+                | FetchRetryChange::CancelDomainWithReplacementPane
                 | FetchRetryChange::DetachDomainBeforePoll
         );
         // Use the actual production reservation path, retaining its admitted
@@ -6113,6 +6119,31 @@ mod tests {
             peer.replace_ready_generation(&client.client, codec::CODEC_VERSION)
                 .unwrap();
         }
+        let replacement =
+            if change == FetchRetryChange::CancelDomainWithReplacementPane {
+                let replacement = ClientPane::new(
+                    &client,
+                    753,
+                    757,
+                    763,
+                    wezterm_term::TerminalSize::default(),
+                    "replacement",
+                    false,
+                )
+                .unwrap();
+                replacement
+                    .renderable
+                    .lock()
+                    .inner
+                    .borrow_mut()
+                    .lines
+                    .put(0, LineEntry::Fetching(successor.clone()));
+                assert_eq!(client.fetch_retry_coordinator.pending.lock().len(), 2,
+                "retired and replacement allocations must both be admitted before driver polling");
+                Some(replacement)
+            } else {
+                None
+            };
         if change == FetchRetryChange::CancelUnpolled || cancel_domain {
             let (_wake_tx, wake_rx) = async_channel::bounded(1);
             let owner = Arc::downgrade(&pane.renderable);
@@ -6182,6 +6213,14 @@ mod tests {
                 );
             } else {
                 assert!(inner.lines.peek(&0).is_none());
+            }
+            if let Some(replacement) = replacement {
+                let replacement = replacement.renderable.lock();
+                assert!(
+                    matches!(replacement.inner.borrow().lines.peek(&0),
+                    Some(LineEntry::Fetching(current)) if current.same_request(&successor)),
+                    "old owner cancellation must never release a replacement allocation's token"
+                );
             }
             assert!(peer.is_empty());
             if cancel_domain {
@@ -6290,6 +6329,11 @@ mod tests {
     #[test]
     fn unpolled_admitted_domain_fetch_driver_preserves_successor_token() {
         exercise_render_fetch_retry(FetchRetryChange::CancelDomainWithSuccessor);
+    }
+
+    #[test]
+    fn unpolled_fetch_driver_admits_reused_pane_id_without_cross_owner_cleanup() {
+        exercise_render_fetch_retry(FetchRetryChange::CancelDomainWithReplacementPane);
     }
 
     #[test]
