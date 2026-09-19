@@ -9036,21 +9036,15 @@ mod tests {
                 &validated_gen2,
                 provenance.original.pane_id,
             )
-            .unwrap()
         };
         assert!(
             matches!(
-                prepare_third().claim(
-                    provenance.original.pane_id,
-                    2,
-                    Uuid::new_v4(),
-                    Uuid::new_v4()
-                ),
-                Err(GuardianProxyError::Client(GuardianClientError::Rejected(
-                    GuardianRejectionCode::InvalidRequest
-                )))
+                prepare_third(),
+                Err(GuardianProxyError::InvalidConfiguration(
+                    "recovery custody admission unavailable"
+                ))
             ),
-            "selected successor custody must not displace a living mux owner"
+            "a living recovered owner must refuse admission before another Claim"
         );
 
         assert!(successor_registration.detach_local_if_current());
@@ -9071,13 +9065,18 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let third_staging = loop {
             while executor.try_tick().unwrap() {}
-            match prepare_third().claim(
-                provenance.original.pane_id,
-                2,
-                third_request,
-                third_handoff,
-            ) {
+            match prepare_third().and_then(|plan| {
+                plan.claim(
+                    provenance.original.pane_id,
+                    2,
+                    third_request,
+                    third_handoff,
+                )
+            }) {
                 Ok(staging) => break staging,
+                Err(GuardianProxyError::InvalidConfiguration(
+                    "recovery custody admission unavailable",
+                )) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
                 Err(GuardianProxyError::Client(GuardianClientError::Rejected(
                     GuardianRejectionCode::InvalidRequest,
                 ))) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
