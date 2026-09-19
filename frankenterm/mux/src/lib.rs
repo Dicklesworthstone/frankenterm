@@ -30742,7 +30742,7 @@ mod tests {
                     Some(reservation)
                 }
                 promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => None,
-                other => panic!("unexpected scheduler rejection: {other:?}"),
+                other => panic!("unexpected scheduler rejection: {:?}", other),
             };
             assert!(matches!(
                 promise::spawn::try_reserve_main_thread(

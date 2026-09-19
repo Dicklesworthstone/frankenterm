@@ -144,6 +144,24 @@ lazy_static::lazy_static! {
 
 pub const ICON_DATA: &[u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
+struct GuiMuxSubscription {
+    owner: Weak<Mux>,
+    id: Arc<AtomicUsize>,
+    dead: Arc<AtomicBool>,
+}
+
+impl Drop for GuiMuxSubscription {
+    fn drop(&mut self) {
+        self.dead.store(true, Ordering::Release);
+        let id = self.id.swap(usize::MAX, Ordering::AcqRel);
+        if id != usize::MAX {
+            if let Some(owner) = self.owner.upgrade() {
+                owner.unsubscribe(id);
+            }
+        }
+    }
+}
+
 // This is a conservative interest summary, not an event queue. Numeric IDs
 // alias modulo 4096; a collision can request an unnecessary paint, but cannot
 // suppress a visible pane's output. Lifecycle authority never enters it.
@@ -890,6 +908,57 @@ impl SyncOutputState {
     }
 }
 
+/// Fold telemetry before attempting any GUI admission. `None` means the
+/// notification still needs its ordinary lifecycle/event handling.
+fn fold_gui_sync_notification(
+    owner: &Weak<Mux>,
+    window_id: MuxWindowId,
+    state: &Mutex<SyncOutputState>,
+    notification: &MuxNotification,
+    cleanup: Option<&PaneRemovalCleanupLease>,
+) -> Option<bool> {
+    if !matches!(
+        notification,
+        MuxNotification::SynchronizedOutput { .. } | MuxNotification::PaneRemoved(_)
+    ) {
+        return None;
+    }
+    let Some(owner) = owner.upgrade() else {
+        return Some(false);
+    };
+    if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)) {
+        return Some(false);
+    }
+    match notification {
+        MuxNotification::SynchronizedOutput { pane_id, event } => {
+            // Resolve membership before taking the accumulator lock; no mux
+            // or native-window callbacks may execute while it is held.
+            if owner
+                .resolve_pane_id(*pane_id)
+                .is_some_and(|(_, id, _)| id == window_id)
+            {
+                state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record(*pane_id, *event);
+            }
+            Some(true)
+        }
+        MuxNotification::PaneRemoved(pane_id) => {
+            // This exact lease prevents a same-ID successor from registering
+            // between the live-pane check and accumulator cleanup.
+            if cleanup.is_some() && owner.get_pane(*pane_id).is_none() {
+                state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .forget_pane(*pane_id);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn record_sync_output_mux_event(
     pane_id: PaneId,
     event: SynchronizedOutputEvent,
@@ -1274,6 +1343,7 @@ pub struct TermWindow {
     render_wake_state: RenderWakeState,
     render_wake_requests: Option<RenderWakeRequests>,
     output_refresh_abort: Option<RenderWakeAbort>,
+    mux_subscription: Option<GuiMuxSubscription>,
     /// Gate for the iter-dirty render-pass clean-line accounting
     /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
     /// wiring marks PTY, cursor, selection, and whole-screen events
@@ -3553,6 +3623,7 @@ impl TermWindow {
             render_wake_state: RenderWakeState::default(),
             render_wake_requests: None,
             output_refresh_abort: None,
+            mux_subscription: None,
             // Per ft-gwzrm: live dirty sources are wired, and the
             // render path only records a clean-line skip after a
             // cached quad list was actually reused.
@@ -5137,6 +5208,7 @@ impl TermWindow {
         let mux = Mux::try_get()
             .ok_or_else(|| anyhow!("cannot subscribe to pane updates without an active mux"))?;
         let dead = Arc::new(AtomicBool::new(false));
+        let owner_dead = Arc::clone(&dead);
         let subscription_id = Arc::new(AtomicUsize::new(usize::MAX));
         let unsubscribe_requested = Arc::new(AtomicBool::new(false));
         let callback_subscription_id = Arc::clone(&subscription_id);
@@ -5207,32 +5279,11 @@ impl TermWindow {
                 if !Self::mux_notification_targets_window(&n, mux_window_id) {
                     return true;
                 }
-                if matches!(&n, MuxNotification::SynchronizedOutput { .. } | MuxNotification::PaneRemoved(_)) {
-                    let Some(owner) = callback_mux.upgrade() else {
-                        return false;
-                    };
-                    if !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner)) {
-                        return false;
-                    }
-                    match &n {
-                        MuxNotification::SynchronizedOutput { pane_id, event } => {
-                            // Membership lookup precedes the accumulator lock;
-                            // the fold never calls mux or native window code.
-                            if owner.resolve_pane_id(*pane_id).is_some_and(|(_, window_id, _)| window_id == mux_window_id) {
-                                sync_output_state.lock().unwrap_or_else(|p| p.into_inner()).record(*pane_id, *event);
-                            }
-                            return true;
-                        }
-                        MuxNotification::PaneRemoved(pane_id) => {
-                            // The exact removal lease prevents same-ID reuse
-                            // until this callback and deferred GUI cleanup finish.
-                            // Never erase an accumulator using only a numeric ID.
-                            if pane_removal_cleanup.is_some() && owner.get_pane(*pane_id).is_none() {
-                                sync_output_state.lock().unwrap_or_else(|p| p.into_inner()).forget_pane(*pane_id);
-                            }
-                        }
-                        _ => unreachable!("notification kind was checked above"),
-                    }
+                if let Some(keep) = fold_gui_sync_notification(
+                    &callback_mux, mux_window_id, &sync_output_state, &n,
+                    pane_removal_cleanup.as_ref(),
+                ) {
+                    return keep;
                 }
                 if let MuxNotification::PaneOutput(pane_id) = &n {
                     // Full means an equivalent refresh is already retained.
@@ -5315,6 +5366,12 @@ impl TermWindow {
                 }
             })
             .context("allocating mux pane-update subscription")?;
+        subscription_id.store(allocated_subscription_id, Ordering::Release);
+        self.mux_subscription = Some(GuiMuxSubscription {
+            owner: Arc::downgrade(&mux),
+            id: Arc::clone(&subscription_id),
+            dead: owner_dead,
+        });
         let (output_abort, output_registration) = AbortHandle::new_pair();
         output_worker.spawn(async move {
             let _ = Abortable::new(
@@ -5377,7 +5434,6 @@ impl TermWindow {
             .await;
         });
         self.render_wake_requests = Some(render_requests);
-        subscription_id.store(allocated_subscription_id, Ordering::Release);
         if unsubscribe_requested.load(Ordering::Acquire) {
             let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
             if sub_id != usize::MAX {
@@ -9930,6 +9986,199 @@ mod tests {
         assert_eq!(replacement.admission_snapshot().active_tasks, 1);
         assert_eq!(replacement.queue_snapshot().depth, 0);
         drop(occupying);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_output_subscription_survives_full_queue_and_filters_window() {
+        if run_scheduler_test_in_child(
+            "sync_output_subscription_survives_full_queue_and_filters_window",
+        ) {
+            return;
+        }
+        use mux::pane::Pane;
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let owner = Arc::new(mux::Mux::new(None));
+        mux::Mux::set_mux(&owner);
+        let _activity = mux::activity::Activity::new_for_mux(&owner);
+        let left = owner.new_empty_window(None, None);
+        let right = owner.new_empty_window(None, None);
+        struct RetireChild(Arc<dyn Pane>);
+        impl Drop for RetireChild {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let mut children = Vec::new();
+        for (pane_id, window_id) in [(998_401, *left), (998_402, *right)] {
+            let size = wezterm_term::TerminalSize::default();
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .unwrap();
+            let writer = pair.master.take_writer().unwrap();
+            let durable = if pane_id == 998_401 {
+                [0x41; 16]
+            } else {
+                [0x42; 16]
+            };
+            let terminal = wezterm_term::Terminal::new(
+                size,
+                Arc::new(config::TermConfig::new_for_pane(
+                    pane_id,
+                    pane_id,
+                    durable,
+                    "sync subscription test".to_owned(),
+                )),
+                "FrankenTerm",
+                "sync-subscription-test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let child = pair
+                .slave
+                .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+                .unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+                pane_id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                pane_id,
+                durable,
+                "sync subscription test".to_owned(),
+            ));
+            children.push(RetireChild(Arc::clone(&pane)));
+            let tab = Arc::new(mux::tab::Tab::new(&size));
+            tab.assign_pane(&pane);
+            owner.add_tab_and_active_pane(&tab).unwrap();
+            owner.add_tab_to_window(&tab, window_id).unwrap();
+        }
+        let state = Arc::new(Mutex::new(super::SyncOutputState::default()));
+        let callback_state = Arc::clone(&state);
+        let callback_owner = Arc::downgrade(&owner);
+        let target = *left;
+        let (pending, receive) = flume::bounded(1);
+        let lifetime = Arc::new(());
+        let callback_lifetime = Arc::clone(&lifetime);
+        let weak_lifetime = Arc::downgrade(&lifetime);
+        drop(lifetime);
+        let id = owner
+            .subscribe_with_pane_removal_cleanup(move |notification, cleanup| {
+                let _lifetime = &callback_lifetime;
+                if let Some(keep) = super::fold_gui_sync_notification(
+                    &callback_owner,
+                    target,
+                    &callback_state,
+                    &notification,
+                    cleanup.as_ref(),
+                ) {
+                    return keep;
+                }
+                if matches!(notification, mux::MuxNotification::PaneOutput(998_401)) {
+                    return !matches!(
+                        pending.try_send(()),
+                        Err(flume::TrySendError::Disconnected(_))
+                    );
+                }
+                true
+            })
+            .unwrap();
+        let dead = Arc::new(AtomicBool::new(false));
+        let subscription = super::GuiMuxSubscription {
+            owner: Arc::downgrade(&owner),
+            id: Arc::new(AtomicUsize::new(id)),
+            dead: Arc::clone(&dead),
+        };
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap())
+                .unwrap();
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let identity = occupying.admission_receipt();
+        assert!(matches!(
+            try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
+            MainThreadReservationOutcome::RetryableFull(_)
+        ));
+        for pane_id in [998_401, 998_402] {
+            for event in [
+                mux::SynchronizedOutputEvent::Depth {
+                    outcome: mux::SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },
+                    max_depth: 1,
+                },
+                mux::SynchronizedOutputEvent::Admission {
+                    decision: mux::SynchronizedOutputAdmissionDecision::Accepted,
+                    bytes: 64,
+                },
+                mux::SynchronizedOutputEvent::Drain {
+                    cause: mux::SynchronizedOutputDrainCause::Esu,
+                    bytes: 0,
+                    depth_outcome: Some(mux::SynchronizedOutputDepthOutcome::Flushed),
+                    max_depth: 1,
+                },
+                mux::SynchronizedOutputEvent::ModeQuery,
+            ] {
+                owner.notify(mux::MuxNotification::SynchronizedOutput { pane_id, event });
+            }
+        }
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.watchdog.bsu_count(), 1);
+            assert_eq!(state.watchdog.esu_count(), 1);
+            assert_eq!(state.watchdog.mode_query_count(), 1);
+            assert_eq!(state.orchestrator.bytes_accepted, 64);
+            assert_eq!(state.orchestrator.bytes_drained_total, 64);
+            assert!(!state.depth_by_pane.contains_key(&998_402));
+            assert!(state.buffered_bytes_by_pane.is_empty());
+        }
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(
+                receive,
+                identity,
+                || true,
+                |reservation| {
+                    let delivered = Arc::clone(&worker_delivered);
+                    reservation.spawn(async move {
+                        delivered.fetch_add(1, Ordering::AcqRel);
+                    })
+                },
+            ))
+        });
+        drop(occupying);
+        // Actual mux notification fanout must still reach the subscription
+        // after the preceding full-queue synchronized-output traffic.
+        owner.notify(mux::MuxNotification::PaneOutput(998_401));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while delivered.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "subscription lost subsequent pane output"
+            );
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(weak_lifetime.upgrade().is_some());
+        drop(subscription);
+        assert!(dead.load(Ordering::Acquire));
+        // No subsequent mux event is needed to free the actual callback.
+        assert!(weak_lifetime.upgrade().is_none());
+        assert!(!owner.unsubscribe(id));
+        worker.join().unwrap();
+        left.cancel();
+        right.cancel();
+        drop(exec);
+        drop(children);
+        mux::Mux::shutdown();
     }
 
     // SimpleExecutor owns a process-global scheduler. Run these tests in their
