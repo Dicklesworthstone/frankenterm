@@ -14906,6 +14906,7 @@ mod tests {
 
     #[test]
     fn per_pane_cache_is_scoped_to_exact_registration() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_001;
@@ -14949,8 +14950,8 @@ mod tests {
 
     #[test]
     fn old_registration_candidate_ack_cannot_commit_replacement_state() {
-        let _executor = SimpleExecutor::new();
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_002;
         let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
@@ -15006,8 +15007,8 @@ mod tests {
 
     #[test]
     fn old_registration_legacy_enqueue_ack_cannot_mutate_replacement_state() {
-        let _executor = SimpleExecutor::new();
         let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let pane_id = 7_003;
         let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
@@ -15015,6 +15016,16 @@ mod tests {
         let (sender, _captured) = capturing_sender();
         let mut handler =
             SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux))).unwrap();
+        let render_admission = handler.push_task.as_ref().unwrap().admission_receipt();
+        assert_eq!(
+            render_admission.queue_id,
+            executor.scheduler_identity().queue_id
+        );
+        assert_eq!(
+            render_admission.scheduler_generation,
+            executor.scheduler_identity().scheduler_generation,
+            "the session owner must be created and drained by this test's executor"
+        );
         let original_registration = handler
             .owner
             .authority()

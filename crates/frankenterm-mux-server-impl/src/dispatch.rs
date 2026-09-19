@@ -9256,6 +9256,7 @@ mod tests {
 
     #[test]
     fn dispatch_client_request_rejects_reserved_zero_before_handler() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9313,6 +9314,7 @@ mod tests {
 
     #[test]
     fn dispatch_client_request_delegates_nonzero_serial_unchanged() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9341,6 +9343,7 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_wrong_wire_direction_before_handler_mutation() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9363,6 +9366,7 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_retired_pdu95_before_handler_mutation() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9385,6 +9389,7 @@ mod tests {
 
     #[test]
     fn dispatch_binds_sampled_input_to_its_exact_connection_stream() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9585,6 +9590,7 @@ mod tests {
 
     #[test]
     fn request_dispatch_admission_rejects_terminal_and_releases_before_response_reentry() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let rejected_mux = Arc::new(Mux::new(None));
         let (rejected_sender, rejected_responses) = capturing_pdu_sender();
@@ -11686,6 +11692,7 @@ mod tests {
 
     #[test]
     fn malformed_ordered_refresh_at_dispatch_revokes_authority_and_retained_successors() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -11771,6 +11778,7 @@ mod tests {
 
     #[test]
     fn rejected_pdu88_at_dispatch_is_sticky_terminal_and_revokes_inflight_fence() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -13237,6 +13245,7 @@ mod tests {
 
     #[test]
     fn process_async_treats_unexpected_eof_as_clean_disconnect() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
@@ -13292,6 +13301,7 @@ mod tests {
 
     #[test]
     fn process_async_treats_read_side_connection_reset_as_clean_disconnect() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
@@ -13351,6 +13361,7 @@ mod tests {
 
     #[test]
     fn process_async_propagates_readable_wait_failures() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let _executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
@@ -14614,6 +14625,7 @@ mod tests {
             let cut = 1 + (cut_seed % (encoded.len() - 1));
             let frame_prefix = encoded[..cut].to_vec();
 
+            let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let _executor = promise::spawn::SimpleExecutor::new();
@@ -14659,6 +14671,7 @@ mod tests {
                 malformed_len
             );
 
+            let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let _executor = promise::spawn::SimpleExecutor::new();
