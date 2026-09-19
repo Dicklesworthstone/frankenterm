@@ -1084,9 +1084,12 @@ mod measured {
                         )?;
                         let sequence = latest_noise_sequence(&text)?;
                         if let Some(previous) = &previous_sequences {
+                            // A fresh observation can fall between parser batches.
+                            // Require monotonicity here; the complete interval
+                            // below must still prove fresh bytes and throughput.
                             ensure!(
-                                sequence > previous[index],
-                                "noise ingestion stalled or regressed"
+                                sequence >= previous[index],
+                                "noise ingestion regressed"
                             );
                         }
                         emit(

@@ -863,7 +863,7 @@ def validate_swarm_measurements(rows, finals, custody):
                 if (sample.get("event") != "noise_sample" or sample.get("after_trial") != trial
                         or sample.get("pane_id") != noise_pane or start < previous_time or end < start
                         or seq != parsed_noise_sequence(sample.get("tail"))
-                        or (prior and seq <= prior[-1])
+                        or (prior and seq < prior[-1])
                         or seq >= by_pane[noise_pane]["records_generated"]):
                     raise ValueError("stale, forged, or out-of-interval noise observation")
                 prior.append(seq)
@@ -1224,12 +1224,41 @@ def test_swarm_receipt_contract():
             for row in rows:
                 if row.get("event") == "noise_sample":
                     row["last_complete_record"] = 1
+                    row["tail"] = noise_record(1).decode("ascii")
             with self.assertRaises(ValueError):
                 validate_swarm_measurements(rows, self.finals, self.custody)
             finals = copy.deepcopy(self.finals)
             finals[1]["bytes_written"] += 1
             with self.assertRaises(ValueError):
                 validate_swarm_measurements(self.rows, finals, self.custody)
+
+        def test_intermediate_plateau_preserves_interval_throughput(self):
+            rows = copy.deepcopy(self.rows)
+            # Both the parsed text and reported counter agree. The first and
+            # final samples, timing, byte lower bound, and latency stay intact.
+            for row in rows:
+                if row.get("event") == "noise_sample" and row["after_trial"] == 10:
+                    row["last_complete_record"] = 1
+                    row["tail"] = noise_record(1).decode("ascii")
+            validate_swarm_measurements(rows, self.finals, self.custody)
+
+        def test_genuine_counter_regression_is_rejected(self):
+            rows = copy.deepcopy(self.rows)
+            for row in rows:
+                if row.get("event") == "noise_sample" and row["after_trial"] == 20:
+                    row["last_complete_record"] = 1000
+                    row["tail"] = noise_record(1000).decode("ascii")
+            with self.assertRaisesRegex(ValueError, "noise observation"):
+                validate_swarm_measurements(rows, self.finals, self.custody)
+
+        def test_insufficient_interval_throughput_is_rejected(self):
+            rows = copy.deepcopy(self.rows)
+            # Keep the reported result consistent with the measured bytes and
+            # a longer interval; acceptance must fail on the actual rate.
+            rows[-1]["duration_us"] *= 1000
+            rows[-1]["throughput_mb_s_lower_bound"] /= 1000
+            with self.assertRaisesRegex(ValueError, "acceptance"):
+                validate_swarm_measurements(rows, self.finals, self.custody)
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(SwarmReceiptTests))
     if not result.wasSuccessful():
