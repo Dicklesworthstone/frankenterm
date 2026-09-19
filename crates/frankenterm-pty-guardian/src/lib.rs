@@ -89,15 +89,15 @@ pub use mux::guardian_protocol::{GuardianInputEffectQuery, InputEffectState};
 #[cfg(unix)]
 pub use output::{
     GuardianCheckpointAdoptionSelectorV1, GuardianDurableSpawnCustodyV1,
-    GuardianReopenedCheckpointV1,
+    GuardianDurableSuccessorCustodyV1, GuardianReopenedCheckpointV1,
 };
 #[cfg(unix)]
 pub use runtime::{GuardianRuntime, GuardianRuntimeConfig, GuardianRuntimeCounters};
 #[cfg(unix)]
 pub use transport::{
     GuardianClaimedPaneLease, GuardianClient, GuardianClientError, GuardianProbeReport,
-    GuardianService, GuardianServiceConfig, GuardianServiceError, ProvisionTokenOutcome,
-    provision_guardian_token,
+    GuardianService, GuardianServiceConfig, GuardianServiceError, GuardianSuccessorRotationClient,
+    ProvisionTokenOutcome, provision_guardian_token,
 };
 
 /// Canonical security-sensitive scratch root for Unix tests.

@@ -553,6 +553,33 @@ type GuardianRebindSecrets = (
 );
 
 impl GuardianDurableSuccessorCustodyV1 {
+    /// Reopen only an exact independently selected durable custody record.
+    /// A transport token alone cannot provision a missing capability.
+    pub fn open_existing(
+        token_path: &Path,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        GuardianDurableSpawnCustodyV1::open_existing_store(token_path)?
+            .lookup_successor_custody(scope)
+    }
+
+    pub(crate) fn into_mux_rotation_payload(
+        self,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            let secret = read_successor_custody_locked(inner, &self.context)?;
+            let bytes = read_synced_custody_bytes::<
+                { mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES },
+            >(inner, &successor_custody_path(inner, &self.context))?;
+            let mut payload = Zeroizing::new(
+                mux::guardian_protocol::GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG.to_vec(),
+            );
+            payload.extend_from_slice(&bytes);
+            payload.extend_from_slice(secret.as_slice());
+            Ok(payload)
+        })
+    }
+
     pub const fn context(&self) -> mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 {
         self.context
     }
@@ -2463,6 +2490,49 @@ impl GuardianCheckpointStageStore {
             let mut verifier = Hmac::<Sha256>::new_from_slice(stored_secret.as_slice())
                 .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
             verifier.update(b"frankenterm.mux-owner-rotation.possession.v1\0");
+            verifier.update(bytes);
+            verifier
+                .verify_slice(&proof.finalize().into_bytes())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            Ok((context, presented))
+        })
+    }
+
+    pub(crate) fn authenticate_successor_mux_rotation_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<
+        (
+            mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1,
+            Zeroizing<[u8; 32]>,
+        ),
+        GuardianCheckpointStageStoreError,
+    > {
+        use mux::guardian_protocol::{
+            GUARDIAN_SUCCESSOR_MUX_ROTATION_PAYLOAD_BYTES, GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG,
+        };
+        if payload.len() != GUARDIAN_SUCCESSOR_MUX_ROTATION_PAYLOAD_BYTES
+            || !payload.starts_with(GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG)
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        self.with_exclusive_directory(|inner| {
+            let record_end = GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG.len()
+                + mux::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES;
+            let bytes = payload[GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG.len()..record_end]
+                .try_into()
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            let (context, stored_secret) = inner.cipher.open_successor_custody_record(bytes)?;
+            drop(read_successor_custody_locked(inner, &context)?);
+            let mut presented = Zeroizing::new([0; 32]);
+            presented.copy_from_slice(&payload[record_end..]);
+            let mut proof = Hmac::<Sha256>::new_from_slice(presented.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            proof.update(b"frankenterm.mux-successor-rotation.possession.v1\0");
+            proof.update(bytes);
+            let mut verifier = Hmac::<Sha256>::new_from_slice(stored_secret.as_slice())
+                .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?;
+            verifier.update(b"frankenterm.mux-successor-rotation.possession.v1\0");
             verifier.update(bytes);
             verifier
                 .verify_slice(&proof.finalize().into_bytes())

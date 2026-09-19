@@ -963,15 +963,46 @@ fn execute_mux_rotation_job(
             GuardianRejectionCode::InvalidRequest,
         ))
     };
-    let Ok((context, presented)) = store.authenticate_mux_rotation_payload(request.payload())
-    else {
-        return reject();
-    };
+    let (initial, successor_custody, presented, pane_id, generation, guardian, predecessor_mux) =
+        if request
+            .payload()
+            .starts_with(mux::guardian_protocol::GUARDIAN_MUX_ROTATION_TAG)
+        {
+            let Ok((context, presented)) =
+                store.authenticate_mux_rotation_payload(request.payload())
+            else {
+                return reject();
+            };
+            (
+                Some(context),
+                None,
+                presented,
+                context.pane_id,
+                1,
+                context.guardian_incarnation,
+                context.mux_incarnation,
+            )
+        } else {
+            let Ok((context, presented)) =
+                store.authenticate_successor_mux_rotation_payload(request.payload())
+            else {
+                return reject();
+            };
+            (
+                None,
+                Some(context),
+                presented,
+                context.pane_id,
+                context.lease_generation,
+                context.successor.guardian_incarnation,
+                context.successor.mux_incarnation,
+            )
+        };
     if request.header().operation != GuardianOperation::Claim
-        || request.header().pane_id != Some(context.pane_id)
-        || context.pane_id != control.pane_id
-        || request.header().lease_generation != 1
-        || request.header().guardian_incarnation != context.guardian_incarnation
+        || request.header().pane_id != Some(pane_id)
+        || pane_id != control.pane_id
+        || request.header().lease_generation != generation
+        || request.header().guardian_incarnation != guardian
     {
         return reject();
     }
@@ -982,11 +1013,11 @@ fn execute_mux_rotation_job(
         return reject();
     };
     let can_rotate = rotation.predecessor_was_retired
-        && control.mux_incarnation == context.mux_incarnation
-        && context.mux_incarnation != request.header().mux_incarnation
+        && control.mux_incarnation == predecessor_mux
+        && predecessor_mux != request.header().mux_incarnation
         && matches!(
-            protocol.pane_state(context.pane_id),
-            Some(GuardianPaneState::LiveUnclaimed { generation: 1 })
+            protocol.pane_state(pane_id),
+            Some(GuardianPaneState::LiveUnclaimed { generation: current }) if *current == generation
         );
     let result = protocol.apply_effect_transactionally(request, |_reply| {
         if !can_rotate {
@@ -1018,35 +1049,64 @@ fn execute_mux_rotation_job(
         };
         // These are pure authenticated provenance checks. A stale retained
         // record cannot quarantine a live pane before any fence was sent.
+        let validated = if let Some(context) = initial.as_ref() {
+            control.session.client.validate_initial_mux_rotation(
+                &successor.client,
+                &control.handle,
+                context,
+                handoff_id,
+                request.header().request_id,
+            )
+        } else if let Some(context) = successor_custody.as_ref() {
+            control.session.client.validate_successor_mux_rotation(
+                &successor.client,
+                &control.handle,
+                context,
+                handoff_id,
+                request.header().request_id,
+            )
+        } else {
+            return GuardianEffectOutcome::DefinitelyNotApplied(
+                RuntimeEffectError::InternalInvariant,
+            );
+        };
         if !successor
             .client
             .matches_mux_identity(request.header().mux_incarnation, rotation.mux_build)
-            || control
-                .session
-                .client
-                .validate_initial_mux_rotation(
-                    &successor.client,
-                    &control.handle,
-                    &context,
-                    handoff_id,
-                    request.header().request_id,
-                )
-                .is_err()
+            || validated.is_err()
         {
             return GuardianEffectOutcome::DefinitelyNotApplied(
                 RuntimeEffectError::InternalInvariant,
             );
         }
-        match control.session.client.rotate_initial_mux_owner(
-            &mut successor.client,
-            store,
-            &control.handle,
-            &context,
-            &presented,
-            handoff_id,
-            request.header().request_id,
-            deadline,
-        ) {
+        let rotated = if let Some(context) = initial.as_ref() {
+            control.session.client.rotate_initial_mux_owner(
+                &mut successor.client,
+                store,
+                &control.handle,
+                context,
+                &presented,
+                handoff_id,
+                request.header().request_id,
+                deadline,
+            )
+        } else if let Some(context) = successor_custody.as_ref() {
+            control.session.client.rotate_successor_mux_owner(
+                &mut successor.client,
+                store,
+                &control.handle,
+                context,
+                &presented,
+                handoff_id,
+                request.header().request_id,
+                deadline,
+            )
+        } else {
+            return GuardianEffectOutcome::DefinitelyNotApplied(
+                RuntimeEffectError::InternalInvariant,
+            );
+        };
+        match rotated {
             Ok(handle) => {
                 rotation.successor_handle = Some(handle);
                 GuardianEffectOutcome::Applied

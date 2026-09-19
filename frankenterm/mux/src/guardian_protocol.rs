@@ -39,6 +39,11 @@ pub const GUARDIAN_PROTOCOL_VERSION: u16 = 5;
 pub const GUARDIAN_MUX_ROTATION_TAG: &[u8; 9] = b"FTMUXROT1";
 pub const GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES: usize =
     GUARDIAN_MUX_ROTATION_TAG.len() + crate::guardian_checkpoint::GUARDIAN_SPAWN_CUSTODY_BYTES + 32;
+pub const GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG: &[u8; 9] = b"FTMUXROT2";
+pub const GUARDIAN_SUCCESSOR_MUX_ROTATION_PAYLOAD_BYTES: usize = GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG
+    .len()
+    + crate::guardian_checkpoint::GUARDIAN_SUCCESSOR_CUSTODY_BYTES
+    + 32;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
 pub const GUARDIAN_MAC_BYTES: usize = 32;
 pub const GUARDIAN_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -1178,10 +1183,21 @@ impl GuardianHelloBuildIdentityV1 {
         payload
     }
 
+    /// Require repeated mux-rotation support during authenticated Hello.
+    /// Version-5 guardians predating this extension reject the reserved byte;
+    /// the ordinary Hello encoding remains unchanged for existing sessions.
+    #[must_use]
+    pub fn encode_requiring_successor_rotation(self) -> [u8; HELLO_BUILD_IDENTITY_PAYLOAD_BYTES] {
+        let mut payload = self.encode();
+        payload[5] = 1;
+        payload
+    }
+
     fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
         if payload.len() != HELLO_BUILD_IDENTITY_PAYLOAD_BYTES
             || payload.get(..4) != Some(HELLO_BUILD_IDENTITY_PAYLOAD_MAGIC.as_slice())
-            || payload[5..8].iter().any(|byte| *byte != 0)
+            || payload[5] > 1
+            || payload[6..8].iter().any(|byte| *byte != 0)
         {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
@@ -11977,10 +11993,16 @@ fn validate_request_envelope(
             GuardianHelloBuildIdentityV1::decode(request.payload())?;
         }
         GuardianOperation::Claim if !request.payload.is_empty() => {
-            if request.payload.len() != GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES
-                || !request.payload.starts_with(GUARDIAN_MUX_ROTATION_TAG)
-                || header.lease_generation != 1
-            {
+            let initial = request.payload.len() == GUARDIAN_MUX_ROTATION_PAYLOAD_BYTES
+                && request.payload.starts_with(GUARDIAN_MUX_ROTATION_TAG)
+                && header.lease_generation == 1;
+            let successor = request.payload.len() == GUARDIAN_SUCCESSOR_MUX_ROTATION_PAYLOAD_BYTES
+                && request
+                    .payload
+                    .starts_with(GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG)
+                && header.lease_generation > 1
+                && header.lease_generation < u64::MAX;
+            if !initial && !successor {
                 return Err(GuardianProtocolError::InvalidOperationPayload);
             }
         }
@@ -13760,6 +13782,49 @@ mod tests {
                 Err(GuardianProtocolError::InvalidOperationPayload)
             );
             assert!(encode_guardian_request(&secret(), &request).is_err());
+        }
+    }
+
+    #[test]
+    fn successor_rotation_requires_exact_payload_and_explicit_hello_extension() {
+        let hello = GuardianHelloBuildIdentityV1::from_build_identity_for_test(
+            AtomicBuildIdentity::Sealed(sealed_build_identity(0x51)),
+        );
+        assert_eq!(hello.encode()[5], 0);
+        let mut extended = hello.encode_requiring_successor_rotation();
+        assert_eq!(extended[5], 1);
+        assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_ok());
+        // The historical decoder rejected any nonzero reserved byte. Ordinary
+        // Hello remains byte-for-byte unchanged; requiring the extension cannot
+        // be mistaken for an ordinary connection by a historical guardian.
+        assert!(extended[5..8].iter().any(|byte| *byte != 0));
+        extended[5] = 2;
+        assert!(GuardianHelloBuildIdentityV1::decode(&extended).is_err());
+        for generation in [1, 2, 3, u64::MAX] {
+            for delta in [-1_isize, 0, 1] {
+                let mut payload = Zeroizing::new(vec![
+                    0x53;
+                    GUARDIAN_SUCCESSOR_MUX_ROTATION_PAYLOAD_BYTES
+                        .checked_add_signed(delta)
+                        .unwrap()
+                ]);
+                payload[..GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG.len()]
+                    .copy_from_slice(GUARDIAN_SUCCESSOR_MUX_ROTATION_TAG);
+                let request = request_zeroizing(
+                    GuardianOperation::Claim,
+                    id(1),
+                    id(2),
+                    id(3),
+                    Some(id(4)),
+                    generation,
+                    0,
+                    Some(id(5)),
+                    payload,
+                );
+                let valid = delta == 0 && (generation == 2 || generation == 3);
+                assert_eq!(validate_request_envelope(&request).is_ok(), valid);
+                assert_eq!(encode_guardian_request(&secret(), &request).is_ok(), valid);
+            }
         }
     }
 
