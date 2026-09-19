@@ -191,10 +191,11 @@ case "$GENERATOR_CASE" in
   tracked) printf 'regenerated\n' >artifact ;;
   untracked) printf 'regenerated\n' >untracked ;;
   create) printf 'new generated artifact\n' >new-artifact ;;
+  executable) chmod +x untracked ;;
   failure) echo 'intentional generator failure' >&2; exit 7 ;;
 esac
 SH
-for mode in unchanged tracked untracked create failure; do
+for mode in unchanged tracked untracked create executable failure; do
   actual=0
   GENERATOR_CASE="$mode" bash "$GENERATED_FIXTURE/scripts/check_generated_artifacts.sh" \
     >"$RUN_DIR/generated-$mode.log" 2>&1 || actual=$?
@@ -206,6 +207,30 @@ for mode in unchanged tracked untracked create failure; do
   fi
   printf 'PASS generated %s exit=%s\n' "$mode" "$actual"
 done
+
+# A symlink to a FIFO must fingerprint only the link, without reading its
+# target. Git omits a preexisting direct FIFO; it too must never block the gate.
+mkfifo "$RUN_DIR/external-fifo"
+ln -s "$RUN_DIR/external-fifo" "$GENERATED_FIXTURE/fifo-link"
+python3 - "$GENERATED_FIXTURE" "$RUN_DIR" <<'PY'
+import os
+import subprocess
+import sys
+
+fixture, logs = sys.argv[1:]
+environment = dict(os.environ, GENERATOR_CASE="unchanged")
+for special in (False, True):
+    if special:
+        os.mkfifo(os.path.join(fixture, "direct-fifo"))
+    result = subprocess.run(
+        ["bash", os.path.join(fixture, "scripts/check_generated_artifacts.sh")],
+        env=environment, capture_output=True, timeout=10,
+    )
+    with open(os.path.join(logs, f"generated-fifo-{special}.log"), "wb") as log:
+        log.write(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    print(f"PASS generated FIFO special={special} exit={result.returncode}")
+PY
 
 printf 'RELEASE_GATE_SELECTION_SUCCESS cases=%s production=passed artifacts=%s\n' "$count" "$RUN_DIR"
 )
