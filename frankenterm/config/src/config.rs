@@ -542,7 +542,10 @@ pub struct Config {
     /// This should not be too large, otherwise the processing cost
     /// of applying a batch of actions to the terminal will be too
     /// high and the user experience will be laggy and less responsive.
-    #[dynamic(default = "default_mux_output_parser_buffer_size")]
+    #[dynamic(
+        default = "default_mux_output_parser_buffer_size",
+        validate = "validate_mux_output_parser_buffer_size"
+    )]
     pub mux_output_parser_buffer_size: usize,
 
     #[dynamic(default = "default_true")]
@@ -2116,6 +2119,14 @@ fn default_mux_output_parser_buffer_size() -> usize {
     128 * 1024
 }
 
+fn validate_mux_output_parser_buffer_size(value: &usize) -> Result<(), String> {
+    if *value == 0 {
+        Err("mux_output_parser_buffer_size must be non-zero".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn default_mux_socket_buffer_size() -> usize {
     1024 * 1024
 }
@@ -3363,6 +3374,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_mux_output_parser_buffer_size_zero_rejected() {
+        assert!(validate_mux_output_parser_buffer_size(&0).is_err());
+    }
+
+    #[test]
+    fn validate_mux_output_parser_buffer_size_positive_accepted() {
+        assert!(validate_mux_output_parser_buffer_size(&1).is_ok());
+        assert!(
+            validate_mux_output_parser_buffer_size(&default_mux_output_parser_buffer_size())
+                .is_ok()
+        );
+        assert!(validate_mux_output_parser_buffer_size(&(512 * 1024)).is_ok());
+    }
+
+    #[test]
     fn validate_max_fps_accepts_exact_supported_boundaries() {
         assert!(validate_max_fps(&MIN_MAX_FPS).is_ok());
         assert!(validate_max_fps(&default_max_fps()).is_ok());
@@ -3822,6 +3848,69 @@ mod tests {
         assert_eq!(
             config.canonicalize_pasted_newlines,
             Some(NewlineCanon::None)
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_default_mux_output_parser_buffer_size() {
+        let obj = std::collections::BTreeMap::new();
+        let config =
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .expect("default config should parse successfully");
+        assert_eq!(
+            config.mux_output_parser_buffer_size,
+            default_mux_output_parser_buffer_size()
+        );
+        assert_eq!(config.mux_output_parser_buffer_size, 128 * 1024);
+    }
+
+    #[test]
+    fn config_from_dynamic_accepts_valid_mux_output_parser_buffer_size() {
+        for valid_size in [1, 4096, 128 * 1024, 512 * 1024, 1024 * 1024] {
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(
+                Value::String("mux_output_parser_buffer_size".into()),
+                Value::U64(valid_size as u64),
+            );
+            let config =
+                Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                    .expect("valid mux_output_parser_buffer_size should parse");
+            assert_eq!(config.mux_output_parser_buffer_size, valid_size);
+        }
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_zero_mux_output_parser_buffer_size() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("mux_output_parser_buffer_size".into()),
+            Value::U64(0),
+        );
+        let error = Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+            .expect_err("zero mux_output_parser_buffer_size must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("mux_output_parser_buffer_size"),
+            "unexpected error: {}",
+            message
+        );
+        assert!(
+            message.contains("must be non-zero"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn config_from_dynamic_rejects_negative_mux_output_parser_buffer_size() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            Value::String("mux_output_parser_buffer_size".into()),
+            Value::I64(-1),
+        );
+        assert!(
+            Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
+                .is_err()
         );
     }
 
