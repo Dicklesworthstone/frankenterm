@@ -20,7 +20,7 @@ use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
-#[cfg(all(test, feature = "disruptor-pane-io"))]
+#[cfg(test)]
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2;
 use frankenterm_term::terminalstate::checkpoint::{
     TerminalCheckpointError, TerminalCheckpointLimits,
