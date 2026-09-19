@@ -2049,6 +2049,63 @@ pub struct GuardianClaimedPaneLease {
     pane_id: Uuid,
     generation: u64,
     next_sequence: u64,
+    successor_claim: Option<GuardianAcknowledgedSuccessorClaim>,
+}
+
+/// Nonsecret selector authority minted only by a successful custody-backed Claim.
+#[derive(Clone, Copy)]
+pub struct GuardianAcknowledgedSuccessorClaim {
+    guardian: Uuid,
+    mux: Uuid,
+    pane: Uuid,
+    generation: u64,
+    request: Uuid,
+    handoff: Uuid,
+}
+
+impl GuardianAcknowledgedSuccessorClaim {
+    /// Reopen after installing lease rollback, so any missing local custody
+    /// rejects activation without leaking the already acquired lease.
+    pub fn reopen(
+        self,
+        token_path: &Path,
+        original: mux::guardian_checkpoint::GuardianSpawnCustodyScopeV1,
+    ) -> Result<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1, GuardianClientError>
+    {
+        let reject = || GuardianClientError::Setup(GuardianServiceError::OutputInitialization);
+        if original.pane_id != self.pane || original.guardian_incarnation != self.guardian {
+            return Err(reject());
+        }
+        let original =
+            crate::output::GuardianDurableSpawnCustodyV1::open_existing(token_path, original)
+                .map_err(|_| reject())?;
+        let build = crate::guardian_runtime_build_identity().map_err(|_| reject())?;
+        let context = original.context();
+        let custody = crate::output::GuardianDurableSuccessorCustodyV1::open_acknowledged_rotation(
+            token_path,
+            mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1 {
+                broker_incarnation: context.broker_incarnation,
+                broker_lineage: context.broker_lineage,
+                broker_build: context.broker_build,
+                successor: mux::guardian_checkpoint::GuardianSuccessorCustodyOwnerV1 {
+                    guardian_incarnation: self.guardian,
+                    connection_id: Uuid::nil(),
+                    mux_incarnation: self.mux,
+                    guardian_build: context.guardian_build,
+                    mux_build: build.into_bytes(),
+                },
+                pane_id: self.pane,
+                handoff_id: self.handoff,
+                lease_generation: self.generation,
+            },
+        )
+        .map_err(|_| reject())?;
+        let selected = custody.context();
+        if selected.ack_id != self.request {
+            return Err(reject());
+        }
+        Ok(selected)
+    }
 }
 
 impl fmt::Debug for GuardianClaimedPaneLease {
@@ -2065,6 +2122,9 @@ impl fmt::Debug for GuardianClaimedPaneLease {
 }
 
 impl GuardianClaimedPaneLease {
+    pub const fn acknowledged_successor_claim(&self) -> Option<GuardianAcknowledgedSuccessorClaim> {
+        self.successor_claim
+    }
     #[must_use]
     pub const fn guardian_incarnation(&self) -> Uuid {
         self.client.guardian_incarnation
@@ -2431,6 +2491,16 @@ impl GuardianClient {
                 GuardianProtocolError::GenerationExhausted,
             ));
         }
+        let successor_claim = (!payload.is_empty() && observed_generation > 0).then_some(
+            GuardianAcknowledgedSuccessorClaim {
+                guardian: self.guardian_incarnation,
+                mux: self.mux_incarnation,
+                pane: pane_id,
+                generation: observed_generation + 1,
+                request: request_id,
+                handoff: effect_id,
+            },
+        );
         let request = self.request_sensitive(
             GuardianOperation::Claim,
             request_id,
@@ -2459,6 +2529,7 @@ impl GuardianClient {
             pane_id,
             generation,
             next_sequence,
+            successor_claim,
         })
     }
 
@@ -2505,6 +2576,7 @@ impl GuardianClient {
             pane_id,
             generation,
             next_sequence,
+            successor_claim: None,
         })
     }
 

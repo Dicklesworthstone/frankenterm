@@ -572,6 +572,14 @@ impl GuardianDurableSuccessorCustodyV1 {
             .lookup_successor_custody_for_reconnect(scope)
     }
 
+    pub(crate) fn open_acknowledged_rotation(
+        token_path: &Path,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+    ) -> Result<Self, GuardianCheckpointStageStoreError> {
+        GuardianDurableSpawnCustodyV1::open_existing_store(token_path)?
+            .lookup_successor_custody_candidates(scope, true)
+    }
+
     pub(crate) fn into_mux_rotation_payload(
         self,
     ) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointStageStoreError> {
@@ -2640,7 +2648,18 @@ impl GuardianCheckpointStageStore {
         &self,
         scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
     ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
+        self.lookup_successor_custody_candidates(scope, false)
+    }
+
+    fn lookup_successor_custody_candidates(
+        &self,
+        scope: mux::guardian_checkpoint::GuardianSuccessorCustodyScopeV1,
+        require_unrebound_rotation: bool,
+    ) -> Result<GuardianDurableSuccessorCustodyV1, GuardianCheckpointStageStoreError> {
         match self.lookup_successor_custody(scope) {
+            Ok(_) if require_unrebound_rotation => {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
+            }
             Ok(custody) => return Ok(custody),
             Err(GuardianCheckpointStageStoreError::Output(GuardianOutputError::Io {
                 source,
@@ -2730,6 +2749,12 @@ impl GuardianCheckpointStageStore {
                     marks[visited] = 2;
                 }
                 path.clear();
+            }
+            // A direct rotation Claim ACK proves only its original connection.
+            // Rebind intents require independent broker selection; never turn
+            // this filesystem search into authority for such a connection.
+            if require_unrebound_rotation && contexts.len() != 1 {
+                return Err(GuardianCheckpointStageStoreError::Conflict);
             }
             Ok(contexts[root])
         })?;
@@ -12695,11 +12720,23 @@ mod tests {
             rebind_from_connection: Uuid::nil(),
         };
         store.persist_successor_custody(&root, &[0x21; 32])?;
+        let mut acknowledged_scope = root.scope();
+        acknowledged_scope.successor.connection_id = Uuid::nil();
+        assert_eq!(
+            store
+                .lookup_successor_custody_candidates(acknowledged_scope, true)?
+                .context(),
+            root
+        );
         for connection in [20, 21] {
             store
                 .reopen_successor_custody(&root)?
                 .prepare_rebind(Uuid::from_u128(connection))?;
         }
+        assert!(matches!(
+            store.lookup_successor_custody_candidates(acknowledged_scope, true),
+            Err(GuardianCheckpointStageStoreError::Conflict)
+        ));
         let mut scope = root.scope();
         scope.successor.connection_id = Uuid::from_u128(99);
         let recovered = store.lookup_successor_custody_for_reconnect(scope)?;

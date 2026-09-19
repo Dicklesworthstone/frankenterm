@@ -834,6 +834,7 @@ struct GuardianPendingClaim {
     effect_id: Uuid,
     size: PtySize,
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    successor_custody: Option<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>,
 }
 
 impl GuardianPendingClaim {
@@ -862,6 +863,30 @@ impl GuardianPendingClaim {
         &self,
         client: GuardianClient,
     ) -> Result<GuardianClaimedPaneLease, GuardianClientError> {
+        if let Some(context) = self.successor_custody {
+            drop(client);
+            let custody =
+                frankenterm_pty_guardian::GuardianDurableSuccessorCustodyV1::open_existing(
+                    &self.token_path,
+                    context.scope(),
+                )
+                .map_err(|_| {
+                    GuardianClientError::Setup(
+                        frankenterm_pty_guardian::GuardianServiceError::OutputInitialization,
+                    )
+                })?;
+            if custody.context() != context {
+                return Err(GuardianClientError::Setup(
+                    frankenterm_pty_guardian::GuardianServiceError::OutputInitialization,
+                ));
+            }
+            return GuardianClient::connect_for_successor_rotation(
+                &self.socket_path,
+                &self.token_path,
+                self.identity.mux_incarnation(),
+            )?
+            .claim_mux_successor(custody, self.request_id, self.effect_id);
+        }
         if let Some(scope) = self.spawn_custody.filter(|_| self.observed_generation == 1) {
             let custody = GuardianDurableSpawnCustodyV1::open_existing(&self.token_path, scope)
                 .map_err(|_| {
@@ -4557,6 +4582,7 @@ pub struct GuardianProxyLeasePlan {
     census: Arc<GuardianCensusCoordinator>,
     client: GuardianClient,
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    successor_custody: Option<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>,
     build_authenticated: bool,
     selected_checkpoint: Option<SelectedRecoveryCheckpoint>,
 }
@@ -4573,9 +4599,8 @@ impl fmt::Debug for GuardianProxyLeasePlan {
 }
 
 impl GuardianProxyLeasePlan {
-    /// Prepare the first successor from validated image provenance. This only
-    /// reopens existing private custody; it neither claims nor publishes a pane.
-    /// Later generations require a separate successor-custody protocol.
+    /// Prepare the exact next successor from validated image provenance.
+    /// This only reopens existing custody; it neither claims nor publishes.
     pub fn prepare_from_recovery(
         socket_path: &Path,
         token_path: &Path,
@@ -4649,22 +4674,21 @@ impl GuardianProxyLeasePlan {
             spawn_effect_id,
             current_mux_incarnation,
             current_lease_generation,
+            acknowledged_successor,
         } = &pane.spawn_custody
         else {
             return Err(GuardianProxyError::InvalidConfiguration(
                 "legacy pane has no original guardian custody",
             ));
         };
-        if *current_lease_generation != 1
-            // ubs:ignore[rust.security.constant-time-compare] — Lease generations are public custody metadata, not secrets; the selected image is already authenticated.
-            || *current_lease_generation != selected.generation
+        if *current_lease_generation != selected.generation
             // ubs:ignore[rust.security.constant-time-compare] — Pane UUIDs are public custody identities, not secret authentication material.
             || *pane_id != selected.pane_id
-            || current_mux_incarnation != original_mux_incarnation
+            || (*current_lease_generation == 1 && current_mux_incarnation != original_mux_incarnation)
             || *current_mux_incarnation == census.mux_incarnation()
         {
             return Err(GuardianProxyError::InvalidConfiguration(
-                "original custody supports only first successor generation",
+                "selected custody differs from checkpoint generation or current owner",
             ));
         }
         let scope = GuardianSpawnCustodyScopeV1 {
@@ -4683,8 +4707,40 @@ impl GuardianProxyLeasePlan {
                     "original guardian custody is missing or unauthenticated",
                 )
             })?;
+        let successor = if *current_lease_generation > 1 {
+            let expected: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 =
+                acknowledged_successor
+                    .ok_or(GuardianProxyError::InvalidConfiguration(
+                        "successor image has no acknowledged custody selector",
+                    ))?
+                    .into();
+            if expected.broker_incarnation != custody.context().broker_incarnation {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "successor custody broker lineage mismatch",
+                ));
+            }
+            let actual =
+                frankenterm_pty_guardian::GuardianDurableSuccessorCustodyV1::open_existing(
+                    token_path,
+                    expected.scope(),
+                )
+                .map_err(|_| {
+                    GuardianProxyError::InvalidConfiguration(
+                        "successor custody is missing or unauthenticated",
+                    )
+                })?;
+            if actual.context() != expected {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "successor custody ACK or connection differs",
+                ));
+            }
+            Some(expected)
+        } else {
+            None
+        };
         let mut plan = Self::prepare_with_build(socket_path, token_path, size, census, true)?
             .with_spawn_custody(custody)?;
+        plan.successor_custody = successor;
         plan.selected_checkpoint = Some(selected);
         Ok(plan)
     }
@@ -4728,6 +4784,7 @@ impl GuardianProxyLeasePlan {
             census,
             client,
             spawn_custody: None,
+            successor_custody: None,
             build_authenticated,
             selected_checkpoint: None,
         })
@@ -4773,7 +4830,10 @@ impl GuardianProxyLeasePlan {
     ) -> Result<GuardianProxyStaging, GuardianProxyError> {
         if let Some(scope) = self.spawn_custody {
             let initial = scope.mux_incarnation == self.client.mux_incarnation();
-            if scope.pane_id != pane_id || observed_generation != u64::from(!initial) {
+            let expected_generation = self
+                .successor_custody
+                .map_or(u64::from(!initial), |c| c.lease_generation);
+            if scope.pane_id != pane_id || observed_generation != expected_generation {
                 return Err(GuardianProxyError::InvalidConfiguration(
                     "custody does not match initial birth or first successor claim",
                 ));
@@ -4811,6 +4871,7 @@ impl GuardianProxyLeasePlan {
             census,
             client,
             spawn_custody,
+            successor_custody,
             build_authenticated: _,
             selected_checkpoint,
         } = self;
@@ -4823,6 +4884,7 @@ impl GuardianProxyLeasePlan {
             effect_id,
             size,
             spawn_custody,
+            successor_custody,
         });
         let started = Instant::now();
         let mut attempts = 0_u32;
@@ -4871,6 +4933,7 @@ impl GuardianProxyLeasePlan {
                 }
             }
         };
+        let acknowledged = claimed_lease.acknowledged_successor_claim();
         let mut staging = GuardianProxyStaging::from_planned_lease(
             &socket_path,
             &token_path,
@@ -4881,6 +4944,18 @@ impl GuardianProxyLeasePlan {
             census,
         )?;
         staging.spawn_custody = spawn_custody;
+        if let Some(acknowledged) = acknowledged {
+            staging.successor_custody = Some(
+                acknowledged
+                    .reopen(
+                        &token_path,
+                        spawn_custody.ok_or(GuardianProxyError::InvalidConfiguration(
+                            "successor requires original lineage",
+                        ))?,
+                    )
+                    .map_err(map_replay_client_error)?,
+            );
+        }
         staging.selected_checkpoint = selected_checkpoint;
         Ok(staging)
     }
@@ -4915,6 +4990,7 @@ impl GuardianProxyLeasePlan {
             census,
             client,
             spawn_custody,
+            successor_custody,
             build_authenticated: _,
             selected_checkpoint,
         } = self;
@@ -4931,6 +5007,7 @@ impl GuardianProxyLeasePlan {
             census,
         )?;
         staging.spawn_custody = spawn_custody;
+        staging.successor_custody = successor_custody;
         staging.selected_checkpoint = selected_checkpoint;
         Ok(staging)
     }
@@ -4944,6 +5021,7 @@ impl GuardianProxyLeasePlan {
 /// reader before any caller can construct a pane.
 pub struct GuardianProxyStaging {
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    successor_custody: Option<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>,
     selected_checkpoint: Option<SelectedRecoveryCheckpoint>,
     actor: SharedGuardianPaneLeaseActor,
     census: Arc<GuardianCensusCoordinator>,
@@ -5198,6 +5276,7 @@ impl GuardianProxyStaging {
             census,
             reader_slot: Arc::new(GuardianReplayReaderSlot::new()),
             spawn_custody: None,
+            successor_custody: None,
             selected_checkpoint: None,
             replay_transport: None,
             checkpoint_publisher,
@@ -5279,6 +5358,7 @@ impl GuardianProxyStaging {
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
             spawn_custody: self.spawn_custody,
+            successor_custody: self.successor_custody,
             terminal,
             restored_prefix: Some(restored_prefix),
             process: Box::new(GuardianProxyChild {
@@ -5322,6 +5402,7 @@ impl GuardianProxyStaging {
         let actor = Arc::clone(&self.actor);
         TestActivatedGuardianProxy {
             spawn_custody: self.spawn_custody,
+            successor_custody: self.successor_custody,
             terminal,
             restored_prefix: None,
             process: Box::new(GuardianProxyChild {
@@ -5351,6 +5432,7 @@ impl GuardianProxyStaging {
 /// caller deliberately constructs and registers a [`LocalPane`].
 pub struct ActivatedGuardianProxy {
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
+    successor_custody: Option<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>,
     terminal: Terminal,
     restored_prefix: Option<GuardianRestoredParserPrefix>,
     process: Box<dyn Child + Send>,
@@ -5397,7 +5479,14 @@ impl ActivatedGuardianProxy {
             self.guardian_checkpoint_publisher
                 .take()
                 .expect("verified guardian activation must retain its checkpoint publisher"),
-            self.spawn_custody,
+            self.spawn_custody.map(|original| {
+                mux::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
+                    original,
+                    current_mux_incarnation: self.lease_identity.mux_incarnation(),
+                    current_lease_generation: self.lease_identity.generation(),
+                    acknowledged_successor: self.successor_custody,
+                }
+            }),
             self.restored_prefix,
         );
         // Construction completed, so the LocalPane's guardian ownership is
@@ -5943,7 +6032,7 @@ mod tests {
                 // The release file is normal cleanup. This approximately
                 // 120-second emergency fuse is separate from the unchanged
                 // five-second phase assertions, not an accepted latency bound.
-                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; echo $$ >>\"$FT_PID\"; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_POST_REGISTRATION\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_REGISTRATION\"; then printf guardian-domain-post-registration-marker; fi; while test ! -e \"$FT_POST_SUCCESSOR\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_SUCCESSOR\"; then printf guardian-domain-post-successor-marker; fi; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
+                command.args(["-c", "trap 'printf S >>\"$FT_SIGNALED\"; exit 0' HUP TERM; echo $$ >>\"$FT_PID\"; printf B >>\"$FT_BIRTHS\"; printf guardian-domain-marker; n=0; while test ! -e \"$FT_POST_REGISTRATION\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_REGISTRATION\"; then printf guardian-domain-post-registration-marker; fi; while test ! -e \"$FT_POST_SUCCESSOR\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_SUCCESSOR\"; then printf guardian-domain-post-successor-marker; fi; while test ! -e \"$FT_POST_SECOND_SUCCESSOR\" && test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; if test -e \"$FT_POST_SECOND_SUCCESSOR\"; then printf guardian-domain-second-successor-marker; fi; while test ! -e \"$FT_RELEASE\" && test $n -lt 2400; do sleep 0.05; n=$((n+1)); done; printf D >>\"$FT_FINISHED\""]);
                 command.env("FT_PID", &child_pid_path);
                 command.env("FT_BIRTHS", &births);
                 command.env("FT_SIGNALED", &signaled);
@@ -5951,6 +6040,10 @@ mod tests {
                 command.env("FT_FINISHED", &finished);
                 command.env("FT_POST_REGISTRATION", &post_registration);
                 command.env("FT_POST_SUCCESSOR", &post_successor);
+                command.env(
+                    "FT_POST_SECOND_SUCCESSOR",
+                    directory.join("post-second-successor"),
+                );
                 command
             };
             let size = TerminalSize {
@@ -7735,6 +7828,12 @@ mod tests {
             .guardian_spawn_custody()
             .expect("successor pane retains authenticated custody");
         assert_eq!(gen2_provenance.original, provenance.original);
+        let gen2_selector = gen2_provenance
+            .acknowledged_successor
+            .expect("successful Claim retained its acknowledged successor custody");
+        assert_eq!(gen2_selector.ack_id, claim_request_id);
+        assert_eq!(gen2_selector.handoff_id, claim_effect_id);
+        assert_eq!(gen2_selector.lease_generation, 2);
         assert_eq!(gen2_provenance.current_lease_generation, 2);
         assert_eq!(
             gen2_provenance.current_mux_incarnation,
@@ -7937,6 +8036,52 @@ mod tests {
             WholeMuxTrustedIdentityConfig::new([0x72; 32]),
         )
         .with_existing_guardian_custody(token.to_path_buf());
+
+        // Re-encryption and a recomputed image digest cannot turn an arbitrary
+        // selector into acknowledged custody. No failed candidate changes roots.
+        for control in 0..7 {
+            let mut changed = gen2_image.clone();
+            let frankenterm_core::mux_recovery_image::RecoverySpawnCustody::Original {
+                acknowledged_successor: Some(c),
+                ..
+            } = &mut changed.panes[0].spawn_custody
+            else {
+                panic!("gen2 custody selector");
+            };
+            match control {
+                0 => c.ack_id = Uuid::new_v4(),
+                1 => c.handoff_id = Uuid::new_v4(),
+                2 => c.successor.connection_id = Uuid::new_v4(),
+                3 => c.pane_id = Uuid::new_v4(),
+                4 => c.lease_generation += 1,
+                5 => c.successor.mux_build[0] ^= 1,
+                _ => c.predecessor.connection_id = Uuid::new_v4(),
+            }
+            changed.image_digest = changed.compute_digest().unwrap();
+            let root = GenerationRootPublishRequest {
+                generation: 2,
+                publisher_id: "altered-successor-selector".into(),
+                predecessor: Some(PredecessorBinding {
+                    expected_generation: root_receipt.generation,
+                    expected_hash: root_receipt.sha256.clone(),
+                }),
+                manifest_bytes: encode_gen2(
+                    &serde_json::to_vec(&changed).unwrap(),
+                    [0x72; 32],
+                    RecoveryObjectKind::WholeMuxImage,
+                    Some(1),
+                ),
+                created_at_ms: gen2_timestamp,
+            };
+            assert!(
+                matches!(
+                    store.publish_generation_root(&root, &authorized_verifier),
+                    Err(PublicationError::VerificationRejected { generation: 2, .. })
+                ),
+                "altered successor selector control {control} must fail encrypted reopen"
+            );
+            assert_eq!(store.inspect_root_candidates().unwrap().0.len(), 1);
+        }
 
         // Negative control 1: mismatched predecessor generation in manifest must be rejected by authorized verifier
         let bad_predecessor_root = GenerationRootPublishRequest {
@@ -8438,7 +8583,232 @@ mod tests {
             "terminal mutation advanced semantic generation; bound capture witness must be rejected"
         );
 
-        (successor_mux, successor_pane)
+        // Restore the independently reopened generation-2 image into a third
+        // mux. Its selector must reach the negotiated successor Claim path.
+        let third_mux = Arc::new(Mux::new(None));
+        let (third_session, _) = third_mux.topology_snapshot_authority().unwrap();
+        let third_incarnation = Uuid::from_bytes(third_session.as_bytes());
+        let third_census = Arc::new(
+            GuardianCensusCoordinator::connect(
+                socket,
+                token,
+                provenance.original.guardian_incarnation,
+                third_incarnation,
+            )
+            .unwrap(),
+        );
+        let prepare_third = || {
+            GuardianProxyLeasePlan::prepare_from_recovery(
+                socket,
+                token,
+                PtySize {
+                    rows: size.rows as u16,
+                    cols: size.cols as u16,
+                    pixel_width: size.pixel_width as u16,
+                    pixel_height: size.pixel_height as u16,
+                },
+                Arc::clone(&third_census),
+                &validated_gen2,
+                provenance.original.pane_id,
+            )
+            .unwrap()
+        };
+        assert!(
+            matches!(
+                prepare_third().claim(
+                    provenance.original.pane_id,
+                    2,
+                    Uuid::new_v4(),
+                    Uuid::new_v4()
+                ),
+                Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                    GuardianRejectionCode::InvalidRequest
+                )))
+            ),
+            "selected successor custody must not displace a living mux owner"
+        );
+
+        assert!(successor_registration.detach_local_if_current());
+        drop(successor_registration);
+        drop(bound_successor_registration);
+        assert!(successor_mux.remove_tab_local_only_if_same(&successor_tab));
+        assert!(successor_mux.domain_was_detached_if_guard(&registered_successor_domain));
+        drop(successor_tab);
+        drop(successor_pane);
+        drop(successor_coordinator);
+        drop(successor_observer);
+        drop(registered_successor_domain);
+        drop(successor_domain);
+        while executor.try_tick().unwrap() {}
+
+        let third_request = Uuid::new_v4();
+        let third_handoff = Uuid::new_v4();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let third_staging = loop {
+            while executor.try_tick().unwrap() {}
+            match prepare_third().claim(
+                provenance.original.pane_id,
+                2,
+                third_request,
+                third_handoff,
+            ) {
+                Ok(staging) => break staging,
+                Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                    GuardianRejectionCode::InvalidRequest,
+                ))) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                Err(error) => panic!("second image-backed successor Claim failed: {error}"),
+            }
+        };
+        let third_domain: Arc<dyn Domain> = Arc::new(
+            GuardianDomain::new(&third_mux, socket.to_path_buf(), token.to_path_buf()).unwrap(),
+        );
+        third_mux.add_domain(&third_domain).unwrap();
+        third_mux.set_default_domain(&third_domain).unwrap();
+        let third_pane_id = alloc_pane_id().unwrap();
+        let description = "second image-backed successor".to_owned();
+        let third_config: Arc<dyn TerminalConfiguration> =
+            Arc::new(config::TermConfig::new_for_pane(
+                third_pane_id,
+                third_domain.domain_id(),
+                *provenance.original.pane_id.as_bytes(),
+                description.clone(),
+            ));
+        let third_pane = mux::domain::UnpublishedPane::from_guardian_proxy(
+            third_staging
+                .restore_and_activate(third_config, TerminalCheckpointLimits::default())
+                .unwrap()
+                .into_local_pane(third_pane_id, third_domain.domain_id(), description),
+        )
+        .unwrap()
+        .publish(&third_mux)
+        .unwrap();
+        let third_tab = Arc::new(mux::tab::Tab::new(&size));
+        third_tab.assign_pane(&third_pane);
+        third_mux.add_tab_and_active_pane(&third_tab).unwrap();
+        let window = third_mux.new_empty_window(None, None);
+        third_mux.add_tab_to_window(&third_tab, *window).unwrap();
+        drop(window);
+        let third_provenance = third_pane.guardian_spawn_custody().unwrap();
+        assert_eq!(third_provenance.original, provenance.original);
+        assert_eq!(third_provenance.current_lease_generation, 3);
+        let third_selector = third_provenance.acknowledged_successor.unwrap();
+        assert_eq!(third_selector.ack_id, third_request);
+        assert_eq!(third_selector.handoff_id, third_handoff);
+        assert_eq!(third_selector.predecessor, gen2_selector.successor);
+        assert_eq!(std::fs::read(&births).unwrap(), b"B");
+        assert!(!signaled.exists());
+        assert!(is_child_alive(original_pid));
+
+        std::fs::write(directory.join("post-second-successor"), b"step").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            let (_, lines) = third_pane.get_lines(0..24);
+            let text: String = lines.iter().map(|line| line.as_str().to_string()).collect();
+            if text.contains("guardian-domain-second-successor-marker") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second successor did not render fresh original-child output"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let gen3_published = capture_real_guardian_checkpoint(&third_mux, third_pane_id, executor);
+        let gen3_captured = third_mux
+            .capture_topology_coherent(Default::default())
+            .unwrap();
+        assert_eq!(
+            gen3_captured.pane_bindings[0].spawn_custody,
+            Some(third_provenance)
+        );
+        let gen3_identity = WholeMuxPublicationIdentity {
+            generation: 3,
+            session_id: "real-guardian-birth".into(),
+            mux_incarnation_id: hex::encode(third_session.as_bytes()),
+            root_object_id: [0x72; 32],
+            publisher_id: "second-successor-claim".into(),
+            ft_version: config::wezterm_version().to_owned(),
+            predecessor: Some(PredecessorBinding {
+                expected_generation: 2,
+                expected_hash: gen2_root_receipt.sha256,
+            }),
+            predecessor_image_digest: Some(gen2_image.image_digest),
+            existing_guardian_custody: Some(token.to_path_buf()),
+        };
+        frankenterm_core::snapshot_engine::publish_whole_mux_recovery(
+            &frankenterm_core::cx::for_testing(),
+            &store,
+            &gen3_captured,
+            &[
+                frankenterm_core::snapshot_engine::WholeMuxPanePublication::guardian(
+                    third_pane_id,
+                    "real-guardian-terminal-gen3",
+                    &gen3_published,
+                ),
+            ],
+            Arc::clone(&key),
+            &gen3_identity,
+        )
+        .unwrap();
+        let reopened = store
+            .select_verified_roots(&authorized_verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        assert_eq!(reopened.generation(), 3);
+        assert_eq!(
+            reopened.image().panes[0].spawn_custody,
+            frankenterm_core::mux_recovery_image::RecoverySpawnCustody::from(Some(
+                third_provenance
+            ))
+        );
+        let child_log_path = directory.join("fresh-image-verifier-gen3.stdout");
+        let child_log = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&child_log_path)
+            .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "guardian_proxy::tests::guardian_image_fresh_process_existing_custody",
+                "--nocapture",
+            ])
+            .env("FT_TEST_IMAGE_REOPEN_ROOT", directory.join("whole-image"))
+            .env("FT_TEST_IMAGE_REOPEN_TOKEN", token)
+            .env("FT_TEST_IMAGE_EXPECTED_GENERATION", "3")
+            .env(
+                "FT_TEST_IMAGE_EXPECTED_MARKER",
+                "guardian-domain-second-successor-marker",
+            )
+            .env_remove("FT_TEST_IMAGE_REOPEN_SCOPE")
+            .env_remove("FT_TEST_IMAGE_REOPEN_CHECKPOINT")
+            .stdout(child_log)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "fresh process rejected generation 3 custody/image"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("settle owned image verifier child");
+                child.wait().unwrap();
+                panic!("fresh generation 3 verifier deadline expired");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let child_log = std::fs::read_to_string(child_log_path).unwrap();
+        assert!(
+            child_log.contains("running 1 test") && child_log.contains("1 passed; 0 failed"),
+            "fresh generation 3 verifier did not execute its test: {child_log}"
+        );
+        (third_mux, third_pane)
     }
 
     #[test]

@@ -6924,6 +6924,7 @@ impl WholeMuxRecoveryVerifier {
             original_mux_build,
             pane_id,
             spawn_effect_id,
+            acknowledged_successor,
             ..
         } = &pane.spawn_custody
         else {
@@ -6939,8 +6940,28 @@ impl WholeMuxRecoveryVerifier {
             pane_id: *pane_id,
             effect_id: *spawn_effect_id,
         };
-        frankenterm_pty_guardian::GuardianDurableSpawnCustodyV1::open_existing(token_path, scope)
-            .and_then(|custody| custody.reopen_checkpoint(selector))
+        let custody = frankenterm_pty_guardian::GuardianDurableSpawnCustodyV1::open_existing(
+            token_path, scope,
+        )
+        .map_err(|_| fail())?;
+        if let Some(expected) = acknowledged_successor {
+            let expected: mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1 =
+                (*expected).into();
+            if expected.broker_incarnation != custody.context().broker_incarnation {
+                return Err(fail());
+            }
+            let successor =
+                frankenterm_pty_guardian::GuardianDurableSuccessorCustodyV1::open_existing(
+                    token_path,
+                    expected.scope(),
+                )
+                .map_err(|_| fail())?;
+            if successor.context() != expected {
+                return Err(fail());
+            }
+        }
+        custody
+            .reopen_checkpoint(selector)
             .map(Some)
             .map_err(|_| fail())
     }
@@ -7336,6 +7357,48 @@ impl WholeMuxRecoveryVerifier {
                 } => {
                     #[cfg(feature = "frankenterm-deps")]
                     {
+                        #[cfg(not(unix))]
+                        if matches!(
+                            &pane.spawn_custody,
+                            crate::mux_recovery_image::RecoverySpawnCustody::Original {
+                                acknowledged_successor: Some(_),
+                                ..
+                            }
+                        ) {
+                            return Err(WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                pane_id: pane.pane_id as u64,
+                                reason:
+                                    "successor custody verification requires local guardian support"
+                                        .to_owned(),
+                            });
+                        }
+                        #[cfg(unix)]
+                        if matches!(
+                            &pane.spawn_custody,
+                            crate::mux_recovery_image::RecoverySpawnCustody::Original {
+                                acknowledged_successor: Some(_),
+                                ..
+                            }
+                        ) {
+                            self.reopen_manifest_guardian_capture(
+                                pane,
+                                frankenterm_pty_guardian::GuardianCheckpointAdoptionSelectorV1 {
+                                    checkpoint_id: publication.checkpoint_identity,
+                                    capturing_mux_incarnation: publication.mux_incarnation,
+                                    capture_generation: *guardian_generation,
+                                    adoption_effect_id: publication.effect_id,
+                                    adoption_sequence: *catalog_generation,
+                                },
+                            )?
+                            .ok_or_else(|| {
+                                WholeMuxRecoveryError::UnprovedGuardianAuthority {
+                                    pane_id: pane.pane_id as u64,
+                                    reason:
+                                        "successor selector requires existing encrypted custody"
+                                            .to_owned(),
+                                }
+                            })?;
+                        }
                         let pane_uuid = uuid::Uuid::parse_str(&pane.pane_uuid).ok();
                         if let Some(witness) =
                             pane_uuid.and_then(|id| self.published_guardian_captures.get(&id))
@@ -7406,6 +7469,10 @@ impl WholeMuxRecoveryVerifier {
                                         original: scope,
                                         current_mux_incarnation: witness.capturing_mux_incarnation(),
                                         current_lease_generation: witness.generation(),
+                                        acknowledged_successor: match &pane.spawn_custody {
+                                            crate::mux_recovery_image::RecoverySpawnCustody::Original { acknowledged_successor, .. } => acknowledged_successor.map(Into::into),
+                                            _ => None,
+                                        },
                                     },
                                 ));
                                 if pane.spawn_custody != expected_provenance

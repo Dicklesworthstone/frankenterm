@@ -334,7 +334,7 @@ enum GuardianLeaseDisposition {
 
 struct GuardianPaneOwnership {
     identity: GuardianPaneLeaseIdentity,
-    spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
+    spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>,
     control: Arc<dyn GuardianPaneLeaseControl>,
     disposition: Mutex<GuardianLeaseDisposition>,
 }
@@ -389,7 +389,7 @@ impl LocalPaneOwnership {
     fn guardian(
         identity: GuardianPaneLeaseIdentity,
         control: Arc<dyn GuardianPaneLeaseControl>,
-        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
+        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>,
     ) -> Self {
         Self::Guardian(Box::new(GuardianPaneOwnership {
             identity,
@@ -1337,13 +1337,7 @@ impl Pane for LocalPane {
         &self,
     ) -> Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1> {
         match &self.ownership {
-            LocalPaneOwnership::Guardian(owner) => owner.spawn_custody.map(|original| {
-                crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1 {
-                    original,
-                    current_mux_incarnation: owner.identity.mux_incarnation(),
-                    current_lease_generation: owner.identity.generation(),
-                }
-            }),
+            LocalPaneOwnership::Guardian(owner) => owner.spawn_custody,
             _ => None,
         }
     }
@@ -4796,7 +4790,7 @@ impl LocalPane {
         command_description: String,
         guardian_live_output_reader: Box<dyn GuardianLiveOutputReader>,
         guardian_checkpoint_publisher: Arc<dyn GuardianLiveCheckpointPublisher>,
-        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCustodyScopeV1>,
+        spawn_custody: Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1>,
         restored_prefix: Option<crate::guardian_checkpoint::GuardianRestoredParserPrefix>,
     ) -> Self {
         let mut pane = Self::new_with_ownership(
@@ -4830,13 +4824,26 @@ impl LocalPane {
         {
             anyhow::bail!("unpublished guardian pane has incomplete or consumed authority");
         }
-        if let Some(scope) = ownership.spawn_custody {
-            if scope.pane_id != ownership.identity.pane_id()
-                || scope.guardian_incarnation != ownership.identity.guardian_incarnation()
-                || (ownership.identity.generation() == 1
-                    && scope.mux_incarnation != ownership.identity.mux_incarnation())
-            {
-                anyhow::bail!("guardian birth provenance does not match live lease");
+        if let Some(provenance) = ownership.spawn_custody {
+            let identity = ownership.identity;
+            anyhow::ensure!(
+                provenance.original.guardian_incarnation == identity.guardian_incarnation
+                    && provenance.original.pane_id == identity.pane_id
+                    && provenance.current_mux_incarnation == identity.mux_incarnation
+                    && provenance.current_lease_generation == identity.generation
+                    && (identity.generation != 1
+                        || provenance.original.mux_incarnation == identity.mux_incarnation),
+                "guardian capture provenance differs from lease identity"
+            );
+            if let Some(successor) = provenance.acknowledged_successor {
+                anyhow::ensure!(
+                    successor.pane_id == identity.pane_id
+                        && successor.successor.guardian_incarnation
+                            == identity.guardian_incarnation
+                        && successor.successor.mux_incarnation == identity.mux_incarnation
+                        && successor.lease_generation == identity.generation,
+                    "guardian successor provenance differs from lease identity"
+                );
             }
         }
         Ok(())
@@ -8059,6 +8066,51 @@ mod tests {
             1,
             "native guard still explicitly kills before releasing its Arc"
         );
+    }
+
+    #[test]
+    fn guardian_publication_rejects_captured_owner_mismatch() {
+        use crate::guardian_checkpoint::{
+            GuardianSpawnCaptureProvenanceV1, GuardianSpawnCustodyScopeV1,
+        };
+        let identity = guardian_lifetime_test_identity(1);
+        let control = Arc::new(FencedGuardianLeaseControl::new(identity));
+        let mut pane =
+            guardian_lifetime_test_pane(725, identity, control, Arc::new(AtomicUsize::new(0)));
+        let provenance = GuardianSpawnCaptureProvenanceV1 {
+            original: GuardianSpawnCustodyScopeV1 {
+                broker_lineage: Uuid::from_u128(1),
+                guardian_incarnation: identity.guardian_incarnation(),
+                mux_incarnation: identity.mux_incarnation(),
+                broker_build: [1; 32],
+                guardian_build: [2; 32],
+                mux_build: [3; 32],
+                pane_id: identity.pane_id(),
+                effect_id: Uuid::from_u128(2),
+            },
+            current_mux_incarnation: identity.mux_incarnation(),
+            current_lease_generation: 1,
+            acknowledged_successor: None,
+        };
+        for wrong_generation in [false, true] {
+            let mut wrong = provenance;
+            if wrong_generation {
+                wrong.current_lease_generation = 2;
+            } else {
+                wrong.current_mux_incarnation = Uuid::new_v4();
+            }
+            let LocalPaneOwnership::Guardian(owner) = &mut pane.ownership else {
+                unreachable!()
+            };
+            owner.spawn_custody = Some(wrong);
+            assert!(pane.validate_unpublished_guardian_proxy().is_err());
+        }
+        let LocalPaneOwnership::Guardian(owner) = &mut pane.ownership else {
+            unreachable!()
+        };
+        owner.spawn_custody = Some(provenance);
+        pane.validate_unpublished_guardian_proxy().unwrap();
+        assert_eq!(pane.guardian_spawn_custody(), Some(provenance));
     }
 
     #[test]
