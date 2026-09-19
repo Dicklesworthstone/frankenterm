@@ -336,6 +336,34 @@ impl WindowEventSender {
 #[error("Graphics drivers lost context")]
 pub struct GraphicsDriversLostContext {}
 
+/// Native effects produced while handling one already admitted notification.
+/// At most one latest title and one repaint request are retained.
+#[derive(Default)]
+pub struct AdmittedWindowActions {
+    repaint: std::sync::atomic::AtomicBool,
+    title: std::sync::Mutex<Option<String>>,
+}
+
+impl AdmittedWindowActions {
+    pub fn request_repaint(&self) {
+        self.repaint
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_title(&self, title: String) {
+        *self.title.lock().unwrap_or_else(|p| p.into_inner()) = Some(title);
+    }
+
+    /// Called synchronously by the native backend before completing its task.
+    pub fn apply(&self, apply: impl FnOnce(Option<String>, bool)) {
+        let title = self.title.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let repaint = self
+            .repaint
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        apply(title, repaint);
+    }
+}
+
 #[async_trait(?Send)]
 pub trait WindowOps {
     /// Show a hidden window
@@ -348,14 +376,14 @@ pub trait WindowOps {
     /// Deliver a notification using capacity already owned by its producer.
     /// The exact scheduler generation and service class survive the handoff;
     /// this must never perform another fallible scheduler admission.
-    /// If the handler sets `repaint`, request a natively paced repaint before
+    /// Apply the handler's native title and paced repaint effects before
     /// completing the returned task. Awaiting that task includes both handler
-    /// execution and the repaint request, not presentation of the frame.
+    /// execution and native effects, not presentation of the frame.
     fn notify_with_reservation<T: Any + Send + Sync>(
         &self,
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
-        repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        actions: Option<std::sync::Arc<AdmittedWindowActions>>,
     ) -> promise::spawn::MainThreadSpawnedTask<()>
     where
         Self: Sized;

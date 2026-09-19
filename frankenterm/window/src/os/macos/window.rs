@@ -855,7 +855,7 @@ impl WindowOps for Window {
         &self,
         t: T,
         reservation: promise::spawn::MainThreadSpawnReservation,
-        repaint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        actions: Option<std::sync::Arc<crate::AdmittedWindowActions>>,
     ) -> promise::spawn::MainThreadSpawnedTask<()> {
         Connection::with_window_inner_reserved(self.id, reservation, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
@@ -865,8 +865,15 @@ impl WindowOps for Window {
                     .events
                     .dispatch(WindowEvent::Notification(Box::new(t)));
             }
-            if repaint.is_some_and(|request| request.load(std::sync::atomic::Ordering::Acquire)) {
-                inner.invalidate();
+            if let Some(actions) = actions {
+                actions.apply(|title, repaint| {
+                    if let Some(title) = title {
+                        inner.set_title(&title);
+                    }
+                    if repaint {
+                        inner.invalidate();
+                    }
+                });
             }
         })
     }

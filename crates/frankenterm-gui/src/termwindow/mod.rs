@@ -365,13 +365,14 @@ pub enum TermWindowNotif {
         mux_window_id: MuxWindowId,
         interest: [u64; OUTPUT_INTEREST_WORDS],
         title_refresh: Option<PendingMuxTitleRefresh>,
-        repaint: Arc<AtomicBool>,
+        reconcile: bool,
+        actions: Arc<window::AdmittedWindowActions>,
     },
     RenderWake {
         ticket: RenderWakeTicket,
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
-        repaint: Arc<AtomicBool>,
+        actions: Arc<window::AdmittedWindowActions>,
     },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
@@ -4253,7 +4254,7 @@ impl TermWindow {
                 ticket,
                 mux_owner,
                 mux_window_id,
-                repaint,
+                actions,
             } => {
                 let Some(owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -4266,11 +4267,11 @@ impl TermWindow {
                 match self.render_wake_state.dispatch(ticket) {
                     RenderWakeDispatch::Fired(RenderWakeReason::Retry(_)) => {
                         if self.render_recovery_state.mark_retry_ready(ticket) {
-                            repaint.store(true, Ordering::Release);
+                            actions.request_repaint();
                         }
                     }
                     RenderWakeDispatch::Fired(RenderWakeReason::Animation) => {
-                        repaint.store(true, Ordering::Release);
+                        actions.request_repaint();
                     }
                     RenderWakeDispatch::Stale => {}
                 }
@@ -4280,7 +4281,8 @@ impl TermWindow {
                 mux_window_id,
                 interest,
                 title_refresh,
-                repaint,
+                reconcile,
+                actions,
             } => {
                 let Some(owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -4290,18 +4292,25 @@ impl TermWindow {
                 {
                     return Ok(());
                 }
+                if reconcile {
+                    self.prune_tab_state_to_live_window();
+                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                    actions.request_repaint();
+                }
                 if let Some(title_refresh) = title_refresh {
                     // Release the single-flight bit before reading live state;
                     // output during this refresh can retain a successor ticket.
                     title_refresh.begin_refresh();
-                    self.update_title_post_status();
+                    self.update_title_impl(Some(&actions));
                     // A title/progress-only refresh can change the tab bar
                     // without any pane output. Retain its native repaint under
                     // this admission before the visibility check returns.
-                    repaint.store(true, Ordering::Release);
+                    actions.request_repaint();
                 }
-                self.record_idle_event(idle_detector::IdleEvent::PtyData);
-                metrics::histogram!("mux.pane_output_event.rate").record(1.);
+                if interest.iter().any(|word| *word != 0) {
+                    self.record_idle_event(idle_detector::IdleEvent::PtyData);
+                    metrics::histogram!("mux.pane_output_event.rate").record(1.);
+                }
                 if !self
                     .get_panes_to_render()
                     .iter()
@@ -4319,7 +4328,7 @@ impl TermWindow {
                 }
                 // The backend invalidates under this same admission after the
                 // callback, preserving its native frame pacing.
-                repaint.store(true, Ordering::Release);
+                actions.request_repaint();
             }
             TermWindowNotif::MuxNotification {
                 notification: n,
@@ -4952,6 +4961,15 @@ impl TermWindow {
         }
     }
 
+    fn mux_notification_reconciles_window(n: &MuxNotification, window_id: MuxWindowId) -> bool {
+        matches!(
+            n,
+            MuxNotification::WindowInvalidated(_)
+                | MuxNotification::WindowOrderChanged { .. }
+                | MuxNotification::FloatingPaneSpawnCommitted(_)
+        ) && Self::mux_notification_targets_window(n, window_id)
+    }
+
     fn mux_notification_only_refreshes_title(n: &MuxNotification) -> bool {
         matches!(
             n,
@@ -5144,6 +5162,8 @@ impl TermWindow {
         let pending_title_refresh = Arc::new(AtomicBool::new(false));
         let retained_title_refresh = Arc::new(Mutex::new(None));
         let callback_title_refresh = Arc::clone(&retained_title_refresh);
+        let pending_reconciliation = Arc::new(AtomicBool::new(false));
+        let callback_reconciliation = Arc::clone(&pending_reconciliation);
         // Reserve retry ownership before accepting the subscription. The
         // capacity-one channel stores only a level-triggered output bit;
         // structural notifications retain their existing ordered path below.
@@ -5209,13 +5229,17 @@ impl TermWindow {
                     callback_output_interest.record(*pane_id);
                     return !matches!(output_tx.try_send(()), Err(TrySendError::Disconnected(_)));
                 }
-                if Self::mux_notification_only_refreshes_title(&n) {
-                    let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) else {
+                let reconcile = Self::mux_notification_reconciles_window(&n, mux_window_id);
+                if reconcile {
+                    callback_reconciliation.store(true, Ordering::Release);
+                }
+                if reconcile || Self::mux_notification_only_refreshes_title(&n) {
+                    if let Some(ticket) = PendingMuxTitleRefresh::acquire(&pending_title_refresh) {
+                        *callback_title_refresh.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(ticket);
+                    } else {
                         metrics::counter!("gui.mux_title_refresh.coalesced").increment(1);
-                        return true;
-                    };
-                    *callback_title_refresh.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(ticket);
+                    }
                     // Title/status notifications describe current state, so
                     // share the retained output wake instead of risking a
                     // permanent unsubscribe at a second initial admission.
@@ -5291,20 +5315,21 @@ impl TermWindow {
                         let mux_window_id = *output_mux_window_id
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let repaint = Arc::new(AtomicBool::new(false));
+                        let actions = Arc::new(window::AdmittedWindowActions::default());
                         output_window.notify_with_reservation(
                             TermWindowNotif::MuxOutputRefresh {
                                 mux_owner: output_mux.clone(),
                                 mux_window_id,
                                 interest: output_interest.take(),
+                                reconcile: pending_reconciliation.swap(false, Ordering::AcqRel),
                                 title_refresh: retained_title_refresh
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
                                     .take(),
-                                repaint: Arc::clone(&repaint),
+                                actions: Arc::clone(&actions),
                             },
                             reservation,
-                            Some(repaint),
+                            Some(actions),
                         )
                     },
                 ),
@@ -5325,16 +5350,16 @@ impl TermWindow {
                     let mux_window_id = *render_mux_window_id
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    let repaint = Arc::new(AtomicBool::new(false));
+                    let actions = Arc::new(window::AdmittedWindowActions::default());
                     render_window.notify_with_reservation(
                         TermWindowNotif::RenderWake {
                             ticket,
                             mux_owner: render_mux.clone(),
                             mux_window_id,
-                            repaint: Arc::clone(&repaint),
+                            actions: Arc::clone(&actions),
                         },
                         reservation,
-                        Some(repaint),
+                        Some(actions),
                     )
                 },
             )
@@ -5862,7 +5887,7 @@ impl TermWindow {
     /// to update the right-status.
     fn update_title(&mut self) {
         self.schedule_status_update();
-        self.update_title_impl();
+        self.update_title_impl(None);
     }
 
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {
@@ -5935,10 +5960,10 @@ impl TermWindow {
     /// Called by window:set_right_status after the status has
     /// been updated; let's update the bar
     pub fn update_title_post_status(&mut self) {
-        self.update_title_impl();
+        self.update_title_impl(None);
     }
 
-    fn update_title_impl(&mut self) {
+    fn update_title_impl(&mut self, admitted: Option<&window::AdmittedWindowActions>) {
         let Some(mux) = self.mux_or_log("update window title") else {
             return;
         };
@@ -5994,7 +6019,9 @@ impl TermWindow {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
-            if let Some(window) = self.window.as_ref() {
+            if let Some(actions) = admitted {
+                actions.request_repaint();
+            } else if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
         }
@@ -6060,7 +6087,11 @@ impl TermWindow {
         };
 
         if let Some(window) = self.window.as_ref() {
-            window.set_title(&title);
+            if let Some(actions) = admitted {
+                actions.set_title(title);
+            } else {
+                window.set_title(&title);
+            }
 
             let show_tab_bar = if num_tabs == 1 {
                 self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab
@@ -9608,7 +9639,22 @@ mod tests {
                         title
                             .expect("title refresh must survive saturation")
                             .begin_refresh();
-                        delivered.fetch_add(1, Ordering::AcqRel);
+                        let actions = window::AdmittedWindowActions::default();
+                        actions.set_title("obsolete title".to_string());
+                        actions.set_title("latest title".to_string());
+                        actions.request_repaint();
+                        // The admitted notification occupies the only slot.
+                        // Native title/repaint effects must still complete;
+                        // trying to schedule either effect again would fail.
+                        assert!(matches!(
+                            try_reserve_main_thread(MainThreadServiceClass::Render, 4096),
+                            MainThreadReservationOutcome::RetryableFull(_)
+                        ));
+                        actions.apply(|title, repaint| {
+                            assert_eq!(title.as_deref(), Some("latest title"));
+                            assert!(repaint);
+                            delivered.fetch_add(1, Ordering::AcqRel);
+                        });
                         delivery_released.recv_async().await.unwrap();
                     })
                 },
@@ -9982,6 +10028,40 @@ mod tests {
 
     #[test]
     fn mux_window_prefilter_skips_ignored_events_without_coalescing_side_effects() {
+        let reconciliation = mux::MuxNotification::WindowInvalidated(17);
+        assert!(super::TermWindow::mux_notification_reconciles_window(
+            &reconciliation,
+            17
+        ));
+        assert!(!super::TermWindow::mux_notification_reconciles_window(
+            &reconciliation,
+            18
+        ));
+        // Cleanup and per-event effects must never enter current-state
+        // reconciliation: their authority cannot be replaced by a final view.
+        for notification in [
+            mux::MuxNotification::PaneRemoved(7),
+            mux::MuxNotification::TabAddedToWindow {
+                window_id: 17,
+                tab_id: 7,
+            },
+            mux::MuxNotification::Alert {
+                pane_id: 7,
+                alert: super::Alert::Bell,
+            },
+            mux::MuxNotification::Alert {
+                pane_id: 7,
+                alert: super::Alert::SetUserVar {
+                    name: "key".to_string(),
+                    value: "value".to_string(),
+                },
+            },
+        ] {
+            assert!(!super::TermWindow::mux_notification_reconciles_window(
+                &notification,
+                17
+            ));
+        }
         for window_id in [0, 17, usize::MAX] {
             for notification in [
                 mux::MuxNotification::PaneAdded(7),
