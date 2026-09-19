@@ -3674,8 +3674,13 @@ impl LocalPane {
                         }
                         frankenterm_term::DeferredScrollbackTrim::Settled { moved }
                         | frankenterm_term::DeferredScrollbackTrim::AdmissionBlocked { moved } => {
+                            // A yielded slice may have filled the pending
+                            // queue. Flush that batch immediately: refusal
+                            // before attempting durability is normal capacity
+                            // backpressure, not a failed persistence attempt.
+                            let stalled = needs_flush && !moved;
                             needs_flush = true;
-                            !moved
+                            stalled
                         }
                     }
                 }
@@ -10097,6 +10102,7 @@ mod tests {
         snapshot_probe: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
         deferred: std::sync::atomic::AtomicBool,
         flushed_rows: AtomicUsize,
+        pending_capacity: AtomicUsize,
     }
 
     impl std::fmt::Debug for MuxCheckpointTestSink {
@@ -10120,6 +10126,7 @@ mod tests {
                 snapshot_probe: std::sync::Mutex::new(None),
                 deferred: std::sync::atomic::AtomicBool::new(false),
                 flushed_rows: AtomicUsize::new(0),
+                pending_capacity: AtomicUsize::new(usize::MAX),
             }
         }
 
@@ -10155,7 +10162,15 @@ mod tests {
             line: &Line,
             _max_retained_rows: usize,
         ) -> bool {
-            self.rows.lock().unwrap().push((stable_row, line.clone()));
+            let mut rows = self.rows.lock().unwrap();
+            if rows
+                .len()
+                .saturating_sub(self.flushed_rows.load(Ordering::SeqCst))
+                >= self.pending_capacity.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            rows.push((stable_row, line.clone()));
             true
         }
 
@@ -10358,6 +10373,88 @@ mod tests {
         pane.drain_scrollback_outside_terminal(sink.clone());
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 16, "one geometry slice must have been queued");
+        assert_eq!(sink.flushed_rows.load(Ordering::SeqCst), rows.len());
+        for (index, (stable_row, line)) in rows.iter().enumerate() {
+            assert_eq!(*stable_row, index as StableRowIndex);
+            assert_eq!(line.as_str().trim_end(), format!("row-{index:02}"));
+        }
+    }
+
+    #[test]
+    fn deferred_scrollback_flushes_full_yielded_batches_without_failure_backoff() {
+        use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit};
+
+        struct NoFailureBackoff(AtomicUsize);
+        impl metrics::Recorder for NoFailureBackoff {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                assert_ne!(key.name(), "mux.scrollback.persistence_backpressure");
+                if key.name() == "mux.scrollback.geometry_yields" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Counter::noop()
+            }
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        #[derive(Debug)]
+        struct BoundedConfig(Arc<MuxCheckpointTestSink>);
+        impl TerminalConfiguration for BoundedConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                2048
+            }
+            fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+                frankenterm_term::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: if self.0.deferred.load(Ordering::SeqCst) {
+                        1
+                    } else {
+                        1000
+                    },
+                    warm_max_bytes: 0,
+                }
+            }
+            fn scrollback_spill_sink(
+                &self,
+            ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let sink = Arc::new(MuxCheckpointTestSink::new());
+        let mut terminal = Terminal::new(
+            term_size(80, 4),
+            Arc::new(BoundedConfig(sink.clone())),
+            "FrankenTerm",
+            "deferred-full-batch-test",
+            Box::new(Vec::<u8>::new()),
+        );
+        for row in 0..70 {
+            terminal.advance_bytes(format!("row-{row:02}\r\n").as_bytes());
+        }
+        assert!(sink.rows.lock().unwrap().is_empty());
+        sink.pending_capacity.store(16, Ordering::SeqCst);
+        sink.deferred.store(true, Ordering::SeqCst);
+        let pane = make_legacy_test_pane(787, terminal);
+        let recorder = NoFailureBackoff(AtomicUsize::new(0));
+        // Thread-local recording observes the real backoff branch without a
+        // wall-clock assertion or interference from parallel tests.
+        metrics::with_local_recorder(&recorder, || {
+            pane.drain_scrollback_outside_terminal(sink.clone());
+        });
+        assert!(recorder.0.load(Ordering::SeqCst) >= 4);
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 66);
         assert_eq!(sink.flushed_rows.load(Ordering::SeqCst), rows.len());
         for (index, (stable_row, line)) in rows.iter().enumerate() {
             assert_eq!(*stable_row, index as StableRowIndex);
