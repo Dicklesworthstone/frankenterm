@@ -119,7 +119,8 @@ fn recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process() {
         object.to_bytes().unwrap(),
     )
     .unwrap();
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
+    let child = Command::new(std::env::current_exe().unwrap())
+        .timeout(std::time::Duration::from_secs(15))
         .args([
             "--exact",
             "recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process",
