@@ -362,6 +362,12 @@ pub enum TermWindowNotif {
         interest: [u64; OUTPUT_INTEREST_WORDS],
         completion: Sender<()>,
     },
+    RenderWake {
+        ticket: RenderWakeTicket,
+        mux_owner: Weak<Mux>,
+        mux_window_id: MuxWindowId,
+        completion: Sender<()>,
+    },
     EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
     SwitchToMuxWindow(MuxWindowId),
@@ -1233,6 +1239,7 @@ pub struct TermWindow {
     /// Ticket validation remains authoritative even if cancellation races a
     /// task that has already posted its notification.
     render_wake_state: RenderWakeState,
+    render_wake_requests: Option<RenderWakeRequests>,
     /// Gate for the iter-dirty render-pass clean-line accounting
     /// path (ft-8pcwy / ft-jvj78 / ft-gwzrm). The live source
     /// wiring marks PTY, cursor, selection, and whole-screen events
@@ -2145,78 +2152,16 @@ impl TermWindow {
                     ticket.0,
                     delay
                 );
-                let reservation = match promise::spawn::try_reserve_main_thread(
-                    promise::spawn::MainThreadServiceClass::Render,
-                    8 * 1024,
-                ) {
-                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                        reservation
-                    }
-                    rejected => {
-                        let cancelled = self.render_wake_state.cancel_exact(ticket);
-                        debug_assert!(
-                            cancelled,
-                            "a just-planned render wake must retain its exact ticket until scheduler admission"
-                        );
-                        metrics::counter!("gui.render.wake", "action" => "scheduler_rejected")
-                            .increment(1);
-                        log::error!(
-                            "main-thread scheduler rejected exact render wake; cancelled ticket and invalidating immediately: {rejected:?}"
-                        );
-                        window.invalidate();
-                        return None;
-                    }
+                let Some(requests) = &self.render_wake_requests else {
+                    self.render_wake_state.cancel_exact(ticket);
+                    return None;
                 };
-                reservation
-                    .handoff_to_main_thread_local_after(
-                        async move { Abortable::new(sleep(delay), registration).await.is_ok() },
-                        move |reservation| {
-                            let wake_window = window.clone();
-                            window.notify_with_reservation(
-                                TermWindowNotif::Apply(Box::new(move |tw| {
-                                    match tw.render_wake_state.dispatch(ticket) {
-                                    RenderWakeDispatch::Fired(RenderWakeReason::Retry(_stage)) => {
-                                        if tw.render_recovery_state.mark_retry_ready(ticket) {
-                                            metrics::counter!(
-                                                "gui.render.retry",
-                                                "action" => "dispatched"
-                                            )
-                                            .increment(1);
-                                            if let Err(error) = tw.paint_if_admitted(&wake_window) {
-                                                log::error!("admitted render retry failed: {error:#}");
-                                            }
-                                        } else {
-                                            metrics::counter!(
-                                                "gui.render.retry",
-                                                "action" => "stale_recovery"
-                                            )
-                                            .increment(1);
-                                        }
-                                    }
-                                    RenderWakeDispatch::Fired(RenderWakeReason::Animation) => {
-                                        metrics::counter!(
-                                            "gui.render.animation_wake",
-                                            "action" => "dispatched"
-                                        )
-                                        .increment(1);
-                                        if let Err(error) = tw.paint_if_admitted(&wake_window) {
-                                            log::error!("admitted animation paint failed: {error:#}");
-                                        }
-                                    }
-                                    RenderWakeDispatch::Stale => {
-                                        metrics::counter!(
-                                            "gui.render.wake",
-                                            "action" => "stale"
-                                        )
-                                        .increment(1);
-                                    }
-                                    }
-                                })),
-                                reservation,
-                            );
-                        },
-                    )
-                    .detach();
+                *requests.pending.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(RenderWakeRequest { ticket, due, registration });
+                if matches!(requests.ready.try_send(()), Err(TrySendError::Disconnected(_))) {
+                    self.render_wake_state.cancel_exact(ticket);
+                    return None;
+                }
                 Some(ticket)
             }
             RenderWakePlan::Exhausted => {
@@ -2856,7 +2801,18 @@ const MAX_BACKEND_RETRIES: u32 = 3;
 const OCCLUDED_REPAINT_PROBE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RenderWakeTicket(u64);
+pub struct RenderWakeTicket(u64);
+
+struct RenderWakeRequest {
+    ticket: RenderWakeTicket,
+    due: Instant,
+    registration: AbortRegistration,
+}
+
+struct RenderWakeRequests {
+    pending: Arc<Mutex<Option<RenderWakeRequest>>>,
+    ready: Sender<()>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RenderWakeReason {
@@ -3526,6 +3482,7 @@ impl TermWindow {
             damage_generation: DamageGeneration::default(),
             render_recovery_state: RenderRecoveryState::default(),
             render_wake_state: RenderWakeState::default(),
+            render_wake_requests: None,
             // Per ft-gwzrm: live dirty sources are wired, and the
             // render path only records a clean-line skip after a
             // cached quad list was actually reused.
@@ -4213,6 +4170,33 @@ impl TermWindow {
                 ticket,
             } => {
                 self.cancel_overlay_for_tab_if_current(tab_id, Some(overlay_pane_id), &ticket);
+            }
+            TermWindowNotif::RenderWake {
+                ticket,
+                mux_owner,
+                mux_window_id,
+                completion,
+            } => {
+                let _completion = completion;
+                let Some(owner) = mux_owner.upgrade() else {
+                    return Ok(());
+                };
+                if self.mux_window_id != mux_window_id
+                    || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
+                {
+                    return Ok(());
+                }
+                match self.render_wake_state.dispatch(ticket) {
+                    RenderWakeDispatch::Fired(RenderWakeReason::Retry(_)) => {
+                        if self.render_recovery_state.mark_retry_ready(ticket) {
+                            self.paint_if_admitted(window)?;
+                        }
+                    }
+                    RenderWakeDispatch::Fired(RenderWakeReason::Animation) => {
+                        self.paint_if_admitted(window)?;
+                    }
+                    RenderWakeDispatch::Stale => {}
+                }
             }
             TermWindowNotif::MuxOutputRefresh {
                 mux_owner,
@@ -5054,7 +5038,7 @@ impl TermWindow {
         true
     }
 
-    fn subscribe_to_pane_updates(&self) -> anyhow::Result<()> {
+    fn subscribe_to_pane_updates(&mut self) -> anyhow::Result<()> {
         let window = self
             .window
             .clone()
