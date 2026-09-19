@@ -9582,444 +9582,448 @@ mod tests {
             Some(newer.seq),
         );
     }
-}
+    // Only the ring-specific tests require the optional disruptor feature.
+    // Checkpoint and surface-capture regressions below remain in the ordinary
+    // test module and share its terminal/PTY fixtures.
+    /// ft-87qfi keep-gate: the lock-free SPSC ring's concurrency contract.
+    ///
+    /// This is the gate that decides whether the disruptor moonshot is safe to keep.
+    /// The whole risk of the technique is a lock-free ordering bug, so this exercises
+    /// the exact primitive the pane->render staging ring is built on
+    /// (`crossbeam::queue::ArrayQueue<Vec<u8>>`, used the same way: producer thread
+    /// pushes batches with back-pressure on full, consumer thread drains, spinning on
+    /// empty) and asserts EXACT in-order delivery — zero loss, zero duplication, zero
+    /// reordering — across many iterations while the small bounded ring repeatedly
+    /// fills, wraps, and empties. No `unsafe`.
+    #[cfg(feature = "disruptor-pane-io")]
+    mod disruptor_ring_keep_gate {
+        use super::*;
+        use crossbeam::queue::ArrayQueue;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
 
-/// ft-87qfi keep-gate: the lock-free SPSC ring's concurrency contract.
-///
-/// This is the gate that decides whether the disruptor moonshot is safe to keep.
-/// The whole risk of the technique is a lock-free ordering bug, so this exercises
-/// the exact primitive the pane->render staging ring is built on
-/// (`crossbeam::queue::ArrayQueue<Vec<u8>>`, used the same way: producer thread
-/// pushes batches with back-pressure on full, consumer thread drains, spinning on
-/// empty) and asserts EXACT in-order delivery — zero loss, zero duplication, zero
-/// reordering — across many iterations while the small bounded ring repeatedly
-/// fills, wraps, and empties. No `unsafe`.
-#[cfg(all(test, feature = "disruptor-pane-io"))]
-mod disruptor_ring_keep_gate {
-    use super::*;
-    use crossbeam::queue::ArrayQueue;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
+        /// A batch is the little-endian bytes of its sequence index plus a sentinel
+        /// tail byte, so every batch is self-identifying and framing corruption is
+        /// detectable. Mirrors the real ring's `Vec<Action>` batches.
+        const TAIL_SENTINEL: u8 = 0xAB;
+        const BATCH_LEN: usize = 9; // 8 index bytes + 1 sentinel
 
-    /// A batch is the little-endian bytes of its sequence index plus a sentinel
-    /// tail byte, so every batch is self-identifying and framing corruption is
-    /// detectable. Mirrors the real ring's `Vec<Action>` batches.
-    const TAIL_SENTINEL: u8 = 0xAB;
-    const BATCH_LEN: usize = 9; // 8 index bytes + 1 sentinel
-
-    fn make_batch(index: u64) -> Vec<u8> {
-        let mut batch = index.to_le_bytes().to_vec();
-        batch.push(TAIL_SENTINEL);
-        batch
-    }
-
-    fn decode_index(batch: &[u8]) -> u64 {
-        assert_eq!(batch.len(), BATCH_LEN, "batch framing corrupted (len)");
-        assert_eq!(
-            batch[8], TAIL_SENTINEL,
-            "batch framing corrupted (sentinel)"
-        );
-        let mut idx_bytes = [0u8; 8];
-        idx_bytes.copy_from_slice(&batch[..8]);
-        u64::from_le_bytes(idx_bytes)
-    }
-
-    #[derive(Debug)]
-    struct TestTermConfig;
-
-    impl TerminalConfiguration for TestTermConfig {
-        fn color_palette(&self) -> ColorPalette {
-            ColorPalette::default()
-        }
-    }
-
-    struct TestMasterPty;
-
-    impl MasterPty for TestMasterPty {
-        fn resize(&self, _size: PtySize) -> Result<(), Error> {
-            Ok(())
+        fn make_batch(index: u64) -> Vec<u8> {
+            let mut batch = index.to_le_bytes().to_vec();
+            batch.push(TAIL_SENTINEL);
+            batch
         }
 
-        fn get_size(&self) -> Result<PtySize, Error> {
-            Ok(PtySize::default())
+        fn decode_index(batch: &[u8]) -> u64 {
+            assert_eq!(batch.len(), BATCH_LEN, "batch framing corrupted (len)");
+            assert_eq!(
+                batch[8], TAIL_SENTINEL,
+                "batch framing corrupted (sentinel)"
+            );
+            let mut idx_bytes = [0u8; 8];
+            idx_bytes.copy_from_slice(&batch[..8]);
+            u64::from_le_bytes(idx_bytes)
         }
 
-        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error> {
-            Ok(Box::new(std::io::Cursor::new(Vec::new())))
+        #[derive(Debug)]
+        struct TestTermConfig;
+
+        impl TerminalConfiguration for TestTermConfig {
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
         }
 
-        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error> {
-            Ok(Box::new(Vec::<u8>::new()))
+        struct TestMasterPty;
+
+        impl MasterPty for TestMasterPty {
+            fn resize(&self, _size: PtySize) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn get_size(&self) -> Result<PtySize, Error> {
+                Ok(PtySize::default())
+            }
+
+            fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error> {
+                Ok(Box::new(std::io::Cursor::new(Vec::new())))
+            }
+
+            fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error> {
+                Ok(Box::new(Vec::<u8>::new()))
+            }
+
+            #[cfg(unix)]
+            fn process_group_leader(&self) -> Option<libc::pid_t> {
+                None
+            }
+
+            #[cfg(unix)]
+            fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+                None
+            }
+
+            #[cfg(unix)]
+            fn tty_name(&self) -> Option<std::path::PathBuf> {
+                None
+            }
         }
 
-        #[cfg(unix)]
-        fn process_group_leader(&self) -> Option<libc::pid_t> {
-            None
+        #[derive(Clone, Debug)]
+        struct TestChild;
+
+        impl ChildKiller for TestChild {
+            fn kill(&mut self) -> IoResult<()> {
+                Ok(())
+            }
+
+            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+                Box::new(self.clone())
+            }
         }
 
-        #[cfg(unix)]
-        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
-            None
+        impl Child for TestChild {
+            fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+                Ok(Some(ExitStatus::with_exit_code(0)))
+            }
+
+            fn wait(&mut self) -> IoResult<ExitStatus> {
+                Ok(ExitStatus::with_exit_code(0))
+            }
+
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
         }
 
-        #[cfg(unix)]
-        fn tty_name(&self) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct TestChild;
-
-    impl ChildKiller for TestChild {
-        fn kill(&mut self) -> IoResult<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(self.clone())
-        }
-    }
-
-    impl Child for TestChild {
-        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-            Ok(Some(ExitStatus::with_exit_code(0)))
-        }
-
-        fn wait(&mut self) -> IoResult<ExitStatus> {
-            Ok(ExitStatus::with_exit_code(0))
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
-    }
-
-    fn test_terminal(size: TerminalSize) -> Terminal {
-        Terminal::new(
-            size,
-            Arc::new(TestTermConfig),
-            "WezTerm",
-            "test",
-            Box::new(Vec::new()),
-        )
-    }
-
-    fn term_size(cols: usize, rows: usize) -> TerminalSize {
-        TerminalSize {
-            cols,
-            rows,
-            pixel_width: cols,
-            pixel_height: rows,
-            dpi: 96,
-        }
-    }
-
-    fn pty_size(cols: u16, rows: u16) -> PtySize {
-        PtySize {
-            cols,
-            rows,
-            pixel_width: cols,
-            pixel_height: rows,
-        }
-    }
-
-    #[test]
-    fn resize_worker_drains_staged_actions_before_noop_probe() {
-        let size = term_size(10, 1);
-        let ring = ArrayQueue::new(4);
-        ring.push(vec![Action::Print('x')])
-            .expect("ring should accept staged action");
-
-        let terminal = Mutex::new(test_terminal(size));
-        let pty: Mutex<Box<dyn MasterPty>> = Mutex::new(Box::new(TestMasterPty));
-        let resize_queue = Mutex::new(ResizeQueueState {
-            pending: None,
-            next_seq: 1,
-            worker_running: true,
-            last_proven_pty_size: Some(pty_size(10, 1)),
-        });
-        let metrics = LocalPane::apply_resize_sync(
-            7,
-            &terminal,
-            &Mutex::new(None),
-            &ring,
-            &pty,
-            &resize_queue,
-            1,
-            size,
-            pty_size(10, 1),
-            ResizeCancellationToken::new(1),
-        )
-        .expect("resize probe should succeed");
-
-        assert!(metrics.noop);
-        assert!(
-            ring.is_empty(),
-            "resize worker left staged actions undrained"
-        );
-        assert_eq!(
-            terminal.lock().cursor_pos().x,
-            1,
-            "staged output must be applied before resize observes terminal state"
-        );
-    }
-
-    #[test]
-    fn checkpoint_lock_drains_disruptor_before_pending_actions_and_model_capture() {
-        use crate::guardian_checkpoint::capture_and_bind_live_parser_checkpoint;
-        use crate::guardian_output_journal::{
-            GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
-            GuardianOutputSegmentIdentity,
-        };
-        use std::io::Read;
-
-        let size = term_size(10, 1);
-        let durable_pane_id = uuid::Uuid::new_v4();
-        let segment =
-            GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
-                .expect("valid checkpoint segment");
-        let directory = tempfile::tempdir().expect("private journal directory");
-        let directory_file = std::fs::File::open(directory.path()).expect("open journal parent");
-        rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
-            .expect("make journal parent private");
-        let mut journal = GuardianOutputJournal::create_new_at(
-            &directory_file,
-            std::ffi::OsStr::new("checkpoint.segment"),
-            segment,
-            GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).expect("valid cipher"),
-            GuardianOutputJournalLimits::default(),
-        )
-        .expect("create checkpoint journal");
-        journal
-            .sync_parent_directory_and_activate()
-            .expect("activate checkpoint journal");
-        let receipt = journal.append_and_sync(b"ab").expect("commit parser bytes");
-
-        let pane = Arc::new(LocalPane::new(
-            1,
-            test_terminal(size),
-            Box::new(TestChild),
-            Box::new(TestMasterPty),
-            Box::new(Vec::<u8>::new()),
-            1,
-            *durable_pane_id.as_bytes(),
-            "checkpoint-disruptor-test".to_string(),
-        ));
-        let registered_pane: Arc<dyn Pane> = pane.clone();
-        let mux = Arc::new(crate::Mux::new(None));
-        let generation = crate::PaneRegistrationGeneration::new(
-            pane.pane_id(),
-            &mux.pane_retirements,
-            Arc::downgrade(&mux),
-        );
-        {
-            let _registration = mux.pane_registration.lock();
-            mux.insert_pane_registration_locked(
-                pane.pane_id(),
-                pane.domain_id(),
-                &registered_pane,
-                &generation,
+        fn test_terminal(size: TerminalSize) -> Terminal {
+            Terminal::new(
+                size,
+                Arc::new(TestTermConfig),
+                "WezTerm",
+                "test",
+                Box::new(Vec::new()),
             )
-            .expect("register checkpoint pane without a competing parser thread");
         }
-        let operation = mux
-            .capture_pane_operation(pane.pane_id())
-            .expect("admit current pane operation");
-        let control = &generation.live_parser_checkpoint;
-        let (mut writer, mut reader) = crate::allocate_socketpair().expect("parser socket");
-        writer
-            .set_non_blocking(true)
-            .expect("nonblocking parser writer");
-        let (mut wake_writer, _wake_reader) = crate::allocate_socketpair().expect("wake socket");
-        wake_writer
-            .set_non_blocking(true)
-            .expect("nonblocking wake writer");
-        control
-            .attach_reader_channels(writer, wake_writer)
-            .expect("attach parser channels");
-        let target = operation
-            .authorize_guardian_output_delivery(segment, receipt, Arc::<[u8]>::from(&b"ab"[..]))
-            .expect("authorize the exact journal bytes for this registration");
-        control
-            .write_delivered_bytes(b"ab")
-            .expect("deliver authenticated bytes");
-        let mut delivered = [0; 2];
-        reader
-            .read_exact(&mut delivered)
-            .expect("read delivered parser bytes");
-        assert_eq!(&delivered, b"ab");
-        let mut parser = termwiz::escape::parser::Parser::new();
-        let mut staged = Vec::new();
-        parser.parse(&delivered[..1], |action| action.append_to(&mut staged));
-        let mut pending = Vec::new();
-        parser.parse(&delivered[1..], |action| action.append_to(&mut pending));
-        assert_eq!(
-            control.record_parsed_bytes(delivered.len()).unwrap(),
-            target
-        );
-        let ground = parser
-            .recovery_ground_boundary()
-            .expect("two printable bytes end at parser ground");
-        let limits = TerminalCheckpointLimits::default();
-        let (request_id, completion) = control
-            .register_checkpoint(
-                &registered_pane,
-                &generation,
-                durable_pane_id,
+
+        fn term_size(cols: usize, rows: usize) -> TerminalSize {
+            TerminalSize {
+                cols,
+                rows,
+                pixel_width: cols,
+                pixel_height: rows,
+                dpi: 96,
+            }
+        }
+
+        fn pty_size(cols: u16, rows: u16) -> PtySize {
+            PtySize {
+                cols,
+                rows,
+                pixel_width: cols,
+                pixel_height: rows,
+            }
+        }
+
+        #[test]
+        fn resize_worker_drains_staged_actions_before_noop_probe() {
+            let size = term_size(10, 1);
+            let ring = ArrayQueue::new(4);
+            ring.push(vec![Action::Print('x')])
+                .expect("ring should accept staged action");
+
+            let terminal = Mutex::new(test_terminal(size));
+            let pty: Mutex<Box<dyn MasterPty>> = Mutex::new(Box::new(TestMasterPty));
+            let resize_queue = Mutex::new(ResizeQueueState {
+                pending: None,
+                next_seq: 1,
+                worker_running: true,
+                last_proven_pty_size: Some(pty_size(10, 1)),
+            });
+            let metrics = LocalPane::apply_resize_sync(
+                7,
+                &terminal,
+                &Mutex::new(None),
+                &ring,
+                &pty,
+                &resize_queue,
+                1,
+                size,
+                pty_size(10, 1),
+                ResizeCancellationToken::new(1),
+            )
+            .expect("resize probe should succeed");
+
+            assert!(metrics.noop);
+            assert!(
+                ring.is_empty(),
+                "resize worker left staged actions undrained"
+            );
+            assert_eq!(
+                terminal.lock().cursor_pos().x,
+                1,
+                "staged output must be applied before resize observes terminal state"
+            );
+        }
+
+        #[test]
+        fn checkpoint_lock_drains_disruptor_before_pending_actions_and_model_capture() {
+            use crate::guardian_checkpoint::capture_and_bind_live_parser_checkpoint;
+            use crate::guardian_output_journal::{
+                GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
+                GuardianOutputSegmentIdentity,
+            };
+            use std::io::Read;
+
+            let size = term_size(10, 1);
+            let durable_pane_id = uuid::Uuid::new_v4();
+            let segment =
+                GuardianOutputSegmentIdentity::new(durable_pane_id, uuid::Uuid::new_v4(), 1, None)
+                    .expect("valid checkpoint segment");
+            let directory = tempfile::tempdir().expect("private journal directory");
+            let directory_file =
+                std::fs::File::open(directory.path()).expect("open journal parent");
+            rustix::fs::fchmod(&directory_file, rustix::fs::Mode::from_raw_mode(0o700))
+                .expect("make journal parent private");
+            let mut journal = GuardianOutputJournal::create_new_at(
+                &directory_file,
+                std::ffi::OsStr::new("checkpoint.segment"),
                 segment,
-                receipt,
-                limits,
+                GuardianOutputCipher::try_from_key_slice(&[0x5a; 32]).expect("valid cipher"),
+                GuardianOutputJournalLimits::default(),
             )
-            .expect("register checkpoint at the authenticated delivery fence");
-        let request = control
-            .begin_capture(target)
-            .unwrap()
-            .expect("admit capture");
-        let capture_operation = generation.try_acquire().expect("lease current generation");
-        {
-            // An idle producer applies immediately. Exercise real contention
-            // so capture, rather than the producer, must drain this batch.
-            let _terminal = pane.terminal.lock();
-            pane.perform_actions(staged);
-        }
-        assert!(
-            !pane.action_ring.is_empty(),
-            "fixture must stage its first parser batch in the disruptor"
-        );
-        let checkpoint = capture_and_bind_live_parser_checkpoint(
-            &registered_pane,
-            &capture_operation,
-            &request,
-            &mut pending,
-            ground,
-        )
-        .expect("capture model through the production LocalPane lock path");
-        control.complete_capture(request_id, Ok(checkpoint));
-        let checkpoint = completion
-            .try_recv()
-            .unwrap()
-            .expect("publish captured model");
+            .expect("create checkpoint journal");
+            journal
+                .sync_parent_directory_and_activate()
+                .expect("activate checkpoint journal");
+            let receipt = journal.append_and_sync(b"ab").expect("commit parser bytes");
 
-        assert!(
-            pane.action_ring.is_empty(),
-            "checkpoint left disruptor actions staged"
-        );
-        assert!(
-            pending.is_empty(),
-            "checkpoint left parser actions unapplied"
-        );
-        assert_eq!(checkpoint.parser_stream_bytes(), 2);
-        assert_eq!(
-            pane.terminal.lock().cursor_pos().x,
-            2,
-            "ring action must precede pending action in captured model"
-        );
-        assert_eq!(pane.get_lines(0..1).1[0].as_str().trim_end(), "ab");
-        assert_eq!(
-            checkpoint.terminal_checkpoint().canonical_payload(),
-            pane.terminal
-                .lock()
-                .capture_recovery_checkpoint(limits)
+            let pane = Arc::new(LocalPane::new(
+                1,
+                test_terminal(size),
+                Box::new(TestChild),
+                Box::new(TestMasterPty),
+                Box::new(Vec::<u8>::new()),
+                1,
+                *durable_pane_id.as_bytes(),
+                "checkpoint-disruptor-test".to_string(),
+            ));
+            let registered_pane: Arc<dyn Pane> = pane.clone();
+            let mux = Arc::new(crate::Mux::new(None));
+            let generation = crate::PaneRegistrationGeneration::new(
+                pane.pane_id(),
+                &mux.pane_retirements,
+                Arc::downgrade(&mux),
+            );
+            {
+                let _registration = mux.pane_registration.lock();
+                mux.insert_pane_registration_locked(
+                    pane.pane_id(),
+                    pane.domain_id(),
+                    &registered_pane,
+                    &generation,
+                )
+                .expect("register checkpoint pane without a competing parser thread");
+            }
+            let operation = mux
+                .capture_pane_operation(pane.pane_id())
+                .expect("admit current pane operation");
+            let control = &generation.live_parser_checkpoint;
+            let (mut writer, mut reader) = crate::allocate_socketpair().expect("parser socket");
+            writer
+                .set_non_blocking(true)
+                .expect("nonblocking parser writer");
+            let (mut wake_writer, _wake_reader) =
+                crate::allocate_socketpair().expect("wake socket");
+            wake_writer
+                .set_non_blocking(true)
+                .expect("nonblocking wake writer");
+            control
+                .attach_reader_channels(writer, wake_writer)
+                .expect("attach parser channels");
+            let target = operation
+                .authorize_guardian_output_delivery(segment, receipt, Arc::<[u8]>::from(&b"ab"[..]))
+                .expect("authorize the exact journal bytes for this registration");
+            control
+                .write_delivered_bytes(b"ab")
+                .expect("deliver authenticated bytes");
+            let mut delivered = [0; 2];
+            reader
+                .read_exact(&mut delivered)
+                .expect("read delivered parser bytes");
+            assert_eq!(&delivered, b"ab");
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut staged = Vec::new();
+            parser.parse(&delivered[..1], |action| action.append_to(&mut staged));
+            let mut pending = Vec::new();
+            parser.parse(&delivered[1..], |action| action.append_to(&mut pending));
+            assert_eq!(
+                control.record_parsed_bytes(delivered.len()).unwrap(),
+                target
+            );
+            let ground = parser
+                .recovery_ground_boundary()
+                .expect("two printable bytes end at parser ground");
+            let limits = TerminalCheckpointLimits::default();
+            let (request_id, completion) = control
+                .register_checkpoint(
+                    &registered_pane,
+                    &generation,
+                    durable_pane_id,
+                    segment,
+                    receipt,
+                    limits,
+                )
+                .expect("register checkpoint at the authenticated delivery fence");
+            let request = control
+                .begin_capture(target)
                 .unwrap()
-                .canonical_payload(),
-            "published checkpoint must contain the complete ordered model"
-        );
-        control.close_reader_channels();
-        drop(capture_operation);
-        drop(operation);
-        assert!(mux.remove_pane_registration_if_same(pane.pane_id(), &registered_pane));
-    }
+                .expect("admit capture");
+            let capture_operation = generation.try_acquire().expect("lease current generation");
+            {
+                // An idle producer applies immediately. Exercise real contention
+                // so capture, rather than the producer, must drain this batch.
+                let _terminal = pane.terminal.lock();
+                pane.perform_actions(staged);
+            }
+            assert!(
+                !pane.action_ring.is_empty(),
+                "fixture must stage its first parser batch in the disruptor"
+            );
+            let checkpoint = capture_and_bind_live_parser_checkpoint(
+                &registered_pane,
+                &capture_operation,
+                &request,
+                &mut pending,
+                ground,
+            )
+            .expect("capture model through the production LocalPane lock path");
+            control.complete_capture(request_id, Ok(checkpoint));
+            let checkpoint = completion
+                .try_recv()
+                .unwrap()
+                .expect("publish captured model");
 
-    #[test]
-    fn spsc_ring_delivers_every_batch_exactly_once_in_order() {
-        // Small, non-power-of-two capacity so the ring wraps and hits full and
-        // empty edges thousands of times per iteration.
-        const CAP: usize = 7;
-        // Enough batches to wrap the ring ~thousands of times per iteration.
-        const BATCHES: u64 = 20_000;
-        // Many independent runs to vary producer/consumer interleaving.
-        const ITERATIONS: usize = 16;
+            assert!(
+                pane.action_ring.is_empty(),
+                "checkpoint left disruptor actions staged"
+            );
+            assert!(
+                pending.is_empty(),
+                "checkpoint left parser actions unapplied"
+            );
+            assert_eq!(checkpoint.parser_stream_bytes(), 2);
+            assert_eq!(
+                pane.terminal.lock().cursor_pos().x,
+                2,
+                "ring action must precede pending action in captured model"
+            );
+            assert_eq!(pane.get_lines(0..1).1[0].as_str().trim_end(), "ab");
+            assert_eq!(
+                checkpoint.terminal_checkpoint().canonical_payload(),
+                pane.terminal
+                    .lock()
+                    .capture_recovery_checkpoint(limits)
+                    .unwrap()
+                    .canonical_payload(),
+                "published checkpoint must contain the complete ordered model"
+            );
+            control.close_reader_channels();
+            drop(capture_operation);
+            drop(operation);
+            assert!(mux.remove_pane_registration_if_same(pane.pane_id(), &registered_pane));
+        }
 
-        for iter in 0..ITERATIONS {
-            let ring: Arc<ArrayQueue<Vec<u8>>> = Arc::new(ArrayQueue::new(CAP));
-            // Signals that the producer has pushed ALL batches. Lets the consumer
-            // terminate (instead of hanging) if a batch were lost: once the
-            // producer is done and the ring is empty, no more batches can arrive.
-            let producer_done = Arc::new(AtomicBool::new(false));
+        #[test]
+        fn spsc_ring_delivers_every_batch_exactly_once_in_order() {
+            // Small, non-power-of-two capacity so the ring wraps and hits full and
+            // empty edges thousands of times per iteration.
+            const CAP: usize = 7;
+            // Enough batches to wrap the ring ~thousands of times per iteration.
+            const BATCHES: u64 = 20_000;
+            // Many independent runs to vary producer/consumer interleaving.
+            const ITERATIONS: usize = 16;
 
-            let producer = {
-                let ring = Arc::clone(&ring);
-                let producer_done = Arc::clone(&producer_done);
-                thread::spawn(move || {
-                    for i in 0..BATCHES {
-                        let mut pending = make_batch(i);
-                        // Bounded ring => back-pressure: spin until it accepts.
+            for iter in 0..ITERATIONS {
+                let ring: Arc<ArrayQueue<Vec<u8>>> = Arc::new(ArrayQueue::new(CAP));
+                // Signals that the producer has pushed ALL batches. Lets the consumer
+                // terminate (instead of hanging) if a batch were lost: once the
+                // producer is done and the ring is empty, no more batches can arrive.
+                let producer_done = Arc::new(AtomicBool::new(false));
+
+                let producer = {
+                    let ring = Arc::clone(&ring);
+                    let producer_done = Arc::clone(&producer_done);
+                    thread::spawn(move || {
+                        for i in 0..BATCHES {
+                            let mut pending = make_batch(i);
+                            // Bounded ring => back-pressure: spin until it accepts.
+                            loop {
+                                match ring.push(pending) {
+                                    Ok(()) => break,
+                                    Err(returned) => {
+                                        pending = returned;
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                        }
+                        producer_done.store(true, Ordering::Release);
+                    })
+                };
+
+                let consumer = {
+                    let ring = Arc::clone(&ring);
+                    let producer_done = Arc::clone(&producer_done);
+                    thread::spawn(move || {
+                        let mut drained: Vec<u64> = Vec::with_capacity(BATCHES as usize);
                         loop {
-                            match ring.push(pending) {
-                                Ok(()) => break,
-                                Err(returned) => {
-                                    pending = returned;
+                            match ring.pop() {
+                                Some(batch) => drained.push(decode_index(&batch)),
+                                None => {
+                                    // No item right now. If the producer has finished
+                                    // and the ring is empty, there is nothing more
+                                    // coming — stop (a short count then proves loss).
+                                    if producer_done.load(Ordering::Acquire) && ring.is_empty() {
+                                        break;
+                                    }
                                     std::hint::spin_loop();
                                 }
                             }
                         }
-                    }
-                    producer_done.store(true, Ordering::Release);
-                })
-            };
+                        drained
+                    })
+                };
 
-            let consumer = {
-                let ring = Arc::clone(&ring);
-                let producer_done = Arc::clone(&producer_done);
-                thread::spawn(move || {
-                    let mut drained: Vec<u64> = Vec::with_capacity(BATCHES as usize);
-                    loop {
-                        match ring.pop() {
-                            Some(batch) => drained.push(decode_index(&batch)),
-                            None => {
-                                // No item right now. If the producer has finished
-                                // and the ring is empty, there is nothing more
-                                // coming — stop (a short count then proves loss).
-                                if producer_done.load(Ordering::Acquire) && ring.is_empty() {
-                                    break;
-                                }
-                                std::hint::spin_loop();
-                            }
-                        }
-                    }
-                    drained
-                })
-            };
+                producer.join().expect("producer thread panicked");
+                let drained = consumer.join().expect("consumer thread panicked");
 
-            producer.join().expect("producer thread panicked");
-            let drained = consumer.join().expect("consumer thread panicked");
-
-            // Zero loss + zero duplication: exactly BATCHES items delivered.
-            assert_eq!(
-                drained.len() as u64,
-                BATCHES,
-                "iter {iter}: delivered {} batches, expected {BATCHES} (loss or duplication)",
-                drained.len()
-            );
-            // Zero reordering: the batch drained at position p is exactly the
-            // batch produced at position p. Combined with the exact count above,
-            // this proves the drained sequence equals the produced sequence byte
-            // for byte, in order.
-            for (pos, &index) in drained.iter().enumerate() {
+                // Zero loss + zero duplication: exactly BATCHES items delivered.
                 assert_eq!(
-                    index, pos as u64,
-                    "iter {iter}: ordering/identity violation at position {pos}: \
+                    drained.len() as u64,
+                    BATCHES,
+                    "iter {iter}: delivered {} batches, expected {BATCHES} (loss or duplication)",
+                    drained.len()
+                );
+                // Zero reordering: the batch drained at position p is exactly the
+                // batch produced at position p. Combined with the exact count above,
+                // this proves the drained sequence equals the produced sequence byte
+                // for byte, in order.
+                for (pos, &index) in drained.iter().enumerate() {
+                    assert_eq!(
+                        index, pos as u64,
+                        "iter {iter}: ordering/identity violation at position {pos}: \
                      got batch index {index} (lock-free SPSC loss/dup/reorder)"
+                    );
+                }
+                // The ring must be fully drained at the end.
+                assert!(
+                    ring.pop().is_none(),
+                    "iter {}: ring not empty after consuming all batches",
+                    iter
                 );
             }
-            // The ring must be fully drained at the end.
-            assert!(
-                ring.pop().is_none(),
-                "iter {}: ring not empty after consuming all batches",
-                iter
-            );
         }
     }
 
