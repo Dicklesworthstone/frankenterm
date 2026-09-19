@@ -7471,7 +7471,7 @@ impl WholeMuxRecoveryVerifier {
                                         current_lease_generation: witness.generation(),
                                         acknowledged_successor: match &pane.spawn_custody {
                                             crate::mux_recovery_image::RecoverySpawnCustody::Original { acknowledged_successor, .. } => acknowledged_successor.map(Into::into),
-                                            _ => None,
+                                            crate::mux_recovery_image::RecoverySpawnCustody::Absent => None,
                                         },
                                     },
                                 ));

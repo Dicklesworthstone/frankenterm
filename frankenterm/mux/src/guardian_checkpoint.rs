@@ -9933,7 +9933,8 @@ mod tests {
             changed[index] ^= 1;
             assert!(
                 cipher.open_recovery_claim_intent(&changed).is_err(),
-                "byte {index}"
+                "byte {}",
+                index
             );
         }
         assert!(cipher

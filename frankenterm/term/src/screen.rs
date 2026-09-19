@@ -12260,6 +12260,73 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn admitted_geometry_ragged_native_history_matches_streamed_viewports() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(24, 80, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 100_000,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "ragged-cold-geometry-test",
+            Box::new(std::io::sink()),
+        );
+        for i in 0..10_000 {
+            if i % 13 == 0 {
+                terminal.advance_bytes(b"\r\n");
+            }
+            let text = format!(
+                "RAGGED_{i:05} {}{} END_{i:05}\r\n",
+                "ab 界 e\u{301} 🚀 xy\u{a0}z ".repeat((i * 37) % 61),
+                "q".repeat((i * 19) % 73),
+            );
+            terminal.advance_bytes(text.as_bytes());
+        }
+        terminal.resize(test_size(24, 69, 96));
+        let screen = terminal.screen();
+        let plan = screen.capture_line_read(0..24).unwrap();
+        assert!(
+            plan.geometry.as_ref().unwrap().row_count > 65_536,
+            "exercise the actual ragged native workload above the old capture limit"
+        );
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let (layout, _) = plan
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .expect("ragged history must retain its admitted compact geometry");
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        let (reference, _) = plan
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(layout.source, reference.source);
+        assert_eq!(layout.visual, reference.visual);
+        assert_eq!(layout.groups, reference.groups);
+        for top in [0, layout.visual.end / 3, layout.visual.end - 24] {
+            let mut fast = screen.capture_line_read(top..top + 24).unwrap();
+            fast.layout = Some(layout.clone());
+            let fast = fast.hydrate(|| false).unwrap();
+            let mut slow = screen.capture_line_read(top..top + 24).unwrap();
+            slow.geometry = None;
+            slow.layout = Some(reference.clone());
+            let slow = slow.hydrate(|| false).unwrap();
+            assert_eq!(fast.first_row(), slow.first_row());
+            assert_eq!(
+                fast.lines().cloned().collect::<Vec<_>>(),
+                slow.lines().cloned().collect::<Vec<_>>(),
+                "historical viewport at {top}"
+            );
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn admitted_geometry_native_parser_corpus_avoids_history_reads() {
         const PARAGRAPHS: usize = 10_000;
         let sink = Arc::new(TestColdScrollbackSink::default());
