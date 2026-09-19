@@ -1565,7 +1565,7 @@ impl Pane for LocalPane {
         Some(
             self.terminal
                 .try_lock()
-                .ok_or_else(|| anyhow::anyhow!("terminal busy"))
+                .ok_or_else(|| anyhow::Error::new(frankenterm_term::screen::ColdReadMetadataBusy))
                 .and_then(|term| term.screen().capture_line_read_with_budget(lines, budget)),
         )
     }
@@ -1601,10 +1601,22 @@ impl Pane for LocalPane {
         true
     }
 
-    fn get_line_layout(&self) -> Option<(SequenceNo, RenderableDimensions)> {
-        let mut term = self.terminal.try_lock()?;
-        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
-        Some((floor, terminal_get_dimensions(&mut term)))
+    fn get_line_layout(
+        &self,
+    ) -> Result<
+        Option<(SequenceNo, RenderableDimensions)>,
+        frankenterm_term::screen::ColdReadMetadataBusy,
+    > {
+        let mut term = self
+            .terminal
+            .try_lock()
+            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+        let Some(floor) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((floor, terminal_get_dimensions(&mut term))))
     }
 
     fn publish_line_reads_at_layout(
@@ -1613,13 +1625,15 @@ impl Pane for LocalPane {
         expected_seqno: SequenceNo,
         expected_dimensions: RenderableDimensions,
         publish: &mut dyn FnMut(),
-    ) -> bool {
-        let Some(mut term) = self.terminal.try_lock() else {
-            return false;
-        };
-        let Some(floor) = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let mut term = self
+            .terminal
+            .try_lock()
+            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+        let Some(floor) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
         else {
-            return false;
+            return Ok(false);
         };
         if expected_seqno == SequenceNo::MAX
             || expected_seqno < floor
@@ -1628,11 +1642,13 @@ impl Pane for LocalPane {
                 &terminal_get_dimensions(&mut term),
                 &expected_dimensions,
             )
-            || !reads
-                .iter()
-                .all(|read| term.screen().validates_line_read(read))
         {
-            return false;
+            return Ok(false);
+        }
+        for read in reads {
+            if !term.screen().try_validate_line_read(read)? {
+                return Ok(false);
+            }
         }
         if reads
             .iter()
@@ -1647,10 +1663,10 @@ impl Pane for LocalPane {
             // before accepting coordinates from a refreshed client request.
             // The CurrentPane caller sends notify_lines_ready after this
             // false result; do not reacquire registration authority here.
-            return false;
+            return Ok(false);
         }
         publish();
-        true
+        Ok(true)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -3010,9 +3026,13 @@ impl LocalPane {
     fn refresh_line_layout_floor(
         observation: &LineLayoutObservation,
         term: &mut Terminal,
-    ) -> Option<SequenceNo> {
-        let mut observation = observation.try_lock()?;
-        let source_changed = term.screen_mut().refresh_cold_source_observation()?;
+    ) -> Result<Option<SequenceNo>, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let mut observation = observation
+            .try_lock()
+            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+        let Some(source_changed) = term.screen_mut().refresh_cold_source_observation()? else {
+            return Ok(None);
+        };
         let screen_changed = observation
             .as_ref()
             .is_some_and(|(witness, _)| !term.screen().matches_coordinate_witness(witness));
@@ -3020,7 +3040,7 @@ impl LocalPane {
             term.increment_seqno();
         }
         if term.current_seqno() == SequenceNo::MAX {
-            return None;
+            return Ok(None);
         }
         let floor = if source_changed || screen_changed {
             term.current_seqno()
@@ -3031,7 +3051,7 @@ impl LocalPane {
         }
         .max(term.screen().cold_visual_layout_seqno());
         *observation = Some((term.screen().capture_coordinate_witness(), floor));
-        Some(floor)
+        Ok(Some(floor))
     }
 
     /// Finalize the same layout authority used by frame capture before exposing
@@ -3047,7 +3067,11 @@ impl LocalPane {
         phase: &'static str,
     ) -> bool {
         let resize_sequence = term.current_seqno();
-        if Self::refresh_line_layout_floor(observation, term).is_none() {
+        if Self::refresh_line_layout_floor(observation, term)
+            .ok()
+            .flatten()
+            .is_none()
+        {
             // Busy storage/observation and saturated sequences are not proof of
             // an unchanged source. Keep the resize but publish no false receipt.
             metrics::counter!(
@@ -3082,7 +3106,9 @@ impl LocalPane {
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions)> {
         let mut term = self.terminal.try_lock()?;
-        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+            .ok()
+            .flatten()?;
         Some((
             floor,
             term.current_seqno(),
@@ -3106,6 +3132,8 @@ impl LocalPane {
             .try_lock()
             .ok_or(SelectionAnchorCaptureError::Busy)?;
         let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+            .ok()
+            .flatten()
             .ok_or(SelectionAnchorCaptureError::Busy)?;
         if floor != expected_floor || terminal_get_dimensions(&mut term) != expected_dimensions {
             return Err(SelectionAnchorCaptureError::SourceChanged);
@@ -3141,7 +3169,9 @@ impl LocalPane {
         Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
     )> {
         let mut term = self.terminal.try_lock()?;
-        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
+        let floor = Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+            .ok()
+            .flatten()?;
         let sequence = term.current_seqno();
         let points = term.screen().resolve_selection_anchor(anchor, sequence);
         Some((floor, sequence, terminal_get_dimensions(&mut term), points))
@@ -3172,7 +3202,9 @@ impl LocalPane {
         #[cfg(not(unix))]
         let _ = detect_password_input;
         let layout_floor =
-            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?;
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+                .ok()
+                .flatten()?;
         let dimensions = terminal_get_dimensions(&mut term);
         // Scrollback eviction and clearing can invalidate a stored viewport
         // without a GUI scroll event. Normalize against this same observation;
@@ -6759,7 +6791,7 @@ mod tests {
             .unwrap();
         assert!(pane.publish_line_reads(std::slice::from_ref(&successor), &mut || {}));
         assert!(pane.terminal.lock().screen().validates_line_read(&prior));
-        let (floor, dimensions) = pane.get_line_layout().unwrap();
+        let (floor, dimensions) = pane.get_line_layout().unwrap().unwrap();
         let sequence = pane.get_current_seqno();
         let mut publications = 0;
         assert!(
@@ -6768,12 +6800,13 @@ mod tests {
                 sequence,
                 dimensions,
                 &mut || publications += 1,
-            ),
+            )
+            .unwrap(),
             "retained prefix must publish without restarting a same-layout read"
         );
         assert_eq!(publications, 1);
         assert_eq!(pane.get_current_seqno(), sequence);
-        assert_eq!(pane.get_line_layout().unwrap().0, floor);
+        assert_eq!(pane.get_line_layout().unwrap().unwrap().0, floor);
 
         // Geometric compatibility is not source authority. Replacing a row
         // at the same coordinate must reject the captured bytes independently.
@@ -6814,27 +6847,33 @@ mod tests {
             .hydrate(|| false)
             .unwrap();
         let mut publications = 0;
-        let (layout_seqno, layout_dimensions) = pane.get_line_layout().unwrap();
-        assert!(pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&read),
-            layout_seqno,
-            layout_dimensions,
-            &mut || {}
-        ));
+        let (layout_seqno, layout_dimensions) = pane.get_line_layout().unwrap().unwrap();
+        assert!(pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&read),
+                layout_seqno,
+                layout_dimensions,
+                &mut || {}
+            )
+            .unwrap());
         let mut wrong_dimensions = layout_dimensions;
         wrong_dimensions.cols += 1;
-        assert!(!pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&read),
-            layout_seqno,
-            wrong_dimensions,
-            &mut || panic!("wrong layout published")
-        ));
-        assert!(!pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&read),
-            SequenceNo::MAX,
-            layout_dimensions,
-            &mut || panic!("saturated authority published")
-        ));
+        assert!(!pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&read),
+                layout_seqno,
+                wrong_dimensions,
+                &mut || panic!("wrong layout published")
+            )
+            .unwrap());
+        assert!(!pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&read),
+                SequenceNo::MAX,
+                layout_dimensions,
+                &mut || panic!("saturated authority published")
+            )
+            .unwrap());
         assert!(
             pane.publish_line_reads(std::slice::from_ref(&read), &mut || {
                 assert!(
@@ -6846,7 +6885,19 @@ mod tests {
         );
         {
             let _busy = pane.terminal.lock();
-            assert!(pane.get_line_layout().is_none());
+            assert_eq!(
+                pane.get_line_layout(),
+                Err(frankenterm_term::screen::ColdReadMetadataBusy)
+            );
+            assert_eq!(
+                pane.publish_line_reads_at_layout(
+                    std::slice::from_ref(&read),
+                    layout_seqno,
+                    layout_dimensions,
+                    &mut || panic!("busy terminal published"),
+                ),
+                Err(frankenterm_term::screen::ColdReadMetadataBusy),
+            );
             assert!(pane.selection_source_snapshot().is_none());
             assert!(
                 !pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1)
@@ -6856,13 +6907,43 @@ mod tests {
                 .unwrap()
                 .is_err());
         }
+        let before_busy = pane.get_current_seqno();
+        {
+            let _busy = pane.line_layout_observation.lock();
+            assert_eq!(
+                pane.get_line_layout(),
+                Err(frankenterm_term::screen::ColdReadMetadataBusy)
+            );
+            assert_eq!(
+                pane.publish_line_reads_at_layout(
+                    std::slice::from_ref(&read),
+                    layout_seqno,
+                    layout_dimensions,
+                    &mut || panic!("busy layout observation published"),
+                ),
+                Err(frankenterm_term::screen::ColdReadMetadataBusy),
+            );
+        }
+        assert_eq!(pane.get_current_seqno(), before_busy);
+        assert!(
+            pane.publish_line_reads_at_layout(
+                std::slice::from_ref(&read),
+                layout_seqno,
+                layout_dimensions,
+                &mut || {},
+            )
+            .unwrap(),
+            "released contention must permit the exact unchanged source"
+        );
         pane.terminal.lock().advance_bytes(b" changed");
-        assert!(!pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&read),
-            layout_seqno,
-            layout_dimensions,
-            &mut || panic!("stale layout published")
-        ));
+        assert!(!pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&read),
+                layout_seqno,
+                layout_dimensions,
+                &mut || panic!("stale layout published")
+            )
+            .unwrap());
         assert!(!pane.publish_line_reads(std::slice::from_ref(&read), &mut || publications += 1));
         assert_eq!(publications, 1);
         // Continued output on another row must not starve an exact retained
@@ -6877,32 +6958,36 @@ mod tests {
             .unwrap()
             .hydrate(|| false)
             .unwrap();
-        let (floor, dimensions) = pane.get_line_layout().unwrap();
+        let (floor, dimensions) = pane.get_line_layout().unwrap().unwrap();
         let observed = pane.get_current_seqno();
         let source_seqno = fresh.lines().next().unwrap().current_seqno();
         pane.terminal.lock().advance_bytes(b"other row");
         assert_eq!(pane.get_lines(0..1).1[0].current_seqno(), source_seqno);
         assert!(pane.get_current_seqno() > observed);
-        assert_eq!(pane.get_line_layout().unwrap().0, floor);
-        assert!(pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&fresh),
-            observed,
-            dimensions,
-            &mut || {}
-        ));
+        assert_eq!(pane.get_line_layout().unwrap().unwrap().0, floor);
+        assert!(pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&fresh),
+                observed,
+                dimensions,
+                &mut || {}
+            )
+            .unwrap());
         pane.terminal
             .lock()
             .advance_bytes(b"\x1b[?1049h\x1b[?1049l");
         assert!(
-            pane.get_line_layout().unwrap().0 > observed,
+            pane.get_line_layout().unwrap().unwrap().0 > observed,
             "unobserved alternate-screen round trip cannot reuse layout authority"
         );
-        assert!(!pane.publish_line_reads_at_layout(
-            std::slice::from_ref(&fresh),
-            observed,
-            dimensions,
-            &mut || panic!("alternate-screen ABA published")
-        ));
+        assert!(!pane
+            .publish_line_reads_at_layout(
+                std::slice::from_ref(&fresh),
+                observed,
+                dimensions,
+                &mut || panic!("alternate-screen ABA published")
+            )
+            .unwrap());
     }
 
     #[test]
@@ -7329,7 +7414,7 @@ mod tests {
             assert!(published > before);
             assert_eq!(
                 LocalPane::refresh_line_layout_floor(&observation, &mut term),
-                Some(published)
+                Ok(Some(published))
             );
             assert_eq!(term.current_seqno(), published);
         }
@@ -7365,7 +7450,7 @@ mod tests {
         let observation = Mutex::new(None);
         assert_eq!(
             LocalPane::refresh_line_layout_floor(&observation, &mut term),
-            Some(SequenceNo::MAX - 2)
+            Ok(Some(SequenceNo::MAX - 2))
         );
         term.resize(term_size(123, 24));
         assert_eq!(term.current_seqno(), SequenceNo::MAX - 1);
@@ -7379,7 +7464,10 @@ mod tests {
                 phase,
             ));
             assert_eq!(term.current_seqno(), SequenceNo::MAX);
-            assert!(LocalPane::refresh_line_layout_floor(&observation, &mut term).is_none());
+            assert_eq!(
+                LocalPane::refresh_line_layout_floor(&observation, &mut term),
+                Ok(None)
+            );
         }
     }
 

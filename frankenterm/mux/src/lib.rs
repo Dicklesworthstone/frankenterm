@@ -4150,10 +4150,13 @@ mod pane_registration_handle {
 
         pub fn get_line_layout(
             &self,
-        ) -> Option<(
-            termwiz::surface::SequenceNo,
-            crate::renderable::RenderableDimensions,
-        )> {
+        ) -> Result<
+            Option<(
+                termwiz::surface::SequenceNo,
+                crate::renderable::RenderableDimensions,
+            )>,
+            frankenterm_term::screen::ColdReadMetadataBusy,
+        > {
             self.pane.get_line_layout()
         }
 
@@ -4163,7 +4166,7 @@ mod pane_registration_handle {
             expected_seqno: termwiz::surface::SequenceNo,
             expected_dimensions: crate::renderable::RenderableDimensions,
             publish: &mut dyn FnMut(),
-        ) -> bool {
+        ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
             self.pane.publish_line_reads_at_layout(
                 reads,
                 expected_seqno,

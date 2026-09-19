@@ -6442,10 +6442,11 @@ impl MuxErrorCode {
     pub const QUOTA_EXCEEDED: Self = Self(9);
     pub const BACKEND_FAILURE: Self = Self(10);
     pub const INDETERMINATE_MUTATION: Self = Self(11);
+    pub const RESOURCE_BUSY: Self = Self(12);
 
     #[must_use]
     pub const fn is_known(self) -> bool {
-        matches!(self.0, 1..=11)
+        matches!(self.0, 1..=12)
     }
 
     #[must_use]
@@ -6462,6 +6463,7 @@ impl MuxErrorCode {
             9 => "quota_exceeded",
             10 => "backend_failure",
             11 => "indeterminate_mutation",
+            12 => "resource_busy",
             _ => "unknown",
         }
     }
@@ -6736,6 +6738,17 @@ impl ErrorResponse {
     }
 
     #[must_use]
+    pub const fn resource_busy(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::RESOURCE_BUSY,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        )
+    }
+
+    #[must_use]
     pub const fn indeterminate_mutation(
         request_ident: u64,
         object: Option<MuxErrorObject>,
@@ -6806,6 +6819,7 @@ impl ErrorResponse {
             MuxErrorCode::DEADLINE_EXCEEDED
                 | MuxErrorCode::QUOTA_EXCEEDED
                 | MuxErrorCode::BACKEND_FAILURE
+                | MuxErrorCode::RESOURCE_BUSY
         ) {
             self.effect == MuxErrorEffect::NOT_APPLIED
                 && self.retry == MuxErrorRetry::SAFE_AFTER_BACKOFF
@@ -25518,6 +25532,7 @@ mod test {
             ErrorResponse::deadline_exceeded(request),
             ErrorResponse::quota_exceeded(request),
             ErrorResponse::backend_failure(request),
+            ErrorResponse::resource_busy(request),
             ErrorResponse::indeterminate_mutation(
                 request,
                 Some(MuxErrorObject {
@@ -25590,6 +25605,63 @@ mod test {
                 .encode_frame_with_mode(2, CompressionMode::Never)
                 .is_err(),
             "a code without object authority must not smuggle an object identity"
+        );
+
+        let busy_with_object = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode::RESOURCE_BUSY,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: 7,
+            }),
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        );
+        assert!(
+            busy_with_object.validate().is_err(),
+            "resource_busy must not carry an object identity"
+        );
+        assert!(
+            Pdu::ErrorResponse(busy_with_object)
+                .encode_frame_with_mode(3, CompressionMode::Never)
+                .is_err(),
+            "resource_busy with object must fail serialization"
+        );
+
+        let busy_with_contradictory_effect = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode::RESOURCE_BUSY,
+            None,
+            MuxErrorEffect::INDETERMINATE,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        );
+        assert!(
+            busy_with_contradictory_effect.validate().is_err(),
+            "resource_busy must reject indeterminate effect"
+        );
+        assert!(
+            Pdu::ErrorResponse(busy_with_contradictory_effect)
+                .encode_frame_with_mode(4, CompressionMode::Never)
+                .is_err(),
+            "resource_busy with indeterminate effect must fail serialization"
+        );
+
+        let busy_with_contradictory_retry = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode::RESOURCE_BUSY,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        );
+        assert!(
+            busy_with_contradictory_retry.validate().is_err(),
+            "resource_busy must reject never retry"
+        );
+        assert!(
+            Pdu::ErrorResponse(busy_with_contradictory_retry)
+                .encode_frame_with_mode(5, CompressionMode::Never)
+                .is_err(),
+            "resource_busy with never retry must fail serialization"
         );
     }
 

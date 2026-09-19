@@ -645,12 +645,17 @@ mod alphabet_test {
         let (_, sequence, dimensions) =
             crate::selection::SelectionAuthority::capture_source(&*fixture.pane).unwrap();
         let mut published = false;
-        assert!(fixture.pane.publish_line_reads_at_layout(
-            ready.plans.as_ref().unwrap().as_ref().unwrap(),
-            sequence,
-            dimensions,
-            &mut || published = true,
-        ));
+        assert!(
+            fixture
+                .pane
+                .publish_line_reads_at_layout(
+                    ready.plans.as_ref().unwrap().as_ref().unwrap(),
+                    sequence,
+                    dimensions,
+                    &mut || published = true,
+                )
+                .unwrap_or(false)
+        );
         assert!(
             published,
             "the actual worker returned publishable read plans"
@@ -940,6 +945,7 @@ mod alphabet_test {
             pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
                 baseline_published = true;
             })
+            .unwrap_or(false)
         );
         assert!(baseline_published);
 
@@ -949,9 +955,11 @@ mod alphabet_test {
 
         // Publication of the old plan MUST fail because screen line generation changed
         let mut published = false;
-        let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
-            published = true;
-        });
+        let ok = pane
+            .publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                published = true;
+            })
+            .unwrap_or(false);
 
         assert!(
             !ok || !published,
@@ -977,9 +985,11 @@ mod alphabet_test {
 
         let plans = [plan];
         let mut published = false;
-        let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
-            published = true;
-        });
+        let ok = pane
+            .publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                published = true;
+            })
+            .unwrap_or(false);
 
         assert!(
             ok && published,
@@ -1087,9 +1097,11 @@ mod alphabet_test {
         // 1. Publication under lock fails without executing callback
         let mut published = false;
         fixture.with_locked_terminal(|| {
-            let ok = pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
-                published = true;
-            });
+            let ok = pane
+                .publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
+                    published = true;
+                })
+                .unwrap_or(false);
             assert!(
                 !ok || !published,
                 "Publication must fail while terminal lock is held"
@@ -1122,6 +1134,7 @@ mod alphabet_test {
             pane.publish_line_reads_at_layout(&plans, seqno, dims, &mut || {
                 published = true;
             })
+            .unwrap_or(false)
         );
         assert!(
             published,
@@ -2696,9 +2709,11 @@ fn advance_quick_select_accepted_action(
     };
 
     let mut published = false;
-    let ok = pane.publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
-        published = true;
-    });
+    let ok = pane
+        .publish_line_reads_at_layout(plans, sequence, dimensions, &mut || {
+            published = true;
+        })
+        .unwrap_or(false);
 
     if !ok || !published {
         if now >= action.deadline {
