@@ -2896,8 +2896,7 @@ impl GuardianRecoveryClaimIntentV1 {
             self.predecessor_mux_build,
             self.target_mux_build,
         ]
-        .iter()
-        .any(|digest| *digest == [0; 32])
+        .contains(&[0; 32])
             || [
                 self.pane_id,
                 self.guardian_incarnation,
