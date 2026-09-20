@@ -10046,17 +10046,13 @@ mod tests {
         // Use a zero elapsed reservation check to avoid wall-clock scheduling
         // making a nominally fast baseline cross the slow-request threshold.
         for _ in 0..4 {
-            let timing = LineReadTiming {
-                outcome: "success",
-                ..LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88)
-            };
+            let mut timing = LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88);
+            timing.outcome = "success";
             assert!(timing.reserve_sample(std::time::Duration::ZERO));
             std::mem::forget(timing);
         }
-        let timing = LineReadTiming {
-            outcome: "success",
-            ..LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88)
-        };
+        let mut timing = LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88);
+        timing.outcome = "success";
         assert!(!timing.reserve_sample(std::time::Duration::ZERO));
         std::mem::forget(timing);
 
