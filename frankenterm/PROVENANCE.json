@@ -641,21 +641,21 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 203,
-        "fix": 266,
+        "fix": 267,
         "other": 54,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 105
+        "test": 106
       },
-      "fork_side_commit_count": 700,
+      "fork_side_commit_count": 702,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-20T08:29:43-04:00",
-        "sha": "8992f5fb3c2ee1062551d6472bd0edcf0d35de75",
-        "subject": "feat(recovery): prepare private topology and preserve workspace metadata"
+        "classification": "fix",
+        "committed_at": "2026-09-20T08:49:37-04:00",
+        "sha": "ba2859e2e9606e6bacb0b2f273dca8929492d6f8",
+        "subject": "fix(recovery): preserve tab focus and layout policy in authenticated images"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2862,
+  "fork_side_commit_total": 2864,
   "generated_at": "2026-09-20T10:39:00Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
