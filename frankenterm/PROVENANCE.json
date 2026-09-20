@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 202,
-        "fix": 265,
+        "fix": 266,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 105
       },
-      "fork_side_commit_count": 698,
+      "fork_side_commit_count": 699,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-20T06:37:43-04:00",
-        "sha": "447b16ec58829524d28d0e32458661f5a5d94b1b",
-        "subject": "test(recovery): inventory historical candidate identity construction"
+        "classification": "fix",
+        "committed_at": "2026-09-20T06:59:38-04:00",
+        "sha": "8b70531c6d239946f0d717d74de6a8a75ceb669b",
+        "subject": "fix(recovery): use explicit historical digest binding"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2857,
+  "fork_side_commit_total": 2858,
   "generated_at": "2026-09-20T10:39:00Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
