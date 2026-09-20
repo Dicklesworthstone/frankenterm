@@ -542,10 +542,18 @@ mod tests {
         let mux = Arc::new(mux::Mux::new(Some(Arc::clone(&domain))));
         let window = mux.new_empty_window(None, None);
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        let command = config::Config::default().build_prog(Some(vec![
-                std::ffi::OsStr::new("/bin/sh"), std::ffi::OsStr::new("-c"),
-                std::ffi::OsStr::new("/bin/stty -echo; printf '\033]2;first-root\007'; while IFS= read -r title; do printf '\033]2;%s\007' \"$title\"; done"),
-        ]), None, None).unwrap();
+        let script = r#"/bin/stty -echo || exit 1; printf '\033]2;first-root\007'; while IFS= read -r title; do printf '\033]2;%s\007' "$title"; done"#;
+        let command = config::Config::default()
+            .build_prog(
+                Some(vec![
+                    std::ffi::OsStr::new("/bin/sh"),
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(script),
+                ]),
+                None,
+                None,
+            )
+            .unwrap();
         let tab = runtime
             .block_on(domain.spawn(
                 &mux,
