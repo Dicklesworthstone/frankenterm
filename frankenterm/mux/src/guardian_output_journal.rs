@@ -472,9 +472,12 @@ impl GuardianEncryptedScrollbackRow {
 
     /// Encode the canonical opaque storage record.
     pub fn encode(&self) -> Result<String, GuardianScrollbackRowError> {
+        let binary_bytes = SCROLLBACK_ROW_HEADER_BYTES
+            .checked_add(self.ciphertext.len())
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(SCROLLBACK_ROW_HEADER_BYTES + self.ciphertext.len())
+            .try_reserve_exact(binary_bytes)
             .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
         bytes.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&self.key_id);
@@ -486,8 +489,19 @@ impl GuardianEncryptedScrollbackRow {
         bytes.extend_from_slice(&self.plaintext_bytes.to_le_bytes());
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.ciphertext);
-        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
-        Ok(format!("{SCROLLBACK_ROW_RECORD_PREFIX}{encoded}"))
+        let encoded_capacity = binary_bytes
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_div(3))
+            .and_then(|bytes| bytes.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(SCROLLBACK_ROW_RECORD_PREFIX.len()))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let mut record = String::new();
+        record
+            .try_reserve_exact(encoded_capacity)
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        record.push_str(SCROLLBACK_ROW_RECORD_PREFIX);
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode_string(bytes, &mut record);
+        Ok(record)
     }
 }
 
@@ -4281,6 +4295,23 @@ mod tests {
             .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024)
             .expect("authenticate exact row");
         assert_eq!(opened.as_slice(), plaintext);
+
+        // Exercise all base64 remainders and either side of the chunked
+        // encoder's 768-byte binary input boundary (header plus AEAD tag).
+        for plaintext_bytes in [1, 2, 3, 655, 656, 657] {
+            let plaintext = vec![0xa5; plaintext_bytes];
+            let sealed = cipher
+                .seal_scrollback_row(scrollback_identity(), &plaintext)
+                .expect("seal chunk-boundary row");
+            let encoded = sealed.encode().expect("encode chunk-boundary row");
+            let parsed = GuardianEncryptedScrollbackRow::parse(&encoded)
+                .expect("parse canonical chunk-boundary row");
+            assert_eq!(parsed.encode().expect("reencode canonical row"), encoded);
+            let opened = cipher
+                .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024)
+                .expect("authenticate chunk-boundary row");
+            assert_eq!(opened.as_slice(), plaintext);
+        }
     }
 
     #[test]
