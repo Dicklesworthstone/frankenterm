@@ -3285,6 +3285,7 @@ mod tests {
     struct ScriptedAppendFile {
         file: File,
         steps: std::collections::VecDeque<AppendWriteStep>,
+        first_buffer_only: bool,
     }
 
     impl Write for ScriptedAppendFile {
@@ -3293,9 +3294,25 @@ mod tests {
         }
 
         fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            // Exercise the Windows File fallback with actual file writes on
+            // every host, including prefixes crossing a record/newline edge.
+            let slices = if self.first_buffer_only {
+                slices
+                    .iter()
+                    .find(|slice| !slice.is_empty())
+                    .map(std::slice::from_ref)
+                    .unwrap_or(&[])
+            } else {
+                slices
+            };
             match self.steps.pop_front() {
                 Some(AppendWriteStep::Prefix(limit)) => {
-                    write_vectored_prefix(&mut self.file, slices, limit)
+                    let written = write_vectored_prefix(&mut self.file, slices, limit)?;
+                    if written < limit {
+                        self.steps
+                            .push_front(AppendWriteStep::Prefix(limit - written));
+                    }
+                    Ok(written)
                 }
                 Some(AppendWriteStep::Interrupted) => Err(std::io::ErrorKind::Interrupted.into()),
                 Some(AppendWriteStep::Zero) => Ok(0),
@@ -3337,29 +3354,32 @@ mod tests {
                 5,
             ),
         ] {
-            let dir = temp_dir();
-            let path = dir.path().join("vectored.log");
-            let mut writer = ScriptedAppendFile {
-                file: File::create(&path).unwrap(),
-                steps: steps.into(),
-            };
-            let mut slices = [
-                IoSlice::new(b""),
-                IoSlice::new(b"abc"),
-                IoSlice::new(b"\n"),
-                IoSlice::new("界".as_bytes()),
-                IoSlice::new(b"\n"),
-                IoSlice::new(b"z"),
-                IoSlice::new(b"\n"),
-            ];
-            let result = write_append_slices(&mut writer, &mut slices);
-            assert_eq!(result.err().map(|error| error.kind()), error);
-            assert!(
-                writer.steps.is_empty(),
-                "all injected boundaries must execute"
-            );
-            writer.file.sync_data().unwrap();
-            assert_eq!(std::fs::read(&path).unwrap(), &expected[..written]);
+            for first_buffer_only in [false, true] {
+                let dir = temp_dir();
+                let path = dir.path().join("vectored.log");
+                let mut writer = ScriptedAppendFile {
+                    file: File::create(&path).unwrap(),
+                    steps: steps.clone().into(),
+                    first_buffer_only,
+                };
+                let mut slices = [
+                    IoSlice::new(b""),
+                    IoSlice::new(b"abc"),
+                    IoSlice::new(b"\n"),
+                    IoSlice::new("界".as_bytes()),
+                    IoSlice::new(b"\n"),
+                    IoSlice::new(b"z"),
+                    IoSlice::new(b"\n"),
+                ];
+                let result = write_append_slices(&mut writer, &mut slices);
+                assert_eq!(result.err().map(|error| error.kind()), error);
+                assert!(
+                    writer.steps.is_empty(),
+                    "all injected boundaries must execute"
+                );
+                writer.file.sync_data().unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), &expected[..written]);
+            }
         }
     }
 
