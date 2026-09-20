@@ -3993,7 +3993,9 @@ impl LocalPane {
                 }
             }
             if let Some(anchor) = viewport.cold_anchor.as_ref() {
-                if let Some(group) = term.screen().cold_viewport_anchor_group(anchor).ok()? {
+                if let Some(requested) =
+                    term.screen().cold_viewport_anchor_read_range(anchor).ok()?
+                {
                     let registration = self.mux_registration.load()?;
                     let resolved = COLD_VIEWPORT_CACHE.try_lock()?.iter().find_map(|entry| {
                         if entry.registration != registration.wire_identity()
@@ -4009,9 +4011,11 @@ impl LocalPane {
                         // Hydration is worker-owned and must never run under
                         // terminal ownership. Retain the original anchor while
                         // the new-width group is fetched; do not paint its old
-                        // numeric row in the meantime.
+                        // numeric row in the meantime. A stale layout first
+                        // requests a bounded geometry refresh; the next capture
+                        // then requests the anchor's actual logical group.
                         drop(term);
-                        self.cold_viewport_lines(group);
+                        self.cold_viewport_lines(requested);
                         return None;
                     }
                 } else {
@@ -9307,6 +9311,16 @@ mod tests {
             assert_eq!(frame.lines[0].as_str(), expected);
             viewport = frame.viewport.unwrap();
             assert!(viewport.cold_anchor.is_some());
+            if cols == 13 {
+                // Ordinary output advances the cold frontier without issuing
+                // a new resize. A stale layout must trigger its own hydration
+                // instead of waiting forever for a nonexistent resize worker.
+                pane.terminal.lock().advance_bytes(b"live\r\n");
+                let frame = capture(viewport);
+                assert_eq!(frame.lines[0].as_str(), expected);
+                viewport = frame.viewport.unwrap();
+                assert!(viewport.cold_anchor.is_some());
+            }
         }
     }
 

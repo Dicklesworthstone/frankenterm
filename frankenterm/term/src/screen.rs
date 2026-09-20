@@ -4279,10 +4279,13 @@ impl Screen {
         self.try_validate_line_read(read).unwrap_or(false)
     }
 
-    /// Locate the retained group without loading payload. Busy layout/source
-    /// metadata must defer a paint; only an invalidated source drops the anchor.
+    /// Plan the read needed to resolve a retained viewport anchor. With current
+    /// geometry this is its complete logical group. Otherwise request the last
+    /// cold row to rebuild geometry on the hydration worker before locating the
+    /// group. The refresh range is never a resolved viewport position.
+    /// Busy source metadata defers a paint; invalidated sources drop the anchor.
     #[cfg(feature = "use_serde")]
-    pub fn cold_viewport_anchor_group(
+    pub fn cold_viewport_anchor_read_range(
         &self,
         anchor: &ColdViewportAnchor,
     ) -> Result<Option<Range<StableRowIndex>>, ColdReadMetadataBusy> {
@@ -4302,10 +4305,20 @@ impl Screen {
         if !interval.retains(&anchor.interval, anchor.source.clone()) {
             return Ok(None);
         }
-        let layout = self
-            .cold_visual_layout_for_interval(&interval)
-            .ok_or(ColdReadMetadataBusy)?;
-        Ok(layout.viewport_anchor_group(anchor))
+        if let Some(layout) = self.cold_visual_layout_for_interval(&interval) {
+            return Ok(layout.viewport_anchor_group(anchor));
+        }
+        // Appending output can advance the resident frontier and invalidate a
+        // reflowed layout without scheduling a resize worker. The cold visual
+        // interval ends at this frontier at every width, so its last row is a
+        // bounded refresh request even while the visual origin is unknown.
+        let frontier = self.phys_to_stable_row_index(0);
+        let rows = interval.rows().ok_or(ColdReadMetadataBusy)?;
+        let last = frontier.checked_sub(1).ok_or(ColdReadMetadataBusy)?;
+        if last < rows.start || frontier > rows.end {
+            return Err(ColdReadMetadataBusy);
+        }
+        Ok(Some(last..frontier))
     }
 
     /// Publication callers that can retry must distinguish transient metadata
@@ -10798,14 +10811,23 @@ pub(crate) mod tests {
             let seqno = index as SequenceNo + 2;
             cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
             assert!(!screen.validates_line_read(&initial));
+            let refresh = screen
+                .cold_viewport_anchor_read_range(&anchor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(refresh.end, screen.phys_to_stable_row_index(0));
+            assert_eq!(refresh.end - refresh.start, 1);
             let layout = screen
-                .capture_line_read(2..3)
+                .capture_line_read(refresh)
                 .unwrap()
                 .hydrate(|| false)
                 .unwrap();
             assert!(screen.validates_line_read(&layout));
             screen.install_line_read_layout(&layout, seqno);
-            let group = screen.cold_viewport_anchor_group(&anchor).unwrap().unwrap();
+            let group = screen
+                .cold_viewport_anchor_read_range(&anchor)
+                .unwrap()
+                .unwrap();
             let ready = screen
                 .capture_line_read(group)
                 .unwrap()
@@ -10824,7 +10846,7 @@ pub(crate) mod tests {
             endpoint.cells = 28;
             let row = ready.resolve_viewport_anchor(&endpoint).unwrap();
             let group = screen
-                .cold_viewport_anchor_group(&endpoint)
+                .cold_viewport_anchor_read_range(&endpoint)
                 .unwrap()
                 .unwrap();
             assert_eq!(row, group.end - 1);
@@ -10833,13 +10855,13 @@ pub(crate) mod tests {
         }
         sink.force_busy_probe.store(true, Ordering::Relaxed);
         assert_eq!(
-            screen.cold_viewport_anchor_group(&anchor),
+            screen.cold_viewport_anchor_read_range(&anchor),
             Err(ColdReadMetadataBusy)
         );
         sink.force_busy_probe.store(false, Ordering::Relaxed);
         *sink.interval_identity.lock().unwrap() =
             crate::config::ScrollbackIntervalIdentity::default();
-        assert_eq!(screen.cold_viewport_anchor_group(&anchor), Ok(None));
+        assert_eq!(screen.cold_viewport_anchor_read_range(&anchor), Ok(None));
     }
 
     #[cfg(feature = "use_serde")]
