@@ -966,6 +966,10 @@ def measure(args):
            "FT_REMOTE_MUX_PROFILE_WATCHDOG_SECONDS": "600"}
     if args.profile_phases:
         env["FT_REMOTE_MUX_PROFILE_PHASES"] = "1"
+        # Headless muxes do not install a metrics recorder. The bounded,
+        # content-free refusal summaries identify contention only in this
+        # explicitly instrumented arm; latency acceptance stays uninstrumented.
+        env["RUST_LOG"] = "info,mux::metadata_refusal=debug"
     for kind in ("CONFIG", "CACHE", "DATA", "STATE", "RUNTIME"):
         env[f"XDG_{kind}_HOME" if kind != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(root / kind.lower())
     script = pathlib.Path(__file__).resolve()
