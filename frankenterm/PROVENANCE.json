@@ -851,19 +851,19 @@
         "cosmetic": 7,
         "feat": 14,
         "fix": 46,
-        "other": 30,
+        "other": 31,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 22
       },
-      "fork_side_commit_count": 129,
+      "fork_side_commit_count": 130,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-20T01:27:29-04:00",
-        "sha": "bd616e0e776251308bc0756c1f2ca80bd8774901",
-        "subject": "fix(term): retain concurrent all-space reflow repair"
+        "classification": "other",
+        "committed_at": "2026-09-20T08:14:25-04:00",
+        "sha": "92980feedb0a7748ade16f1b056b9b6a214ff86d",
+        "subject": "perf(scrollback): canonicalize compact rows without cell vectors"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2860,
+  "fork_side_commit_total": 2861,
   "generated_at": "2026-09-20T10:39:00Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
