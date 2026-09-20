@@ -3414,6 +3414,63 @@ mod tests {
     }
 
     #[test]
+    fn resize_saved_pending_wrap_preserves_subsequent_typing() {
+        for (old_cols, new_cols, setup, expected) in [
+            (5, 10, "ABCDE", "ABCDEZ"),
+            (10, 12, "\x1b[?69h\x1b[3;6sABCD", "  ABCDZ"),
+        ] {
+            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+                kitty_budget: 1024,
+                unicode_version: UnicodeVersion::new(14),
+                scorecard_enabled: true,
+                checksum_rectangular_area: false,
+            });
+            let original_size = TerminalSize {
+                rows: 4,
+                cols: old_cols,
+                pixel_width: old_cols * 10,
+                pixel_height: 80,
+                dpi: 96,
+            };
+            let mut terminal = crate::Terminal::new(
+                original_size,
+                config,
+                "test",
+                "1",
+                Box::new(std::io::sink()),
+            );
+            terminal.advance_bytes(setup.as_bytes());
+            terminal.advance_bytes(b"\x1b[?1049h");
+            assert!(terminal
+                .screen
+                .screen
+                .saved_cursor
+                .as_ref()
+                .expect("1049 saves the primary cursor")
+                .wrap_next);
+
+            terminal.resize(TerminalSize {
+                cols: new_cols,
+                pixel_width: new_cols * 10,
+                ..original_size
+            });
+            terminal.advance_bytes(b"\x1b[?1049lZ");
+
+            // Restoring a pending wrap after widening must insert after the
+            // original final glyph, including when it reached a narrow margin.
+            // An independent text oracle catches two resize paths agreeing on
+            // the same erroneous overwrite or premature newline.
+            let lines = terminal.screen().all_lines();
+            let nonempty: Vec<String> = lines
+                .iter()
+                .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+                .filter(|line| !line.is_empty())
+                .collect();
+            assert_eq!(nonempty, vec![expected.to_owned()], "old_cols={old_cols}");
+        }
+    }
+
+    #[test]
     fn prepared_terminal_resize_preserves_primary_alternate_and_saved_cursor() {
         for alternate_active in [false, true] {
             let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
