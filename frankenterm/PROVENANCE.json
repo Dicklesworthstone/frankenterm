@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 54,
-        "fix": 104,
+        "fix": 105,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 36
       },
-      "fork_side_commit_count": 248,
+      "fork_side_commit_count": 249,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-19T12:40:53-04:00",
-        "sha": "b1bf90f241f449bb849276d8d2c983734b5acdda",
-        "subject": "fix(client): admit replacement pane fetch retry owners independently"
+        "committed_at": "2026-09-20T07:13:25-04:00",
+        "sha": "609c3a4d38298311ef30d1f92d061872f1268f3e",
+        "subject": "fix(input): bound remote mouse queue and retain worker admission"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2858,
+  "fork_side_commit_total": 2859,
   "generated_at": "2026-09-20T10:39:00Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
