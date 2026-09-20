@@ -1178,14 +1178,14 @@ impl super::TermWindow {
                     if amount > 0 {
                         TMB::WheelUp(amount as usize)
                     } else {
-                        TMB::WheelDown((-amount) as usize)
+                        TMB::WheelDown(amount.unsigned_abs() as usize)
                     }
                 }
                 WMEK::HorzWheel(amount) => {
                     if amount > 0 {
                         TMB::WheelLeft(amount as usize)
                     } else {
-                        TMB::WheelRight((-amount) as usize)
+                        TMB::WheelRight(amount.unsigned_abs() as usize)
                     }
                 }
             },
