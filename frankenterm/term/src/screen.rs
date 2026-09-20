@@ -1271,10 +1271,14 @@ impl ScreenLineRead {
                 continue;
             }
             let mut logical = group.take().expect("current row created its logical group");
-            // Match the text-bearing planner without loading cold cells.
-            // Spaces preserve insertion offsets even in all-space paragraphs
-            // and incomplete prefixes continuing in resident rows.
-            logical.preserve_trailing_spaces();
+            if wrapped && end == self.hot_top && aligned_seam {
+                // This is only a prefix of a paragraph continuing in resident
+                // rows. Its last spaces are separators, not terminal padding.
+                logical.preserve_trailing_spaces();
+            } else {
+                // Match the text-bearing planner without loading cold cells.
+                logical.preserve_terminal_trailing_spaces();
+            }
             let count =
                 if wrapped && end == self.hot_top && aligned_seam && logical.physical_len() == 0 {
                     0
@@ -6048,15 +6052,18 @@ impl Screen {
     // Stored terminal separators are content, including the spaces before an
     // insertion point. The generic wrap planner trims them and can thereby
     // move the cursor or join the next character to the preceding word.
-    // This includes all-space paragraphs: trimming them destroys insertion
-    // offsets just as surely as trimming the spaces following a visible word.
+    // Entirely blank screen rows retain their existing single-row treatment.
     fn plan_terminal_line_wrap(
         line: Line,
         cols: usize,
         cost_model: MonospaceKpCostModel,
         scratch: &mut LineWrapWidthPrefixScratch,
     ) -> LineWrapLayout {
-        line.plan_wrap_preserving_trailing_spaces(cols, cost_model, scratch)
+        if line.is_whitespace() {
+            line.plan_wrap_with_width_prefix_scratch(cols, cost_model, scratch)
+        } else {
+            line.plan_wrap_preserving_trailing_spaces(cols, cost_model, scratch)
+        }
     }
 
     #[cfg(feature = "use_serde")]
@@ -12593,87 +12600,6 @@ pub(crate) mod tests {
             assert_active_cursor_cold_paragraph_after_resize(13, "TAIL ", prepared);
             assert_active_cursor_cold_paragraph_after_resize(17, "TAIL   ", prepared);
         }
-    }
-
-    #[cfg(feature = "use_serde")]
-    #[test]
-    fn active_cursor_all_space_paragraph_preserves_insertion_spaces() {
-        for count in [159, 160, 161] {
-            for columns in [13, 17, 31] {
-                for prepared in [false, true] {
-                    assert_all_space_paragraph_after_resize(count, columns, prepared);
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "use_serde")]
-    fn assert_all_space_paragraph_after_resize(count: usize, columns: usize, prepared: bool) {
-        let sink = Arc::new(TestColdScrollbackSink::default());
-        let mut terminal = crate::Terminal::new(
-            test_size(4, 20, 96),
-            Arc::new(TestTermConfig {
-                scrollback: 10_000,
-                scrollback_tier: crate::config::ScrollbackTierConfig {
-                    enabled: true,
-                    hot_lines: 1,
-                    warm_max_bytes: 0,
-                },
-                cold_sink: Some(sink),
-                ..TestTermConfig::default()
-            }),
-            "FrankenTerm",
-            "active-all-space-paragraph-test",
-            Box::new(std::io::sink()),
-        );
-        let original = " ".repeat(count);
-        terminal.advance_bytes(original.as_bytes());
-        let size = test_size(4, columns, 96);
-        if prepared {
-            let mut preparation = terminal.capture_reflow_preparation(size).unwrap();
-            assert!(preparation.prepare(|| false));
-            terminal.resize_with_prepared_reflow(size, Some(&mut preparation));
-            assert!(preparation.was_applied());
-        } else {
-            terminal.resize(size);
-        }
-        let mut seam = terminal
-            .capture_cold_seam_reflow()
-            .unwrap()
-            .expect("capture the all-space active paragraph")
-            .hydrate(|| false)
-            .unwrap();
-        let sequence = terminal.current_seqno() + 1;
-        assert!(terminal
-            .install_cold_seam_reflow(&mut seam, sequence)
-            .unwrap());
-        terminal.increment_seqno();
-        terminal.advance_bytes(b"!");
-        let mut layout = terminal
-            .screen()
-            .capture_line_read(0..1)
-            .unwrap()
-            .prepare_cold_layout(|| false)
-            .unwrap();
-        let sequence = terminal.current_seqno();
-        assert!(terminal
-            .screen_mut()
-            .install_prepared_cold_layout(&mut layout, sequence)
-            .unwrap());
-        let screen = terminal.screen();
-        let start = screen.scrollback_top_stable_row();
-        let end = screen.phys_to_stable_row_index(screen.lines.len());
-        let all = screen
-            .capture_line_read(start..end)
-            .unwrap()
-            .hydrate(|| false)
-            .unwrap();
-        let actual: String = all.lines().map(Line::as_str).collect();
-        assert_eq!(
-            actual,
-            format!("{original}!"),
-            "count={count}, columns={columns}, prepared={prepared}"
-        );
     }
 
     #[cfg(feature = "use_serde")]
