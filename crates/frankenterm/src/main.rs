@@ -8204,6 +8204,14 @@ enum BackupCommands {
 
 #[derive(Subcommand)]
 enum SnapshotCommands {
+    /// Prepare a new private store for periodic mux recovery, offline
+    PrepareRecoveryStore {
+        /// New directory; its parent must exist. Existing roots are preserved.
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
     /// Enroll a new local recovery DEK using an existing private wrapping key
     EnrollRecoveryKey {
         #[arg(long)]
@@ -48896,7 +48904,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
     if let Some(Commands::Snapshot {
         command: snapshot_command,
     }) = command.as_ref()
-        && run_recovery_key_command(cx, snapshot_command).await?
+        && run_recovery_setup_command(cx, snapshot_command).await?
     {
         return Ok(());
     }
@@ -79946,12 +79954,45 @@ fn print_checkpoint_artifact_receipt_plain(
     println!("  Running processes:    not preserved by this artifact");
 }
 
-async fn run_recovery_key_command(
+async fn run_recovery_setup_command(
     cx: &frankenterm_core::cx::Cx,
     command: &SnapshotCommands,
 ) -> anyhow::Result<bool> {
     use frankenterm_core::snapshot_engine::{enroll_recovery_key, open_recovery_key_enrollment};
     use frankenterm_core::snapshot_representation::RecoveryWrapContext;
+    if let SnapshotCommands::PrepareRecoveryStore { root, format } = command {
+        use frankenterm_core::snapshot_publication::{PublicationLimits, SnapshotPublicationStore};
+        let output_format = resolve_snapshot_session_output_format(format);
+        let selected_root = root.clone();
+        let result = run_cli_blocking_with_cx(cx, "recovery store preparation", move || {
+            let store =
+                SnapshotPublicationStore::create_new(selected_root, PublicationLimits::default())?;
+            Ok(store.root_path().to_owned())
+        })
+        .await;
+        let prepared_root = match result {
+            Ok(root) => root,
+            Err(error) => {
+                trace_bounded_cli_internal_error("recovery store preparation", &error);
+                emit_snapshot_session_error(
+                    output_format,
+                    "recovery_store_preparation_failed",
+                    "Store preparation did not complete. The parent must exist and the root must be new. Existing or incomplete roots are preserved; inspect them before choosing a new root.",
+                )?;
+                std::process::exit(1);
+            }
+        };
+        let payload = serde_json::json!({
+            "operation": "prepare_recovery_store",
+            "status": "empty_store_prepared",
+            "root": prepared_root,
+            "snapshot_generation": null,
+        });
+        if !print_snapshot_session_structured_output(&payload, output_format)? {
+            println!("Prepared empty recovery store: {}", prepared_root.display());
+        }
+        return Ok(true);
+    }
     let (root, wrapping_key, namespace_id, policy_id, format, enroll) = match command {
         SnapshotCommands::EnrollRecoveryKey {
             root,
@@ -80638,9 +80679,10 @@ async fn handle_snapshot_command(
             }
         }
 
-        command @ (SnapshotCommands::EnrollRecoveryKey { .. }
+        command @ (SnapshotCommands::PrepareRecoveryStore { .. }
+        | SnapshotCommands::EnrollRecoveryKey { .. }
         | SnapshotCommands::VerifyRecoveryKey { .. }) => {
-            run_recovery_key_command(&cx, &command).await?;
+            run_recovery_setup_command(&cx, &command).await?;
         }
 
         SnapshotCommands::VerifyArtifact { path, format } => {

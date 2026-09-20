@@ -23,6 +23,66 @@ const INCIDENT_PANE_ID: u64 = 4_242;
 
 #[cfg(unix)]
 #[test]
+fn recovery_store_preparation_cli_is_offline_and_exclusive() {
+    use frankenterm_core::snapshot_publication::{PublicationLimits, SnapshotPublicationStore};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let dir = tempfile::Builder::new()
+        .prefix(".ft-store-cli-")
+        .tempdir_in(fs::canonicalize("/tmp").unwrap())
+        .unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = dir.path().join("blocked-workspace");
+    fs::write(&workspace, b"not a workspace directory").unwrap();
+    let root = dir.path().join("store");
+    let run = |root: &Path| {
+        Command::cargo_bin("ft")
+            .unwrap()
+            .timeout(std::time::Duration::from_secs(15))
+            .env("FT_WORKSPACE", &workspace)
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env_remove("FRANKENTERM_CONFIG_FILE")
+            .env_remove("WEZTERM_UNIX_SOCKET")
+            .args(["snapshot", "prepare-recovery-store", "--root"])
+            .arg(root)
+            .args(["--format", "json"])
+            .output()
+            .unwrap()
+    };
+    let output = run(&root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "empty_store_prepared");
+    assert_eq!(receipt["root"], root.to_str().unwrap());
+    assert!(receipt["snapshot_generation"].is_null());
+    let store =
+        SnapshotPublicationStore::open_existing(&root, PublicationLimits::default()).unwrap();
+    assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+    drop(store);
+    fs::write(root.join("sentinel"), b"retained").unwrap();
+    let partial = dir.path().join("partial");
+    fs::create_dir(&partial).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&partial, &alias).unwrap();
+    for rejected in [&root, &partial, &alias.join("new-store")] {
+        let output = run(rejected);
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["error_code"],
+            "recovery_store_preparation_failed"
+        );
+    }
+    assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"retained");
+    assert_eq!(fs::read_dir(partial).unwrap().count(), 0);
+    assert_eq!(fs::read(workspace).unwrap(), b"not a workspace directory");
+}
+
+#[cfg(unix)]
+#[test]
 fn recovery_enrollment_cli_reopens_and_decrypts_in_fresh_process() {
     use frankenterm_core::snapshot_engine::open_recovery_key_enrollment;
     use frankenterm_core::snapshot_representation::{

@@ -1013,6 +1013,47 @@ pub struct SnapshotPublicationStore {
 }
 
 impl SnapshotPublicationStore {
+    /// Prepare an empty store exclusively. The parent must already exist;
+    /// existing roots (including incomplete preparations) are never repaired.
+    /// A failed durability step leaves its files in place for inspection.
+    pub fn create_new(
+        root_path: impl Into<PathBuf>,
+        limits: PublicationLimits,
+    ) -> Result<Self, PublicationError> {
+        if limits.max_store_bytes < STORE_QUOTA_BYTES as u64 || limits.max_store_entries < 5 {
+            return Err(PublicationError::StoreQuotaPolicy);
+        }
+        let root_path = root_path.into();
+        let leaf = root_path
+            .file_name()
+            .ok_or_else(|| PublicationError::InsecurePermissions {
+                path: root_path.clone(),
+                reason: "new store root requires a leaf name".to_owned(),
+            })?;
+        let parent_path = root_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = open_directory_hierarchy_nofollow(parent_path, false)?;
+        let builder = cap_std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use cap_std::fs::DirBuilderExt as _;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        parent
+            .create_dir_with(leaf, &builder)
+            .map_err(|error| PublicationError::io(&root_path, error))?;
+        sync_directory(&parent, parent_path)?;
+        let root = parent
+            .open_dir_nofollow(leaf)
+            .map_err(|error| PublicationError::io(&root_path, error))?;
+        verify_directory_security(&root, &root_path)?;
+        Self::initialize_children(root_path, root, limits)
+    }
+
     /// Pin an already prepared store without creating, repairing or syncing
     /// anything. Missing components fail closed; an empty prepared store is
     /// valid and may subsequently receive its first authenticated generation.
@@ -1149,6 +1190,14 @@ impl SnapshotPublicationStore {
             sync_directory(&parent_directory, parent_path)?;
         }
 
+        Self::initialize_children(root_path, root_dir, limits)
+    }
+
+    fn initialize_children(
+        root_path: PathBuf,
+        root_dir: Dir,
+        limits: PublicationLimits,
+    ) -> Result<Self, PublicationError> {
         let objects_dir = Self::ensure_private_child_dir(&root_dir, OBJECTS_DIR_NAME, &root_path)?;
         let root_slots_dir = Self::ensure_private_child_dir(&root_dir, ROOTS_DIR_NAME, &root_path)?;
         let generations_dir =
@@ -4151,6 +4200,53 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_store_preparation_preserves_existing_and_incomplete_roots() {
+        let temp = private_test_directory();
+        let root = temp.path().join("new-store");
+        let store =
+            SnapshotPublicationStore::create_new(&root, PublicationLimits::default()).unwrap();
+        assert_eq!(store.root_path(), root);
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        drop(store);
+        SnapshotPublicationStore::open_existing(&root, PublicationLimits::default()).unwrap();
+        std::fs::write(root.join("sentinel"), b"retain").unwrap();
+        assert!(SnapshotPublicationStore::create_new(&root, PublicationLimits::default()).is_err());
+        assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"retain");
+        let incomplete = temp.path().join("incomplete");
+        std::fs::create_dir(&incomplete).unwrap();
+        assert!(
+            SnapshotPublicationStore::create_new(&incomplete, PublicationLimits::default())
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&incomplete).unwrap().count(), 0);
+        let missing_parent = temp.path().join("absent-parent");
+        assert!(
+            SnapshotPublicationStore::create_new(
+                missing_parent.join("store"),
+                PublicationLimits::default()
+            )
+            .is_err()
+        );
+        assert!(!missing_parent.exists());
+        let interrupted = temp.path().join("interrupted");
+        DIRECTORY_SYNC_FAILURE.with(|failure| *failure.borrow_mut() = Some(temp.path().to_owned()));
+        assert!(
+            SnapshotPublicationStore::create_new(&interrupted, PublicationLimits::default())
+                .is_err()
+        );
+        assert!(interrupted.is_dir());
+        assert!(
+            SnapshotPublicationStore::open_existing(&interrupted, PublicationLimits::default())
+                .is_err()
+        );
+        assert!(
+            SnapshotPublicationStore::create_new(&interrupted, PublicationLimits::default())
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&interrupted).unwrap().count(), 0);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn store_preparation_rejects_symlink_ancestors_without_mutating_targets() {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -4167,6 +4263,9 @@ mod tests {
         // to pass both paths and initialize the directory behind the alias.
         for leaf in ["existing", "missing"] {
             let path = alias.join("nested").join(leaf);
+            assert!(
+                SnapshotPublicationStore::create_new(&path, PublicationLimits::default()).is_err()
+            );
             assert!(SnapshotPublicationStore::open(&path, PublicationLimits::default()).is_err());
             assert!(
                 SnapshotPublicationStore::open_existing(&path, PublicationLimits::default())
