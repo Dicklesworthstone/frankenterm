@@ -1403,9 +1403,30 @@ fn reserve_mux_payload_admission(
             .map_err(|rejected| anyhow!("user-variable admission refused: {rejected:?}"))?;
         return Ok((completion, Some(callback)));
     }
+    let mut bytes = 4 * 1024_usize;
+    if let MuxNotification::WindowTopologyChanged(change) = notification {
+        // Charge immutable backing allocations even when another subscriber
+        // shares them. Do not traverse mutable Tab/pane state held by these
+        // identity handles. Each Arc slice also owns two reference counters;
+        // the extra alignment allowance conservatively covers its header.
+        let mut charge_slice = |payload_bytes: usize| -> anyhow::Result<()> {
+            bytes = bytes
+                .checked_add(payload_bytes)
+                .and_then(|value| value.checked_add(3 * std::mem::size_of::<usize>()))
+                .ok_or_else(|| anyhow!("topology callback byte estimate overflow"))?;
+            Ok(())
+        };
+        charge_slice(std::mem::size_of_val(change.windows()))?;
+        charge_slice(std::mem::size_of_val(change.attached_tabs()))?;
+        charge_slice(std::mem::size_of_val(change.created_windows()))?;
+        charge_slice(std::mem::size_of_val(change.removed_windows()))?;
+        for window in change.windows() {
+            charge_slice(std::mem::size_of_val(window.ordered_tabs()))?;
+        }
+    }
     match promise::spawn::try_reserve_main_thread(
         promise::spawn::MainThreadServiceClass::Render,
-        4 * 1024,
+        bytes,
     ) {
         promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
             Ok((reservation, None))
@@ -10822,6 +10843,102 @@ mod tests {
                 );
             }
             assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        }
+    }
+
+    #[test]
+    fn topology_admission_charges_real_frozen_snapshot_and_releases_bytes() {
+        if run_scheduler_test_in_child(
+            "topology_admission_charges_real_frozen_snapshot_and_releases_bytes",
+        ) {
+            return;
+        }
+        use promise::spawn::{MainThreadAdmissionLimits, MainThreadServiceClass, SimpleExecutor};
+        use std::sync::{Arc, Mutex};
+
+        let producer_executor = SimpleExecutor::new();
+        let owner = Arc::new(mux::Mux::new(None));
+        mux::Mux::set_mux(&owner);
+        let activity = mux::activity::Activity::new_for_mux(&owner);
+        let window = owner.new_empty_window(None, None);
+        let window_id = *window;
+        let observed = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&observed);
+        let subscription = owner
+            .subscribe(move |notification| {
+                if let mux::MuxNotification::WindowTopologyChanged(change) = &notification
+                    && change.affects_window(window_id)
+                {
+                    *capture.lock().unwrap() = Some(notification);
+                }
+                true
+            })
+            .unwrap();
+        // The immutable tab-handle slice alone exceeds the old 4 KiB charge.
+        for _ in 0..513 {
+            let tab = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
+            owner.add_tab_no_panes(&tab).unwrap();
+            owner.add_tab_to_window(&tab, window_id).unwrap();
+        }
+        assert!(owner.unsubscribe(subscription));
+        let notification = observed.lock().unwrap().take().unwrap();
+        let mux::MuxNotification::WindowTopologyChanged(change) = &notification else {
+            unreachable!();
+        };
+        assert_eq!(change.windows().len(), 1);
+        assert_eq!(change.windows()[0].ordered_tabs().len(), 513);
+        assert_eq!(change.attached_tabs().len(), 1);
+        assert!(super::TermWindow::mux_notification_targets_window(
+            &notification,
+            window_id,
+        ));
+        assert!(!super::RetainedMuxRefresh::handles(
+            &notification,
+            window_id
+        ));
+        let backing_bytes = std::mem::size_of_val(change.windows())
+            + std::mem::size_of_val(change.windows()[0].ordered_tabs())
+            + std::mem::size_of_val(change.attached_tabs())
+            + std::mem::size_of_val(change.created_windows())
+            + std::mem::size_of_val(change.removed_windows());
+        assert!(backing_bytes > 4096);
+        // Four outer Arc slices and one window's tab slice, including header
+        // alignment allowance, are retained by this actual producer event.
+        let expected_bytes = 4096 + backing_bytes + 5 * 3 * std::mem::size_of::<usize>();
+        drop(window);
+        drop(activity);
+        mux::Mux::shutdown();
+        drop(owner);
+        drop(producer_executor);
+
+        for budget in [4096, expected_bytes - 1, expected_bytes] {
+            let exec = SimpleExecutor::try_with_limits(
+                MainThreadAdmissionLimits::new(1, budget, 0, 0).unwrap(),
+            )
+            .unwrap();
+            let admission = super::reserve_mux_payload_admission(&notification);
+            if budget == expected_bytes {
+                let (reservation, callback) = admission.unwrap();
+                assert!(callback.is_none());
+                assert_eq!(
+                    reservation.admission_receipt().estimated_bytes.get(),
+                    expected_bytes,
+                );
+                assert_eq!(
+                    reservation.admission_receipt().service_class,
+                    MainThreadServiceClass::Render,
+                );
+                assert_eq!(exec.admission_snapshot().active_tasks, 1);
+                assert_eq!(
+                    exec.admission_snapshot().active_estimated_bytes,
+                    expected_bytes,
+                );
+                drop(reservation);
+            } else {
+                assert!(admission.is_err(), "snapshot backing must affect admission");
+            }
+            assert_eq!(exec.admission_snapshot().active_tasks, 0);
+            assert_eq!(exec.admission_snapshot().active_estimated_bytes, 0);
         }
     }
 
