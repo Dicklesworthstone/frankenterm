@@ -1680,7 +1680,7 @@ mod tests {
         // Exercise the real LocalPane reader/resize endpoints with retained
         // PTY probes, rather than an inert closure pretending to be a reader.
         for invalid_revision in [false, true] {
-            let id = alloc_pane_id();
+            let id = alloc_pane_id().expect("allocate recovery fixture pane identity");
             let durable = uuid::Uuid::new_v4();
             let size = TerminalSize {
                 rows: 4,
