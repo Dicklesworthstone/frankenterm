@@ -1316,6 +1316,13 @@ impl TerminalState {
     }
 
     fn resize_cursors(&self) -> (CursorPosition, CursorPosition) {
+        // A pending autowrap denotes the insertion point after the rightmost
+        // cell. Reflow must map that offset, not the displayed cursor cell,
+        // otherwise the next character overwrites the last printed glyph.
+        let mut active = self.cursor;
+        if self.wrap_next && !self.screen.alt_screen_is_active {
+            active.x = self.left_and_right_margins.end;
+        }
         if self.screen.alt_screen_is_active {
             (
                 self.screen
@@ -1324,11 +1331,11 @@ impl TerminalState {
                     .as_ref()
                     .map(|s| s.position)
                     .unwrap_or_else(CursorPosition::default),
-                self.cursor,
+                active,
             )
         } else {
             (
-                self.cursor,
+                active,
                 self.screen
                     .alt_screen
                     .saved_cursor
