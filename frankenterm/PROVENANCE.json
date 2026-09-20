@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 202,
-        "fix": 258,
+        "fix": 259,
         "other": 52,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 103
       },
-      "fork_side_commit_count": 687,
+      "fork_side_commit_count": 688,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-19T20:49:53-04:00",
-        "sha": "4f562aa38113907cdca3a01527e1a4b0b3a459d0",
-        "subject": "diagnostics(mux): expose bounded metadata refusal stages"
+        "classification": "fix",
+        "committed_at": "2026-09-19T21:04:33-04:00",
+        "sha": "76008508f2796b56218246a70c6f7ad2e96a88af",
+        "subject": "fix(mux): use current atomic update API in refusal diagnostics"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,7 +1064,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2823,
+  "fork_side_commit_total": 2824,
   "generated_at": "2026-09-19T21:41:41.039575Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
