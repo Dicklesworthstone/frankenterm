@@ -2730,7 +2730,6 @@ impl DirectMuxClient {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
         const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
         let mut chunk_rows = 512isize;
-        let mut retry_snapshot = None;
         let mut busy_retries = 0usize;
         let mut diagnostics = TextReadDiagnostics {
             enabled: tracing::enabled!(target: "frankenterm::mux_text_diagnostics", tracing::Level::TRACE),
@@ -2744,18 +2743,13 @@ impl DirectMuxClient {
         'snapshot: for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
             checkpoint_mux_cx(cx, self.connection_id, "text_read_snapshot")?;
             diagnostics.attempts += 1;
-            // A rejected chunk or changed final fence already supplied a
-            // correlated snapshot. Reuse it only within this transaction;
-            // every chunk and the final source fence still validate it.
-            let initial = match retry_snapshot.take() {
-                Some(snapshot) => snapshot,
-                None => {
-                    let phase_started = diagnostics.start_phase();
-                    let initial = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
-                    diagnostics.phase("initial_fence", phase_started);
-                    initial?
-                }
-            };
+            // Retry suspension lets the producer advance. A snapshot obtained
+            // before that yield/backoff is evidence of the rejected attempt,
+            // not a fresh starting fence for the next one.
+            let phase_started = diagnostics.start_phase();
+            let initial = self.get_pane_render_state_with_cx(cx, pane_id, true).await;
+            diagnostics.phase("initial_fence", phase_started);
+            let initial = initial?;
             let layout = LineReadLayout {
                 seqno: initial.seqno,
                 dimensions: initial.dimensions,
@@ -2858,7 +2852,6 @@ impl DirectMuxClient {
                                     },
                                     phase_started,
                                 );
-                                retry_snapshot = Some(current);
                                 continue 'snapshot;
                             }
                         }
@@ -2950,7 +2943,6 @@ impl DirectMuxClient {
                     },
                     phase_started,
                 );
-                retry_snapshot = Some(final_state);
             }
         }
         Err(DirectMuxError::TextSnapshotChanged {
@@ -7547,7 +7539,7 @@ mod tests {
     }
 
     #[test]
-    fn text_read_reuses_correlated_retry_fence_but_rejects_later_source_change() {
+    fn text_read_refreshes_fences_after_retry_suspension() {
         for rejected_chunk in [false, true] {
             run_async_test(async move {
                 let cx = crate::cx::for_testing();
@@ -7558,17 +7550,21 @@ mod tests {
                         Pdu::GetPaneRenderChanges(_) => {
                             let mut count = seen.lock().unwrap();
                             count.0 += 1;
-                            text_read_state(count.0.min(3), 0, 3)
+                            // The source advances again after each observation
+                            // that rejected the previous attempt, then settles.
+                            // Reusing those pre-suspension observations spends
+                            // all three attempts before reaching source 5.
+                            text_read_state(count.0.min(5), 0, 3)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let seqno = request.layout.seqno;
                             seen.lock().unwrap().1.push(seqno);
-                            if rejected_chunk && seqno == 1 {
+                            if rejected_chunk && seqno < 5 {
                                 Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
                                     GetLinesAtLayout::IDENT,
                                 ))
                             } else {
-                                text_read_reply(request, if seqno == 3 { "current" } else { "old" })
+                                text_read_reply(request, if seqno == 5 { "current" } else { "old" })
                             }
                         }
                         other => panic!("unexpected text request {other:?}"),
@@ -7582,12 +7578,12 @@ mod tests {
                 assert_eq!(
                     client.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
                     MuxTextReadResult::Text(text_read_expected(0..3, "current")),
-                    "a second source change must discard the earlier complete response"
+                    "yield and timed retry must each start from a fresh source fence"
                 );
                 assert_eq!(
                     *counts.lock().unwrap(),
-                    (4, vec![1, 2, 3]),
-                    "reuse correlated observations, but retain a final fence on every attempt"
+                    (6, vec![1, 3, 5]),
+                    "refresh after each suspension and retain the final success fence"
                 );
                 drop(client);
                 timeout(Duration::from_secs(5), server)
@@ -7669,8 +7665,8 @@ mod tests {
                     ));
                     assert_eq!(
                         *counts.lock().unwrap(),
-                        (4, 3),
-                        "three attempts reuse each correlated final fence as the next start"
+                        (6, 3),
+                        "three attempts each have independent initial and final fences"
                     );
                 }
                 drop(client);
@@ -7935,12 +7931,12 @@ mod tests {
                             count.0 += 1;
                             // Three changing attempts, then one stable source
                             // for a separate caller-initiated transaction.
-                            text_read_state(count.0.min(5), 0, 3)
+                            text_read_state(count.0.min(7), 0, 3)
                         }
                         Pdu::GetLinesAtLayout(request) => {
                             let mut count = seen.lock().unwrap();
                             count.1 += 1;
-                            if rejected_chunk && count.0 < 5 {
+                            if rejected_chunk && count.0 < 7 {
                                 Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
                                     GetLinesAtLayout::IDENT,
                                 ))
@@ -7990,7 +7986,7 @@ mod tests {
                         attempts: 3,
                     }) if phase == expected_phase
                 ));
-                assert_eq!(*counts.lock().unwrap(), (4, 3));
+                assert_eq!(*counts.lock().unwrap(), (6, 3));
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.recovery_attempts, 0, "no second retry budget");
                 assert_eq!(stats.connections_created, 1);
@@ -8000,7 +7996,7 @@ mod tests {
                     pool.get_text_with_cx(&cx, 9, 100_000).await.unwrap(),
                     MuxTextReadResult::Text(text_read_expected(0..3, "settled"))
                 );
-                assert_eq!(*counts.lock().unwrap(), (6, 4));
+                assert_eq!(*counts.lock().unwrap(), (8, 4));
                 let stats = pool.stats_with_cx(&cx).await.unwrap();
                 assert_eq!(stats.connections_created, 1, "aligned stream stays usable");
                 assert_eq!(stats.pool.total_acquired, 2);
