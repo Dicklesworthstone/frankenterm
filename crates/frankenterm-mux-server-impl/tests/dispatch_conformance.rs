@@ -312,6 +312,10 @@ fn run_with_backpressure(
     let _lock = GLOBAL_STATE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    // Session admission reserves its render coordinator on the real bounded
+    // scheduler, including for empty streams. Retire queued work only after
+    // this session and its scoped mux have been dropped.
+    let _executor = promise::spawn::SimpleExecutor::new();
     let mux = Arc::new(Mux::new(None));
     let _scoped = ScopedMux::install(&mux);
 
