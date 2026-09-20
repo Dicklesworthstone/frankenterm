@@ -5998,6 +5998,7 @@ mod tests {
         let lock_violation = Arc::new(AtomicBool::new(false));
         let callback_thread = wrong_thread.clone();
         let callback_lock = lock_violation.clone();
+        let callback_tab = Arc::downgrade(&tab);
         let owner_thread = std::thread::current().id();
         mux.subscribe(move |notification| {
             if let crate::MuxNotification::Alert { alert, .. } = notification {
@@ -6007,6 +6008,13 @@ mod tests {
                 );
                 let pane = weak_pane.upgrade().unwrap();
                 callback_lock.fetch_or(pane.terminal.try_lock().is_none(), Ordering::SeqCst);
+                callback_lock.fetch_or(
+                    !callback_tab
+                        .upgrade()
+                        .unwrap()
+                        .topology_lock_is_available_for_test(),
+                    Ordering::SeqCst,
+                );
                 observed.lock().push(alert);
             }
             true
@@ -6066,6 +6074,47 @@ mod tests {
         assert_eq!(received.lock().len(), before);
         drop(emitting);
         pump_until(&executor, || received.lock().len() > before);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+
+        // Reconciliation holds the real tab topology mutex while waiting for
+        // this pane's terminal dimensions. Applying a title must not invoke
+        // subscribers inline in that state. The indexed window-title lookup
+        // itself does not take the tab mutex; this proves callback isolation
+        // during concurrent reconciliation, not a window-title ABBA cycle.
+        let before = received.lock().len();
+        let mut output = pane.prepare_alert_output().unwrap();
+        let mut actions = vec![title("concurrent-reconciliation")];
+        let batch = pane
+            .admit_alert_actions(&mut actions, 0, &mut output)
+            .unwrap();
+        let mut emitting = pane.terminal.lock();
+        let worker_tab = tab.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let reconcile = std::thread::spawn(move || {
+            worker_tab.rebuild_splits_sizes_from_contained_panes();
+            done_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tab.topology_lock_is_available_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "reconciliation did not acquire topology"
+            );
+            std::thread::yield_now();
+        }
+        batch.apply(&mut emitting);
+        assert_eq!(received.lock().len(), before);
+        drop(emitting);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        reconcile.join().unwrap();
+        pump_until(&executor, || received.lock().len() > before);
+        assert_eq!(
+            mux.get_window(window_id).unwrap().get_title(),
+            "concurrent-reconciliation"
+        );
+        assert!(!lock_violation.load(Ordering::SeqCst));
         pump_until(&executor, || {
             executor.admission_snapshot().active_tasks == 0
         });
@@ -6144,6 +6193,130 @@ mod tests {
         assert_eq!(oversized.actions.len(), 1);
         assert_eq!(pane.terminal.lock().current_seqno(), seqno);
         drop(oversized);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+
+        // Registration-only fixture: the helper enforces the real retirement
+        // and in-flight generation fences without starting a fake PTY reader.
+        // This proves alert custody/reuse, not reader startup or recovery.
+        let make_retirement_pane = || {
+            Arc::new(LocalPane::new(
+                813,
+                guardian_lifetime_test_terminal(),
+                Box::new(ColdResizeTestChild::default()),
+                Box::new(GuardianLifetimeTestMasterPty),
+                Box::new(Vec::<u8>::new()),
+                dynamic.domain_id(),
+                [0xa2; 16],
+                "alert-retirement".into(),
+            ))
+        };
+        let retiring = make_retirement_pane();
+        let retiring_dynamic: Arc<dyn Pane> = retiring.clone();
+        let retiring_generation = crate::PaneRegistrationGeneration::new(
+            813,
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                813,
+                dynamic.domain_id(),
+                &retiring_dynamic,
+                &retiring_generation,
+            )
+            .unwrap();
+        }
+        retiring
+            .mux_registration
+            .reserve(mux.capture_pane_registration(&retiring_dynamic).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finalize();
+        let retirement_events = Arc::new(Mutex::new(Vec::new()));
+        let events = retirement_events.clone();
+        mux.subscribe(move |notification| {
+            match notification {
+                crate::MuxNotification::Alert {
+                    pane_id: 813,
+                    alert,
+                } => {
+                    if let Alert::WindowTitleChanged(title) = alert {
+                        events.lock().push(title.clone());
+                    }
+                }
+                crate::MuxNotification::PaneRemoved(813) => {
+                    events.lock().push("removed".into());
+                }
+                _ => {}
+            }
+            true
+        })
+        .unwrap();
+        retiring
+            .perform_actions(vec![title("accepted-before-retirement")])
+            .unwrap();
+        mux.remove_pane_if_same(813, &retiring_dynamic);
+        let replacement = make_retirement_pane();
+        let replacement_dynamic: Arc<dyn Pane> = replacement.clone();
+        let replacement_generation = crate::PaneRegistrationGeneration::new(
+            813,
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            assert!(mux
+                .insert_pane_registration_locked(
+                    813,
+                    dynamic.domain_id(),
+                    &replacement_dynamic,
+                    &replacement_generation,
+                )
+                .is_err());
+        }
+        pump_until(&executor, || retirement_events.lock().len() == 2);
+        assert_eq!(
+            *retirement_events.lock(),
+            ["accepted-before-retirement", "removed"]
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                813,
+                dynamic.domain_id(),
+                &replacement_dynamic,
+                &replacement_generation,
+            )
+            .unwrap();
+        }
+        replacement
+            .mux_registration
+            .reserve(mux.capture_pane_registration(&replacement_dynamic).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finalize();
+        let old_seqno = retiring.terminal.lock().current_seqno();
+        let successor_seqno = replacement.terminal.lock().current_seqno();
+        let stale = retiring
+            .perform_actions(vec![title("stale-title")])
+            .unwrap_err();
+        assert_eq!(stale.reason, PaneActionAdmissionRefusal::Retired);
+        assert_eq!(stale.actions, vec![title("stale-title")]);
+        assert_eq!(retiring.terminal.lock().current_seqno(), old_seqno);
+        assert_eq!(replacement.terminal.lock().current_seqno(), successor_seqno);
+        replacement
+            .perform_actions(vec![title("successor-title")])
+            .unwrap();
+        pump_until(&executor, || retirement_events.lock().len() == 3);
+        assert_eq!(
+            *retirement_events.lock(),
+            ["accepted-before-retirement", "removed", "successor-title"]
+        );
         pump_until(&executor, || {
             executor.admission_snapshot().active_tasks == 0
         });
