@@ -6757,18 +6757,55 @@ fn serialize_exact_semantic_scrollback_line(
     }
     let mut cell_widths = Vec::new();
     cell_widths.try_reserve_exact(cells.len()).ok()?;
-    for cell in cells {
+    let mut compact = cells.len() >= 32;
+    // Alternating attributes gain no run compression and add cluster overhead.
+    let mut runs = 0usize;
+    let run_limit = cells.len() / 8;
+    let mut previous_attrs = None;
+    for cell in cells.iter() {
         let width = u8::try_from(cell.width()).ok()?;
         if !matches!(width, 1 | 2) {
             return None;
         }
         cell_widths.push(width);
+        if compact {
+            compact = width == 1
+                && matches!(cell.str().as_bytes(), [byte] if (b' '..=b'~').contains(byte));
+            if compact && previous_attrs != Some(cell.attrs()) {
+                runs += 1;
+                previous_attrs = Some(cell.attrs());
+                compact = runs <= run_limit;
+            }
+        }
     }
     let semantic = ExactSemanticScrollbackLineV1 {
         schema: 1,
         line: semantic_line,
         cell_widths,
     };
+    if compact {
+        let mut candidate = ExactSemanticScrollbackLineV1 {
+            schema: 2,
+            line: semantic.line.clone(),
+            cell_widths: semantic.cell_widths.clone(),
+        };
+        candidate.line.compress_for_scrollback();
+        if let Some(plaintext) = serialize_semantic_scrollback_payload(&candidate) {
+            if compact_scrollback_decoded_charge(&candidate, plaintext.len())
+                .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
+            {
+                return Some(plaintext);
+            }
+        }
+        // A compact encoding must not admit a row whose expansion exceeds the
+        // existing hard limit. Retain the original vector schema on refusal.
+    }
+    serialize_semantic_scrollback_payload(&semantic)
+}
+
+fn serialize_semantic_scrollback_payload(
+    semantic: &ExactSemanticScrollbackLineV1,
+) -> Option<Zeroizing<Vec<u8>>> {
     let mut plaintext =
         BoundedScrollbackPlaintext::new(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE);
     let serialization = {
@@ -6779,6 +6816,39 @@ fn serialize_exact_semantic_scrollback_line(
         return None;
     }
     Some(plaintext.bytes)
+}
+
+/// Validate the complete compact representation and charge expansion before
+/// cells_mut allocates its vector or clones any per-cell attribute payload.
+/// CR/LF, arbitrary grapheme strings and wide spacers cannot use schema 2.
+fn compact_scrollback_decoded_charge(
+    semantic: &ExactSemanticScrollbackLineV1,
+    plaintext_bytes: usize,
+) -> Option<usize> {
+    if semantic.cell_widths.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
+        || semantic.line.len() != semantic.cell_widths.len()
+        || semantic.cell_widths.iter().any(|width| *width != 1)
+    {
+        return None;
+    }
+    let mut charge = plaintext_bytes.checked_add(
+        semantic
+            .cell_widths
+            .len()
+            .checked_mul(std::mem::size_of::<termwiz::cell::Cell>())?,
+    )?;
+    let mut count = 0usize;
+    for cell in semantic.line.visible_cells() {
+        count = count.checked_add(1)?;
+        if count > semantic.cell_widths.len()
+            || cell.width() != 1
+            || !matches!(cell.str().as_bytes(), [byte] if (b' '..=b'~').contains(byte))
+        {
+            return None;
+        }
+        charge = charge.checked_add(cell.attrs().snapshot_clone_heap_bytes()?)?;
+    }
+    (count == semantic.cell_widths.len()).then_some(charge)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -7034,7 +7104,7 @@ fn decode_persisted_scrollback_line_with_limit(
             )
             .context("authenticate semantic scrollback row at durable location")?;
         let plaintext = expand_exact_scrollback_plaintext(plaintext, max_decoded_bytes)?;
-        let decoded_bytes = plaintext.len();
+        let mut decoded_bytes = plaintext.len();
         let mut reader = plaintext.as_slice();
         let mut semantic: ExactSemanticScrollbackLineV1 =
             codec::bounded_varbincode_deserialize(&mut reader)
@@ -7044,9 +7114,19 @@ fn decode_persisted_scrollback_line_with_limit(
             "semantic scrollback row contains trailing plaintext"
         );
         anyhow::ensure!(
-            semantic.schema == 1,
+            matches!(semantic.schema, 1 | 2),
             "unsupported semantic scrollback row schema"
         );
+        if semantic.schema == 2 {
+            decoded_bytes = compact_scrollback_decoded_charge(&semantic, decoded_bytes)
+                .ok_or_else(|| anyhow::anyhow!("invalid compact semantic scrollback row"))?;
+            if decoded_bytes > max_decoded_bytes.min(LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE) {
+                return Err(ScrollbackDecodedBudgetExceeded {
+                    minimum_required: decoded_bytes,
+                }
+                .into());
+            }
+        }
         let cells = semantic.line.cells_mut();
         anyhow::ensure!(
             cells.len() == semantic.cell_widths.len(),
@@ -10465,6 +10545,235 @@ mod tests {
         assert_eq!(cold_rx.recv().unwrap(), expected[62..64]);
         assert_eq!(backing.retained_scrollback_rows(), 64, "read cannot flush");
         assert_eq!(deferred.load_scrollback_lines(30..34), expected[30..34]);
+    }
+
+    #[test]
+    fn compact_scrollback_encrypted_reopen_preserves_full_line_and_prefix_budget() {
+        let (dir, backing, deferred) = deferred_test_sink();
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://checkpoint.example/compact",
+            "compact-row",
+        ))));
+        let mut line = Line::from_text(
+            "FT_NOISE 0000000000000000 0123456789abcdef FT_END",
+            &attrs,
+            42,
+            None,
+        );
+        let mut alternate = attrs.clone();
+        alternate.set_reverse(true);
+        line.set_cell_grapheme(3, "N", 1, alternate, 42);
+        line.set_last_cell_was_wrapped(true, 42);
+        line.cells_mut();
+        let expected = varbincode::serialize(&line).unwrap();
+        let raw = serialize_exact_semantic_scrollback_line(&line).unwrap();
+        let semantic: ExactSemanticScrollbackLineV1 =
+            codec::bounded_varbincode_deserialize(&mut raw.as_slice()).unwrap();
+        assert_eq!(semantic.schema, 2);
+        let charge = compact_scrollback_decoded_charge(&semantic, raw.len()).unwrap();
+        assert!(charge > raw.len());
+        for row in 0..4 {
+            assert!(backing.store_scrollback_line(row, &line, 16));
+        }
+        drop(deferred);
+        drop(backing);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 913,
+            domain_id: 3,
+            durable_pane_id: [0xd3; 16],
+            command_description: "deferred-scrollback-test".to_string(),
+        };
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context).unwrap();
+        for range in [0..4, 2..4] {
+            let restored = reopened
+                .load_scrollback_lines_with_limits(range, u64::MAX, charge * 2)
+                .unwrap();
+            assert_eq!(
+                restored.len(),
+                2,
+                "aggregate materialization budget preserves a prefix"
+            );
+            for row in restored {
+                assert_eq!(varbincode::serialize(&row).unwrap(), expected);
+            }
+        }
+        let error = reopened
+            .load_scrollback_lines_with_limits(0..1, u64::MAX, charge - 1)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn compact_scrollback_noise_record_does_not_grow_encrypted_storage() {
+        use mux::guardian_output_journal::GuardianScrollbackRowIdentity;
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        // The producer's 51 wire bytes become this printable row plus CRLF.
+        let mut line = Line::from_text(
+            "FT_NOISE 0000000000000000 0123456789abcdef FT_END",
+            &CellAttributes::blank(),
+            42,
+            None,
+        );
+        let widths = line
+            .cells_mut()
+            .iter()
+            .map(|cell| cell.width() as u8)
+            .collect();
+        let old = serialize_semantic_scrollback_payload(&ExactSemanticScrollbackLineV1 {
+            schema: 1,
+            line: line.clone(),
+            cell_widths: widths,
+        })
+        .unwrap();
+        let new = serialize_exact_semantic_scrollback_line(&line).unwrap();
+        let state = *backing.lock_state("compact size identity").unwrap();
+        let mut keyring = backing.lock_keyring("compact size cipher").unwrap();
+        let cipher = keyring.latest_active_cipher().unwrap();
+        let identity = GuardianScrollbackRowIdentity::new(
+            backing.durable_pane_id,
+            state.content_epoch,
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        let old_payload = compress_exact_scrollback_plaintext(&old).unwrap_or(old);
+        let new_payload = compress_exact_scrollback_plaintext(&new).unwrap_or(new);
+        let old_record = cipher
+            .seal_scrollback_row(identity, &old_payload)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let new_record = cipher
+            .seal_scrollback_row(identity, &new_payload)
+            .unwrap()
+            .encode()
+            .unwrap();
+        eprintln!(
+            "compact noise encrypted bytes old={} new={}",
+            old_record.len(),
+            new_record.len()
+        );
+        assert!(
+            new_record.len() <= old_record.len(),
+            "compact encoding must not grow the measured noise record"
+        );
+    }
+
+    #[test]
+    fn compact_scrollback_rejects_unsafe_cells_and_precharges_fat_attributes() {
+        let (_fallback_dir, fallback, _fallback_deferred) = deferred_test_sink();
+        for (row, (text, width)) in [("\r", 1), ("\n", 1), ("AB", 1), ("A", 2), ("界", 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut line = Line::from_text(&"a".repeat(64), &CellAttributes::blank(), 7, None);
+            line.set_cell_grapheme(1, text, width, CellAttributes::blank(), 7);
+            if text == "\r" {
+                line.set_cell_grapheme(2, "\n", 1, CellAttributes::blank(), 7);
+            }
+            // Preserve a hidden spacer's distinct attributes in the wide case.
+            if width == 2 {
+                line.cells_mut()[2].attrs_mut().set_reverse(true);
+            }
+            let raw = serialize_exact_semantic_scrollback_line(&line).unwrap();
+            let semantic: ExactSemanticScrollbackLineV1 =
+                codec::bounded_varbincode_deserialize(&mut raw.as_slice()).unwrap();
+            assert_eq!(
+                semantic.schema, 1,
+                "unsafe grapheme must retain vector storage"
+            );
+            line.cells_mut();
+            assert!(fallback.store_scrollback_line(row as isize, &line, 16));
+            let restored = fallback.load_scrollback_line(row as isize).unwrap();
+            assert_eq!(
+                varbincode::serialize(&restored).unwrap(),
+                varbincode::serialize(&line).unwrap()
+            );
+        }
+        let mut alternating = Line::from_text(&"a".repeat(64), &CellAttributes::blank(), 7, None);
+        let mut bold = CellAttributes::blank();
+        bold.set_italic(true);
+        for index in (0..64).step_by(2) {
+            alternating.set_cell_grapheme(index, "a", 1, bold.clone(), 7);
+        }
+        let vector = ExactSemanticScrollbackLineV1 {
+            schema: 1,
+            line: alternating.clone(),
+            cell_widths: vec![1; 64],
+        };
+        assert_eq!(
+            serialize_exact_semantic_scrollback_line(&alternating).unwrap(),
+            serialize_semantic_scrollback_payload(&vector).unwrap(),
+            "high attribute churn must keep identical vector bytes and storage cost",
+        );
+        let mut attrs = CellAttributes::blank();
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://checkpoint.example/budget",
+            "fat-budget",
+        ))));
+        let mut line = Line::from_text(&"a".repeat(1024), &attrs, 7, None);
+        line.compress_for_scrollback();
+        let mut semantic = ExactSemanticScrollbackLineV1 {
+            schema: 2,
+            line,
+            cell_widths: vec![1; 1024],
+        };
+        let raw = serialize_semantic_scrollback_payload(&semantic).unwrap();
+        let expected = raw.len()
+            + 1024
+                * (std::mem::size_of::<termwiz::cell::Cell>()
+                    + attrs.snapshot_clone_heap_bytes().unwrap());
+        assert_eq!(
+            compact_scrollback_decoded_charge(&semantic, raw.len()),
+            Some(expected)
+        );
+        let (_dir, backing, _deferred) = deferred_test_sink();
+        let state = *backing.lock_state("compact budget identity").unwrap();
+        let mut keyring = backing.lock_keyring("compact budget cipher").unwrap();
+        let cipher = keyring.latest_active_cipher().unwrap();
+        let identity = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+            backing.durable_pane_id,
+            state.content_epoch,
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        let encrypted = cipher
+            .seal_scrollback_row(identity, &raw)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut cache = GuardianScrollbackCipherCache::new(&keyring);
+        let error = decode_persisted_scrollback_line_with_limit(
+            &encrypted,
+            &mut cache,
+            backing.durable_pane_id,
+            state.content_epoch,
+            0,
+            0,
+            expected - 1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ScrollbackDecodedBudgetExceeded>()
+                .unwrap()
+                .minimum_required,
+            expected,
+            "authenticated compact row must charge cloned attributes before materialization",
+        );
+        semantic.cell_widths.pop();
+        assert!(compact_scrollback_decoded_charge(&semantic, raw.len()).is_none());
+        semantic.cell_widths.push(2);
+        assert!(compact_scrollback_decoded_charge(&semantic, raw.len()).is_none());
     }
 
     #[test]
