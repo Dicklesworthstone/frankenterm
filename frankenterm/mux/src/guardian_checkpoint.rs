@@ -1042,7 +1042,8 @@ impl GuardianAuthenticatedHistoricalGenesisPayload {
         identity.update(REPLAY_IDENTITY_DIGEST_DOMAIN);
         identity.update(b"frankenterm.escape-parser.recovery-ground.v3\0");
         identity.update(b"frankenterm.term.recovery-replay-semantics.v2");
-        if self.begin[128..160] != <[u8; 32]>::from(identity.finalize()) {
+        let supported_identity: [u8; 32] = identity.finalize().into();
+        if self.begin[128..160] != supported_identity {
             return Err(GuardianCheckpointCipherError::InvalidDescriptor);
         }
         // The authenticated source remains owned while the migration decoder
