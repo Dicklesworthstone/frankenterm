@@ -90,6 +90,81 @@ const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
 const PRODUCTION_TRACE_BYTE_CEILING: u64 = 32 * 1024 * 1024;
 const PRODUCTION_TRACE_SAMPLE_DENOMINATOR: u64 = 1_024;
 
+static LINE_READ_TIMING_LOGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static LINE_READ_TIMING_BASELINES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Sampled latency from post-validation scheduling through handler completion.
+/// Excludes request decode, prior authority lookup, and outbound write/flush.
+/// Worker wait includes queueing and hydration; success means accepted source
+/// plus a response enqueue attempt, not transport delivery confirmation.
+/// Drop this guard outside pane authority and terminal-lock callbacks.
+struct LineReadTiming {
+    started: Instant,
+    requested_rows: usize,
+    owner_queue: Option<std::time::Duration>,
+    capture: Option<std::time::Duration>,
+    worker_wait: Option<std::time::Duration>,
+    reply_prepare: Option<std::time::Duration>,
+    owner_resume: Option<std::time::Duration>,
+    publish_enqueue: Option<std::time::Duration>,
+    outcome: &'static str,
+}
+
+impl LineReadTiming {
+    fn start() -> Option<Instant> {
+        log::log_enabled!(target: "mux::line_read_timing", log::Level::Debug).then(Instant::now)
+    }
+
+    fn admitted(started: Instant, requested_rows: usize) -> Self {
+        Self {
+            started,
+            requested_rows,
+            owner_queue: Some(started.elapsed()),
+            capture: None,
+            worker_wait: None,
+            reply_prepare: None,
+            owner_resume: None,
+            publish_enqueue: None,
+            outcome: "abandoned",
+        }
+    }
+
+    fn reserve_sample(&self, elapsed: std::time::Duration) -> bool {
+        if self.outcome == "success"
+            && elapsed < std::time::Duration::from_millis(20)
+            && LINE_READ_TIMING_BASELINES
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < 4).then_some(count + 1)
+                })
+                .is_err()
+        {
+            return false;
+        }
+        LINE_READ_TIMING_LOGS
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < 128).then_some(count + 1)
+            })
+            .is_ok()
+    }
+}
+
+impl Drop for LineReadTiming {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if !self.reserve_sample(elapsed) {
+            return;
+        }
+        let ns = |value: Option<std::time::Duration>| value.map(|value| value.as_nanos());
+        log::debug!(target: "mux::line_read_timing",
+            "sampled_line_read outcome={} requested_rows={} total_ns={} owner_queue_ns={:?} capture_ns={:?} worker_wait_ns={:?} reply_prepare_ns={:?} owner_resume_ns={:?} publish_enqueue_ns={:?}",
+            self.outcome, self.requested_rows, elapsed.as_nanos(), ns(self.owner_queue),
+            ns(self.capture), ns(self.worker_wait), ns(self.reply_prepare),
+            ns(self.owner_resume), ns(self.publish_enqueue));
+    }
+}
+
 struct CancelLineReadOnDrop(Arc<std::sync::atomic::AtomicBool>);
 
 /// A detached storage worker must stop when its exact connection retires,
@@ -8956,11 +9031,19 @@ impl SessionHandler {
                         .len()
                         .saturating_mul(std::mem::size_of::<std::ops::Range<StableRowIndex>>()),
                 );
+                let timing_started = LineReadTiming::start();
                 schedule_main_thread_rpc(
                     MainThreadServiceClass::Interactive,
                     estimated_bytes,
                     |send_response| async move {
+                        let mut timing = timing_started.map(|started| {
+                            LineReadTiming::admitted(started, requested_rows.unwrap_or(0))
+                        });
+                        let timing_enabled = timing.is_some();
                         let Some(permit) = mux::pane::LineReadPermit::try_acquire() else {
+                            if let Some(timing) = &mut timing {
+                                timing.outcome = "worker_capacity";
+                            }
                             send_response(Err(anyhow!("cold read worker capacity exhausted")));
                             return;
                         };
@@ -8975,18 +9058,23 @@ impl SessionHandler {
                         let worker = match permit.start(
                             move || hydration_cancellation.is_cancelled(),
                             move |result, permit| {
+                                let worker_completed = timing_enabled.then(Instant::now);
                                 complete_owned_line_read(
                                     result,
                                     permit,
                                     || cancellation.is_cancelled(),
                                     |result| {
-                                        let _ = tx.send(result);
+                                        let sent = timing_enabled.then(Instant::now);
+                                        let _ = tx.send((result, worker_completed, sent));
                                     },
                                 );
                             },
                         ) {
                             Ok(worker) => worker,
                             Err(error) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = "worker_start";
+                                }
                                 send_response(Err(error.into()));
                                 return;
                             }
@@ -8995,6 +9083,7 @@ impl SessionHandler {
                         // and panic recovery. Every exit hands them to the
                         // already-running worker, including a later-range error.
                         let mut plans = Vec::with_capacity(lines.len());
+                        let capture_started = timing_enabled.then(Instant::now);
                         let captured = recover_line_read_callback(|| {
                             with_current_pane(&authority, &registration, |pane| {
                                 if let Some(layout) = layout {
@@ -9030,9 +9119,16 @@ impl SessionHandler {
                                 Ok(true)
                             })
                         });
+                        if let Some(timing) = &mut timing {
+                            timing.capture = capture_started.map(|started| started.elapsed());
+                        }
+                        let submitted = timing_enabled.then(Instant::now);
                         match captured {
                             Ok(true) => worker.submit(plans),
                             Ok(false) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = "unsupported";
+                                }
                                 cancelled.store(true, Ordering::Release);
                                 worker.submit(plans);
                                 if layout.is_some() {
@@ -9044,6 +9140,9 @@ impl SessionHandler {
                                 // Non-local pane types retain their existing
                                 // transport-specific behavior; LocalPane never
                                 // falls back to synchronous storage on refusal.
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = "legacy_fallback";
+                                }
                                 send_response(recover_line_read_callback(|| {
                                     with_current_pane(&authority, &registration, |pane| {
                                         let mut result = Vec::new();
@@ -9067,6 +9166,9 @@ impl SessionHandler {
                                 return;
                             }
                             Err(error) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = line_read_failure_reason(&error);
+                                }
                                 record_line_read_failure("capture", &error);
                                 cancelled.store(true, Ordering::Release);
                                 worker.submit(plans);
@@ -9075,17 +9177,37 @@ impl SessionHandler {
                             }
                         }
                         let result = match frankenterm_core::runtime_async::oneshot_recv(rx).await {
-                            Ok(result) => result,
+                            Ok((result, worker_completed, sent)) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.worker_wait = submitted
+                                        .zip(worker_completed)
+                                        .map(|(start, end)| end.saturating_duration_since(start));
+                                    timing.reply_prepare = worker_completed
+                                        .zip(sent)
+                                        .map(|(start, end)| end.saturating_duration_since(start));
+                                    timing.owner_resume = sent.map(|sent| sent.elapsed());
+                                }
+                                result
+                            }
                             Err(_) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = "worker_unavailable";
+                                }
                                 send_response(Err(anyhow!("cold read worker unavailable")));
                                 return;
                             }
                         };
                         match result {
-                            Err(error) => send_response(Err(error)),
+                            Err(error) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.outcome = line_read_failure_reason(&error);
+                                }
+                                send_response(Err(error));
+                            }
                             Ok(mut reply) => {
                                 let OwnedLineReply { plans, payload, .. } = &mut reply;
                                 let mut response_attempted = false;
+                                let publish_started = timing_enabled.then(Instant::now);
                                 let published = recover_line_read_callback(|| {
                                     with_current_pane(&authority, &registration, |pane| {
                                         let mut publish = || {
@@ -9124,6 +9246,15 @@ impl SessionHandler {
                                         Ok(accepted)
                                     })
                                 });
+                                if let Some(timing) = &mut timing {
+                                    timing.publish_enqueue =
+                                        publish_started.map(|start| start.elapsed());
+                                    timing.outcome = match &published {
+                                        Ok(true) => "success",
+                                        Ok(false) => "source_changed",
+                                        Err(error) => line_read_failure_reason(error),
+                                    };
+                                }
                                 if !response_attempted && !matches!(published, Ok(true)) {
                                     let error = published
                                         .err()
@@ -9869,6 +10000,107 @@ async fn move_pane(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn line_read_timing_is_opt_in_capped_and_content_free_after_lock_release() {
+        const CHILD: &str = "FT_LINE_READ_TIMING_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sessionhandler::tests::line_read_timing_is_opt_in_capped_and_content_free_after_lock_release",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        struct Logger {
+            rows: std::sync::Mutex<Vec<String>>,
+            authority: std::sync::Mutex<()>,
+        }
+        impl log::Log for Logger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.target() == "mux::line_read_timing"
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                assert!(self.authority.try_lock().is_ok(), "logged under authority");
+                self.rows.lock().unwrap().push(record.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: Logger = Logger {
+            rows: std::sync::Mutex::new(Vec::new()),
+            authority: std::sync::Mutex::new(()),
+        };
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Off);
+        assert!(LineReadTiming::start().is_none());
+        assert!(LOGGER.rows.lock().unwrap().is_empty());
+        assert_eq!(LINE_READ_TIMING_LOGS.load(Ordering::Relaxed), 0);
+        log::set_max_level(log::LevelFilter::Debug);
+
+        // Use a zero elapsed reservation check to avoid wall-clock scheduling
+        // making a nominally fast baseline cross the slow-request threshold.
+        for _ in 0..4 {
+            let timing = LineReadTiming {
+                outcome: "success",
+                ..LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88)
+            };
+            assert!(timing.reserve_sample(std::time::Duration::ZERO));
+            std::mem::forget(timing);
+        }
+        let timing = LineReadTiming {
+            outcome: "success",
+            ..LineReadTiming::admitted(LineReadTiming::start().unwrap(), 88)
+        };
+        assert!(!timing.reserve_sample(std::time::Duration::ZERO));
+        std::mem::forget(timing);
+
+        for index in 0..200 {
+            let mut timing =
+                LineReadTiming::admitted(Instant::now() - std::time::Duration::from_millis(21), 88);
+            {
+                let _authority = LOGGER.authority.lock().unwrap();
+                let error = anyhow!("sensitive-terminal-content-canary");
+                timing.outcome = if index == 0 {
+                    line_read_failure_reason(&error)
+                } else {
+                    "success"
+                };
+                timing.capture = Some(std::time::Duration::from_nanos(7));
+                assert!(LOGGER.rows.lock().unwrap().len() <= 124);
+            }
+            drop(timing);
+        }
+        let rows = LOGGER.rows.lock().unwrap();
+        assert_eq!(rows.len(), 124);
+        assert_eq!(LINE_READ_TIMING_LOGS.load(Ordering::Relaxed), 128);
+        assert!(rows[0].starts_with("sampled_line_read outcome=other "));
+        for row in rows.iter() {
+            assert!(!row.contains("sensitive-terminal-content-canary"));
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 10);
+            assert_eq!(fields[0], "sampled_line_read");
+            for (field, name) in fields[1..].iter().zip([
+                "outcome",
+                "requested_rows",
+                "total_ns",
+                "owner_queue_ns",
+                "capture_ns",
+                "worker_wait_ns",
+                "reply_prepare_ns",
+                "owner_resume_ns",
+                "publish_enqueue_ns",
+            ]) {
+                assert!(field.starts_with(&format!("{name}=")), "{row}");
+            }
+        }
+    }
+
     #[test]
     fn fenced_line_read_rejects_evicted_range_and_retires_captured_plan() {
         #[derive(Debug)]
