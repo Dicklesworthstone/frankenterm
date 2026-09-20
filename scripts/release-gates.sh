@@ -84,6 +84,7 @@ gate "mux interface imports"                     "scripts/check_mux_interface_im
 cargo_gate "workspace cycles"                    "scripts/check_workspace_cycles.sh"
 cargo_gate "feature flag matrix"                 "bash scripts/check_feature_flag_matrix.sh"
 gate "release panic contract (profiles)"         "bash scripts/check-release-panic-contract.sh --profiles-only"
+gate "linux release ABI verifier"               "python3 scripts/check-linux-release-abi.py --self-test"
 gate "windows/unix coupling ratchet"             "bash scripts/check_windows_unix_coupling.sh"
 cargo_gate "finish-line guards"                  "bash scripts/check_finish_line_guards.sh"
 gate "spec conventions"                          "scripts/check-spec-conventions.sh"
