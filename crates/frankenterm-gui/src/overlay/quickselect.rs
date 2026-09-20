@@ -587,7 +587,8 @@ mod alphabet_test {
 
         fn mutate(&self, text: &str) {
             self.pane
-                .perform_actions(vec![termwiz::escape::Action::PrintString(text.into())]);
+                .perform_actions(vec![termwiz::escape::Action::PrintString(text.into())])
+                .expect("quick-select fixture output must be admitted");
         }
 
         fn with_locked_terminal<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -3424,7 +3425,10 @@ impl Pane for QuickSelectOverlay {
         self.delegate.mouse_event(event)
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
+    fn perform_actions(
+        &self,
+        actions: Vec<termwiz::escape::Action>,
+    ) -> Result<(), mux::pane::PaneActionAdmissionError> {
         self.delegate.perform_actions(actions)
     }
 

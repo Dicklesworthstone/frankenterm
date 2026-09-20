@@ -2795,7 +2795,10 @@ impl Pane for CopyOverlay {
         anyhow::bail!("ignoring mouse while copying");
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
+    fn perform_actions(
+        &self,
+        actions: Vec<termwiz::escape::Action>,
+    ) -> Result<(), mux::pane::PaneActionAdmissionError> {
         self.delegate.perform_actions(actions)
     }
 

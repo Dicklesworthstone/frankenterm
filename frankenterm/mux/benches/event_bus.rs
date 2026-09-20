@@ -335,7 +335,8 @@ fn bench_pane_io_perform_actions(c: &mut Criterion) {
             make_local_pane,
             |pane| {
                 for actions in &batches {
-                    pane.perform_actions(black_box(actions.clone()));
+                    pane.perform_actions(black_box(actions.clone()))
+                        .expect("benchmark action admission");
                 }
                 black_box(pane.get_cursor_position());
             },
@@ -350,7 +351,8 @@ fn bench_pane_io_perform_actions(c: &mut Criterion) {
             |pane| {
                 pane.bench_with_terminal_lock_held(|| {
                     for actions in &batches {
-                        pane.perform_actions(black_box(actions.clone()));
+                        pane.perform_actions(black_box(actions.clone()))
+                            .expect("benchmark action admission");
                     }
                 });
                 black_box(pane.get_cursor_position());

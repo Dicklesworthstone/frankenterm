@@ -6,8 +6,9 @@ use crate::guardian_checkpoint::{
 use crate::pane::GuardianLiveOutputDelivery;
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, GuardianLiveCheckpointPublisher,
-    GuardianLiveOutputReader, LogicalLine, Pane, PaneId, PaneSurfaceSnapshot, PaneTitleMetadata,
-    Pattern, SearchResult, WithPaneLines,
+    GuardianLiveOutputReader, LogicalLine, Pane, PaneActionAdmissionError,
+    PaneActionAdmissionRefusal, PaneId, PaneSurfaceSnapshot, PaneTitleMetadata, Pattern,
+    SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -474,6 +475,8 @@ pub enum PendingActionDrainPolicy {
 /// Errors occurring during legacy mux-owned terminal checkpoint capture.
 #[derive(Debug, thiserror::Error)]
 pub enum LegacyTerminalCaptureError {
+    #[error("pending parser action admission refused before mutation: {0:?}")]
+    ActionAdmission(PaneActionAdmissionRefusal),
     #[error("pending parser actions remain unapplied: {0} actions pending")]
     PendingActionsRemain(usize),
     #[error("cold scrollback snapshot generation is stale")]
@@ -1392,6 +1395,7 @@ pub struct LocalPane {
     // Serializes complete producer batches, including deferred persistence,
     // without preventing GUI readers or resize workers from taking terminal.
     output_application: Mutex<()>,
+    alert_staging: Arc<Mutex<PaneAlertStaging>>,
     scrollback_flush_sink: Mutex<Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>>>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
@@ -1426,7 +1430,7 @@ pub struct LocalPane {
     /// NO `unsafe`). Present only under the `disruptor-pane-io` feature; the
     /// default build keeps the plain mutex path.
     #[cfg(feature = "disruptor-pane-io")]
-    action_ring: Arc<ArrayQueue<Vec<Action>>>,
+    action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
 }
 
 fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
@@ -2168,17 +2172,38 @@ impl Pane for LocalPane {
         Some(self.locked_terminal().get_config())
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        let _output_application = self.output_application.lock();
-        #[cfg(not(feature = "disruptor-pane-io"))]
-        {
-            // Default path: apply directly under the terminal mutex.
-            self.terminal.lock().perform_actions(actions);
+    fn perform_actions(
+        &self,
+        mut actions: Vec<termwiz::escape::Action>,
+    ) -> Result<(), PaneActionAdmissionError> {
+        if actions.is_empty() {
+            return Ok(());
         }
-        #[cfg(feature = "disruptor-pane-io")]
-        {
-            // ft-87qfi: lock-free SPSC staging — see `perform_actions_disruptor`.
-            self.perform_actions_disruptor(actions);
+        // Authority is acquired outside terminal/tab locks and declared before
+        // their guards, so refusal drops those guards before lifecycle custody.
+        let mut output = match self.prepare_alert_output() {
+            Ok(output) => output,
+            Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
+        };
+        let _output_application = self.output_application.lock();
+        if PaneAlertPreflight::needs_terminal_state(&actions) {
+            // A terminator may publish a title begun in another batch. Drain
+            // prior admitted work, then observe and admit against exact state.
+            let mut terminal = self.locked_terminal();
+            let pending_title = terminal.pending_tmux_title_bytes();
+            match self.admit_alert_actions(&mut actions, pending_title, &mut output) {
+                Ok(batch) => batch.apply(&mut terminal),
+                Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
+            }
+        } else {
+            let batch = match self.admit_alert_actions(&mut actions, 0, &mut output) {
+                Ok(batch) => batch,
+                Err(reason) => return Err(PaneActionAdmissionError { actions, reason }),
+            };
+            #[cfg(not(feature = "disruptor-pane-io"))]
+            batch.apply(&mut self.terminal.lock());
+            #[cfg(feature = "disruptor-pane-io")]
+            self.perform_actions_disruptor(batch);
         }
         // With the disruptor enabled this also drains the admitted ring before
         // backpressure, so queued rows cannot be stranded until later input.
@@ -2187,6 +2212,7 @@ impl Pane for LocalPane {
             drop(self.locked_terminal());
             self.drain_scrollback_outside_terminal(sink);
         }
+        Ok(())
     }
 
     fn capture_live_parser_checkpoint(
@@ -2196,6 +2222,12 @@ impl Pane for LocalPane {
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+        let mut output = if pending_actions.is_empty() {
+            None
+        } else {
+            self.prepare_alert_output()
+                .map_err(LiveParserPaneCaptureError::ActionAdmission)?
+        };
         // `locked_terminal` drains the optional disruptor ring before it returns.
         // Apply this parser's still-local actions and capture staged hot state
         // under the terminal lock, then release the lock immediately so cold-history
@@ -2203,7 +2235,10 @@ impl Pane for LocalPane {
         let staged = {
             let _output_application = self.output_application.lock();
             let mut terminal = self.locked_terminal();
-            terminal.perform_actions(std::mem::take(pending_actions));
+            let pending_title = terminal.pending_tmux_title_bytes();
+            self.admit_alert_actions(pending_actions, pending_title, &mut output)
+                .map_err(LiveParserPaneCaptureError::ActionAdmission)?
+                .apply(&mut terminal);
             terminal
                 .capture_staged(limits)
                 .map_err(LiveParserPaneCaptureError::Terminal)?
@@ -2885,9 +2920,7 @@ pub fn schedule_control_action(
             &GENERATED_OUTPUT_WORKERS,
             std::mem::size_of::<Action>(),
             || move || {
-                let _ = registration.try_with_current_output(|pane| {
-                    pane.perform_actions(vec![action]);
-                });
+                apply_generated_actions(&registration, vec![action]);
             }
         ),
         "terminal control could not be queued; background output capacity is unavailable"
@@ -2897,10 +2930,29 @@ pub fn schedule_control_action(
 
 pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
     spawn_generated_output(&GENERATED_OUTPUT_WORKERS, message, move |actions| {
-        let _ = registration.try_with_current_output(|pane| {
-            pane.perform_actions(actions);
-        });
+        apply_generated_actions(&registration, actions);
     });
+}
+
+fn apply_generated_actions(registration: &PaneRegistrationHandle, mut actions: Vec<Action>) {
+    loop {
+        match registration.try_with_current_output(|pane| pane.perform_actions(actions)) {
+            Some(Ok(())) => return,
+            Some(Err(error)) if error.reason == PaneActionAdmissionRefusal::Capacity => {
+                actions = error.actions;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Some(Err(error)) => {
+                metrics::counter!("mux.generated_output.admission_cancelled").increment(1);
+                log::error!("generated output cancelled after admission refusal: {error}");
+                return;
+            }
+            None => {
+                metrics::counter!("mux.generated_output.registration_cancelled").increment(1);
+                return;
+            }
+        }
+    }
 }
 
 impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
@@ -3022,54 +3074,426 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
     }
 }
 
+/// Storage needed before applying an action batch that can emit alerts.
+///
+/// This is a pre-mutation bound, not an estimate computed after the terminal
+/// has already accepted an event. Keep the OSC match exhaustive so new string
+/// commands cannot silently bypass the historical-payload budget.
+struct PaneAlertPreflight {
+    count: usize,
+    text_bytes: usize,
+}
+
+impl PaneAlertPreflight {
+    fn needs_terminal_state(actions: &[Action]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Esc(termwiz::escape::Esc::Code(
+                    termwiz::escape::EscCode::StringTerminator
+                ))
+            )
+        })
+    }
+
+    fn for_actions(actions: &[Action], pending_tmux_title_bytes: usize) -> Option<Self> {
+        use termwiz::escape::osc::{ITermProprietary, OperatingSystemCommand};
+        use termwiz::escape::{ControlCode, Esc, EscCode};
+
+        // Only ST can publish text retained by earlier batches. Those batches
+        // are admitted while holding the terminal lock after draining the ring.
+        // Include all printable input, even outside a title, to conservatively
+        // cover every same-batch title without assuming String growth policy.
+        let mut tmux_title_bytes = pending_tmux_title_bytes;
+        if Self::needs_terminal_state(actions) {
+            for action in actions {
+                let bytes = match action {
+                    Action::Print(c) => c.len_utf8(),
+                    Action::PrintString(s) => s.len(),
+                    _ => 0,
+                };
+                tmux_title_bytes = tmux_title_bytes.checked_add(bytes)?;
+            }
+        }
+        let mut count = usize::from(!actions.is_empty());
+        let mut text_bytes = 0usize;
+        for action in actions {
+            let action_count = match action {
+                Action::OperatingSystemCommand(command) => match command.as_ref() {
+                    OperatingSystemCommand::SetIconNameAndWindowTitle(_) => 2,
+                    // At most one notification per OSC, including palette lists.
+                    _ => 1,
+                },
+                Action::Esc(Esc::Code(EscCode::StringTerminator)) => 2,
+                Action::Esc(Esc::Code(EscCode::FullReset))
+                | Action::Control(ControlCode::Bell)
+                | Action::KittyImage(_) => 1,
+                Action::Print(_)
+                | Action::PrintString(_)
+                | Action::Control(_)
+                | Action::DeviceControl(_)
+                | Action::CSI(_)
+                | Action::Esc(_)
+                | Action::Sixel(_)
+                | Action::XtGetTcap(_) => 0,
+            };
+            count = count.checked_add(action_count)?;
+            let additional = match action {
+                Action::OperatingSystemCommand(command) => match command.as_ref() {
+                    OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
+                        title.capacity().checked_mul(2)?
+                    }
+                    OperatingSystemCommand::SetWindowTitle(title)
+                    | OperatingSystemCommand::SetWindowTitleSun(title)
+                    | OperatingSystemCommand::SetIconName(title)
+                    | OperatingSystemCommand::SetIconNameSun(title)
+                    | OperatingSystemCommand::SystemNotification(title)
+                    | OperatingSystemCommand::SetMouseShape(title) => title.capacity(),
+                    OperatingSystemCommand::ITermProprietary(command) => match command {
+                        ITermProprietary::SetUserVar { name, value } => {
+                            name.capacity().checked_add(value.capacity())?
+                        }
+                        ITermProprietary::SetProfile(name) => name.capacity(),
+                        ITermProprietary::SetMark
+                        | ITermProprietary::StealFocus
+                        | ITermProprietary::ClearScrollback
+                        | ITermProprietary::CurrentDir(_)
+                        | ITermProprietary::CopyToClipboard(_)
+                        | ITermProprietary::EndCopy
+                        | ITermProprietary::HighlightCursorLine(_)
+                        | ITermProprietary::RequestCellSize
+                        | ITermProprietary::ReportCellSize { .. }
+                        | ITermProprietary::Copy(_)
+                        | ITermProprietary::ReportVariable(_)
+                        | ITermProprietary::SetBadgeFormat(_)
+                        | ITermProprietary::File(_)
+                        | ITermProprietary::UnicodeVersion(_) => 0,
+                    },
+                    OperatingSystemCommand::RxvtExtension(params) => params
+                        .get(1)
+                        .map_or(0, String::capacity)
+                        .checked_add(params.get(2).map_or(0, String::capacity))?,
+                    OperatingSystemCommand::SetHyperlink(_)
+                    | OperatingSystemCommand::ClearSelection(_)
+                    | OperatingSystemCommand::QuerySelection(_)
+                    | OperatingSystemCommand::SetSelection(_, _)
+                    | OperatingSystemCommand::FinalTermSemanticPrompt(_)
+                    | OperatingSystemCommand::ChangeColorNumber(_)
+                    | OperatingSystemCommand::ChangeDynamicColors(_, _)
+                    | OperatingSystemCommand::ResetDynamicColor(_)
+                    | OperatingSystemCommand::CurrentWorkingDirectory(_)
+                    | OperatingSystemCommand::ResetColors(_)
+                    | OperatingSystemCommand::ConEmuProgress(_)
+                    | OperatingSystemCommand::Unspecified(_) => 0,
+                },
+                // Staged strings are normalized to capacity == length. The
+                // sanitizer retains at most 256 Unicode scalar values.
+                Action::KittyImage(_) => 256 * 4,
+                Action::Esc(Esc::Code(EscCode::StringTerminator)) => {
+                    tmux_title_bytes.checked_mul(2)?
+                }
+                Action::Print(_)
+                | Action::PrintString(_)
+                | Action::Control(_)
+                | Action::DeviceControl(_)
+                | Action::CSI(_)
+                | Action::Esc(_)
+                | Action::Sixel(_)
+                | Action::XtGetTcap(_) => 0,
+            };
+            text_bytes = text_bytes.checked_add(additional)?;
+        }
+        Some(Self { count, text_bytes })
+    }
+
+    fn retained_bytes(&self) -> Option<usize> {
+        self.count
+            .checked_mul(std::mem::size_of::<Alert>())?
+            .checked_add(self.text_bytes)?
+            .checked_add(LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES)
+    }
+}
+
 struct LocalPaneNotifHandler {
-    pane_id: PaneId,
-    mux_registration: Arc<PaneRegistrationSlot>,
+    staging: Arc<Mutex<PaneAlertStaging>>,
+}
+
+#[derive(Default)]
+struct PaneAlertStaging {
+    active: Option<ActivePaneAlerts>,
+    tail: Option<promise::Future<()>>,
+}
+
+struct ActivePaneAlerts {
+    alerts: Vec<Alert>,
+    remaining_text_bytes: usize,
+}
+
+struct PaneAlertCompletion {
+    _successor: promise::Promise<()>,
+    delivered: bool,
+}
+
+#[cfg(test)]
+static ALERT_DELIVERY_CANCELLED: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for PaneAlertCompletion {
+    fn drop(&mut self) {
+        if !self.delivered {
+            metrics::counter!("mux.pane_alerts.delivery_cancelled").increment(1);
+            #[cfg(test)]
+            ALERT_DELIVERY_CANCELLED.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+struct FundedPaneAlerts {
+    reservation: Option<promise::spawn::BackgroundSpawnReservation>,
+    main: Option<promise::spawn::MainThreadSpawnReservation>,
+    output: Option<crate::PaneAlertOutput>,
+    alerts: Vec<Alert>,
+    text_bytes: usize,
+    terminal: std::sync::Weak<Mutex<Terminal>>,
+}
+
+struct AdmittedPaneActions {
+    actions: Vec<Action>,
+    alerts: Option<FundedPaneAlerts>,
+    staging: Arc<Mutex<PaneAlertStaging>>,
+}
+
+impl FundedPaneAlerts {
+    fn reserve(
+        preflight: PaneAlertPreflight,
+        output: &mut Option<crate::PaneAlertOutput>,
+        terminal: &Arc<Mutex<Terminal>>,
+    ) -> Result<Option<Self>, PaneActionAdmissionRefusal> {
+        use promise::spawn::BackgroundSpawnError;
+        use promise::spawn::{MainThreadReservationOutcome as Outcome, MainThreadServiceClass};
+        if output.is_none() {
+            return Ok(None);
+        }
+        let bytes = preflight
+            .retained_bytes()
+            .ok_or(PaneActionAdmissionRefusal::SizeOverflow)?;
+        if !promise::spawn::is_scheduler_configured() {
+            return Err(PaneActionAdmissionRefusal::SchedulerUnavailable);
+        }
+        let reservation =
+            promise::spawn::try_reserve_background_task(bytes).map_err(|error| match error {
+                BackgroundSpawnError::TaskCapacityExhausted { .. } => {
+                    PaneActionAdmissionRefusal::Capacity
+                }
+                BackgroundSpawnError::EstimatedByteCapacityExhausted {
+                    requested,
+                    capacity,
+                    ..
+                } if requested <= capacity => PaneActionAdmissionRefusal::Capacity,
+                BackgroundSpawnError::EstimatedByteCapacityExhausted { .. }
+                | BackgroundSpawnError::ZeroEstimatedBytes => {
+                    PaneActionAdmissionRefusal::SizeOverflow
+                }
+                BackgroundSpawnError::WorkerUnavailable(_) => {
+                    PaneActionAdmissionRefusal::SchedulerUnavailable
+                }
+            })?;
+        let main = match promise::spawn::try_reserve_main_thread(
+            MainThreadServiceClass::Interactive,
+            bytes,
+        ) {
+            Outcome::Reserved(main) => main,
+            Outcome::RetryableFull(_) => return Err(PaneActionAdmissionRefusal::Capacity),
+            Outcome::SchedulerUnavailable => {
+                return Err(PaneActionAdmissionRefusal::SchedulerUnavailable)
+            }
+            Outcome::InvalidSize(_) => return Err(PaneActionAdmissionRefusal::SizeOverflow),
+            Outcome::RetiredGeneration(_) | Outcome::AuthorityExhausted(_) => {
+                return Err(PaneActionAdmissionRefusal::Retired)
+            }
+            Outcome::Coalesced(_) => unreachable!("historical alert batches cannot coalesce"),
+        };
+        let mut alerts = Vec::new();
+        alerts
+            .try_reserve_exact(preflight.count)
+            .map_err(|_| PaneActionAdmissionRefusal::Allocation)?;
+        // Do not assume an allocator's capacity rounding is free.
+        if alerts.capacity() > preflight.count {
+            return Err(PaneActionAdmissionRefusal::Allocation);
+        }
+        Ok(Some(Self {
+            reservation: Some(reservation),
+            main: Some(main),
+            output: output.take(),
+            alerts,
+            text_bytes: preflight.text_bytes,
+            terminal: Arc::downgrade(terminal),
+        }))
+    }
+
+    fn publish(
+        mut self,
+        predecessor: Option<promise::Future<()>>,
+        completion: promise::Promise<()>,
+    ) {
+        let reservation = self.reservation.take().expect("funded batch owns custody");
+        let main = self
+            .main
+            .take()
+            .expect("funded batch owns main-thread admission");
+        let output = self
+            .output
+            .take()
+            .expect("funded batch owns output authority");
+        let alerts = std::mem::take(&mut self.alerts);
+        let terminal = self.terminal.clone();
+        let mut completion = PaneAlertCompletion {
+            _successor: completion,
+            delivered: false,
+        };
+        reservation.spawn(async move {
+            // Both an unpolled cancellation and a completed callback release
+            // this link. Later batches wait for actual completion, not enqueue.
+            if let Some(predecessor) = predecessor {
+                let _ = predecessor.await;
+            }
+            wait_for_alert_terminal_unlock(&terminal).await;
+            main.spawn(async move {
+                for alert in alerts {
+                    if !output.dispatch_alert(alert) {
+                        return;
+                    }
+                }
+                completion.delivered = true;
+            })
+            .detach();
+        });
+    }
+}
+
+async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<Mutex<Terminal>>) {
+    loop {
+        let Some(terminal) = terminal.upgrade() else {
+            return;
+        };
+        if terminal.try_lock().is_some() {
+            return;
+        }
+        drop(terminal);
+        promise::spawn::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+impl Drop for FundedPaneAlerts {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let output = self.output.take();
+        let main = self.main.take();
+        let terminal = self.terminal.clone();
+        // The global background executor has no main-binding close path and
+        // never polls inline. Even cancellation of an unapplied ring entry
+        // must not release its lifecycle continuation under a terminal/tab lock.
+        reservation.spawn(async move {
+            wait_for_alert_terminal_unlock(&terminal).await;
+            drop(main);
+            drop(output);
+        });
+    }
+}
+
+fn normalize_alert_text(alert: &mut Alert) -> usize {
+    fn normalize(text: &mut String) -> usize {
+        *text = std::mem::take(text).into_boxed_str().into_string();
+        text.capacity()
+    }
+    match alert {
+        Alert::ToastNotification { title, body, .. } => {
+            title.as_mut().map_or(0, normalize) + normalize(body)
+        }
+        Alert::IconTitleChanged(title) | Alert::TabTitleChanged(title) => {
+            title.as_mut().map_or(0, normalize)
+        }
+        Alert::WindowTitleChanged(title) => normalize(title),
+        Alert::SetUserVar { name, value } => normalize(name) + normalize(value),
+        Alert::SetProfileRequested { name } => normalize(name),
+        Alert::MouseShapeRequested { shape } => normalize(shape),
+        Alert::ImageAltText { text, .. } => normalize(text),
+        Alert::Bell
+        | Alert::CurrentWorkingDirectoryChanged
+        | Alert::PaletteChanged
+        | Alert::OutputSinceFocusLost
+        | Alert::Progress(_) => 0,
+    }
+}
+
+impl AdmittedPaneActions {
+    fn apply(self, terminal: &mut Terminal) {
+        let Self {
+            actions,
+            mut alerts,
+            staging,
+        } = self;
+        {
+            let mut state = staging.lock();
+            assert!(
+                state.active.is_none(),
+                "terminal action batches are serialized"
+            );
+            state.active = alerts.as_mut().map(|batch| ActivePaneAlerts {
+                alerts: std::mem::take(&mut batch.alerts),
+                remaining_text_bytes: batch.text_bytes,
+            });
+        }
+        let application = PaneAlertApplication { alerts, staging };
+        terminal.perform_actions(actions);
+        drop(application);
+    }
+}
+
+struct PaneAlertApplication {
+    alerts: Option<FundedPaneAlerts>,
+    staging: Arc<Mutex<PaneAlertStaging>>,
+}
+
+impl Drop for PaneAlertApplication {
+    fn drop(&mut self) {
+        let Some(mut batch) = self.alerts.take() else {
+            return;
+        };
+        let (predecessor, completion) = {
+            let mut state = self.staging.lock();
+            batch.alerts = state
+                .active
+                .take()
+                .expect("funded alert staging remains installed")
+                .alerts;
+            let mut completion = promise::Promise::<()>::new();
+            let successor = completion.get_future().expect("new completion future");
+            (state.tail.replace(successor), completion)
+        };
+        batch.publish(predecessor, completion);
+    }
 }
 
 impl AlertHandler for LocalPaneNotifHandler {
-    fn alert(&mut self, alert: Alert) {
-        let Some(registration) = self.mux_registration.load() else {
-            log::trace!(
-                "dropping alert for unregistered local pane {}",
-                self.pane_id
-            );
+    fn alert(&mut self, mut alert: Alert) {
+        let mut state = self.staging.lock();
+        let Some(active) = state.active.as_mut() else {
+            // Unregistered model-only batches never acquire authority midway
+            // through application, even if registration races this callback.
             return;
         };
-        if !promise::spawn::is_scheduler_configured() {
-            let _ = registration.try_with_current(|pane| {
-                pane.dispatch_alert(alert);
-            });
-            return;
-        }
-        match promise::spawn::try_reserve_main_thread(
-            promise::spawn::MainThreadServiceClass::Interactive,
-            LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
-        ) {
-            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                reservation
-                    .spawn(async move {
-                        let _ = registration.try_with_current(|pane| {
-                            pane.dispatch_alert(alert);
-                        });
-                    })
-                    .detach();
-            }
-            rejected => {
-                metrics::counter!(
-                    "mux.local_pane.main_thread_admission",
-                    "operation" => "pane alert",
-                    "outcome" => "inline_fallback"
-                )
-                .increment(1);
-                log::error!(
-                    "main-thread scheduler rejected local-pane alert; preserving alert inline: {rejected:?}"
-                );
-                let _ = registration.try_with_current(|pane| {
-                    pane.dispatch_alert(alert);
-                });
-            }
-        }
+        let bytes = normalize_alert_text(&mut alert);
+        active.remaining_text_bytes = active
+            .remaining_text_bytes
+            .checked_sub(bytes)
+            .expect("alert preflight covers retained strings");
+        assert!(
+            active.alerts.len() < active.alerts.capacity(),
+            "alert preflight covers event count"
+        );
+        active.alerts.push(alert);
     }
 }
 
@@ -3117,6 +3541,43 @@ fn split_child(
 }
 
 impl LocalPane {
+    fn prepare_alert_output(
+        &self,
+    ) -> Result<Option<crate::PaneAlertOutput>, PaneActionAdmissionRefusal> {
+        let Some(registration) = self.mux_registration.load() else {
+            return Ok(None);
+        };
+        if !promise::spawn::is_scheduler_configured() {
+            return Err(PaneActionAdmissionRefusal::SchedulerUnavailable);
+        }
+        // Initialize the lazy executor/reactor before taking any terminal lock.
+        // Actual batch admission later is a bounded, nonblocking counter update.
+        drop(
+            promise::spawn::try_reserve_background_task(1)
+                .map_err(|_| PaneActionAdmissionRefusal::Capacity)?,
+        );
+        registration
+            .reserve_alert_output()
+            .map(Some)
+            .ok_or(PaneActionAdmissionRefusal::Retired)
+    }
+
+    fn admit_alert_actions(
+        &self,
+        actions: &mut Vec<Action>,
+        pending_tmux_title_bytes: usize,
+        output: &mut Option<crate::PaneAlertOutput>,
+    ) -> Result<AdmittedPaneActions, PaneActionAdmissionRefusal> {
+        let preflight = PaneAlertPreflight::for_actions(actions, pending_tmux_title_bytes)
+            .ok_or(PaneActionAdmissionRefusal::SizeOverflow)?;
+        let alerts = FundedPaneAlerts::reserve(preflight, output, &self.terminal)?;
+        Ok(AdmittedPaneActions {
+            actions: std::mem::take(actions),
+            alerts,
+            staging: Arc::clone(&self.alert_staging),
+        })
+    }
+
     /// Capture a legacy mux-owned pane terminal checkpoint using distinct model-only authority.
     ///
     /// The capture separates hot-state capture from cold-history materialization:
@@ -3169,10 +3630,19 @@ impl LocalPane {
         if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
             return Err(LegacyTerminalCaptureError::FalseGuardianAuthority);
         }
+        let mut output = if pending_actions.is_empty() {
+            None
+        } else {
+            self.prepare_alert_output()
+                .map_err(LegacyTerminalCaptureError::ActionAdmission)?
+        };
         let _output_application = self.output_application.lock();
         let mut terminal = self.locked_terminal();
         if !pending_actions.is_empty() {
-            terminal.perform_actions(std::mem::take(pending_actions));
+            let pending_title = terminal.pending_tmux_title_bytes();
+            self.admit_alert_actions(pending_actions, pending_title, &mut output)
+                .map_err(LegacyTerminalCaptureError::ActionAdmission)?
+                .apply(&mut terminal);
         }
         let staged = terminal.capture_staged(limits)?;
         Ok(staged.bind_external_parser_ground(ground))
@@ -3219,12 +3689,21 @@ impl LocalPane {
             PendingActionDrainPolicy::DrainAndApply => {}
         }
 
+        let mut output = if pending_actions.is_empty() {
+            None
+        } else {
+            self.prepare_alert_output()
+                .map_err(LegacyTerminalCaptureError::ActionAdmission)?
+        };
         // 1. Under terminal lock: drain/apply actions, capture hot state, pin cold generation
         let staged = {
             let _output_application = self.output_application.lock();
             let mut terminal = self.locked_terminal();
             if policy == PendingActionDrainPolicy::DrainAndApply {
-                terminal.perform_actions(std::mem::take(pending_actions));
+                let pending_title = terminal.pending_tmux_title_bytes();
+                self.admit_alert_actions(pending_actions, pending_title, &mut output)
+                    .map_err(LegacyTerminalCaptureError::ActionAdmission)?
+                    .apply(&mut terminal);
             }
             terminal.capture_staged(limits).map_err(|e| match e {
                 RecoveryTerminalCheckpointError::Checkpoint(
@@ -3938,9 +4417,9 @@ impl LocalPane {
     /// resize worker, whose static helper cannot call `locked_terminal`.
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
-    fn drain_action_ring_into(action_ring: &ArrayQueue<Vec<Action>>, term: &mut Terminal) {
+    fn drain_action_ring_into(action_ring: &ArrayQueue<AdmittedPaneActions>, term: &mut Terminal) {
         while let Some(actions) = action_ring.pop() {
-            term.perform_actions(actions);
+            actions.apply(term);
         }
     }
 
@@ -3952,19 +4431,19 @@ impl LocalPane {
     /// saturated, fall back to a blocking apply (back-pressure), draining first
     /// to preserve order.
     #[cfg(feature = "disruptor-pane-io")]
-    fn perform_actions_disruptor(&self, actions: Vec<Action>) {
-        if actions.is_empty() {
+    fn perform_actions_disruptor(&self, actions: AdmittedPaneActions) {
+        if actions.actions.is_empty() {
             return;
         }
         if let Some(mut term) = self.terminal.try_lock() {
             self.drain_action_ring_locked(&mut term);
-            term.perform_actions(actions);
+            actions.apply(&mut term);
             return;
         }
         if let Err(actions) = self.action_ring.push(actions) {
             let mut term = self.terminal.lock();
             self.drain_action_ring_locked(&mut term);
-            term.perform_actions(actions);
+            actions.apply(&mut term);
         }
     }
 
@@ -4068,7 +4547,7 @@ impl LocalPane {
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
         line_layout_observation: Arc<LineLayoutObservation>,
-        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
@@ -4127,7 +4606,7 @@ impl LocalPane {
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
         line_layout_observation: Arc<LineLayoutObservation>,
-        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<AdmittedPaneActions>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
         registration: Arc<PaneRegistrationSlot>,
@@ -4576,7 +5055,7 @@ impl LocalPane {
 
     fn prepare_resize_reflow(
         terminal: &Mutex<Terminal>,
-        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         size: TerminalSize,
         is_cancelled: impl Fn() -> bool,
     ) -> (Option<frankenterm_term::ScreenReflowPreparation>, Duration) {
@@ -4602,7 +5081,7 @@ impl LocalPane {
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
         line_layout_observation: &LineLayoutObservation,
-        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<AdmittedPaneActions>,
         pty: &Mutex<Box<dyn MasterPty>>,
         resize_queue: &Mutex<ResizeQueueState>,
         commit_id: u64,
@@ -5011,6 +5490,7 @@ impl LocalPane {
         ownership: LocalPaneOwnership,
     ) -> Self {
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
+        let alert_staging = Arc::new(Mutex::new(PaneAlertStaging::default()));
         let child_exit_prune = ChildExitPruneState::new(Arc::clone(&mux_registration));
         let tmux_domain = Arc::new(Mutex::new(None));
         let (process, signaller, pid) = split_child(process, Arc::clone(&child_exit_prune));
@@ -5021,8 +5501,7 @@ impl LocalPane {
             mux_registration: Arc::clone(&mux_registration),
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler {
-            pane_id,
-            mux_registration: Arc::clone(&mux_registration),
+            staging: Arc::clone(&alert_staging),
         }));
 
         let process = Arc::new(Mutex::new(ProcessState::Running {
@@ -5049,6 +5528,7 @@ impl LocalPane {
             cold_viewport_failure: Arc::new(Mutex::new(None)),
             line_layout_observation: Arc::new(Mutex::new(None)),
             output_application: Mutex::new(()),
+            alert_staging,
             scrollback_flush_sink: Mutex::new(scrollback_flush_sink),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
@@ -5361,6 +5841,309 @@ mod tests {
     use super::*;
     use frankenterm_term::config::ScrollbackSpillSink;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn historical_alert_admission_preserves_fifo_bounds_and_shutdown() {
+        const CHILD: &str = "FT_HISTORICAL_ALERT_CONTRACT_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "localpane::tests::historical_alert_admission_preserves_fifo_bounds_and_shutdown", "--nocapture"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "alert subprocess failed: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout)
+                        .contains("HISTORICAL_ALERT_CONTRACT_SUCCESS"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "alert subprocess timed out: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn pump_until(executor: &promise::spawn::SimpleExecutor, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                while executor.try_tick().unwrap() {}
+                assert!(
+                    Instant::now() < deadline,
+                    "alert publication did not complete"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn title(value: &str) -> Action {
+            Action::OperatingSystemCommand(Box::new(
+                termwiz::escape::osc::OperatingSystemCommand::SetWindowTitle(value.into()),
+            ))
+        }
+        let domain: Arc<dyn Domain> =
+            Arc::new(crate::domain::LocalDomain::new("alert-contract").unwrap());
+        let pane = Arc::new(LocalPane::new(
+            812,
+            guardian_lifetime_test_terminal(),
+            Box::new(ColdResizeTestChild::default()),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            domain.domain_id(),
+            [0xa1; 16],
+            "alert-contract".into(),
+        ));
+        let mut model_only_actions = vec![title("before-registration")];
+        let mut model_only_output = pane.prepare_alert_output().unwrap();
+        assert!(model_only_output.is_none());
+        let model_only = pane
+            .admit_alert_actions(&mut model_only_actions, 0, &mut model_only_output)
+            .unwrap();
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        let mux = Arc::new(crate::Mux::new(Some(domain)));
+        let generation = crate::PaneRegistrationGeneration::new(
+            pane.pane_id(),
+            &mux.pane_retirements,
+            Arc::downgrade(&mux),
+        );
+        {
+            let _registration = mux.pane_registration.lock();
+            mux.insert_pane_registration_locked(
+                pane.pane_id(),
+                pane.domain_id(),
+                &dynamic,
+                &generation,
+            )
+            .unwrap();
+        }
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        pane.mux_registration
+            .reserve(registration)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finalize();
+
+        // A registered embedding with no scheduler refuses the original batch.
+        let no_scheduler = pane
+            .perform_actions(vec![title("not-applied")])
+            .unwrap_err();
+        assert_eq!(
+            no_scheduler.reason,
+            PaneActionAdmissionRefusal::SchedulerUnavailable
+        );
+        assert_eq!(no_scheduler.actions.len(), 1);
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(32, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Alert>::new()));
+        let observed = received.clone();
+        let weak_pane = Arc::downgrade(&pane);
+        let wrong_thread = Arc::new(AtomicBool::new(false));
+        let lock_violation = Arc::new(AtomicBool::new(false));
+        let callback_thread = wrong_thread.clone();
+        let callback_lock = lock_violation.clone();
+        let owner_thread = std::thread::current().id();
+        mux.subscribe(move |notification| {
+            if let crate::MuxNotification::Alert { alert, .. } = notification {
+                callback_thread.fetch_or(
+                    std::thread::current().id() != owner_thread,
+                    Ordering::SeqCst,
+                );
+                let pane = weak_pane.upgrade().unwrap();
+                callback_lock.fetch_or(pane.terminal.try_lock().is_none(), Ordering::SeqCst);
+                observed.lock().push(alert);
+            }
+            true
+        })
+        .unwrap();
+
+        // An unregistered batch cannot acquire notification authority midway
+        // through application merely because the pane was registered meanwhile.
+        model_only.apply(&mut pane.terminal.lock());
+        assert!(received.lock().is_empty());
+        pane.perform_actions(vec![title("A")]).unwrap();
+        pane.perform_actions(vec![title("B")]).unwrap();
+        assert!(received.lock().is_empty());
+        pump_until(&executor, || {
+            received
+                .lock()
+                .iter()
+                .filter(|alert| matches!(alert, Alert::WindowTitleChanged(_)))
+                .count()
+                == 2
+        });
+        let titles = received
+            .lock()
+            .iter()
+            .filter_map(|alert| match alert {
+                Alert::WindowTitleChanged(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["A", "B"]);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+
+        // Exercise the production admission/application helper while retaining
+        // the emitting guard. Even pumping the main executor cannot dispatch it.
+        let before = received.lock().len();
+        let mut output = pane.prepare_alert_output().unwrap();
+        let mut actions = vec![Action::Control(termwiz::escape::ControlCode::Bell)];
+        let batch = pane
+            .admit_alert_actions(&mut actions, 0, &mut output)
+            .unwrap();
+        let mut emitting = pane.terminal.lock();
+        batch.apply(&mut emitting);
+        for _ in 0..20 {
+            while executor.try_tick().unwrap() {}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(received.lock().len(), before);
+        drop(emitting);
+        pump_until(&executor, || received.lock().len() > before);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+
+        // A later ST owns no text itself but emits two retained Unicode titles.
+        let unicode = "界🙂".repeat(512);
+        pane.perform_actions(vec![
+            Action::Esc(termwiz::escape::Esc::Code(
+                termwiz::escape::EscCode::TmuxTitle,
+            )),
+            Action::PrintString(unicode.clone()),
+        ])
+        .unwrap();
+        pane.perform_actions(vec![Action::Esc(termwiz::escape::Esc::Code(
+            termwiz::escape::EscCode::StringTerminator,
+        ))])
+        .unwrap();
+        pump_until(&executor, || {
+            received
+                .lock()
+                .iter()
+                .any(|alert| matches!(alert, Alert::WindowTitleChanged(s) if s == &unicode))
+        });
+        assert!(received
+            .lock()
+            .iter()
+            .any(|alert| matches!(alert, Alert::IconTitleChanged(Some(s)) if s == &unicode)));
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+
+        let mut saturation = Vec::new();
+        loop {
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                1,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(permit) => {
+                    saturation.push(permit)
+                }
+                promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => break,
+                other => panic!("unexpected saturation result: {other:?}"),
+            }
+        }
+        let seqno = pane.terminal.lock().current_seqno();
+        let secret = "secret-canary-never-format";
+        let rejected = pane.perform_actions(vec![title(secret)]).unwrap_err();
+        assert_eq!(rejected.reason, PaneActionAdmissionRefusal::Capacity);
+        assert_eq!(pane.terminal.lock().current_seqno(), seqno);
+        assert!(!format!("{rejected:?} {rejected}").contains(secret));
+        assert!(
+            matches!(&rejected.actions[..], [Action::OperatingSystemCommand(command)] if matches!(command.as_ref(), termwiz::escape::osc::OperatingSystemCommand::SetWindowTitle(s) if s == secret))
+        );
+        drop(saturation);
+        pane.perform_actions(rejected.actions).unwrap();
+        pump_until(&executor, || {
+            received
+                .lock()
+                .iter()
+                .any(|alert| matches!(alert, Alert::WindowTitleChanged(s) if s == secret))
+        });
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+        assert!(!wrong_thread.load(Ordering::SeqCst));
+        assert!(!lock_violation.load(Ordering::SeqCst));
+
+        // Close the exact scheduler while two accepted batches are fenced by
+        // the emitting guard. They cancel, release FIFO and output custody, and
+        // do not run subscriber callbacks on the producer or background thread.
+        let cancellations = ALERT_DELIVERY_CANCELLED.load(Ordering::Acquire);
+        let before = received.lock().len();
+        let mut first_output = pane.prepare_alert_output().unwrap();
+        let mut second_output = pane.prepare_alert_output().unwrap();
+        let mut first = vec![title("cancelled-first")];
+        let mut second = vec![title("cancelled-second")];
+        let first = pane
+            .admit_alert_actions(&mut first, 0, &mut first_output)
+            .unwrap();
+        let second = pane
+            .admit_alert_actions(&mut second, 0, &mut second_output)
+            .unwrap();
+        let mut emitting = pane.terminal.lock();
+        first.apply(&mut emitting);
+        second.apply(&mut emitting);
+        drop(executor);
+        assert_eq!(received.lock().len(), before);
+        drop(emitting);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ALERT_DELIVERY_CANCELLED.load(Ordering::Acquire) < cancellations + 2
+            || generation.operation_state.load(Ordering::Acquire)
+                & crate::PANE_REGISTRATION_OPERATION_MASK
+                != 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "closed scheduler stranded funded alert custody"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(received.lock().len(), before);
+        assert_eq!(promise::spawn::main_thread_admission_accounting_errors(), 0);
+        let dead = Arc::new(AtomicBool::new(false));
+        crate::send_actions_to_mux_with_scheduler_state(
+            &Arc::downgrade(&dynamic),
+            &generation,
+            &dead,
+            vec![title("refused-parser-boundary")],
+            true,
+        );
+        assert!(dead.load(Ordering::Acquire));
+        assert!(generation
+            .live_parser_checkpoint
+            .state
+            .lock()
+            .poison
+            .is_some());
+        assert!(
+            generation
+                .live_parser_checkpoint
+                .record_parsed_bytes(0)
+                .is_err(),
+            "a refused batch must never become an acknowledged checkpoint boundary"
+        );
+        println!("HISTORICAL_ALERT_CONTRACT_SUCCESS");
+    }
 
     #[derive(Debug, Default)]
     struct ColdResizeTestSink {
@@ -7071,7 +7854,7 @@ mod tests {
                 // Force the producer to stage output. Snapshot capture must
                 // apply it before cloning, without reacquiring the mutex.
                 let _terminal = pane.terminal.lock();
-                pane.perform_actions(staged);
+                pane.perform_actions(staged).unwrap();
                 assert!(!pane.action_ring.is_empty());
             }
             let mut render = Render {
@@ -10205,7 +10988,7 @@ mod tests {
                 // An idle producer applies immediately. Exercise real contention
                 // so capture, rather than the producer, must drain this batch.
                 let _terminal = pane.terminal.lock();
-                pane.perform_actions(staged);
+                pane.perform_actions(staged).unwrap();
             }
             assert!(
                 !pane.action_ring.is_empty(),

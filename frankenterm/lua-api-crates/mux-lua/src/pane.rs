@@ -288,7 +288,8 @@ impl UserData for MuxPane {
             let mut actions = vec![];
             parser.parse(text.as_bytes(), |action| actions.push(action));
 
-            pane.perform_actions(actions);
+            pane.perform_actions(actions)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
 

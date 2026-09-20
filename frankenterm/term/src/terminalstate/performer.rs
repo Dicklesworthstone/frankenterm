@@ -31,6 +31,18 @@ use url::Url;
 const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
 
+impl TerminalState {
+    /// Bytes retained by an unfinished legacy tmux title sequence.
+    ///
+    /// Embedders admitting an external action batch must include this state:
+    /// a later StringTerminator can publish the title without carrying any
+    /// text in that action. The caller must keep terminal mutation serialized
+    /// from this observation through application of the admitted batch.
+    pub fn pending_tmux_title_bytes(&self) -> usize {
+        self.accumulating_title.as_ref().map_or(0, String::len)
+    }
+}
+
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
 pub(crate) struct Performer<'a> {

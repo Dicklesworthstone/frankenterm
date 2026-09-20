@@ -2251,7 +2251,8 @@ mod tests {
         // Deterministically change output after the first metadata observation.
         pane.perform_actions(vec![termwiz::escape::Action::PrintString(
             " more output".into(),
-        )]);
+        )])
+        .expect("selection fixture output must be admitted");
         let (observed, _) = TermWindow::refresh_local_copy_source(
             &pane, &desired, &mut copy, authority, sequence, dimensions,
         )
@@ -2265,7 +2266,8 @@ mod tests {
         let mut actions = Vec::new();
         termwiz::escape::parser::Parser::new()
             .parse(b"\x1b[1;1HCHANGED", |action| actions.push(action));
-        pane.perform_actions(actions);
+        pane.perform_actions(actions)
+            .expect("selection fixture output must be admitted");
         let (authority, sequence, dimensions) = SelectionAuthority::capture_source(&*pane).unwrap();
         let mut stale = SelectionCopy::new(&desired, sequence).unwrap();
         assert!(
@@ -3230,7 +3232,8 @@ mod tests {
         // Mutate actual pane output
         pane.perform_actions(vec![termwiz::escape::Action::PrintString(
             " MUTATED".into(),
-        )]);
+        )])
+        .expect("selection fixture output must be admitted");
 
         let (new_authority, new_sequence, new_dims) =
             SelectionAuthority::capture_source(&*pane).unwrap();

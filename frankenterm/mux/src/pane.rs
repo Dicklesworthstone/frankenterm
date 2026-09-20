@@ -31,6 +31,47 @@ use url::Url;
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type PaneId = usize;
 
+/// Refusal before applying any action in the returned batch.
+///
+/// Readers may retry temporary saturation after releasing all model locks.
+/// Other producers must return the error to their caller. Ownership stays with
+/// the caller so backpressure cannot silently discard terminal input.
+pub struct PaneActionAdmissionError {
+    pub actions: Vec<termwiz::escape::Action>,
+    pub reason: PaneActionAdmissionRefusal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneActionAdmissionRefusal {
+    Unsupported,
+    Capacity,
+    SchedulerUnavailable,
+    Retired,
+    SizeOverflow,
+    Allocation,
+}
+
+impl std::fmt::Debug for PaneActionAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneActionAdmissionError")
+            .field("reason", &self.reason)
+            .field("action_count", &self.actions.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for PaneActionAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pane action batch refused before mutation: {:?}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for PaneActionAdmissionError {}
+
 static LINE_READ_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_LINE_READ_WORKERS: usize = 4;
 type LineReadTask = Box<dyn FnOnce() + Send + 'static>;
@@ -938,7 +979,15 @@ pub trait Pane: Downcast + Send + Sync {
         PerformAssignmentResult::Unhandled
     }
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()>;
-    fn perform_actions(&self, _actions: Vec<termwiz::escape::Action>) {}
+    fn perform_actions(
+        &self,
+        actions: Vec<termwiz::escape::Action>,
+    ) -> Result<(), PaneActionAdmissionError> {
+        Err(PaneActionAdmissionError {
+            actions,
+            reason: PaneActionAdmissionRefusal::Unsupported,
+        })
+    }
 
     /// Apply parser-pending actions and capture the terminal model while the
     /// caller's typed external-parser ground witness remains live. Only the mux

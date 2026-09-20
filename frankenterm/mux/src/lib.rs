@@ -4646,6 +4646,37 @@ mod pane_registration_handle {
         current: CurrentPane<'a>,
     }
 
+    /// Exact-generation authority retained by a funded historical alert batch.
+    /// Weak owners avoid a cycle through a pane's unapplied action ring. The
+    /// output continuation fences removal/reuse until dispatch or cancellation.
+    pub(crate) struct PaneAlertOutput {
+        registration: PaneRegistrationHandle,
+        _output: PaneOutputContinuation,
+    }
+
+    impl PaneAlertOutput {
+        pub(crate) fn dispatch_alert(&self, alert: Alert) -> bool {
+            let Some(owner) = self.registration.generation.owner.upgrade() else {
+                return false;
+            };
+            if let Some(pane) = self.registration.pane.upgrade() {
+                CurrentPane {
+                    owner: owner.as_ref(),
+                    pane: &pane,
+                    registration: &self.registration,
+                    pane_id: self.registration.pane_id(),
+                }
+                .dispatch_alert(alert);
+            } else {
+                owner.notify(MuxNotification::Alert {
+                    pane_id: self.registration.pane_id(),
+                    alert,
+                });
+            }
+            true
+        }
+    }
+
     impl CurrentPaneOutput<'_> {
         pub fn pane_id(&self) -> PaneId {
             self.current.pane_id()
@@ -4655,8 +4686,11 @@ mod pane_registration_handle {
             self.current.is_same_pane_ref(pane)
         }
 
-        pub fn perform_actions(&self, actions: Vec<Action>) {
-            self.current.pane.perform_actions(actions);
+        pub fn perform_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> Result<(), crate::pane::PaneActionAdmissionError> {
+            self.current.pane.perform_actions(actions)
         }
 
         /// Dispatch an alert while retaining the same exact-generation output
@@ -6050,6 +6084,20 @@ mod pane_registration_handle {
             Some(result)
         }
 
+        pub(crate) fn reserve_alert_output(&self) -> Option<PaneAlertOutput> {
+            let pane = self.pane.upgrade()?;
+            let owner = self.generation.owner.upgrade()?;
+            let output = owner.reserve_pane_output_for_reader(
+                &pane,
+                &self.generation,
+                promise::spawn::is_scheduler_configured(),
+            )?;
+            Some(PaneAlertOutput {
+                registration: self.clone(),
+                _output: output,
+            })
+        }
+
         /// Remove and kill only the registration represented by this handle.
         ///
         /// Callers must not hold mux topology or tab locks; pane cleanup and
@@ -6360,6 +6408,7 @@ mod pane_registration_handle {
     }
 }
 
+pub(crate) use pane_registration_handle::PaneAlertOutput;
 pub use pane_registration_handle::{
     CurrentPane, CurrentPaneOutput, FloatingPaneCommitReceipt, FloatingSpawnTarget,
     FrozenFloatingPaneSpawn, MoveCommitReceipt, PaneOperationGuard, PaneRegistrationHandle,
@@ -10306,6 +10355,16 @@ fn send_actions_to_mux_with_scheduler_state(
     actions: Vec<Action>,
     scheduler_configured: bool,
 ) {
+    if generation
+        .live_parser_checkpoint
+        .state
+        .lock()
+        .poison
+        .is_some()
+    {
+        dead.store(true, Ordering::Release);
+        return;
+    }
     let start = Instant::now();
     let Some(pane) = pane.upgrade() else {
         dead.store(true, Ordering::Release);
@@ -10321,7 +10380,30 @@ fn send_actions_to_mux_with_scheduler_state(
         return;
     };
 
-    pane.perform_actions(actions);
+    let mut pending = actions;
+    loop {
+        match pane.perform_actions(pending) {
+            Ok(()) => break,
+            Err(error)
+                if error.reason == crate::pane::PaneActionAdmissionRefusal::Capacity
+                    && !dead.load(Ordering::Acquire) =>
+            {
+                pending = error.actions;
+                // Parser-owned input stays here; never sleep while retaining a
+                // terminal or topology guard. Admission made no model mutation.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                metrics::counter!("mux.pane_actions.admission_cancelled").increment(1);
+                log::error!("pane reader stopped after action admission refusal: {error}");
+                generation
+                    .live_parser_checkpoint
+                    .poison("terminal action admission refused before mutation");
+                dead.store(true, Ordering::Release);
+                return;
+            }
+        }
+    }
     histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
     output.finish();
     histogram!("send_actions_to_mux.rate").record(1.);
@@ -22987,7 +23069,10 @@ mod tests {
             Ok(())
         }
 
-        fn perform_actions(&self, actions: Vec<Action>) {
+        fn perform_actions(
+            &self,
+            actions: Vec<Action>,
+        ) -> Result<(), crate::pane::PaneActionAdmissionError> {
             let on_actions = self.on_actions.lock().take();
             if let Some(on_actions) = on_actions {
                 on_actions();
@@ -22996,6 +23081,7 @@ mod tests {
             if let Some(checkpoint) = self.checkpoint.as_ref() {
                 checkpoint.terminal.lock().perform_actions(actions);
             }
+            Ok(())
         }
 
         fn capture_live_parser_checkpoint(
@@ -27620,7 +27706,7 @@ mod tests {
         assert_eq!(
             handle.try_with_current_output(|output| {
                 assert_eq!(output.pane_id(), 132);
-                output.perform_actions(vec![Action::Print('x')]);
+                output.perform_actions(vec![Action::Print('x')]).unwrap();
             }),
             Some(()),
         );
@@ -27670,7 +27756,7 @@ mod tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = handle.try_with_current_output::<()>(|output| {
-                output.perform_actions(vec![Action::Print('x')]);
+                output.perform_actions(vec![Action::Print('x')]).unwrap();
                 panic!("intentional output-closure panic");
             });
         }));
@@ -27714,7 +27800,7 @@ mod tests {
                 assert!(mux.pending_pane_lifecycle.try_lock().is_some());
                 assert!(mux.retiring_pane_ids.try_lock().is_some());
                 assert!(mux.subscribers.try_write().is_some());
-                output.perform_actions(vec![Action::Print('x')]);
+                output.perform_actions(vec![Action::Print('x')]).unwrap();
             }),
             Some(()),
         );

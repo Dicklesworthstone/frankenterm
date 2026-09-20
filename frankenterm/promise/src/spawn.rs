@@ -749,6 +749,14 @@ impl MainThreadAdmissionController {
                     MainThreadAdmissionError::TicketExhausted => {
                         MainThreadAdmissionOutcome::AuthorityExhausted(rejection)
                     }
+                    MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                        requested,
+                        capacity,
+                        ..
+                    } if requested > capacity => MainThreadAdmissionOutcome::InvalidSize(rejection),
+                    MainThreadAdmissionError::TaskCapacityExhausted { capacity: 0, .. } => {
+                        MainThreadAdmissionOutcome::InvalidSize(rejection)
+                    }
                     MainThreadAdmissionError::TaskCapacityExhausted { .. }
                     | MainThreadAdmissionError::EstimatedByteCapacityExhausted { .. } => {
                         MainThreadAdmissionOutcome::RetryableFull(rejection)
@@ -3091,6 +3099,38 @@ mod tests {
             outcome => panic!("expected retired-generation outcome, got {:?}", outcome),
         };
         assert!(retired.snapshot.retired);
+    }
+
+    #[test]
+    fn admission_distinguishes_permanent_service_size_from_transient_saturation() {
+        let controller = admission_controller(8, 100, 0, 40);
+        assert!(matches!(
+            controller.admit(MainThreadServiceClass::Interactive, 61),
+            MainThreadAdmissionOutcome::InvalidSize(_)
+        ));
+        let occupied = controller
+            .try_admit(MainThreadServiceClass::Interactive, 40)
+            .unwrap();
+        assert!(matches!(
+            controller.admit(MainThreadServiceClass::Interactive, 21),
+            MainThreadAdmissionOutcome::RetryableFull(_)
+        ));
+        drop(occupied);
+        let retried = controller
+            .try_admit(MainThreadServiceClass::Interactive, 21)
+            .unwrap();
+        drop(retried);
+        assert!(matches!(
+            controller.admit(MainThreadServiceClass::Topology, 101),
+            MainThreadAdmissionOutcome::InvalidSize(_)
+        ));
+        let no_general_slots = admission_controller(1, 100, 1, 0);
+        assert!(matches!(
+            no_general_slots.admit(MainThreadServiceClass::Interactive, 1),
+            MainThreadAdmissionOutcome::InvalidSize(_)
+        ));
+        assert_eq!(controller.snapshot().active_estimated_bytes, 0);
+        assert_eq!(controller.snapshot().active_tasks, 0);
     }
 
     #[test]

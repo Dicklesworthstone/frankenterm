@@ -5130,6 +5130,8 @@ impl LiveParserCaptureAuthority {
 pub enum LiveParserPaneCaptureError {
     #[error("pane backend does not expose a live terminal checkpoint boundary")]
     Unsupported,
+    #[error("pending parser action admission refused before mutation: {0:?}")]
+    ActionAdmission(crate::pane::PaneActionAdmissionRefusal),
     #[error("terminal model checkpoint capture failed: {0}")]
     Terminal(#[source] RecoveryTerminalCheckpointError),
 }

@@ -332,8 +332,12 @@ impl Pane for TermWizTerminalPane {
         Some(self.terminal.lock().get_config())
     }
 
-    fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+    fn perform_actions(
+        &self,
+        actions: Vec<termwiz::escape::Action>,
+    ) -> Result<(), crate::pane::PaneActionAdmissionError> {
+        self.terminal.lock().perform_actions(actions);
+        Ok(())
     }
 
     fn kill(&self) {

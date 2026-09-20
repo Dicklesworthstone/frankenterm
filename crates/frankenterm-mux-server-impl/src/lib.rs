@@ -9720,7 +9720,8 @@ mod tests {
         let mut actions = Vec::new();
         termwiz::escape::parser::Parser::new()
             .parse(corpus.as_bytes(), |action| actions.push(action));
-        pane.perform_actions(actions);
+        pane.perform_actions(actions)
+            .expect("test action admission");
         assert_eq!(backing.retained_scrollback_rows(), 545);
         // The first batch establishes authority with one row, then writes
         // its other 255 rows. Later full and final batches write 256 and 33.
@@ -9790,7 +9791,7 @@ mod tests {
             let observed = rx.recv_timeout(std::time::Duration::from_millis(500));
             let responsive = observed.is_ok();
             drop(lease);
-            writer.join().unwrap();
+            writer.join().unwrap().expect("test action admission");
             reader.join().unwrap();
             assert!(
                 entered,
@@ -9850,7 +9851,9 @@ mod tests {
         let writing = Arc::clone(&pane);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let writer = std::thread::spawn(move || {
-            writing.perform_actions(actions);
+            writing
+                .perform_actions(actions)
+                .expect("test action admission");
             done_tx.send(()).unwrap();
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
