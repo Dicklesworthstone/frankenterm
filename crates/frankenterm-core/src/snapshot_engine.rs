@@ -13713,6 +13713,14 @@ mod tests {
             .collect();
         let captured = mux::MuxCapturedTopology {
             session_incarnation: mux::MuxSessionIncarnation::from_bytes([3; 16]),
+            default_domain_id: Some(0),
+            domains: vec![mux::MuxCapturedDomain {
+                domain_id: 0,
+                name: "local".into(),
+                state: mux::domain::DomainState::Attached,
+                policy: crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture()
+                    .to_mux(),
+            }],
             topology_revision: mux::TopologyRevision::new(1),
             captured_at_epoch_ms: 1,
             client_workspace: None,

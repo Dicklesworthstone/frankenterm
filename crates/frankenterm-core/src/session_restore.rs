@@ -7017,6 +7017,37 @@ pub fn prepare_unpublished_whole_mux_topology(
     let topology = mux::domain::UnpublishedRecoveredTopology::prepare(
         captured_windows,
         captured_tabs,
+        image
+            .topology
+            .domains
+            .iter()
+            .map(|domain| {
+                Ok(mux::MuxCapturedDomain {
+                    domain_id: domain.incarnation_domain_id,
+                    name: domain.domain_name.clone(),
+                    state: if domain.is_attached {
+                        mux::domain::DomainState::Attached
+                    } else {
+                        mux::domain::DomainState::Detached
+                    },
+                    policy: domain
+                        .recovery_policy
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing authenticated domain policy"))?
+                        .to_mux(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        image
+            .topology
+            .domain_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing authenticated default domain state"))?
+            .default_domain_id,
+        image
+            .require_live_workspace_state()?
+            .default_workspace
+            .clone(),
         &expected_panes,
         panes,
     )?;
@@ -14279,7 +14310,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -14564,7 +14599,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -14731,7 +14770,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -14842,7 +14885,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -14937,6 +14984,7 @@ mod tests {
 
         let topology = RecoveryTopology {
             domains: vec![],
+            domain_state: Some(Default::default()),
             windows: vec![],
             focused_window_id: None,
             client_workspace: None,
@@ -14988,6 +15036,7 @@ mod tests {
             header: header_unsupported_version,
             topology: RecoveryTopology {
                 domains: vec![],
+                domain_state: Some(Default::default()),
                 windows: vec![],
                 focused_window_id: None,
                 client_workspace: None,
@@ -15082,7 +15131,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -15228,7 +15281,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -15310,6 +15367,7 @@ mod tests {
 
         let topology = RecoveryTopology {
             domains: vec![],
+            domain_state: Some(Default::default()),
             windows: vec![],
             focused_window_id: None,
             client_workspace: None,
@@ -15428,7 +15486,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -15625,13 +15687,20 @@ mod tests {
                     incarnation_domain_id: 42,
                     domain_name: "domain-alpha".to_string(),
                     is_attached: true,
+                    recovery_policy: Some(
+                        crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                    ),
                 },
                 RecoveryDomain {
                     incarnation_domain_id: 77,
                     domain_name: "domain-beta".to_string(),
                     is_attached: true,
+                    recovery_policy: Some(
+                        crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                    ),
                 },
             ],
+            domain_state: Some(Default::default()),
             windows: vec![
                 RecoveryWindow {
                     window_id: 1,
@@ -15857,7 +15926,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -16100,7 +16173,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -16299,6 +16376,7 @@ mod tests {
             header,
             topology: RecoveryTopology {
                 domains: vec![],
+                domain_state: Some(Default::default()),
                 windows: vec![],
                 focused_window_id: None,
                 client_workspace: None,
@@ -16406,7 +16484,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -16546,7 +16628,11 @@ mod tests {
                 incarnation_domain_id: 1,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(
+                    crate::mux_recovery_image::RecoveryDomainPolicy::local_test_fixture(),
+                ),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![RecoveryWindow {
                 window_id: 1,
                 stable_window_id: "00000000-0000-0000-0000-000000000001".to_string(),

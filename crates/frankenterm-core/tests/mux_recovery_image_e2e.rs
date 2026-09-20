@@ -259,6 +259,23 @@ impl Fixture {
         Self {
             captured: mux::MuxCapturedTopology {
                 session_incarnation: mux::MuxSessionIncarnation::from_bytes(INCARNATION),
+                default_domain_id: Some(1),
+                domains: [(1, "local"), (2, "remote")]
+                    .into_iter()
+                    .map(|(id, name)| mux::MuxCapturedDomain {
+                        domain_id: id,
+                        name: name.into(),
+                        state: mux::domain::DomainState::Attached,
+                        policy: mux::domain::DomainRecoveryPolicy::Local(
+                            mux::domain::LocalDomainRecoveryPolicy {
+                                default_prog: None,
+                                default_cwd: None,
+                                environment: Default::default(),
+                                term: "xterm-256color".into(),
+                            },
+                        ),
+                    })
+                    .collect(),
                 topology_revision: mux::TopologyRevision::new(7),
                 captured_at_epoch_ms: 1_700_000_000_000,
                 client_workspace: Some(mux::MuxCapturedClientWorkspaceBinding {

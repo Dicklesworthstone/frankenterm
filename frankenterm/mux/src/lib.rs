@@ -311,12 +311,22 @@ pub struct MuxCapturedPaneBinding {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MuxCapturedDomain {
+    pub domain_id: DomainId,
+    pub name: String,
+    pub state: domain::DomainState,
+    pub policy: domain::DomainRecoveryPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MuxCapturedTopology {
     pub session_incarnation: MuxSessionIncarnation,
     pub topology_revision: TopologyRevision,
     pub captured_at_epoch_ms: u64,
     pub client_workspace: Option<MuxCapturedClientWorkspaceBinding>,
     pub default_workspace: String,
+    pub default_domain_id: Option<DomainId>,
+    pub domains: Vec<MuxCapturedDomain>,
     pub workspaces: Vec<MuxCapturedWorkspace>,
     pub windows: Vec<MuxCapturedWindow>,
     pub tabs: Vec<MuxCapturedTab>,
@@ -346,6 +356,8 @@ impl Default for MuxTopologyCaptureConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MuxTopologyCaptureError {
+    #[error("domain directory or durable recovery policy is unsupported")]
+    UnsupportedDomainPolicy,
     #[error("mux topology authority exhausted")]
     AuthorityExhausted,
     #[error(
@@ -18745,12 +18757,62 @@ impl Mux {
         let max_attempts = config.max_attempts.max(1);
 
         for attempt in 1..=max_attempts {
+            let captured_config = configuration();
             let initial_stamp = {
                 let topology = self.topology.lock();
                 topology
                     .snapshot()
                     .map_err(|_| MuxTopologyCaptureError::AuthorityExhausted)?
             };
+
+            // Clone exact domain allocations under their directory lock, then
+            // inspect policies outside mux locks. The final revision/config
+            // fence rejects a changed directory or configuration generation.
+            let (domain_candidates, captured_default_domain) = {
+                let _registration = self.domain_registration.lock();
+                let domains = self.domains.read();
+                if domains.len() > 256 {
+                    return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
+                }
+                let candidates: Vec<_> = domains
+                    .iter()
+                    .map(|(&id, domain)| (id, Arc::clone(domain)))
+                    .collect();
+                let default = self.default_domain_registration.read().clone();
+                (candidates, default)
+            };
+            let default_domain_id = captured_default_domain
+                .as_ref()
+                .map(|registration| registration.domain_id);
+            let mut captured_domains = Vec::with_capacity(domain_candidates.len());
+            let mut domain_policy_bytes = 0usize;
+            for (domain_id, domain) in &domain_candidates {
+                if domain.domain_id() != *domain_id || domain.domain_name().len() > 65536 {
+                    return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
+                }
+                let policy = domain
+                    .recovery_policy(&captured_config)
+                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                policy
+                    .validate()
+                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                domain_policy_bytes = domain_policy_bytes
+                    .checked_add(
+                        policy
+                            .payload_bytes()
+                            .ok_or(MuxTopologyCaptureError::UnsupportedDomainPolicy)?,
+                    )
+                    .and_then(|bytes| bytes.checked_add(domain.domain_name().len()))
+                    .filter(|bytes| *bytes <= 16 * 1024 * 1024)
+                    .ok_or(MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                captured_domains.push(MuxCapturedDomain {
+                    domain_id: *domain_id,
+                    name: domain.domain_name().to_owned(),
+                    state: domain.state(),
+                    policy,
+                });
+            }
+            captured_domains.sort_by_key(|domain| domain.domain_id);
 
             // Capture window metadata and tabs under read locks
             let (window_snapshots, window_tabs) = {
@@ -19143,14 +19205,35 @@ impl Mux {
             });
 
             // Re-verify topology revision at the end of the cut
-            let final_stamp = {
+            let (final_stamp, domains_current) = {
+                let _registration = self.domain_registration.lock();
+                let domains = self.domains.read();
+                let current_default = self.default_domain_registration.read();
+                let default_current =
+                    match (captured_default_domain.as_ref(), current_default.as_ref()) {
+                        (None, None) => true,
+                        (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                        _ => false,
+                    };
+                let domains_current = default_current
+                    && domains.len() == domain_candidates.len()
+                    && domain_candidates.iter().all(|(id, expected)| {
+                        domains
+                            .get(id)
+                            .is_some_and(|current| Arc::ptr_eq(expected, current))
+                    });
                 let topology = self.topology.lock();
-                topology
+                let stamp = topology
                     .snapshot()
-                    .map_err(|_| MuxTopologyCaptureError::AuthorityExhausted)?
+                    .map_err(|_| MuxTopologyCaptureError::AuthorityExhausted)?;
+                (stamp, domains_current)
             };
 
-            if initial_stamp == final_stamp && registrations_current {
+            if initial_stamp == final_stamp
+                && registrations_current
+                && domains_current
+                && configuration().generation() == captured_config.generation()
+            {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -19161,7 +19244,13 @@ impl Mux {
                     topology_revision: initial_stamp.1,
                     captured_at_epoch_ms: now_ms,
                     client_workspace,
-                    default_workspace: self.get_default_workspace(),
+                    default_workspace: captured_config
+                        .default_workspace
+                        .as_deref()
+                        .unwrap_or(DEFAULT_WORKSPACE)
+                        .to_owned(),
+                    default_domain_id,
+                    domains: captured_domains,
                     workspaces,
                     windows: window_snapshots,
                     tabs: captured_tabs,
@@ -24267,6 +24356,22 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl Domain for GuardedMutationTestDomain {
+        fn recovery_policy(
+            &self,
+            _config: &config::ConfigHandle,
+        ) -> anyhow::Result<domain::DomainRecoveryPolicy> {
+            // This model domain has no transport or command callback state.
+            // Its topology fixtures do not establish production spawn custody.
+            Ok(domain::DomainRecoveryPolicy::Local(
+                domain::LocalDomainRecoveryPolicy {
+                    default_prog: None,
+                    default_cwd: None,
+                    environment: Default::default(),
+                    term: "xterm-256color".into(),
+                },
+            ))
+        }
+
         fn supports_floating_pane_spawn(&self) -> bool {
             self.supports_floating_spawn
         }
@@ -38032,6 +38137,43 @@ mod tests {
 
         // Only the healthy subscriber remains
         assert_eq!(mux.subscribers.read().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_topology_coherent_retains_empty_domains_and_exact_default() {
+        let first: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("empty-first").unwrap());
+        let second: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("empty-second").unwrap());
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&first))));
+        mux.add_domain(&second).unwrap();
+        mux.set_default_domain(&second).unwrap();
+        let captured = mux
+            .capture_topology_coherent(MuxTopologyCaptureConfig::default())
+            .unwrap();
+        assert!(captured.pane_bindings.is_empty());
+        assert!(captured.windows.is_empty());
+        assert_eq!(captured.default_domain_id, Some(second.domain_id()));
+        assert_eq!(captured.domains.len(), 2);
+        for actual in &captured.domains {
+            let source = if actual.domain_id == first.domain_id() {
+                &first
+            } else {
+                &second
+            };
+            assert_eq!(actual.name, source.domain_name());
+            assert_eq!(actual.state, source.state());
+            assert!(matches!(
+                actual.policy,
+                domain::DomainRecoveryPolicy::Local(_)
+            ));
+        }
+        let no_default = Arc::new(Mux::new(None));
+        no_default.add_domain(&first).unwrap();
+        let captured = no_default
+            .capture_topology_coherent(MuxTopologyCaptureConfig::default())
+            .unwrap();
+        assert_eq!(captured.domains.len(), 1);
+        assert_eq!(captured.default_domain_id, None);
     }
 
     #[test]

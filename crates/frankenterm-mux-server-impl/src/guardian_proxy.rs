@@ -135,6 +135,23 @@ impl GuardianDomain {
 
 #[async_trait::async_trait(?Send)]
 impl Domain for GuardianDomain {
+    fn recovery_policy(
+        &self,
+        captured_config: &config::ConfigHandle,
+    ) -> anyhow::Result<mux::domain::DomainRecoveryPolicy> {
+        anyhow::ensure!(
+            [self.socket_path.as_path(), self.token_path.as_path()]
+                .iter()
+                .all(|path| path.is_absolute() && path.to_str().is_some_and(|s| s.len() <= 65536)),
+            "guardian recovery endpoint paths are not bounded absolute UTF-8 paths"
+        );
+        Ok(mux::domain::DomainRecoveryPolicy::GuardianLocal {
+            commands: self.commands.capture_recovery_policy(captured_config)?,
+            socket_path: self.socket_path.clone(),
+            token_path: self.token_path.clone(),
+        })
+    }
+
     async fn spawn_pane(
         &self,
         mux: &Arc<mux::Mux>,
@@ -4593,11 +4610,33 @@ impl GuardianReplayReaderSlot {
     }
 }
 
+/// Exact authenticated root provenance, retained across lease resolution and
+/// terminal activation. It is not reconstructible from a pane UUID alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelectedRecoveryRoot {
+    envelope_sha256: [u8; 32],
+    image_digest: [u8; 32],
+    generation: u64,
+}
+
+impl SelectedRecoveryRoot {
+    fn from_validated(
+        recovery: &frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+    ) -> Self {
+        Self {
+            envelope_sha256: recovery.root_envelope_sha256(),
+            image_digest: recovery.image().image_digest,
+            generation: recovery.generation(),
+        }
+    }
+}
+
 /// An exact checkpoint selected from an authenticated whole-mux image.
 /// Only `prepare_from_recovery` mints this authority in production; neither
 /// caller-supplied provenance nor a digest alone authorizes replay selection.
 #[derive(Clone, Copy)]
 struct SelectedRecoveryCheckpoint {
+    root: SelectedRecoveryRoot,
     pane_id: Uuid,
     generation: u64,
     checkpoint_id: GuardianCheckpointIdentityDigest,
@@ -4607,6 +4646,19 @@ struct SelectedRecoveryCheckpoint {
 }
 
 impl SelectedRecoveryCheckpoint {
+    fn validate_root(
+        self,
+        root: SelectedRecoveryRoot,
+        lease: GuardianPaneLeaseIdentity,
+    ) -> Result<(), GuardianProxyError> {
+        if self.root != root {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian activation belongs to another authenticated recovery root",
+            ));
+        }
+        self.validate_attach(lease.pane_id(), lease.generation())
+    }
+
     fn validate_descriptor(
         self,
         descriptor: GuardianCheckpointDescriptorV1,
@@ -4723,6 +4775,7 @@ impl GuardianProxyLeasePlan {
                 )
             })?;
         let selected = SelectedRecoveryCheckpoint {
+            root: SelectedRecoveryRoot::from_validated(recovery),
             pane_id: durable_pane_id,
             generation: *guardian_generation,
             checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(
@@ -5760,6 +5813,7 @@ impl GuardianProxyStaging {
             .map_err(GuardianProxyError::RestoredModel)?;
         let actor = Arc::clone(&self.actor);
         Ok(ActivatedGuardianProxy {
+            selected_checkpoint: self.selected_checkpoint,
             spawn_custody: self.spawn_custody,
             successor_custody: self.successor_custody,
             terminal,
@@ -5804,6 +5858,7 @@ impl GuardianProxyStaging {
         let identity = self.identity();
         let actor = Arc::clone(&self.actor);
         TestActivatedGuardianProxy {
+            selected_checkpoint: self.selected_checkpoint,
             spawn_custody: self.spawn_custody,
             successor_custody: self.successor_custody,
             terminal,
@@ -5834,6 +5889,7 @@ impl GuardianProxyStaging {
 /// Fully restored guardian proxy facets that remain unpublished until the
 /// caller deliberately constructs and registers a [`LocalPane`].
 pub struct ActivatedGuardianProxy {
+    selected_checkpoint: Option<SelectedRecoveryCheckpoint>,
     spawn_custody: Option<GuardianSpawnCustodyScopeV1>,
     successor_custody: Option<mux::guardian_checkpoint::GuardianSuccessorCustodyContextV1>,
     terminal: Terminal,
@@ -5846,6 +5902,171 @@ pub struct ActivatedGuardianProxy {
     guardian_checkpoint_publisher: Option<Arc<GuardianCheckpointPublisher>>,
     lease_identity: GuardianPaneLeaseIdentity,
     lease_rollback: GuardianClaimedLeaseRollback,
+}
+
+/// Joint ownership of one authenticated root, its fully reconciled guardian
+/// activations, and private topology. This deliberately exposes no live mux or
+/// publication method while atomic batch registration is being implemented.
+pub struct PreparedGuardianWholeMuxTopology {
+    owner: Arc<mux::Mux>,
+    target_incarnation: Uuid,
+    topology: frankenterm_core::session_restore::PreparedWholeMuxTopology,
+}
+
+impl PreparedGuardianWholeMuxTopology {
+    fn validate_staged_cohort<'a>(
+        owner: &mux::Mux,
+        recovery: &'a frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+        staged: &[GuardianProxyStaging],
+    ) -> Result<
+        (
+            Uuid,
+            HashMap<Uuid, &'a frankenterm_core::mux_recovery_image::RecoveryPane>,
+        ),
+        GuardianProxyError,
+    > {
+        recovery
+            .image()
+            .require_live_topology_state()
+            .map_err(|_| {
+                GuardianProxyError::InvalidConfiguration(
+                    "recovery root lacks complete topology authority",
+                )
+            })?;
+        let (session, revision) = owner.topology_snapshot_authority().map_err(|_| {
+            GuardianProxyError::InvalidConfiguration("recovery target topology authority exhausted")
+        })?;
+        let target_incarnation = Uuid::from_bytes(session.as_bytes());
+        let source_incarnation = Uuid::parse_str(&recovery.image().header.mux_incarnation_id)
+            .map_err(|_| {
+                GuardianProxyError::InvalidConfiguration(
+                    "recovery source mux incarnation is invalid",
+                )
+            })?;
+        if source_incarnation == target_incarnation
+            || staged.len() != recovery.pane_count()
+            || revision != mux::TopologyRevision::INITIAL
+            || !owner.is_empty()
+            || !owner.iter_windows().is_empty()
+        {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "recovery target or guardian activation count mismatch",
+            ));
+        }
+        let root = SelectedRecoveryRoot::from_validated(recovery);
+        let mut by_uuid = HashMap::new();
+        for pane in &recovery.image().panes {
+            let uuid = Uuid::parse_str(&pane.pane_uuid).map_err(|_| {
+                GuardianProxyError::InvalidConfiguration("recovery pane identity is not a UUID")
+            })?;
+            if by_uuid.insert(uuid, pane).is_some() {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "duplicate recovery pane identity",
+                ));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        // Validate the entire cohort before constructing any LocalPane. Every
+        // rejected proxy still owns its exact lease rollback guard here.
+        for proxy in staged {
+            let identity = proxy.identity();
+            let selected =
+                proxy
+                    .selected_checkpoint
+                    .ok_or(GuardianProxyError::InvalidConfiguration(
+                        "guardian activation has no authenticated recovery-root selection",
+                    ))?;
+            selected.validate_root(root, identity)?;
+            if identity.mux_incarnation() != target_incarnation
+                || !by_uuid.contains_key(&identity.pane_id())
+                || !seen.insert(identity.pane_id())
+                || proxy.replay_transport.is_none()
+                || proxy.checkpoint_publisher.is_none()
+                || proxy.spawn_custody.is_none()
+            {
+                return Err(GuardianProxyError::InvalidConfiguration(
+                    "guardian recovery cohort is incomplete or belongs to another target",
+                ));
+            }
+        }
+        Ok((target_incarnation, by_uuid))
+    }
+
+    pub fn prepare(
+        owner: Arc<mux::Mux>,
+        recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+        staged: Vec<GuardianProxyStaging>,
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Self, GuardianProxyError> {
+        let (target_incarnation, by_uuid) =
+            Self::validate_staged_cohort(&owner, &recovery, &staged)?;
+        let root = SelectedRecoveryRoot::from_validated(&recovery);
+        let domains: HashMap<_, _> = recovery
+            .image()
+            .topology
+            .domains
+            .iter()
+            .map(|domain| (domain.domain_name.as_str(), domain.incarnation_domain_id))
+            .collect();
+        let mut unpublished = Vec::new();
+        unpublished
+            .try_reserve_exact(staged.len())
+            .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+        for proxy in staged {
+            let pane = by_uuid.get(&proxy.identity().pane_id()).ok_or(
+                GuardianProxyError::InvalidConfiguration(
+                    "recovery pane disappeared during assembly",
+                ),
+            )?;
+            let domain_id = *domains.get(pane.domain_name.as_str()).ok_or(
+                GuardianProxyError::InvalidConfiguration("recovery pane domain is absent"),
+            )?;
+            let config: Arc<dyn TerminalConfiguration> =
+                Arc::new(config::TermConfig::new_for_pane(
+                    pane.pane_id,
+                    domain_id,
+                    *proxy.identity().pane_id().as_bytes(),
+                    String::new(),
+                ));
+            let activated = proxy.restore_and_activate(config, limits)?;
+            activated
+                .selected_checkpoint
+                .ok_or(GuardianProxyError::InvalidConfiguration(
+                    "guardian activation lost its selected recovery root",
+                ))?
+                .validate_root(root, activated.lease_identity)?;
+            unpublished.push(
+                UnpublishedPane::from_guardian_proxy(activated.into_local_pane(
+                    pane.pane_id,
+                    domain_id,
+                    String::new(),
+                ))
+                .map_err(GuardianProxyError::RestoredModel)?,
+            );
+        }
+        let topology = frankenterm_core::session_restore::prepare_unpublished_whole_mux_topology(
+            recovery,
+            unpublished,
+        )
+        .map_err(GuardianProxyError::RestoredModel)?;
+        Ok(Self {
+            owner,
+            target_incarnation,
+            topology,
+        })
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.topology.counts()
+    }
+
+    pub fn target_is_current(&self) -> bool {
+        self.owner
+            .topology_snapshot_authority()
+            .is_ok_and(|(session, _)| {
+                Uuid::from_bytes(session.as_bytes()) == self.target_incarnation
+            })
+    }
 }
 
 impl fmt::Debug for ActivatedGuardianProxy {
@@ -8134,7 +8355,7 @@ mod tests {
         let claim_request_id = Uuid::new_v4();
         let claim_effect_id = Uuid::new_v4();
         let claim_deadline = Instant::now() + Duration::from_secs(5);
-        let staging = loop {
+        let mut staging = loop {
             while executor.try_tick().unwrap() {}
             let successor_plan = GuardianProxyLeasePlan::prepare_from_recovery(
                 socket,
@@ -8166,6 +8387,41 @@ mod tests {
             }
         };
 
+        PreparedGuardianWholeMuxTopology::validate_staged_cohort(
+            &successor_mux,
+            &validated,
+            std::slice::from_ref(&staging),
+        )
+        .expect("actual claimed successor cohort matches the authenticated root");
+        let exact_selection = staging
+            .selected_checkpoint
+            .expect("selected authenticated root");
+        for control in 0..3 {
+            let selected = staging.selected_checkpoint.as_mut().unwrap();
+            match control {
+                0 => selected.root.envelope_sha256[0] ^= 1,
+                1 => selected.root.image_digest[0] ^= 1,
+                2 => selected.root.generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                PreparedGuardianWholeMuxTopology::validate_staged_cohort(
+                    &successor_mux,
+                    &validated,
+                    std::slice::from_ref(&staging),
+                )
+                .is_err(),
+                "same-pane wrong-root cohort must refuse before activation"
+            );
+            assert!(matches!(
+                *staging.reader_slot.state.lock(),
+                GuardianReplayReaderState::Staged
+            ));
+            assert!(staging.replay_transport.is_some());
+            assert!(successor_mux.is_empty());
+            staging.selected_checkpoint = Some(exact_selection);
+        }
+
         let successor_pane_id = alloc_pane_id().expect("allocate successor pane id");
         assert_ne!(
             successor_pane_id, pane_id,
@@ -8191,6 +8447,28 @@ mod tests {
         let activated = staging
             .restore_and_activate(successor_term_config, TerminalCheckpointLimits::default())
             .expect("successor restore_and_activate must succeed");
+        let selected = activated
+            .selected_checkpoint
+            .expect("authenticated root selection survives terminal activation");
+        let selected_root = SelectedRecoveryRoot::from_validated(&validated);
+        selected
+            .validate_root(selected_root, activated.lease_identity)
+            .expect("activated successor remains bound to the selected authenticated root");
+        for control in 0..3 {
+            let mut other_root = selected_root;
+            match control {
+                0 => other_root.envelope_sha256[0] ^= 1,
+                1 => other_root.image_digest[0] ^= 1,
+                2 => other_root.generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                selected
+                    .validate_root(other_root, activated.lease_identity)
+                    .is_err(),
+                "same pane and lease must not authorize a different recovery root"
+            );
+        }
         let local_pane = activated.into_local_pane(
             successor_pane_id,
             successor_domain_id,
@@ -10664,6 +10942,11 @@ mod tests {
     fn selected_recovery_checkpoint_binds_exact_replay_before_acknowledgement() {
         let fixture = capture_record_checkpoint_fixture();
         let selected = SelectedRecoveryCheckpoint {
+            root: SelectedRecoveryRoot {
+                envelope_sha256: [0x31; 32],
+                image_digest: [0x32; 32],
+                generation: 7,
+            },
             pane_id: identity().pane_id(),
             generation: fixture.descriptor.capture_generation(),
             checkpoint_id: fixture.descriptor.checkpoint_id(),

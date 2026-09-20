@@ -90,6 +90,9 @@ pub struct UnpublishedRecoveredTopology {
     panes: Vec<UnpublishedPane>,
     captured_windows: Vec<crate::MuxCapturedWindow>,
     captured_tabs: Vec<crate::tab::MuxCapturedTab>,
+    captured_domains: Vec<crate::MuxCapturedDomain>,
+    default_domain_id: Option<DomainId>,
+    default_workspace: String,
 }
 
 impl UnpublishedRecoveredTopology {
@@ -99,16 +102,65 @@ impl UnpublishedRecoveredTopology {
     pub fn prepare(
         captured_windows: Vec<crate::MuxCapturedWindow>,
         captured_tabs: Vec<crate::tab::MuxCapturedTab>,
+        captured_domains: Vec<crate::MuxCapturedDomain>,
+        default_domain_id: Option<DomainId>,
+        default_workspace: String,
         expected_panes: &HashMap<PaneId, ([u8; 16], DomainId)>,
         panes: Vec<UnpublishedPane>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            panes.len() <= 4096 && captured_windows.len() <= 4096 && captured_tabs.len() <= 4096,
+            panes.len() <= 4096
+                && captured_windows.len() <= 4096
+                && captured_tabs.len() <= 4096
+                && captured_domains.len() <= 256,
             "recovered topology exceeds construction bounds"
         );
         anyhow::ensure!(
             panes.len() == expected_panes.len(),
             "recovered pane custody count mismatch"
+        );
+        anyhow::ensure!(
+            !default_workspace.is_empty() && default_workspace.len() <= 65536,
+            "invalid recovered default workspace"
+        );
+        let mut domain_ids = std::collections::HashSet::new();
+        let mut domain_names = std::collections::HashSet::new();
+        let mut policy_bytes = 0usize;
+        for domain in &captured_domains {
+            domain.policy.validate()?;
+            anyhow::ensure!(
+                domain.domain_id != usize::MAX
+                    && !domain.name.is_empty()
+                    && domain.name.len() <= 65536
+                    && !domain.name.contains('\0')
+                    && domain_ids.insert(domain.domain_id)
+                    && domain_names.insert(domain.name.as_str()),
+                "invalid or duplicate recovered domain identity"
+            );
+            anyhow::ensure!(
+                domain.state == DomainState::Attached,
+                "supported recovered local domain must be attached"
+            );
+            policy_bytes = policy_bytes
+                .checked_add(
+                    domain
+                        .policy
+                        .payload_bytes()
+                        .context("recovered domain policy size overflow")?,
+                )
+                .and_then(|bytes| bytes.checked_add(domain.name.len()))
+                .filter(|bytes| *bytes <= 16 * 1024 * 1024)
+                .context("recovered domain policy aggregate exceeds byte budget")?;
+        }
+        anyhow::ensure!(
+            default_domain_id.is_none_or(|id| domain_ids.contains(&id)),
+            "recovered default domain is absent from domain census"
+        );
+        anyhow::ensure!(
+            expected_panes
+                .values()
+                .all(|(_, domain)| domain_ids.contains(domain)),
+            "recovered pane domain is absent from domain census"
         );
         let mut pane_map = HashMap::new();
         for owned in &panes {
@@ -210,6 +262,9 @@ impl UnpublishedRecoveredTopology {
             panes,
             captured_windows,
             captured_tabs,
+            captured_domains,
+            default_domain_id,
+            default_workspace,
         })
     }
 
@@ -223,6 +278,16 @@ impl UnpublishedRecoveredTopology {
 
     pub fn captured_tabs(&self) -> &[crate::tab::MuxCapturedTab] {
         &self.captured_tabs
+    }
+
+    pub fn captured_domains(&self) -> &[crate::MuxCapturedDomain] {
+        &self.captured_domains
+    }
+    pub fn default_domain_id(&self) -> Option<DomainId> {
+        self.default_domain_id
+    }
+    pub fn default_workspace(&self) -> &str {
+        &self.default_workspace
     }
 }
 
@@ -437,6 +502,16 @@ impl Drop for PreparedPane {
 )]
 #[async_trait(?Send)]
 pub trait Domain: Downcast + Send + Sync {
+    /// Durable construction policy, never a live connection or registration
+    /// capability. Unsupported transports must opt in with a real restore
+    /// contract before whole-mux recovery can capture them.
+    fn recovery_policy(
+        &self,
+        _config: &config::ConfigHandle,
+    ) -> anyhow::Result<DomainRecoveryPolicy> {
+        bail!("domain transport has no durable recovery policy")
+    }
+
     /// Spawn a new command within this domain on the exact originating mux.
     async fn spawn(
         &self,
@@ -638,11 +713,166 @@ pub trait Domain: Downcast + Send + Sync {
 }
 impl_downcast!(Domain);
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalDomainRecoveryPolicy {
+    pub default_prog: Option<Vec<String>>,
+    pub default_cwd: Option<PathBuf>,
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub term: String,
+}
+
+impl std::fmt::Debug for LocalDomainRecoveryPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalDomainRecoveryPolicy")
+            .field(
+                "program_arguments",
+                &self.default_prog.as_ref().map(Vec::len),
+            )
+            .field("has_working_directory", &self.default_cwd.is_some())
+            .field("environment_entries", &self.environment.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalDomainRecoveryPolicy {
+    pub fn payload_bytes(&self) -> Option<usize> {
+        self.default_prog
+            .iter()
+            .flatten()
+            .map(String::len)
+            .chain(
+                self.environment
+                    .iter()
+                    .flat_map(|(key, value)| [key.len(), value.len()]),
+            )
+            .chain(self.default_cwd.iter().map(|path| path.as_os_str().len()))
+            .chain(std::iter::once(self.term.len()))
+            .try_fold(0usize, usize::checked_add)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.default_prog
+                .as_ref()
+                .is_none_or(|args| !args.is_empty() && args.len() <= 4096)
+                && self.environment.len() <= 4096,
+            "invalid recovered domain spawn policy entry count"
+        );
+        let cwd = self
+            .default_cwd
+            .as_ref()
+            .map(|path| {
+                path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("recovered domain working directory is not UTF-8")
+                })
+            })
+            .transpose()?;
+        let values = self
+            .default_prog
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(
+                self.environment
+                    .iter()
+                    .flat_map(|(k, v)| [k.as_str(), v.as_str()]),
+            )
+            .chain(cwd)
+            .chain(std::iter::once(self.term.as_str()));
+        let mut bytes = 0usize;
+        for value in values {
+            anyhow::ensure!(
+                value.len() <= 65536 && !value.contains('\0'),
+                "invalid recovered domain policy field"
+            );
+            bytes = bytes
+                .checked_add(value.len())
+                .ok_or_else(|| anyhow::anyhow!("recovered domain policy size overflow"))?;
+        }
+        anyhow::ensure!(
+            bytes <= 2 * 1024 * 1024,
+            "recovered domain policy exceeds byte budget"
+        );
+        anyhow::ensure!(
+            self.environment
+                .keys()
+                .all(|key| !key.is_empty() && !key.contains('=')),
+            "invalid recovered environment key"
+        );
+        Ok(())
+    }
+
+    fn command_config(&self) -> config::Config {
+        config::Config {
+            default_prog: self.default_prog.clone(),
+            default_cwd: self.default_cwd.clone(),
+            set_environment_variables: self
+                .environment
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            term: self.term.clone(),
+            ..config::Config::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DomainRecoveryPolicy {
+    Local(LocalDomainRecoveryPolicy),
+    GuardianLocal {
+        commands: LocalDomainRecoveryPolicy,
+        socket_path: PathBuf,
+        token_path: PathBuf,
+    },
+}
+
+impl DomainRecoveryPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Local(policy) => policy.validate(),
+            Self::GuardianLocal {
+                commands,
+                socket_path,
+                token_path,
+            } => {
+                commands.validate()?;
+                anyhow::ensure!(
+                    [socket_path, token_path].iter().all(|path| {
+                        path.is_absolute()
+                            && path
+                                .to_str()
+                                .is_some_and(|value| value.len() <= 65536 && !value.contains('\0'))
+                    }),
+                    "invalid recovered guardian endpoint path"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn payload_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Local(policy) => policy.payload_bytes(),
+            Self::GuardianLocal {
+                commands,
+                socket_path,
+                token_path,
+            } => commands
+                .payload_bytes()?
+                .checked_add(socket_path.as_os_str().len())?
+                .checked_add(token_path.as_os_str().len()),
+        }
+    }
+}
+
 pub struct LocalDomain {
     pty_system: Mutex<Box<dyn PtySystem + Send>>,
     id: DomainId,
     name: String,
     configuration: LocalDomainConfiguration,
+    recovered_policy: Option<LocalDomainRecoveryPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -654,11 +884,127 @@ enum LocalDomainConfiguration {
 }
 
 impl LocalDomain {
+    /// Private construction only: the caller must reserve durable IDs and
+    /// publish the complete recovered domain cohort atomically.
+    pub fn from_recovery_policy(
+        id: DomainId,
+        name: String,
+        policy: LocalDomainRecoveryPolicy,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            cfg!(unix)
+                && id != usize::MAX
+                && !name.is_empty()
+                && name.len() <= 65536
+                && !name.contains('\0'),
+            "invalid recovered local domain identity"
+        );
+        policy.validate()?;
+        Ok(Self {
+            pty_system: Mutex::new(native_pty_system()),
+            id,
+            name,
+            configuration: LocalDomainConfiguration::Runtime,
+            recovered_policy: Some(policy),
+        })
+    }
+
+    pub fn capture_recovery_policy(
+        &self,
+        captured_config: &config::ConfigHandle,
+    ) -> anyhow::Result<LocalDomainRecoveryPolicy> {
+        #[cfg(unix)]
+        let native_pty = self
+            .pty_system
+            .try_lock()
+            .context("domain PTY construction policy is busy")?
+            .downcast_ref::<portable_pty::unix::UnixPtySystem>()
+            .is_some();
+        #[cfg(not(unix))]
+        let native_pty = false;
+        anyhow::ensure!(
+            native_pty,
+            "domain PTY backend has no supported recovery policy"
+        );
+        if let Some(policy) = &self.recovered_policy {
+            return Ok(policy.clone());
+        }
+        anyhow::ensure!(
+            cfg!(unix)
+                && matches!(self.configuration, LocalDomainConfiguration::Runtime)
+                && !captured_config
+                    .exec_domains
+                    .iter()
+                    .any(|d| d.name == self.name)
+                && !captured_config
+                    .wsl_domains
+                    .as_ref()
+                    .is_some_and(|domains| domains.iter().any(|d| d.name == self.name)),
+            "domain command callbacks or transport overrides cannot be restored"
+        );
+        let program = captured_config.default_prog.as_ref();
+        anyhow::ensure!(
+            program.is_none_or(|args| !args.is_empty() && args.len() <= 4096)
+                && captured_config.set_environment_variables.len() <= 4096,
+            "domain spawn policy exceeds bounded entry limits"
+        );
+        let cwd = captured_config
+            .default_cwd
+            .as_ref()
+            .map(|path| {
+                path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("domain recovery requires a UTF-8 working directory")
+                })
+            })
+            .transpose()?;
+        let strings = program
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(
+                captured_config
+                    .set_environment_variables
+                    .iter()
+                    .flat_map(|(k, v)| [k.as_str(), v.as_str()]),
+            )
+            .chain(cwd)
+            .chain(std::iter::once(captured_config.term.as_str()));
+        let mut bytes = 0usize;
+        for value in strings {
+            anyhow::ensure!(
+                value.len() <= 65536,
+                "domain policy field exceeds byte limit"
+            );
+            bytes = bytes
+                .checked_add(value.len())
+                .ok_or_else(|| anyhow::anyhow!("domain policy byte count overflow"))?;
+        }
+        anyhow::ensure!(
+            bytes <= 2 * 1024 * 1024,
+            "domain spawn policy exceeds byte budget"
+        );
+        let policy = LocalDomainRecoveryPolicy {
+            default_prog: captured_config.default_prog.clone(),
+            default_cwd: captured_config.default_cwd.clone(),
+            environment: captured_config
+                .set_environment_variables
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            term: captured_config.term.clone(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn new(name: &str) -> Result<Self, Error> {
         Ok(Self::with_pty_system(name, native_pty_system()))
     }
 
     fn resolve_exec_domain(&self) -> Option<ExecDomain> {
+        if self.recovered_policy.is_some() {
+            return None;
+        }
         match &self.configuration {
             LocalDomainConfiguration::Exec(exec) => Some(exec.clone()),
             LocalDomainConfiguration::Runtime => config::configuration()
@@ -671,6 +1017,9 @@ impl LocalDomain {
     }
 
     fn resolve_wsl_domain(&self) -> Option<WslDomain> {
+        if self.recovered_policy.is_some() {
+            return None;
+        }
         match &self.configuration {
             LocalDomainConfiguration::Wsl(wsl) => Some(wsl.clone()),
             LocalDomainConfiguration::Runtime => config::configuration()
@@ -701,6 +1050,7 @@ impl LocalDomain {
             id,
             name,
             configuration,
+            recovered_policy: None,
         }
     }
 
@@ -1051,7 +1401,12 @@ impl LocalDomain {
         command_dir: Option<String>,
         pane_id: PaneId,
     ) -> anyhow::Result<CommandBuilder> {
-        let config = configuration();
+        let live_config = configuration();
+        let recovered_config = self
+            .recovered_policy
+            .as_ref()
+            .map(LocalDomainRecoveryPolicy::command_config);
+        let config: &config::Config = recovered_config.as_ref().unwrap_or(&live_config);
 
         let wsl = self.resolve_wsl_domain();
         let default_prog = wsl
@@ -1237,6 +1592,14 @@ impl Drop for KillOnDropChildResult {
 
 #[async_trait(?Send)]
 impl Domain for LocalDomain {
+    fn recovery_policy(
+        &self,
+        captured_config: &config::ConfigHandle,
+    ) -> anyhow::Result<DomainRecoveryPolicy> {
+        self.capture_recovery_policy(captured_config)
+            .map(DomainRecoveryPolicy::Local)
+    }
+
     async fn spawn_pane(
         &self,
         mux: &Arc<Mux>,
@@ -1500,6 +1863,80 @@ mod tests {
                 Mux::shutdown();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_local_spawn_policy_controls_actual_command() -> anyhow::Result<()> {
+        let policy = LocalDomainRecoveryPolicy {
+            default_prog: Some(vec!["/bin/sh".into(), "-l".into()]),
+            default_cwd: Some("/retained-cwd".into()),
+            environment: [("FT_RECOVERED_POLICY".into(), "retained".into())].into(),
+            term: "retained-terminal".into(),
+        };
+        let domain =
+            LocalDomain::from_recovery_policy(817, "restored-local".into(), policy.clone())?;
+        let mux = Arc::new(Mux::new(None));
+        let command = promise::spawn::block_on(domain.build_command(&mux, None, None, 819))?;
+        assert_eq!(
+            command.get_argv().as_slice(),
+            &[OsString::from("/bin/sh"), OsString::from("-l")]
+        );
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/retained-cwd"))
+        );
+        assert_eq!(
+            command.get_env("FT_RECOVERED_POLICY"),
+            Some(std::ffi::OsStr::new("retained"))
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("retained-terminal"))
+        );
+        assert_eq!(domain.domain_id(), 817);
+        assert_eq!(
+            domain.capture_recovery_policy(&config::ConfigHandle::default_config())?,
+            policy
+        );
+        assert!(domain.resolve_exec_domain().is_none());
+        assert!(domain.resolve_wsl_domain().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_domain_policy_refuses_callbacks_and_invalid_environment() -> anyhow::Result<()> {
+        let (pty, spawn_calls) = SlowSpawnPtySystem::new(Duration::ZERO);
+        let custom = LocalDomain::with_pty_system("custom-backend", Box::new(pty));
+        assert!(custom
+            .capture_recovery_policy(&config::ConfigHandle::default_config())
+            .is_err());
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+        #[cfg(unix)]
+        {
+            let native = LocalDomain::new("busy-backend")?;
+            let _held = native.pty_system.lock();
+            assert!(native
+                .capture_recovery_policy(&config::ConfigHandle::default_config())
+                .is_err());
+        }
+        let domain = LocalDomain::new_exec_domain(ExecDomain {
+            name: "callback-domain".into(),
+            fixup_command: "uncaptured-function".into(),
+            label: None,
+        })?;
+        assert!(domain
+            .capture_recovery_policy(&config::ConfigHandle::default_config())
+            .is_err());
+        let policy = LocalDomainRecoveryPolicy {
+            default_prog: None,
+            default_cwd: None,
+            environment: [("invalid=key".into(), "value".into())].into(),
+            term: "xterm".into(),
+        };
+        assert!(policy.validate().is_err());
+        assert!(LocalDomain::from_recovery_policy(817, "invalid".into(), policy).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1770,6 +2207,19 @@ mod tests {
             let prepared = UnpublishedRecoveredTopology::prepare(
                 vec![window.clone()],
                 vec![tab.clone()],
+                vec![crate::MuxCapturedDomain {
+                    domain_id: 1,
+                    name: "fixture-local".into(),
+                    state: DomainState::Attached,
+                    policy: DomainRecoveryPolicy::Local(LocalDomainRecoveryPolicy {
+                        default_prog: None,
+                        default_cwd: None,
+                        environment: Default::default(),
+                        term: "xterm".into(),
+                    }),
+                }],
+                Some(1),
+                "restored workspace".into(),
                 &HashMap::from([(id, (*durable.as_bytes(), 1))]),
                 vec![UnpublishedPane::new(pane)],
             );
@@ -1778,6 +2228,9 @@ mod tests {
             } else {
                 let prepared = prepared.expect("valid private topology");
                 assert_eq!(prepared.counts(), (1, 1, 1));
+                assert_eq!(prepared.default_domain_id(), Some(1));
+                assert_eq!(prepared.default_workspace(), "restored workspace");
+                assert_eq!(prepared.captured_domains()[0].name, "fixture-local");
                 let actual_window = &prepared.windows[0];
                 assert_eq!(actual_window.durable_id(), window.durable_window_id);
                 assert_eq!(actual_window.get_title(), window.title);

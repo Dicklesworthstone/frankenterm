@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 6;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 7;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -607,6 +607,191 @@ pub struct RecoveryTopology {
     /// authorize a complete live restore; omission preserves schema 3/4 hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_state: Option<RecoveryWorkspaceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_state: Option<RecoveryDomainState>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryDomainState {
+    #[serde(deserialize_with = "deserialize_required_workspace_active_window")]
+    pub default_domain_id: Option<usize>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryLocalDomainPolicy {
+    #[serde(deserialize_with = "deserialize_required_domain_program")]
+    pub default_prog: Option<Vec<String>>,
+    #[serde(deserialize_with = "deserialize_required_domain_cwd")]
+    pub default_cwd: Option<String>,
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub term: String,
+}
+
+impl fmt::Debug for RecoveryLocalDomainPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoveryLocalDomainPolicy")
+            .field("argument_count", &self.default_prog.as_ref().map(Vec::len))
+            .field("has_default_cwd", &self.default_cwd.is_some())
+            .field("environment_count", &self.environment.len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn deserialize_required_domain_program<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer)
+}
+
+fn deserialize_required_domain_cwd<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum RecoveryDomainPolicy {
+    Local(RecoveryLocalDomainPolicy),
+    GuardianLocal {
+        commands: RecoveryLocalDomainPolicy,
+        socket_path: String,
+        token_path: String,
+    },
+}
+
+impl RecoveryDomainPolicy {
+    #[cfg(test)]
+    pub(crate) fn local_test_fixture() -> Self {
+        Self::Local(RecoveryLocalDomainPolicy {
+            default_prog: None,
+            default_cwd: None,
+            environment: std::collections::BTreeMap::new(),
+            term: "xterm-256color".into(),
+        })
+    }
+
+    fn validate(&self) -> Result<usize, MuxRecoveryImageError> {
+        let invalid =
+            || MuxRecoveryImageError::InvalidCapturedTopology("invalid domain recovery policy");
+        let (commands, endpoints) = match self {
+            Self::Local(commands) => (commands, None),
+            Self::GuardianLocal {
+                commands,
+                socket_path,
+                token_path,
+            } => (commands, Some([socket_path.as_str(), token_path.as_str()])),
+        };
+        if commands
+            .default_prog
+            .as_ref()
+            .is_some_and(|args| args.is_empty() || args.len() > 4096)
+            || commands.environment.len() > 4096
+            || commands
+                .environment
+                .keys()
+                .any(|key| key.is_empty() || key.contains('='))
+        {
+            return Err(invalid());
+        }
+        let mut bytes = 0usize;
+        let values = commands
+            .default_prog
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(
+                commands
+                    .environment
+                    .iter()
+                    .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
+            )
+            .chain(commands.default_cwd.as_deref())
+            .chain(std::iter::once(commands.term.as_str()));
+        for value in values {
+            if value.len() > 65_536 || value.contains('\0') {
+                return Err(invalid());
+            }
+            bytes = bytes.checked_add(value.len()).ok_or_else(invalid)?;
+        }
+        if bytes > 2 * 1024 * 1024 {
+            return Err(invalid());
+        }
+        if let Some(endpoints) = endpoints {
+            for path in endpoints {
+                if path.len() > 65_536
+                    || path.contains('\0')
+                    || !std::path::Path::new(path).is_absolute()
+                {
+                    return Err(invalid());
+                }
+                bytes = bytes.checked_add(path.len()).ok_or_else(invalid)?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    fn from_mux(policy: &mux::domain::DomainRecoveryPolicy) -> Result<Self, MuxRecoveryImageError> {
+        let invalid = || {
+            MuxRecoveryImageError::InvalidCapturedTopology("invalid native domain recovery policy")
+        };
+        let commands = |policy: &mux::domain::LocalDomainRecoveryPolicy| -> Result<RecoveryLocalDomainPolicy, MuxRecoveryImageError> {
+            policy.validate().map_err(|_| invalid())?;
+            Ok(RecoveryLocalDomainPolicy {
+                default_prog: policy.default_prog.clone(),
+                default_cwd: policy.default_cwd.as_ref().map(|path| path.to_str().map(str::to_owned).ok_or_else(invalid)).transpose()?,
+                environment: policy.environment.clone(), term: policy.term.clone(),
+            })
+        };
+        let result = match policy {
+            mux::domain::DomainRecoveryPolicy::Local(policy) => Self::Local(commands(policy)?),
+            mux::domain::DomainRecoveryPolicy::GuardianLocal {
+                commands: policy,
+                socket_path,
+                token_path,
+            } => {
+                for path in [socket_path, token_path] {
+                    let text = path.to_str().ok_or_else(invalid)?;
+                    if !path.is_absolute() || text.len() > 65_536 || text.contains('\0') {
+                        return Err(invalid());
+                    }
+                }
+                Self::GuardianLocal {
+                    commands: commands(policy)?,
+                    socket_path: socket_path.to_str().ok_or_else(invalid)?.to_owned(),
+                    token_path: token_path.to_str().ok_or_else(invalid)?.to_owned(),
+                }
+            }
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    pub(crate) fn to_mux(&self) -> mux::domain::DomainRecoveryPolicy {
+        let commands =
+            |policy: &RecoveryLocalDomainPolicy| mux::domain::LocalDomainRecoveryPolicy {
+                default_prog: policy.default_prog.clone(),
+                default_cwd: policy.default_cwd.as_ref().map(std::path::PathBuf::from),
+                environment: policy.environment.clone(),
+                term: policy.term.clone(),
+            };
+        match self {
+            Self::Local(policy) => mux::domain::DomainRecoveryPolicy::Local(commands(policy)),
+            Self::GuardianLocal {
+                commands: policy,
+                socket_path,
+                token_path,
+            } => mux::domain::DomainRecoveryPolicy::GuardianLocal {
+                commands: commands(policy),
+                socket_path: socket_path.into(),
+                token_path: token_path.into(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,6 +832,8 @@ pub struct RecoveryDomain {
     pub incarnation_domain_id: usize,
     pub domain_name: String,
     pub is_attached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_policy: Option<RecoveryDomainPolicy>,
 }
 
 /// Exact configured window placement, without inventing desktop dimensions.
@@ -1448,7 +1635,7 @@ impl MuxRecoveryImage {
         }
         if !matches!(
             self.header.schema_version,
-            3 | 4 | 5 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
+            3 | 4 | 5 | 6 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
         ) {
             return Err(MuxRecoveryImageError::UnsupportedSchemaVersion(
                 self.header.schema_version,
@@ -1550,8 +1737,51 @@ impl MuxRecoveryImage {
             });
         }
 
+        match (&self.topology.domain_state, self.header.schema_version) {
+            (None, 7..) | (Some(_), ..=6) => {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "domain authority does not match image schema",
+                ));
+            }
+            _ => {}
+        }
+        let mut policy_bytes = 0usize;
         for domain in &self.topology.domains {
             validate_string_len("domain.domain_name", &domain.domain_name, MAX_STRING_BYTES)?;
+            match (&domain.recovery_policy, self.header.schema_version) {
+                (None, 7..) | (Some(_), ..=6) => {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "domain policy does not match image schema",
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(policy) = &domain.recovery_policy {
+                if domain.incarnation_domain_id == usize::MAX || domain.domain_name.contains('\0') {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "invalid current domain identity",
+                    ));
+                }
+                // Both supported native constructors are always attached.
+                // Detached remote/plugin domains require their own policy and
+                // cannot be reconstructed as a local attached domain.
+                if !domain.is_attached {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "supported domain policy requires attached state",
+                    ));
+                }
+                policy_bytes = policy_bytes
+                    .checked_add(policy.validate()?)
+                    .and_then(|bytes| bytes.checked_add(domain.domain_name.len()))
+                    .ok_or(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "domain policy budget overflow",
+                    ))?;
+                if policy_bytes > MAX_RECOVERY_IMAGE_BYTES {
+                    return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                        "aggregate domain policy budget exceeded",
+                    ));
+                }
+            }
         }
 
         for pane in &self.panes {
@@ -1737,6 +1967,21 @@ impl MuxRecoveryImage {
         }
 
         // 4. Panes catalog uniqueness, domain reference validity, and checkpoint bindings
+        if let Some(state) = &self.topology.domain_state {
+            if state
+                .default_domain_id
+                .is_some_and(|id| !known_domain_ids.contains(&id))
+                || !self
+                    .topology
+                    .domains
+                    .windows(2)
+                    .all(|pair| pair[0].incarnation_domain_id < pair[1].incarnation_domain_id)
+            {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "invalid domain census/default authority",
+                ));
+            }
+        }
         let mut catalog_pane_ids = HashSet::new();
         let mut catalog_pane_uuids = HashSet::new();
         let mut catalog_pane_uuids_by_id = HashMap::new();
@@ -2260,9 +2505,9 @@ impl MuxRecoveryImage {
     /// both workspace state and the tab policies that drive future behavior.
     pub fn require_live_topology_state(&self) -> Result<(), MuxRecoveryImageError> {
         self.require_live_workspace_state()?;
-        if self.header.schema_version < 6 {
+        if self.header.schema_version < 7 {
             return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
-                "historical image lacks complete live tab runtime metadata",
+                "historical image lacks complete live tab/domain runtime metadata",
             ));
         }
         Ok(())
@@ -2747,19 +2992,45 @@ impl MuxRecoveryImage {
         }
 
         // 5. Build domains
-        let mut domain_map: std::collections::BTreeMap<usize, String> =
-            std::collections::BTreeMap::new();
-        for binding in &captured.pane_bindings {
-            domain_map.insert(binding.domain_id, binding.domain_name.clone());
+        if captured.domains.len() > MAX_RECOVERY_DOMAINS {
+            return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                "captured domain census exceeds limit",
+            ));
         }
-        let domains: Vec<RecoveryDomain> = domain_map
-            .into_iter()
-            .map(|(id, name)| RecoveryDomain {
-                incarnation_domain_id: id,
-                domain_name: name,
-                is_attached: true,
-            })
-            .collect();
+        let mut domains = Vec::with_capacity(captured.domains.len());
+        let mut policy_bytes = 0usize;
+        for domain in &captured.domains {
+            validate_string_len("domain.domain_name", &domain.name, MAX_STRING_BYTES)?;
+            let policy = RecoveryDomainPolicy::from_mux(&domain.policy)?;
+            policy_bytes = policy_bytes
+                .checked_add(policy.validate()?)
+                .and_then(|bytes| bytes.checked_add(domain.name.len()))
+                .ok_or(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "domain policy budget overflow",
+                ))?;
+            if policy_bytes > MAX_RECOVERY_IMAGE_BYTES {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "aggregate domain policy budget exceeded",
+                ));
+            }
+            domains.push(RecoveryDomain {
+                incarnation_domain_id: domain.domain_id,
+                domain_name: domain.name.clone(),
+                is_attached: domain.state == mux::domain::DomainState::Attached,
+                recovery_policy: Some(policy),
+            });
+        }
+        for binding in &captured.pane_bindings {
+            if !domains.iter().any(|domain| {
+                domain.incarnation_domain_id == binding.domain_id
+                    && domain.domain_name == binding.domain_name
+                    && domain.is_attached
+            }) {
+                return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                    "pane binding differs from captured domain census",
+                ));
+            }
+        }
 
         // 6. Build windows and tabs
         let mut captured_tabs_by_id = HashMap::new();
@@ -2940,6 +3211,9 @@ impl MuxRecoveryImage {
 
         let topology = RecoveryTopology {
             domains,
+            domain_state: Some(RecoveryDomainState {
+                default_domain_id: captured.default_domain_id,
+            }),
             windows,
             focused_window_id,
             client_workspace,
@@ -3277,6 +3551,10 @@ mod tests {
         // image, which is readable history but lacks repeat-rotation authority.
         let mut legacy = image.clone();
         legacy.header.schema_version = 3;
+        legacy.topology.domain_state = None;
+        for domain in &mut legacy.topology.domains {
+            domain.recovery_policy = None;
+        }
         legacy.topology.workspace_state = None;
         for tab in legacy
             .topology
@@ -3742,7 +4020,9 @@ mod tests {
                 incarnation_domain_id: 0,
                 domain_name: "local".to_string(),
                 is_attached: true,
+                recovery_policy: Some(RecoveryDomainPolicy::local_test_fixture()),
             }],
+            domain_state: Some(Default::default()),
             windows: vec![window],
             focused_window_id: Some(100),
             client_workspace: Some(ClientWorkspaceBinding {
@@ -3783,6 +4063,134 @@ mod tests {
     }
 
     #[test]
+    fn domain_authority_requires_schema_seven_and_preserves_historical_bytes() {
+        let image = make_valid_test_image();
+        image.require_live_topology_state().unwrap();
+        for version in [3, 4, 5, 6] {
+            let mut historical = image.clone();
+            historical.header.schema_version = version;
+            historical.topology.domain_state = None;
+            for domain in &mut historical.topology.domains {
+                domain.recovery_policy = None;
+            }
+            if version < 5 {
+                historical.topology.workspace_state = None;
+            }
+            if version < 6 {
+                for tab in historical
+                    .topology
+                    .windows
+                    .iter_mut()
+                    .flat_map(|window| &mut window.tabs)
+                {
+                    tab.runtime_state = None;
+                }
+            }
+            historical.image_digest = historical.compute_digest().unwrap();
+            let bytes = historical.to_canonical_json().unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("domain_state") && !text.contains("recovery_policy"));
+            let reopened = MuxRecoveryImage::from_json_slice(&bytes).unwrap();
+            assert_eq!(reopened.to_canonical_json().unwrap(), bytes);
+            assert!(reopened.require_live_topology_state().is_err());
+            historical.topology.domain_state = Some(Default::default());
+            assert!(historical.validate().is_err());
+        }
+        let mut missing = image.clone();
+        missing.topology.domain_state = None;
+        assert!(missing.validate().is_err());
+        missing = image.clone();
+        missing.topology.domains[0].recovery_policy = None;
+        assert!(missing.validate().is_err());
+        let mut wire = serde_json::to_value(&image).unwrap();
+        wire["topology"]["domain_state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("default_domain_id");
+        assert!(serde_json::from_value::<MuxRecoveryImage>(wire).is_err());
+    }
+
+    #[test]
+    fn domain_authority_binds_empty_domains_default_and_command_policy() {
+        let mut image = make_valid_test_image();
+        let commands = RecoveryLocalDomainPolicy {
+            default_prog: Some(vec!["/bin/sh".into(), "-l".into()]),
+            default_cwd: Some("/var/tmp".into()),
+            environment: std::collections::BTreeMap::from([("LANG".into(), "C.UTF-8".into())]),
+            term: "xterm-256color".into(),
+        };
+        image.topology.domains.push(RecoveryDomain {
+            incarnation_domain_id: 77,
+            domain_name: "empty-guardian".into(),
+            is_attached: true,
+            recovery_policy: Some(RecoveryDomainPolicy::GuardianLocal {
+                commands,
+                socket_path: "/var/tmp/g.sock".into(),
+                token_path: "/var/tmp/g.token".into(),
+            }),
+        });
+        image
+            .topology
+            .domain_state
+            .as_mut()
+            .unwrap()
+            .default_domain_id = Some(77);
+        image.image_digest = image.compute_digest().unwrap();
+        image.validate().unwrap();
+        let reopened =
+            MuxRecoveryImage::from_json_slice(&image.to_canonical_json().unwrap()).unwrap();
+        assert_eq!(reopened.topology, image.topology);
+        let mut changed = image.clone();
+        changed
+            .topology
+            .domain_state
+            .as_mut()
+            .unwrap()
+            .default_domain_id = Some(0);
+        assert_ne!(changed.compute_digest().unwrap(), image.image_digest);
+        assert!(changed.validate().is_err());
+        for case in 0..10 {
+            let mut invalid = image.clone();
+            let RecoveryDomainPolicy::GuardianLocal {
+                commands,
+                socket_path,
+                ..
+            } = invalid.topology.domains[1]
+                .recovery_policy
+                .as_mut()
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            match case {
+                0 => commands.default_prog = Some(vec![]),
+                1 => commands.default_cwd = Some("bad\0cwd".into()),
+                2 => {
+                    commands.environment.insert("bad=key".into(), "x".into());
+                }
+                3 => commands.term = "x".repeat(65_537),
+                4 => *socket_path = "relative/socket".into(),
+                5 => {
+                    invalid
+                        .topology
+                        .domain_state
+                        .as_mut()
+                        .unwrap()
+                        .default_domain_id = Some(999)
+                }
+                6 => invalid.topology.domains.swap(0, 1),
+                7 => invalid.topology.domains[1].is_attached = false,
+                8 => invalid.topology.domains[1].incarnation_domain_id = usize::MAX,
+                _ => invalid.topology.domains[1].domain_name = "bad\0domain".into(),
+            }
+            if let Ok(digest) = invalid.compute_digest() {
+                invalid.image_digest = digest;
+            }
+            assert!(invalid.validate().is_err(), "case {case}");
+        }
+    }
+
+    #[test]
     fn tab_runtime_state_requires_schema_six_and_preserves_historical_bytes() {
         let image = make_valid_test_image();
         image.require_live_topology_state().unwrap();
@@ -3795,6 +4203,10 @@ mod tests {
         for version in [3, 4, 5] {
             let mut historical = missing.clone();
             historical.header.schema_version = version;
+            historical.topology.domain_state = None;
+            for domain in &mut historical.topology.domains {
+                domain.recovery_policy = None;
+            }
             if version < 5 {
                 historical.topology.workspace_state = None;
             }
@@ -3938,6 +4350,10 @@ mod tests {
         for version in [3, 4] {
             let mut historical = missing.clone();
             historical.header.schema_version = version;
+            historical.topology.domain_state = None;
+            for domain in &mut historical.topology.domains {
+                domain.recovery_policy = None;
+            }
             for tab in historical
                 .topology
                 .windows
@@ -4662,7 +5078,9 @@ mod tests {
                     incarnation_domain_id: 0,
                     domain_name: "local".to_string(),
                     is_attached: true,
+                    recovery_policy: Some(RecoveryDomainPolicy::local_test_fixture()),
                 }],
+                domain_state: Some(Default::default()),
                 windows: vec![RecoveryWindow {
                     window_id: 100,
                     stable_window_id: "00000000-0000-0000-0000-000000000100".to_string(),
@@ -5463,6 +5881,13 @@ mod converter_tests {
 
         let captured = mux::MuxCapturedTopology {
             session_incarnation,
+            default_domain_id: Some(1),
+            domains: vec![mux::MuxCapturedDomain {
+                domain_id: 1,
+                name: "local".into(),
+                state: mux::domain::DomainState::Attached,
+                policy: RecoveryDomainPolicy::local_test_fixture().to_mux(),
+            }],
             topology_revision: mux::TopologyRevision::new(1),
             captured_at_epoch_ms: 1773500000000,
             client_workspace: None,
@@ -5609,6 +6034,63 @@ mod converter_tests {
             panic!("split lost")
         };
         assert_eq!(ratio.to_bits(), (-0.0f64).to_bits());
+    }
+
+    #[test]
+    fn converter_preserves_full_domain_census_and_rejects_binding_substitution() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.domains.push(mux::MuxCapturedDomain {
+            domain_id: 77,
+            name: "empty".into(),
+            state: mux::domain::DomainState::Attached,
+            policy: RecoveryDomainPolicy::local_test_fixture().to_mux(),
+        });
+        captured.default_domain_id = Some(77);
+        let image = MuxRecoveryImage::from_mux_captured(
+            meta.clone(),
+            &captured,
+            &borrowed_acks(&acks),
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(image.topology.domains.len(), 2);
+        assert_eq!(
+            image
+                .topology
+                .domain_state
+                .as_ref()
+                .unwrap()
+                .default_domain_id,
+            Some(77)
+        );
+        assert!(image.topology.domains[1].is_attached);
+        assert_eq!(
+            image.topology.domains[1]
+                .recovery_policy
+                .as_ref()
+                .unwrap()
+                .to_mux(),
+            captured.domains[1].policy
+        );
+        for change in 0..3 {
+            let mut invalid = captured.clone();
+            match change {
+                0 => {
+                    invalid.domains.remove(0);
+                }
+                1 => invalid.domains[0].name = "substituted".into(),
+                _ => invalid.domains[0].state = mux::domain::DomainState::Detached,
+            }
+            assert!(
+                MuxRecoveryImage::from_mux_captured(
+                    meta.clone(),
+                    &invalid,
+                    &borrowed_acks(&acks),
+                    &refs
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
