@@ -105,6 +105,7 @@ std::thread_local! {
         std::cell::Cell::new(0)
     };
     static LIVE_SCROLLBACK_AUTHORITY_BATCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_EVICTION_RANGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1837,6 +1838,112 @@ fn live_scrollback_authority_record_at(
         .ok_or_else(|| anyhow::anyhow!("authenticated ledger is missing sequence {sequence}"))
 }
 
+/// Read-ahead belongs only to one append projection while its store guard is
+/// held. It carries bytes, never ledger authority: every consumed record still
+/// passes through the existing sequence, chain and retained-byte arithmetic.
+struct LedgerEvictionReader<'a> {
+    store: &'a frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+    pane_id: u64,
+    next_sequence: u64,
+    end_sequence: u64,
+    records: std::vec::IntoIter<String>,
+    #[cfg(test)]
+    range_reads: usize,
+    #[cfg(test)]
+    scalar_reads: usize,
+}
+
+impl<'a> LedgerEvictionReader<'a> {
+    // Bound stored bytes requested and capacities retained for reuse separately.
+    // This is not an allocator/total-heap bound: lines_range may transiently
+    // allocate more capacity, and one oversized row uses the existing scalar
+    // record limit after the read-ahead allocation has been dropped.
+    const BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+    fn new(
+        store: &'a frankenterm_core::storage::mmap_store::MmapScrollbackStore,
+        state: VerifiedLedgerState,
+        end_sequence: u64,
+    ) -> Self {
+        Self {
+            store,
+            pane_id: state.ledger_pane_id,
+            next_sequence: state.oldest_sequence.unwrap_or(state.next_sequence),
+            end_sequence,
+            records: Vec::new().into_iter(),
+            #[cfg(test)]
+            range_reads: 0,
+            #[cfg(test)]
+            scalar_reads: 0,
+        }
+    }
+
+    fn read(&mut self, sequence: u64) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            sequence == self.next_sequence && sequence < self.end_sequence,
+            "append eviction reader sequence is inconsistent"
+        );
+        if self.records.len() == 0 {
+            // Release the previous vector's slots before allocating another.
+            self.records = Vec::new().into_iter();
+            let mut count = usize::try_from(
+                (self.end_sequence - sequence).min(LIVE_SCROLLBACK_APPEND_MAX_ROWS as u64),
+            )?;
+            loop {
+                let end = sequence
+                    .checked_add(u64::try_from(count)?)
+                    .ok_or_else(|| anyhow::anyhow!("append eviction read range overflows"))?;
+                #[cfg(test)]
+                {
+                    self.range_reads += 1;
+                    LIVE_SCROLLBACK_EVICTION_RANGE_READS.with(|reads| reads.set(reads.get() + 1));
+                }
+                match self.store.lines_range(
+                    self.pane_id, sequence..end, LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+                    Self::BYTE_LIMIT as u64,
+                ) {
+                    Ok(records) => {
+                        anyhow::ensure!(records.len() == count,
+                            "authenticated ledger is missing an eviction record");
+                        let retained_capacity = records.iter().fold(
+                            records.capacity().checked_mul(std::mem::size_of::<String>()),
+                            |bytes, record| bytes.and_then(|bytes| bytes.checked_add(record.capacity())),
+                        );
+                        if retained_capacity.is_some_and(|bytes| bytes <= Self::BYTE_LIMIT) {
+                            self.records = records.into_iter();
+                            break;
+                        }
+                        // Do not keep an over-budget batch while retrying or
+                        // reading a scalar. No accepted projection is mutated.
+                        drop(records);
+                    }
+                    Err(frankenterm_core::storage::mmap_store::MmapStoreError::PaneReadLimitExceeded {
+                        limit_name: "stored_bytes", ..
+                    }) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if count == 1 {
+                    #[cfg(test)]
+                    {
+                        self.scalar_reads += 1;
+                    }
+                    let record =
+                        live_scrollback_authority_record_at(self.store, self.pane_id, sequence)?;
+                    self.next_sequence += 1; // sequence < end_sequence proves no overflow.
+                    return Ok(record);
+                }
+                count = count.div_ceil(2);
+            }
+        }
+        let record = self
+            .records
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty eviction read-ahead"))?;
+        self.next_sequence += 1;
+        Ok(record)
+    }
+}
+
 impl VerifiedLedgerState {
     fn empty(ledger_pane_id: u64) -> Self {
         Self {
@@ -1940,6 +2047,18 @@ impl VerifiedLedgerState {
         max_retained_rows: usize,
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
     ) -> anyhow::Result<(Self, u64)> {
+        self.project_append_with_reader(desired_sequence, record, max_retained_rows, |sequence| {
+            live_scrollback_authority_record_at(store, self.ledger_pane_id, sequence)
+        })
+    }
+
+    fn project_append_with_reader(
+        self,
+        desired_sequence: u64,
+        record: &str,
+        max_retained_rows: usize,
+        mut read_evicted: impl FnMut(u64) -> anyhow::Result<String>,
+    ) -> anyhow::Result<(Self, u64)> {
         anyhow::ensure!(
             self.next_sequence == desired_sequence && max_retained_rows != 0,
             "incremental append predecessor authority is inconsistent"
@@ -1975,8 +2094,7 @@ impl VerifiedLedgerState {
             let sequence = previous_oldest
                 .checked_add(offset)
                 .ok_or_else(|| anyhow::anyhow!("incremental eviction sequence overflows"))?;
-            let evicted =
-                live_scrollback_authority_record_at(store, self.ledger_pane_id, sequence)?;
+            let evicted = read_evicted(sequence)?;
             chain_anchor = live_scrollback_incremental_chain_next(
                 chain_anchor,
                 self.ledger_pane_id,
@@ -3992,14 +4110,36 @@ impl LiveScrollbackSpillSink {
         let current_record_count = u64::try_from(store.line_count(ledger_pane_id))?;
         let max_retained_rows_u64 = u64::try_from(max_retained_rows)?;
         let mut target_authority = predecessor_authority;
+        let batch_rows = u64::try_from(encrypted_records.len())?;
+        let after_batch_next = desired_sequence
+            .checked_add(batch_rows)
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch sequence overflows"))?;
+        let after_batch_count = predecessor_authority
+            .record_count
+            .checked_add(batch_rows)
+            .ok_or_else(|| anyhow::anyhow!("append WAL batch count overflows"))?
+            .min(max_retained_rows_u64);
+        let eviction_end = after_batch_next
+            .checked_sub(after_batch_count)
+            .ok_or_else(|| anyhow::anyhow!("append WAL eviction range underflows"))?;
+        anyhow::ensure!(
+            eviction_end <= desired_sequence,
+            "append WAL would evict an unpersisted batch record"
+        );
+        let mut eviction_reader =
+            LedgerEvictionReader::new(store, predecessor_authority, eviction_end);
         let mut evicted_record_count = 0u64;
         let mut encrypted_record_bytes = 0u64;
         for (offset, record) in encrypted_records.iter().enumerate() {
             let sequence = desired_sequence
                 .checked_add(u64::try_from(offset)?)
                 .ok_or_else(|| anyhow::anyhow!("append WAL sequence overflows"))?;
-            let (target, evicted) =
-                target_authority.project_append(sequence, record, max_retained_rows, store)?;
+            let (target, evicted) = target_authority.project_append_with_reader(
+                sequence,
+                record,
+                max_retained_rows,
+                |evicted_sequence| eviction_reader.read(evicted_sequence),
+            )?;
             target_authority = target;
             evicted_record_count = evicted_record_count
                 .checked_add(evicted)
@@ -6976,27 +7116,29 @@ fn serialize_exact_semantic_scrollback_line(
             }
         }
     }
-    let semantic = ExactSemanticScrollbackLineV1 {
+    let mut semantic = ExactSemanticScrollbackLineV1 {
         schema: 1,
         line: semantic_line,
         cell_widths,
     };
     if compact {
-        let mut candidate = ExactSemanticScrollbackLineV1 {
-            schema: 2,
-            line: semantic.line.clone(),
-            cell_widths: semantic.cell_widths.clone(),
-        };
-        candidate.line.compress_for_scrollback();
-        if let Some(plaintext) = serialize_semantic_scrollback_payload(&candidate) {
-            if compact_scrollback_decoded_charge(&candidate, plaintext.len())
+        // This is already an owned clone of the caller's line. Reuse it and
+        // its width vector instead of cloning both again for every ASCII row.
+        semantic.schema = 2;
+        semantic.line.compress_for_scrollback();
+        if let Some(plaintext) = serialize_semantic_scrollback_payload(&semantic) {
+            if compact_scrollback_decoded_charge(&semantic, plaintext.len())
                 .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
             {
                 return Some(plaintext);
             }
         }
         // A compact encoding must not admit a row whose expansion exceeds the
-        // existing hard limit. Retain the original vector schema on refusal.
+        // existing hard limit. Rebuild the exact original vector representation
+        // only on refusal; do not infer its bytes from a compact round trip.
+        semantic.schema = 1;
+        semantic.line = line.clone();
+        semantic.line.cells_mut();
     }
     serialize_semantic_scrollback_payload(&semantic)
 }
@@ -10361,6 +10503,124 @@ mod tests {
     }
 
     #[test]
+    fn ledger_eviction_read_ahead_matches_scalar_projection_and_retention_shrink() {
+        use frankenterm_core::storage::mmap_store::{MmapScrollbackStore, MmapStoreConfig};
+        for (append_count, retention, expected_reads) in [(1024, 2048, 1), (32, 64, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store =
+                MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).unwrap();
+            let records: Vec<_> = (0..2048).map(|index| format!("old-{index}-界")).collect();
+            for chunk in records.chunks(1024) {
+                store
+                    .append_lines(7, &chunk.iter().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap();
+            }
+            let predecessor = VerifiedLedgerState::scan_store(7, &store, [0; 32]).unwrap();
+            let eviction_end = 2048 + append_count - retention;
+            let mut reader = LedgerEvictionReader::new(&store, predecessor, eviction_end as u64);
+            let mut scalar = predecessor;
+            let mut batched = predecessor;
+            for offset in 0..append_count {
+                let sequence = 2048 + offset as u64;
+                let record = format!("new-{offset}-é");
+                let (expected, expected_evictions) = scalar
+                    .project_append(sequence, &record, retention, &store)
+                    .unwrap();
+                let (actual, actual_evictions) = batched
+                    .project_append_with_reader(sequence, &record, retention, |sequence| {
+                        reader.read(sequence)
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(actual_evictions, expected_evictions);
+                scalar = expected;
+                batched = actual;
+            }
+            assert_eq!(reader.next_sequence, eviction_end as u64);
+            assert_eq!(reader.records.len(), 0);
+            assert_eq!(reader.range_reads, expected_reads);
+            assert_eq!(reader.scalar_reads, 0);
+            assert_eq!(
+                store.next_seq(7).unwrap(),
+                2048,
+                "projection never mutates storage"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_eviction_read_ahead_bounds_chunks_and_isolates_oversized_record() {
+        use frankenterm_core::storage::mmap_store::{MmapScrollbackStore, MmapStoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).unwrap();
+        let records = [
+            "a".repeat(6 * 1024 * 1024),
+            "b".repeat(6 * 1024 * 1024),
+            "c".repeat(6 * 1024 * 1024),
+            "d".repeat(17 * 1024 * 1024),
+        ];
+        for record in &records {
+            store.append_line(7, record).unwrap();
+        }
+        let predecessor = VerifiedLedgerState::scan_store(7, &store, [0; 32]).unwrap();
+        let mut reader = LedgerEvictionReader::new(&store, predecessor, 4);
+        for (sequence, expected) in records.iter().enumerate() {
+            let actual = reader.read(sequence as u64).unwrap();
+            assert_eq!(&actual, expected);
+            let remaining_capacity: usize =
+                reader.records.as_slice().iter().map(String::capacity).sum();
+            assert!(remaining_capacity <= LedgerEvictionReader::BYTE_LIMIT);
+        }
+        assert!(reader.range_reads > 1, "a byte-limited range must split");
+        assert_eq!(
+            reader.scalar_reads, 1,
+            "only the individually oversized row uses scalar I/O"
+        );
+        assert_eq!(reader.next_sequence, 4);
+        assert!(
+            reader.read(4).is_err(),
+            "read-ahead cannot escape the authorized interval"
+        );
+    }
+
+    #[test]
+    fn ledger_eviction_read_ahead_rejects_missing_truncated_and_invalid_records() {
+        use frankenterm_core::storage::mmap_store::{MmapScrollbackStore, MmapStoreConfig};
+        for fault in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store =
+                MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).unwrap();
+            store.append_lines(7, &["first", "second"]).unwrap();
+            let predecessor = VerifiedLedgerState::scan_store(7, &store, [0; 32]).unwrap();
+            if fault == 0 {
+                store.prune_before(7, 1).unwrap();
+            } else {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.path().join("7.log"))
+                    .unwrap();
+                if fault == 1 {
+                    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+                } else {
+                    file.write_all(&[0xff]).unwrap();
+                }
+            }
+            let mut reader = LedgerEvictionReader::new(&store, predecessor, 2);
+            assert!(reader.read(0).is_err());
+            assert_eq!(
+                reader.next_sequence, 0,
+                "failure never acknowledges a record"
+            );
+            assert_eq!(
+                reader.scalar_reads, 0,
+                "corruption is never retried as capacity pressure"
+            );
+            assert_eq!(reader.range_reads, 1);
+        }
+    }
+
+    #[test]
     fn native_scrollback_batch_bounds_shrink_retention_and_reject_tampered_authority() {
         let (dir, backing, deferred) = deferred_test_sink();
         let prior = Line::from_text("prior", &CellAttributes::blank(), 1, None);
@@ -10870,6 +11130,34 @@ mod tests {
             new_record.len() <= old_record.len(),
             "compact encoding must not grow the measured noise record"
         );
+    }
+
+    #[test]
+    fn compact_scrollback_encoder_refusal_preserves_original_vector_bytes() {
+        // Printable ASCII is compact-eligible, but a sufficiently long row's
+        // expanded cell vector exceeds the existing decoder budget. This must
+        // still use the original vector encoding (or its existing refusal),
+        // never publish the otherwise serializable compact representation.
+        let count = LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
+            / std::mem::size_of::<termwiz::cell::Cell>()
+            + 1;
+        let line = Line::from_text(&"a".repeat(count), &CellAttributes::blank(), 7, None);
+        let mut vector = ExactSemanticScrollbackLineV1 {
+            schema: 1,
+            line: line.clone(),
+            cell_widths: vec![1; count],
+        };
+        vector.line.cells_mut();
+        let expected = serialize_semantic_scrollback_payload(&vector);
+        vector.schema = 2;
+        vector.line.compress_for_scrollback();
+        let compact = serialize_semantic_scrollback_payload(&vector)
+            .expect("compact candidate fits the wire budget before expansion charging");
+        assert!(
+            compact_scrollback_decoded_charge(&vector, compact.len()).unwrap()
+                > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE
+        );
+        assert_eq!(serialize_exact_semantic_scrollback_line(&line), expected);
     }
 
     #[test]
@@ -11733,7 +12021,7 @@ mod tests {
         LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(std::cell::Cell::get)
     }
 
-    fn later_append_authority_reads(retained_rows: usize, target_retention: usize) -> u64 {
+    fn later_append_authority_reads(retained_rows: usize, target_retention: usize) -> (u64, usize) {
         let dir = tempfile::tempdir().expect("create incremental-authority fixture");
         let identity_byte = u8::try_from(retained_rows).unwrap_or(201);
         let context = config::ScrollbackSpillSinkContext {
@@ -11760,6 +12048,7 @@ mod tests {
             ));
         }
         reset_authority_record_reads();
+        LIVE_SCROLLBACK_EVICTION_RANGE_READS.with(|reads| reads.set(0));
         let batches = LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get);
         assert!(sink.store_scrollback_line(
             isize::try_from(retained_rows).expect("fixture stable row fits isize"),
@@ -11788,7 +12077,10 @@ mod tests {
         .expect("read measured v2 append WAL")
         .expect("measured v2 append WAL exists");
         assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
-        reads
+        (
+            reads,
+            LIVE_SCROLLBACK_EVICTION_RANGE_READS.with(std::cell::Cell::get),
+        )
     }
 
     #[test]
@@ -11796,8 +12088,9 @@ mod tests {
         let short = later_append_authority_reads(8, 16);
         let long = later_append_authority_reads(128, 256);
         assert_eq!(
-            short, 0,
-            "later append does not issue scalar target-row reads"
+            short,
+            (0, 0),
+            "later append without eviction issues neither scalar nor eviction range reads"
         );
         assert_eq!(
             long, short,
@@ -11813,11 +12106,15 @@ mod tests {
             .checked_add(1)
             .and_then(|rows| rows.checked_sub(target_retention))
             .expect("fixture eviction arithmetic is valid");
-        let reads = later_append_authority_reads(retained_rows, target_retention);
+        let (reads, range_reads) = later_append_authority_reads(retained_rows, target_retention);
         assert_eq!(
-            reads,
-            u64::try_from(evicted).expect("fixture eviction count fits u64"),
-            "prefix eviction may read each evicted row once and only constant receipt rows"
+            reads, 0,
+            "bounded eviction performs no scalar descriptor reads"
+        );
+        assert_eq!(
+            range_reads,
+            evicted.div_ceil(LIVE_SCROLLBACK_APPEND_MAX_ROWS),
+            "the real append path reads the affected prefix in bounded ranges"
         );
     }
 
