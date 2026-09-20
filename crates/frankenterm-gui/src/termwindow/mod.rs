@@ -1100,6 +1100,7 @@ pub struct PaneState {
     /// Otherwise, the viewport is at the bottom of the
     /// scrollback.
     viewport: Option<StableRowIndex>,
+    native_viewport: Option<mux::localpane::NativeViewport>,
     /// Terminal sequence fence consumed by render damage discovery. This is
     /// deliberately independent from `selection.seqno`: a selection's fence
     /// must remain fixed for its lifetime, while the renderer must advance
@@ -9816,6 +9817,7 @@ impl TermWindow {
             let Some(mut state) = self.pane_state(pane_id) else {
                 return;
             };
+            state.native_viewport = None;
             if pos != state.viewport {
                 state.viewport = pos;
 

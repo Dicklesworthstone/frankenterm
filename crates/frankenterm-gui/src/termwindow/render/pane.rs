@@ -318,7 +318,12 @@ impl crate::TermWindow {
             Some(
                 local
                     .try_capture_render_frame(
-                        self.get_viewport(pane_id),
+                        self.pane_state(pane_id).and_then(|state| {
+                            state
+                                .native_viewport
+                                .clone()
+                                .or_else(|| state.viewport.map(mux::localpane::NativeViewport::new))
+                        }),
                         damage_baseline,
                         selection_baseline,
                         &self.config.hyperlink_rules,
@@ -343,6 +348,9 @@ impl crate::TermWindow {
             // that effective viewport before damage, selection, and rendering
             // derive any row coordinates from GUI state.
             self.set_viewport(pane_id, Some(frame.first), frame.dimensions);
+            if let Some(mut state) = self.pane_state(pane_id) {
+                state.native_viewport = frame.viewport.clone();
+            }
         }
         self.check_for_dirty_lines_and_invalidate_selection(&pos.pane, native_frame.as_ref())?;
         let selection_frame_before = if let Some(frame) = &native_frame {

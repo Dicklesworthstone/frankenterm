@@ -177,6 +177,20 @@ type LineLayoutObservation = Mutex<
     )>,
 >;
 
+/// A scrolled viewport retains its logical insertion point across resident
+/// reflow. Cold rows currently retain only their numeric fallback.
+#[derive(Clone)]
+pub struct NativeViewport {
+    row: StableRowIndex,
+    anchor: Option<frankenterm_term::screen::ScreenSelectionAnchor>,
+}
+
+impl NativeViewport {
+    pub fn new(row: StableRowIndex) -> Self {
+        Self { row, anchor: None }
+    }
+}
+
 /// Owned native paint input. Terminal metadata, damage and resident rows are
 /// captured under one nonblocking terminal acquisition. Rendering never holds
 /// that lock, and must retain damage if capture returns `None`.
@@ -189,6 +203,7 @@ pub struct NativeRenderFrame {
     pub dirty: RangeSet<StableRowIndex>,
     pub selection_dirty: RangeSet<StableRowIndex>,
     pub first: StableRowIndex,
+    pub viewport: Option<NativeViewport>,
     pub lines: Vec<Line>,
     pub password_input: bool,
     coordinate_witness: frankenterm_term::screen::ScreenCoordinateWitness,
@@ -3937,7 +3952,7 @@ impl LocalPane {
 
     pub fn try_capture_render_frame(
         &self,
-        viewport: Option<StableRowIndex>,
+        mut viewport: Option<NativeViewport>,
         damage_baseline: SequenceNo,
         selection_baseline: SequenceNo,
         rules: &[termwiz::hyperlink::Rule],
@@ -3964,10 +3979,21 @@ impl LocalPane {
                 .ok()
                 .flatten()?;
         let dimensions = terminal_try_get_dimensions(&mut term)?;
+        let sequence = term.current_seqno();
+        if let Some(viewport) = viewport.as_mut() {
+            if let Some(anchor) = viewport.anchor.as_ref() {
+                match term.screen().resolve_selection_anchor(anchor, sequence) {
+                    Some([Some(point), _, _]) => viewport.row = point.row,
+                    _ => viewport.anchor = None,
+                }
+            }
+        }
         // Scrollback eviction and clearing can invalidate a stored viewport
         // without a GUI scroll event. Normalize against this same observation;
         // requesting an evicted row would otherwise retry hydration forever.
         let first = viewport
+            .as_ref()
+            .map(|viewport| viewport.row)
             .unwrap_or(dimensions.physical_top)
             .max(dimensions.scrollback_top)
             .min(dimensions.physical_top);
@@ -3986,6 +4012,7 @@ impl LocalPane {
             dirty: RangeSet::new(),
             selection_dirty: RangeSet::new(),
             first,
+            viewport: None,
             lines: Vec::with_capacity(dimensions.viewport_rows),
             password_input,
             coordinate_witness: term.screen().capture_coordinate_witness(),
@@ -4025,6 +4052,27 @@ impl LocalPane {
             // previously presented frame instead of settling its damage with
             // a partial or empty replacement.
             return None;
+        }
+        if first < dimensions.physical_top {
+            let mut viewport = viewport.unwrap_or_else(|| NativeViewport::new(first));
+            if viewport.row != first {
+                viewport.anchor = None;
+            }
+            viewport.row = first;
+            if viewport.anchor.is_none() {
+                viewport.anchor = term.screen_mut().capture_selection_anchor(
+                    frame.source_sequence,
+                    [
+                        Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                            row: first,
+                            column: Some(0),
+                        }),
+                        None,
+                        None,
+                    ],
+                );
+            }
+            frame.viewport = Some(viewport);
         }
         drop(term);
         if !cold {
@@ -8483,7 +8531,7 @@ mod tests {
         let dimensions = pane.get_dimensions();
         for requested in [StableRowIndex::MIN, StableRowIndex::MAX] {
             let normalized = pane
-                .try_capture_render_frame(Some(requested), 0, 0, &[], false)
+                .try_capture_render_frame(Some(NativeViewport::new(requested)), 0, 0, &[], false)
                 .expect("an out-of-range viewport must converge to available rows");
             assert_eq!(
                 normalized.first,
@@ -8493,6 +8541,84 @@ mod tests {
             );
             assert_eq!(normalized.lines.len(), dimensions.viewport_rows);
         }
+    }
+
+    #[test]
+    fn native_viewport_retains_logical_offset_across_repeated_reflow() {
+        let pane = LocalPane::new(
+            709,
+            guardian_lifetime_test_terminal(),
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x79; 16],
+            "native-viewport-anchor".to_string(),
+        );
+        {
+            let mut term = pane.terminal.lock();
+            term.resize(term_size(20, 4));
+            for index in 0..40 {
+                term.advance_bytes(
+                    format!("abcde\u{301}fghij界klmnopqrUVWXYZ{index:02}\r\n").as_bytes(),
+                );
+            }
+        }
+        let dimensions = pane.get_dimensions();
+        let (first, lines) = pane.get_lines(dimensions.scrollback_top..dimensions.physical_top);
+        let offset = lines
+            .iter()
+            .position(|line| line.as_str() == "UVWXYZ10")
+            .unwrap();
+        let original_row = first + offset as StableRowIndex;
+        let original = pane
+            .try_capture_render_frame(Some(NativeViewport::new(original_row)), 0, 0, &[], false)
+            .unwrap();
+        assert_eq!(original.lines[0].as_str(), "UVWXYZ10");
+        let mut viewport = original.viewport.unwrap();
+        assert!(viewport.anchor.is_some());
+        for (cols, expected) in [
+            (13, "lmnopqrUVWXYZ"),
+            (40, "abcde\u{301}fghij界klmnopqrUVWXYZ10"),
+            (20, "UVWXYZ10"),
+        ] {
+            pane.terminal.lock().resize(term_size(cols, 4));
+            {
+                let _busy = pane.terminal.lock();
+                assert!(pane
+                    .try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                    .is_none());
+            }
+            let frame = pane
+                .try_capture_render_frame(Some(viewport), 0, 0, &[], false)
+                .unwrap();
+            assert_eq!(frame.lines[0].as_str(), expected);
+            viewport = frame.viewport.unwrap();
+            assert!(viewport.anchor.is_some());
+            if cols == 13 {
+                let numeric = pane
+                    .try_capture_render_frame(
+                        Some(NativeViewport::new(original_row)),
+                        0,
+                        0,
+                        &[],
+                        false,
+                    )
+                    .unwrap();
+                assert_ne!(
+                    numeric.lines[0].as_str(),
+                    expected,
+                    "numeric-only viewport must expose the original location-jump defect"
+                );
+            }
+        }
+        let bottom = pane
+            .try_capture_render_frame(None, 0, 0, &[], false)
+            .unwrap();
+        assert!(bottom.viewport.is_none());
+        assert_eq!(bottom.first, bottom.dimensions.physical_top);
     }
 
     #[test]
