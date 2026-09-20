@@ -4033,7 +4033,9 @@ mod tests {
                 is_attached: true,
                 recovery_policy: Some(RecoveryDomainPolicy::local_test_fixture()),
             }],
-            domain_state: Some(Default::default()),
+            domain_state: Some(RecoveryDomainState {
+                default_domain_id: Some(0),
+            }),
             windows: vec![window],
             focused_window_id: Some(100),
             client_workspace: Some(ClientWorkspaceBinding {

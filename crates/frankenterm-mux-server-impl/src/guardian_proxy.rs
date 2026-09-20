@@ -6223,8 +6223,9 @@ impl PreparedGuardianWholeMuxTopology {
                     "recovery source mux incarnation is invalid",
                 )
             })?;
+        let activation_count_matches = staged.len() == recovery.pane_count();
         if source_incarnation == target_incarnation
-            || staged.len() != recovery.pane_count()
+            || !activation_count_matches
             || revision != mux::TopologyRevision::INITIAL
             || !owner.is_empty()
             || !owner.iter_windows().is_empty()
@@ -6422,8 +6423,14 @@ impl PreparedGuardianWholeMuxTopology {
         if let Some(budget) = budget {
             budget.checkpoint()?;
         }
+        let cancellation = budget.map(|budget| mux::CancellationObserver::from_cx(budget.cx));
         self.topology
-            .publish(&self.owner, domains, budget.map(|budget| budget.deadline))
+            .publish(
+                &self.owner,
+                domains,
+                budget.map(|budget| budget.deadline),
+                cancellation.as_ref(),
+            )
             .map_err(GuardianProxyError::RestoredModel)
     }
 

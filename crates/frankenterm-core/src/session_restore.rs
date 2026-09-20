@@ -6775,6 +6775,7 @@ impl PreparedWholeMuxTopology {
         owner: &Arc<mux::Mux>,
         domains: Vec<Arc<dyn mux::domain::Domain>>,
         deadline: Option<std::time::Instant>,
+        cancellation: Option<&mux::CancellationObserver>,
     ) -> anyhow::Result<PublishedWholeMuxTopology> {
         let (incarnation, _) = owner.topology_snapshot_authority()?;
         let source_incarnation =
@@ -6783,7 +6784,8 @@ impl PreparedWholeMuxTopology {
             incarnation.as_bytes() != *source_incarnation.as_bytes(),
             "restored topology requires a fresh mux incarnation"
         );
-        let publication = owner.publish_recovered_topology(self.topology, domains, deadline)?;
+        let publication =
+            owner.publish_recovered_topology(self.topology, domains, deadline, cancellation)?;
         Ok(PublishedWholeMuxTopology {
             source: self.source,
             publication,

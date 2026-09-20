@@ -105,6 +105,7 @@ use parking_lot::{
 };
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
+pub use promise::CancellationObserver;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15788,8 +15789,13 @@ impl Mux {
         mut recovered: domain::UnpublishedRecoveredTopology,
         domains: Vec<Arc<dyn Domain>>,
         deadline: Option<Instant>,
+        cancellation: Option<&CancellationObserver>,
     ) -> anyhow::Result<RecoveredTopologyPublication> {
         let check_deadline = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !cancellation.is_some_and(CancellationObserver::is_cancelled),
+                "recovered topology publication cancelled"
+            );
             anyhow::ensure!(
                 deadline.is_none_or(|deadline| Instant::now() < deadline),
                 "recovered topology publication deadline expired"
@@ -25157,7 +25163,7 @@ mod tests {
             }
             true
         })?;
-        let receipt = owner.publish_recovered_topology(topology, domains, None)?;
+        let receipt = owner.publish_recovered_topology(topology, domains, None, None)?;
         assert!(before.load(Ordering::Acquire));
         assert!(receipt.matches_owner(&owner));
         assert!(!receipt.matches_owner(&Arc::new(Mux::new(None))));
@@ -25236,7 +25242,7 @@ mod tests {
         let owner = Arc::new(Mux::new(None));
         let (topology, domains, panes) = recovered_native_pty_fixture()?;
         let error = owner
-            .publish_recovered_topology(topology, domains, Some(Instant::now()))
+            .publish_recovered_topology(topology, domains, Some(Instant::now()), None)
             .err()
             .expect("expired deadline must refuse before preparation");
         assert!(format!("{error:#}").contains("deadline expired"));
@@ -25257,6 +25263,44 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(unix, feature = "async-asupersync"))]
+    #[test]
+    fn recovered_topology_cancelled_at_final_cut_leaves_real_pty_graph_unpublished(
+    ) -> anyhow::Result<()> {
+        let _guard = global_test_lock();
+        let _executor = BoundedTestExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let (topology, domains, panes) = recovered_native_pty_fixture()?;
+        let (cancellation, cancel) = promise::test_cancellation_pair();
+        *owner.recovered_before_publication.lock() = Some(Box::new(cancel));
+        let error = owner
+            .publish_recovered_topology(topology, domains, None, Some(&cancellation))
+            .err()
+            .expect("cancellation after reader preparation must refuse publication");
+        assert!(format!("{error:#}").contains("publication cancelled"));
+        assert!(cancellation.is_cancelled());
+        assert!(owner.iter_domains().is_empty());
+        assert!(owner.iter_panes().is_empty());
+        assert!(owner.iter_windows().is_empty());
+        assert!(owner.tabs.read().is_empty());
+        assert!(owner.tab_parents.read().is_empty());
+        assert!(owner.pane_preparations.lock().is_empty());
+        assert!(owner.pending_pane_lifecycle.lock().by_pane.is_empty());
+        assert_eq!(
+            owner.topology_snapshot_authority()?.1,
+            TopologyRevision::INITIAL
+        );
+        for pane in panes.iter() {
+            assert!(pane.mux_registration_slot().load().is_none());
+            assert!(!pane
+                .get_lines(0..24)
+                .1
+                .iter()
+                .any(|line| line.as_str().contains("recovered-native-ready")));
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn recovered_topology_last_real_reader_failure_leaves_zero_publication() -> anyhow::Result<()> {
@@ -25266,7 +25310,7 @@ mod tests {
         let (topology, domains, panes) = recovered_native_pty_fixture()?;
         *owner.recovered_reader_failure_at.lock() = Some(1);
         let error = owner
-            .publish_recovered_topology(topology, domains, None)
+            .publish_recovered_topology(topology, domains, None, None)
             .err()
             .expect("last reader must fail");
         assert!(format!("{error:#}").contains("readiness"));
@@ -25313,7 +25357,7 @@ mod tests {
         )?);
         *domains.last_mut().unwrap() = substituted;
         let error = owner
-            .publish_recovered_topology(topology, domains, None)
+            .publish_recovered_topology(topology, domains, None, None)
             .err()
             .expect("changed final domain policy must refuse");
         assert!(format!("{error:#}").contains("authenticated policy"));

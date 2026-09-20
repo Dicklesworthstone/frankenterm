@@ -6,6 +6,47 @@ use thiserror::*;
 
 pub mod spawn;
 
+/// Read-only, atomic cancellation authority for callback-free publication cuts.
+/// The retained context has no runtime effect capabilities. No observer can be
+/// constructed when the Asupersync bridge is disabled.
+pub struct CancellationObserver {
+    #[cfg(feature = "async-asupersync")]
+    cx: asupersync::Cx<asupersync::cx::cap::None>,
+    #[cfg(not(feature = "async-asupersync"))]
+    unavailable: std::convert::Infallible,
+}
+
+impl CancellationObserver {
+    #[cfg(feature = "async-asupersync")]
+    pub fn from_cx(cx: &asupersync::Cx) -> Self {
+        Self { cx: cx.restrict() }
+    }
+
+    /// Observe official cancellation producers without locking or invoking
+    /// application code. Cancellation masks do not hide a publication refusal.
+    pub fn is_cancelled(&self) -> bool {
+        #[cfg(feature = "async-asupersync")]
+        {
+            self.cx.published_cancel_requested()
+        }
+        #[cfg(not(feature = "async-asupersync"))]
+        {
+            match self.unavailable {}
+        }
+    }
+}
+
+/// Supply dependent-crate tests with real cancellation authority without
+/// exposing a production cancellation setter on the read-only observer.
+#[cfg(all(feature = "test-support", feature = "async-asupersync"))]
+pub fn test_cancellation_pair() -> (CancellationObserver, impl FnOnce() + Send) {
+    let cx = asupersync::Cx::detached_cancel_context();
+    let observer = CancellationObserver { cx: cx.clone() };
+    (observer, move || {
+        cx.cancel_fast(asupersync::types::CancelKind::User);
+    })
+}
+
 #[derive(Debug, Error)]
 #[error("Promise was dropped before completion")]
 pub struct BrokenPromise {}
