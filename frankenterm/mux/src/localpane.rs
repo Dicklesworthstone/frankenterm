@@ -3237,6 +3237,9 @@ struct PaneAlertCompletion {
 #[cfg(test)]
 static ALERT_DELIVERY_CANCELLED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+static ALERT_MAIN_HANDOFFS: AtomicUsize = AtomicUsize::new(0);
+
 impl Drop for PaneAlertCompletion {
     fn drop(&mut self) {
         if !self.delivered {
@@ -3359,6 +3362,9 @@ impl FundedPaneAlerts {
                 let _ = predecessor.await;
             }
             wait_for_alert_terminal_unlock(&terminal).await;
+            metrics::counter!("mux.pane_alerts.main_handoff").increment(1);
+            #[cfg(test)]
+            ALERT_MAIN_HANDOFFS.fetch_add(1, Ordering::Release);
             main.spawn(async move {
                 for alert in alerts {
                     if !output.dispatch_alert(alert) {
@@ -3366,6 +3372,9 @@ impl FundedPaneAlerts {
                     }
                 }
                 completion.delivered = true;
+                // Keep the whole guard in this callback until delivery ends;
+                // capturing only the flag would release its FIFO successor early.
+                drop(completion);
             })
             .detach();
         });
@@ -3470,6 +3479,13 @@ impl Drop for PaneAlertApplication {
                 .take()
                 .expect("funded alert staging remains installed")
                 .alerts;
+            if batch.alerts.is_empty() {
+                // Ordinary output often changes only the terminal model. It
+                // needs no historical callback or FIFO node. Preserve the last
+                // nonempty tail; funded Drop releases output custody off-thread.
+                drop(state);
+                return;
+            }
             let mut completion = promise::Promise::<()>::new();
             let successor = completion.get_future().expect("new completion future");
             (state.tail.replace(successor), completion)
@@ -6001,7 +6017,9 @@ mod tests {
         // through application merely because the pane was registered meanwhile.
         model_only.apply(&mut pane.terminal.lock());
         assert!(received.lock().is_empty());
+        let handoffs = ALERT_MAIN_HANDOFFS.load(Ordering::Acquire);
         pane.perform_actions(vec![title("A")]).unwrap();
+        pane.perform_actions(vec![Action::Print('x')]).unwrap();
         pane.perform_actions(vec![title("B")]).unwrap();
         assert!(received.lock().is_empty());
         pump_until(&executor, || {
@@ -6025,6 +6043,11 @@ mod tests {
         pump_until(&executor, || {
             executor.admission_snapshot().active_tasks == 0
         });
+        assert_eq!(
+            ALERT_MAIN_HANDOFFS.load(Ordering::Acquire),
+            handoffs + 2,
+            "the intervening no-alert output must not enqueue a main-thread callback"
+        );
 
         // Exercise the production admission/application helper while retaining
         // the emitting guard. Even pumping the main executor cannot dispatch it.
@@ -6084,7 +6107,7 @@ mod tests {
                     saturation.push(permit)
                 }
                 promise::spawn::MainThreadReservationOutcome::RetryableFull(_) => break,
-                other => panic!("unexpected saturation result: {other:?}"),
+                other => panic!("unexpected saturation result: {:?}", other),
             }
         }
         let seqno = pane.terminal.lock().current_seqno();
@@ -6109,6 +6132,21 @@ mod tests {
         });
         assert!(!wrong_thread.load(Ordering::SeqCst));
         assert!(!lock_violation.load(Ordering::SeqCst));
+
+        // Independent byte-pressure control: task slots are empty, but the
+        // owned title alone fills the configured byte limit before overhead.
+        // The old flat 4 KiB estimate incorrectly accepted this same payload.
+        let seqno = pane.terminal.lock().current_seqno();
+        let oversized = pane
+            .perform_actions(vec![title(&"x".repeat(1024 * 1024))])
+            .unwrap_err();
+        assert_eq!(oversized.reason, PaneActionAdmissionRefusal::SizeOverflow);
+        assert_eq!(oversized.actions.len(), 1);
+        assert_eq!(pane.terminal.lock().current_seqno(), seqno);
+        drop(oversized);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
 
         // Close the exact scheduler while two accepted batches are fenced by
         // the emitting guard. They cancel, release FIFO and output custody, and
