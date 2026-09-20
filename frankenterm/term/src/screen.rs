@@ -1275,6 +1275,9 @@ impl ScreenLineRead {
                 // This is only a prefix of a paragraph continuing in resident
                 // rows. Its last spaces are separators, not terminal padding.
                 logical.preserve_trailing_spaces();
+            } else {
+                // Match the text-bearing planner without loading cold cells.
+                logical.preserve_terminal_trailing_spaces();
             }
             let count =
                 if wrapped && end == self.hot_top && aligned_seam && logical.physical_len() == 0 {
@@ -6033,7 +6036,8 @@ impl Screen {
             return (vec![line], None);
         }
 
-        let layout = line.plan_wrap_with_width_prefix_scratch(
+        let layout = Self::plan_terminal_line_wrap(
+            line,
             physical_cols,
             policy.kp_cost_model,
             width_prefix_scratch,
@@ -6043,6 +6047,23 @@ impl Screen {
             layout.deferred_rows(0..layout.row_count(), seqno),
             scorecard,
         )
+    }
+
+    // Stored terminal separators are content, including the spaces before an
+    // insertion point. The generic wrap planner trims them and can thereby
+    // move the cursor or join the next character to the preceding word.
+    // Entirely blank screen rows retain their existing single-row treatment.
+    fn plan_terminal_line_wrap(
+        line: Line,
+        cols: usize,
+        cost_model: MonospaceKpCostModel,
+        scratch: &mut LineWrapWidthPrefixScratch,
+    ) -> LineWrapLayout {
+        if line.is_whitespace() {
+            line.plan_wrap_with_width_prefix_scratch(cols, cost_model, scratch)
+        } else {
+            line.plan_wrap_preserving_trailing_spaces(cols, cost_model, scratch)
+        }
     }
 
     #[cfg(feature = "use_serde")]
@@ -6071,11 +6092,7 @@ impl Screen {
                     &mut scratch,
                 )
             } else {
-                logical.plan_wrap_with_width_prefix_scratch(
-                    cols,
-                    policy.kp_cost_model,
-                    &mut scratch,
-                )
+                Self::plan_terminal_line_wrap(logical, cols, policy.kp_cost_model, &mut scratch)
             };
             // Natural word boundaries can leave spare columns. Only the actual
             // plan bounds output rows; ceil(cell_count / cols) cannot do so.
@@ -6152,14 +6169,13 @@ impl Screen {
             let source = retained.get_or_init(|| {
                 #[cfg(test)]
                 REFLOW_RETAINED_SOURCE_BUILDS.with(|count| count.set(count.get() + 1));
-                let layout = line
-                    .clone()
-                    .plan_wrap_with_width_prefix_scratch(
-                        physical_cols,
-                        policy.kp_cost_model,
-                        width_prefix_scratch,
-                    )
-                    .retain_width_prefix();
+                let layout = Self::plan_terminal_line_wrap(
+                    line.clone(),
+                    physical_cols,
+                    policy.kp_cost_model,
+                    width_prefix_scratch,
+                )
+                .retain_width_prefix();
                 initialized_for_request = true;
                 layout
             });
@@ -12571,12 +12587,27 @@ pub(crate) mod tests {
     #[test]
     fn active_cursor_cold_paragraph_remains_readable_after_resize() {
         for (columns, suffix) in [(13, "TAIL"), (17, "TAIL"), (31, "TAIL"), (13, "TAIL界")] {
-            assert_active_cursor_cold_paragraph_after_resize(columns, suffix);
+            for prepared in [false, true] {
+                assert_active_cursor_cold_paragraph_after_resize(columns, suffix, prepared);
+            }
         }
     }
 
     #[cfg(feature = "use_serde")]
-    fn assert_active_cursor_cold_paragraph_after_resize(columns: usize, suffix: &str) {
+    #[test]
+    fn active_cursor_cold_paragraph_preserves_trailing_spaces() {
+        for prepared in [false, true] {
+            assert_active_cursor_cold_paragraph_after_resize(13, "TAIL ", prepared);
+            assert_active_cursor_cold_paragraph_after_resize(17, "TAIL   ", prepared);
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn assert_active_cursor_cold_paragraph_after_resize(
+        columns: usize,
+        suffix: &str,
+        use_prepared: bool,
+    ) {
         let sink = Arc::new(TestColdScrollbackSink::default());
         let mut terminal = crate::Terminal::new(
             test_size(4, 20, 96),
@@ -12596,7 +12627,23 @@ pub(crate) mod tests {
         );
         let original = format!("{}{suffix}", "0123456789 ab 界 e\u{301} 🚀 ".repeat(40));
         terminal.advance_bytes(original.as_bytes());
-        terminal.resize(test_size(4, columns, 96));
+        let size = test_size(4, columns, 96);
+        if use_prepared {
+            let mut prepared = terminal.capture_reflow_preparation(size).unwrap();
+            assert!(prepared.prepare(|| false));
+            terminal.resize_with_prepared_reflow(size, Some(&mut prepared));
+            assert!(prepared.was_applied());
+        } else {
+            terminal.resize(size);
+        }
+        let resident_text: String = terminal.screen().lines.iter().map(Line::as_str).collect();
+        assert!(
+            resident_text.ends_with(suffix),
+            "resize must preserve the active suffix before cold seam preparation: suffix={:?}, cursor={:?}, tail={:?}",
+            suffix,
+            terminal.cursor_pos(),
+            terminal.screen().lines.back().map(Line::as_str)
+        );
         let mut stale = terminal
             .capture_cold_seam_reflow()
             .unwrap()
@@ -12892,7 +12939,9 @@ pub(crate) mod tests {
     #[test]
     fn prepared_cold_layout_cancellation_and_payload_fallback_remain_exact() {
         let (mut screen, sink) = stored_physical_fixture(9, 32);
-        screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        // Collapse each three-row source group without relying on discarded
+        // trailing spaces, so the request still starts before retained geometry.
+        screen.resize(test_size(4, 40, 96), test_cursor(0, 0, 1), 2, false);
         assert!(screen
             .capture_line_read(0..1)
             .unwrap()
