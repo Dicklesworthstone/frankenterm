@@ -317,51 +317,78 @@ fn decompress_kitty_zlib_bounded(input: &[u8], max_output: usize) -> anyhow::Res
     }
 }
 
-fn sanitize_kitty_alt_text(input: &str) -> Option<String> {
-    let mut out = String::with_capacity(input.len());
-    let mut prev_was_space = false;
+fn kitty_alt_text_chars(mut input: &[u8]) -> impl Iterator<Item = char> + '_ {
+    std::iter::from_fn(move || {
+        if input.is_empty() {
+            return None;
+        }
+        // Inspect at most one UTF-8 scalar's worth of bytes. Decoding a whole
+        // lossy String would allocate in proportion to an untrusted payload.
+        let prefix = &input[..input.len().min(4)];
+        let (ch, consumed) = match std::str::from_utf8(prefix) {
+            Ok(valid) => {
+                let ch = valid.chars().next().expect("nonempty UTF-8 prefix");
+                (ch, ch.len_utf8())
+            }
+            Err(error) if error.valid_up_to() != 0 => {
+                let valid = std::str::from_utf8(&prefix[..error.valid_up_to()])
+                    .expect("decoder-certified UTF-8 prefix");
+                let ch = valid.chars().next().expect("nonempty valid prefix");
+                (ch, ch.len_utf8())
+            }
+            Err(error) => ('\u{fffd}', error.error_len().unwrap_or(prefix.len())),
+        };
+        input = &input[consumed..];
+        Some(ch)
+    })
+}
 
-    for ch in input.chars() {
+fn sanitize_kitty_alt_text(input: impl IntoIterator<Item = char>) -> Option<String> {
+    let mut out = String::with_capacity(MAX_KITTY_ALT_TEXT_CHARS * 4);
+    let mut pending_space = false;
+    let mut count = 0;
+
+    for ch in input {
         let cp = ch as u32;
         let is_control = cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp);
         if is_control {
-            if matches!(ch, '\t' | '\n' | '\r') && !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
+            if matches!(ch, '\t' | '\n' | '\r') {
+                pending_space = true;
             }
             continue;
         }
 
         if ch.is_whitespace() {
-            if !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
-            }
+            pending_space = true;
             continue;
         }
 
+        // Delay collapsed whitespace until another visible character proves
+        // it is not trailing whitespace. This preserves trim-before-truncate,
+        // including a space exactly at the truncation boundary.
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+            count += 1;
+            if count == MAX_KITTY_ALT_TEXT_CHARS {
+                break;
+            }
+        }
         out.push(ch);
-        prev_was_space = false;
+        count += 1;
+        if count == MAX_KITTY_ALT_TEXT_CHARS {
+            break;
+        }
+        pending_space = false;
     }
-
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut text = String::new();
-    for ch in trimmed.chars().take(MAX_KITTY_ALT_TEXT_CHARS) {
-        text.push(ch);
-    }
-    Some(text)
+    (!out.is_empty()).then_some(out)
 }
 
-fn kitty_data_filename(data: &KittyImageData) -> Option<String> {
+fn kitty_data_filename(data: &KittyImageData) -> Option<&str> {
     match data {
         KittyImageData::File { path, .. } | KittyImageData::TemporaryFile { path, .. } => {
             Path::new(path)
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+                .and_then(|name| name.to_str())
                 .filter(|name| !name.is_empty())
         }
         KittyImageData::Direct(_)
@@ -372,13 +399,13 @@ fn kitty_data_filename(data: &KittyImageData) -> Option<String> {
 
 fn resolve_kitty_alt_text(transmit: &KittyImageTransmit) -> Option<String> {
     if let Some(bytes) = &transmit.alt_text {
-        let decoded = String::from_utf8_lossy(bytes);
-        if let Some(text) = sanitize_kitty_alt_text(&decoded) {
+        if let Some(text) = sanitize_kitty_alt_text(kitty_alt_text_chars(bytes)) {
             return Some(text);
         }
     }
 
-    kitty_data_filename(&transmit.data).and_then(|filename| sanitize_kitty_alt_text(&filename))
+    kitty_data_filename(&transmit.data)
+        .and_then(|filename| sanitize_kitty_alt_text(filename.chars()))
 }
 
 fn placement_stable_rows(info: PlacementInfo) -> Option<std::ops::Range<StableRowIndex>> {
@@ -2941,6 +2968,53 @@ mod tests {
         assert_eq!(data, &pixels);
     }
 
+    proptest::proptest! {
+        #[test]
+        fn kitty_alt_text_decoder_matches_lossy_utf8(
+            bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..2048)
+        ) {
+            let decoded: String = kitty_alt_text_chars(&bytes).collect();
+            let expected = String::from_utf8_lossy(&bytes);
+            proptest::prop_assert_eq!(decoded.as_str(), expected.as_ref());
+        }
+    }
+
+    #[test]
+    fn kitty_alt_text_stops_consuming_at_scalar_limit() {
+        let consumed = std::cell::Cell::new(0usize);
+        let input = std::iter::from_fn(|| {
+            let next = consumed.get() + 1;
+            assert!(
+                next <= MAX_KITTY_ALT_TEXT_CHARS,
+                "read beyond visible prefix"
+            );
+            consumed.set(next);
+            Some('🚀')
+        });
+        let text = sanitize_kitty_alt_text(input).expect("visible alt text");
+        assert_eq!(consumed.get(), MAX_KITTY_ALT_TEXT_CHARS);
+        assert_eq!(text, "🚀".repeat(MAX_KITTY_ALT_TEXT_CHARS));
+        assert_eq!(text.capacity(), MAX_KITTY_ALT_TEXT_CHARS * 4);
+    }
+
+    #[test]
+    fn kitty_alt_text_trims_before_truncating_collapsed_space() {
+        let prefix = "a".repeat(MAX_KITTY_ALT_TEXT_CHARS - 1);
+        assert_eq!(
+            sanitize_kitty_alt_text(format!(" \t{prefix}\r\n ").chars()),
+            Some(prefix.clone())
+        );
+        assert_eq!(
+            sanitize_kitty_alt_text(format!(" \t{prefix}\r\n b").chars()),
+            Some(format!("{prefix} "))
+        );
+        assert_eq!(sanitize_kitty_alt_text(" \t\u{7}\u{85}\n".chars()), None);
+        assert_eq!(
+            sanitize_kitty_alt_text("x\u{7}\u{85}y\tz".chars()),
+            Some("xy z".to_owned())
+        );
+    }
+
     #[test]
     fn kitty_transmit_emits_sanitized_alt_text_alert_after_admission() {
         let (mut terminal, alerts) = terminal_with_alerts(1024);
@@ -3014,6 +3088,24 @@ mod tests {
             resolve_kitty_alt_text(&transmit),
             Some("sales-chart.png".to_string()),
         );
+
+        let mut oversized = transmit;
+        let basename = "界".repeat(100_000);
+        oversized.data = KittyImageData::File {
+            path: format!("/tmp/{basename}"),
+            data_size: None,
+            data_offset: None,
+        };
+        // The protocol path is untrusted and may exceed filesystem limits;
+        // filename fallback must borrow it, not allocate a second full copy.
+        let filename = kitty_data_filename(&oversized.data).unwrap();
+        let KittyImageData::File { path, .. } = &oversized.data else {
+            unreachable!();
+        };
+        assert_eq!(filename.as_ptr(), path.as_bytes()[5..].as_ptr());
+        let text = resolve_kitty_alt_text(&oversized).unwrap();
+        assert_eq!(text, "界".repeat(MAX_KITTY_ALT_TEXT_CHARS));
+        assert_eq!(text.capacity(), MAX_KITTY_ALT_TEXT_CHARS * 4);
     }
 
     fn kitty_graphics_fixture_path(name: &str, file: &str) -> std::path::PathBuf {
