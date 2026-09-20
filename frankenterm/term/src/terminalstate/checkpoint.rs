@@ -5602,7 +5602,8 @@ mod tests {
                 .wrap_next_column = endpoint;
             assert!(
                 invalid.to_canonical_json(limits).is_err(),
-                "endpoint={endpoint:?}"
+                "endpoint={:?}",
+                endpoint
             );
         }
         let mut old_version = checkpoint;
