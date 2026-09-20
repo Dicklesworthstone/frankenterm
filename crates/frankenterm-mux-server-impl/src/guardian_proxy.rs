@@ -10182,7 +10182,9 @@ mod tests {
         .into_live(Box::new(std::io::sink()))
         .expect("activate captured parser fixture with discard writer");
         assert_eq!(
-            restored.screen().all_lines()[0].as_str().trim_end(),
+            restored.screen().lines_in_phys_range(0..1)[0]
+                .as_str()
+                .trim_end(),
             "guardian-checkpoint-base",
             "checkpoint must contain the actual admitted parser payload"
         );
