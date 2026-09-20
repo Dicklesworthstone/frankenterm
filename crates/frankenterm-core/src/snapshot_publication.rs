@@ -663,66 +663,64 @@ fn verify_directory_security(dir: &Dir, path: &Path) -> Result<(), PublicationEr
     Ok(())
 }
 
-/// Creates missing ancestor directories while rejecting symlinks at inspected leaves.
-/// Existing ancestor prefixes are resolved through ambient directory access.
-fn ensure_directory_hierarchy_nofollow(path: &Path) -> Result<Dir, PublicationError> {
-    if path.as_os_str().is_empty() || path == Path::new(".") {
-        return Dir::open_ambient_dir(".", cap_std::ambient_authority())
-            .map_err(|e| PublicationError::io(path, e));
+/// Resolve every component relative to an already pinned directory. Creation
+/// completes parent-entry durability even when retrying an earlier mkdir.
+/// Read-only callers neither create directories nor sync existing entries.
+fn open_directory_hierarchy_nofollow(path: &Path, create: bool) -> Result<Dir, PublicationError> {
+    use std::path::Component;
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(PublicationError::InsecurePermissions {
+            path: path.to_path_buf(),
+            reason: "directory path contains a parent component".to_string(),
+        });
     }
-
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(PublicationError::InsecurePermissions {
-                    path: path.to_path_buf(),
-                    reason: "directory component is a symlink (symlinks forbidden)".to_string(),
-                });
-            }
-            let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority())
-                .map_err(|e| PublicationError::io(path, e))?;
-            // A preceding mkdir may be visible even though its parent sync
-            // failed. Reopening that directory must complete the entry sync.
-            if let Some(parent) = path.parent() {
-                let parent_path = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir => resolved.push(part.as_os_str()),
+            _ => break,
+        }
+    }
+    if resolved.as_os_str().is_empty() {
+        resolved.push(".");
+    }
+    let mut directory = Dir::open_ambient_dir(&resolved, cap_std::ambient_authority())
+        .map_err(|error| PublicationError::io(path, error))?;
+    for part in path.components() {
+        let Component::Normal(name) = part else {
+            continue;
+        };
+        let child_path = resolved.join(name);
+        let child = match directory.open_dir_nofollow(name) {
+            Ok(child) => child,
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                let builder = cap_std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                let builder = {
+                    use cap_std::fs::DirBuilderExt as _;
+                    let mut builder = builder;
+                    builder.mode(0o700);
+                    builder
                 };
-                let parent_directory =
-                    Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())
-                        .map_err(|error| PublicationError::io(parent_path, error))?;
-                sync_directory(&parent_directory, parent_path)?;
+                directory
+                    .create_dir_with(name, &builder)
+                    .map_err(|error| PublicationError::io(&child_path, error))?;
+                directory
+                    .open_dir_nofollow(name)
+                    .map_err(|error| PublicationError::io(&child_path, error))?
             }
-            Ok(directory)
+            Err(error) => return Err(PublicationError::io(&child_path, error)),
+        };
+        if create {
+            sync_directory(&directory, &resolved)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let parent_dir = ensure_directory_hierarchy_nofollow(parent)?;
-            let leaf = path
-                .file_name()
-                .ok_or_else(|| PublicationError::InsecurePermissions {
-                    path: path.to_path_buf(),
-                    reason: "path has no leaf component".to_string(),
-                })?;
-            let builder = cap_std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            let builder = {
-                use cap_std::fs::DirBuilderExt as _;
-                let mut builder = builder;
-                builder.mode(0o700);
-                builder
-            };
-            parent_dir
-                .create_dir_with(leaf, &builder)
-                .map_err(|e| PublicationError::io(path, e))?;
-            sync_directory(&parent_dir, parent)?;
-            parent_dir
-                .open_dir_nofollow(leaf)
-                .map_err(|e| PublicationError::io(path, e))
-        }
-        Err(e) => Err(PublicationError::io(path, e)),
+        directory = child;
+        resolved = child_path;
     }
+    Ok(directory)
 }
 
 /// Persist directory entry changes, including a rename whose earlier caller
@@ -1026,38 +1024,7 @@ impl SnapshotPublicationStore {
             return Err(PublicationError::StoreQuotaPolicy);
         }
         let root_path = root_path.into();
-        let mut anchor = PathBuf::new();
-        for component in root_path.components() {
-            match component {
-                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                    anchor.push(component.as_os_str())
-                }
-                _ => break,
-            }
-        }
-        if anchor.as_os_str().is_empty() {
-            anchor.push(".");
-        }
-        let mut directory = Dir::open_ambient_dir(&anchor, cap_std::ambient_authority())
-            .map_err(|error| PublicationError::io(&root_path, error))?;
-        for component in root_path.components() {
-            match component {
-                std::path::Component::Prefix(_)
-                | std::path::Component::RootDir
-                | std::path::Component::CurDir => {}
-                std::path::Component::Normal(name) => {
-                    directory = directory
-                        .open_dir_nofollow(name)
-                        .map_err(|error| PublicationError::io(&root_path, error))?;
-                }
-                _ => {
-                    return Err(PublicationError::InsecurePermissions {
-                        path: root_path.clone(),
-                        reason: "existing store path has an unsupported component".to_string(),
-                    });
-                }
-            }
-        }
+        let directory = open_directory_hierarchy_nofollow(&root_path, false)?;
         verify_directory_security(&directory, &root_path)?;
         let child = |name: &str| {
             let path = root_path.join(name);
@@ -1131,8 +1098,7 @@ impl SnapshotPublicationStore {
 
         let root_dir = if root_exists {
             // Existing directory: open and verify security WITHOUT mutating permissions (no chmod)
-            let dir = Dir::open_ambient_dir(&root_path, cap_std::ambient_authority())
-                .map_err(|e| PublicationError::io(&root_path, e))?;
+            let dir = open_directory_hierarchy_nofollow(&root_path, false)?;
             verify_directory_security(&dir, &root_path)?;
             dir
         } else {
@@ -1147,7 +1113,7 @@ impl SnapshotPublicationStore {
                     })?;
 
             // Ensure parent directory exists without symlinks
-            let parent_dir = ensure_directory_hierarchy_nofollow(parent_path)?;
+            let parent_dir = open_directory_hierarchy_nofollow(parent_path, true)?;
 
             let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
@@ -1160,6 +1126,9 @@ impl SnapshotPublicationStore {
             parent_dir
                 .create_dir_with(leaf, &builder)
                 .map_err(|e| PublicationError::io(&root_path, e))?;
+            // Persist the mkdir through the same pinned parent capability;
+            // a later pathname reopen may resolve a replaced ancestor.
+            sync_directory(&parent_dir, parent_path)?;
 
             let dir = parent_dir
                 .open_dir_nofollow(leaf)
@@ -1176,7 +1145,7 @@ impl SnapshotPublicationStore {
             } else {
                 parent
             };
-            let parent_directory = ensure_directory_hierarchy_nofollow(parent_path)?;
+            let parent_directory = open_directory_hierarchy_nofollow(parent_path, true)?;
             sync_directory(&parent_directory, parent_path)?;
         }
 
@@ -4179,6 +4148,36 @@ mod tests {
             "opening must not repair a missing directory"
         );
         assert!(retained.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn store_preparation_rejects_symlink_ancestors_without_mutating_targets() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let temp = private_test_directory();
+        let real = temp.path().join("real");
+        let nested = real.join("nested");
+        let existing = nested.join("existing");
+        for path in [&real, &nested, &existing] {
+            std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // The parent itself is not a symlink. Ambient prefix resolution used
+        // to pass both paths and initialize the directory behind the alias.
+        for leaf in ["existing", "missing"] {
+            let path = alias.join("nested").join(leaf);
+            assert!(SnapshotPublicationStore::open(&path, PublicationLimits::default()).is_err());
+            assert!(
+                SnapshotPublicationStore::open_existing(&path, PublicationLimits::default())
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0);
+        assert!(!nested.join("missing").exists());
+        // The same physical store works through its explicit nofollow path.
+        SnapshotPublicationStore::open(&existing, PublicationLimits::default()).unwrap();
+        SnapshotPublicationStore::open_existing(&existing, PublicationLimits::default()).unwrap();
     }
 
     #[test]
