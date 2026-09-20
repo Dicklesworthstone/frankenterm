@@ -6242,11 +6242,9 @@ mod tests {
             match notification {
                 crate::MuxNotification::Alert {
                     pane_id: 813,
-                    alert,
+                    alert: Alert::WindowTitleChanged(title),
                 } => {
-                    if let Alert::WindowTitleChanged(title) = alert {
-                        events.lock().push(title.clone());
-                    }
+                    events.lock().push(title.clone());
                 }
                 crate::MuxNotification::PaneRemoved(813) => {
                     events.lock().push("removed".into());
@@ -11069,8 +11067,15 @@ mod tests {
         fn resize_worker_drains_staged_actions_before_noop_probe() {
             let size = term_size(10, 1);
             let ring = ArrayQueue::new(4);
-            ring.push(vec![Action::Print('x')])
-                .expect("ring should accept staged action");
+            assert!(
+                ring.push(AdmittedPaneActions {
+                    actions: vec![Action::Print('x')],
+                    alerts: None,
+                    staging: Arc::new(Mutex::new(PaneAlertStaging::default())),
+                })
+                .is_ok(),
+                "ring should accept unregistered model-only action"
+            );
 
             let terminal = Mutex::new(test_terminal(size));
             let pty: Mutex<Box<dyn MasterPty>> = Mutex::new(Box::new(TestMasterPty));
@@ -11078,6 +11083,8 @@ mod tests {
                 pending: None,
                 next_seq: 1,
                 worker_running: true,
+                reconcile_tab_on_completion: false,
+                completion_reservation: None,
                 last_proven_pty_size: Some(pty_size(10, 1)),
             });
             let metrics = LocalPane::apply_resize_sync(
@@ -11210,8 +11217,10 @@ mod tests {
                     &registered_pane,
                     &generation,
                     durable_pane_id,
-                    segment,
-                    receipt,
+                    crate::guardian_checkpoint::LiveParserCheckpointSource::Output {
+                        segment,
+                        output: receipt,
+                    },
                     limits,
                 )
                 .expect("register checkpoint at the authenticated delivery fence");
