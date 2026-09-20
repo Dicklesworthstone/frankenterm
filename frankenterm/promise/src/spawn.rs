@@ -613,14 +613,6 @@ impl MainThreadAdmissionController {
         } else {
             state.active_general_tasks
         };
-        if active_tasks >= task_capacity {
-            return Err(MainThreadAdmissionError::TaskCapacityExhausted {
-                active: active_tasks,
-                capacity: task_capacity,
-                service_class,
-            });
-        }
-
         let estimated_byte_capacity = if critical {
             self.inner.limits.estimated_byte_capacity()
         } else {
@@ -634,6 +626,23 @@ impl MainThreadAdmissionController {
         } else {
             state.active_general_estimated_bytes
         };
+        // A request that can never fit must not become retryable merely
+        // because another task currently occupies the task-count budget.
+        if estimated_bytes.get() > estimated_byte_capacity {
+            return Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: active_estimated_bytes,
+                requested: estimated_bytes.get(),
+                capacity: estimated_byte_capacity,
+                service_class,
+            });
+        }
+        if active_tasks >= task_capacity {
+            return Err(MainThreadAdmissionError::TaskCapacityExhausted {
+                active: active_tasks,
+                capacity: task_capacity,
+                service_class,
+            });
+        }
         let Some(prospective_estimated_bytes) =
             active_estimated_bytes.checked_add(estimated_bytes.get())
         else {
@@ -3129,6 +3138,15 @@ mod tests {
             no_general_slots.admit(MainThreadServiceClass::Interactive, 1),
             MainThreadAdmissionOutcome::InvalidSize(_)
         ));
+        let full_slots = admission_controller(1, 100, 0, 40);
+        let occupied = full_slots
+            .try_admit(MainThreadServiceClass::Interactive, 1)
+            .unwrap();
+        assert!(matches!(
+            full_slots.admit(MainThreadServiceClass::Interactive, 61),
+            MainThreadAdmissionOutcome::InvalidSize(_)
+        ));
+        drop(occupied);
         assert_eq!(controller.snapshot().active_estimated_bytes, 0);
         assert_eq!(controller.snapshot().active_tasks, 0);
     }

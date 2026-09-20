@@ -3262,13 +3262,31 @@ struct AdmittedPaneActions {
     staging: Arc<Mutex<PaneAlertStaging>>,
 }
 
+fn background_alert_refusal(
+    error: promise::spawn::BackgroundSpawnError,
+) -> PaneActionAdmissionRefusal {
+    use promise::spawn::BackgroundSpawnError;
+    match error {
+        BackgroundSpawnError::TaskCapacityExhausted { .. } => PaneActionAdmissionRefusal::Capacity,
+        BackgroundSpawnError::EstimatedByteCapacityExhausted {
+            requested,
+            capacity,
+            ..
+        } if requested <= capacity => PaneActionAdmissionRefusal::Capacity,
+        BackgroundSpawnError::EstimatedByteCapacityExhausted { .. }
+        | BackgroundSpawnError::ZeroEstimatedBytes => PaneActionAdmissionRefusal::SizeOverflow,
+        BackgroundSpawnError::WorkerUnavailable(_) => {
+            PaneActionAdmissionRefusal::SchedulerUnavailable
+        }
+    }
+}
+
 impl FundedPaneAlerts {
     fn reserve(
         preflight: PaneAlertPreflight,
         output: &mut Option<crate::PaneAlertOutput>,
         terminal: &Arc<Mutex<Terminal>>,
     ) -> Result<Option<Self>, PaneActionAdmissionRefusal> {
-        use promise::spawn::BackgroundSpawnError;
         use promise::spawn::{MainThreadReservationOutcome as Outcome, MainThreadServiceClass};
         if output.is_none() {
             return Ok(None);
@@ -3280,23 +3298,7 @@ impl FundedPaneAlerts {
             return Err(PaneActionAdmissionRefusal::SchedulerUnavailable);
         }
         let reservation =
-            promise::spawn::try_reserve_background_task(bytes).map_err(|error| match error {
-                BackgroundSpawnError::TaskCapacityExhausted { .. } => {
-                    PaneActionAdmissionRefusal::Capacity
-                }
-                BackgroundSpawnError::EstimatedByteCapacityExhausted {
-                    requested,
-                    capacity,
-                    ..
-                } if requested <= capacity => PaneActionAdmissionRefusal::Capacity,
-                BackgroundSpawnError::EstimatedByteCapacityExhausted { .. }
-                | BackgroundSpawnError::ZeroEstimatedBytes => {
-                    PaneActionAdmissionRefusal::SizeOverflow
-                }
-                BackgroundSpawnError::WorkerUnavailable(_) => {
-                    PaneActionAdmissionRefusal::SchedulerUnavailable
-                }
-            })?;
+            promise::spawn::try_reserve_background_task(bytes).map_err(background_alert_refusal)?;
         let main = match promise::spawn::try_reserve_main_thread(
             MainThreadServiceClass::Interactive,
             bytes,
@@ -3552,10 +3554,7 @@ impl LocalPane {
         }
         // Initialize the lazy executor/reactor before taking any terminal lock.
         // Actual batch admission later is a bounded, nonblocking counter update.
-        drop(
-            promise::spawn::try_reserve_background_task(1)
-                .map_err(|_| PaneActionAdmissionRefusal::Capacity)?,
-        );
+        drop(promise::spawn::try_reserve_background_task(1).map_err(background_alert_refusal)?);
         registration
             .reserve_alert_output()
             .map(Some)
@@ -5843,6 +5842,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn alert_executor_initialization_failure_is_not_retryable_capacity() {
+        use promise::spawn::BackgroundSpawnError;
+        assert_eq!(
+            background_alert_refusal(BackgroundSpawnError::WorkerUnavailable(
+                "unavailable".into()
+            )),
+            PaneActionAdmissionRefusal::SchedulerUnavailable,
+        );
+        assert_eq!(
+            background_alert_refusal(BackgroundSpawnError::TaskCapacityExhausted {
+                active: 1,
+                capacity: 1
+            }),
+            PaneActionAdmissionRefusal::Capacity,
+        );
+    }
+
+    #[test]
     fn historical_alert_admission_preserves_fifo_bounds_and_shutdown() {
         const CHILD: &str = "FT_HISTORICAL_ALERT_CONTRACT_CHILD";
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
@@ -5951,6 +5968,13 @@ mod tests {
             promise::spawn::MainThreadAdmissionLimits::new(32, 1024 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
+        let tab = Arc::new(crate::tab::Tab::new(&term_size(80, 24)));
+        mux.add_tab_no_panes(&tab).unwrap();
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id).unwrap();
+        drop(window);
+        tab.assign_pane(&dynamic);
         let received = Arc::new(Mutex::new(Vec::<Alert>::new()));
         let observed = received.clone();
         let weak_pane = Arc::downgrade(&pane);
@@ -5997,6 +6021,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(titles, ["A", "B"]);
+        assert_eq!(mux.get_window(window_id).unwrap().get_title(), "B");
         pump_until(&executor, || {
             executor.admission_snapshot().active_tasks == 0
         });
