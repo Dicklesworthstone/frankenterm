@@ -575,9 +575,59 @@ impl WindowEventRetryRequest {
 
 struct WindowEventRetryDelivery {
     pending: Arc<AtomicBool>,
+    status: Arc<PendingStatusUpdate>,
     deliver: Box<
         dyn Fn(WindowEventAdmission) -> promise::spawn::MainThreadSpawnedTask<()> + Send + Sync,
     >,
+}
+
+/// One immediate request and one periodic deadline per exact GUI owner. The
+/// output worker waits on this deadline without holding a main-thread permit.
+#[derive(Default)]
+pub struct PendingStatusUpdate(Mutex<(bool, Option<Instant>)>);
+
+impl PendingStatusUpdate {
+    fn request(&self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).0 = true;
+    }
+
+    fn arm(&self, interval: u64) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if interval == 0 {
+            state.1.take().is_some()
+        } else if state.1.is_none() {
+            state.1 = Instant::now().checked_add(Duration::from_millis(interval));
+            if state.1.is_none() {
+                log::error!("status_update_interval exceeds the native timer range");
+            }
+            state.1.is_some()
+        } else {
+            false
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.0 {
+            Some(Instant::now())
+        } else {
+            state.1
+        }
+    }
+
+    fn take_due(&self, owner: &Arc<Self>, current: &Arc<Self>) -> bool {
+        if !Arc::ptr_eq(owner, current) {
+            return false;
+        }
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let expired = state.1.is_some_and(|deadline| deadline <= Instant::now());
+        let due = state.0 || expired;
+        state.0 = false;
+        if expired {
+            state.1 = None;
+        }
+        due
+    }
 }
 
 async fn run_mux_output_refresh(
@@ -590,7 +640,20 @@ async fn run_mux_output_refresh(
     events: Option<WindowEventRetryDelivery>,
     cleanup: Option<&GuiPaneCleanupOwner>,
 ) {
-    while pending.recv_async().await.is_ok() {
+    loop {
+        if let Some(deadline) = events.as_ref().and_then(|events| events.status.deadline()) {
+            let wake = pending.recv_async();
+            let timer = sleep(deadline.saturating_duration_since(Instant::now()));
+            futures::pin_mut!(wake, timer);
+            if matches!(
+                futures::future::select(wake, timer).await,
+                futures::future::Either::Left((Err(_), _))
+            ) {
+                return;
+            }
+        } else if pending.recv_async().await.is_err() {
+            return;
+        }
         let mut delay = Duration::from_millis(10);
         let mut event_serviced = false;
         loop {
@@ -833,6 +896,7 @@ pub enum TermWindowNotif {
     MuxOutputRefresh {
         mux_owner: Weak<Mux>,
         mux_window_id: MuxWindowId,
+        status: Arc<PendingStatusUpdate>,
         interest: [u64; OUTPUT_INTEREST_WORDS],
         invalidations: MuxOutputInvalidations,
         title_refresh: Option<PendingMuxTitleRefresh>,
@@ -845,7 +909,6 @@ pub enum TermWindowNotif {
         mux_window_id: MuxWindowId,
         actions: Arc<::window::AdmittedWindowActions>,
     },
-    EmitStatusUpdate,
     Apply(Box<dyn FnOnce(&mut TermWindow) + Send + Sync>),
     SwitchToMuxWindow(MuxWindowId),
     SetInnerSize {
@@ -2000,6 +2063,7 @@ pub struct TermWindow {
     render_wake_requests: Option<RenderWakeRequests>,
     output_refresh_abort: Option<RenderWakeAbort>,
     window_event_retry: Option<WindowEventRetryRequest>,
+    pending_status_update: Arc<PendingStatusUpdate>,
     last_window_event_retry: Option<String>,
     mux_subscription: Option<GuiMuxSubscription>,
     pane_cleanup_subscription: Option<GuiMuxSubscription>,
@@ -2103,7 +2167,6 @@ pub struct TermWindow {
     /// same-revision invalidations.
     last_tab_state_prune_revision: Cell<Option<mux::window::WindowOrderRevision>>,
 
-    last_status_call: Instant,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -4297,6 +4360,7 @@ impl TermWindow {
             render_wake_state: RenderWakeState::default(),
             render_wake_requests: None,
             output_refresh_abort: None,
+            pending_status_update: Arc::new(PendingStatusUpdate::default()),
             window_event_retry: None,
             last_window_event_retry: None,
             mux_subscription: None,
@@ -4350,7 +4414,6 @@ impl TermWindow {
                 |config| config.line_to_ele_shape_cache_size,
                 &config,
             )),
-            last_status_call: Instant::now(),
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -5075,6 +5138,7 @@ impl TermWindow {
             TermWindowNotif::MuxOutputRefresh {
                 mux_owner,
                 mux_window_id,
+                status,
                 interest,
                 invalidations,
                 title_refresh,
@@ -5088,6 +5152,9 @@ impl TermWindow {
                     || !Mux::try_get().is_some_and(|current| Arc::ptr_eq(&current, &owner))
                 {
                     return Ok(());
+                }
+                if status.take_due(&status, &self.pending_status_update) {
+                    self.handle_status_update();
                 }
                 // Leave the lease in its prepaid slot throughout cleanup. A
                 // cancelled native task never dequeues it, and an unwinding
@@ -5435,9 +5502,6 @@ impl TermWindow {
                     cleanup.complete();
                 }
             }
-            TermWindowNotif::EmitStatusUpdate => {
-                self.handle_status_update();
-            }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let pane = Mux::try_get()
                     .and_then(|mux| mux.get_pane(pane_id))
@@ -5667,8 +5731,9 @@ impl TermWindow {
     }
 
     fn schedule_status_update(&self) {
-        if let Some(window) = self.window.as_ref() {
-            window.notify(TermWindowNotif::EmitStatusUpdate);
+        self.pending_status_update.request();
+        if let Some(retry) = self.window_event_retry.as_ref() {
+            let _ = retry.wake.try_send(());
         }
     }
 
@@ -6277,6 +6342,7 @@ impl TermWindow {
         let event_retry_owner = Arc::downgrade(&event_retry_pending);
         let event_delivery = WindowEventRetryDelivery {
             pending: event_retry_pending,
+            status: Arc::clone(&self.pending_status_update),
             deliver: Box::new(move |(callback, completion)| {
                 let mux_owner = event_mux.clone();
                 let retry_owner = event_retry_owner.clone();
@@ -6294,6 +6360,7 @@ impl TermWindow {
             }),
         };
         let output_cleanup = Arc::clone(&self.pane_cleanup);
+        let output_status = Arc::clone(&self.pending_status_update);
         output_worker.spawn(async move {
             let _ = Abortable::new(
                 run_mux_output_refresh(
@@ -6309,6 +6376,7 @@ impl TermWindow {
                             TermWindowNotif::MuxOutputRefresh {
                                 mux_owner: output_mux.clone(),
                                 mux_window_id,
+                                status: Arc::clone(&output_status),
                                 invalidations: output_interest.take_invalidations(),
                                 interest: output_interest.take(),
                                 reconcile: pending_reconciliation.swap(false, Ordering::AcqRel),
@@ -7186,37 +7254,13 @@ impl TermWindow {
     }
 
     fn schedule_next_status_update(&mut self) {
-        if let Some(window) = self.window.as_ref() {
-            let now = Instant::now();
-            if self.last_status_call <= now {
-                // Zero disables periodic status updates. In particular, the
-                // recurring notification must not become a zero-delay loop.
-                if self.config.status_update_interval == 0 {
-                    return;
-                }
-                let interval = Duration::from_millis(self.config.status_update_interval);
-                let Some(target) = now.checked_add(interval) else {
-                    log::error!("status_update_interval exceeds the native timer range");
-                    return;
-                };
-                let window = window.clone();
-                match promise::spawn::try_reserve_main_thread(
-                    promise::spawn::MainThreadServiceClass::Render,
-                    4 * 1024,
-                ) {
-                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                        self.last_status_call = target;
-                        reservation
-                            .spawn_local(async move {
-                                sleep(target.saturating_duration_since(Instant::now())).await;
-                                window.notify(TermWindowNotif::EmitStatusUpdate);
-                            })
-                            .detach();
-                    }
-                    rejected => log::error!(
-                        "main-thread scheduler rejected status update timer; left it immediately eligible for retry: {rejected:?}"
-                    ),
-                }
+        if self.window.is_some()
+            && self
+                .pending_status_update
+                .arm(self.config.status_update_interval)
+        {
+            if let Some(retry) = self.window_event_retry.as_ref() {
+                let _ = retry.wake.try_send(());
             }
         }
     }
@@ -11165,6 +11209,7 @@ mod tests {
                     })
                 },
                 Some(super::WindowEventRetryDelivery {
+                    status: Arc::new(super::PendingStatusUpdate::default()),
                     pending: Arc::clone(&pending),
                     deliver: Box::new(move |(callback, completion)| {
                         let callback_receipt = callback.admission_receipt();
@@ -11450,6 +11495,109 @@ mod tests {
             pending.take_invalidations(),
             super::MuxOutputInvalidations::default()
         );
+    }
+
+    #[test]
+    fn periodic_status_survives_pressure_and_keeps_output_moving() {
+        if run_scheduler_test_in_child("periodic_status_survives_pressure_and_keeps_output_moving")
+        {
+            return;
+        }
+        use promise::spawn::{
+            MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass,
+            SimpleExecutor, try_reserve_main_thread,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap())
+                .unwrap();
+        let reserve = || match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected free scheduler: {other:?}"),
+        };
+        let initial = reserve();
+        let identity = initial.admission_receipt();
+        drop(initial);
+        let status = Arc::new(super::PendingStatusUpdate::default());
+        assert!(status.arm(60_000));
+        let output_count = Arc::new(AtomicUsize::new(0));
+        let status_count = Arc::new(AtomicUsize::new(0));
+        let (wake, receive) = flume::bounded(1);
+        let (attempted, attempts) = flume::bounded(32);
+        let worker_status = Arc::clone(&status);
+        let worker_output = Arc::clone(&output_count);
+        let worker_count = Arc::clone(&status_count);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(
+                receive,
+                identity,
+                || {
+                    let _ = attempted.try_send(());
+                    true
+                },
+                |reservation| {
+                    let status = Arc::clone(&worker_status);
+                    let output = Arc::clone(&worker_output);
+                    let count = Arc::clone(&worker_count);
+                    reservation.spawn(async move {
+                        output.fetch_add(1, Ordering::AcqRel);
+                        if status.take_due(&status, &status) {
+                            let prior = count.fetch_add(1, Ordering::AcqRel);
+                            // Same rearm policy as handle_status_update. Stop
+                            // after the second period to make duplicates visible.
+                            status.arm(if prior == 0 { 20 } else { 0 });
+                        }
+                    })
+                },
+                Some(super::WindowEventRetryDelivery {
+                    pending: Arc::new(AtomicBool::new(false)),
+                    status: Arc::clone(&worker_status),
+                    deliver: Box::new(|_| panic!("no Lua retry requested")),
+                }),
+                None,
+            ));
+        });
+        let tick_until = |ready: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready() {
+                assert!(Instant::now() < deadline, "status coordinator stalled");
+                let _ = exec.try_tick().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wake.send(()).unwrap();
+        tick_until(&|| output_count.load(Ordering::Acquire) == 1);
+        tick_until(&|| exec.admission_snapshot().active_tasks == 0);
+        assert_eq!(status_count.load(Ordering::Acquire), 0);
+        // A future status deadline did not delay the output refresh.
+        let occupying = reserve();
+        assert!(status.arm(0));
+        assert!(status.arm(1));
+        wake.send(()).unwrap();
+        // Drain old attempt receipts, then observe two retries while the only
+        // real scheduler slot is occupied and the deadline has expired.
+        while attempts.try_recv().is_ok() {}
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(status_count.load(Ordering::Acquire), 0);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        drop(occupying);
+        // No wake is sent after release, nor for the successor period.
+        tick_until(&|| status_count.load(Ordering::Acquire) == 2);
+        tick_until(&|| exec.admission_snapshot().active_tasks == 0);
+        assert!(status.deadline().is_none());
+        drop(wake);
+        worker.join().unwrap();
+        assert_eq!(status_count.load(Ordering::Acquire), 2);
+
+        let replacement = Arc::new(super::PendingStatusUpdate::default());
+        status.request();
+        assert!(!status.take_due(&status, &replacement));
+        assert!(status.take_due(&status, &status));
+        assert!(!status.take_due(&status, &status));
+        assert!(!replacement.arm(0));
+        assert!(replacement.deadline().is_none());
     }
 
     #[test]
