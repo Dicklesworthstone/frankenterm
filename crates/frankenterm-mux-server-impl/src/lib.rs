@@ -12066,12 +12066,12 @@ mod tests {
                 0 => {
                     // Keep framing and byte count; invalidate exact ciphertext.
                     let at = copy.encrypted_record.len() - 5;
-                    let replacement = if &copy.encrypted_record[at..at + 1] == "A" {
+                    let replacement = if &copy.encrypted_record[at..=at] == "A" {
                         "B"
                     } else {
                         "A"
                     };
-                    copy.encrypted_record.replace_range(at..at + 1, replacement);
+                    copy.encrypted_record.replace_range(at..=at, replacement);
                 }
                 1 => copy.encrypted_record_sha256 = hex::encode([0x55; 32]),
                 2 => copy.target_chain_tail_sha256 = Some(hex::encode([0x55; 32])),
