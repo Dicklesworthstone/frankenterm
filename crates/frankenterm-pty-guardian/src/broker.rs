@@ -32948,7 +32948,7 @@ mod tests {
             secret_lease_generation: 1,
         };
         let encoded = binding.encode();
-        let inspect = |bytes: &[u8], context| {
+        let inspect = |bytes: &[u8], context: &GuardianSpawnCustodyContextV1| {
             inspect_historical_genesis_binding(
                 &catalog,
                 &token,
