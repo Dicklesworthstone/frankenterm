@@ -13321,6 +13321,11 @@ mod tests {
         use mux::domain::{Domain, LocalDomain};
         use std::ffi::OsStr;
 
+        // Registered parser actions require real alert-delivery admission.
+        // This test owns the scheduler until all of its panes have retired;
+        // a bare async runtime does not configure that event-delivery path.
+        let executor = promise::spawn::SimpleExecutor::new();
+
         struct OwnedPane {
             mux: Arc<mux::Mux>,
             pane: Arc<dyn mux::pane::Pane>,
@@ -13364,17 +13369,18 @@ mod tests {
             mux: Arc::clone(&mux),
             pane: tab.get_active_pane().unwrap(),
         };
-        let wait_title = |title: &str| {
+        let wait_title = |title: &str, phase: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
             while owned.pane.get_title() != title {
+                while executor.try_tick().expect("pump real PTY alerts") {}
                 assert!(
                     Instant::now() < deadline,
-                    "real PTY never reached title {title}"
+                    "real PTY never reached title {title} during {phase}"
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
         };
-        wait_title("A");
+        wait_title("A", "initial child output");
         let topology = mux.capture_topology_coherent(Default::default()).unwrap();
         assert_eq!(topology.pane_bindings.len(), 1);
         let directory = checkpoint_artifact_test_directory();
@@ -13408,7 +13414,7 @@ mod tests {
                         writeln!(writer, "{title}").unwrap();
                         writer.flush().unwrap();
                     }
-                    wait_title(title);
+                    wait_title(title, "post-ACK title mutation");
                 }
             },
         );
@@ -13453,7 +13459,7 @@ mod tests {
                 writeln!(writer, "hold").unwrap();
                 writer.flush().unwrap();
             }
-            wait_title("HOLD");
+            wait_title("HOLD", "partial OSC request");
             let mut polls = 0usize;
             let started = Instant::now();
             let delayed = mux.capture_pane_model_checkpoint(
@@ -13487,7 +13493,7 @@ mod tests {
                 let ack = delayed.expect("full timeout permits a delayed real parser ACK");
                 assert!(mux.model_checkpoint_is_current(owned.pane.pane_id(), &ack));
             }
-            wait_title("A");
+            wait_title("A", "partial OSC completion");
         }
         // Reuse the same real pane and authority after both failures; neither
         // cancellation nor rejected ACK may poison or latch the next attempt.

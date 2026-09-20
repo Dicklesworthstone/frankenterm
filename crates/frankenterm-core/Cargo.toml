@@ -198,6 +198,9 @@ xattr.workspace = true
 [target.'cfg(unix)'.dev-dependencies]
 # Diagnostic examples correlate their phases with same-host perf samples.
 rustix = { workspace = true, features = ["time"] }
+# Real LocalPane parser tests must own the same admitted event scheduler as
+# the headless mux, rather than relying on another test to configure one.
+promise.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
