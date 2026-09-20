@@ -11268,10 +11268,40 @@ mod tests {
                 stream
                     .write_all(&encode_guardian_response(&secret, &response).expect("Claim frame"))
                     .expect("send Claim");
+                // A deduplicated Claim receipt proves the historical effect,
+                // not that its lease is still live. Cleanup must authenticate
+                // Attach against the same ledger before it can retire a writer.
+                let attach =
+                    decode_guardian_request(&secret, &receive(&mut stream)).expect("Attach");
+                assert_eq!(attach.header().operation, GuardianOperation::Attach);
+                assert_eq!(attach.header().pane_id, Some(lease_identity.pane_id()));
+                assert_eq!(
+                    attach.header().mux_incarnation,
+                    lease_identity.mux_incarnation()
+                );
+                assert_eq!(attach.header().lease_generation, 1);
+                let reply = protocol
+                    .apply_observation(&attach)
+                    .expect("authenticate current claimed lease");
+                let GuardianReply::Attached { next_sequence, .. } = &reply else {
+                    panic!("canonical Attach must return the current mutation sequence");
+                };
+                let next_sequence = *next_sequence;
+                let response =
+                    GuardianResponseEnvelope::reply(&attach, &reply).expect("Attach reply");
+                stream
+                    .write_all(&encode_guardian_response(&secret, &response).expect("Attach frame"))
+                    .expect("send Attach");
                 let retire =
                     decode_guardian_request(&secret, &receive(&mut stream)).expect("Retire");
                 assert_eq!(retire.header().operation, GuardianOperation::RetireLease);
                 assert_eq!(retire.header().lease_generation, 1);
+                assert_eq!(retire.header().pane_id, Some(lease_identity.pane_id()));
+                assert_eq!(
+                    retire.header().mux_incarnation,
+                    lease_identity.mux_incarnation()
+                );
+                assert_eq!(retire.header().lease_sequence, next_sequence);
                 let reply = protocol
                     .apply_effect_transactionally(&retire, |_| GuardianEffectOutcome::<()>::Applied)
                     .expect("canonical retirement");
