@@ -10162,7 +10162,14 @@ mod tests {
         LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS.with(|count| count.set(0));
         LIVE_SCROLLBACK_CONTENT_GROUPS.with(|count| count.set(0));
         LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|count| count.set(0));
+        let batches = LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get);
         deferred.flush_scrollback().unwrap();
+        assert_eq!(authority_record_reads(), 0);
+        assert_eq!(
+            LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get),
+            batches + 1,
+            "the complete durable target is checked in one bounded batch"
+        );
         assert_eq!(
             LIVE_SCROLLBACK_WAL_PUBLICATIONS.with(|count| count.get()),
             1
@@ -10192,11 +10199,6 @@ mod tests {
             expected.cells_mut();
             assert_eq!(actual, expected);
         }
-        let reads = LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|count| count.get());
-        assert!(
-            reads >= lines.len() as u64,
-            "actual target rows must be checked against durable storage"
-        );
     }
 
     #[test]
