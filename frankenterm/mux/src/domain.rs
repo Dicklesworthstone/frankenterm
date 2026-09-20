@@ -1872,9 +1872,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovered_local_spawn_policy_controls_actual_command() -> anyhow::Result<()> {
+        let retained_cwd = std::env::current_dir()?;
+        // Native command preparation deliberately discards unreadable paths.
+        // Exercise restored policy with a directory that can actually be used.
+        retained_cwd.read_dir()?;
         let policy = LocalDomainRecoveryPolicy {
             default_prog: Some(vec!["/bin/sh".into(), "-l".into()]),
-            default_cwd: Some("/retained-cwd".into()),
+            default_cwd: Some(retained_cwd.clone()),
             environment: [("FT_RECOVERED_POLICY".into(), "retained".into())].into(),
             term: "retained-terminal".into(),
         };
@@ -1888,7 +1892,7 @@ mod tests {
         );
         assert_eq!(
             command.get_cwd().map(OsString::as_os_str),
-            Some(std::ffi::OsStr::new("/retained-cwd"))
+            Some(retained_cwd.as_os_str())
         );
         assert_eq!(
             command.get_env("FT_RECOVERED_POLICY"),

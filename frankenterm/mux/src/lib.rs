@@ -38168,12 +38168,18 @@ mod tests {
             ));
         }
         let no_default = Arc::new(Mux::new(None));
+        let captured = no_default
+            .capture_topology_coherent(MuxTopologyCaptureConfig::default())
+            .unwrap();
+        assert!(captured.domains.is_empty());
+        assert_eq!(captured.default_domain_id, None);
+        // Registration installs the first domain as the default atomically.
         no_default.add_domain(&first).unwrap();
         let captured = no_default
             .capture_topology_coherent(MuxTopologyCaptureConfig::default())
             .unwrap();
         assert_eq!(captured.domains.len(), 1);
-        assert_eq!(captured.default_domain_id, None);
+        assert_eq!(captured.default_domain_id, Some(first.domain_id()));
     }
 
     #[test]
