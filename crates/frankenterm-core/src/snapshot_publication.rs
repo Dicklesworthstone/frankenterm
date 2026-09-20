@@ -1190,6 +1190,8 @@ impl SnapshotPublicationStore {
                     } else {
                         return Err(PublicationError::StoreQuotaPolicy);
                     };
+                    #[cfg(not(unix))]
+                    let _ = pinned;
                     #[cfg(unix)]
                     {
                         let actual = pinned
