@@ -6746,6 +6746,278 @@ impl std::fmt::Debug for ValidatedWholeMuxRecovery {
     }
 }
 
+/// Authenticated source retained together with private topology construction.
+/// This value has no live mux, reader activation, or publication capability.
+/// Guardian lease/replay reconciliation is still required before registration.
+#[cfg(feature = "frankenterm-deps")]
+pub struct PreparedWholeMuxTopology {
+    source: ValidatedWholeMuxRecovery,
+    topology: mux::domain::UnpublishedRecoveredTopology,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl PreparedWholeMuxTopology {
+    pub fn source(&self) -> &ValidatedWholeMuxRecovery {
+        &self.source
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.topology.counts()
+    }
+}
+
+/// Prepare exact persisted topology while retaining every pane's unpublished
+/// rollback ownership. Failure cannot register panes or start their readers.
+#[cfg(feature = "frankenterm-deps")]
+pub fn prepare_unpublished_whole_mux_topology(
+    source: ValidatedWholeMuxRecovery,
+    panes: Vec<mux::domain::UnpublishedPane>,
+) -> anyhow::Result<PreparedWholeMuxTopology> {
+    use crate::mux_recovery_image::{
+        RecoveryGeometryOrigin, RecoveryGuiDimension, RecoverySplitNode,
+    };
+    use mux::tab::{
+        MuxCapturedFloatingPane, MuxCapturedPaneStack, MuxCapturedTab, PaneEntry, PaneNode,
+        TabStackEntry, TabStackId,
+    };
+    fn size(value: crate::mux_recovery_image::TerminalSize) -> frankenterm_term::TerminalSize {
+        frankenterm_term::TerminalSize {
+            rows: value.rows,
+            cols: value.cols,
+            pixel_width: value.pixel_width,
+            pixel_height: value.pixel_height,
+            dpi: value.dpi,
+        }
+    }
+    fn dimension(value: RecoveryGuiDimension) -> config::Dimension {
+        match value {
+            RecoveryGuiDimension::Points(bits) => config::Dimension::Points(f32::from_bits(bits)),
+            RecoveryGuiDimension::Pixels(bits) => config::Dimension::Pixels(f32::from_bits(bits)),
+            RecoveryGuiDimension::Percent(bits) => config::Dimension::Percent(f32::from_bits(bits)),
+            RecoveryGuiDimension::Cells(bits) => config::Dimension::Cells(f32::from_bits(bits)),
+        }
+    }
+    fn tree(
+        node: &RecoverySplitNode,
+        tab: &crate::mux_recovery_image::RecoveryTab,
+        window: &crate::mux_recovery_image::RecoveryWindow,
+        pane_metadata: &HashMap<usize, &RecoveryPane>,
+        top: usize,
+        left: usize,
+    ) -> anyhow::Result<PaneNode> {
+        Ok(match node {
+            RecoverySplitNode::Leaf { pane_id, pane_uuid } => {
+                let pane = pane_metadata
+                    .get(pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("missing recovered leaf metadata"))?;
+                anyhow::ensure!(
+                    &pane.pane_uuid == pane_uuid,
+                    "recovered leaf durable identity mismatch"
+                );
+                PaneNode::Leaf(PaneEntry {
+                    window_id: window.window_id,
+                    tab_id: tab.tab_id,
+                    pane_id: *pane_id,
+                    title: pane.title.clone(),
+                    size: size(pane.size),
+                    working_dir: pane.cwd.clone().map(TryInto::try_into).transpose()?,
+                    alt_screen_active: pane.alt_screen_active,
+                    is_active_pane: tab.active_pane_id == *pane_id,
+                    is_zoomed_pane: tab.zoomed_pane_id == Some(*pane_id),
+                    workspace: window.workspace.clone(),
+                    // These fields are not used to construct a tab. Actual
+                    // terminal coordinates remain owned by its checkpoint;
+                    // this structural carrier must never become a render reply.
+                    cursor_pos: mux::renderable::StableCursorPosition::default(),
+                    physical_top: 0,
+                    top_row: top,
+                    left_col: left,
+                    tty_name: None,
+                })
+            }
+            RecoverySplitNode::Split {
+                split,
+                left: first,
+                right: second,
+            } => {
+                let direction = match split.direction {
+                    crate::mux_recovery_image::SplitDirection::Horizontal => {
+                        mux::tab::SplitDirection::Horizontal
+                    }
+                    crate::mux_recovery_image::SplitDirection::Vertical => {
+                        mux::tab::SplitDirection::Vertical
+                    }
+                };
+                let (next_top, next_left) = match split.direction {
+                    crate::mux_recovery_image::SplitDirection::Horizontal => (
+                        top,
+                        left.checked_add(split.first.cols)
+                            .and_then(|v| v.checked_add(1))
+                            .ok_or_else(|| anyhow::anyhow!("recovered column overflow"))?,
+                    ),
+                    crate::mux_recovery_image::SplitDirection::Vertical => (
+                        top.checked_add(split.first.rows)
+                            .and_then(|v| v.checked_add(1))
+                            .ok_or_else(|| anyhow::anyhow!("recovered row overflow"))?,
+                        left,
+                    ),
+                };
+                PaneNode::Split {
+                    left: Box::new(tree(first, tab, window, pane_metadata, top, left)?),
+                    right: Box::new(tree(
+                        second,
+                        tab,
+                        window,
+                        pane_metadata,
+                        next_top,
+                        next_left,
+                    )?),
+                    node: mux::tab::SplitDirectionAndSize {
+                        direction,
+                        first: size(split.first),
+                        second: size(split.second),
+                    },
+                }
+            }
+        })
+    }
+    let image = source.image();
+    image.require_live_workspace_state()?;
+    let pane_metadata: HashMap<_, _> = image
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id, pane))
+        .collect();
+    let domains: HashMap<_, _> = image
+        .topology
+        .domains
+        .iter()
+        .map(|domain| (domain.domain_name.as_str(), domain.incarnation_domain_id))
+        .collect();
+    let mut expected_panes = HashMap::new();
+    for pane in &image.panes {
+        let domain = *domains
+            .get(pane.domain_name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing recovered pane domain"))?;
+        expected_panes.insert(
+            pane.pane_id,
+            (*uuid::Uuid::parse_str(&pane.pane_uuid)?.as_bytes(), domain),
+        );
+    }
+    let mut captured_windows = Vec::new();
+    let mut captured_tabs = Vec::new();
+    for window in &image.topology.windows {
+        let mut structural_pane_count = 0usize;
+        for tab in &window.tabs {
+            structural_pane_count = structural_pane_count
+                .checked_add(tab.all_pane_ids().len())
+                .ok_or_else(|| anyhow::anyhow!("recovered pane count overflow"))?;
+            captured_tabs.push(MuxCapturedTab {
+                tab_id: tab.tab_id,
+                durable_tab_id: uuid::Uuid::parse_str(&tab.stable_tab_id)?,
+                window_id: window.window_id,
+                title: tab.title.clone(),
+                size: size(tab.size),
+                size_before_zoom: size(tab.size_before_zoom),
+                active_pane_id: Some(tab.active_pane_id),
+                zoomed_pane_id: tab.zoomed_pane_id,
+                split_tree: tab
+                    .root_split
+                    .as_ref()
+                    .map(|node| tree(node, tab, window, &pane_metadata, 0, 0))
+                    .transpose()?
+                    .unwrap_or(PaneNode::Empty),
+                floating_panes: tab
+                    .floating_panes
+                    .iter()
+                    .map(|pane| MuxCapturedFloatingPane {
+                        pane_id: pane.pane_id,
+                        rect: mux::tab::FloatingPaneRect {
+                            left: pane.rect.left,
+                            top: pane.rect.top,
+                            width: pane.rect.width,
+                            height: pane.rect.height,
+                        },
+                        z_order: pane.z_order,
+                        visible: pane.visible,
+                        pinned: pane.pinned,
+                        opacity: pane.opacity(),
+                        is_focused: tab.floating_focus == Some(pane.pane_id),
+                    })
+                    .collect(),
+                floating_focus: tab.floating_focus,
+                pane_stacks: tab
+                    .pane_stacks
+                    .iter()
+                    .map(|stack| MuxCapturedPaneStack {
+                        slot_index: stack.slot_index,
+                        pane_ids: stack.pane_ids.clone(),
+                        active_index: stack.active_index,
+                    })
+                    .collect(),
+                underlying_tiled_active_pane_id: tab.underlying_tiled_active_pane_id,
+            });
+        }
+        captured_windows.push(mux::MuxCapturedWindow {
+            window_id: window.window_id,
+            durable_window_id: uuid::Uuid::parse_str(&window.stable_window_id)?,
+            workspace: window.workspace.clone(),
+            title: window.title.clone(),
+            order_revision: mux::window::WindowOrderRevision::new(window.order_revision),
+            ordered_tab_ids: window.tabs.iter().map(|tab| tab.tab_id).collect(),
+            active_tab_id: window
+                .tabs
+                .get(window.active_tab_index)
+                .map(|tab| tab.tab_id),
+            active_tab_index: (!window.tabs.is_empty()).then_some(window.active_tab_index),
+            last_active_tab_id: window.last_active_tab_id,
+            tab_stacks: window
+                .tab_stacks
+                .iter()
+                .flat_map(|stack| {
+                    stack
+                        .tab_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(position, tab_id)| TabStackEntry {
+                            stack_id: TabStackId(stack.stack_id),
+                            tab_id: *tab_id,
+                            position,
+                            is_visible: *tab_id == stack.visible_tab_id,
+                        })
+                })
+                .collect(),
+            position: window
+                .gui_position
+                .as_ref()
+                .map(|position| config::GuiPosition {
+                    x: dimension(position.x),
+                    y: dimension(position.y),
+                    origin: match &position.origin {
+                        RecoveryGeometryOrigin::ScreenCoordinateSystem => {
+                            config::GeometryOrigin::ScreenCoordinateSystem
+                        }
+                        RecoveryGeometryOrigin::MainScreen => config::GeometryOrigin::MainScreen,
+                        RecoveryGeometryOrigin::ActiveScreen => {
+                            config::GeometryOrigin::ActiveScreen
+                        }
+                        RecoveryGeometryOrigin::Named(name) => {
+                            config::GeometryOrigin::Named(name.clone())
+                        }
+                    },
+                }),
+            structural_pane_count,
+        });
+    }
+    let topology = mux::domain::UnpublishedRecoveredTopology::prepare(
+        captured_windows,
+        captured_tabs,
+        &expected_panes,
+        panes,
+    )?;
+    Ok(PreparedWholeMuxTopology { source, topology })
+}
+
 /// Trusted expected identity configuration for whole-mux recovery verification.
 ///
 /// Ensures the root recovery manifest cannot self-assert arbitrary identity or
@@ -13793,6 +14065,36 @@ mod tests {
         Arc::new(RecoveryKey::from_bytes([0x51; 32]).expect("test recovery key"))
     }
 
+    fn recovery_test_workspace_state(
+        windows: &[(&str, usize)],
+    ) -> Option<crate::mux_recovery_image::RecoveryWorkspaceState> {
+        use crate::mux_recovery_image::{RecoveryWorkspace, RecoveryWorkspaceState};
+        let mut workspaces = vec![RecoveryWorkspace {
+            name: "default".to_string(),
+            window_ids: Vec::new(),
+            active_window_id: None,
+        }];
+        for (name, id) in windows {
+            if let Some(workspace) = workspaces
+                .iter_mut()
+                .find(|workspace| workspace.name == *name)
+            {
+                workspace.window_ids.push(*id);
+                workspace.active_window_id.get_or_insert(*id);
+            } else {
+                workspaces.push(RecoveryWorkspace {
+                    name: (*name).to_string(),
+                    window_ids: vec![*id],
+                    active_window_id: Some(*id),
+                });
+            }
+        }
+        Some(RecoveryWorkspaceState {
+            default_workspace: "default".to_string(),
+            workspaces,
+        })
+    }
+
     fn whole_mux_test_verifier() -> WholeMuxRecoveryVerifier {
         WholeMuxRecoveryVerifier::new_production(
             whole_mux_test_key(),
@@ -14015,6 +14317,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -14287,6 +14590,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -14452,6 +14756,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image1 = MuxRecoveryImage {
@@ -14561,6 +14866,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image2 = MuxRecoveryImage {
@@ -14625,6 +14931,7 @@ mod tests {
             windows: vec![],
             focused_window_id: None,
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[]),
         };
 
         let image = MuxRecoveryImage {
@@ -14675,6 +14982,7 @@ mod tests {
                 windows: vec![],
                 focused_window_id: None,
                 client_workspace: None,
+                workspace_state: recovery_test_workspace_state(&[]),
             },
             panes: vec![],
             image_digest: [0u8; 32],
@@ -14797,6 +15105,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -14941,6 +15250,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -14992,6 +15302,7 @@ mod tests {
             windows: vec![],
             focused_window_id: None,
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -15138,6 +15449,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -15370,6 +15682,10 @@ mod tests {
             ],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[
+                ("workspace-1", 1),
+                ("workspace-2", 2),
+            ]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -15559,6 +15875,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -15800,6 +16117,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -15968,6 +16286,7 @@ mod tests {
                 windows: vec![],
                 focused_window_id: None,
                 client_workspace: None,
+                workspace_state: recovery_test_workspace_state(&[]),
             },
             panes: vec![],
             image_digest: [0x11u8; 32],
@@ -16100,6 +16419,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {
@@ -16241,6 +16561,7 @@ mod tests {
             }],
             focused_window_id: Some(1),
             client_workspace: None,
+            workspace_state: recovery_test_workspace_state(&[("default", 1)]),
         };
 
         let mut image = MuxRecoveryImage {

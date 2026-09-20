@@ -4778,6 +4778,192 @@ fn min_floating_pane_height() -> usize {
 }
 
 impl Tab {
+    /// Build an ownerless recovery tab without invoking pane callbacks, resizing
+    /// terminals, registering panes, or reserving process-global numeric IDs.
+    /// The unpublished topology owner must retain all pane rollback custody.
+    pub(crate) fn from_recovery_capture(
+        captured: &MuxCapturedTab,
+        panes: &HashMap<PaneId, Arc<dyn Pane>>,
+    ) -> anyhow::Result<Self> {
+        let mut pending = vec![(&captured.split_tree, 1usize)];
+        let mut nodes = 0usize;
+        while let Some((node, depth)) = pending.pop() {
+            nodes = nodes
+                .checked_add(1)
+                .context("recovered tree size overflow")?;
+            anyhow::ensure!(
+                depth <= 64 && nodes <= 8191,
+                "recovered tree exceeds construction bounds"
+            );
+            if let PaneNode::Split { left, right, .. } = node {
+                pending.push((left, depth + 1));
+                pending.push((right, depth + 1));
+            }
+        }
+        anyhow::ensure!(
+            !captured.durable_tab_id.is_nil(),
+            "nil recovered tab identity"
+        );
+        anyhow::ensure!(
+            captured.tab_id != usize::MAX
+                && captured
+                    .split_tree
+                    .all_window_and_tab_ids_match((captured.window_id, captured.tab_id))
+                    != Some(false),
+            "invalid recovered tab identity"
+        );
+        let mut tiled_ids = Vec::new();
+        let mut members = HashSet::new();
+        let mut active = None;
+        let mut zoomed = None;
+        let mut underlying = None;
+        let tree = build_from_pane_tree_with_underlying(
+            captured.split_tree.clone().into_tree(),
+            &mut active,
+            &mut zoomed,
+            captured.underlying_tiled_active_pane_id,
+            &mut underlying,
+            &mut |entry| {
+                anyhow::ensure!(
+                    members.insert(entry.pane_id),
+                    "duplicate recovered tiled pane"
+                );
+                tiled_ids.push(entry.pane_id);
+                panes
+                    .get(&entry.pane_id)
+                    .cloned()
+                    .context("missing recovered tiled pane")
+            },
+        )?;
+        let mut floating_panes = Vec::new();
+        for floating in &captured.floating_panes {
+            anyhow::ensure!(
+                members.insert(floating.pane_id),
+                "duplicate recovered floating pane"
+            );
+            anyhow::ensure!(
+                floating.opacity.is_finite()
+                    && (0.0..=1.0).contains(&floating.opacity)
+                    && floating.is_focused == (captured.floating_focus == Some(floating.pane_id)),
+                "invalid recovered floating state"
+            );
+            floating_panes.push(FloatingPane {
+                pane: panes
+                    .get(&floating.pane_id)
+                    .cloned()
+                    .context("missing recovered floating pane")?,
+                pane_id: floating.pane_id,
+                rect: floating.rect,
+                z_order: floating.z_order,
+                visible: floating.visible,
+                pinned: floating.pinned,
+                opacity: floating.opacity,
+            });
+        }
+        let mut pane_stacks = HashMap::new();
+        for stack in &captured.pane_stacks {
+            let visible = stack
+                .pane_ids
+                .get(stack.active_index)
+                .context("invalid recovered pane stack focus")?;
+            anyhow::ensure!(
+                tiled_ids.get(stack.slot_index) == Some(visible),
+                "recovered pane stack slot mismatch"
+            );
+            let mut stack_members = HashSet::new();
+            let mut resolved = Vec::new();
+            for id in &stack.pane_ids {
+                anyhow::ensure!(
+                    stack_members.insert(*id),
+                    "duplicate recovered stack member"
+                );
+                if id != visible {
+                    anyhow::ensure!(
+                        members.insert(*id),
+                        "recovered stack member has another placement"
+                    );
+                }
+                resolved.push(
+                    panes
+                        .get(id)
+                        .cloned()
+                        .context("missing recovered stack pane")?,
+                );
+            }
+            let mut restored = PaneStack::new(resolved);
+            anyhow::ensure!(
+                restored.select(stack.active_index),
+                "invalid recovered stack selection"
+            );
+            anyhow::ensure!(
+                pane_stacks.insert(stack.slot_index, restored).is_none(),
+                "duplicate recovered pane stack slot"
+            );
+        }
+        let tiled_active = captured
+            .underlying_tiled_active_pane_id
+            .or_else(|| captured.active_pane_id.filter(|id| tiled_ids.contains(id)));
+        let active_index = match tiled_active {
+            Some(id) => tiled_ids
+                .iter()
+                .position(|candidate| *candidate == id)
+                .context("missing underlying recovered active pane")?,
+            None if tiled_ids.is_empty() => 0,
+            None => anyhow::bail!("missing underlying recovered tiled focus"),
+        };
+        if let Some(id) = captured.floating_focus {
+            anyhow::ensure!(
+                floating_panes
+                    .iter()
+                    .any(|pane| pane.pane_id == id && pane.visible),
+                "invalid recovered floating focus"
+            );
+        }
+        let effective_active = captured
+            .zoomed_pane_id
+            .or(captured.floating_focus)
+            .or(tiled_active);
+        anyhow::ensure!(
+            effective_active == captured.active_pane_id,
+            "inconsistent recovered active pane"
+        );
+        let zoomed = captured
+            .zoomed_pane_id
+            .map(|id| {
+                anyhow::ensure!(members.contains(&id), "recovered zoomed pane is not placed");
+                panes
+                    .get(&id)
+                    .cloned()
+                    .context("missing recovered zoomed pane")
+            })
+            .transpose()?;
+        Ok(Self {
+            tab_id: captured.tab_id,
+            durable_id: captured.durable_tab_id,
+            mux_owner_generation: AtomicU64::new(0),
+            inner: Mutex::new(TabInner {
+                id: captured.tab_id,
+                mux_owner: Weak::new(),
+                mux_owner_bound: false,
+                mux_owner_active: false,
+                mux_owner_generation: 0,
+                pane: Some(tree),
+                floating_panes,
+                floating_focus: captured.floating_focus,
+                size: captured.size,
+                size_before_zoom: captured.size_before_zoom,
+                active: active_index,
+                zoomed,
+                title: Arc::from(captured.title.as_str()),
+                recency: Recency::default(),
+                collapsed_panes: HashSet::new(),
+                layout_cycle: Some(crate::layout::default_cycle()),
+                pane_stacks,
+                constraint_overrides: HashMap::new(),
+            }),
+        })
+    }
+
     pub fn new(size: &TerminalSize) -> Self {
         let inner = TabInner::new(size);
         let tab_id = inner.id;
@@ -7358,7 +7544,7 @@ impl Tab {
         self.inner.lock().get_pane_direction(direction, ignore_zoom)
     }
 
-    fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
+    pub(crate) fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
         self.inner.lock().snapshot_panes_callback_free()
     }
 
@@ -23821,6 +24007,69 @@ mod test {
             .capture_tab_topology(42, "test-workspace")
             .expect("capture tab topology");
         (tab, captured)
+    }
+
+    #[test]
+    fn recovery_constructor_preserves_floating_stack_zoom_and_underlying_focus_without_callbacks() {
+        let (source, _) = make_test_captured_tab();
+        let existing: HashMap<_, _> = source
+            .snapshot_panes_callback_free()
+            .into_iter()
+            .map(|pane| (pane.pane_id(), pane))
+            .collect();
+        {
+            let mut inner = source.inner.lock();
+            let hidden = FakePane::new(55, inner.size);
+            let mut stack = PaneStack::new(vec![hidden, Arc::clone(&existing[&10])]);
+            assert!(stack.select(1));
+            inner.pane_stacks.insert(0, stack);
+            inner.floating_panes[0].pinned = true;
+            inner.floating_panes[0].opacity = 0.375;
+            inner.size_before_zoom.pixel_width = 799;
+        }
+        for zoomed in [false, true] {
+            source.inner.lock().zoomed = zoomed.then(|| Arc::clone(&existing[&20]));
+            let captured = source.capture_tab_topology(42, "test-workspace").unwrap();
+            let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut panes = HashMap::new();
+            for pane in source.snapshot_panes_callback_free() {
+                let dimensions = pane.get_dimensions();
+                let counter = Arc::clone(&callbacks);
+                panes.insert(
+                    pane.pane_id(),
+                    FakePane::new_with_callback_probe(
+                        pane.pane_id(),
+                        TerminalSize {
+                            rows: dimensions.viewport_rows,
+                            cols: dimensions.cols,
+                            pixel_width: dimensions.pixel_width,
+                            pixel_height: dimensions.pixel_height,
+                            dpi: dimensions.dpi,
+                        },
+                        false,
+                        false,
+                        Arc::new(move || {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }),
+                    ),
+                );
+            }
+            let restored = Tab::from_recovery_capture(&captured, &panes).unwrap();
+            assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(restored.inner.lock().notification_owner().is_none());
+            assert_eq!(
+                restored.capture_tab_topology(42, "test-workspace").unwrap(),
+                captured
+            );
+            callbacks.store(0, std::sync::atomic::Ordering::SeqCst);
+            let mut invalid = captured.clone();
+            invalid
+                .floating_panes
+                .push(invalid.floating_panes[0].clone());
+            assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+            drop(restored);
+            assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

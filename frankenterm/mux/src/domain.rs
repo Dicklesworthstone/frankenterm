@@ -77,6 +77,155 @@ pub struct UnpublishedPane {
     guardian_publication: Option<Arc<AtomicBool>>,
 }
 
+/// Private restored topology and its still-armed pane rollback custody.
+///
+/// This is construction only, not a live registration capability. In particular
+/// no reader is taken, no thread is started, no global IDs are reserved, and no
+/// callback or topology notification is delivered. Dropping a failed or unused
+/// preparation retains the normal guardian lease-only rollback behavior.
+pub struct UnpublishedRecoveredTopology {
+    // Drop topology references before the last pane custody references.
+    windows: Vec<crate::window::Window>,
+    tabs: HashMap<crate::tab::TabId, Arc<Tab>>,
+    panes: Vec<UnpublishedPane>,
+    captured_windows: Vec<crate::MuxCapturedWindow>,
+    captured_tabs: Vec<crate::tab::MuxCapturedTab>,
+}
+
+impl UnpublishedRecoveredTopology {
+    /// Assemble already-authenticated metadata without granting its caller
+    /// publication authority. The core recovery adapter retains the typed root
+    /// verification alongside this value; these DTOs alone are not that proof.
+    pub fn prepare(
+        captured_windows: Vec<crate::MuxCapturedWindow>,
+        captured_tabs: Vec<crate::tab::MuxCapturedTab>,
+        expected_panes: &HashMap<PaneId, ([u8; 16], DomainId)>,
+        panes: Vec<UnpublishedPane>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            panes.len() <= 4096 && captured_windows.len() <= 4096 && captured_tabs.len() <= 4096,
+            "recovered topology exceeds construction bounds"
+        );
+        anyhow::ensure!(
+            panes.len() == expected_panes.len(),
+            "recovered pane custody count mismatch"
+        );
+        let mut pane_map = HashMap::new();
+        for owned in &panes {
+            let pane = owned.pane();
+            let id = pane.pane_id();
+            let expected = expected_panes
+                .get(&id)
+                .context("unexpected recovered pane custody")?;
+            anyhow::ensure!(
+                pane.durable_pane_id() == Some(expected.0) && pane.domain_id() == expected.1,
+                "recovered pane custody identity mismatch"
+            );
+            anyhow::ensure!(
+                pane.mux_registration_slot().load().is_none(),
+                "recovered pane is already registered"
+            );
+            anyhow::ensure!(
+                pane_map.insert(id, Arc::clone(pane)).is_none(),
+                "duplicate recovered pane custody"
+            );
+        }
+        let mut tabs = HashMap::new();
+        let pane_ids: HashMap<_, _> = pane_map
+            .iter()
+            .map(|(id, pane)| (Arc::as_ptr(pane).cast::<()>(), *id))
+            .collect();
+        let mut durable_tabs = std::collections::HashSet::new();
+        let mut placed_panes = std::collections::HashSet::new();
+        for captured in &captured_tabs {
+            anyhow::ensure!(
+                durable_tabs.insert(captured.durable_tab_id),
+                "duplicate durable recovered tab"
+            );
+            let tab = Arc::new(Tab::from_recovery_capture(captured, &pane_map)?);
+            // The snapshot is callback-free and includes hidden stack members.
+            for pane in tab.snapshot_panes_callback_free() {
+                let id = *pane_ids
+                    .get(&Arc::as_ptr(&pane).cast::<()>())
+                    .context("unowned recovered tab pane")?;
+                anyhow::ensure!(
+                    placed_panes.insert(id),
+                    "recovered pane has multiple tab placements"
+                );
+            }
+            anyhow::ensure!(
+                tabs.insert(captured.tab_id, tab).is_none(),
+                "duplicate recovered tab"
+            );
+        }
+        anyhow::ensure!(
+            placed_panes.len() == pane_map.len(),
+            "unplaced recovered pane custody"
+        );
+        let mut windows = Vec::new();
+        let mut window_ids = std::collections::HashSet::new();
+        let mut durable_windows = std::collections::HashSet::new();
+        let mut placed_tabs = std::collections::HashSet::new();
+        for captured in &captured_windows {
+            anyhow::ensure!(
+                window_ids.insert(captured.window_id)
+                    && durable_windows.insert(captured.durable_window_id),
+                "duplicate recovered window"
+            );
+            let mut pane_count = 0usize;
+            for id in &captured.ordered_tab_ids {
+                anyhow::ensure!(
+                    placed_tabs.insert(*id),
+                    "recovered tab has multiple window placements"
+                );
+                let metadata = captured_tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == *id)
+                    .context("missing recovered tab metadata")?;
+                anyhow::ensure!(
+                    metadata.window_id == captured.window_id,
+                    "recovered tab parent mismatch"
+                );
+                pane_count = pane_count
+                    .checked_add(
+                        tabs.get(id)
+                            .context("missing recovered tab")?
+                            .snapshot_panes_callback_free()
+                            .len(),
+                    )
+                    .context("recovered pane count overflow")?;
+            }
+            anyhow::ensure!(
+                pane_count == captured.structural_pane_count,
+                "recovered structural pane count mismatch"
+            );
+            windows.push(crate::window::Window::from_recovery_capture(
+                captured, &tabs,
+            )?);
+        }
+        anyhow::ensure!(placed_tabs.len() == tabs.len(), "unplaced recovered tab");
+        Ok(Self {
+            windows,
+            tabs,
+            panes,
+            captured_windows,
+            captured_tabs,
+        })
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (self.windows.len(), self.tabs.len(), self.panes.len())
+    }
+
+    pub fn captured_windows(&self) -> &[crate::MuxCapturedWindow] {
+        &self.captured_windows
+    }
+
+    pub fn captured_tabs(&self) -> &[crate::tab::MuxCapturedTab] {
+        &self.captured_tabs
+    }
+}
+
 /// Read-only evidence that a particular guardian pane completed mux publication.
 /// The receipt remains true after the registered pane is removed.
 #[derive(Clone)]
@@ -1461,18 +1610,23 @@ mod tests {
 
     struct TestMasterPty {
         written: Arc<StdMutex<Vec<u8>>>,
+        reader_requests: Arc<AtomicUsize>,
+        resize_requests: Arc<AtomicUsize>,
     }
 
     impl TestMasterPty {
         fn new() -> Self {
             Self {
                 written: Arc::new(StdMutex::new(Vec::new())),
+                reader_requests: Arc::new(AtomicUsize::new(0)),
+                resize_requests: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
 
     impl MasterPty for TestMasterPty {
         fn resize(&self, _size: PtySize) -> Result<(), Error> {
+            self.resize_requests.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1481,6 +1635,7 @@ mod tests {
         }
 
         fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
+            self.reader_requests.fetch_add(1, Ordering::SeqCst);
             struct BlockingReader;
             impl Read for BlockingReader {
                 fn read(&mut self, _buf: &mut [u8]) -> IoResult<usize> {
@@ -1516,6 +1671,135 @@ mod tests {
     struct SlowSpawnSlavePty {
         delay: Duration,
         spawn_calls: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn unpublished_recovered_topology_retains_metadata_without_reader_or_resize_activation() {
+        use crate::tab::{MuxCapturedTab, PaneEntry, PaneNode};
+        use crate::window::WindowOrderRevision;
+        // Exercise the real LocalPane reader/resize endpoints with retained
+        // PTY probes, rather than an inert closure pretending to be a reader.
+        for invalid_revision in [false, true] {
+            let id = alloc_pane_id();
+            let durable = uuid::Uuid::new_v4();
+            let size = TerminalSize {
+                rows: 4,
+                cols: 12,
+                pixel_width: 120,
+                pixel_height: 40,
+                dpi: 96,
+            };
+            let master = TestMasterPty::new();
+            let reader_requests = Arc::clone(&master.reader_requests);
+            let resize_requests = Arc::clone(&master.resize_requests);
+            let written = Arc::clone(&master.written);
+            let config =
+                config::TermConfig::new_for_pane(id, 1, *durable.as_bytes(), String::new());
+            let terminal = frankenterm_term::Terminal::new(
+                size,
+                Arc::new(config),
+                "recovery-test",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
+                id,
+                terminal,
+                Box::new(TestChild::untracked()),
+                Box::new(master),
+                Box::new(BufferWriter {
+                    written: Arc::clone(&written),
+                }),
+                1,
+                *durable.as_bytes(),
+                String::new(),
+            ));
+            let registration = Arc::clone(pane.mux_registration_slot());
+            let tab_id = 71;
+            let window_id = 81;
+            let tab = MuxCapturedTab {
+                tab_id,
+                durable_tab_id: uuid::Uuid::new_v4(),
+                window_id,
+                title: "restored tab title".to_string(),
+                size,
+                size_before_zoom: size,
+                active_pane_id: Some(id),
+                zoomed_pane_id: None,
+                split_tree: PaneNode::Leaf(PaneEntry {
+                    window_id,
+                    tab_id,
+                    pane_id: id,
+                    title: pane.get_title(),
+                    size,
+                    working_dir: None,
+                    alt_screen_active: false,
+                    is_active_pane: true,
+                    is_zoomed_pane: false,
+                    workspace: "restored workspace".to_string(),
+                    cursor_pos: pane.get_cursor_position(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: None,
+                }),
+                floating_panes: Vec::new(),
+                floating_focus: None,
+                pane_stacks: Vec::new(),
+                underlying_tiled_active_pane_id: Some(id),
+            };
+            let window = crate::MuxCapturedWindow {
+                window_id,
+                durable_window_id: uuid::Uuid::new_v4(),
+                workspace: "restored workspace".to_string(),
+                title: "restored window title".to_string(),
+                order_revision: WindowOrderRevision::new(if invalid_revision {
+                    u64::MAX
+                } else {
+                    912
+                }),
+                ordered_tab_ids: vec![tab_id],
+                active_tab_id: Some(tab_id),
+                active_tab_index: Some(0),
+                last_active_tab_id: Some(tab_id),
+                tab_stacks: Vec::new(),
+                position: None,
+                structural_pane_count: 1,
+            };
+            let prepared = UnpublishedRecoveredTopology::prepare(
+                vec![window.clone()],
+                vec![tab.clone()],
+                &HashMap::from([(id, (*durable.as_bytes(), 1))]),
+                vec![UnpublishedPane::new(pane)],
+            );
+            if invalid_revision {
+                assert!(prepared.is_err());
+            } else {
+                let prepared = prepared.expect("valid private topology");
+                assert_eq!(prepared.counts(), (1, 1, 1));
+                let actual_window = &prepared.windows[0];
+                assert_eq!(actual_window.durable_id(), window.durable_window_id);
+                assert_eq!(actual_window.get_title(), window.title);
+                assert_eq!(actual_window.get_workspace(), window.workspace);
+                assert_eq!(
+                    actual_window.order_snapshot().unwrap().order_revision(),
+                    window.order_revision
+                );
+                let actual_tab = prepared
+                    .tabs
+                    .get(&tab_id)
+                    .unwrap()
+                    .capture_tab_topology(window_id, &window.workspace)
+                    .unwrap();
+                assert_eq!(actual_tab, tab);
+                assert!(registration.load().is_none());
+                drop(prepared);
+            }
+            assert_eq!(reader_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(resize_requests.load(Ordering::SeqCst), 0);
+            assert!(written.lock().unwrap().is_empty());
+            assert!(registration.load().is_none());
+        }
     }
 
     impl SlavePty for SlowSpawnSlavePty {

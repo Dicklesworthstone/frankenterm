@@ -259,6 +259,98 @@ pub struct Window {
 }
 
 impl Window {
+    /// Construct private recovery state. No notification, registration, global
+    /// ID allocation, or pane callback is performed by this constructor.
+    pub(crate) fn from_recovery_capture(
+        captured: &crate::MuxCapturedWindow,
+        tabs_by_id: &HashMap<TabId, Arc<Tab>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            captured.window_id != usize::MAX
+                && !captured.durable_window_id.is_nil()
+                && captured.order_revision.get() != u64::MAX,
+            "invalid recovered window identity or revision"
+        );
+        let mut seen = HashSet::new();
+        let mut tabs = Vec::new();
+        for id in &captured.ordered_tab_ids {
+            anyhow::ensure!(seen.insert(*id), "duplicate recovered window tab");
+            tabs.push(
+                tabs_by_id
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing recovered window tab"))?,
+            );
+        }
+        let active = match captured.active_tab_index {
+            Some(index) => {
+                anyhow::ensure!(
+                    captured.ordered_tab_ids.get(index).copied() == captured.active_tab_id
+                        && index < tabs.len(),
+                    "invalid recovered active tab"
+                );
+                index
+            }
+            None => {
+                anyhow::ensure!(
+                    tabs.is_empty() && captured.active_tab_id.is_none(),
+                    "missing recovered active tab"
+                );
+                0
+            }
+        };
+        anyhow::ensure!(
+            captured
+                .last_active_tab_id
+                .is_none_or(|id| seen.contains(&id)),
+            "missing recovered last-active tab"
+        );
+        let mut groups: HashMap<TabStackId, Vec<&TabStackEntry>> = HashMap::new();
+        for entry in &captured.tab_stacks {
+            anyhow::ensure!(
+                seen.contains(&entry.tab_id),
+                "recovered tab stack names absent tab"
+            );
+            groups.entry(entry.stack_id).or_default().push(entry);
+        }
+        let mut tab_stacks = TabStackState::default();
+        for (id, mut entries) in groups {
+            entries.sort_by_key(|entry| entry.position);
+            anyhow::ensure!(
+                entries
+                    .iter()
+                    .enumerate()
+                    .all(|(index, entry)| index == entry.position),
+                "invalid recovered tab stack order"
+            );
+            let visible: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_visible)
+                .map(|(index, _)| index)
+                .collect();
+            anyhow::ensure!(visible.len() == 1, "invalid recovered tab stack visibility");
+            tab_stacks
+                .create_stack(id, entries.iter().map(|entry| entry.tab_id).collect())
+                .map_err(|error| anyhow::anyhow!("invalid recovered tab stack: {error:?}"))?;
+            tab_stacks.cycle_visible(id, isize::try_from(visible[0])?);
+        }
+        Ok(Self {
+            id: captured.window_id,
+            durable_id: captured.durable_window_id,
+            owner: std::sync::Weak::new(),
+            tabs,
+            active,
+            order_revision: captured.order_revision,
+            last_active: captured.last_active_tab_id,
+            tab_stacks,
+            structural_pane_count: captured.structural_pane_count,
+            workspace: captured.workspace.clone(),
+            title: captured.title.clone(),
+            initial_position: captured.position.clone(),
+        })
+    }
+
     /// Construct an ownerless standalone window.
     ///
     /// Production mux windows are created through [`Mux::new_empty_window`],
@@ -1577,6 +1669,71 @@ mod tests {
     use frankenterm_term::TerminalSize;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::convert::TryFrom;
+
+    #[test]
+    fn recovery_window_constructor_preserves_order_history_and_stack_visibility() {
+        let first = Arc::new(Tab::new(&TerminalSize::default()));
+        let second = Arc::new(Tab::new(&TerminalSize::default()));
+        let tabs = HashMap::from([
+            (first.tab_id(), Arc::clone(&first)),
+            (second.tab_id(), Arc::clone(&second)),
+        ]);
+        let mut captured = crate::MuxCapturedWindow {
+            window_id: 987,
+            durable_window_id: uuid::Uuid::new_v4(),
+            workspace: "second workspace".to_string(),
+            title: "recovered Ω".to_string(),
+            order_revision: WindowOrderRevision::new(734),
+            ordered_tab_ids: vec![second.tab_id(), first.tab_id()],
+            active_tab_id: Some(first.tab_id()),
+            active_tab_index: Some(1),
+            last_active_tab_id: Some(second.tab_id()),
+            tab_stacks: vec![
+                TabStackEntry {
+                    stack_id: TabStackId(8),
+                    tab_id: first.tab_id(),
+                    position: 0,
+                    is_visible: false,
+                },
+                TabStackEntry {
+                    stack_id: TabStackId(8),
+                    tab_id: second.tab_id(),
+                    position: 1,
+                    is_visible: true,
+                },
+            ],
+            position: None,
+            structural_pane_count: 0,
+        };
+        let restored = Window::from_recovery_capture(&captured, &tabs).unwrap();
+        assert!(restored.owner.upgrade().is_none());
+        assert_eq!(restored.id, captured.window_id);
+        assert_eq!(restored.durable_id, captured.durable_window_id);
+        assert_eq!(restored.order_revision, captured.order_revision);
+        assert_eq!(
+            restored
+                .tabs
+                .iter()
+                .map(|tab| tab.tab_id())
+                .collect::<Vec<_>>(),
+            captured.ordered_tab_ids
+        );
+        assert_eq!(restored.active, 1);
+        assert_eq!(restored.last_active, Some(second.tab_id()));
+        assert_eq!(restored.tab_stacks.overview_entries(), captured.tab_stacks);
+        assert_eq!(restored.workspace, captured.workspace);
+        assert_eq!(restored.title, captured.title);
+        captured.tab_stacks.push(TabStackEntry {
+            stack_id: TabStackId(9),
+            tab_id: first.tab_id(),
+            position: 0,
+            is_visible: true,
+        });
+        assert!(
+            Window::from_recovery_capture(&captured, &tabs).is_err(),
+            "a tab cannot acquire a second stack membership"
+        );
+    }
 
     #[test]
     fn durable_window_identity_survives_metadata_changes_and_numeric_reuse() {

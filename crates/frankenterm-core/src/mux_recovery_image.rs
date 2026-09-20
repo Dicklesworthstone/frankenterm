@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 4;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 5;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -110,6 +110,9 @@ pub enum MuxRecoveryImageError {
 
     #[error("unsupported schema version: {0}")]
     UnsupportedSchemaVersion(u32),
+
+    #[error("invalid or incomplete workspace recovery state: {0}")]
+    InvalidWorkspaceState(&'static str),
 
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
@@ -597,6 +600,35 @@ pub struct RecoveryTopology {
     pub focused_window_id: Option<usize>,
     /// Active workspace is per-client (`mux/lib.rs:11710`), not global truth.
     pub client_workspace: Option<ClientWorkspaceBinding>,
+    /// Required in schema 5. Absent historical state stays absent and cannot
+    /// authorize a complete live restore; omission preserves schema 3/4 hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_state: Option<RecoveryWorkspaceState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryWorkspaceState {
+    pub default_workspace: String,
+    pub workspaces: Vec<RecoveryWorkspace>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryWorkspace {
+    pub name: String,
+    pub window_ids: Vec<usize>,
+    #[serde(deserialize_with = "deserialize_required_workspace_active_window")]
+    pub active_window_id: Option<usize>,
+}
+
+fn deserialize_required_workspace_active_window<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer)
 }
 
 /// Binds a specific client identity to its active workspace.
@@ -1087,7 +1119,7 @@ impl MuxRecoveryImage {
         }
         if !matches!(
             self.header.schema_version,
-            3 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
+            3 | 4 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
         ) {
             return Err(MuxRecoveryImageError::UnsupportedSchemaVersion(
                 self.header.schema_version,
@@ -1122,6 +1154,48 @@ impl MuxRecoveryImage {
                 &cw.active_workspace,
                 MAX_STRING_BYTES,
             )?;
+        }
+
+        match (&self.topology.workspace_state, self.header.schema_version) {
+            (None, 5..) => {
+                return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                    "schema 5 requires captured workspace state",
+                ));
+            }
+            (Some(_), ..=4) => {
+                return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                    "historical schema cannot claim schema 5 workspace authority",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(state) = &self.topology.workspace_state {
+            validate_string_len(
+                "workspace.default",
+                &state.default_workspace,
+                MAX_STRING_BYTES,
+            )?;
+            if state.workspaces.len() > MAX_RECOVERY_WINDOWS {
+                return Err(MuxRecoveryImageError::ResourceLimit {
+                    resource: "workspaces",
+                    count: state.workspaces.len(),
+                    limit: MAX_RECOVERY_WINDOWS,
+                });
+            }
+            let mut members = 0usize;
+            for workspace in &state.workspaces {
+                validate_string_len("workspace.name", &workspace.name, MAX_STRING_BYTES)?;
+                members = members.checked_add(workspace.window_ids.len()).ok_or(
+                    MuxRecoveryImageError::InvalidWorkspaceState("window membership overflow"),
+                )?;
+                if members > MAX_RECOVERY_WINDOWS {
+                    return Err(MuxRecoveryImageError::ResourceLimit {
+                        resource: "workspace_window_members",
+                        count: members,
+                        limit: MAX_RECOVERY_WINDOWS,
+                    });
+                }
+            }
         }
 
         // 3. Resource count limits
@@ -1808,6 +1882,7 @@ impl MuxRecoveryImage {
         }
 
         // 8. Content digest check
+        self.validate_workspace_state()?;
         let computed_digest = self.compute_digest()?;
         if computed_digest != self.image_digest {
             return Err(MuxRecoveryImageError::DigestMismatch {
@@ -1816,6 +1891,63 @@ impl MuxRecoveryImage {
             });
         }
 
+        Ok(())
+    }
+
+    /// Expose complete workspace metadata only after full image validation.
+    /// Historical images remain verifiable but cannot invent the omitted state.
+    pub fn require_live_workspace_state(
+        &self,
+    ) -> Result<&RecoveryWorkspaceState, MuxRecoveryImageError> {
+        self.validate()?;
+        self.topology
+            .workspace_state
+            .as_ref()
+            .ok_or(MuxRecoveryImageError::InvalidWorkspaceState(
+                "historical image lacks complete live workspace metadata",
+            ))
+    }
+
+    fn validate_workspace_state(&self) -> Result<(), MuxRecoveryImageError> {
+        let Some(state) = &self.topology.workspace_state else {
+            return Ok(());
+        };
+        let windows: HashMap<_, _> = self
+            .topology
+            .windows
+            .iter()
+            .map(|window| (window.window_id, window.workspace.as_str()))
+            .collect();
+        let mut names = HashSet::new();
+        let mut members = HashSet::new();
+        for workspace in &state.workspaces {
+            if !names.insert(&workspace.name) {
+                return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                    "duplicate workspace",
+                ));
+            }
+            for id in &workspace.window_ids {
+                if windows.get(id).copied() != Some(workspace.name.as_str()) || !members.insert(*id)
+                {
+                    return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                        "window membership is missing, duplicated, or belongs to another workspace",
+                    ));
+                }
+            }
+            if workspace
+                .active_window_id
+                .is_some_and(|id| !workspace.window_ids.contains(&id))
+            {
+                return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                    "active window is not a member of its workspace",
+                ));
+            }
+        }
+        if members.len() != windows.len() {
+            return Err(MuxRecoveryImageError::InvalidWorkspaceState(
+                "orphan workspace window",
+            ));
+        }
         Ok(())
     }
 
@@ -2440,6 +2572,18 @@ impl MuxRecoveryImage {
             windows,
             focused_window_id,
             client_workspace,
+            workspace_state: Some(RecoveryWorkspaceState {
+                default_workspace: captured.default_workspace.clone(),
+                workspaces: captured
+                    .workspaces
+                    .iter()
+                    .map(|workspace| RecoveryWorkspace {
+                        name: workspace.name.clone(),
+                        window_ids: workspace.window_ids.clone(),
+                        active_window_id: workspace.active_window_id,
+                    })
+                    .collect(),
+            }),
         };
 
         // 8. Envelope assembly, digest calculation, and full validation
@@ -2762,6 +2906,7 @@ mod tests {
         // image, which is readable history but lacks repeat-rotation authority.
         let mut legacy = image.clone();
         legacy.header.schema_version = 3;
+        legacy.topology.workspace_state = None;
         if let RecoverySpawnCustody::Original(custody) = &mut legacy.panes[0].spawn_custody {
             custody.original_mux_incarnation = uuid::Uuid::from_u128(13);
             custody.current_lease_generation = 2;
@@ -3224,6 +3369,14 @@ mod tests {
                 client_id: "client-gui-1".to_string(),
                 active_workspace: "default".to_string(),
             }),
+            workspace_state: Some(RecoveryWorkspaceState {
+                default_workspace: "default".into(),
+                workspaces: vec![RecoveryWorkspace {
+                    name: "default".into(),
+                    window_ids: vec![100],
+                    active_window_id: Some(100),
+                }],
+            }),
         };
 
         let header = RecoveryImageHeader {
@@ -3247,6 +3400,102 @@ mod tests {
         let digest = image.compute_digest().unwrap();
         image.image_digest = digest;
         image
+    }
+
+    #[test]
+    fn workspace_state_requires_explicit_current_authority_and_preserves_history() {
+        let image = make_valid_test_image();
+        image.require_live_workspace_state().unwrap();
+        let mut missing = image.clone();
+        missing.topology.workspace_state = None;
+        assert!(matches!(
+            missing.validate(),
+            Err(MuxRecoveryImageError::InvalidWorkspaceState(_))
+        ));
+        for version in [3, 4] {
+            let mut historical = missing.clone();
+            historical.header.schema_version = version;
+            historical.image_digest = historical.compute_digest().unwrap();
+            historical.validate().unwrap();
+            let bytes = historical.to_canonical_json().unwrap();
+            assert!(
+                !std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("workspace_state")
+            );
+            let reopened = MuxRecoveryImage::from_json_slice(&bytes).unwrap();
+            assert_eq!(reopened.to_canonical_json().unwrap(), bytes);
+            assert!(matches!(
+                reopened.require_live_workspace_state(),
+                Err(MuxRecoveryImageError::InvalidWorkspaceState(_))
+            ));
+            historical.topology.workspace_state = image.topology.workspace_state.clone();
+            assert!(matches!(
+                historical.validate(),
+                Err(MuxRecoveryImageError::InvalidWorkspaceState(_))
+            ));
+        }
+        for field in ["default_workspace", "workspaces"] {
+            let mut value = serde_json::to_value(&image).unwrap();
+            value["topology"]["workspace_state"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<MuxRecoveryImage>(value).is_err());
+        }
+        let mut value = serde_json::to_value(&image).unwrap();
+        value["topology"]["workspace_state"]["workspaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("active_window_id");
+        assert!(serde_json::from_value::<MuxRecoveryImage>(value).is_err());
+    }
+
+    #[test]
+    fn workspace_state_membership_and_digest_reject_tampering() {
+        for fault in 0..5 {
+            let mut image = make_valid_test_image();
+            let state = image.topology.workspace_state.as_mut().unwrap();
+            match fault {
+                0 => state.workspaces[0].active_window_id = Some(999),
+                1 => state.workspaces[0].window_ids.push(100),
+                2 => state.workspaces[0].window_ids.clear(),
+                3 => state.workspaces[0].name = "wrong-workspace".into(),
+                _ => state.workspaces.push(state.workspaces[0].clone()),
+            }
+            image.image_digest = image.compute_digest().unwrap();
+            assert!(
+                matches!(
+                    image.validate(),
+                    Err(MuxRecoveryImageError::InvalidWorkspaceState(_))
+                ),
+                "fault={fault}"
+            );
+        }
+        let mut image = make_valid_test_image();
+        image
+            .topology
+            .workspace_state
+            .as_mut()
+            .unwrap()
+            .default_workspace = "changed".into();
+        assert!(matches!(
+            image.validate(),
+            Err(MuxRecoveryImageError::DigestMismatch { .. })
+        ));
+        image
+            .topology
+            .workspace_state
+            .as_mut()
+            .unwrap()
+            .default_workspace = "x".repeat(MAX_STRING_BYTES + 1);
+        assert!(matches!(
+            image.validate_bounds(),
+            Err(MuxRecoveryImageError::StringTooLong {
+                field: "workspace.default",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3896,6 +4145,14 @@ mod tests {
                 }],
                 focused_window_id: Some(100),
                 client_workspace: None,
+                workspace_state: Some(RecoveryWorkspaceState {
+                    default_workspace: "default".into(),
+                    workspaces: vec![RecoveryWorkspace {
+                        name: "default".into(),
+                        window_ids: vec![100],
+                        active_window_id: Some(100),
+                    }],
+                }),
             },
             panes,
             image_digest: [0u8; 32],
@@ -4726,6 +4983,51 @@ mod converter_tests {
         );
 
         (meta, captured, checkpoint_acks, checkpoint_object_refs)
+    }
+
+    #[test]
+    fn converter_preserves_distinct_default_client_and_workspace_window_choices() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        captured.default_workspace = "future-default-with-no-windows".into();
+        captured.client_workspace = Some(mux::MuxCapturedClientWorkspaceBinding {
+            client_id: "client-a".into(),
+            active_workspace: "other".into(),
+        });
+        let mut other = captured.windows[0].clone();
+        other.window_id = 20;
+        other.durable_window_id = uuid::Uuid::from_u128(0x8820);
+        other.workspace = "other".into();
+        other.ordered_tab_ids.clear();
+        other.active_tab_id = None;
+        other.active_tab_index = None;
+        other.last_active_tab_id = None;
+        other.tab_stacks.clear();
+        other.structural_pane_count = 0;
+        captured.windows.push(other);
+        captured.workspaces.push(mux::MuxCapturedWorkspace {
+            name: "other".into(),
+            window_ids: vec![20],
+            active_window_id: Some(20),
+            pane_count: 0,
+        });
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        let restored =
+            MuxRecoveryImage::from_json_slice(&image.to_canonical_json().unwrap()).unwrap();
+        let state = restored.require_live_workspace_state().unwrap();
+        assert_eq!(state.default_workspace, captured.default_workspace);
+        assert_eq!(state.workspaces.len(), captured.workspaces.len());
+        for (actual, expected) in state.workspaces.iter().zip(&captured.workspaces) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.window_ids, expected.window_ids);
+            assert_eq!(actual.active_window_id, expected.active_window_id);
+        }
+        assert_eq!(restored.topology.focused_window_id, Some(20));
+        assert_eq!(
+            restored.topology.client_workspace.unwrap().active_workspace,
+            "other"
+        );
     }
 
     #[test]
