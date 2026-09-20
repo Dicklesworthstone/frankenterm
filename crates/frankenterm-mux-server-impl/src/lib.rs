@@ -79,7 +79,7 @@ const LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str = "frankenterm.live-scrollback-append-wal.v1";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2: &str = "frankenterm.live-scrollback-append-wal.v2";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3: &str = "frankenterm.live-scrollback-append-wal.v3";
-const LIVE_SCROLLBACK_APPEND_MAX_ROWS: usize = 256;
+const LIVE_SCROLLBACK_APPEND_MAX_ROWS: usize = 1024;
 const LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const LIVE_SCROLLBACK_APPEND_WAL_NAME: &str = ".append-wal.v1.json";
 const LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME: &str = ".append-wal.v1.installing";
@@ -405,7 +405,7 @@ mod deferred_scrollback {
     };
     use wezterm_term::{Line, StableRowIndex};
 
-    const MAX_PENDING_ROWS: usize = 256;
+    const MAX_PENDING_ROWS: usize = super::LIVE_SCROLLBACK_APPEND_MAX_ROWS;
     const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
     const MAX_CACHED_ROWS: usize = 32;
     const MAX_CACHED_BYTES: usize = 256 * 1024;
@@ -657,12 +657,19 @@ mod deferred_scrollback {
             if state.publication_uncertain {
                 return ScrollbackLineAdmission::Refused;
             }
-            if let Some(existing) = state
-                .pending
-                .iter()
-                .find(|row| row.stable_row == stable_row)
-            {
-                if existing.line.as_ref() != line || existing.retention != retention {
+            // Admission appends contiguous sequence numbers; draining removes
+            // only a prefix. Retention's oldest can advance beyond pending
+            // rows, so index from the actual queue front instead.
+            let pending_index = state.pending.front().and_then(|first| {
+                stable_row
+                    .checked_sub(first.stable_row)
+                    .and_then(|offset| usize::try_from(offset).ok())
+            });
+            if let Some(existing) = pending_index.and_then(|index| state.pending.get(index)) {
+                if existing.stable_row != stable_row
+                    || existing.line.as_ref() != line
+                    || existing.retention != retention
+                {
                     return ScrollbackLineAdmission::Refused;
                 }
                 let interval = match (state.oldest, state.newest_exclusive) {
@@ -1018,6 +1025,57 @@ mod deferred_scrollback {
             !reused.same_lineage(&admitted),
             "same keys and bytes after clear are a new source"
         );
+    }
+
+    #[test]
+    fn deferred_pending_index_preserves_exact_duplicates_and_retention() {
+        use wezterm_term::CellAttributes;
+        use wezterm_term::config::ScrollbackLineAdmission;
+
+        let (_dir, backing, deferred) = super::tests::deferred_test_sink();
+        let line = Line::from_text("pending", &CellAttributes::blank(), 0, None);
+        let different = Line::from_text("different", &CellAttributes::blank(), 0, None);
+        for row in -4..0 {
+            assert!(deferred.store_scrollback_line(row, &line, 2));
+        }
+        let bytes = deferred.state.lock().unwrap().pending_bytes;
+        for row in [-4, -2, -1] {
+            let receipt = deferred.store_scrollback_line_with_receipt(row, &line, 2);
+            assert!(matches!(receipt, ScrollbackLineAdmission::Admitted { .. }));
+            if row == -4 {
+                assert!(matches!(
+                    receipt,
+                    ScrollbackLineAdmission::Admitted { interval: None }
+                ));
+            }
+            assert!(!deferred.store_scrollback_line(row, &different, 2));
+            assert!(!deferred.store_scrollback_line(row, &line, 3));
+        }
+        for row in [isize::MIN, -5, 1, isize::MAX] {
+            assert!(!deferred.store_scrollback_line(row, &line, 2));
+        }
+        {
+            let state = deferred.state.lock().unwrap();
+            assert_eq!(state.pending.len(), 4);
+            assert_eq!(state.pending_bytes, bytes);
+            assert_eq!(state.oldest, Some(-2));
+        }
+        // Real durability drains multiple retention-limited prefixes. A new
+        // pending suffix must rebase on its own front, not retained history.
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.retained_scrollback_rows(), 2);
+        assert!(deferred.state.lock().unwrap().pending.is_empty());
+        for row in 0..4 {
+            assert!(deferred.store_scrollback_line(row, &line, 2));
+        }
+        for row in [0, 2, 3] {
+            assert!(deferred.store_scrollback_line(row, &line, 2));
+        }
+        assert!(!deferred.store_scrollback_line(-1, &line, 2));
+        assert_eq!(deferred.state.lock().unwrap().pending.len(), 4);
+        deferred.flush_scrollback().unwrap();
+        assert_eq!(backing.load_scrollback_line(2), Some(line.clone()));
+        assert_eq!(backing.load_scrollback_line(3), Some(line));
     }
 
     #[test]
@@ -9897,7 +9955,7 @@ mod tests {
             wezterm_term::color::ColorPalette::default()
         }
         fn scrollback_size(&self) -> usize {
-            2048
+            4096
         }
         fn scrollback_tier_config(&self) -> wezterm_term::config::ScrollbackTierConfig {
             wezterm_term::config::ScrollbackTierConfig {
@@ -9957,7 +10015,8 @@ mod tests {
         let (_dir, backing, deferred) = deferred_test_sink();
         let pane = deferred_test_pane(deferred);
         let mut corpus = String::new();
-        for row in 0..550 {
+        let row_count = 2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38;
+        for row in 0..row_count {
             use std::fmt::Write as _;
             write!(corpus, "row-{row:03} e\u{301} 日本語\r\n").unwrap();
         }
@@ -9966,21 +10025,21 @@ mod tests {
             .parse(corpus.as_bytes(), |action| actions.push(action));
         pane.perform_actions(actions)
             .expect("test action admission");
-        assert_eq!(backing.retained_scrollback_rows(), 545);
+        assert_eq!(backing.retained_scrollback_rows(), row_count - 5);
         // The first batch establishes authority with one row, then writes
-        // its other 255 rows. Later full and final batches write 256 and 33.
+        // its other 1023 rows. Later full and final batches write 1024 and 33.
         // Cooperative geometry slices must not create extra generations.
         assert_eq!(backing.state.lock().unwrap().revision, 4);
-        let (first, lines) = pane.get_lines(0..551);
+        let (first, lines) = pane.get_lines(0..isize::try_from(row_count + 1).unwrap());
         assert_eq!(first, 0);
-        assert_eq!(lines.len(), 551);
-        for (row, line) in lines.iter().take(550).enumerate() {
+        assert_eq!(lines.len(), row_count + 1);
+        for (row, line) in lines.iter().take(row_count).enumerate() {
             assert_eq!(
                 line.as_str().trim_end(),
                 format!("row-{row:03} e\u{301} 日本語")
             );
         }
-        assert!(lines[550].as_str().trim().is_empty());
+        assert!(lines[row_count].as_str().trim().is_empty());
     }
 
     #[test]
@@ -10490,21 +10549,26 @@ mod tests {
     fn deferred_scrollback_refuses_bounded_overflow_without_hiding_rows() {
         let (_dir, backing, deferred) = deferred_test_sink();
         let line = Line::from_text("bounded", &CellAttributes::blank(), 0, None);
-        for row in 0..256 {
-            assert!(deferred.store_scrollback_line(row, &line, 512));
+        let cap = isize::try_from(LIVE_SCROLLBACK_APPEND_MAX_ROWS).unwrap();
+        let retention = LIVE_SCROLLBACK_APPEND_MAX_ROWS * 2;
+        for row in 0..cap {
+            assert!(deferred.store_scrollback_line(row, &line, retention));
         }
-        assert!(!deferred.store_scrollback_line(256, &line, 512));
-        assert_eq!(deferred.retained_scrollback_rows(), 256);
-        assert_eq!(deferred.load_scrollback_line(255), Some(line));
+        assert!(!deferred.store_scrollback_line(cap, &line, retention));
+        assert_eq!(
+            deferred.retained_scrollback_rows(),
+            LIVE_SCROLLBACK_APPEND_MAX_ROWS
+        );
+        assert_eq!(deferred.load_scrollback_line(cap - 1), Some(line));
         assert_eq!(backing.retained_scrollback_rows(), 0);
 
         let (_byte_dir, byte_backing, byte_deferred) = deferred_test_sink();
         let long = Line::from_text(&"x".repeat(4096), &CellAttributes::blank(), 0, None);
-        let accepted = (0..256)
-            .take_while(|row| byte_deferred.store_scrollback_line(*row, &long, 512))
+        let accepted = (0..cap)
+            .take_while(|row| byte_deferred.store_scrollback_line(*row, &long, retention))
             .count();
         assert!(
-            accepted > 0 && accepted < 256,
+            accepted > 0 && accepted < LIVE_SCROLLBACK_APPEND_MAX_ROWS,
             "byte charge must bound long rows before the row cap"
         );
         assert!(byte_deferred.retained_scrollback_bytes() <= 16 * 1024 * 1024);

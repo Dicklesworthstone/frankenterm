@@ -154,7 +154,7 @@ const COLD_ERASURE_MAX_SHARD_BYTES: u64 = 512 * 1024 * 1024;
 const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
 const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
-const PANE_APPEND_MAX_ROWS: usize = 256;
+const PANE_APPEND_MAX_ROWS: usize = 1024;
 const PANE_APPEND_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
@@ -1383,8 +1383,8 @@ impl PaneFile {
                 _ => None,
             }),
         };
-        // At most 512 descriptors (8 KiB on 64-bit hosts) cover the existing
-        // 256-row/32-MiB bound. File uses writev on Unix; platforms or writes
+        // At most 2048 descriptors (32 KiB on 64-bit hosts) cover the
+        // 1024-row/32-MiB bound. File uses writev on Unix; platforms or writes
         // accepting only a prefix are handled without replaying accepted bytes.
         write_append_slices(&mut writer, &mut slices)?;
         #[cfg(test)]
@@ -3376,7 +3376,10 @@ mod tests {
         let calls = PANE_APPEND_WRITE_CALLS.with(|count| count.get());
         assert!(calls > 0);
         #[cfg(target_os = "linux")]
-        assert_eq!(calls, 1, "one real writev accepts the entire bounded batch");
+        assert_eq!(
+            calls, 2,
+            "Linux accepts the cap-sized batch in two real writev calls with its 1024-iovec limit"
+        );
         assert_eq!(PANE_APPEND_DATA_SYNCS.with(|count| count.get()), 1);
         assert_eq!(store.tail_lines(7, PANE_APPEND_MAX_ROWS).unwrap(), lines);
         assert_eq!(store.next_seq(7).unwrap(), PANE_APPEND_MAX_ROWS as u64);
