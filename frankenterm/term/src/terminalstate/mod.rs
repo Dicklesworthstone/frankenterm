@@ -3481,9 +3481,9 @@ mod tests {
                     terminal.resize(resized);
                 }
                 terminal.advance_bytes(if alternate {
-                    b"\x1b[?1049lZ"
+                    b"\x1b[?1049lZ".as_slice()
                 } else {
-                    b"\x1b8Z"
+                    b"\x1b8Z".as_slice()
                 });
 
                 // Restoring a pending wrap after widening must insert after the
