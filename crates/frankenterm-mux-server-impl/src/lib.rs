@@ -549,14 +549,28 @@ mod deferred_scrollback {
                             .iter()
                             .take(MAX_PENDING_ROWS)
                             .take_while(|row| row.retention == first.retention)
-                            .map(|row| row.line.as_ref().clone())
+                            .map(|row| Arc::clone(&row.line))
                             .collect();
-                        (first.stable_row, lines, first.retention)
+                        // Keep the previous cache alive through retirement as
+                        // well. Last-reference Line destruction must not block
+                        // metadata readers while state is locked.
+                        let cached: Vec<_> = state
+                            .cached
+                            .iter()
+                            .map(|row| Arc::clone(&row.line))
+                            .collect();
+                        (first.stable_row, lines, cached, first.retention)
                     })
                 };
-                let Some((stable_row, lines, retention)) = next else {
+                let Some((stable_row, pending_lines, cached_lines, retention)) = next else {
                     return Ok(());
                 };
+                // Only bounded Arc handles were captured under state. Materialize
+                // the backing-store batch outside the metadata critical section.
+                let lines: Vec<_> = pending_lines
+                    .iter()
+                    .map(|line| line.as_ref().clone())
+                    .collect();
                 let acknowledged = self
                     .backing
                     .store_scrollback_lines(stable_row, &lines, retention);
@@ -579,6 +593,9 @@ mod deferred_scrollback {
                     state.cache_acknowledged(row);
                 }
                 state.durable_bytes = durable_bytes;
+                drop(state);
+                drop(cached_lines);
+                drop(pending_lines);
                 metrics::counter!("mux.scrollback.deferred_rows_durable")
                     .increment(acknowledged as u64);
             }

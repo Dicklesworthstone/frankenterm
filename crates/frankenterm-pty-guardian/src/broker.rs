@@ -14424,6 +14424,134 @@ impl BrokerPaneLeaseWalCatalogV1 {
     }
 }
 
+/// Authenticate one existing, fully acknowledged birth without opening the
+/// mutable catalog service or granting append/recovery/process authority.
+pub(crate) fn inspect_historical_genesis_binding(
+    catalog_path: &Path,
+    token_path: &Path,
+    journal_id: Uuid,
+    canonical_binding: &[u8],
+    custody: mux::guardian_checkpoint::GuardianSpawnCustodyContextV1,
+) -> Result<(), BrokerSpawnWalError> {
+    let binding = BrokerGenesisBinding::decode(canonical_binding)
+        .map_err(|_| BrokerSpawnWalError::InvalidIdentity)?;
+    let (secret, mut token_authority) =
+        crate::transport::load_guardian_secret_with_authority(token_path)
+            .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?;
+    let mut token_lease = token_authority
+        .acquire_effect_lease()
+        .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?;
+    token_lease
+        .validate()
+        .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?;
+    let authenticator = secret
+        .broker_spawn_wal_authenticator()
+        .map_err(|_| BrokerSpawnWalError::InvalidIdentity)?;
+    validate_broker_spawn_catalog_path(catalog_path)?;
+    let before = std::fs::symlink_metadata(catalog_path)?;
+    validate_broker_spawn_catalog_directory_metadata(&before)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(catalog_path)?;
+    require_same_broker_spawn_catalog_object(&before, &directory.metadata()?)?;
+    let lock_name = OsStr::new(BROKER_SPAWN_CATALOG_LOCK_NAME);
+    let lock = File::from(
+        rustix::fs::openat(
+            &directory,
+            lock_name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    revalidate_open_broker_spawn_catalog_file(&directory, lock_name, &lock, 0, 0)?;
+    lock_broker_spawn_catalog(&lock)?;
+    let open = |name: &OsStr, maximum| -> Result<File, BrokerSpawnWalError> {
+        let identity = broker_spawn_catalog_stat_identity_at(
+            &directory,
+            name,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            maximum,
+        )?;
+        let file = File::from(
+            rustix::fs::openat(
+                &directory,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        );
+        if validate_broker_spawn_catalog_file_metadata(
+            &file.metadata()?,
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            maximum,
+        )? != identity
+        {
+            return Err(BrokerSpawnWalError::InsecureCatalogIdentity);
+        }
+        Ok(file)
+    };
+    let wal_name = broker_spawn_catalog_wal_name(journal_id);
+    let head_name = broker_spawn_catalog_head_name(journal_id);
+    let mut wal = open(&wal_name, BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES)?;
+    let head = open(&head_name, BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES)?;
+    let mut header = [0; BROKER_SPAWN_WAL_FILE_HEADER_BYTES];
+    wal.read_exact(&mut header)?;
+    wal.rewind()?;
+    let (identity, _) =
+        decode_broker_spawn_file_header(&header, BROKER_SPAWN_WAL_FILE_MAGIC, &authenticator)?;
+    let journal = BrokerSpawnJournalV1::open(wal, head, identity, authenticator)?;
+    let status = journal.status();
+    let expected_identity =
+        BrokerSpawnWalIdentityV1::from_binding(journal_id, custody.broker_lineage, binding)?;
+    if identity != expected_identity
+        || binding.mux_incarnation != custody.mux_incarnation
+        || binding.durable_pane_id != custody.pane_id
+        || binding.spawn_effect_id != custody.effect_id
+        || binding.spawning_mux_build_identity_digest != custody.mux_build
+        || binding.live_guardian_build_identity_digest != custody.guardian_build
+        || status.phase != Some(BrokerSpawnWalPhaseV1::ReplyAcknowledged)
+        || status.reply_ack_id != Some(custody.ack_id)
+        || status.child_identity
+            != Some(BrokerKernelChildIdentityV1 {
+                process_id: custody.child_pid,
+                broker_child_nonce: custody.child_nonce,
+                kernel_start_identity_digest: custody.child_start_digest,
+            })
+        || status.tail != BrokerSpawnWalTailV1::Clean
+        || status.head_reconciliation_required
+    {
+        return Err(BrokerSpawnWalError::CatalogIdentityMismatch);
+    }
+    revalidate_open_broker_spawn_catalog_file(
+        &directory,
+        &wal_name,
+        &journal.wal,
+        BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        BROKER_SPAWN_WAL_MAX_PHYSICAL_BYTES,
+    )?;
+    revalidate_open_broker_spawn_catalog_file(
+        &directory,
+        &head_name,
+        &journal.head,
+        BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+        BROKER_SPAWN_HEAD_MAX_PHYSICAL_BYTES,
+    )?;
+    require_same_broker_spawn_catalog_object(&before, &std::fs::symlink_metadata(catalog_path)?)?;
+    revalidate_open_broker_spawn_catalog_file(&directory, lock_name, &lock, 0, 0)?;
+    token_lease
+        .validate()
+        .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?;
+    token_authority
+        .validate()
+        .map_err(|_| BrokerSpawnWalError::InsecureCatalogIdentity)?;
+    Ok(())
+}
+
 fn broker_genesis_binding_digest(binding: BrokerGenesisBinding) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"frankenterm.guardian-broker.genesis-binding.v1\0");
@@ -32745,6 +32873,140 @@ mod tests {
             validate_broker_recovered_lease_bindings(&missing_spawns, &missing_leases),
             Err(BrokerControlServiceError::InvalidRecoveredLeaseState)
         ));
+    }
+
+    #[test]
+    fn historical_genesis_binding_requires_exact_reservation_custody_and_anchored_head() {
+        let temp = tempfile::tempdir_in(crate::canonical_test_temp_root()).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let token = temp.path().join("token");
+        crate::transport::provision_guardian_token(&token).unwrap();
+        let (secret, _) = crate::transport::load_guardian_secret_with_authority(&token).unwrap();
+        let authenticator = secret.broker_spawn_wal_authenticator().unwrap();
+        let auth = authority(id(71), id(72), id(73), id(74), 0x51, 0x52);
+        let payload = command_payload("true", &temp.path().join("unused"));
+        let binding = binding_for(&payload, &auth);
+        let identity =
+            BrokerSpawnWalIdentityV1::from_binding(id(900), authenticator.lineage_id(), binding)
+                .unwrap();
+        let catalog = temp.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(open_new_test_file(
+            &catalog.join(BROKER_SPAWN_CATALOG_LOCK_NAME),
+        ));
+        let wal_name = broker_spawn_catalog_wal_name(identity.journal_id);
+        let head_name = broker_spawn_catalog_head_name(identity.journal_id);
+        let mut journal = BrokerSpawnJournalV1::create(
+            open_new_test_file(&catalog.join(&wal_name)),
+            open_new_test_file(&catalog.join(&head_name)),
+            identity,
+            authenticator,
+        )
+        .unwrap();
+        let parent = File::open(&catalog).unwrap();
+        journal
+            .bind_parent_publication(&parent, &wal_name, &head_name)
+            .unwrap();
+        journal.sync_parent_directory_and_activate(&parent).unwrap();
+        journal.append_intent_and_sync().unwrap();
+        let BrokerSpawnAttemptAdmissionV1::Authorized(permit) =
+            journal.begin_spawn_attempt_and_sync(id(902)).unwrap()
+        else {
+            panic!("first fixture attempt must be authorized");
+        };
+        // This test authenticates a constructed WAL, not a real child process.
+        let child = test_kernel_child(12_345);
+        let BrokerSpawnAttemptExecutionV1::EffectSucceeded { observation, .. } =
+            permit.invoke_once(|| Ok::<_, ()>(((), child)))
+        else {
+            panic!("fixture child identity must be valid");
+        };
+        journal
+            .append_spawn_observed_and_sync(*observation)
+            .unwrap();
+        journal
+            .acknowledge_spawn_reply_and_sync(id(903), child)
+            .unwrap();
+        drop(journal);
+        let custody = mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+            broker_incarnation: id(71),
+            broker_lineage: identity.broker_lineage_id,
+            guardian_incarnation: id(72),
+            mux_incarnation: binding.mux_incarnation,
+            broker_build: [0x50; 32],
+            guardian_build: binding.live_guardian_build_identity_digest,
+            mux_build: binding.spawning_mux_build_identity_digest,
+            pane_id: binding.durable_pane_id,
+            effect_id: binding.spawn_effect_id,
+            ack_id: id(903),
+            child_pid: child.process_id,
+            child_nonce: child.broker_child_nonce,
+            child_start_digest: child.kernel_start_identity_digest,
+            wire_ack_generation: 1,
+            secret_lease_generation: 1,
+        };
+        let encoded = binding.encode();
+        let inspect = |bytes: &[u8], context| {
+            inspect_historical_genesis_binding(
+                &catalog,
+                &token,
+                identity.journal_id,
+                bytes,
+                context,
+            )
+        };
+        inspect(&encoded, custody).unwrap();
+        for offset in [16, 48, 72, 172, 176, 208, 240] {
+            let mut wrong = encoded;
+            wrong[offset] ^= 1;
+            assert!(
+                inspect(&wrong, custody).is_err(),
+                "reservation field {offset}"
+            );
+        }
+        for wrong in [
+            mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+                effect_id: id(904),
+                ..custody
+            },
+            mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+                ack_id: id(904),
+                ..custody
+            },
+            mux::guardian_checkpoint::GuardianSpawnCustodyContextV1 {
+                child_pid: child.process_id + 1,
+                ..custody
+            },
+        ] {
+            assert!(inspect(&encoded, wrong).is_err());
+        }
+        inspect(&encoded, custody).unwrap();
+        let head_path = catalog.join(&head_name);
+        let original_head = fs::read(&head_path).unwrap();
+        let mut head = open_existing_test_file(&head_path);
+        head.seek(SeekFrom::End(-1)).unwrap();
+        head.write_all(&[original_head[original_head.len() - 1] ^ 1])
+            .unwrap();
+        head.sync_all().unwrap();
+        assert!(
+            inspect(&encoded, custody).is_err(),
+            "tampered authenticated head"
+        );
+        head.seek(SeekFrom::Start(0)).unwrap();
+        head.write_all(&original_head).unwrap();
+        head.set_len(BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64)
+            .unwrap();
+        head.sync_all().unwrap();
+        assert!(
+            inspect(&encoded, custody).is_err(),
+            "head reconciliation cannot grant inspection"
+        );
+        assert_eq!(
+            head.metadata().unwrap().len(),
+            BROKER_SPAWN_WAL_FILE_HEADER_BYTES_U64,
+            "read-only inspection repaired an incomplete head"
+        );
     }
 
     #[test]

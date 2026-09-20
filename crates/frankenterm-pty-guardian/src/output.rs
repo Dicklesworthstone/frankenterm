@@ -933,6 +933,152 @@ impl GuardianRecoveryClaimAdmission {
 }
 
 impl GuardianDurableSpawnCustodyV1 {
+    /// Inspect an existing historical Genesis under independently authenticated
+    /// guardian child custody and broker reservation commitment. Selectors only
+    /// locate files; they never authorize their contents. No replay eligibility
+    /// or current terminal-schema validity is asserted by this result.
+    pub fn inspect_historical_genesis(
+        self,
+        candidate_id: Uuid,
+        broker_catalog: &Path,
+        broker_token: &Path,
+        broker_journal: Uuid,
+    ) -> Result<GuardianAuthenticatedHistoricalGenesis, GuardianCheckpointStageStoreError> {
+        self.store.with_exclusive_directory(|inner| {
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            let identity = CheckpointCatalogIdentity {
+                scope: CheckpointCatalogScope::Genesis {
+                    spawn_effect_id: self.context.effect_id,
+                },
+                generation: 1,
+                candidate_id,
+            };
+            let read = |role, maximum| -> Result<Vec<u8>, GuardianCheckpointStageStoreError> {
+                let path = checkpoint_catalog_path(inner, identity, role)?;
+                let file =
+                    open_private_file_at(&inner.directory, &inner.directory_path, &path, false)?;
+                let metadata = file.metadata().map_err(|error| {
+                    GuardianCheckpointStageStoreError::io("historical-genesis-metadata", error)
+                })?;
+                validate_private_file_metadata(&metadata, None)?;
+                checkpoint_catalog_read_file(
+                    inner,
+                    &path,
+                    FileIdentity::capture(&metadata, Some(metadata.len())),
+                    maximum,
+                )
+            };
+            let candidate_bytes = read(
+                CheckpointCatalogPathRole::Candidate,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )?;
+            let marker_bytes = read(
+                CheckpointCatalogPathRole::Marker,
+                CHECKPOINT_CATALOG_MARKER_BYTES as u64,
+            )?;
+            let candidate = checkpoint_catalog_decode_candidate(&candidate_bytes)?;
+            let marker = checkpoint_catalog_decode_marker(&marker_bytes)?;
+            if candidate.format != CheckpointCatalogFormat::ProtectedV3
+                || candidate.metadata.identity != identity
+                || candidate.adoption_evidence.is_some()
+                || !checkpoint_catalog_marker_matches_candidate(&marker, &candidate)
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            let metadata = candidate.metadata;
+            checkpoint_catalog_validate_metadata(&metadata)?;
+            let reservation = CheckpointCatalogGenesisReservationBinding {
+                mux_incarnation: metadata.adoption_mux_incarnation,
+                spawn_effect_id: metadata.adoption_effect_id,
+                durable_pane_id: metadata.genesis_durable_pane_id,
+                origin_request_id: metadata.genesis_origin_request_id,
+                spawn_payload_bytes: metadata.genesis_spawn_payload_bytes,
+                spawn_payload_digest: metadata.genesis_spawn_payload_digest,
+                spawning_mux_build_identity_digest: metadata
+                    .genesis_spawning_mux_build_identity_digest,
+                live_guardian_build_identity_digest: metadata
+                    .genesis_live_guardian_build_identity_digest,
+                rows: u16::try_from(metadata.rows)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?,
+                cols: u16::try_from(metadata.cols)
+                    .map_err(|_| GuardianCheckpointStageStoreError::Conflict)?,
+                pixel_width: metadata.genesis_pixel_width,
+                pixel_height: metadata.genesis_pixel_height,
+                checkpoint_identity_digest: metadata.checkpoint_id,
+                boundary_identity_digest: metadata.boundary_id,
+                upload_id: metadata.upload_id,
+            };
+            if !checkpoint_catalog_genesis_metadata_matches_reservation(&metadata, reservation) {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            // Existing broker Genesis wire encoding, authenticated against its
+            // complete reservation digest by the read-only broker inspector.
+            let mut binding = [0; 256];
+            binding[0..16].copy_from_slice(reservation.mux_incarnation.as_bytes());
+            binding[16..32].copy_from_slice(reservation.spawn_effect_id.as_bytes());
+            binding[32..48].copy_from_slice(reservation.durable_pane_id.as_bytes());
+            binding[48..64].copy_from_slice(reservation.origin_request_id.as_bytes());
+            binding[64..72].copy_from_slice(&reservation.spawn_payload_bytes.to_be_bytes());
+            binding[72..104].copy_from_slice(&reservation.spawn_payload_digest);
+            binding[104..136].copy_from_slice(&reservation.spawning_mux_build_identity_digest);
+            binding[136..168].copy_from_slice(&reservation.live_guardian_build_identity_digest);
+            binding[168..170].copy_from_slice(&reservation.rows.to_be_bytes());
+            binding[170..172].copy_from_slice(&reservation.cols.to_be_bytes());
+            binding[172..174].copy_from_slice(&reservation.pixel_width.to_be_bytes());
+            binding[174..176].copy_from_slice(&reservation.pixel_height.to_be_bytes());
+            binding[176..208].copy_from_slice(&reservation.checkpoint_identity_digest);
+            binding[208..240].copy_from_slice(&reservation.boundary_identity_digest);
+            binding[240..256].copy_from_slice(reservation.upload_id.as_bytes());
+            crate::broker::inspect_historical_genesis_binding(
+                broker_catalog,
+                broker_token,
+                broker_journal,
+                &binding,
+                self.context,
+            )
+            .map_err(|_| GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
+            let payload = inner
+                .cipher
+                .inspect_historical_genesis_payload(&candidate.records)?;
+            let begin = payload.canonical_begin();
+            if begin[16..32] != *reservation.spawn_effect_id.as_bytes()
+                || begin[40..56] != *metadata.upload_id.as_bytes()
+                || begin[56..88] != metadata.checkpoint_id
+                || begin[88..120] != metadata.boundary_id
+                || begin[128..160] != metadata.replay_semantics_id
+                || begin[160..164] != metadata.rows.to_be_bytes()
+                || begin[164..168] != metadata.cols.to_be_bytes()
+                || begin[168..176] != metadata.total_bytes.to_be_bytes()
+                || begin[176..208] != metadata.terminal_payload_digest
+                || begin[332..336] != metadata.chunk_count.to_be_bytes()
+                || candidate.records.first().is_none_or(|record| {
+                    record.context().publication_id() != metadata.completion_id
+                })
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            // Re-read exact files after cross-authority authentication. Nothing
+            // is acknowledged, repaired, or published by this inspection.
+            if read(
+                CheckpointCatalogPathRole::Candidate,
+                CHECKPOINT_CATALOG_MAX_CANDIDATE_BYTES,
+            )? != candidate_bytes
+                || read(
+                    CheckpointCatalogPathRole::Marker,
+                    CHECKPOINT_CATALOG_MARKER_BYTES as u64,
+                )? != marker_bytes
+            {
+                return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
+            }
+            drop(read_spawn_custody_locked(inner, &self.context)?);
+            Ok(GuardianAuthenticatedHistoricalGenesis {
+                scope: self.context.scope(),
+                metadata,
+                payload,
+            })
+        })
+    }
+
     /// Reopen an acknowledged, protected checkpoint using existing private
     /// custody and catalog bytes only. This grants offline verification, never
     /// a writer lease or permission to rotate a later successor generation.
@@ -1103,6 +1249,72 @@ struct CheckpointCatalogMetadata {
 pub struct GuardianReopenedCheckpointV1 {
     scope: GuardianSpawnCustodyScopeV1,
     metadata: CheckpointCatalogMetadata,
+}
+
+/// Authenticated historical state and birth binding. This is not a restore
+/// permit: terminal migration and successor custody remain separate gates.
+pub struct GuardianAuthenticatedHistoricalGenesis {
+    scope: GuardianSpawnCustodyScopeV1,
+    metadata: CheckpointCatalogMetadata,
+    payload: mux::guardian_checkpoint::GuardianAuthenticatedHistoricalGenesisPayload,
+}
+
+impl GuardianAuthenticatedHistoricalGenesis {
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.scope
+    }
+    pub const fn checkpoint_id(&self) -> [u8; 32] {
+        self.metadata.checkpoint_id
+    }
+    pub const fn replay_semantics_id(&self) -> [u8; 32] {
+        self.metadata.replay_semantics_id
+    }
+    pub const fn dimensions(&self) -> (u32, u32) {
+        (self.metadata.rows, self.metadata.cols)
+    }
+    pub fn terminal_payload(&self) -> &[u8] {
+        self.payload.terminal_payload()
+    }
+
+    pub fn prepare_v2_migration(
+        self,
+        limits: frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Result<GuardianPreparedHistoricalGenesisMigration, GuardianCheckpointStageStoreError> {
+        let migration = self.payload.prepare_v2_migration(limits)?;
+        if migration.source_canonical_payload() != self.terminal_payload()
+            || (migration.rows(), migration.cols()) != self.dimensions()
+            || migration.pixel_width() != u64::from(self.metadata.genesis_pixel_width)
+            || migration.pixel_height() != u64::from(self.metadata.genesis_pixel_height)
+        {
+            return Err(GuardianCheckpointStageStoreError::Conflict);
+        }
+        Ok(GuardianPreparedHistoricalGenesisMigration {
+            origin: self,
+            migration,
+        })
+    }
+}
+
+/// Keeps the authenticated old birth inseparable from its prepared new model.
+/// This owns data only, with no lease, replay, publication, or live terminal.
+pub struct GuardianPreparedHistoricalGenesisMigration {
+    origin: GuardianAuthenticatedHistoricalGenesis,
+    migration: frankenterm_term::terminalstate::checkpoint::PreparedTerminalCheckpointV2Migration,
+}
+
+impl GuardianPreparedHistoricalGenesisMigration {
+    pub const fn scope(&self) -> GuardianSpawnCustodyScopeV1 {
+        self.origin.scope()
+    }
+    pub const fn source_checkpoint_id(&self) -> [u8; 32] {
+        self.origin.checkpoint_id()
+    }
+    pub fn source_canonical_payload(&self) -> &[u8] {
+        self.origin.terminal_payload()
+    }
+    pub fn target_canonical_payload(&self) -> &[u8] {
+        self.migration.target_canonical_payload()
+    }
 }
 
 impl GuardianReopenedCheckpointV1 {
@@ -12881,6 +13093,171 @@ mod tests {
         let mut owned = Zeroizing::new(Vec::with_capacity(bytes.len()));
         owned.extend_from_slice(bytes);
         owned
+    }
+
+    #[test]
+    #[ignore = "requires FT_HISTORICAL_GENESIS_FIXTURE containing retained genuine old-producer custody/catalogs"]
+    fn historical_genesis_authentication_and_v2_migration_from_retained_birth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from(
+            std::env::var_os("FT_HISTORICAL_GENESIS_FIXTURE")
+                .ok_or("missing retained historical fixture")?,
+        );
+        let token = root.join("state/token");
+        let broker_token = root.join("broker/token");
+        let broker_catalog = root.join("broker/spawn-catalog");
+        let store = GuardianDurableSpawnCustodyV1::open_existing_store(&token)?;
+        let names = read_directory_names(&store.inner.directory)?;
+        assert!(names.len() <= CHECKPOINT_CATALOG_MAX_RELEVANT_FILES);
+        let custody_names: Vec<_> = names
+            .iter()
+            .filter(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with("spawn-custody-v1-") && name.ends_with(".bin")
+                })
+            })
+            .collect();
+        assert_eq!(custody_names.len(), 1, "fixture has one genuine birth");
+        let bytes = read_synced_custody_bytes::<GUARDIAN_SPAWN_CUSTODY_BYTES>(
+            &store.inner,
+            &store.inner.directory_path.join(custody_names[0]),
+        )?;
+        let (context, secret) = store.inner.cipher.open_spawn_custody_record(&bytes)?;
+        drop(secret);
+        let candidates: Vec<_> = names
+            .iter()
+            .filter_map(|name| name.to_str().and_then(checkpoint_catalog_parse_path))
+            .filter(|(identity, kind)| {
+                identity.scope
+                    == CheckpointCatalogScope::Genesis {
+                        spawn_effect_id: context.effect_id,
+                    }
+                    && matches!(
+                        kind,
+                        CheckpointCatalogPathKind::Canonical(CheckpointCatalogPathRole::Candidate)
+                    )
+            })
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        let identity = candidates[0].0;
+        let journal_names: Vec<_> = std::fs::read_dir(&broker_catalog)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("spawn-")?.strip_suffix(".wal.v1"))
+                    .and_then(|id| Uuid::parse_str(id).ok())
+            })
+            .collect();
+        assert_eq!(journal_names.len(), 1);
+        let journal = journal_names[0];
+        let custody = || GuardianDurableSpawnCustodyV1 {
+            store: store.clone(),
+            context,
+        };
+        let authenticated = custody().inspect_historical_genesis(
+            identity.candidate_id,
+            &broker_catalog,
+            &broker_token,
+            journal,
+        )?;
+        assert!(frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
+            authenticated.terminal_payload(), TerminalCheckpointLimits::default()).is_err());
+        let expected_source = Zeroizing::new(authenticated.terminal_payload().to_vec());
+        for width in [true, false] {
+            let mut wrong_pixels = custody().inspect_historical_genesis(
+                identity.candidate_id,
+                &broker_catalog,
+                &broker_token,
+                journal,
+            )?;
+            // Corrupt only the in-memory joint binding after authenticating the
+            // real fixture; no retained file or running process is modified.
+            if width {
+                wrong_pixels.metadata.genesis_pixel_width ^= 1;
+            } else {
+                wrong_pixels.metadata.genesis_pixel_height ^= 1;
+            }
+            assert!(
+                wrong_pixels
+                    .prepare_v2_migration(TerminalCheckpointLimits::default())
+                    .is_err()
+            );
+        }
+        let migration = authenticated.prepare_v2_migration(TerminalCheckpointLimits::default())?;
+        assert_eq!(
+            migration.source_canonical_payload(),
+            expected_source.as_slice()
+        );
+        frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
+            migration.target_canonical_payload(),
+            TerminalCheckpointLimits::default(),
+        )?;
+        assert!(
+            custody()
+                .inspect_historical_genesis(
+                    identity.candidate_id,
+                    &broker_catalog,
+                    &broker_token,
+                    Uuid::new_v4()
+                )
+                .is_err()
+        );
+        let wrong = GuardianDurableSpawnCustodyV1 {
+            store: store.clone(),
+            context: GuardianSpawnCustodyContextV1 {
+                effect_id: Uuid::new_v4(),
+                ..context
+            },
+        };
+        assert!(
+            wrong
+                .inspect_historical_genesis(
+                    identity.candidate_id,
+                    &broker_catalog,
+                    &broker_token,
+                    journal
+                )
+                .is_err()
+        );
+        // Mutate only in-memory ciphertext copies, never the retained fixture.
+        let path =
+            checkpoint_catalog_path(&store.inner, identity, CheckpointCatalogPathRole::Candidate)?;
+        let original = std::fs::read(path)?;
+        let count = checkpoint_catalog_decode_candidate(&original)?
+            .records
+            .len();
+        for index in [0, 1, count - 1] {
+            let mut candidate = checkpoint_catalog_decode_candidate(&original)?;
+            let record = &candidate.records[index];
+            let mut ciphertext = record.ciphertext().to_vec();
+            ciphertext[0] ^= 1;
+            candidate.records[index] = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &record.fixed_header(),
+                ciphertext,
+                record.plaintext_bytes(),
+            )?;
+            assert!(
+                store
+                    .inner
+                    .cipher
+                    .inspect_historical_genesis_payload(&candidate.records)
+                    .is_err()
+            );
+        }
+        let mut reordered = checkpoint_catalog_decode_candidate(&original)?;
+        reordered.records.swap(0, 1);
+        assert!(
+            store
+                .inner
+                .cipher
+                .inspect_historical_genesis_payload(&reordered.records)
+                .is_err()
+        );
+        println!("HISTORICAL_GENESIS_AUTHENTICATION_AND_V2_MIGRATION_SUCCESS");
+        Ok(())
     }
 
     fn spawn_custody_context() -> GuardianSpawnCustodyContextV1 {

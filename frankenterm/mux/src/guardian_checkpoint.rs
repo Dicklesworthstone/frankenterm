@@ -1015,6 +1015,54 @@ pub struct GuardianCheckpointCandidateIdentityV1 {
     digest: Zeroizing<[u8; 32]>,
 }
 
+/// Authenticated historical Genesis bytes, without current replay eligibility.
+/// This type deliberately exposes no current descriptor or publication permit.
+pub struct GuardianAuthenticatedHistoricalGenesisPayload {
+    begin: Zeroizing<Vec<u8>>,
+    payload: Zeroizing<Vec<u8>>,
+}
+
+impl GuardianAuthenticatedHistoricalGenesisPayload {
+    pub fn canonical_begin(&self) -> &[u8] {
+        &self.begin
+    }
+
+    pub fn terminal_payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn prepare_v2_migration(
+        &self,
+        mut limits: TerminalCheckpointLimits,
+    ) -> Result<
+        frankenterm_term::terminalstate::checkpoint::PreparedTerminalCheckpointV2Migration,
+        GuardianCheckpointCipherError,
+    > {
+        let mut identity = Sha256::new();
+        identity.update(REPLAY_IDENTITY_DIGEST_DOMAIN);
+        identity.update(b"frankenterm.escape-parser.recovery-ground.v3\0");
+        identity.update(b"frankenterm.term.recovery-replay-semantics.v2");
+        if self.begin[128..160] != <[u8; 32]>::from(identity.finalize()) {
+            return Err(GuardianCheckpointCipherError::InvalidDescriptor);
+        }
+        // The authenticated source remains owned while the migration decoder
+        // retains its own canonical source and target. Reserve that existing
+        // allocation first; the leaf decoder accounts for its additional data.
+        let retained = self
+            .begin
+            .capacity()
+            .checked_add(self.payload.capacity())
+            .ok_or(GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
+        limits.max_retained_capture_bytes = limits
+            .max_retained_capture_bytes
+            .checked_sub(retained)
+            .ok_or(GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
+        frankenterm_term::terminalstate::checkpoint::PreparedTerminalCheckpointV2Migration::decode_canonical_json(
+            &self.payload, limits,
+        ).map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)
+    }
+}
+
 impl GuardianCheckpointCandidateIdentityV1 {
     pub fn from_canonical_begin_plaintext(
         plaintext: &Zeroizing<Vec<u8>>,
@@ -3265,6 +3313,162 @@ impl GuardianCheckpointCipher {
         };
         record.validate_bounded(GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES)?;
         Ok(record)
+    }
+
+    /// Authenticate the fixed historical Genesis upload envelope independently
+    /// of current terminal/replay semantics. Full reservation and child custody
+    /// must additionally be authenticated by the guardian catalog inspector.
+    /// No typed stage request, manifest receipt, or replay descriptor escapes.
+    pub fn inspect_historical_genesis_payload(
+        &self,
+        records: &[GuardianEncryptedCheckpointStageRecordV1],
+    ) -> Result<GuardianAuthenticatedHistoricalGenesisPayload, GuardianCheckpointCipherError> {
+        let invalid = || GuardianCheckpointCipherError::InvalidDescriptor;
+        let candidate = records.first().ok_or_else(invalid)?;
+        let context = candidate.context();
+        if context.kind() != GuardianCheckpointStageRecordKindV1::CandidateMetadata {
+            return Err(invalid());
+        }
+        let mut begin = self.open(&context, candidate, GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES)?;
+        // GCS1 stage wire v2 has a fixed 336-byte Begin. Its Genesis scope and
+        // zero output watermark are canonical independently of terminal schema.
+        if begin.len() != 336
+            || begin[..9] != [b'G', b'C', b'S', b'1', 0, 2, 1, 0, 2]
+            || begin[9..16] != [0; 7]
+            || begin[32..40] != [0; 8]
+            || begin[208..224] != [0; 16]
+            || begin[224] != 1
+            || begin[225..232] != [0; 7]
+            || begin[248..328] != [0; 80]
+            || begin[16..32] != begin[232..248]
+        {
+            return Err(invalid());
+        }
+        let effect = Uuid::from_slice(&begin[16..32]).map_err(|_| invalid())?;
+        let upload = Uuid::from_slice(&begin[40..56]).map_err(|_| invalid())?;
+        let read_u32 = |offset| -> Result<u32, GuardianCheckpointCipherError> {
+            Ok(u32::from_be_bytes(
+                begin[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ))
+        };
+        let read_u64 = |offset| -> Result<u64, GuardianCheckpointCipherError> {
+            Ok(u64::from_be_bytes(
+                begin[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ))
+        };
+        let digest = |offset| -> Result<[u8; 32], GuardianCheckpointCipherError> {
+            begin[offset..offset + 32].try_into().map_err(|_| invalid())
+        };
+        let descriptor = GuardianCheckpointArtifactDescriptorV1 {
+            origin: GuardianCheckpointOriginV1::from_genesis_effect(effect)
+                .map_err(|_| invalid())?,
+            parser_stream_bytes: 0,
+            replay_identity_digest: digest(128)?,
+            rows: read_u32(160)?,
+            cols: read_u32(164)?,
+            terminal_payload_bytes: read_u64(168)?,
+            terminal_payload_digest: digest(176)?,
+        };
+        descriptor
+            .validate_claimed_identity_digests(digest(88)?, digest(56)?)
+            .map_err(|_| invalid())?;
+        if upload.is_nil() || read_u64(120)? != 1 {
+            return Err(invalid());
+        }
+        let chunk_bytes = read_u32(328)?;
+        let chunks = read_u32(332)?;
+        let mut ordered = GuardianCheckpointOrderedChunkSetBuilderV1::new(
+            descriptor.terminal_payload_bytes,
+            chunk_bytes,
+            chunks,
+        )?;
+        if records.len()
+            != usize::try_from(chunks)
+                .map_err(|_| invalid())?
+                .checked_add(2)
+                .ok_or_else(invalid)?
+        {
+            return Err(invalid());
+        }
+        let scope = GuardianCheckpointStageScopeV1::genesis(effect)?;
+        let expected = |kind, position, bytes| {
+            GuardianCheckpointStageRecordContextV1::from_persisted_parts(
+                kind,
+                scope,
+                upload,
+                descriptor.canonical_boundary_identity_digest(),
+                descriptor.canonical_checkpoint_identity_digest(),
+                context.publication_id(),
+                position,
+                bytes,
+            )
+        };
+        if !context.same_wire_identity(&expected(
+            GuardianCheckpointStageRecordKindV1::CandidateMetadata,
+            None,
+            GUARDIAN_CHECKPOINT_BEGIN_REQUEST_BYTES,
+        )?) {
+            return Err(invalid());
+        }
+        let mut payload = Zeroizing::new(Vec::new());
+        payload
+            .try_reserve_exact(
+                usize::try_from(descriptor.terminal_payload_bytes).map_err(|_| invalid())?,
+            )
+            .map_err(|_| GuardianCheckpointCipherError::PlaintextAllocationFailed)?;
+        for index in 0..chunks {
+            let offset = u64::from(index) * u64::from(chunk_bytes);
+            let bytes = u32::try_from(
+                (descriptor.terminal_payload_bytes - offset).min(u64::from(chunk_bytes)),
+            )
+            .map_err(|_| invalid())?;
+            let chunk = self.open(
+                &expected(
+                    GuardianCheckpointStageRecordKindV1::Chunk,
+                    Some((index, offset)),
+                    bytes,
+                )?,
+                &records[usize::try_from(index).map_err(|_| invalid())? + 1],
+                bytes,
+            )?;
+            ordered.push_authenticated_chunk(index, offset, &chunk)?;
+            payload.extend_from_slice(&chunk);
+        }
+        let (payload_bytes, payload_digest) = terminal_payload_identity(&payload)
+            .map_err(|_| GuardianCheckpointCipherError::PlaintextIdentityMismatch)?;
+        if payload_bytes != descriptor.terminal_payload_bytes
+            || !checkpoint_stage_digests_match(&payload_digest, &descriptor.terminal_payload_digest)
+        {
+            return Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch);
+        }
+        // Canonical Begin was independently checked above; do not invoke the
+        // current-version Stage decoder to construct its historical identity.
+        let mut candidate_hash = Sha256::new();
+        candidate_hash.update(CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN);
+        candidate_hash.update(&begin);
+        let identity = GuardianCheckpointCandidateIdentityV1 {
+            digest: Zeroizing::new(candidate_hash.finalize().into()),
+        };
+        begin[6] = 3;
+        let manifest = checkpoint_canonical_seal_manifest(&begin, &identity, &ordered.finish()?)?;
+        begin[6] = 1;
+        let seal = self.open_exact_payload(
+            &expected(
+                GuardianCheckpointStageRecordKindV1::SealManifest,
+                None,
+                GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+            )?,
+            records.last().ok_or_else(invalid)?,
+            GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES,
+        )?;
+        if !checkpoint_stage_bytes_match(&seal, &manifest) {
+            return Err(GuardianCheckpointCipherError::SealManifestIdentityMismatch);
+        }
+        Ok(GuardianAuthenticatedHistoricalGenesisPayload { begin, payload })
     }
 
     /// Authenticate an existing final record and prove that its decrypted
@@ -9903,6 +10107,141 @@ mod tests {
     }
 
     #[test]
+    fn historical_genesis_payload_authenticates_unknown_profile_without_authorizing_migration() {
+        let cipher = checkpoint_stage_cipher(0xb3);
+        // Synthetic pristine V2 data exercises profile authorization. Genuine
+        // old-producer provenance is covered separately by the retained-birth test.
+        let current = terminal_checkpoint();
+        let canonical = current.canonical_payload();
+        assert!(!canonical
+            .windows(b"wrap_next_column".len())
+            .any(|bytes| bytes == b"wrap_next_column"));
+        let suffix = canonical.strip_prefix(b"{\"version\":3,").unwrap();
+        let mut payload = b"{\"version\":2,".to_vec();
+        payload.extend_from_slice(suffix);
+        frankenterm_term::terminalstate::checkpoint::PreparedTerminalCheckpointV2Migration::decode_canonical_json(
+            &payload, TerminalCheckpointLimits::default(),
+        ).unwrap();
+        let (total, payload_digest) = terminal_payload_identity(&payload).unwrap();
+        let mut profile = Sha256::new();
+        profile.update(REPLAY_IDENTITY_DIGEST_DOMAIN);
+        profile.update(b"frankenterm.escape-parser.recovery-ground.v3\0");
+        profile.update(b"frankenterm.term.recovery-replay-semantics.v2");
+        let supported: [u8; 32] = profile.finalize().into();
+        for replay_identity_digest in [supported, [0xb3; 32]] {
+            let effect = Uuid::new_v4();
+            let upload = Uuid::new_v4();
+            let publication = Uuid::new_v4();
+            let descriptor = GuardianCheckpointArtifactDescriptorV1 {
+                origin: GuardianCheckpointOriginV1::from_genesis_effect(effect).unwrap(),
+                parser_stream_bytes: 0,
+                replay_identity_digest,
+                rows: 24,
+                cols: 80,
+                terminal_payload_bytes: total,
+                terminal_payload_digest: payload_digest,
+            };
+            let mut begin = vec![0; 336];
+            begin[..9].copy_from_slice(&[b'G', b'C', b'S', b'1', 0, 2, 1, 0, 2]);
+            begin[16..32].copy_from_slice(effect.as_bytes());
+            begin[40..56].copy_from_slice(upload.as_bytes());
+            begin[56..88].copy_from_slice(&descriptor.canonical_checkpoint_identity_digest());
+            begin[88..120].copy_from_slice(&descriptor.canonical_boundary_identity_digest());
+            begin[120..128].copy_from_slice(&1u64.to_be_bytes());
+            begin[128..160].copy_from_slice(&descriptor.replay_identity_digest);
+            begin[160..164].copy_from_slice(&descriptor.rows.to_be_bytes());
+            begin[164..168].copy_from_slice(&descriptor.cols.to_be_bytes());
+            begin[168..176].copy_from_slice(&total.to_be_bytes());
+            begin[176..208].copy_from_slice(&payload_digest);
+            begin[224] = 1;
+            begin[232..248].copy_from_slice(effect.as_bytes());
+            let chunk_bytes = u32::try_from(total).unwrap();
+            begin[328..332].copy_from_slice(&chunk_bytes.to_be_bytes());
+            begin[332..336].copy_from_slice(&1u32.to_be_bytes());
+            let scope = GuardianCheckpointStageScopeV1::genesis(effect).unwrap();
+            let seal = |kind, position, bytes: &[u8]| {
+                let (length, digest) = checkpoint_stage_plaintext_identity(bytes).unwrap();
+                let context = GuardianCheckpointStageRecordContextV1::from_persisted_parts(
+                    kind,
+                    scope,
+                    upload,
+                    descriptor.canonical_boundary_identity_digest(),
+                    descriptor.canonical_checkpoint_identity_digest(),
+                    publication,
+                    position,
+                    length,
+                )
+                .unwrap();
+                cipher.seal_exact_payload(context, bytes, &digest).unwrap()
+            };
+            let mut candidate_hash = Sha256::new();
+            candidate_hash.update(CHECKPOINT_CANDIDATE_IDENTITY_DOMAIN);
+            candidate_hash.update(&begin);
+            let candidate_identity = GuardianCheckpointCandidateIdentityV1 {
+                digest: Zeroizing::new(candidate_hash.finalize().into()),
+            };
+            let mut ordered =
+                GuardianCheckpointOrderedChunkSetBuilderV1::new(total, chunk_bytes, 1).unwrap();
+            ordered
+                .push_authenticated_chunk(0, 0, &Zeroizing::new(payload.clone()))
+                .unwrap();
+            let mut records = vec![
+                seal(
+                    GuardianCheckpointStageRecordKindV1::CandidateMetadata,
+                    None,
+                    &begin,
+                ),
+                seal(
+                    GuardianCheckpointStageRecordKindV1::Chunk,
+                    Some((0, 0)),
+                    &payload,
+                ),
+            ];
+            begin[6] = 3;
+            let manifest = checkpoint_canonical_seal_manifest(
+                &begin,
+                &candidate_identity,
+                &ordered.finish().unwrap(),
+            )
+            .unwrap();
+            records.push(seal(
+                GuardianCheckpointStageRecordKindV1::SealManifest,
+                None,
+                &manifest,
+            ));
+            let authenticated = cipher.inspect_historical_genesis_payload(&records).unwrap();
+            assert_eq!(authenticated.terminal_payload(), payload);
+            assert_eq!(
+                &authenticated.canonical_begin()[128..160],
+                &replay_identity_digest
+            );
+            let prepared = authenticated.prepare_v2_migration(TerminalCheckpointLimits::default());
+            if replay_identity_digest == supported {
+                assert_eq!(prepared.unwrap().source_canonical_payload(), payload);
+                let mut limits = TerminalCheckpointLimits::default();
+                limits.max_retained_capture_bytes =
+                    authenticated.begin.capacity() + authenticated.payload.capacity();
+                assert!(
+                    authenticated.prepare_v2_migration(limits).is_err(),
+                    "already-retained authenticated bytes must consume the migration budget"
+                );
+            } else {
+                assert!(
+                    prepared.is_err(),
+                    "authenticated unsupported replay profile must refuse migration"
+                );
+            }
+            for index in 0..records.len() {
+                records[index].ciphertext[0] ^= 1;
+                assert!(cipher.inspect_historical_genesis_payload(&records).is_err());
+                records[index].ciphertext[0] ^= 1;
+            }
+            records.swap(0, 1);
+            assert!(cipher.inspect_historical_genesis_payload(&records).is_err());
+        }
+    }
+
+    #[test]
     fn recovery_claim_intent_authenticates_builds_lineage_and_operation_ids() {
         let intent = GuardianRecoveryClaimIntentV1 {
             root_envelope_sha256: [1; 32],
@@ -11941,6 +12280,7 @@ mod tests {
             "inspect_catalog_adoption_evidence:pub:GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_catalog_adoption_evidence_with_seed:pub:GuardianCheckpointCatalogAdoptionEvidenceSeedV1,GuardianCheckpointCatalogAdoptionBindingV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_durable_manifest_receipt:pub:GuardianCheckpointStageBindingV1,GuardianCheckpointStageRequestV1,Uuid,GuardianCheckpointCandidateIdentityV1,GuardianCheckpointOrderedChunkSetIdentityV1,GuardianEncryptedCheckpointStageRecordV1",
+            "inspect_historical_genesis_payload:pub:GuardianEncryptedCheckpointStageRecordV1",
             "inspect_expiry_finalizer:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianEncryptedCheckpointStageRecordV1",
             "inspect_expiry_finalizer_with_policy:pub:GuardianCheckpointDurableCompletionReceiptV1,GuardianCheckpointStageRequestV1,GuardianCheckpointPolicyExpiryReceiptV1,GuardianEncryptedCheckpointStageRecordV1",
             "key_id:pub:",
@@ -11968,23 +12308,33 @@ mod tests {
         sort_authority_methods(&mut inventory.cipher_method_surfaces);
         let mut expected_cipher_method_surfaces = vec![
             expected_authority_method(
-                "GuardianCheckpointCipher", "pub", false,
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
                 "fn seal_recovery_claim_intent(&self, intent: GuardianRecoveryClaimIntentV1) -> Result<[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES], GuardianSpawnCustodyError>",
             ),
             expected_authority_method(
-                "GuardianCheckpointCipher", "pub", false,
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
                 "fn open_recovery_claim_intent(&self, bytes: &[u8; GUARDIAN_RECOVERY_CLAIM_INTENT_BYTES]) -> Result<GuardianRecoveryClaimIntentV1, GuardianSpawnCustodyError>",
             ),
             expected_authority_method(
-                "GuardianCheckpointCipher", "pub", false,
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
                 "fn seal_successor_custody(&self, context: GuardianSuccessorCustodyContextV1, secret: &[u8; 32]) -> Result<[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES], GuardianSpawnCustodyError>",
             ),
             expected_authority_method(
-                "GuardianCheckpointCipher", "pub", false,
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
                 "fn open_successor_custody_record(&self, bytes: &[u8; GUARDIAN_SUCCESSOR_CUSTODY_BYTES]) -> Result<(GuardianSuccessorCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>",
             ),
             expected_authority_method(
-                "GuardianCheckpointCipher", "pub", false,
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
                 "fn open_spawn_custody_record(&self, bytes: &[u8; GUARDIAN_SPAWN_CUSTODY_BYTES]) -> Result<(GuardianSpawnCustodyContextV1, Zeroizing<[u8; 32]>), GuardianSpawnCustodyError>",
             ),
             expected_authority_method(
@@ -12136,6 +12486,12 @@ mod tests {
                 "private",
                 false,
                 "fn open_exact_payload(&self, expected_context: &GuardianCheckpointStageRecordContextV1, record: &GuardianEncryptedCheckpointStageRecordV1, max_plaintext_bytes: u32) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn inspect_historical_genesis_payload(&self, records: &[GuardianEncryptedCheckpointStageRecordV1]) -> Result<GuardianAuthenticatedHistoricalGenesisPayload, GuardianCheckpointCipherError>",
             ),
         ];
         expected_cipher_method_surfaces.extend([
@@ -12462,15 +12818,9 @@ mod tests {
                 expected_use("use thiserror::Error;"),
                 expected_use("use uuid::Uuid;"),
                 expected_use("use zeroize::{Zeroize, Zeroizing};"),
-                expected_use(
-                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
-                ),
-                expected_use(
-                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
-                ),
-                expected_use(
-                    "use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",
-                ),
+                expected_use("use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",),
+                expected_use("use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",),
+                expected_use("use crate::guardian_protocol::GuardianCheckpointOutputBoundaryV1;",),
                 expected_use(
                     "use crate::guardian_protocol::{GuardianCheckpointDescriptorV1, GuardianCheckpointDisposition, GuardianCheckpointIntent};",
                 ),

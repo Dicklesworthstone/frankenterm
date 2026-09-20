@@ -2890,6 +2890,299 @@ impl std::fmt::Debug for TerminalCheckpointV3 {
     }
 }
 
+// Historical wire projections deliberately remain private. They describe the
+// exact V2 field order without making V2 input acceptable to the live decoder.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "CheckpointSavedCursor", deny_unknown_fields)]
+struct HistoricalSavedCursorV2 {
+    position: CheckpointCursorPosition,
+    wrap_next: bool,
+    #[serde(skip)]
+    wrap_next_column: Option<u64>,
+    pen: CheckpointCellAttributes,
+    dec_origin_mode: bool,
+    g0_charset: CheckpointCharSet,
+    g1_charset: CheckpointCharSet,
+}
+
+mod historical_saved_cursor_option {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct Borrowed<'a>(#[serde(with = "HistoricalSavedCursorV2")] &'a CheckpointSavedCursor);
+
+    #[derive(Deserialize)]
+    struct Owned(#[serde(with = "HistoricalSavedCursorV2")] CheckpointSavedCursor);
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        value: &Option<CheckpointSavedCursor>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.as_ref().map(Borrowed).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<CheckpointSavedCursor>, D::Error> {
+        Option::<Owned>::deserialize(deserializer).map(|value| value.map(|cursor| cursor.0))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "CheckpointScreen", deny_unknown_fields)]
+struct HistoricalScreenV2 {
+    lines: Vec<CheckpointLine>,
+    stable_row_index_offset: u64,
+    cold_snapshot_generation: Option<CheckpointScrollbackGeneration>,
+    cold_prefix_line_count: u64,
+    allow_scrollback: bool,
+    keyboard_stack: Vec<CheckpointKeyboardEncoding>,
+    physical_rows: u32,
+    physical_cols: u32,
+    dpi: u32,
+    #[serde(with = "historical_saved_cursor_option")]
+    saved_cursor: Option<CheckpointSavedCursor>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "TerminalCheckpointV3", deny_unknown_fields)]
+struct HistoricalTerminalV2 {
+    version: u32,
+    custom_cell_width_maps: Vec<CheckpointCustomCellWidthMap>,
+    replay_config: CheckpointReplayConfigV2,
+    #[serde(with = "HistoricalScreenV2")]
+    primary_screen: CheckpointScreen,
+    #[serde(with = "HistoricalScreenV2")]
+    alternate_screen: CheckpointScreen,
+    alternate_screen_active: bool,
+    pen: CheckpointCellAttributes,
+    cursor: CheckpointCursorPosition,
+    wrap_next: bool,
+    clear_semantic_attribute_on_newline: bool,
+    last_semantic_command_status: Option<i32>,
+    insert: bool,
+    dec_auto_wrap: bool,
+    saved_dec_private_modes: BTreeMap<CheckpointSavedDecMode, bool>,
+    reverse_wraparound_mode: bool,
+    reverse_video_mode: bool,
+    synchronized_output: bool,
+    dec_origin_mode: bool,
+    top_margin: VisibleRowIndex,
+    bottom_margin: VisibleRowIndex,
+    left_margin: u64,
+    right_margin: u64,
+    left_and_right_margin_mode: bool,
+    application_cursor_keys: bool,
+    modify_other_keys: Option<i64>,
+    dec_ansi_mode: bool,
+    sixel_display_mode: bool,
+    use_private_color_registers_for_each_graphic: bool,
+    color_map: BTreeMap<u16, CheckpointRgbColor>,
+    application_keypad: bool,
+    bracketed_paste: bool,
+    any_event_mouse: bool,
+    focus_tracking: bool,
+    mouse_encoding: CheckpointMouseEncoding,
+    mouse_tracking: bool,
+    button_event_mouse: bool,
+    current_mouse_buttons: Vec<CheckpointMouseButton>,
+    last_mouse_move: Option<CheckpointMouseEvent>,
+    cursor_visible: bool,
+    keyboard_encoding: CheckpointKeyboardEncoding,
+    g0_charset: CheckpointCharSet,
+    g1_charset: CheckpointCharSet,
+    shift_out: bool,
+    newline_mode: bool,
+    tab_stops: Vec<bool>,
+    tab_width: u64,
+    title: String,
+    icon_title: Option<String>,
+    progress: Progress,
+    palette: Option<CheckpointColorPalette>,
+    pixel_width: u64,
+    pixel_height: u64,
+    dpi: u32,
+    current_dir: Option<String>,
+    term_program: String,
+    term_version: String,
+    sixel_scrolls_right: bool,
+    user_vars: BTreeMap<String, String>,
+    kitty_max_image_id: u32,
+    seqno: u64,
+    unicode_version: CheckpointUnicodeVersion,
+    unicode_version_stack: Vec<CheckpointUnicodeVersionStackEntry>,
+    enable_conpty_quirks: bool,
+    suppress_initial_title_change: bool,
+    accumulating_title: Option<String>,
+    lost_focus_seqno: u64,
+    lost_focus_alerted_seqno: u64,
+    focused: bool,
+    bidi_enabled: Option<bool>,
+    bidi_hint: Option<CheckpointBidiHint>,
+}
+
+#[derive(Serialize)]
+struct HistoricalTerminalRef<'a>(#[serde(with = "HistoricalTerminalV2")] &'a TerminalCheckpointV3);
+
+/// Explicit, capability-free preparation of the losslessly reconstructible V2
+/// subset. The caller must separately authenticate these exact source bytes and
+/// publish a new target identity; this value grants no guardian or replay lease.
+pub struct PreparedTerminalCheckpointV2Migration {
+    source: Zeroizing<Vec<u8>>,
+    target: Zeroizing<Vec<u8>>,
+    rows: u32,
+    cols: u32,
+    pixel_width: u64,
+    pixel_height: u64,
+}
+
+impl std::fmt::Debug for PreparedTerminalCheckpointV2Migration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedTerminalCheckpointV2Migration")
+            .field("source_bytes", &self.source.len())
+            .field("target_bytes", &self.target.len())
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("pixel_width", &self.pixel_width)
+            .field("pixel_height", &self.pixel_height)
+            .finish()
+    }
+}
+
+impl PreparedTerminalCheckpointV2Migration {
+    pub fn decode_canonical_json(
+        bytes: &[u8],
+        limits: TerminalCheckpointLimits,
+    ) -> Result<Self, TerminalCheckpointError> {
+        limits.validate_policy()?;
+        ensure_limit("encoded_bytes", bytes.len(), limits.max_encoded_bytes)?;
+        if !bytes.starts_with(b"{\"version\":2,") {
+            return Err(TerminalCheckpointError::NonCanonicalEncoding);
+        }
+        let mut budget = JsonStructuralBudget {
+            retained_bytes: 0,
+            limits,
+        };
+        let mut decoder = serde_json::Deserializer::from_slice(bytes);
+        JsonStructuralSeed {
+            budget: &mut budget,
+            depth: 0,
+        }
+        .deserialize(&mut decoder)
+        .map_err(|_| TerminalCheckpointError::Serialization)?;
+        decoder
+            .end()
+            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        let mut decoder = serde_json::Deserializer::from_slice(bytes);
+        let mut checkpoint = HistoricalTerminalV2::deserialize(&mut decoder)
+            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        decoder
+            .end()
+            .map_err(|_| TerminalCheckpointError::Serialization)?;
+        for screen in [&checkpoint.primary_screen, &checkpoint.alternate_screen] {
+            if screen
+                .saved_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.wrap_next)
+            {
+                return Err(TerminalCheckpointError::InvalidField {
+                    field: "migration.v2.saved_cursor.wrap_next",
+                    reason: "historical pending-wrap insertion endpoint is unavailable",
+                });
+            }
+        }
+        // Charge both retained canonical buffers together with the structural
+        // materialization estimate. Writers reserve fallibly within the remaining
+        // budget; retaining two individually bounded payloads is insufficient.
+        let remaining = limits
+            .max_retained_capture_bytes
+            .checked_sub(budget.retained_bytes)
+            .ok_or_else(|| {
+                resource_limit(
+                    "migration_retained_bytes",
+                    budget.retained_bytes,
+                    limits.max_retained_capture_bytes,
+                )
+            })?;
+        let maximum = limits.max_encoded_bytes.min(remaining);
+        let mut writer = BoundedCheckpointWriter::new(maximum);
+        if serde_json::to_writer(&mut writer, &HistoricalTerminalRef(&checkpoint)).is_err() {
+            return Err(match writer.failure {
+                Some(BoundedWriterFailure::Limit) => resource_limit(
+                    "migration_retained_bytes",
+                    maximum.saturating_add(1),
+                    maximum,
+                ),
+                Some(BoundedWriterFailure::Allocation) => {
+                    TerminalCheckpointError::ResourceAllocation("migration.source")
+                }
+                None => TerminalCheckpointError::Serialization,
+            });
+        }
+        let source = writer.into_inner();
+        if source.as_slice() != bytes {
+            return Err(TerminalCheckpointError::NonCanonicalEncoding);
+        }
+        let remaining = remaining.checked_sub(source.capacity()).ok_or_else(|| {
+            resource_limit("migration_retained_bytes", source.capacity(), remaining)
+        })?;
+        // This is an explicit semantic projection, never a JSON version edit.
+        // All common fields stay in the same owned model; V2's absent endpoints
+        // were constructed as None by the historical cursor projection.
+        checkpoint.version = TERMINAL_CHECKPOINT_VERSION;
+        let target_limits = TerminalCheckpointLimits {
+            max_encoded_bytes: limits.max_encoded_bytes.min(remaining),
+            ..limits
+        };
+        let target = checkpoint.to_canonical_json(target_limits)?;
+        ensure_limit("migration_retained_bytes", target.capacity(), remaining)?;
+        let rows = checkpoint.primary_screen.physical_rows;
+        let cols = checkpoint.primary_screen.physical_cols;
+        let pixel_width = checkpoint.pixel_width;
+        let pixel_height = checkpoint.pixel_height;
+        drop(checkpoint);
+        Ok(Self {
+            source,
+            target,
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        })
+    }
+
+    #[must_use]
+    pub fn source_canonical_payload(&self) -> &[u8] {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn target_canonical_payload(&self) -> &[u8] {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    #[must_use]
+    pub const fn cols(&self) -> u32 {
+        self.cols
+    }
+
+    #[must_use]
+    pub const fn pixel_width(&self) -> u64 {
+        self.pixel_width
+    }
+
+    #[must_use]
+    pub const fn pixel_height(&self) -> u64 {
+        self.pixel_height
+    }
+}
+
 /// Bounded hot terminal state captured under the terminal lock.
 /// The cold-history snapshot generation and interval are pinned under lock,
 /// while materialization of cold rows and fragments from the spill sink is deferred
@@ -5775,6 +6068,165 @@ mod tests {
             TerminalCheckpointV3::decode_canonical_json(&extra, limits),
             Err(TerminalCheckpointError::Serialization)
         ));
+    }
+
+    fn historical_v2_wire(mut checkpoint: TerminalCheckpointV3) -> Vec<u8> {
+        // Construct the historical typed wire, rather than rewriting a V3 JSON
+        // version or treating the resulting data as an authenticated artifact.
+        checkpoint.version = 2;
+        serde_json::to_vec(&HistoricalTerminalRef(&checkpoint)).unwrap()
+    }
+
+    #[test]
+    fn historical_v2_preparation_preserves_source_and_all_common_state() {
+        let limits = TerminalCheckpointLimits::default();
+        let mut live = terminal_with_distinct_custom_width_maps(false);
+        live.advance_bytes(b"primary\x1b]0;historical-title\x07\x1b]8;id=old;https://example.invalid/v2\x07link\x1b]8;;\x07\x1b7");
+        live.advance_bytes(b"\x1b[?1049h\x1b[31;4malternate\x1b7");
+        live.user_vars
+            .insert("historical".into(), "retained".into());
+        live.progress = Progress::Percentage(67);
+        live.accumulating_title = Some("pending-fragment".into());
+        let expected = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert!(expected.primary_screen.saved_cursor.is_some());
+        assert!(expected.alternate_screen.saved_cursor.is_some());
+        let source = historical_v2_wire(expected.clone());
+        assert!(source.starts_with(b"{\"version\":2,"));
+        assert!(!source
+            .windows(b"wrap_next_column".len())
+            .any(|part| part == b"wrap_next_column"));
+        assert!(TerminalCheckpointV3::decode_canonical_json(&source, limits).is_err());
+        let prepared =
+            PreparedTerminalCheckpointV2Migration::decode_canonical_json(&source, limits).unwrap();
+        assert_eq!(prepared.source_canonical_payload(), source);
+        assert_eq!(prepared.rows(), expected.primary_screen.physical_rows);
+        assert_eq!(prepared.cols(), expected.primary_screen.physical_cols);
+        assert_eq!(prepared.pixel_width(), expected.pixel_width);
+        assert_eq!(prepared.pixel_height(), expected.pixel_height);
+        let target = TerminalCheckpointV3::decode_canonical_json(
+            prepared.target_canonical_payload(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            target.checkpoint(),
+            &expected,
+            "every common field must survive projection"
+        );
+        assert_eq!(
+            prepared.target_canonical_payload(),
+            expected.to_canonical_json(limits).unwrap().as_slice()
+        );
+        assert!(
+            prepared.source.capacity() + prepared.target.capacity()
+                <= limits.max_retained_capture_bytes
+        );
+    }
+
+    #[test]
+    fn historical_v2_preparation_rejects_ambiguous_saved_wrap_on_either_screen() {
+        let limits = TerminalCheckpointLimits::default();
+        let mut live = terminal();
+        live.advance_bytes(b"primary\x1b7\x1b[?1049hsecondary\x1b7");
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        for alternate in [false, true] {
+            let mut ambiguous = checkpoint.clone();
+            let screen = if alternate {
+                &mut ambiguous.alternate_screen
+            } else {
+                &mut ambiguous.primary_screen
+            };
+            let saved = screen.saved_cursor.as_mut().unwrap();
+            saved.wrap_next = true;
+            saved.wrap_next_column = Some(saved.position.x + 1);
+            let source = historical_v2_wire(ambiguous);
+            assert!(matches!(
+                PreparedTerminalCheckpointV2Migration::decode_canonical_json(&source, limits),
+                Err(TerminalCheckpointError::InvalidField {
+                    field: "migration.v2.saved_cursor.wrap_next",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn historical_v2_preparation_requires_exact_wire_and_joint_memory_budget() {
+        let limits = TerminalCheckpointLimits::default();
+        let mut live = terminal();
+        live.advance_bytes(b"saved\x1b7");
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        let source = historical_v2_wire(checkpoint.clone());
+        let mut unknown = source[..source.len() - 1].to_vec();
+        unknown.extend_from_slice(b",\"unexpected\":true}");
+        let mut whitespace = source.clone();
+        whitespace.push(b' ');
+        let mut omitted = source.clone();
+        let field = b"\"wrap_next\":false,";
+        let offset = omitted
+            .windows(field.len())
+            .position(|part| part == field)
+            .unwrap();
+        omitted.drain(offset..offset + field.len());
+        let mut new_cursor_field = source.clone();
+        let offset = new_cursor_field
+            .windows(field.len())
+            .position(|part| part == field)
+            .unwrap()
+            + field.len();
+        new_cursor_field.splice(
+            offset..offset,
+            b"\"wrap_next_column\":null,".iter().copied(),
+        );
+        for invalid in [
+            unknown,
+            whitespace,
+            omitted,
+            new_cursor_field,
+            checkpoint.to_canonical_json(limits).unwrap().to_vec(),
+        ] {
+            assert!(
+                PreparedTerminalCheckpointV2Migration::decode_canonical_json(&invalid, limits)
+                    .is_err()
+            );
+        }
+        let prepared =
+            PreparedTerminalCheckpointV2Migration::decode_canonical_json(&source, limits).unwrap();
+        let mut budget = JsonStructuralBudget {
+            retained_bytes: 0,
+            limits,
+        };
+        let mut decoder = serde_json::Deserializer::from_slice(&source);
+        JsonStructuralSeed {
+            budget: &mut budget,
+            depth: 0,
+        }
+        .deserialize(&mut decoder)
+        .unwrap();
+        let joint_limit =
+            budget.retained_bytes + prepared.source.capacity() + prepared.target.len() - 1;
+        assert!(joint_limit > source.len());
+        assert!(
+            PreparedTerminalCheckpointV2Migration::decode_canonical_json(
+                &source,
+                TerminalCheckpointLimits {
+                    max_retained_capture_bytes: joint_limit,
+                    ..limits
+                }
+            )
+            .is_err(),
+            "individually fitting buffers must not evade the joint retained limit"
+        );
+        assert!(
+            PreparedTerminalCheckpointV2Migration::decode_canonical_json(
+                &source,
+                TerminalCheckpointLimits {
+                    max_encoded_bytes: source.len() - 1,
+                    ..limits
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -126,6 +126,10 @@ fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), 
     Ok(())
 }
 
+fn get_lines_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(if attempt == 0 { 1 } else { 10 })
+}
+
 async fn text_snapshot_retry_with_cx(cx: &Cx, attempt: usize) -> Result<(), DirectMuxError> {
     if attempt == 0 {
         // A freshly installed cold layout or completed producer write can
@@ -1468,6 +1472,8 @@ pub struct DirectMuxClient {
     poison_transition_count: usize,
     #[cfg(test)]
     render_retention_codec_stats: RenderRetentionCodecStats,
+    #[cfg(test)]
+    get_lines_retry_delays: [Option<Duration>; 3],
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -2315,6 +2321,8 @@ impl DirectMuxClient {
             poison_transition_count: 0,
             #[cfg(test)]
             render_retention_codec_stats: RenderRetentionCodecStats::default(),
+            #[cfg(test)]
+            get_lines_retry_delays: [None; 3],
             config,
         };
 
@@ -2610,40 +2618,75 @@ impl DirectMuxClient {
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
         const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
-        let mut busy_retries = 0usize;
-        loop {
-            let response = self
-                .send_request_with_cx(
-                    cx,
-                    Pdu::GetLines(GetLines {
-                        pane_id: pane_id as usize,
-                        lines: lines.clone(),
-                    }),
-                )
-                .await;
-            let response = match response {
-                Err(DirectMuxError::RemoteRejection(error))
-                    if error.validate().is_ok()
-                        && error.request_ident == <GetLines as codec::PduWireIdent>::IDENT
-                        && error.effect == codec::MuxErrorEffect::NOT_APPLIED
-                        && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF =>
-                {
-                    if error.code == codec::MuxErrorCode::RESOURCE_BUSY
-                        && busy_retries < MAX_RESOURCE_BUSY_RETRIES
-                    {
-                        busy_retries += 1;
-                        crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
-                            .await
-                            .map_err(|error| cancelled_mux_error("get_lines_backoff", error))?;
-                        continue;
-                    }
-                    return Err(DirectMuxError::RemoteRejection(error));
+        let budget = self
+            .config
+            .write_timeout
+            .saturating_add(self.config.read_timeout);
+        let deadline = crate::runtime_async::timer_now_with_cx(cx) + budget;
+        #[cfg(test)]
+        {
+            self.get_lines_retry_delays = [None; 3];
+        }
+        let result = crate::runtime_async::timeout_with_cx(cx, budget, async {
+            let mut busy_retries = 0usize;
+            loop {
+                checkpoint_mux_cx(cx, self.connection_id, "get_lines_retry")?;
+                if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
+                    return Err(DirectMuxError::ReadTimeout);
                 }
-                result => result?,
-            };
-            match response {
-                Pdu::GetLinesResponse(payload) => return Ok(payload),
-                other => return self.unexpected_response("GetLinesResponse", &other, true),
+                let response = self
+                    .send_request_with_cx(
+                        cx,
+                        Pdu::GetLines(GetLines {
+                            pane_id: pane_id as usize,
+                            lines: lines.clone(),
+                        }),
+                    )
+                    .await;
+                let response = match response {
+                    Err(DirectMuxError::RemoteRejection(error))
+                        if error.validate().is_ok()
+                            && error.request_ident == <GetLines as codec::PduWireIdent>::IDENT
+                            && error.effect == codec::MuxErrorEffect::NOT_APPLIED
+                            && error.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF =>
+                    {
+                        if error.code == codec::MuxErrorCode::RESOURCE_BUSY
+                            && busy_retries < MAX_RESOURCE_BUSY_RETRIES
+                        {
+                            // A completed producer write can make the next read ready
+                            // immediately. Still use a timer; repeated contention keeps
+                            // the conservative delay and the original retry cap.
+                            let delay = get_lines_retry_delay(busy_retries);
+                            #[cfg(test)]
+                            {
+                                self.get_lines_retry_delays[busy_retries] = Some(delay);
+                            }
+                            busy_retries += 1;
+                            crate::runtime_async::sleep_with_cx(cx, delay)
+                                .await
+                                .map_err(|error| cancelled_mux_error("get_lines_backoff", error))?;
+                            continue;
+                        }
+                        return Err(DirectMuxError::RemoteRejection(error));
+                    }
+                    result => result?,
+                };
+                match response {
+                    Pdu::GetLinesResponse(payload) => return Ok(payload),
+                    other => return self.unexpected_response("GetLinesResponse", &other, true),
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(timeout) => {
+                let error =
+                    classify_cx_timeout(cx, "get_lines", timeout, DirectMuxError::ReadTimeout);
+                // Cancellation of an in-flight read may leave a partial frame.
+                // Never let a later caller reuse this stream as if aligned.
+                self.poison_connection("get lines budget expired", true);
+                Err(error)
             }
         }
     }
@@ -8307,6 +8350,11 @@ mod tests {
                 2,
                 "first busy followed by valid lines must succeed on exactly second request"
             );
+            assert_eq!(
+                client.get_lines_retry_delays,
+                [Some(Duration::from_millis(1)), None, None],
+                "actual successful retry must schedule only the short initial delay"
+            );
             drop(client);
             timeout(Duration::from_secs(5), server)
                 .await
@@ -8350,6 +8398,14 @@ mod tests {
                 requests.load(Ordering::SeqCst),
                 4,
                 "repeated busy must stop bounded at cap (1 initial + 3 retries = 4 requests)"
+            );
+            assert_eq!(
+                client.get_lines_retry_delays,
+                [
+                    Some(Duration::from_millis(1)),
+                    Some(Duration::from_millis(10)),
+                    Some(Duration::from_millis(10)),
+                ]
             );
             drop(client);
             timeout(Duration::from_secs(5), server)
@@ -8663,6 +8719,109 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn get_lines_retries_share_one_request_deadline() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("get-lines-deadline.sock");
+            let listener = compat_unix::bind(&path).await.unwrap();
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = StreamingPduBuffer::new();
+                let mut requests = 0;
+                'connection: loop {
+                    let mut bytes = [0; 4096];
+                    let count = unix_stream_read(&mut stream, &mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&bytes[..count]);
+                    while let Some(decoded) = Pdu::stream_decode(&mut buffer).unwrap() {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    min_supported: CODEC_VERSION_MIN_SUPPORTED,
+                                    version_string: "deadline-test".into(),
+                                    executable_path: PathBuf::from("/bin/ft"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetLines(request) => {
+                                assert_eq!(request.pane_id, 42);
+                                assert_eq!(request.lines.len(), 1);
+                                assert_eq!(request.lines[0], 0..1);
+                                requests += 1;
+                                // Each reply fits the individual 900ms read timeout,
+                                // but together they exceed the one-second operation
+                                // budget. No assertion depends on sub-10ms wall time.
+                                crate::runtime_async::sleep(Duration::from_millis(600)).await;
+                                if requests == 1 {
+                                    Pdu::ErrorResponse(codec::ErrorResponse::resource_busy(
+                                        GetLines::IDENT,
+                                    ))
+                                } else {
+                                    Pdu::GetLinesResponse(codec::GetLinesResponse {
+                                        pane_id: request.pane_id,
+                                        lines: vec![(
+                                            0,
+                                            frankenterm_term::Line::from_text(
+                                                "late but individually valid",
+                                                &termwiz::cell::CellAttributes::default(),
+                                                1,
+                                                None,
+                                            ),
+                                        )]
+                                        .into(),
+                                    })
+                                }
+                            }
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        let mut encoded = Vec::new();
+                        response.encode(&mut encoded, decoded.serial).unwrap();
+                        if let Err(error) = stream.write_all(&encoded).await {
+                            assert!(is_disconnected_io_kind(error.kind()));
+                            break 'connection;
+                        }
+                    }
+                }
+                requests
+            });
+            let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                .await
+                .unwrap();
+            client.config.write_timeout = Duration::from_millis(100);
+            client.config.read_timeout = Duration::from_millis(900);
+            let error = client
+                .get_lines_with_cx(&cx, 42, std::iter::once(0..1).collect())
+                .await
+                .expect_err("second individually valid response exceeds aggregate deadline");
+            assert!(matches!(error, DirectMuxError::ReadTimeout), "{error:?}");
+            assert!(client.connection_poisoned);
+            assert_eq!(client.poison_transition_count, 1);
+            assert!(client.outstanding_requests.is_empty());
+            let serial = client.serial;
+            assert!(matches!(
+                client
+                    .get_lines_with_cx(&cx, 42, std::iter::once(0..1).collect())
+                    .await,
+                Err(DirectMuxError::Disconnected)
+            ));
+            assert_eq!(client.serial, serial, "retired stream cannot send again");
+            drop(client);
+            assert_eq!(
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                2
+            );
         });
     }
 
@@ -20107,6 +20266,34 @@ mod tests {
         /// production helpers wrap.
         async fn lab_send(cx: &asupersync::Cx, tx: &compat_mpsc::Sender<PaneDelta>, v: PaneDelta) {
             tx.reserve(cx).await.expect("reserve lab permit").send(v);
+        }
+
+        #[test]
+        fn get_lines_retry_timers_advance_virtual_time_and_cancel() {
+            run_lab(849, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let started = crate::runtime_async::timer_now_with_cx(&cx);
+                for (attempt, expected_ns) in [(0, 1_000_000), (1, 11_000_000), (2, 21_000_000)] {
+                    crate::runtime_async::sleep_with_cx(&cx, get_lines_retry_delay(attempt))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        crate::runtime_async::timer_now_with_cx(&cx).duration_since(started),
+                        expected_ns
+                    );
+                }
+                cx.cancel_with(crate::outcome::CancelKind::User, Some("retry timer test"));
+                let before_cancelled_wait = crate::runtime_async::timer_now_with_cx(&cx);
+                assert!(
+                    crate::runtime_async::sleep_with_cx(&cx, get_lines_retry_delay(0))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    crate::runtime_async::timer_now_with_cx(&cx),
+                    before_cancelled_wait
+                );
+            });
         }
 
         /// 1. A single PaneDelta channel delivers a value end-to-end under
