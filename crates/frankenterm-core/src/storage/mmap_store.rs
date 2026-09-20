@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
@@ -167,6 +167,83 @@ const GF_PRIM: u32 = 0x11d;
 std::thread_local! {
     static PANE_APPEND_DATA_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PANE_APPEND_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static PANE_APPEND_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Keep the remaining slice cursor, including progress within a record or its
+// newline, across short writes. No buffer owns or copies the row payloads.
+fn write_append_slices<W: Write>(
+    writer: &mut W,
+    mut slices: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+struct PaneAppendWriter<'a> {
+    file: &'a mut File,
+    #[cfg(test)]
+    fault_after_bytes: Option<usize>,
+}
+
+impl Write for PaneAppendWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(bytes)])
+    }
+
+    fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fault_after_bytes {
+            if remaining == 0 {
+                return Err(std::io::Error::other(
+                    "injected append failure during real vectored write",
+                ));
+            }
+            let written = write_vectored_prefix(self.file, slices, remaining)?;
+            self.fault_after_bytes = Some(remaining - written);
+            return Ok(written);
+        }
+        #[cfg(test)]
+        PANE_APPEND_WRITE_CALLS.with(|count| count.set(count.get() + 1));
+        self.file.write_vectored(slices)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(test)]
+fn write_vectored_prefix(
+    file: &mut File,
+    slices: &[IoSlice<'_>],
+    limit: usize,
+) -> std::io::Result<usize> {
+    // Faults still write to the real file through the same vectored operation.
+    // This changes only the offered byte prefix, never the production cursor.
+    let mut prefix = [IoSlice::new(&[]); PANE_APPEND_MAX_ROWS * 2];
+    assert!(slices.len() <= prefix.len());
+    let mut remaining = limit;
+    let mut used = 0;
+    for (index, slice) in slices.iter().enumerate() {
+        let len = slice.len().min(remaining);
+        prefix[used] = IoSlice::new(&slice[..len]);
+        used = index + 1;
+        remaining -= len;
+        if remaining == 0 {
+            break;
+        }
+    }
+    PANE_APPEND_WRITE_CALLS.with(|count| count.set(count.get() + 1));
+    file.write_vectored(&prefix[..used])
 }
 
 fn validate_append_batch(lines: &[&str]) -> Result<(), MmapStoreError> {
@@ -1254,9 +1331,22 @@ impl PaneFile {
         } else {
             physical_end
         };
-        let mut offsets = Vec::with_capacity(lines.len());
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(lines.len())
+            .map_err(|_| std::io::Error::other("cannot reserve bounded append offsets"))?;
+        let mut slices = Vec::new();
+        let slice_count = lines
+            .len()
+            .checked_mul(2)
+            .ok_or(MmapStoreError::NumericOverflow("append_slice_count"))?;
+        slices
+            .try_reserve_exact(slice_count)
+            .map_err(|_| std::io::Error::other("cannot reserve bounded append slices"))?;
         for line in lines {
             offsets.push(LineOffset(new_file_len));
+            slices.push(IoSlice::new(line.as_bytes()));
+            slices.push(IoSlice::new(b"\n"));
             new_file_len = new_file_len
                 .checked_add(
                     u64::try_from(line.len())
@@ -1282,26 +1372,26 @@ impl PaneFile {
         // write or durability operation fails, readers keep the prior
         // committed boundary and a later append starts on a fresh line.
         self.trailing_partial = true;
-        for (index, line) in lines.iter().enumerate() {
+        let mut writer = PaneAppendWriter {
+            file: &mut self.file,
             #[cfg(test)]
-            if index == 0 && PANE_APPEND_FAULT.with(|fault| fault.get() == Some(0)) {
-                self.file.write_all(&line.as_bytes()[..line.len() / 2])?;
-                return Err(std::io::Error::other(
-                    "injected append failure during real record write",
-                )
-                .into());
-            }
-            self.file.write_all(line.as_bytes())?;
-            self.file.write_all(b"\n")?;
-            #[cfg(test)]
-            if PANE_APPEND_FAULT.with(|fault| fault.get() == Some(index + 1)) {
-                return Err(std::io::Error::other(
-                    "injected append failure after real record write",
-                )
-                .into());
-            }
-            #[cfg(not(test))]
-            let _ = index;
+            fault_after_bytes: PANE_APPEND_FAULT.with(|fault| match fault.get() {
+                Some(0) => Some(lines[0].len() / 2),
+                Some(rows) if rows <= lines.len() => {
+                    Some(lines[..rows].iter().map(|line| line.len() + 1).sum())
+                }
+                _ => None,
+            }),
+        };
+        // At most 512 descriptors (8 KiB on 64-bit hosts) cover the existing
+        // 256-row/32-MiB bound. File uses writev on Unix; platforms or writes
+        // accepting only a prefix are handled without replaying accepted bytes.
+        write_append_slices(&mut writer, &mut slices)?;
+        #[cfg(test)]
+        if writer.fault_after_bytes == Some(0) {
+            return Err(
+                std::io::Error::other("injected append failure after real vectored write").into(),
+            );
         }
         // A successful spill is a crash-durability acknowledgement, not just
         // a userspace-buffer acknowledgement. `flush` alone can leave the
@@ -3184,6 +3274,123 @@ mod tests {
         MmapScrollbackStore::new(config).expect("create hybrid store")
     }
 
+    #[derive(Clone, Copy)]
+    enum AppendWriteStep {
+        Prefix(usize),
+        Interrupted,
+        Zero,
+        Fatal,
+    }
+
+    struct ScriptedAppendFile {
+        file: File,
+        steps: std::collections::VecDeque<AppendWriteStep>,
+    }
+
+    impl Write for ScriptedAppendFile {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            panic!("append helper must use the vectored path");
+        }
+
+        fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(AppendWriteStep::Prefix(limit)) => {
+                    write_vectored_prefix(&mut self.file, slices, limit)
+                }
+                Some(AppendWriteStep::Interrupted) => Err(std::io::ErrorKind::Interrupted.into()),
+                Some(AppendWriteStep::Zero) => Ok(0),
+                Some(AppendWriteStep::Fatal) => Err(std::io::ErrorKind::PermissionDenied.into()),
+                None => self.file.write_vectored(slices),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn append_vectored_writer_preserves_short_write_progress_and_errors() {
+        use AppendWriteStep::{Fatal, Interrupted, Prefix, Zero};
+        let expected = "abc\n界\nz\n".as_bytes();
+        for (steps, error, written) in [
+            (
+                vec![
+                    Prefix(2),
+                    Interrupted,
+                    Prefix(1),
+                    Prefix(1),
+                    Prefix(2),
+                    Prefix(1),
+                ],
+                None,
+                expected.len(),
+            ),
+            (
+                vec![Prefix(4), Zero],
+                Some(std::io::ErrorKind::WriteZero),
+                4,
+            ),
+            (
+                vec![Prefix(5), Fatal],
+                Some(std::io::ErrorKind::PermissionDenied),
+                5,
+            ),
+        ] {
+            let dir = temp_dir();
+            let path = dir.path().join("vectored.log");
+            let mut writer = ScriptedAppendFile {
+                file: File::create(&path).unwrap(),
+                steps: steps.into(),
+            };
+            let mut slices = [
+                IoSlice::new(b""),
+                IoSlice::new(b"abc"),
+                IoSlice::new(b"\n"),
+                IoSlice::new("界".as_bytes()),
+                IoSlice::new(b"\n"),
+                IoSlice::new(b"z"),
+                IoSlice::new(b"\n"),
+            ];
+            let result = write_append_slices(&mut writer, &mut slices);
+            assert_eq!(result.err().map(|error| error.kind()), error);
+            assert!(
+                writer.steps.is_empty(),
+                "all injected boundaries must execute"
+            );
+            writer.file.sync_data().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), &expected[..written]);
+        }
+    }
+
+    #[test]
+    fn append_batch_uses_bounded_vectored_file_writes() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        let lines: Vec<_> = (0..PANE_APPEND_MAX_ROWS)
+            .map(|index| if index % 2 == 0 { "" } else { "界e\u{301}" })
+            .collect();
+        PANE_APPEND_WRITE_CALLS.with(|count| count.set(0));
+        PANE_APPEND_DATA_SYNCS.with(|count| count.set(0));
+        assert_eq!(store.append_lines(7, &lines).unwrap(), 0);
+        let calls = PANE_APPEND_WRITE_CALLS.with(|count| count.get());
+        assert!(calls > 0);
+        #[cfg(target_os = "linux")]
+        assert_eq!(calls, 1, "one real writev accepts the entire bounded batch");
+        assert_eq!(PANE_APPEND_DATA_SYNCS.with(|count| count.get()), 1);
+        assert_eq!(store.tail_lines(7, PANE_APPEND_MAX_ROWS).unwrap(), lines);
+        assert_eq!(store.next_seq(7).unwrap(), PANE_APPEND_MAX_ROWS as u64);
+        assert_eq!(
+            store.append_lines(7, &[]).unwrap(),
+            PANE_APPEND_MAX_ROWS as u64
+        );
+        assert_eq!(PANE_APPEND_WRITE_CALLS.with(|count| count.get()), calls);
+        drop(store);
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(7).unwrap();
+        assert_eq!(reopened.tail_lines(7, PANE_APPEND_MAX_ROWS).unwrap(), lines);
+    }
+
     #[test]
     fn append_batch_real_backends_commit_exact_rows_once() {
         for fallback in [false, true] {
@@ -3250,7 +3457,7 @@ mod tests {
 
     #[test]
     fn append_batch_failures_keep_live_prefix_and_expose_exact_reopen_suffix() {
-        for (fault, complete_rows) in [(0, 0), (1, 1), (usize::MAX, 3)] {
+        for (fault, complete_rows) in [(0, 0), (1, 1), (3, 3), (usize::MAX, 3)] {
             let dir = temp_dir();
             let mut store = file_only_store(dir.path());
             store.append_line(7, "prior").unwrap();
@@ -3282,6 +3489,36 @@ mod tests {
                 ["prior", "abcdef", "界e\u{301}", "👩‍💻"]
             );
             assert_eq!(reopened.next_seq(7).unwrap(), 4);
+        }
+    }
+
+    #[test]
+    fn append_batch_failed_vectored_prefix_retries_on_same_live_store_once() {
+        for fault in [0, 1, 3, usize::MAX] {
+            let dir = temp_dir();
+            let mut store = file_only_store(dir.path());
+            store.append_line(7, "prior").unwrap();
+            let batch = ["abcdef", "界e\u{301}", "👩‍💻"];
+            PANE_APPEND_FAULT.with(|setting| setting.set(Some(fault)));
+            let result = store.append_lines(7, &batch);
+            PANE_APPEND_FAULT.with(|setting| setting.set(None));
+            assert!(result.is_err());
+            assert_eq!(store.next_seq(7).unwrap(), 1);
+            assert_eq!(store.tail_lines(7, 9).unwrap(), ["prior"]);
+            assert_eq!(store.append_lines(7, &batch).unwrap(), 1);
+            assert_eq!(store.next_seq(7).unwrap(), 4);
+            assert_eq!(
+                store.tail_lines(7, 9).unwrap(),
+                ["prior", "abcdef", "界e\u{301}", "👩‍💻"]
+            );
+            drop(store);
+            let mut reopened = file_only_store(dir.path());
+            reopened.ensure_pane(7).unwrap();
+            assert_eq!(reopened.next_seq(7).unwrap(), 4);
+            assert_eq!(
+                reopened.tail_lines(7, 9).unwrap(),
+                ["prior", "abcdef", "界e\u{301}", "👩‍💻"]
+            );
         }
     }
 
