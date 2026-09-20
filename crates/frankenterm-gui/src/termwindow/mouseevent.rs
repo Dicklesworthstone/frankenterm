@@ -876,10 +876,6 @@ impl super::TermWindow {
             event
         );
 
-        let dims = pane.get_dimensions();
-        let viewport = self
-            .get_viewport(pane.pane_id())
-            .unwrap_or(dims.physical_top);
         let current_selection_frame = selection_position
             .as_ref()
             .and_then(|pos| self.selection_frame_stamp_for_position(&pane, pos));
@@ -900,10 +896,11 @@ impl super::TermWindow {
                     state.selection_frame.displayed_for_geometry(geometry)
                 })
         };
-        let stable_row = checked_mouse_stable_row(
-            mouse_selection_frame.map_or(viewport, |frame| frame.viewport),
-            row,
-        );
+        // Mouse coordinates belong to the accepted displayed frame. Reading
+        // current dimensions here both waits on native parser/reflow locks
+        // and can map a displayed row onto a different, undisplayed viewport.
+        let stable_row =
+            mouse_selection_frame.and_then(|frame| checked_mouse_stable_row(frame.viewport, row));
 
         {
             let Some(mut pane_state) = self.pane_state(pane.pane_id()) else {
