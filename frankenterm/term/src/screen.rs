@@ -12407,6 +12407,19 @@ pub(crate) mod tests {
                         terminal.advance_bytes(
                             format!("\x1b[{};{}H", cursor.y + 1, cursor.x + 1).as_bytes(),
                         );
+                        // A saved cursor can change during preparation while
+                        // the live cursor returns to exactly its old position.
+                        assert!(terminal.screen().saved_cursor.is_none());
+                        terminal.advance_bytes(b"\x1b[1;1H\x1b7");
+                        terminal.advance_bytes(
+                            format!("\x1b[{};{}H", cursor.y + 1, cursor.x + 1).as_bytes(),
+                        );
+                        let sequence = terminal.current_seqno() + 1;
+                        assert!(!terminal
+                            .install_cold_seam_reflow(&mut seam, sequence)
+                            .unwrap());
+                        assert!(terminal.capture_cold_seam_reflow().unwrap().is_none());
+                        terminal.screen_mut().saved_cursor = None;
                     }
                     let sequence = terminal.current_seqno();
                     let point = SelectionAnchorCoordinate {
