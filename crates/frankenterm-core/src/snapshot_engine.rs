@@ -763,10 +763,16 @@ pub fn publish_whole_mux_recovery(
         let checked_root = if candidate.generation == expected.generation {
             current_verifier.verify_root_with_cx(cx, candidate, store)?
         } else if let Some(predecessor) = expected.predecessor.as_ref() {
-            if candidate.generation == predecessor.expected_generation {
+            if candidate.generation <= predecessor.expected_generation {
                 let checked = predecessor_verifier.verify_root_with_cx(cx, candidate, store)?;
-                if hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
-                    || Some(checked.image().image_digest) != expected.predecessor_image_digest
+                // Both alternating slots retain authenticated discovery roots.
+                // Verify the older slot too: rejecting it makes generation 3
+                // fail reconciliation before it can replace generation 1.
+                // The publication store still requires the selected active
+                // root to match the exact predecessor generation and hash.
+                if candidate.generation == predecessor.expected_generation
+                    && (hex::encode(checked.root_envelope_sha256()) != predecessor.expected_hash
+                        || Some(checked.image().image_digest) != expected.predecessor_image_digest)
                 {
                     return Err(VerifyPublicationError::Predecessor);
                 }

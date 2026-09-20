@@ -525,6 +525,10 @@ impl PeriodicRecovery {
                 &state.identity,
                 timeout,
             );
+            #[cfg(test)]
+            if let Err(error) = &outcome {
+                eprintln!("periodic recovery test capture failed: {error:?}");
+            }
             let (published_generation, error, terminal) = match outcome {
                 Ok(receipt) => {
                     // Verification settlement must finish even if shutdown
@@ -565,13 +569,17 @@ mod tests {
     use frankenterm_core::snapshot_engine::enroll_recovery_key;
     use mux::domain::{Domain, LocalDomain};
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     fn prepared() -> (tempfile::TempDir, RecoveryOptions) {
-        // macOS's ambient temporary path may traverse /var -> /private/var;
-        // use its resolved parent so the production no-symlink opener is tested.
-        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        let directory = tempfile::tempdir_in(parent).unwrap();
+        // RCH's TMPDIR can sit beneath a group-writable checkout. Resolve the
+        // platform /tmp instead; on macOS this also removes /var symlinks.
+        // The production key opener must keep rejecting unsafe ancestors.
+        let parent = std::fs::canonicalize("/tmp").unwrap();
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .unwrap();
         let kek = directory.path().join("wrapping-key");
         std::fs::OpenOptions::new()
             .create_new(true)

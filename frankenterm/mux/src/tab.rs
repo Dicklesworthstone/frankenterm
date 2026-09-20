@@ -24344,6 +24344,52 @@ mod test {
     }
 
     #[test]
+    fn recovery_runtime_preserves_constrained_collapse_and_grow() {
+        let (source, _) = make_test_captured_tab();
+        for (id, min_width) in [(10, 30), (20, 40)] {
+            source.inner.lock().constraint_overrides.insert(
+                id,
+                PaneConstraints {
+                    min_width,
+                    ..PaneConstraints::default()
+                },
+            );
+        }
+        let captured = source.capture_tab_topology(42, "test-workspace").unwrap();
+        let make_restored = || {
+            let panes = source
+                .snapshot_panes_callback_free()
+                .into_iter()
+                .map(|pane| (pane.pane_id(), FakePane::new(pane.pane_id(), captured.size)))
+                .collect();
+            Tab::from_recovery_capture(&captured, &panes).unwrap()
+        };
+        let restored = make_restored();
+        let without_policy = make_restored();
+        without_policy.inner.lock().constraint_overrides.clear();
+        let small = TerminalSize {
+            cols: 50,
+            pixel_width: 500,
+            ..captured.size
+        };
+        source.resize(small);
+        restored.resize(small);
+        without_policy.resize(small);
+        assert!(!source.collapsed_pane_ids().is_empty());
+        assert_eq!(restored.collapsed_pane_ids(), source.collapsed_pane_ids());
+        assert!(without_policy.collapsed_pane_ids().is_empty());
+        source.resize(captured.size);
+        restored.resize(captured.size);
+        assert!(source.collapsed_pane_ids().is_empty());
+        assert!(restored.collapsed_pane_ids().is_empty());
+        // A second shrink verifies that growth retained the restored policy.
+        source.resize(small);
+        restored.resize(small);
+        assert!(!restored.collapsed_pane_ids().is_empty());
+        assert_eq!(restored.collapsed_pane_ids(), source.collapsed_pane_ids());
+    }
+
+    #[test]
     fn recovery_runtime_rejects_noncanonical_or_unbounded_state() {
         let (source, captured) = make_test_captured_tab();
         let panes: HashMap<_, _> = source

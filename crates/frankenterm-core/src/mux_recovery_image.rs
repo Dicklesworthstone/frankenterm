@@ -4201,7 +4201,7 @@ mod tests {
                         .domain_state
                         .as_mut()
                         .unwrap()
-                        .default_domain_id = Some(999)
+                        .default_domain_id = Some(999);
                 }
                 6 => invalid.topology.domains.swap(0, 1),
                 7 => invalid.topology.domains[1].is_attached = false,

@@ -16061,9 +16061,16 @@ impl Mux {
                     && !topology.exhausted,
                 "recovery target topology changed"
             );
+            let mut pending_windows = self.pending_window_notifications.lock();
+            anyhow::ensure!(
+                pending_windows.owner.upgrade().is_none()
+                    || std::ptr::eq(pending_windows.owner.as_ptr(), Arc::as_ptr(self)),
+                "recovery window notification owner changed"
+            );
             check_deadline()?;
             let revision = topology.reserve_revision()?;
             // No fallible calls or external callbacks after this point.
+            pending_windows.owner = Arc::downgrade(self);
             *live_domains = staged_domains;
             *live_names = staged_domain_names;
             *live_registrations = staged_registrations;
@@ -25216,6 +25223,11 @@ mod tests {
                     .any(|line| line.as_str().contains("reply:after-publication"))
             })
         });
+        // Exercise a recovered window transaction before creating a new
+        // window, which would otherwise incidentally bind the delivery owner.
+        let retired_tab = owner.get_tab(expected_tabs[0].tab_id).unwrap();
+        assert!(owner.remove_tab_local_only_if_same(&retired_tab));
+        assert!(owner.get_tab(retired_tab.tab_id()).is_none());
         let next_window = owner.new_empty_window(None, None);
         assert!(*next_window > 500_001);
         assert!(!expected_windows
