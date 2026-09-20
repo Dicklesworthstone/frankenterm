@@ -14431,7 +14431,7 @@ pub(crate) fn inspect_historical_genesis_binding(
     token_path: &Path,
     journal_id: Uuid,
     canonical_binding: &[u8],
-    custody: mux::guardian_checkpoint::GuardianSpawnCustodyContextV1,
+    custody: &mux::guardian_checkpoint::GuardianSpawnCustodyContextV1,
 ) -> Result<(), BrokerSpawnWalError> {
     let binding = BrokerGenesisBinding::decode(canonical_binding)
         .map_err(|_| BrokerSpawnWalError::InvalidIdentity)?;
@@ -14508,9 +14508,10 @@ pub(crate) fn inspect_historical_genesis_binding(
     let status = journal.status();
     let expected_identity =
         BrokerSpawnWalIdentityV1::from_binding(journal_id, custody.broker_lineage, binding)?;
+    let durable_pane_matches = binding.durable_pane_id == custody.pane_id;
     if identity != expected_identity
         || binding.mux_incarnation != custody.mux_incarnation
-        || binding.durable_pane_id != custody.pane_id
+        || !durable_pane_matches
         || binding.spawn_effect_id != custody.effect_id
         || binding.spawning_mux_build_identity_digest != custody.mux_build
         || binding.live_guardian_build_identity_digest != custody.guardian_build
@@ -32956,12 +32957,12 @@ mod tests {
                 context,
             )
         };
-        inspect(&encoded, custody).unwrap();
+        inspect(&encoded, &custody).unwrap();
         for offset in [16, 48, 72, 172, 176, 208, 240] {
             let mut wrong = encoded;
             wrong[offset] ^= 1;
             assert!(
-                inspect(&wrong, custody).is_err(),
+                inspect(&wrong, &custody).is_err(),
                 "reservation field {offset}"
             );
         }
@@ -32979,9 +32980,9 @@ mod tests {
                 ..custody
             },
         ] {
-            assert!(inspect(&encoded, wrong).is_err());
+            assert!(inspect(&encoded, &wrong).is_err());
         }
-        inspect(&encoded, custody).unwrap();
+        inspect(&encoded, &custody).unwrap();
         let head_path = catalog.join(&head_name);
         let original_head = fs::read(&head_path).unwrap();
         let mut head = open_existing_test_file(&head_path);
@@ -32990,7 +32991,7 @@ mod tests {
             .unwrap();
         head.sync_all().unwrap();
         assert!(
-            inspect(&encoded, custody).is_err(),
+            inspect(&encoded, &custody).is_err(),
             "tampered authenticated head"
         );
         head.seek(SeekFrom::Start(0)).unwrap();
@@ -32999,7 +33000,7 @@ mod tests {
             .unwrap();
         head.sync_all().unwrap();
         assert!(
-            inspect(&encoded, custody).is_err(),
+            inspect(&encoded, &custody).is_err(),
             "head reconciliation cannot grant inspection"
         );
         assert_eq!(

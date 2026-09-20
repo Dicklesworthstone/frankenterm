@@ -1034,7 +1034,7 @@ impl GuardianDurableSpawnCustodyV1 {
                 broker_token,
                 broker_journal,
                 &binding,
-                self.context,
+                &self.context,
             )
             .map_err(|_| GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
             let payload = inner
@@ -13113,7 +13113,8 @@ mod tests {
             .iter()
             .filter(|name| {
                 name.to_str().is_some_and(|name| {
-                    name.starts_with("spawn-custody-v1-") && name.ends_with(".bin")
+                    name.starts_with("spawn-custody-v1-")
+                        && Path::new(name).extension() == Some(std::ffi::OsStr::new("bin"))
                 })
             })
             .collect();
