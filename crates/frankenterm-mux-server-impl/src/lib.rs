@@ -105,6 +105,7 @@ std::thread_local! {
         std::cell::Cell::new(0)
     };
     static LIVE_SCROLLBACK_WAL_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1233,6 +1234,7 @@ struct LiveScrollbackSpillSink {
     command_description: String,
     manifest_path: PathBuf,
     mutation_gate: std::sync::Mutex<()>,
+    append_wal_identity_cache: std::sync::Mutex<[Option<ValidatedAppendWalIdentity>; 2]>,
     store: std::sync::Mutex<frankenterm_core::storage::mmap_store::MmapScrollbackStore>,
     state: std::sync::Mutex<LiveScrollbackSpillState>,
     keyring: Arc<std::sync::Mutex<guardian_output_keys::GuardianOutputKeyring>>,
@@ -1427,6 +1429,36 @@ struct LiveScrollbackAppendWalV1 {
     additional_encrypted_records: Vec<String>,
     guardian_authentication: Option<String>,
     wal_sha256: String,
+}
+
+/// Owns the exact decoded value whose canonical checksum was recomputed.
+/// Never expose mutable access: a claimed on-disk checksum alone is not proof.
+struct ChecksumVerifiedAppendWal {
+    wal: LiveScrollbackAppendWalV1,
+    checksum: [u8; 32],
+}
+
+impl ChecksumVerifiedAppendWal {
+    fn verify(wal: LiveScrollbackAppendWalV1) -> anyhow::Result<Self> {
+        let checksum =
+            decode_live_scrollback_canonical_digest(&wal.wal_sha256, "append WAL checksum")?;
+        anyhow::ensure!(
+            wal.wal_sha256 == LiveScrollbackSpillSink::append_wal_checksum(&wal)?,
+            "scrollback append WAL checksum failed"
+        );
+        Ok(Self { wal, checksum })
+    }
+}
+
+/// Only the context-free identity checks are memoized. Every filesystem read,
+/// checksum, current key authorization, manifest and store check stays live.
+/// Two fixed-size entries cover the current and predecessor WAL; no ciphertext
+/// is retained. The checksum view binds every identity-validator input (the
+/// checksum claim itself is independently verified by the owned proof above).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ValidatedAppendWalIdentity {
+    checksum: [u8; 32],
+    durable_pane_id: [u8; 16],
 }
 
 impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
@@ -3035,6 +3067,8 @@ impl LiveScrollbackSpillSink {
         wal: &LiveScrollbackAppendWalV1,
         durable_pane_id: [u8; 16],
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(|count| count.set(count.get() + 1));
         anyhow::ensure!(
             matches!(
                 wal.schema.as_str(),
@@ -3259,6 +3293,29 @@ impl LiveScrollbackSpillSink {
             wal.guardian_authentication.is_some(),
             "append WAL guardian authentication is missing"
         );
+        Ok(())
+    }
+
+    fn validate_verified_append_wal_identity(
+        &self,
+        verified: &ChecksumVerifiedAppendWal,
+    ) -> anyhow::Result<()> {
+        let identity = ValidatedAppendWalIdentity {
+            checksum: verified.checksum,
+            durable_pane_id: self.durable_pane_id,
+        };
+        let mut cache = self
+            .append_wal_identity_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("append WAL identity cache is poisoned"))?;
+        if cache.contains(&Some(identity)) {
+            metrics::counter!("mux.scrollback.append_wal_identity_cache_hits").increment(1);
+            return Ok(());
+        }
+        metrics::counter!("mux.scrollback.append_wal_identity_cache_misses").increment(1);
+        Self::validate_append_wal_identity(&verified.wal, self.durable_pane_id)?;
+        cache[1] = cache[0];
+        cache[0] = Some(identity);
         Ok(())
     }
 
@@ -3909,7 +3966,9 @@ impl LiveScrollbackSpillSink {
             #[cfg(unix)]
             let parent = _parent;
 
-            if let Some(active) = Self::read_append_wal(&active_path)? {
+            if let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? {
+                self.validate_verified_append_wal_identity(&verified)?;
+                let active = verified.wal;
                 let manifest = Self::read_manifest(&self.manifest_path)?
                     .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
                 let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
@@ -3920,7 +3979,6 @@ impl LiveScrollbackSpillSink {
                     &durable_pane_id,
                     &self.manifest_path,
                 )?;
-                Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
                 Self::authenticate_append_wal(&active, &keyring)?;
                 anyhow::ensure!(
                     Self::authenticate_manifest(&manifest, &keyring)?,
@@ -4084,9 +4142,11 @@ impl LiveScrollbackSpillSink {
     /// immediately-adjacent predecessor relation recoverable.
     fn advance_authenticated_append_wal_supersession(&self) -> anyhow::Result<()> {
         let active_path = Self::append_wal_path(&self.manifest_path)?;
-        let Some(active) = Self::read_append_wal(&active_path)? else {
+        let Some(verified) = Self::read_checksum_verified_append_wal(&active_path)? else {
             return Ok(());
         };
+        self.validate_verified_append_wal_identity(&verified)?;
+        let active = verified.wal;
         let manifest = Self::read_manifest(&self.manifest_path)?
             .ok_or_else(|| anyhow::anyhow!("retained append WAL has no published manifest"))?;
         let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
@@ -4102,7 +4162,6 @@ impl LiveScrollbackSpillSink {
                 .lock_keyring("advance append WAL supersession authentication")
                 .map_err(anyhow::Error::new)?;
             let keyring = keyring.scoped_authority()?;
-            Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
             Self::authenticate_append_wal(&active, &keyring)?;
             anyhow::ensure!(
                 Self::authenticate_manifest(&manifest, &keyring)?,
@@ -5369,6 +5428,7 @@ impl LiveScrollbackSpillSink {
             command_description,
             manifest_path,
             mutation_gate: std::sync::Mutex::new(()),
+            append_wal_identity_cache: std::sync::Mutex::new([None; 2]),
             store: std::sync::Mutex::new(store),
             state: std::sync::Mutex::new(state),
             keyring,
@@ -5512,6 +5572,12 @@ impl LiveScrollbackSpillSink {
     fn read_append_wal(
         path: &std::path::Path,
     ) -> anyhow::Result<Option<LiveScrollbackAppendWalV1>> {
+        Ok(Self::read_checksum_verified_append_wal(path)?.map(|verified| verified.wal))
+    }
+
+    fn read_checksum_verified_append_wal(
+        path: &std::path::Path,
+    ) -> anyhow::Result<Option<ChecksumVerifiedAppendWal>> {
         let path_metadata_before = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5611,17 +5677,14 @@ impl LiveScrollbackSpillSink {
         }
         let wal: LiveScrollbackAppendWalV1 = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode scrollback append WAL {}", path.display()))?;
-        anyhow::ensure!(
-            wal.wal_sha256.len() == 64
-                && wal
-                    .wal_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-                && wal.wal_sha256 == Self::append_wal_checksum(&wal)?,
-            "scrollback append WAL checksum failed at {}",
-            path.display()
-        );
-        Ok(Some(wal))
+        ChecksumVerifiedAppendWal::verify(wal)
+            .with_context(|| {
+                format!(
+                    "scrollback append WAL checksum failed at {}",
+                    path.display()
+                )
+            })
+            .map(Some)
     }
 
     /// A deterministic stage is not authoritative until its complete,
@@ -11298,6 +11361,163 @@ mod tests {
             .expect("open manifest fixture parent")
             .sync_all()
             .expect("synchronize manifest fixture parent");
+    }
+
+    #[test]
+    fn append_wal_identity_cache_requires_verified_bytes_and_exact_context() {
+        let (_dir, _context, mut sink, wal, _appended) = append_wal_fixture(181, 8);
+        let path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+        write_complete_append_wal_fixture(&path, &wal);
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        for _ in 0..2 {
+            let verified = LiveScrollbackSpillSink::read_checksum_verified_append_wal(&path)
+                .unwrap()
+                .unwrap();
+            sink.validate_verified_append_wal_identity(&verified)
+                .unwrap();
+        }
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before + 1,
+            "fresh disk checksums may reuse one successful full identity validation"
+        );
+
+        let mut tampered = wal.clone();
+        tampered.appended_stable_row += 1;
+        overwrite_private_append_wal_fixture(&path, &tampered);
+        assert!(LiveScrollbackSpillSink::read_checksum_verified_append_wal(&path).is_err());
+        assert!(ChecksumVerifiedAppendWal::verify(tampered.clone()).is_err());
+        tampered.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&tampered).unwrap();
+        overwrite_private_append_wal_fixture(&path, &tampered);
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        for _ in 0..2 {
+            let verified = LiveScrollbackSpillSink::read_checksum_verified_append_wal(&path)
+                .unwrap()
+                .unwrap();
+            assert!(
+                sink.validate_verified_append_wal_identity(&verified)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before + 2,
+            "a recomputed checksum cannot cache an invalid identity, even on retry"
+        );
+
+        let verified = ChecksumVerifiedAppendWal::verify(wal.clone()).unwrap();
+        let original_pane = sink.durable_pane_id;
+        sink.durable_pane_id = [182; 16];
+        assert!(
+            sink.validate_verified_append_wal_identity(&verified)
+                .is_err()
+        );
+        sink.durable_pane_id = original_pane;
+
+        let mut next = wal.clone();
+        next.max_retained_rows += 1;
+        seal_append_wal_fixture(&sink, &mut next);
+        overwrite_private_append_wal_fixture(&path, &next);
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        for _ in 0..2 {
+            let next = LiveScrollbackSpillSink::read_checksum_verified_append_wal(&path)
+                .unwrap()
+                .unwrap();
+            sink.validate_verified_append_wal_identity(&next).unwrap();
+        }
+        sink.validate_verified_append_wal_identity(&verified)
+            .unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before + 1,
+            "a distinct valid WAL validates once; both bounded entries remain reusable"
+        );
+    }
+
+    #[test]
+    fn append_wal_identity_cache_keeps_live_key_manifest_and_disk_checks() {
+        let (_dir, _context, mut sink, _wal, appended) = append_wal_fixture(183, 8);
+        assert!(sink.store_scrollback_line(11, &appended, 8));
+        // The real append path populated the cache during its final acknowledgement.
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before,
+            "production supersession checks must reuse the validated identity"
+        );
+        let (_other_dir, _other_context, other, _other_wal, _other_line) =
+            append_wal_fixture(184, 8);
+        let original_keys = Arc::clone(&sink.keyring);
+        sink.keyring = Arc::clone(&other.keyring);
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        let error = sink
+            .advance_authenticated_append_wal_supersession()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("append WAL guardian key"));
+        sink.keyring = original_keys;
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
+
+        let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .unwrap()
+            .unwrap();
+        let mut tampered_manifest = manifest.clone();
+        tampered_manifest.command_description.push_str("-tampered");
+        tampered_manifest.manifest_sha256 =
+            LiveScrollbackSpillSink::manifest_checksum(&tampered_manifest).unwrap();
+        overwrite_private_manifest_fixture(&sink.manifest_path, &tampered_manifest);
+        assert!(
+            sink.advance_authenticated_append_wal_supersession()
+                .is_err()
+        );
+        overwrite_private_manifest_fixture(&sink.manifest_path, &manifest);
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
+
+        let path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+        let wal = LiveScrollbackSpillSink::read_append_wal(&path)
+            .unwrap()
+            .unwrap();
+        let mut tampered = wal.clone();
+        tampered.encrypted_record.push('x');
+        overwrite_private_append_wal_fixture(&path, &tampered);
+        assert!(
+            sink.advance_authenticated_append_wal_supersession()
+                .is_err()
+        );
+        overwrite_private_append_wal_fixture(&path, &wal);
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before,
+            "cache hits must not bypass current key, manifest, or disk integrity checks"
+        );
+
+        let mut unauthenticated = wal.clone();
+        unauthenticated.guardian_authentication = Some("invalid-authentication".to_string());
+        unauthenticated.wal_sha256 =
+            LiveScrollbackSpillSink::append_wal_checksum(&unauthenticated).unwrap();
+        overwrite_private_append_wal_fixture(&path, &unauthenticated);
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        for _ in 0..2 {
+            let error = sink
+                .advance_authenticated_append_wal_supersession()
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("parse append WAL guardian authentication"));
+        }
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before + 1,
+            "even a successful identity cache hit must reject invalid authentication again"
+        );
+        overwrite_private_append_wal_fixture(&path, &wal);
+        sink.advance_authenticated_append_wal_supersession()
+            .unwrap();
     }
 
     #[test]
