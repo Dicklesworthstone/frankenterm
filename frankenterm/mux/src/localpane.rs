@@ -94,7 +94,7 @@ fn record_metadata_refusal(stage: MetadataRefusalStage) {
     #[cfg(test)]
     LAST_METADATA_REFUSAL.with(|last| last.set(Some(stage)));
     if log::log_enabled!(target: "mux::metadata_refusal", log::Level::Debug) {
-        let _ = METADATA_REFUSALS[stage as usize].fetch_update(
+        let _ = METADATA_REFUSALS[stage as usize].try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |count| Some(count.saturating_add(1)),
@@ -109,7 +109,7 @@ fn metadata_busy(stage: MetadataRefusalStage) -> frankenterm_term::screen::ColdR
 
 fn reserve_metadata_refusal_log(emitted: &AtomicUsize) -> bool {
     emitted
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < METADATA_REFUSAL_LOG_LIMIT).then_some(count.saturating_add(1))
         })
         .is_ok()
