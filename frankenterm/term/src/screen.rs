@@ -3682,6 +3682,17 @@ impl Screen {
     /// Visible-head seams require the separate cursor-anchor transaction.
     #[cfg(feature = "use_serde")]
     pub fn capture_cold_seam_reflow(&self) -> anyhow::Result<Option<ColdSeamReflow>> {
+        self.capture_cold_seam_reflow_before(self.lines.len().saturating_sub(self.physical_rows))
+    }
+
+    /// The terminal may authorize completed visible rows before its cursor.
+    /// The exclusive bound must be checked again against the live cursor at
+    /// installation; screen-only callers can authorize historical rows only.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn capture_cold_seam_reflow_before(
+        &self,
+        resident_end: usize,
+    ) -> anyhow::Result<Option<ColdSeamReflow>> {
         use crate::config::ScrollbackIntervalCapture;
         if !self.allow_scrollback || self.recovery_scrollback.is_some() {
             return Ok(None);
@@ -3719,10 +3730,8 @@ impl Screen {
                 return Ok(None);
             }
         }
-        let maximum = self
-            .lines
-            .len()
-            .saturating_sub(self.physical_rows)
+        let maximum = resident_end
+            .min(self.lines.len())
             .min(ScreenLineRead::MAX_ROWS - 1);
         let mut budget = LineReadCaptureBudget::default();
         let mut count = None;
@@ -3772,13 +3781,27 @@ impl Screen {
         prepared: &mut ColdSeamReflow,
         seqno: SequenceNo,
     ) -> anyhow::Result<bool> {
+        self.install_cold_seam_reflow_before(
+            prepared,
+            seqno,
+            self.lines.len().saturating_sub(self.physical_rows),
+        )
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn install_cold_seam_reflow_before(
+        &mut self,
+        prepared: &mut ColdSeamReflow,
+        seqno: SequenceNo,
+        resident_end: usize,
+    ) -> anyhow::Result<bool> {
         use crate::config::ScrollbackIntervalCapture;
         if seqno == SequenceNo::MAX
             || prepared.replacement.is_none()
             || !self.matches_coordinate_witness(&prepared.witness)
             || !self.same_cold_fragments(&prepared.previous)
             || self.phys_to_stable_row_index(0) != prepared.frontier
-            || prepared.resident.len() > self.lines.len().saturating_sub(self.physical_rows)
+            || prepared.resident.len() > resident_end.min(self.lines.len())
             || !self
                 .lines
                 .iter()
@@ -12323,6 +12346,149 @@ pub(crate) mod tests {
                 "historical viewport at {top}"
             );
         }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn admitted_geometry_repeated_resize_preserves_late_visible_history() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(8, 80, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 10_000,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "repeated-cold-geometry-test",
+            Box::new(std::io::sink()),
+        );
+        let mut original = String::new();
+        for i in 0..96 {
+            if i % 13 == 0 {
+                terminal.advance_bytes(b"\r\n");
+            }
+            let record = format!(
+                "ROW_{i:03} {}{} END_{i:03}",
+                "ab 界 e\u{301} 🚀 xy\u{a0}z ".repeat((i * 7) % 17),
+                "q".repeat((i * 19) % 37),
+            );
+            original.push_str(&record);
+            terminal.advance_bytes(record.as_bytes());
+            terminal.advance_bytes(b"\r\n");
+        }
+        let mut visible_seams = 0;
+        for cols in [31, 113, 47, 80, 31, 80] {
+            terminal.resize(test_size(8, cols, 96));
+            // Match LocalPane's resize transaction: settle the paragraph
+            // crossing the storage boundary before publishing its index.
+            if let Some(seam) = terminal.capture_cold_seam_reflow().unwrap() {
+                let mut seam = seam.hydrate(|| false).unwrap();
+                if seam.is_ready() {
+                    let cursor = terminal.cursor_pos();
+                    let cursor_row = terminal.screen().phys_row(cursor.y);
+                    let cursor_text = terminal.screen().lines[cursor_row].clone();
+                    let history_rows =
+                        terminal.screen().lines.len() - terminal.screen().physical_rows;
+                    if seam.resident.len() > history_rows {
+                        visible_seams += 1;
+                        // Off-lock work must lose authority if the cursor
+                        // moves into the paragraph, even without a text edit.
+                        terminal.advance_bytes(b"\x1b[1;1H");
+                        let sequence = terminal.current_seqno() + 1;
+                        assert!(!terminal
+                            .install_cold_seam_reflow(&mut seam, sequence)
+                            .unwrap());
+                        terminal.advance_bytes(
+                            format!("\x1b[{};{}H", cursor.y + 1, cursor.x + 1).as_bytes(),
+                        );
+                    }
+                    let sequence = terminal.current_seqno();
+                    let point = SelectionAnchorCoordinate {
+                        row: terminal.screen().phys_to_stable_row_index(0),
+                        column: Some(0),
+                    };
+                    let selection = terminal
+                        .screen_mut()
+                        .capture_selection_anchor(sequence, [Some(point), None, None])
+                        .unwrap();
+                    let sequence = terminal.current_seqno() + 1;
+                    assert!(terminal
+                        .install_cold_seam_reflow(&mut seam, sequence)
+                        .unwrap());
+                    terminal.increment_seqno();
+                    assert_eq!(terminal.cursor_pos().x, cursor.x);
+                    assert_eq!(terminal.cursor_pos().y, cursor.y);
+                    assert_eq!(terminal.screen().lines[cursor_row], cursor_text);
+                    assert!(terminal
+                        .screen()
+                        .resolve_selection_anchor(&selection, sequence)
+                        .is_none());
+                }
+            }
+            let plan = terminal.screen().capture_line_read(0..8).unwrap();
+            let (reference, _) = plan
+                .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+                .unwrap();
+            let mut prepared = plan.prepare_cold_layout(|| false).unwrap();
+            let sequence = terminal.current_seqno();
+            assert!(terminal
+                .screen_mut()
+                .install_prepared_cold_layout(&mut prepared, sequence)
+                .unwrap());
+            let screen = terminal.screen();
+            for top in [
+                reference.visual.start,
+                reference.visual.start + (reference.visual.end - reference.visual.start) / 2,
+                reference.visual.end - 4,
+            ] {
+                let fast = screen.capture_line_read(top..top + 8).unwrap();
+                if fast.resident_first <= reference.visual.end {
+                    let layout = fast
+                        .layout
+                        .as_ref()
+                        .expect("indexed viewport must reuse layout");
+                    assert_eq!(layout.source, reference.source);
+                    assert_eq!(layout.visual, reference.visual);
+                    assert_eq!(layout.groups, reference.groups);
+                }
+                let fast = fast.hydrate(|| false).unwrap_or_else(|error| {
+                    panic!(
+                        "visible history unavailable at width {}, row {}: {}",
+                        cols, top, error
+                    )
+                });
+                assert_eq!(fast.row_count(), 8, "visible viewport must be complete");
+                let visible: String = fast.lines().map(|line| line.as_str()).collect();
+                assert!(!visible.is_empty());
+                assert!(
+                    original.contains(&visible),
+                    "visible text must match original corpus"
+                );
+                let mut slow = screen.capture_line_read(top..top + 8).unwrap();
+                slow.geometry = None;
+                if slow.resident_first <= reference.visual.end {
+                    slow.layout = Some(reference.clone());
+                }
+                let slow = slow.hydrate(|| false).unwrap();
+                assert_eq!(fast.first_row(), slow.first_row());
+                assert_eq!(
+                    fast.lines().cloned().collect::<Vec<_>>(),
+                    slow.lines().cloned().collect::<Vec<_>>(),
+                    "late-visible history at width {cols}, row {top}"
+                );
+                assert!(screen.validates_line_read(&fast));
+            }
+        }
+        assert!(
+            visible_seams > 0,
+            "exercise a seam inside the visible screen"
+        );
     }
 
     #[cfg(feature = "use_serde")]

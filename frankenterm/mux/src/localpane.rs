@@ -4342,7 +4342,7 @@ impl LocalPane {
                                 let Some(term) = terminal.try_lock() else {
                                     return Ok(None);
                                 };
-                                term.screen().capture_cold_seam_reflow().map(Some)
+                                term.capture_cold_seam_reflow().map(Some)
                             })
                             .unwrap_or(Ok(None))
                     })?
@@ -4366,9 +4366,8 @@ impl LocalPane {
                                     with_resize_commit_barrier(resize_queue, token, || {
                                         let seqno =
                                             next_cold_resize_sequence(term.current_seqno())?;
-                                        let installed = term
-                                            .screen_mut()
-                                            .install_cold_seam_reflow(&mut seam, seqno)?;
+                                        let installed =
+                                            term.install_cold_seam_reflow(&mut seam, seqno)?;
                                         if installed {
                                             term.increment_seqno();
                                             Self::publish_resize_source(

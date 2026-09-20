@@ -1051,6 +1051,29 @@ impl TerminalState {
         &mut self.screen
     }
 
+    /// Prepare the cold/resident paragraph, including completed visible rows
+    /// strictly before the cursor. The active cursor row is never rewritten.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_cold_seam_reflow(
+        &self,
+    ) -> anyhow::Result<Option<crate::screen::ColdSeamReflow>> {
+        self.screen
+            .capture_cold_seam_reflow_before(self.screen.phys_row(self.cursor.y))
+    }
+
+    /// Recheck cursor authority after off-lock preparation. A cursor move into
+    /// the captured paragraph rejects it even when its text is unchanged.
+    #[cfg(feature = "use_serde")]
+    pub fn install_cold_seam_reflow(
+        &mut self,
+        prepared: &mut crate::screen::ColdSeamReflow,
+        seqno: SequenceNo,
+    ) -> anyhow::Result<bool> {
+        let resident_end = self.screen.phys_row(self.cursor.y);
+        self.screen
+            .install_cold_seam_reflow_before(prepared, seqno, resident_end)
+    }
+
     /// Parser-side maintenance of the primary screen, including while the
     /// alternate screen is active. The caller releases the terminal between
     /// slices and drains the sink only when blocked or settled after progress.
