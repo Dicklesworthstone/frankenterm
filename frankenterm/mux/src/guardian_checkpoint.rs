@@ -12768,6 +12768,7 @@ mod tests {
         inventory.construction_sites.sort();
         let mut expected_construction_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext",
+            "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCipher::inspect_historical_genesis_payload",
             "GuardianCheckpointDurableCompletionReceiptV1@GuardianCheckpointCipher::inspect_durable_manifest_receipt",
             "GuardianCheckpointGenesisSpawnPermitV1@GuardianCheckpointGenesisSpawnPermitV1::issue",
             "GuardianCheckpointManifestRetryCapabilityV1@GuardianCheckpointManifestSealCapabilitiesV1::from_authority",
