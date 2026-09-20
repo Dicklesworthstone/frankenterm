@@ -177,17 +177,22 @@ type LineLayoutObservation = Mutex<
     )>,
 >;
 
-/// A scrolled viewport retains its logical insertion point across resident
-/// reflow. Cold rows currently retain only their numeric fallback.
+/// A scrolled viewport retains its logical insertion point across reflow.
+/// Resident rows use terminal anchors; closed cold groups use storage identity.
 #[derive(Clone)]
 pub struct NativeViewport {
     row: StableRowIndex,
     anchor: Option<frankenterm_term::screen::ScreenSelectionAnchor>,
+    cold_anchor: Option<frankenterm_term::screen::ColdViewportAnchor>,
 }
 
 impl NativeViewport {
     pub fn new(row: StableRowIndex) -> Self {
-        Self { row, anchor: None }
+        Self {
+            row,
+            anchor: None,
+            cold_anchor: None,
+        }
     }
 }
 
@@ -3987,6 +3992,32 @@ impl LocalPane {
                     _ => viewport.anchor = None,
                 }
             }
+            if let Some(anchor) = viewport.cold_anchor.as_ref() {
+                if let Some(group) = term.screen().cold_viewport_anchor_group(anchor).ok()? {
+                    let registration = self.mux_registration.load()?;
+                    let resolved = COLD_VIEWPORT_CACHE.try_lock()?.iter().find_map(|entry| {
+                        if entry.registration != registration.wire_identity()
+                            || !term.screen().validates_line_read(&entry.read)
+                        {
+                            return None;
+                        }
+                        entry.read.resolve_viewport_anchor(anchor)
+                    });
+                    if let Some(row) = resolved {
+                        viewport.row = row;
+                    } else {
+                        // Hydration is worker-owned and must never run under
+                        // terminal ownership. Retain the original anchor while
+                        // the new-width group is fetched; do not paint its old
+                        // numeric row in the meantime.
+                        drop(term);
+                        self.cold_viewport_lines(group);
+                        return None;
+                    }
+                } else {
+                    viewport.cold_anchor = None;
+                }
+            }
         }
         // Scrollback eviction and clearing can invalidate a stored viewport
         // without a GUI scroll event. Normalize against this same observation;
@@ -4057,6 +4088,7 @@ impl LocalPane {
             let mut viewport = viewport.unwrap_or_else(|| NativeViewport::new(first));
             if viewport.row != first {
                 viewport.anchor = None;
+                viewport.cold_anchor = None;
             }
             viewport.row = first;
             if viewport.anchor.is_none() {
@@ -4071,6 +4103,17 @@ impl LocalPane {
                         None,
                     ],
                 );
+            }
+            if cold && viewport.cold_anchor.is_none() {
+                let registration = self.mux_registration.load()?;
+                viewport.cold_anchor = COLD_VIEWPORT_CACHE.try_lock()?.iter().find_map(|entry| {
+                    if entry.registration != registration.wire_identity()
+                        || !term.screen().validates_line_read(&entry.read)
+                    {
+                        return None;
+                    }
+                    entry.read.capture_viewport_anchor(first)
+                });
             }
             frame.viewport = Some(viewport);
         }
@@ -9117,6 +9160,153 @@ mod tests {
                     lock
                 );
             });
+        }
+    }
+
+    #[test]
+    fn cold_viewport_anchor_survives_worker_hydration_and_resize() {
+        const CHILD: &str = "FT_COLD_VIEWPORT_ANCHOR_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "localpane::tests::cold_viewport_anchor_survives_worker_hydration_and_resize",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "cold viewport subprocess timed out: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(32, 512 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let (pane, _mux, registration, _old_sink, token) = cold_resize_fixture(false);
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut term = Terminal::new(
+            term_size(20, 4),
+            Arc::new(ColdResizeTestConfig(sink)),
+            "FrankenTerm",
+            "cold-viewport-anchor",
+            Box::new(Vec::new()),
+        );
+        for index in 0..12 {
+            term.advance_bytes(
+                format!("abcde\u{301}fghij界klmnopqrUVWXYZ{index:02}\r\n").as_bytes(),
+            );
+        }
+        *pane.terminal.lock() = term;
+        LocalPane::prepare_cold_layout_after_resize(
+            pane.pane_id(),
+            &pane.terminal,
+            &pane.line_layout_observation,
+            &pane.resize_queue,
+            token,
+            registration.clone(),
+        );
+        let dimensions = pane.get_dimensions();
+        let history = pane
+            .capture_line_read(
+                dimensions.scrollback_top..dimensions.physical_top,
+                &mut Default::default(),
+            )
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let offset = history
+            .lines()
+            .position(|line| line.as_str() == "UVWXYZ04")
+            .unwrap();
+        let row = history.first_row() + offset as StableRowIndex;
+        let capture = |viewport: NativeViewport| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if let Some(frame) =
+                    pane.try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                {
+                    return frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold viewport hydration did not converge"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let frame = capture(NativeViewport::new(row));
+        assert_eq!(frame.lines[0].as_str(), "UVWXYZ04");
+        let mut viewport = frame.viewport.unwrap();
+        assert!(
+            viewport.cold_anchor.is_some(),
+            "fixture must exercise cold identity"
+        );
+        for (cols, expected) in [
+            (13, "lmnopqrUVWXYZ"),
+            (40, "abcde\u{301}fghij界klmnopqrUVWXYZ04"),
+            (20, "UVWXYZ04"),
+        ] {
+            let size = term_size(cols, 4);
+            let pty = pty_size(cols as u16, 4);
+            let pending = {
+                let mut queue = pane.resize_queue.lock();
+                queue.enqueue(size, pty, Instant::now());
+                queue.dequeue_for_worker().unwrap()
+            };
+            let token = ResizeCancellationToken::new(pending.seq);
+            LocalPane::apply_resize_sync(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                #[cfg(feature = "disruptor-pane-io")]
+                &pane.action_ring,
+                &pane.pty,
+                &pane.resize_queue,
+                pending.seq,
+                size,
+                pty,
+                token,
+            )
+            .unwrap();
+            LocalPane::prepare_cold_layout_after_resize(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                &pane.resize_queue,
+                token,
+                registration.clone(),
+            );
+            let frame = capture(viewport);
+            assert_eq!(frame.lines[0].as_str(), expected);
+            viewport = frame.viewport.unwrap();
+            assert!(viewport.cold_anchor.is_some());
         }
     }
 

@@ -338,6 +338,32 @@ pub struct ScreenLineRead {
     geometry: Option<ColdGeometrySnapshot>,
 }
 
+/// A logical position in an immutable, complete backing-store group. Visual
+/// row numbers and wrapping width are deliberately absent from its identity.
+#[cfg(feature = "use_serde")]
+#[derive(Clone)]
+pub struct ColdViewportAnchor {
+    sink: std::sync::Weak<dyn crate::config::ScrollbackSpillSink>,
+    interval: crate::config::ScrollbackInterval,
+    source: Range<StableRowIndex>,
+    cells: usize,
+    fragments: Option<std::sync::Weak<ColdRowFragments>>,
+}
+
+#[cfg(feature = "use_serde")]
+impl ColdViewportAnchor {
+    fn matches_fragments(&self, current: &Option<Arc<ColdRowFragments>>) -> bool {
+        match &self.fragments {
+            Some(before) => current
+                .as_ref()
+                .is_some_and(|current| before.as_ptr() == Arc::as_ptr(current)),
+            None => current
+                .as_ref()
+                .is_none_or(|current| current.rows.range(self.source.clone()).next().is_none()),
+        }
+    }
+}
+
 /// Worker-owned coordinate preparation, never a receipt for readable text.
 /// Admitted geometry can establish the complete cold mapping without loading
 /// the arbitrary row used to capture its source. Displaced metadata remains
@@ -536,6 +562,14 @@ enum ColdVisualLayoutKind {
 
 #[cfg(feature = "use_serde")]
 impl ColdVisualLayout {
+    fn viewport_anchor_group(&self, anchor: &ColdViewportAnchor) -> Option<Range<StableRowIndex>> {
+        let index = self
+            .groups
+            .partition_point(|(source, _)| source.end <= anchor.source.start);
+        let (source, visual) = self.groups.get(index)?;
+        (source == &anchor.source).then(|| visual.clone())
+    }
+
     fn stored_physical(&self) -> bool {
         matches!(self.kind, ColdVisualLayoutKind::StoredPhysical { .. })
     }
@@ -2278,6 +2312,80 @@ impl ScreenLineRead {
             None => (self.hydrated.as_slice(), self.resident.as_slice()),
         };
         first.iter().chain(rest)
+    }
+
+    /// Call only after validating this read against the current Screen under
+    /// terminal ownership. The sum visits bounded row metadata, never cells.
+    pub fn capture_viewport_anchor(&self, row: StableRowIndex) -> Option<ColdViewportAnchor> {
+        if !self.complete {
+            return None;
+        }
+        let layout = self.layout.as_ref()?;
+        let index = layout
+            .groups
+            .partition_point(|(_, visual)| visual.end <= row);
+        let (source, visual) = layout.groups.get(index)?;
+        if !visual.contains(&row)
+            || (source.end == layout.source.end
+                && matches!(
+                    layout.kind,
+                    ColdVisualLayoutKind::StoredPhysical { open_tail: true }
+                ))
+        {
+            return None;
+        }
+        let (_, lines) = self.cached_lines(visual.clone())?;
+        if lines.len() > Self::MAX_ROWS || lines.last()?.last_cell_was_wrapped() {
+            return None;
+        }
+        let offset = usize::try_from(row.checked_sub(visual.start)?).ok()?;
+        let cells = lines[..offset]
+            .iter()
+            .try_fold(0usize, |sum, line| sum.checked_add(line.len()))?;
+        let (sink, interval) = self.cold.as_ref()?;
+        Some(ColdViewportAnchor {
+            sink: Arc::downgrade(sink),
+            interval: interval.clone(),
+            source: source.clone(),
+            cells,
+            // Identity must not keep decoded fragment payload alive on the
+            // GUI thread. Changes elsewhere at the seam cannot move this
+            // immutable closed group.
+            fragments: self
+                .fragments
+                .as_ref()
+                .filter(|fragments| fragments.rows.range(source.clone()).next().is_some())
+                .map(Arc::downgrade),
+        })
+    }
+
+    /// Resolve against this read's new wrapping, preserving the original cell
+    /// offset even when it now falls inside a visual row. Publication must
+    /// still validate the read's coordinate and content witnesses.
+    pub fn resolve_viewport_anchor(&self, anchor: &ColdViewportAnchor) -> Option<StableRowIndex> {
+        let (sink, interval) = self.cold.as_ref()?;
+        if !self.complete
+            || !std::ptr::addr_eq(Arc::as_ptr(sink), anchor.sink.as_ptr())
+            || !interval.retains(&anchor.interval, anchor.source.clone())
+            || !anchor.matches_fragments(&self.fragments)
+        {
+            return None;
+        }
+        let visual = self.layout.as_ref()?.viewport_anchor_group(anchor)?;
+        let (_, lines) = self.cached_lines(visual.clone())?;
+        if lines.len() > Self::MAX_ROWS {
+            return None;
+        }
+        let mut remaining = anchor.cells;
+        for (offset, line) in lines.iter().enumerate() {
+            if remaining < line.len() || (remaining == line.len() && offset + 1 == lines.len()) {
+                return visual
+                    .start
+                    .checked_add(StableRowIndex::try_from(offset).ok()?);
+            }
+            remaining = remaining.checked_sub(line.len())?;
+        }
+        None
     }
 }
 
@@ -4169,6 +4277,35 @@ impl Screen {
     #[cfg(feature = "use_serde")]
     pub fn validates_line_read(&self, read: &ScreenLineRead) -> bool {
         self.try_validate_line_read(read).unwrap_or(false)
+    }
+
+    /// Locate the retained group without loading payload. Busy layout/source
+    /// metadata must defer a paint; only an invalidated source drops the anchor.
+    #[cfg(feature = "use_serde")]
+    pub fn cold_viewport_anchor_group(
+        &self,
+        anchor: &ColdViewportAnchor,
+    ) -> Result<Option<Range<StableRowIndex>>, ColdReadMetadataBusy> {
+        let Some(sink) = self.config.scrollback_spill_sink() else {
+            return Ok(None);
+        };
+        if !std::ptr::addr_eq(Arc::as_ptr(&sink), anchor.sink.as_ptr())
+            || !anchor.matches_fragments(&self.cold_row_fragments)
+        {
+            return Ok(None);
+        }
+        let interval = match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(interval) => interval,
+            crate::config::ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+            crate::config::ScrollbackIntervalCapture::Unavailable => return Ok(None),
+        };
+        if !interval.retains(&anchor.interval, anchor.source.clone()) {
+            return Ok(None);
+        }
+        let layout = self
+            .cold_visual_layout_for_interval(&interval)
+            .ok_or(ColdReadMetadataBusy)?;
+        Ok(layout.viewport_anchor_group(anchor))
     }
 
     /// Publication callers that can retry must distinguish transient metadata
@@ -10605,6 +10742,147 @@ pub(crate) mod tests {
         assert!(screen.cold_visual_layout.is_none());
         assert_eq!(sink.load_scrollback_line(0).unwrap(), originals[0]);
         assert_eq!(sink.load_scrollback_line(1).unwrap(), originals[1]);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_viewport_anchor_preserves_unicode_offset_and_rejects_replaced_source() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut prefix = Line::from_text(
+            "abcde\u{301}fghij界klmnopqr",
+            &CellAttributes::blank(),
+            1,
+            None,
+        );
+        prefix.set_last_cell_was_wrapped(true, 1);
+        for (row, line) in [
+            prefix,
+            Line::from_text("UVWXYZ10", &CellAttributes::blank(), 1, None),
+            Line::from_text("other", &CellAttributes::blank(), 1, None),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(sink.store_scrollback_line(row as StableRowIndex, line, 100));
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            20,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 3;
+        let initial = screen
+            .capture_line_read(0..2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&initial));
+        screen.install_line_read_layout(&initial, 1);
+        let anchor = initial.capture_viewport_anchor(1).unwrap();
+        assert_eq!(initial.resolve_viewport_anchor(&anchor), Some(1));
+        let mut cursor = test_cursor(0, 0, 1);
+        for (index, (cols, expected)) in [
+            (11, "界klmnopqrU"),
+            (13, "lmnopqrUVWXYZ"),
+            (40, "abcde\u{301}fghij界klmnopqrUVWXYZ10"),
+            (20, "UVWXYZ10"),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            let seqno = index as SequenceNo + 2;
+            cursor = screen.resize(test_size(3, cols, 96), cursor, seqno, false);
+            assert!(!screen.validates_line_read(&initial));
+            let layout = screen
+                .capture_line_read(2..3)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&layout));
+            screen.install_line_read_layout(&layout, seqno);
+            let group = screen.cold_viewport_anchor_group(&anchor).unwrap().unwrap();
+            let ready = screen
+                .capture_line_read(group)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&ready));
+            let row = ready.resolve_viewport_anchor(&anchor).unwrap();
+            assert_eq!(
+                ready.cached_lines(row..row + 1).unwrap().1[0].as_str(),
+                expected
+            );
+            // An empty final continuation row can anchor the insertion point
+            // after the final cell. Widening may absorb that row, but the
+            // endpoint still belongs to the last visual row of the group.
+            let mut endpoint = anchor.clone();
+            endpoint.cells = 28;
+            let row = ready.resolve_viewport_anchor(&endpoint).unwrap();
+            let group = screen
+                .cold_viewport_anchor_group(&endpoint)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row, group.end - 1);
+            endpoint.cells += 1;
+            assert!(ready.resolve_viewport_anchor(&endpoint).is_none());
+        }
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        assert_eq!(
+            screen.cold_viewport_anchor_group(&anchor),
+            Err(ColdReadMetadataBusy)
+        );
+        sink.force_busy_probe.store(false, Ordering::Relaxed);
+        *sink.interval_identity.lock().unwrap() =
+            crate::config::ScrollbackIntervalIdentity::default();
+        assert_eq!(screen.cold_viewport_anchor_group(&anchor), Ok(None));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_viewport_anchor_does_not_retain_payload_or_depend_on_unrelated_fragments() {
+        let originals = [
+            Line::from_text(
+                "abcdefghijklmnopqrstUVWXYZ10",
+                &CellAttributes::blank(),
+                1,
+                None,
+            ),
+            Line::from_text("other", &CellAttributes::blank(), 1, None),
+        ];
+        for replaced in [0usize, 1] {
+            let (screen, sink) = streamed_cold_fragment_fixture(
+                &originals,
+                [(replaced as StableRowIndex, originals[replaced].clone())].into(),
+                20,
+            );
+            let read = screen
+                .capture_line_read(0..1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&read));
+            let fragments = screen.cold_row_fragments.as_ref().unwrap();
+            let sink_owners = Arc::strong_count(&sink);
+            let fragment_owners = Arc::strong_count(fragments);
+            let anchor = read.capture_viewport_anchor(0).unwrap();
+            assert_eq!(anchor.source, 0..1);
+            assert_eq!(Arc::strong_count(&sink), sink_owners);
+            assert_eq!(Arc::strong_count(fragments), fragment_owners);
+            assert!(anchor.matches_fragments(&screen.cold_row_fragments));
+            let mut changed = (**fragments).clone();
+            changed.rows = Arc::new([(1, originals[1].clone())].into());
+            assert_eq!(
+                anchor.matches_fragments(&Some(Arc::new(changed.clone()))),
+                replaced == 1
+            );
+            changed.rows = Arc::new([(0, originals[0].clone())].into());
+            assert!(!anchor.matches_fragments(&Some(Arc::new(changed))));
+        }
     }
 
     #[cfg(feature = "use_serde")]
