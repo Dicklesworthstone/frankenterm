@@ -402,6 +402,8 @@ fn capture_and_publish_whole_mux_recovery_at_boundary(
     let rechecked = mux.capture_topology_coherent(config)?;
     if captured.session_incarnation != rechecked.session_incarnation
         || captured.topology_revision != rechecked.topology_revision
+        || captured.domains != rechecked.domains
+        || captured.default_domain_id != rechecked.default_domain_id
         || captured.windows != rechecked.windows
         || captured.tabs != rechecked.tabs
         || captured.pane_bindings != rechecked.pane_bindings
@@ -13316,6 +13318,117 @@ mod tests {
         assert_eq!(receipt.generation, 1);
         assert!(!authority.in_progress.load(Ordering::Acquire));
         assert!(!authority.reconciliation_is_required());
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "frankenterm-deps"))]
+    #[allow(clippy::too_many_lines)]
+    fn model_mux_capture_rejects_domain_policy_change_at_capture_cut() {
+        use mux::domain::{Domain, LocalDomain};
+        use std::io::Read as _;
+
+        // LocalDomain captures process-wide configuration. Isolate the real
+        // configuration mutation from every other libtest in this process.
+        const CHILD_ENV: &str = "FT_SNAPSHOT_DOMAIN_POLICY_CHILD";
+        const TEST_NAME: &str =
+            "snapshot_engine::tests::model_mux_capture_rejects_domain_policy_change_at_capture_cut";
+        if std::env::var(CHILD_ENV).as_deref() != Ok(TEST_NAME) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+                .env(CHILD_ENV, TEST_NAME)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn isolated domain policy test");
+            let read = |pipe: Box<dyn std::io::Read + Send>| {
+                std::thread::spawn(move || {
+                    let mut output = String::new();
+                    pipe.take(1024 * 1024).read_to_string(&mut output).unwrap();
+                    output
+                })
+            };
+            let stdout = read(Box::new(child.stdout.take().unwrap()));
+            let stderr = read(Box::new(child.stderr.take().unwrap()));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    child.wait().expect("reap timed-out domain policy test");
+                    panic!("isolated domain policy test exceeded its deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = stdout.join().unwrap();
+            let stderr = stderr.join().unwrap();
+            assert!(
+                status.success()
+                    && stdout.contains("running 1 test")
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    && stdout.contains(&format!("test {TEST_NAME} ... ok")),
+                "isolated domain policy test failed: {status}\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        config::use_this_configuration(config::Config {
+            term: "capture-policy-A".into(),
+            ..config::Config::default()
+        });
+        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("capture-policy-domain").unwrap());
+        let mux = mux::Mux::new(Some(domain));
+        let topology = mux.capture_topology_coherent(Default::default()).unwrap();
+        assert_eq!(topology.domains.len(), 1);
+        assert!(topology.pane_bindings.is_empty());
+        let directory = checkpoint_artifact_test_directory();
+        let store = crate::snapshot_publication::SnapshotPublicationStore::open(
+            directory.path(),
+            Default::default(),
+        )
+        .unwrap();
+        let key =
+            Arc::new(crate::snapshot_representation::RecoveryKey::from_bytes([23; 32]).unwrap());
+        let expected = WholeMuxPublicationIdentity {
+            generation: 1,
+            session_id: "domain-policy-cut".into(),
+            mux_incarnation_id: hex::encode(topology.session_incarnation.as_bytes()),
+            root_object_id: [24; 32],
+            publisher_id: "test".into(),
+            ft_version: "test".into(),
+            predecessor: None,
+            predecessor_image_digest: None,
+            existing_guardian_custody: None,
+        };
+        let reached_boundary = std::cell::Cell::new(false);
+        let result = capture_and_publish_whole_mux_recovery_at_boundary(
+            &crate::cx::Cx::for_testing(),
+            &mux,
+            &store,
+            key,
+            &expected,
+            Duration::from_secs(5),
+            || {
+                reached_boundary.set(true);
+                config::use_this_configuration(config::Config {
+                    term: "capture-policy-B".into(),
+                    ..config::Config::default()
+                });
+                let changed = mux.capture_topology_coherent(Default::default()).unwrap();
+                assert_eq!(topology.session_incarnation, changed.session_incarnation);
+                assert_eq!(topology.topology_revision, changed.topology_revision);
+                assert_eq!(topology.default_domain_id, changed.default_domain_id);
+                assert_ne!(topology.domains, changed.domains);
+            },
+        );
+        assert!(reached_boundary.get());
+        assert!(
+            matches!(result, Err(WholeMuxCaptureError::StaleCapture)),
+            "{result:?}"
+        );
+        assert!(store.inspect_root_candidates().unwrap().0.is_empty());
+        assert!(store.list_object_ids().unwrap().is_empty());
     }
 
     #[test]

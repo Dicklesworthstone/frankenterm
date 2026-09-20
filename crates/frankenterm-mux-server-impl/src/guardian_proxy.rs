@@ -193,6 +193,29 @@ impl Domain for GuardianDomain {
         &self,
         captured_config: &config::ConfigHandle,
     ) -> anyhow::Result<mux::domain::DomainRecoveryPolicy> {
+        // A recovered domain starts with fresh spawn admission. Never encode
+        // that policy while a worker or an unpublished birth still owns the
+        // original domain's fence. Share spawn admission across the complete
+        // read so a new worker cannot start between these checks.
+        anyhow::ensure!(
+            self.admission
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "guardian domain spawn admission is busy during recovery capture"
+        );
+        let _admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
+        let state = self
+            .state
+            .try_lock()
+            .context("guardian domain birth state is busy during recovery capture")?;
+        anyhow::ensure!(
+            state.unadopted_birth.is_none()
+                || state
+                    .publication
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.was_published()),
+            "guardian domain retains an unpublished birth during recovery capture"
+        );
         anyhow::ensure!(
             [self.socket_path.as_path(), self.token_path.as_path()]
                 .iter()
@@ -6846,6 +6869,19 @@ mod tests {
         assert!(domain.state.lock().unadopted_birth.is_none());
         assert!(domain.state.lock().publication.is_none());
         assert!(!domain.admission.load(Ordering::Acquire));
+        let held_state = domain.state.lock();
+        assert!(
+            domain
+                .recovery_policy(&config::ConfigHandle::default_config())
+                .is_err(),
+            "busy birth state must refuse without waiting"
+        );
+        assert!(!domain.admission.load(Ordering::Acquire));
+        drop(held_state);
+        assert_eq!(
+            domain.recovery_policy(&config::ConfigHandle::default_config())?,
+            policy
+        );
         drop(mux);
         assert!(domain.owner.upgrade().is_none());
         Ok(())
@@ -7214,6 +7250,22 @@ mod tests {
                 "Domain birth published before commit"
             );
             let pane = unpublished.publish(&mux).unwrap();
+            let published_birth = domain.state.lock().unadopted_birth;
+            assert!(published_birth.is_some());
+            assert!(
+                domain
+                    .state
+                    .lock()
+                    .publication
+                    .as_ref()
+                    .unwrap()
+                    .was_published()
+            );
+            domain
+                .recovery_policy(&config::configuration())
+                .expect("published birth bookkeeping must permit policy capture");
+            assert_eq!(domain.state.lock().unadopted_birth, published_birth);
+            assert!(!domain.admission.load(Ordering::Acquire));
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 while executor.try_tick().unwrap() {}
@@ -7405,6 +7457,12 @@ mod tests {
                 assert_eq!(std::fs::read(&births).unwrap(), b"BB");
                 assert!(domain.admission.load(Ordering::Acquire));
                 assert!(domain.state.lock().publication.is_none());
+                assert!(domain.recovery_policy(&config::configuration()).is_err());
+                assert!(matches!(
+                    mux.capture_topology_coherent(Default::default()),
+                    Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+                ));
+                assert!(domain.admission.load(Ordering::Acquire));
                 drop(spawn);
                 assert!(
                     domain.admission.load(Ordering::Acquire),
@@ -7521,6 +7579,15 @@ mod tests {
                     .unwrap()
                     .was_published()
             );
+            let unresolved_birth = domain.state.lock().unadopted_birth;
+            assert!(!domain.admission.load(Ordering::Acquire));
+            assert!(domain.recovery_policy(&config::configuration()).is_err());
+            assert!(matches!(
+                mux.capture_topology_coherent(Default::default()),
+                Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+            ));
+            assert_eq!(domain.state.lock().unadopted_birth, unresolved_birth);
+            assert!(!domain.admission.load(Ordering::Acquire));
             assert!(
                 promise::spawn::block_on(domain.spawn_unpublished_pane(
                     &mux,

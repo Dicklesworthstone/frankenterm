@@ -19609,6 +19609,24 @@ impl Mux {
                     })
             });
 
+            // Domain runtime admission can change without replacing its Arc or
+            // advancing topology. Recheck outside mux locks: guardian policy
+            // capture must be able to refuse a newly unresolved spawn.
+            let mut domain_policies_current = true;
+            for (domain_id, domain) in &domain_candidates {
+                let expected = &captured_domains[captured_domains
+                    .binary_search_by_key(domain_id, |domain| domain.domain_id)
+                    .expect("captured domain census preserves every candidate")];
+                let policy = domain
+                    .recovery_policy(&captured_config)
+                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                policy
+                    .validate()
+                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                domain_policies_current &=
+                    policy == expected.policy && domain.state() == expected.state;
+            }
+
             // Re-verify topology revision at the end of the cut
             let (final_stamp, domains_current) = {
                 let _registration = self.domain_registration.lock();
@@ -19637,6 +19655,7 @@ impl Mux {
             if initial_stamp == final_stamp
                 && registrations_current
                 && domains_current
+                && domain_policies_current
                 && configuration().generation() == captured_config.generation()
             {
                 let now_ms = std::time::SystemTime::now()
