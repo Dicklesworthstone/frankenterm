@@ -2729,6 +2729,10 @@ impl DirectMuxClient {
     ) -> Result<Result<MuxTextReadResult, codec::ErrorResponse>, DirectMuxError> {
         const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
         const MAX_RESOURCE_BUSY_RETRIES: usize = 3;
+        #[cfg(test)]
+        {
+            self.get_lines_retry_delays = [None; 3];
+        }
         let mut chunk_rows = 512isize;
         let mut busy_retries = 0usize;
         let mut diagnostics = TextReadDiagnostics {
@@ -2800,10 +2804,15 @@ impl DirectMuxClient {
                         if error.code == codec::MuxErrorCode::RESOURCE_BUSY
                             && busy_retries < MAX_RESOURCE_BUSY_RETRIES
                         {
+                            let delay = get_lines_retry_delay(busy_retries);
+                            #[cfg(test)]
+                            {
+                                self.get_lines_retry_delays[busy_retries] = Some(delay);
+                            }
                             busy_retries += 1;
                             diagnostics.resource_busy_retries += 1;
                             let phase_started = diagnostics.start_phase();
-                            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                            crate::runtime_async::sleep_with_cx(cx, delay)
                                 .await
                                 .map_err(|error| cancelled_mux_error("text_read_backoff", error))?;
                             diagnostics.phase("busy_wait", phase_started);
