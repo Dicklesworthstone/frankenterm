@@ -10669,15 +10669,30 @@ mod tests {
     #[test]
     fn compact_scrollback_rejects_unsafe_cells_and_precharges_fat_attributes() {
         let (_fallback_dir, fallback, _fallback_deferred) = deferred_test_sink();
-        for (row, (text, width)) in [("\r", 1), ("\n", 1), ("AB", 1), ("A", 2), ("界", 2)]
-            .into_iter()
-            .enumerate()
+        for (row, (text, width, stored_text, schema)) in [
+            ("A\r", 1, "A\r", 1),
+            ("\r\nA", 1, "\r\nA", 1),
+            ("AB", 1, "AB", 1),
+            ("A", 2, "A", 1),
+            ("界", 2, "界", 1),
+            // TeenyString deliberately normalizes isolated controls and CRLF
+            // to a space. Those actual stored cells are safe positive cases.
+            ("\r", 1, " ", 2),
+            ("\n", 1, " ", 2),
+            ("\r\n", 1, " ", 2),
+            ("\x7f", 1, " ", 2),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut line = Line::from_text(&"a".repeat(64), &CellAttributes::blank(), 7, None);
             line.set_cell_grapheme(1, text, width, CellAttributes::blank(), 7);
-            if text == "\r" {
-                line.set_cell_grapheme(2, "\n", 1, CellAttributes::blank(), 7);
-            }
+            assert_eq!(
+                line.cells_mut()[1].str(),
+                stored_text,
+                "fixture text {text:?}"
+            );
+            assert_eq!(line.cells_mut()[1].width(), width, "fixture width {text:?}");
             // Preserve a hidden spacer's distinct attributes in the wide case.
             if width == 2 {
                 line.cells_mut()[2].attrs_mut().set_reverse(true);
@@ -10686,15 +10701,16 @@ mod tests {
             let semantic: ExactSemanticScrollbackLineV1 =
                 codec::bounded_varbincode_deserialize(&mut raw.as_slice()).unwrap();
             assert_eq!(
-                semantic.schema, 1,
-                "unsafe grapheme must retain vector storage"
+                semantic.schema, schema,
+                "schema must match actual stored cell text={stored_text:?} width={width}"
             );
             line.cells_mut();
             assert!(fallback.store_scrollback_line(row as isize, &line, 16));
             let restored = fallback.load_scrollback_line(row as isize).unwrap();
             assert_eq!(
                 varbincode::serialize(&restored).unwrap(),
-                varbincode::serialize(&line).unwrap()
+                varbincode::serialize(&line).unwrap(),
+                "encrypted full-line parity for input={text:?} width={width}"
             );
         }
         let mut alternating = Line::from_text(&"a".repeat(64), &CellAttributes::blank(), 7, None);
