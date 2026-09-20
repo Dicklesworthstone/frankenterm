@@ -4124,7 +4124,7 @@ impl TerminalCheckpointV3 {
                 supported: TERMINAL_CHECKPOINT_VERSION,
             });
         }
-        if version_text != "2" {
+        if version_text != TERMINAL_CHECKPOINT_VERSION.to_string() {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
 
@@ -5735,12 +5735,12 @@ mod tests {
             .expect("encode fixture");
 
         let mut unknown_version = canonical.clone();
-        let version = b"{\"version\":2";
+        let version = b"{\"version\":3";
         assert!(unknown_version.starts_with(version));
-        unknown_version[version.len() - 1] = b'3';
+        unknown_version[version.len() - 1] = b'4';
         assert!(matches!(
             TerminalCheckpointV3::decode_canonical_json(&unknown_version, limits),
-            Err(TerminalCheckpointError::UnsupportedVersion { observed: 3, .. })
+            Err(TerminalCheckpointError::UnsupportedVersion { observed: 4, .. })
         ));
 
         // Mutate the canonical bytes in place so this negative reaches typed
