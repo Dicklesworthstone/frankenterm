@@ -7084,6 +7084,7 @@ impl Screen {
         seqno: SequenceNo,
         verified: Option<VerifiedPreparedResize>,
         selection_anchors: &mut SelectionAnchorRegistry,
+        saved_cursor: &mut Option<(usize, PhysRowIndex)>,
     ) -> (usize, PhysRowIndex) {
         let (cursor_x, cursor_y) = cursor;
         self.invalidate_coordinate_witnesses();
@@ -7100,6 +7101,8 @@ impl Screen {
             || self.logical_cursor_from_physical(cursor_x, cursor_y),
             |prepared| prepared.logical_cursor,
         );
+        let logical_saved_cursor =
+            saved_cursor.and_then(|(x, y)| self.logical_cursor_from_physical(x, y));
         // These are the live points at commit, never the worker snapshot's
         // points. Mapping reads only row lengths/wrap flags, not cell payloads.
         let logical_anchors: Vec<_> = selection_anchors
@@ -7254,6 +7257,21 @@ impl Screen {
             }
         }
 
+        if let Some((logical_idx, mut remaining)) = logical_saved_cursor {
+            if let (Some(&start), Some(&end)) =
+                (row_prefix.get(logical_idx), row_prefix.get(logical_idx + 1))
+            {
+                for row in start..end {
+                    let row_len = self.lines[row].len();
+                    if remaining < row_len || row + 1 == end {
+                        *saved_cursor = Some((remaining, row));
+                        break;
+                    }
+                    remaining -= row_len;
+                }
+            }
+        }
+
         let mut anchor_index = 0;
         selection_anchors.0.retain_mut(|entry| {
             let logical = &logical_anchors[anchor_index];
@@ -7299,6 +7317,7 @@ impl Screen {
         let capacity = physical_rows + self.hot_scrollback_size();
         while self.lines.len() > capacity
             && self.lines.len().saturating_sub(1) > adjusted_cursor.1
+            && saved_cursor.is_none_or(|(_, row)| self.lines.len().saturating_sub(1) > row)
             && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
         {
             self.lines.pop_back();
@@ -7435,6 +7454,7 @@ impl Screen {
         snapshot.stable_row_index_offset = self.stable_row_index_offset;
         snapshot.resize_wrap_policy = self.resize_wrap_policy;
         snapshot.rewrap_cache = self.rewrap_cache.clone();
+        snapshot.saved_cursor = self.saved_cursor.clone();
         if let Some(start) = profile_start {
             log::debug!(
                 target: "frankenterm_term::screen::reflow_profile",
@@ -7475,6 +7495,15 @@ impl Screen {
             && prepared.snapshot.physical_rows == self.physical_rows
             && prepared.snapshot.stable_row_index_offset == self.stable_row_index_offset
             && prepared.snapshot.resize_wrap_policy == self.resize_wrap_policy
+            && prepared
+                .snapshot
+                .saved_cursor
+                .as_ref()
+                .map(|saved| (saved.position, saved.wrap_next, saved.wrap_next_column))
+                == self
+                    .saved_cursor
+                    .as_ref()
+                    .map(|saved| (saved.position, saved.wrap_next, saved.wrap_next_column))
             && prepared.source_lines.len() == self.lines.len()
             && prepared
                 .source_lines
@@ -7496,11 +7525,54 @@ impl Screen {
     }
 
     fn prune_resize_trailing_blanks(&mut self, cursor: CursorPosition) {
-        let cursor_phys = self.phys_row(cursor.y);
+        let cursor_phys = self
+            .saved_cursor
+            .as_ref()
+            .map_or(self.phys_row(cursor.y), |saved| {
+                self.phys_row(cursor.y).max(self.phys_row(saved.position.y))
+            });
         for _ in cursor_phys + 1..self.lines.len() {
             if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
                 self.lines.pop_back();
             }
+        }
+    }
+
+    /// Normalize a saved insertion point after resize resets the margins.
+    fn set_resized_saved_cursor(
+        &mut self,
+        column: usize,
+        row: PhysRowIndex,
+        visible_row: VisibleRowIndex,
+        seqno: SequenceNo,
+    ) {
+        let pending_wrap = column >= self.physical_cols
+            && (self.allow_scrollback
+                || self
+                    .saved_cursor
+                    .as_ref()
+                    .is_some_and(|saved| saved.wrap_next));
+        // A wide glyph's displayed cursor remains at its lead cell; the
+        // insertion point remains the exclusive endpoint saved separately.
+        let displayed_column = if column >= self.physical_cols {
+            self.lines
+                .get(row)
+                .and_then(|line| {
+                    line.visible_cells()
+                        .filter(|cell| cell.cell_index() < self.physical_cols)
+                        .last()
+                        .map(|cell| cell.cell_index())
+                })
+                .unwrap_or(self.physical_cols - 1)
+        } else {
+            column
+        };
+        if let Some(saved) = self.saved_cursor.as_mut() {
+            saved.position.x = displayed_column;
+            saved.position.y = visible_row.max(0);
+            saved.position.seqno = seqno;
+            saved.wrap_next = pending_wrap;
+            saved.wrap_next_column = pending_wrap.then_some(self.physical_cols);
         }
     }
 
@@ -7534,6 +7606,17 @@ impl Screen {
             && physical_cols == self.physical_cols
             && size.dpi == self.dpi
         {
+            // TerminalState resets margins even when geometry is unchanged.
+            // A former narrow-margin endpoint can now be an interior column.
+            if let Some((column, row, y)) = self.saved_cursor.as_ref().map(|saved| {
+                (
+                    saved.wrap_next_column.unwrap_or(saved.position.x),
+                    self.phys_row(saved.position.y),
+                    saved.position.y,
+                )
+            }) {
+                self.set_resized_saved_cursor(column, row, y, seqno);
+            }
             self.finish_selection_anchor_resize(selection_anchors, seqno);
             return cursor;
         }
@@ -7585,6 +7668,13 @@ impl Screen {
         // this avoids growing the scrollback size when rapidly switching between normal and
         // maximized states.
         let cursor_phys = self.phys_row(cursor.y);
+        let mut saved_cursor = self.saved_cursor.as_ref().map(|saved| {
+            (
+                saved.wrap_next_column.unwrap_or(saved.position.x),
+                self.phys_row(saved.position.y),
+            )
+        });
+        let old_saved_cursor = saved_cursor;
         self.prune_resize_trailing_blanks(cursor);
         let mut verified_wraps = None;
         if let Some(prepared) = prepared {
@@ -7649,6 +7739,7 @@ impl Screen {
                         seqno,
                         verified_wraps,
                         &mut selection_anchors,
+                        &mut saved_cursor,
                     )
                 } else {
                     // Keep resize responsive for large scrollback histories
@@ -7754,6 +7845,18 @@ impl Screen {
 
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
+        if let Some((column, row)) = saved_cursor {
+            let saved_y = if resize_preserves_scrollback {
+                self.saved_cursor
+                    .as_ref()
+                    .map_or(0, |saved| saved.position.y)
+                    .saturating_add(row as i64)
+                    .saturating_sub(old_saved_cursor.map_or(0, |(_, row)| row as i64))
+            } else {
+                row as i64 - (self.lines.len() as i64 - physical_rows as i64)
+            };
+            self.set_resized_saved_cursor(column, row, saved_y, seqno);
+        }
         self.finish_selection_anchor_resize(selection_anchors, seqno);
         self.retain_last_good_frame(seqno, LastGoodFrameTransition::ResizeCommit);
         CursorPosition {
@@ -15752,6 +15855,7 @@ pub(crate) mod tests {
             2,
             None,
             &mut SelectionAnchorRegistry::default(),
+            &mut None,
         );
         assert_eq!(cursor, (0, 0));
         assert_eq!(screen.lines.len(), 4, "two trailing blank rows were pruned");
@@ -16902,6 +17006,7 @@ pub(crate) mod tests {
                     2,
                     None,
                     &mut SelectionAnchorRegistry::default(),
+                    &mut None,
                 );
                 screen.physical_cols = cols;
                 assert_eq!(
@@ -16938,6 +17043,7 @@ pub(crate) mod tests {
                 2,
                 None,
                 &mut SelectionAnchorRegistry::default(),
+                &mut None,
             );
             screen.physical_cols = cols;
             assert_eq!(

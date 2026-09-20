@@ -1938,7 +1938,7 @@ pub enum RecoveryParserCheckpoint<'a> {
 #[cfg(feature = "frankenterm-deps")]
 impl<'a> RecoveryParserCheckpoint<'a> {
     #[must_use]
-    pub fn terminal_checkpoint(&self) -> &'a frankenterm_term::RecoveryTerminalCheckpointV2 {
+    pub fn terminal_checkpoint(&self) -> &'a frankenterm_term::RecoveryTerminalCheckpointV3 {
         match self {
             Self::Model(ack) => &ack.terminal_checkpoint,
             Self::Guardian(published) => published.capture().terminal_checkpoint(),
@@ -1976,7 +1976,7 @@ struct ImageParserCapture<'a> {
     durable_pane_id: uuid::Uuid,
     parser_stream_bytes: u64,
     semantic_generation: u64,
-    terminal_checkpoint: &'a frankenterm_term::RecoveryTerminalCheckpointV2,
+    terminal_checkpoint: &'a frankenterm_term::RecoveryTerminalCheckpointV3,
 }
 
 #[cfg(feature = "frankenterm-deps")]
@@ -2190,7 +2190,7 @@ impl MuxRecoveryImage {
                 pane_id: binding.pane_id,
                 reason,
             };
-            let validated = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+            let validated = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
                 ack.terminal_checkpoint.canonical_payload(),
                 frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
             ).map_err(|_| invalid_model("canonical checkpoint validation failed"))?;
@@ -3108,7 +3108,7 @@ mod tests {
                     object_id: format!("obj_{pane_id}"),
                     byte_length: 512,
                     payload_digest: [1u8; 32],
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1747371642000,
@@ -4448,7 +4448,7 @@ mod converter_tests {
         rows: usize,
         cols: usize,
         stream: &[u8],
-    ) -> frankenterm_term::RecoveryTerminalCheckpointV2 {
+    ) -> frankenterm_term::RecoveryTerminalCheckpointV3 {
         let size = TermTerminalSize {
             rows,
             cols,
@@ -4471,9 +4471,9 @@ mod converter_tests {
     fn make_test_ack(
         registration_wire_identity: [u8; 16],
         durable_pane_id: uuid::Uuid,
-        terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV3,
     ) -> mux::ModelParserCheckpointAck {
-        let semantic_generation = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+        let semantic_generation = frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
             terminal_checkpoint.canonical_payload(), TerminalCheckpointLimits::default(),
         ).unwrap().checkpoint().semantic_generation();
         mux::ModelParserCheckpointAck {
@@ -4712,7 +4712,7 @@ mod converter_tests {
                 object_id: "obj-101".to_string(),
                 byte_length: 512,
                 payload_digest: [1u8; 32],
-                schema_version: 2,
+                schema_version: 3,
             },
         );
         checkpoint_object_refs.insert(
@@ -4721,7 +4721,7 @@ mod converter_tests {
                 object_id: "obj-102".to_string(),
                 byte_length: 512,
                 payload_digest: [2u8; 32],
-                schema_version: 2,
+                schema_version: 3,
             },
         );
 
@@ -4928,7 +4928,7 @@ mod converter_tests {
                 object_id: "obj-103".to_string(),
                 byte_length: 512,
                 payload_digest: [3u8; 32],
-                schema_version: 2,
+                schema_version: 3,
             },
         );
 
@@ -5027,7 +5027,7 @@ mod converter_tests {
                 object_id: "extra".to_string(),
                 byte_length: 128,
                 payload_digest: [9u8; 32],
-                schema_version: 2,
+                schema_version: 3,
             },
         );
 

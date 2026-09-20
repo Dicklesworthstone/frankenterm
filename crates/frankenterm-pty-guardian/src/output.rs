@@ -12863,7 +12863,7 @@ mod tests {
     use super::*;
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
-        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+        RecoveryTerminalCheckpointV3, Terminal, TerminalConfiguration, TerminalSize,
     };
     use mio::{Poll, Token};
     use mux::guardian_protocol::{
@@ -13901,7 +13901,7 @@ mod tests {
         terminal
     }
 
-    fn checkpoint_catalog_test_terminal(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+    fn checkpoint_catalog_test_terminal(content: &[u8]) -> RecoveryTerminalCheckpointV3 {
         checkpoint_catalog_test_terminal_instance(content)
             .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
             .expect("capture canonical catalog checkpoint fixture")
@@ -14095,7 +14095,7 @@ mod tests {
         pane_id: Uuid,
         generation: u64,
         upload_id: Uuid,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
         receipt: GuardianOutputAppendReceipt,
         chunk_bytes: u32,
         chunk: Option<(u32, &[u8])>,
@@ -14207,7 +14207,7 @@ mod tests {
         sequence: u64,
         identity_base: u128,
         receipt: GuardianOutputAppendReceipt,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
     ) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
         if terminal.parser_stream_bytes() != receipt.cumulative_plaintext_bytes() {
             return Err("catalog fixture parser/output watermark mismatch".into());

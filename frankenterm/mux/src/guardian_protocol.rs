@@ -13,7 +13,7 @@ use frankenterm_build_identity::{
 };
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{
-    terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2,
+    terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV3,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use portable_pty::{cmdbuilder::CommandBuilder, PtySize};
@@ -4179,7 +4179,7 @@ impl GuardianCheckpointDescriptorV1 {
     /// assigned only after the exact spawn effect adopts it.
     pub fn for_genesis_artifact(
         spawn_effect_id: Uuid,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
     ) -> Result<Self, GuardianProtocolError> {
         let canonical = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
             spawn_effect_id,
@@ -4583,7 +4583,7 @@ impl GuardianCheckpointDescriptorV1 {
         canonical_terminal_payload: &[u8],
         limits: TerminalCheckpointLimits,
     ) -> Result<
-        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV2,
+        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV3,
         GuardianProtocolError,
     > {
         self.validate()?;
@@ -12267,7 +12267,7 @@ mod tests {
         assert!(!format!("{authority:?}").contains("5a5a"));
     }
 
-    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV3 {
         terminal_checkpoint_with_size(24, 80, 640, 384)
     }
 
@@ -12276,7 +12276,7 @@ mod tests {
         cols: usize,
         pixel_width: usize,
         pixel_height: usize,
-    ) -> RecoveryTerminalCheckpointV2 {
+    ) -> RecoveryTerminalCheckpointV3 {
         Terminal::new(
             TerminalSize {
                 rows,
@@ -12701,7 +12701,7 @@ mod tests {
         request_id: Uuid,
         spawn_effect_id: Uuid,
         upload_id: Uuid,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
     ) -> GuardianRequestEnvelope {
         let descriptor =
             GuardianCheckpointDescriptorV1::for_genesis_artifact(spawn_effect_id, terminal)
@@ -12731,7 +12731,7 @@ mod tests {
     fn issued_genesis_identity(
         command: &str,
         size: PtySize,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
         upload_id: Uuid,
     ) -> GuardianGenesisReservationIdentityV1 {
         let guardian = id(1);

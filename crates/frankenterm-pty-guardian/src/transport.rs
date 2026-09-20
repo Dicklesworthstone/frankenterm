@@ -4824,7 +4824,7 @@ mod tests {
     use super::*;
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
-        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+        RecoveryTerminalCheckpointV3, Terminal, TerminalConfiguration, TerminalSize,
     };
     use std::io::SeekFrom;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -4838,7 +4838,7 @@ mod tests {
         }
     }
 
-    fn transport_checkpoint() -> RecoveryTerminalCheckpointV2 {
+    fn transport_checkpoint() -> RecoveryTerminalCheckpointV3 {
         Terminal::new(
             TerminalSize {
                 rows: 24,

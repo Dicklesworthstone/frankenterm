@@ -4855,7 +4855,7 @@ mod tests {
     use super::*;
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
-        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+        RecoveryTerminalCheckpointV3, Terminal, TerminalConfiguration, TerminalSize,
     };
     use mio::{Poll, Waker};
     use mux::guardian_output_journal::GuardianOutputAppendReceipt;
@@ -5123,7 +5123,7 @@ mod tests {
         }
     }
 
-    fn runtime_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+    fn runtime_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV3 {
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -5143,7 +5143,7 @@ mod tests {
             .expect("capture canonical runtime checkpoint fixture")
     }
 
-    fn runtime_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+    fn runtime_terminal_checkpoint() -> RecoveryTerminalCheckpointV3 {
         runtime_terminal_checkpoint_with(&[])
     }
 
@@ -5189,7 +5189,7 @@ mod tests {
         pane_id: Uuid,
         generation: u64,
         upload_id: Uuid,
-        terminal: &RecoveryTerminalCheckpointV2,
+        terminal: &RecoveryTerminalCheckpointV3,
         receipt: GuardianOutputAppendReceipt,
         chunk_bytes: u32,
         chunk: Option<(u32, &[u8])>,

@@ -25238,7 +25238,7 @@ mod tests {
             reached_output,
             "bounded checkpoint transfer reaches empty output phase"
         );
-        frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+        frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
             &canonical,
             frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
         )

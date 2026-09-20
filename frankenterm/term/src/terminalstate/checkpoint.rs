@@ -15,7 +15,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Current semantic terminal checkpoint schema.
-pub const TERMINAL_CHECKPOINT_VERSION: u32 = 2;
+pub const TERMINAL_CHECKPOINT_VERSION: u32 = 3;
 
 fn resource_limit(
     resource: &'static str,
@@ -293,15 +293,15 @@ impl<'de> serde::de::Visitor<'de> for JsonStructuralVisitor<'_> {
 /// A checkpoint that passed canonical decoding, semantic validation, and all
 /// target-architecture conversions.  This type deliberately has no Deserialize
 /// implementation and is the only checkpoint authority accepted by restore.
-pub struct ValidatedTerminalCheckpointV2 {
-    checkpoint: TerminalCheckpointV2,
+pub struct ValidatedTerminalCheckpointV3 {
+    checkpoint: TerminalCheckpointV3,
     limits: TerminalCheckpointLimits,
 }
 
-impl std::fmt::Debug for ValidatedTerminalCheckpointV2 {
+impl std::fmt::Debug for ValidatedTerminalCheckpointV3 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_tuple("ValidatedTerminalCheckpointV2")
+            .debug_tuple("ValidatedTerminalCheckpointV3")
             .field(&self.checkpoint)
             .finish()
     }
@@ -2101,6 +2101,7 @@ impl TerminalConfiguration for ReplayTerminalConfiguration {
 struct CheckpointSavedCursor {
     position: CheckpointCursorPosition,
     wrap_next: bool,
+    wrap_next_column: Option<u64>,
     pen: CheckpointCellAttributes,
     dec_origin_mode: bool,
     g0_charset: CheckpointCharSet,
@@ -2112,6 +2113,7 @@ impl CheckpointSavedCursor {
         Ok(Self {
             position: CheckpointCursorPosition::capture(value.position)?,
             wrap_next: value.wrap_next,
+            wrap_next_column: value.wrap_next_column.map(|column| column as u64),
             pen: CheckpointCellAttributes::capture(&value.pen)?,
             dec_origin_mode: value.dec_origin_mode,
             g0_charset: value.g0_charset.into(),
@@ -2123,6 +2125,10 @@ impl CheckpointSavedCursor {
         Ok(SavedCursor {
             position: self.position.into_live()?,
             wrap_next: self.wrap_next,
+            wrap_next_column: self
+                .wrap_next_column
+                .map(|column| usize_from_u64(column, "screen.saved_cursor.wrap_next_column"))
+                .transpose()?,
             pen: self.pen.into_live()?,
             dec_origin_mode: self.dec_origin_mode,
             g0_charset: self.g0_charset.into_live(),
@@ -2138,6 +2144,16 @@ impl CheckpointSavedCursor {
     ) -> Result<(), TerminalCheckpointError> {
         self.position
             .validate_retained(terminal_seqno, "screen.saved_cursor")?;
+        if self.wrap_next != self.wrap_next_column.is_some()
+            || self.wrap_next_column.is_some_and(|column| {
+                column == 0 || column > limits.max_cols as u64 || column <= self.position.x
+            })
+        {
+            return Err(TerminalCheckpointError::InvalidField {
+                field: "screen.saved_cursor.wrap_next_column",
+                reason: "pending wrap requires a bounded insertion point after the cursor",
+            });
+        }
         self.pen.validate(limits, usage)
     }
 }
@@ -2771,7 +2787,7 @@ impl TerminalCheckpointLimits {
 /// serde decoding will be paired with a validating constructor before restore.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TerminalCheckpointV2 {
+pub struct TerminalCheckpointV3 {
     version: u32,
     custom_cell_width_maps: Vec<CheckpointCustomCellWidthMap>,
     replay_config: CheckpointReplayConfigV2,
@@ -2844,10 +2860,10 @@ pub struct TerminalCheckpointV2 {
     bidi_hint: Option<CheckpointBidiHint>,
 }
 
-impl std::fmt::Debug for TerminalCheckpointV2 {
+impl std::fmt::Debug for TerminalCheckpointV3 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TerminalCheckpointV2")
+            .debug_struct("TerminalCheckpointV3")
             .field("version", &self.version)
             .field("rows", &self.primary_screen.physical_rows)
             .field("cols", &self.primary_screen.physical_cols)
@@ -2969,12 +2985,12 @@ impl StagedRecoveryCheckpoint {
 
     pub fn materialize(
         self,
-    ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
+    ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
         let checkpoint = self.hot.materialize_cold_history(self.limits)?;
         let rows = checkpoint.primary_rows();
         let cols = checkpoint.primary_cols();
         let payload = checkpoint.to_canonical_json(self.limits)?;
-        Ok(crate::RecoveryTerminalCheckpointV2::from_canonical_parts(
+        Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             payload,
             rows,
             cols,
@@ -2998,11 +3014,11 @@ impl StagedHotCheckpoint {
 
     /// Materialize cold-history rows and fragments from the spill sink outside the terminal lock,
     /// revalidate generation against the pinned generation (failing if stale),
-    /// and assemble the canonical `TerminalCheckpointV2`.
+    /// and assemble the canonical `TerminalCheckpointV3`.
     pub fn materialize_cold_history(
         mut self,
         limits: TerminalCheckpointLimits,
-    ) -> Result<TerminalCheckpointV2, TerminalCheckpointError> {
+    ) -> Result<TerminalCheckpointV3, TerminalCheckpointError> {
         limits.validate_policy()?;
 
         let parts = self
@@ -3025,7 +3041,7 @@ impl StagedHotCheckpoint {
             })?;
 
         let primary_screen = CheckpointScreen::capture(parts)?;
-        let checkpoint = TerminalCheckpointV2 {
+        let checkpoint = TerminalCheckpointV3 {
             version: TERMINAL_CHECKPOINT_VERSION,
             custom_cell_width_maps: self.custom_cell_width_maps,
             replay_config: self.replay_config,
@@ -3117,7 +3133,7 @@ impl StagedHotCheckpoint {
     }
 }
 
-impl TerminalCheckpointV2 {
+impl TerminalCheckpointV3 {
     fn preflight_checkpoint_attributes(
         attributes: &CellAttributes,
         limits: TerminalCheckpointLimits,
@@ -4078,7 +4094,7 @@ impl TerminalCheckpointV2 {
     pub fn decode_canonical_json(
         bytes: &[u8],
         limits: TerminalCheckpointLimits,
-    ) -> Result<ValidatedTerminalCheckpointV2, TerminalCheckpointError> {
+    ) -> Result<ValidatedTerminalCheckpointV3, TerminalCheckpointError> {
         limits.validate_policy()?;
         if bytes.is_empty() {
             return Err(TerminalCheckpointError::InvalidField {
@@ -4134,7 +4150,7 @@ impl TerminalCheckpointV2 {
         if canonical.as_slice() != bytes {
             return Err(TerminalCheckpointError::NonCanonicalEncoding);
         }
-        Ok(ValidatedTerminalCheckpointV2 { checkpoint, limits })
+        Ok(ValidatedTerminalCheckpointV3 { checkpoint, limits })
     }
 
     #[must_use]
@@ -4145,9 +4161,9 @@ impl TerminalCheckpointV2 {
     pub fn validate_into(
         self,
         limits: TerminalCheckpointLimits,
-    ) -> Result<ValidatedTerminalCheckpointV2, TerminalCheckpointError> {
+    ) -> Result<ValidatedTerminalCheckpointV3, TerminalCheckpointError> {
         self.validate(limits)?;
-        Ok(ValidatedTerminalCheckpointV2 {
+        Ok(ValidatedTerminalCheckpointV3 {
             checkpoint: self,
             limits,
         })
@@ -4157,7 +4173,7 @@ impl TerminalCheckpointV2 {
         self,
         ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
-    ) -> Result<crate::RecoveryTerminalCheckpointV2, TerminalCheckpointError> {
+    ) -> Result<crate::RecoveryTerminalCheckpointV3, TerminalCheckpointError> {
         let active_screen = if self.alternate_screen_active {
             &self.alternate_screen
         } else {
@@ -4166,7 +4182,7 @@ impl TerminalCheckpointV2 {
         let rows = active_screen.physical_rows as usize;
         let cols = active_screen.physical_cols as usize;
         let canonical_payload = self.to_canonical_json(limits)?;
-        Ok(crate::RecoveryTerminalCheckpointV2::from_canonical_parts(
+        Ok(crate::RecoveryTerminalCheckpointV3::from_canonical_parts(
             canonical_payload,
             rows,
             cols,
@@ -4291,7 +4307,7 @@ impl TerminalCheckpointV2 {
     }
 }
 
-impl ValidatedTerminalCheckpointV2 {
+impl ValidatedTerminalCheckpointV3 {
     /// Reconstruct the complete immutable replay configuration without live
     /// writer, callback, or spill capabilities.
     pub fn replay_configuration(
@@ -4305,15 +4321,15 @@ impl ValidatedTerminalCheckpointV2 {
         ))
     }
 
-    /// Reference to the underlying validated `TerminalCheckpointV2`.
+    /// Reference to the underlying validated `TerminalCheckpointV3`.
     #[must_use]
-    pub fn checkpoint(&self) -> &TerminalCheckpointV2 {
+    pub fn checkpoint(&self) -> &TerminalCheckpointV3 {
         &self.checkpoint
     }
 
-    /// Consume the wrapper and return the validated `TerminalCheckpointV2`.
+    /// Consume the wrapper and return the validated `TerminalCheckpointV3`.
     #[must_use]
-    pub fn into_checkpoint(self) -> TerminalCheckpointV2 {
+    pub fn into_checkpoint(self) -> TerminalCheckpointV3 {
         self.checkpoint
     }
 
@@ -4389,7 +4405,7 @@ impl ValidatedTerminalCheckpointV2 {
 
 impl TerminalState {
     fn from_validated_checkpoint(
-        checkpoint: TerminalCheckpointV2,
+        checkpoint: TerminalCheckpointV3,
         limits: TerminalCheckpointLimits,
         config: Arc<dyn TerminalConfiguration>,
         custom_cell_width_maps: &[Arc<HashMap<u32, u8>>],
@@ -4442,7 +4458,7 @@ impl TerminalState {
             });
         }
 
-        let TerminalCheckpointV2 {
+        let TerminalCheckpointV3 {
             version: _,
             custom_cell_width_maps: _,
             replay_config: _,
@@ -5102,9 +5118,9 @@ mod tests {
         let mut terminal = terminal();
         terminal.advance_bytes(b"primary\x1b]2;checkpoint-title\x07");
         terminal.advance_bytes(b"\x1b[?1049h\x1b[31malternate");
-        let checkpoint = TerminalCheckpointV2::capture(&terminal).expect("capture terminal");
+        let checkpoint = TerminalCheckpointV3::capture(&terminal).expect("capture terminal");
         let encoded = serde_json::to_vec(&checkpoint).expect("serialize checkpoint");
-        let decoded: TerminalCheckpointV2 =
+        let decoded: TerminalCheckpointV3 =
             serde_json::from_slice(&encoded).expect("deserialize checkpoint");
 
         assert_eq!(decoded, checkpoint);
@@ -5122,7 +5138,7 @@ mod tests {
         terminal.kitty_img.mark_nonempty_for_checkpoint_test();
 
         assert_eq!(
-            TerminalCheckpointV2::capture(&terminal),
+            TerminalCheckpointV3::capture(&terminal),
             Err(TerminalCheckpointError::UnsupportedGraphicsState)
         );
     }
@@ -5136,8 +5152,8 @@ mod tests {
         second.user_vars.insert("alpha".into(), "first".into());
         second.user_vars.insert("zeta".into(), "last".into());
 
-        let first = TerminalCheckpointV2::capture(&first).expect("capture first terminal");
-        let second = TerminalCheckpointV2::capture(&second).expect("capture second terminal");
+        let first = TerminalCheckpointV3::capture(&first).expect("capture first terminal");
+        let second = TerminalCheckpointV3::capture(&second).expect("capture second terminal");
         assert_eq!(
             serde_json::to_vec(&first).expect("serialize first terminal"),
             serde_json::to_vec(&second).expect("serialize second terminal")
@@ -5147,12 +5163,12 @@ mod tests {
     #[test]
     fn canonical_custom_width_table_deduplicates_shared_semantics_and_sorts_content() {
         let limits = TerminalCheckpointLimits::default();
-        let first = TerminalCheckpointV2::capture_with_limits(
+        let first = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(false),
             limits,
         )
         .expect("capture first custom-width terminal");
-        let second = TerminalCheckpointV2::capture_with_limits(
+        let second = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(true),
             limits,
         )
@@ -5182,7 +5198,7 @@ mod tests {
     #[test]
     fn custom_width_table_rejects_out_of_bounds_reference() {
         let limits = TerminalCheckpointLimits::default();
-        let mut checkpoint = TerminalCheckpointV2::capture_with_limits(
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(false),
             limits,
         )
@@ -5202,7 +5218,7 @@ mod tests {
     #[test]
     fn custom_width_table_rejects_unreferenced_rows() {
         let limits = TerminalCheckpointLimits::default();
-        let mut checkpoint = TerminalCheckpointV2::capture_with_limits(
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(false),
             limits,
         )
@@ -5224,7 +5240,7 @@ mod tests {
     #[test]
     fn custom_width_table_rejects_noncanonical_or_empty_maps() {
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(false),
             limits,
         )
@@ -5267,7 +5283,7 @@ mod tests {
     #[test]
     fn custom_width_table_rejects_stack_map_mismatch() {
         let limits = TerminalCheckpointLimits::default();
-        let mut checkpoint = TerminalCheckpointV2::capture_with_limits(
+        let mut checkpoint = TerminalCheckpointV3::capture_with_limits(
             &terminal_with_distinct_custom_width_maps(false),
             limits,
         )
@@ -5291,7 +5307,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_unbound_or_alternate_cold_prefix_metadata() {
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&terminal(), limits)
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal(), limits)
             .expect("capture cold-prefix validation fixture");
 
         let mut unbound = checkpoint.clone();
@@ -5328,7 +5344,7 @@ mod tests {
         let (mut live, sink) = crate::screen::tests::cold_seam_test_terminal();
         let limits = TerminalCheckpointLimits::default();
         let config = live.get_config();
-        let before = TerminalCheckpointV2::capture_with_limits(&live, limits).unwrap();
+        let before = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
         let oldest = sink.oldest_scrollback_row().unwrap();
         let frontier = live.screen().phys_to_stable_row_index(0);
         let stored_before: Vec<_> = (oldest..frontier)
@@ -5348,7 +5364,7 @@ mod tests {
             .screen_mut()
             .install_cold_seam_reflow(&mut prepared, seqno)
             .unwrap());
-        let captured = TerminalCheckpointV2::capture_with_limits(&live, limits).unwrap();
+        let captured = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
         let text = |screen: &CheckpointScreen| {
             screen
                 .lines
@@ -5371,7 +5387,7 @@ mod tests {
             "live seam installation must not rewrite immutable storage"
         );
         let canonical = captured.to_canonical_json(limits).unwrap();
-        let mut inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .unwrap()
             .restore_inert(config)
             .unwrap();
@@ -5386,7 +5402,7 @@ mod tests {
         inert.replay_bytes(b"tail").unwrap();
         let replayed = inert.checkpoint().unwrap();
         let activated = inert.into_live(Box::new(std::io::sink())).unwrap();
-        let after = TerminalCheckpointV2::capture_with_limits(&activated, limits).unwrap();
+        let after = TerminalCheckpointV3::capture_with_limits(&activated, limits).unwrap();
         assert_eq!(after.primary_screen.lines, replayed.primary_screen.lines);
         assert_eq!(after.cursor, replayed.cursor);
         assert_eq!(after.wrap_next, replayed.wrap_next);
@@ -5423,18 +5439,18 @@ mod tests {
             .screen_mut()
             .install_cold_seam_reflow(&mut prepared, seqno)
             .unwrap());
-        let canonical = TerminalCheckpointV2::capture_with_limits(&live, limits)
+        let canonical = TerminalCheckpointV3::capture_with_limits(&live, limits)
             .unwrap()
             .to_canonical_json(limits)
             .unwrap();
-        let inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .unwrap()
             .restore_inert(config)
             .unwrap();
         let oldest = sink.oldest_scrollback_row().unwrap();
         let original = sink.load_scrollback_line(oldest).unwrap();
         assert!(sink.store_scrollback_line(oldest, &original, 32));
-        assert!(TerminalCheckpointV2::capture_with_limits(&live, limits).is_err());
+        assert!(TerminalCheckpointV3::capture_with_limits(&live, limits).is_err());
         let failure = match inert.into_live(Box::new(std::io::sink())) {
             Ok(_) => panic!("stale cold generation cannot activate replacement text"),
             Err(failure) => failure,
@@ -5504,12 +5520,12 @@ mod tests {
         terminal.accumulating_title = Some("pending-title-fragment".into());
 
         let limits = TerminalCheckpointLimits::default();
-        let before = TerminalCheckpointV2::capture_with_limits(&terminal, limits)
+        let before = TerminalCheckpointV3::capture_with_limits(&terminal, limits)
             .expect("capture rich terminal");
         let canonical = before
             .to_canonical_json(limits)
             .expect("encode canonical rich terminal");
-        let validated = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let validated = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("decode canonical rich terminal");
         let inert = validated
             .restore_inert(Arc::new(RichCheckpointTestConfig))
@@ -5522,6 +5538,76 @@ mod tests {
                 .expect("encode restored rich terminal"),
             canonical,
         );
+    }
+
+    #[test]
+    fn saved_pending_wrap_checkpoint_preserves_resize_then_typing() {
+        let limits = TerminalCheckpointLimits::default();
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(RichCheckpointTestConfig);
+        let size = TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 100,
+            pixel_height: 80,
+            dpi: 96,
+        };
+        let mut live = Terminal::new(
+            size,
+            Arc::clone(&config),
+            "FrankenTerm",
+            "saved-wrap-checkpoint",
+            Box::new(std::io::sink()),
+        );
+        live.advance_bytes(b"\x1b[?69h\x1b[3;6sABCD\x1b[?1049h\x1b[2;9s");
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits).unwrap();
+        assert_eq!(checkpoint.version, 3);
+        assert_eq!(
+            checkpoint
+                .primary_screen
+                .saved_cursor
+                .as_ref()
+                .unwrap()
+                .wrap_next_column,
+            Some(6)
+        );
+        let canonical = checkpoint.to_canonical_json(limits).unwrap();
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
+            .unwrap()
+            .restore_inert(config)
+            .unwrap();
+        let mut restored = inert.into_live(Box::new(std::io::sink())).unwrap();
+        restored.resize(TerminalSize {
+            cols: 12,
+            pixel_width: 120,
+            ..size
+        });
+        restored.advance_bytes(b"\x1b[?1049lZ");
+        let text: Vec<String> = restored
+            .screen()
+            .all_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(text, vec!["  ABCDZ"]);
+
+        for endpoint in [None, Some(0), Some(5), Some(limits.max_cols as u64 + 1)] {
+            let mut invalid = checkpoint.clone();
+            invalid
+                .primary_screen
+                .saved_cursor
+                .as_mut()
+                .unwrap()
+                .wrap_next_column = endpoint;
+            assert!(
+                invalid.to_canonical_json(limits).is_err(),
+                "endpoint={endpoint:?}"
+            );
+        }
+        let mut old_version = checkpoint;
+        old_version.version = 2;
+        assert!(old_version.to_canonical_json(limits).is_err());
     }
 
     #[test]
@@ -5539,12 +5625,12 @@ mod tests {
         for index in 0..48 {
             live.advance_bytes(format!("retained-{index}\r\n").as_bytes());
         }
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&live, limits)
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits)
             .expect("capture writer-preparation fixture");
         let canonical = checkpoint
             .to_canonical_json(limits)
             .expect("encode writer-preparation fixture");
-        let mut inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let mut inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("decode writer-preparation fixture")
             .restore_inert(config)
             .expect("restore writer-preparation fixture");
@@ -5588,7 +5674,7 @@ mod tests {
         for index in 0..48 {
             live.advance_bytes(format!("retained-{index}\r\n").as_bytes());
         }
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&live, limits)
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&live, limits)
             .expect("capture resident-only recovery fixture");
         let canonical = checkpoint
             .to_canonical_json(limits)
@@ -5598,7 +5684,7 @@ mod tests {
                 tier_enabled: true,
                 sink: Arc::clone(&sink),
             });
-        let inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("validate resident-only recovery fixture")
             .restore_inert(activation_config)
             .expect("restore retiering fixture off topology");
@@ -5642,7 +5728,7 @@ mod tests {
     #[test]
     fn canonical_decoder_rejects_unknown_omitted_and_extra_fields() {
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&terminal(), limits)
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal(), limits)
             .expect("capture fixture");
         let canonical = checkpoint
             .to_canonical_json(limits)
@@ -5653,7 +5739,7 @@ mod tests {
         assert!(unknown_version.starts_with(version));
         unknown_version[version.len() - 1] = b'3';
         assert!(matches!(
-            TerminalCheckpointV2::decode_canonical_json(&unknown_version, limits),
+            TerminalCheckpointV3::decode_canonical_json(&unknown_version, limits),
             Err(TerminalCheckpointError::UnsupportedVersion { observed: 3, .. })
         ));
 
@@ -5673,7 +5759,7 @@ mod tests {
         let mut omitted = canonical.clone();
         omitted.drain(title_offset..title_offset + title_field.len());
         assert!(matches!(
-            TerminalCheckpointV2::decode_canonical_json(&omitted, limits),
+            TerminalCheckpointV3::decode_canonical_json(&omitted, limits),
             Err(TerminalCheckpointError::Serialization)
         ));
 
@@ -5685,7 +5771,7 @@ mod tests {
         let mut extra = canonical[..final_brace].to_vec();
         extra.extend_from_slice(b",\"unexpected\":true}");
         assert!(matches!(
-            TerminalCheckpointV2::decode_canonical_json(&extra, limits),
+            TerminalCheckpointV3::decode_canonical_json(&extra, limits),
             Err(TerminalCheckpointError::Serialization)
         ));
     }
@@ -5698,7 +5784,7 @@ mod tests {
         };
 
         assert!(matches!(
-            TerminalCheckpointV2::capture_with_limits(&terminal(), limits),
+            TerminalCheckpointV3::capture_with_limits(&terminal(), limits),
             Err(TerminalCheckpointError::ResourceLimit {
                 resource: "physical_rows",
                 ..
@@ -5733,12 +5819,12 @@ mod tests {
         terminal.set_config(Arc::clone(&lowered));
 
         let limits = TerminalCheckpointLimits::default();
-        let checkpoint = TerminalCheckpointV2::capture_with_limits(&terminal, limits)
+        let checkpoint = TerminalCheckpointV3::capture_with_limits(&terminal, limits)
             .expect("capture state retained across a config-limit decrease");
         let canonical = checkpoint
             .to_canonical_json(limits)
             .expect("encode lowered-config checkpoint");
-        let inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let inert = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("validate lowered-config checkpoint")
             .restore_inert(lowered)
             .expect("restore state retained across a config-limit decrease");
@@ -5935,7 +6021,7 @@ mod tests {
         let limits = TerminalCheckpointLimits::default();
 
         // Phase 1: Under terminal lock
-        let staged = TerminalCheckpointV2::capture_staged(&terminal, limits)
+        let staged = TerminalCheckpointV3::capture_staged(&terminal, limits)
             .expect("capture_staged must succeed under lock");
 
         // Release terminal lock immediately
@@ -5957,7 +6043,7 @@ mod tests {
         let canonical = checkpoint
             .to_canonical_json(limits)
             .expect("encode canonical");
-        let decoded = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        let decoded = TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("decode canonical");
         assert_eq!(decoded.checkpoint.primary_screen.cold_prefix_line_count, 2);
         assert_eq!(
@@ -5998,7 +6084,7 @@ mod tests {
         let limits = TerminalCheckpointLimits::default();
 
         // Phase 1: Capture staged (pins generation)
-        let staged = TerminalCheckpointV2::capture_staged(&terminal, limits)
+        let staged = TerminalCheckpointV3::capture_staged(&terminal, limits)
             .expect("staged capture succeeds");
         drop(terminal);
 

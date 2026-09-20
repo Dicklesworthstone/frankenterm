@@ -22,13 +22,13 @@ use frankenterm_dynamic::Value;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::color::ColorPalette;
 #[cfg(test)]
-use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2;
+use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3;
 use frankenterm_term::terminalstate::checkpoint::{
     TerminalCheckpointError, TerminalCheckpointLimits,
 };
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex,
+    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV3, SemanticZone, StableRowIndex,
     Terminal, TerminalConfiguration, TerminalSize,
 };
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
@@ -2221,7 +2221,7 @@ impl Pane for LocalPane {
         pending_actions: &mut Vec<Action>,
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, LiveParserPaneCaptureError> {
         let mut output = if pending_actions.is_empty() {
             None
         } else {
@@ -3600,7 +3600,7 @@ impl LocalPane {
     ///    cold-history generation from the scrollback spill sink.
     /// 2. Release terminal lock immediately.
     /// 3. Outside terminal lock: materialize cold-history rows from the spill sink, revalidate
-    ///    generation freshness, and assemble canonical `RecoveryTerminalCheckpointV2`.
+    ///    generation freshness, and assemble canonical `RecoveryTerminalCheckpointV3`.
     pub(crate) fn current_model_semantic_generation(&self) -> Option<u64> {
         if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
             return None;
@@ -3669,7 +3669,7 @@ impl LocalPane {
         pending_actions: &mut Vec<Action>,
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, LegacyTerminalCaptureError> {
         self.capture_legacy_terminal_checkpoint_with_policy(
             authority,
             pending_actions,
@@ -3687,7 +3687,7 @@ impl LocalPane {
         ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         limits: TerminalCheckpointLimits,
         policy: PendingActionDrainPolicy,
-    ) -> Result<RecoveryTerminalCheckpointV2, LegacyTerminalCaptureError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, LegacyTerminalCaptureError> {
         // Enforce distinct model-only authority: fail closed if guardian-owned
         if matches!(self.ownership, LocalPaneOwnership::Guardian(_)) {
             return Err(LegacyTerminalCaptureError::FalseGuardianAuthority);
@@ -3740,7 +3740,7 @@ impl LocalPane {
                 ),
             })?;
 
-        // 3. Serialize canonical payload and assemble RecoveryTerminalCheckpointV2 outside terminal lock
+        // 3. Serialize canonical payload and assemble RecoveryTerminalCheckpointV3 outside terminal lock
         checkpoint
             .into_recovery_checkpoint_at_external_parser_ground(ground, limits)
             .map_err(|e| match e {
@@ -8881,7 +8881,7 @@ mod tests {
 
     #[test]
     fn native_resize_source_publication_rejects_sequence_saturation() {
-        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV2;
+        use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointV3;
 
         // Restore an otherwise valid real model near the sequence boundary;
         // no test-only setter or replacement terminal implementation is needed.
@@ -8892,9 +8892,9 @@ mod tests {
         let mut payload: serde_json::Value =
             serde_json::from_slice(checkpoint.canonical_payload()).unwrap();
         payload["seqno"] = serde_json::json!(SequenceNo::MAX - 3);
-        let checkpoint: TerminalCheckpointV2 = serde_json::from_value(payload).unwrap();
+        let checkpoint: TerminalCheckpointV3 = serde_json::from_value(payload).unwrap();
         let encoded = checkpoint.to_canonical_json(limits).unwrap();
-        let inert = TerminalCheckpointV2::decode_canonical_json(&encoded, limits)
+        let inert = TerminalCheckpointV3::decode_canonical_json(&encoded, limits)
             .unwrap()
             .restore_inert(Arc::new(GuardianLifetimeTestTermConfig))
             .unwrap();
@@ -11805,7 +11805,7 @@ mod tests {
         assert!(!recovery.canonical_payload().is_empty());
 
         let validated =
-            TerminalCheckpointV2::decode_canonical_json(recovery.canonical_payload(), limits)
+            TerminalCheckpointV3::decode_canonical_json(recovery.canonical_payload(), limits)
                 .expect("canonical payload must decode and validate");
 
         let checkpoint = validated.checkpoint();
@@ -12053,7 +12053,7 @@ mod tests {
             .expect("capture with cold reflow fragments must succeed");
 
         let validated =
-            TerminalCheckpointV2::decode_canonical_json(recovery.canonical_payload(), limits)
+            TerminalCheckpointV3::decode_canonical_json(recovery.canonical_payload(), limits)
                 .expect("canonical payload must decode and validate");
 
         let checkpoint = validated.checkpoint();

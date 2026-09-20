@@ -31,7 +31,7 @@ use frankenterm_core::snapshot_representation::{
     decode_recovery_object, encode_recovery_object, representation_id_from_envelope_bytes,
 };
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
+use frankenterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3};
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use mux::tab::{PaneEntry, PaneNode, SplitDirection, SplitDirectionAndSize};
 
@@ -115,7 +115,7 @@ impl Fixture {
         let cursors: Vec<_> = acks
             .iter()
             .map(|ack| {
-                let validated = TerminalCheckpointV2::decode_canonical_json(
+                let validated = TerminalCheckpointV3::decode_canonical_json(
                     ack.terminal_checkpoint.canonical_payload(),
                     TerminalCheckpointLimits::default(),
                 )

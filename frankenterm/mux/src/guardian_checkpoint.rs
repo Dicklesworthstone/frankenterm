@@ -23,8 +23,8 @@ use crate::{
     PaneRegistrationOperationLease,
 };
 use frankenterm_term::{
-    terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2},
-    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2,
+    terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3},
+    RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV3,
     RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID,
 };
 use sha2::{Digest as _, Sha256};
@@ -367,7 +367,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
     /// when the guardian durably adopts this artifact.
     pub fn from_genesis_checkpoint(
         spawn_effect_id: Uuid,
-        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV3,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if terminal_checkpoint.parser_stream_bytes() != 0 {
             return Err(GuardianCheckpointBoundaryError::GenesisParserWatermark);
@@ -556,7 +556,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
         canonical_terminal_payload: &[u8],
         limits: TerminalCheckpointLimits,
     ) -> Result<
-        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV2,
+        frankenterm_term::terminalstate::checkpoint::ValidatedTerminalCheckpointV3,
         GuardianCheckpointBoundaryError,
     > {
         self.validate_identity_fields()?;
@@ -564,7 +564,7 @@ impl GuardianCheckpointArtifactDescriptorV1 {
             return Err(GuardianCheckpointBoundaryError::ReplayIdentityMismatch);
         }
         let validated =
-            TerminalCheckpointV2::decode_canonical_json(canonical_terminal_payload, limits)
+            TerminalCheckpointV3::decode_canonical_json(canonical_terminal_payload, limits)
                 .map_err(|_| GuardianCheckpointBoundaryError::InvalidCanonicalTerminalPayload)?;
         if validated.rows() != self.rows || validated.cols() != self.cols {
             return Err(GuardianCheckpointBoundaryError::TerminalGeometryMismatch);
@@ -953,7 +953,7 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
     #[cfg(test)]
     fn issue_for_test(
         spawn_effect_id: Uuid,
-        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV3,
         upload_id: Uuid,
     ) -> Self {
         let descriptor = GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
@@ -961,7 +961,7 @@ impl GuardianCheckpointGenesisSpawnPermitV1 {
             terminal_checkpoint,
         )
         .expect("test Genesis checkpoint descriptor must be valid");
-        let terminal = TerminalCheckpointV2::decode_canonical_json(
+        let terminal = TerminalCheckpointV3::decode_canonical_json(
             terminal_checkpoint.canonical_payload(),
             TerminalCheckpointLimits::default(),
         )
@@ -1340,7 +1340,7 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
     pub fn from_genesis_spawn_permit(
         binding: &GuardianCheckpointStageBindingV1,
         permit: GuardianCheckpointGenesisSpawnPermitV1,
-        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV3,
     ) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError> {
         if terminal_checkpoint.parser_stream_bytes() != 0 {
             return Err(GuardianCheckpointBoundaryError::GenesisParserWatermark);
@@ -1370,7 +1370,7 @@ impl GuardianCheckpointValidatedManifestAuthorityV1 {
         if binding.descriptor.origin.spawn_effect_id() != Some(reservation.spawn_effect_id()) {
             return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
         }
-        let terminal = TerminalCheckpointV2::decode_canonical_json(
+        let terminal = TerminalCheckpointV3::decode_canonical_json(
             canonical_payload,
             TerminalCheckpointLimits::default(),
         )
@@ -4822,7 +4822,7 @@ impl GuardianRestoredTerminal {
         Ok(metadata)
     }
 
-    pub fn checkpoint(&self) -> Result<TerminalCheckpointV2, frankenterm_term::InertTerminalError> {
+    pub fn checkpoint(&self) -> Result<TerminalCheckpointV3, frankenterm_term::InertTerminalError> {
         self.terminal.checkpoint()
     }
 
@@ -4906,7 +4906,7 @@ impl GuardianCheckpointBoundary {
         expected_durable_pane_id: Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
-        terminal_checkpoint: &RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: &RecoveryTerminalCheckpointV3,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         validate_output_identity(expected_durable_pane_id, segment, output)?;
         let rows = u32::try_from(terminal_checkpoint.rows())
@@ -5231,7 +5231,7 @@ pub struct LiveParserCheckpointAck {
     registration_wire_identity: [u8; 16],
     boundary: GuardianCheckpointBoundary,
     boundary_digest: [u8; 32],
-    terminal_checkpoint: RecoveryTerminalCheckpointV2,
+    terminal_checkpoint: RecoveryTerminalCheckpointV3,
     semantic_generation: u64,
 }
 
@@ -5306,7 +5306,7 @@ impl LiveParserCheckpointAck {
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
         target_parser_stream_bytes: u64,
-        terminal_checkpoint: RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: RecoveryTerminalCheckpointV3,
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if registration_wire_identity == [0; 16] {
@@ -5322,7 +5322,7 @@ impl LiveParserCheckpointAck {
             &terminal_checkpoint,
         )?;
         let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
-        let validated = TerminalCheckpointV2::decode_canonical_json(
+        let validated = TerminalCheckpointV3::decode_canonical_json(
             terminal_checkpoint.canonical_payload(),
             limits,
         )
@@ -5341,7 +5341,7 @@ impl LiveParserCheckpointAck {
         registration_wire_identity: [u8; 16],
         durable_pane_id: Uuid,
         restored: GuardianCheckpointBoundary,
-        terminal_checkpoint: RecoveryTerminalCheckpointV2,
+        terminal_checkpoint: RecoveryTerminalCheckpointV3,
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianCheckpointBoundaryError> {
         if registration_wire_identity == [0; 16] {
@@ -5378,7 +5378,7 @@ impl LiveParserCheckpointAck {
             ..restored
         };
         let boundary_digest = live_parser_boundary_digest(registration_wire_identity, &boundary);
-        let validated = TerminalCheckpointV2::decode_canonical_json(
+        let validated = TerminalCheckpointV3::decode_canonical_json(
             terminal_checkpoint.canonical_payload(),
             limits,
         )
@@ -5461,7 +5461,7 @@ impl LiveParserCheckpointAck {
         &self.boundary
     }
 
-    pub const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2 {
+    pub const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV3 {
         &self.terminal_checkpoint
     }
 
@@ -5469,7 +5469,7 @@ impl LiveParserCheckpointAck {
         self.semantic_generation
     }
 
-    pub fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2) {
+    pub fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV3) {
         (self.boundary, self.terminal_checkpoint)
     }
 }
@@ -5767,7 +5767,7 @@ static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, 
 static_assertions::assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);
 static_assertions::assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);
 static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);
-static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV3: zeroize::ZeroizeOnDrop);
 static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);
 static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);
 
@@ -5783,7 +5783,7 @@ mod tests {
     };
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
-        RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
+        RecoveryTerminalCheckpointV3, Terminal, TerminalConfiguration, TerminalSize,
     };
     use std::collections::BTreeSet;
     use std::fs::File;
@@ -8271,7 +8271,7 @@ mod tests {
                 ),
                 expected_use("use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};",),
                 expected_use(
-                    "use frankenterm_term::{terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV2};",
+                    "use frankenterm_term::{terminalstate::checkpoint::TerminalCheckpointLimits, RecoveryTerminalCheckpointV3};",
                 ),
                 expected_use("use hmac::{Hmac, KeyInit, Mac};"),
                 expected_use("use portable_pty::{cmdbuilder::CommandBuilder, PtySize};"),
@@ -8600,7 +8600,7 @@ mod tests {
         rows: usize,
         cols: usize,
         term_version: &str,
-    ) -> RecoveryTerminalCheckpointV2 {
+    ) -> RecoveryTerminalCheckpointV3 {
         Terminal::new(
             TerminalSize {
                 rows,
@@ -8618,15 +8618,15 @@ mod tests {
         .expect("capture canonical terminal fixture")
     }
 
-    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV3 {
         terminal_checkpoint_with(24, 80, "guardian-checkpoint-test")
     }
 
-    fn record_terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+    fn record_terminal_checkpoint() -> RecoveryTerminalCheckpointV3 {
         record_terminal_checkpoint_with(b"checkpoint boundary")
     }
 
-    fn record_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV2 {
+    fn record_terminal_checkpoint_with(content: &[u8]) -> RecoveryTerminalCheckpointV3 {
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -8671,7 +8671,7 @@ mod tests {
         pane: Uuid,
         segment: GuardianOutputSegmentIdentity,
         output: GuardianOutputAppendReceipt,
-        checkpoint: RecoveryTerminalCheckpointV2,
+        checkpoint: RecoveryTerminalCheckpointV3,
     ) -> LiveParserCheckpointAck {
         let parser_stream_bytes = checkpoint.parser_stream_bytes();
         let capture = LiveParserCheckpointAck::capture(
@@ -11337,7 +11337,7 @@ mod tests {
             expected_authority_field(
                 "LiveParserCheckpointAck",
                 "terminal_checkpoint",
-                "RecoveryTerminalCheckpointV2",
+                "RecoveryTerminalCheckpointV3",
             ),
             expected_authority_field("LiveParserCheckpointAck", "semantic_generation", "u64"),
             expected_authority_field(
@@ -11609,7 +11609,7 @@ mod tests {
                 "GuardianCheckpointGenesisSpawnPermitV1",
                 "private",
                 true,
-                "fn issue_for_test(spawn_effect_id: Uuid, terminal_checkpoint: &RecoveryTerminalCheckpointV2, upload_id: Uuid) -> Self",
+                "fn issue_for_test(spawn_effect_id: Uuid, terminal_checkpoint: &RecoveryTerminalCheckpointV3, upload_id: Uuid) -> Self",
             ),
             expected_authority_method(
                 "GuardianCheckpointCandidateIdentityV1",
@@ -11681,7 +11681,7 @@ mod tests {
                 "GuardianCheckpointValidatedManifestAuthorityV1",
                 "pub",
                 false,
-                "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV2) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
+                "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV3) -> Result<(Self, GuardianGenesisReservationIdentityV1), GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "GuardianCheckpointValidatedManifestAuthorityV1",
@@ -11771,13 +11771,13 @@ mod tests {
                 "LiveParserCheckpointAck",
                 "private",
                 false,
-                "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV2, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
+                "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV3, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
                 "private",
                 false,
-                "fn capture_restored(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, restored: GuardianCheckpointBoundary, terminal_checkpoint: RecoveryTerminalCheckpointV2, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
+                "fn capture_restored(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, restored: GuardianCheckpointBoundary, terminal_checkpoint: RecoveryTerminalCheckpointV3, limits: TerminalCheckpointLimits) -> Result<Self, GuardianCheckpointBoundaryError>",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -11867,7 +11867,7 @@ mod tests {
                 "LiveParserCheckpointAck",
                 "pub",
                 false,
-                "const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2",
+                "const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV3",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -11879,7 +11879,7 @@ mod tests {
                 "LiveParserCheckpointAck",
                 "pub",
                 false,
-                "fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2)",
+                "fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV3)",
             ),
             expected_authority_method(
                 "LiveParserCheckpointAck",
@@ -12450,7 +12450,7 @@ mod tests {
                     "use crate::{LiveParserCheckpointControl, LiveParserCheckpointError, PaneRegistrationGeneration, PaneRegistrationOperationLease};",
                 ),
                 expected_use(
-                    "use frankenterm_term::{terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID};",
+                    "use frankenterm_term::{terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3}, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV3, RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID};",
                 ),
                 expected_use("use sha2::{Digest as _, Sha256};"),
                 // Rust 2018 custody decoding uses TryInto only for fixed-width
@@ -12651,7 +12651,7 @@ mod tests {
                     "static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);"
                 ),
                 expected_item_macro(
-                    "static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);"
+                    "static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV3: zeroize::ZeroizeOnDrop);"
                 ),
                 expected_item_macro(
                     "static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);"

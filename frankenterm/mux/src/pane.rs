@@ -13,7 +13,7 @@ use frankenterm_term::color::ColorPalette;
 use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
 use frankenterm_term::{
     Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    RecoveryTerminalCheckpointV2, SemanticZone, StableRowIndex, TerminalConfiguration,
+    RecoveryTerminalCheckpointV3, SemanticZone, StableRowIndex, TerminalConfiguration,
     TerminalSize,
 };
 use parking_lot::MappedMutexGuard;
@@ -998,7 +998,7 @@ pub trait Pane: Downcast + Send + Sync {
         _pending_actions: &mut Vec<termwiz::escape::Action>,
         _ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
         _limits: TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, LiveParserPaneCaptureError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, LiveParserPaneCaptureError> {
         Err(LiveParserPaneCaptureError::Unsupported)
     }
     fn is_dead(&self) -> bool;

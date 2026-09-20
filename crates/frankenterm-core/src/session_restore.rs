@@ -89,7 +89,7 @@ use frankenterm_term::terminal::InertTerminal;
 #[cfg(all(test, feature = "frankenterm-deps"))]
 use frankenterm_term::terminal::Terminal;
 #[cfg(feature = "frankenterm-deps")]
-use frankenterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
+use frankenterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3};
 use zeroize::Zeroizing;
 
 // =============================================================================
@@ -7622,7 +7622,7 @@ impl WholeMuxRecoveryVerifier {
             #[cfg(feature = "frankenterm-deps")]
             {
                 let term_limits = TerminalCheckpointLimits::default();
-                let validated = TerminalCheckpointV2::decode_canonical_json(
+                let validated = TerminalCheckpointV3::decode_canonical_json(
                     decoded_json.as_slice(),
                     term_limits,
                 )
@@ -7726,7 +7726,7 @@ pub struct ReconstructedWholeMuxSession {
 /// Reconstruct a verified whole-mux recovery image into offline inert terminals.
 ///
 /// Refuses to operate if `destination_namespace` is a currently active live session.
-/// Enforces `TerminalCheckpointV2::decode_canonical_json` -> `ValidatedTerminalCheckpointV2::restore_inert`
+/// Enforces `TerminalCheckpointV3::decode_canonical_json` -> `ValidatedTerminalCheckpointV3::restore_inert`
 /// for every pane in the recovery image, guaranteeing real terminal state reconstruction
 /// (modes, alternate screen, scrollback, cursor positions, pen attributes) without live PTY takeover.
 #[cfg(feature = "frankenterm-deps")]
@@ -7790,7 +7790,7 @@ pub fn reconstruct_whole_mux_image_inert_with_config<S: std::hash::BuildHasher>(
 
         // 2. Decode and validate canonical JSON terminal checkpoint
         let validated_checkpoint =
-            TerminalCheckpointV2::decode_canonical_json(payload, terminal_limits).map_err(
+            TerminalCheckpointV3::decode_canonical_json(payload, terminal_limits).map_err(
                 |source| WholeMuxRecoveryError::TerminalCheckpointDecode {
                     pane_id: pane.pane_id as u64,
                     source,
@@ -13926,7 +13926,7 @@ mod tests {
                         object_id: obj1_id,
                         byte_length: payload1.len() as u64,
                         payload_digest: digest1,
-                        schema_version: 2,
+                        schema_version: 3,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -13957,7 +13957,7 @@ mod tests {
                         object_id: obj2_id,
                         byte_length: payload2.len() as u64,
                         payload_digest: digest2,
-                        schema_version: 2,
+                        schema_version: 3,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -14241,7 +14241,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -14406,7 +14406,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -14515,7 +14515,7 @@ mod tests {
                     object_id: "obj-missing-gen-2".to_string(),
                     payload_digest: [0x55u8; 32],
                     byte_length: 128,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000001000,
@@ -14751,7 +14751,7 @@ mod tests {
                     object_id: "obj-never-published".to_string(),
                     byte_length: 64,
                     payload_digest: [0xAAu8; 32],
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -14895,7 +14895,7 @@ mod tests {
                     object_id: obj_id.clone(),
                     byte_length: tampered_payload.len() as u64,
                     payload_digest: valid_digest, // expected digest is for untampered
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -15085,7 +15085,7 @@ mod tests {
                     object_id: "obj-fake-guardian".to_string(),
                     payload_digest: [0x77u8; 32],
                     byte_length: 64,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::Guardian {
                     guardian_generation: 1,
@@ -15254,7 +15254,7 @@ mod tests {
                         object_id: obj1_id,
                         byte_length: payload1.len() as u64,
                         payload_digest: digest1,
-                        schema_version: 2,
+                        schema_version: 3,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -15285,7 +15285,7 @@ mod tests {
                         object_id: obj2_id,
                         byte_length: payload2.len() as u64,
                         payload_digest: digest2,
-                        schema_version: 2,
+                        schema_version: 3,
                     },
                     authority: CheckpointAuthority::ModelOnly {
                         captured_at_epoch_ms: 1700000000000,
@@ -15513,7 +15513,7 @@ mod tests {
                     object_id: obj_id_str.clone(),
                     byte_length: enc_checkpoint_bytes.len() as u64,
                     payload_digest: enc_checkpoint_digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -15754,7 +15754,7 @@ mod tests {
                     object_id: obj_id_str,
                     byte_length: enc_checkpoint_bytes.len() as u64,
                     payload_digest: enc_checkpoint_digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -16057,7 +16057,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,
@@ -16195,7 +16195,7 @@ mod tests {
                     object_id: obj_id,
                     byte_length: payload.len() as u64,
                     payload_digest: digest,
-                    schema_version: 2,
+                    schema_version: 3,
                 },
                 authority: CheckpointAuthority::ModelOnly {
                     captured_at_epoch_ms: 1700000000000,

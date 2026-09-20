@@ -6186,7 +6186,7 @@ mod tests {
     use std::fs::File;
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use wezterm_term::color::ColorPalette;
-    use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2};
+    use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3};
     use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6280,7 +6280,7 @@ mod tests {
         let limits = TerminalCheckpointLimits::default();
         let checkpoint = pristine.capture_recovery_checkpoint(limits).unwrap();
         let inert =
-            TerminalCheckpointV2::decode_canonical_json(checkpoint.canonical_payload(), limits)
+            TerminalCheckpointV3::decode_canonical_json(checkpoint.canonical_payload(), limits)
                 .unwrap()
                 .restore_inert(missing_storage_config)
                 .unwrap();
@@ -7421,7 +7421,7 @@ mod tests {
                 object_id: object_id.into(),
                 byte_length: ciphertext.len() as u64,
                 payload_digest: digest,
-                schema_version: 2,
+                schema_version: 3,
             },
         )]);
         let parser_checkpoints =
@@ -7819,7 +7819,7 @@ mod tests {
                 object_id: object_id.into(),
                 byte_length: ciphertext.len() as u64,
                 payload_digest: digest,
-                schema_version: 2,
+                schema_version: 3,
             },
         )]);
         let parser_checkpoints =
@@ -8308,7 +8308,7 @@ mod tests {
         )
         .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
         .unwrap();
-        let model_state = TerminalCheckpointV2::decode_canonical_json(
+        let model_state = TerminalCheckpointV3::decode_canonical_json(
             model_checkpoint.canonical_payload(),
             TerminalCheckpointLimits::default(),
         )
@@ -8425,7 +8425,7 @@ mod tests {
                 object_id: gen2_object_id.into(),
                 byte_length: gen2_ciphertext.len() as u64,
                 payload_digest: gen2_digest,
-                schema_version: 2,
+                schema_version: 3,
             },
         )]);
         let gen2_parser_checkpoints = HashMap::from([(
@@ -10076,7 +10076,7 @@ mod tests {
             .capture_recovery_checkpoint(limits)
             .expect("capture terminal fixture")
             .into_canonical_payload();
-        TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+        TerminalCheckpointV3::decode_canonical_json(&canonical, limits)
             .expect("validate terminal fixture")
             .restore_inert(config)
             .expect("restore terminal fixture off topology")

@@ -504,7 +504,7 @@ pub fn publish_whole_mux_recovery(
         representation_id_from_envelope_bytes,
     };
     use frankenterm_term::terminalstate::checkpoint::{
-        TERMINAL_CHECKPOINT_VERSION, TerminalCheckpointLimits, TerminalCheckpointV2,
+        TERMINAL_CHECKPOINT_VERSION, TerminalCheckpointLimits, TerminalCheckpointV3,
     };
 
     snapshot_cx_checkpoint(cx)?;
@@ -584,7 +584,7 @@ pub fn publish_whole_mux_recovery(
                 && total_bytes <= current_verifier.limits().max_total_checkpoint_bytes,
             "whole-mux checkpoint byte limit exceeded",
         )?;
-        let checkpoint = TerminalCheckpointV2::decode_canonical_json(
+        let checkpoint = TerminalCheckpointV3::decode_canonical_json(
             payload,
             TerminalCheckpointLimits::default(),
         )?;

@@ -392,7 +392,7 @@ pub struct ModelParserCheckpointAck {
     pub durable_pane_id: uuid::Uuid,
     pub parser_stream_bytes: u64,
     pub semantic_generation: u64,
-    pub terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV2,
+    pub terminal_checkpoint: frankenterm_term::RecoveryTerminalCheckpointV3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -23091,7 +23091,7 @@ mod tests {
             ground: termwiz::escape::parser::RecoveryGroundBoundary<'_>,
             limits: TerminalCheckpointLimits,
         ) -> Result<
-            frankenterm_term::RecoveryTerminalCheckpointV2,
+            frankenterm_term::RecoveryTerminalCheckpointV3,
             crate::guardian_checkpoint::LiveParserPaneCaptureError,
         > {
             let checkpoint = self

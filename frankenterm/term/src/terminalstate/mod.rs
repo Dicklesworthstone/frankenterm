@@ -199,8 +199,9 @@ impl TabStop {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SavedCursor {
-    position: CursorPosition,
-    wrap_next: bool,
+    pub(crate) position: CursorPosition,
+    pub(crate) wrap_next: bool,
+    pub(crate) wrap_next_column: Option<usize>,
     pen: CellAttributes,
     dec_origin_mode: bool,
     g0_charset: CharSet,
@@ -1329,7 +1330,10 @@ impl TerminalState {
                     .screen
                     .saved_cursor
                     .as_ref()
-                    .map(|s| s.position)
+                    .map(|s| CursorPosition {
+                        x: s.wrap_next_column.unwrap_or(s.position.x),
+                        ..s.position
+                    })
                     .unwrap_or_else(CursorPosition::default),
                 active,
             )
@@ -1340,7 +1344,10 @@ impl TerminalState {
                     .alt_screen
                     .saved_cursor
                     .as_ref()
-                    .map(|s| s.position)
+                    .map(|s| CursorPosition {
+                        x: s.wrap_next_column.unwrap_or(s.position.x),
+                        ..s.position
+                    })
                     .unwrap_or_else(CursorPosition::default),
             )
         }
@@ -1377,24 +1384,11 @@ impl TerminalState {
                 &Position::Absolute(adjusted_cursor_alt.x as i64),
                 &Position::Absolute(adjusted_cursor_alt.y),
             );
-
-            if let Some(saved) = self.screen.screen.saved_cursor.as_mut() {
-                saved.position.x = adjusted_cursor_main.x;
-                saved.position.y = adjusted_cursor_main.y;
-                saved.position.seqno = self.seqno;
-                saved.wrap_next = false;
-            }
         } else {
             self.set_cursor_pos(
                 &Position::Absolute(adjusted_cursor_main.x as i64),
                 &Position::Absolute(adjusted_cursor_main.y),
             );
-            if let Some(saved) = self.screen.alt_screen.saved_cursor.as_mut() {
-                saved.position.x = adjusted_cursor_alt.x;
-                saved.position.y = adjusted_cursor_alt.y;
-                saved.position.seqno = self.seqno;
-                saved.wrap_next = false;
-            }
         }
     }
 
@@ -3179,6 +3173,7 @@ impl TerminalState {
         let saved = SavedCursor {
             position: self.cursor,
             wrap_next: self.wrap_next,
+            wrap_next_column: self.wrap_next.then_some(self.left_and_right_margins.end),
             pen: self.pen.clone(),
             dec_origin_mode: self.dec_origin_mode,
             g0_charset: self.g0_charset,
@@ -3201,6 +3196,7 @@ impl TerminalState {
             .unwrap_or_else(|| SavedCursor {
                 position: CursorPosition::default(),
                 wrap_next: false,
+                wrap_next_column: None,
                 pen: Default::default(),
                 dec_origin_mode: false,
                 g0_charset: CharSet::Ascii,
@@ -3415,59 +3411,141 @@ mod tests {
 
     #[test]
     fn resize_saved_pending_wrap_preserves_subsequent_typing() {
-        for (old_cols, new_cols, setup, expected) in [
-            (5, 10, "ABCDE", "ABCDEZ"),
-            (10, 12, "\x1b[?69h\x1b[3;6sABCD", "  ABCDZ"),
-        ] {
-            let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
-                kitty_budget: 1024,
-                unicode_version: UnicodeVersion::new(14),
-                scorecard_enabled: true,
-                checksum_rectangular_area: false,
-            });
-            let original_size = TerminalSize {
-                rows: 4,
-                cols: old_cols,
-                pixel_width: old_cols * 10,
-                pixel_height: 80,
-                dpi: 96,
-            };
-            let mut terminal = crate::Terminal::new(
-                original_size,
-                config,
-                "test",
-                "1",
-                Box::new(std::io::sink()),
-            );
-            terminal.advance_bytes(setup.as_bytes());
-            terminal.advance_bytes(b"\x1b[?1049h");
-            assert!(terminal
+        for (alternate, prepared) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (old_cols, new_cols, setup, alternate_setup, expected) in [
+                (5, 10, "ABCDE", "", "ABCDEZ"),
+                (10, 12, "\x1b[?69h\x1b[3;6sABCD", "", "  ABCDZ"),
+                (10, 10, "\x1b[?69h\x1b[3;6sABCD", "", "  ABCDZ"),
+                (5, 10, "abc界", "", "abc界Z"),
+                (
+                    10,
+                    8,
+                    "abcdefghijklmnopqrst",
+                    "",
+                    "abcdefgh\nijklmnop\nqrstZ",
+                ),
+                (10, 12, "\x1b[?69h\x1b[3;6sABCD", "\x1b[2;9s", "  ABCDZ"),
+            ] {
+                let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+                    kitty_budget: 1024,
+                    unicode_version: UnicodeVersion::new(14),
+                    scorecard_enabled: true,
+                    checksum_rectangular_area: false,
+                });
+                let original_size = TerminalSize {
+                    rows: 4,
+                    cols: old_cols,
+                    pixel_width: old_cols * 10,
+                    pixel_height: 80,
+                    dpi: 96,
+                };
+                let mut terminal = crate::Terminal::new(
+                    original_size,
+                    config,
+                    "test",
+                    "1",
+                    Box::new(std::io::sink()),
+                );
+                terminal.advance_bytes(setup.as_bytes());
+                if alternate {
+                    terminal.advance_bytes(b"\x1b[?1049h");
+                    terminal.advance_bytes(alternate_setup.as_bytes());
+                } else {
+                    terminal.advance_bytes(b"\x1b7\x1b[H");
+                }
+                assert!(
+                    terminal
+                        .screen
+                        .screen
+                        .saved_cursor
+                        .as_ref()
+                        .expect("the primary cursor was saved")
+                        .wrap_next
+                );
+
+                let resized = TerminalSize {
+                    cols: new_cols,
+                    pixel_width: new_cols * 10,
+                    ..original_size
+                };
+                if prepared {
+                    let mut preparation = terminal.capture_reflow_preparation(resized);
+                    if let Some(candidate) = preparation.as_mut() {
+                        assert!(candidate.prepare(|| false));
+                    }
+                    terminal.resize_with_prepared_reflow(resized, preparation.as_mut());
+                    if expected.contains('\n') {
+                        assert!(preparation.as_ref().unwrap().was_applied());
+                    }
+                } else {
+                    terminal.resize(resized);
+                }
+                terminal.advance_bytes(if alternate {
+                    b"\x1b[?1049lZ"
+                } else {
+                    b"\x1b8Z"
+                });
+
+                // Restoring a pending wrap after widening must insert after the
+                // original final glyph, including when it reached a narrow margin.
+                // An independent text oracle catches two resize paths agreeing on
+                // the same erroneous overwrite or premature newline.
+                let lines = terminal.screen().all_lines();
+                let nonempty: Vec<String> = lines
+                    .iter()
+                    .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                assert_eq!(
+                    nonempty,
+                    expected.split('\n').map(str::to_owned).collect::<Vec<_>>(),
+                    "old_cols={old_cols} alternate={alternate} prepared={prepared}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_clipped_alternate_saved_cursor_does_not_invent_pending_wrap() {
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(TestTermConfig {
+            kitty_budget: 1024,
+            unicode_version: UnicodeVersion::new(14),
+            scorecard_enabled: true,
+            checksum_rectangular_area: false,
+        });
+        let size = TerminalSize {
+            rows: 4,
+            cols: 10,
+            pixel_width: 100,
+            pixel_height: 80,
+            dpi: 96,
+        };
+        let mut terminal =
+            crate::Terminal::new(size, config, "test", "1", Box::new(std::io::sink()));
+        terminal.advance_bytes(b"\x1b[?1049hABCDEFG\x1b7");
+        assert!(
+            !terminal
                 .screen
-                .screen
+                .alt_screen
                 .saved_cursor
                 .as_ref()
-                .expect("1049 saves the primary cursor")
-                .wrap_next);
-
-            terminal.resize(TerminalSize {
-                cols: new_cols,
-                pixel_width: new_cols * 10,
-                ..original_size
-            });
-            terminal.advance_bytes(b"\x1b[?1049lZ");
-
-            // Restoring a pending wrap after widening must insert after the
-            // original final glyph, including when it reached a narrow margin.
-            // An independent text oracle catches two resize paths agreeing on
-            // the same erroneous overwrite or premature newline.
-            let lines = terminal.screen().all_lines();
-            let nonempty: Vec<String> = lines
-                .iter()
-                .map(|line| line.as_str().trim_end_matches(' ').to_owned())
-                .filter(|line| !line.is_empty())
-                .collect();
-            assert_eq!(nonempty, vec![expected.to_owned()], "old_cols={old_cols}");
-        }
+                .unwrap()
+                .wrap_next
+        );
+        terminal.resize(TerminalSize {
+            cols: 5,
+            pixel_width: 50,
+            ..size
+        });
+        terminal.advance_bytes(b"\x1b8Z");
+        let text: Vec<String> = terminal
+            .screen()
+            .all_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(text, vec!["ABCDZ"]);
     }
 
     #[test]
@@ -3544,8 +3622,12 @@ mod tests {
                     ),
                 ] {
                     assert_eq!(
-                        actual.as_ref().map(|c| (c.position, c.wrap_next)),
-                        expected.as_ref().map(|c| (c.position, c.wrap_next))
+                        actual
+                            .as_ref()
+                            .map(|c| (c.position, c.wrap_next, c.wrap_next_column)),
+                        expected
+                            .as_ref()
+                            .map(|c| (c.position, c.wrap_next, c.wrap_next_column))
                     );
                 }
                 assert_eq!(
@@ -4363,6 +4445,7 @@ mod tests {
         let sc = SavedCursor {
             position: CursorPosition::default(),
             wrap_next: false,
+            wrap_next_column: None,
             pen: CellAttributes::default(),
             dec_origin_mode: false,
             g0_charset: CharSet::Ascii,
@@ -4377,6 +4460,7 @@ mod tests {
         let sc = SavedCursor {
             position: CursorPosition::default(),
             wrap_next: true,
+            wrap_next_column: Some(80),
             pen: CellAttributes::default(),
             dec_origin_mode: true,
             g0_charset: CharSet::DecLineDrawing,
@@ -4384,6 +4468,7 @@ mod tests {
         };
         let sc2 = sc.clone();
         assert!(sc2.wrap_next);
+        assert_eq!(sc2.wrap_next_column, Some(80));
         assert!(sc2.dec_origin_mode);
         assert_eq!(sc2.g0_charset, CharSet::DecLineDrawing);
         assert_eq!(sc2.g1_charset, CharSet::Uk);

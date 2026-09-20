@@ -431,7 +431,7 @@ pub struct Terminal {
 /// cannot pair state bytes with an unrelated parser instance.
 #[cfg(feature = "use_serde")]
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct RecoveryTerminalCheckpointV2 {
+pub struct RecoveryTerminalCheckpointV3 {
     canonical_payload: Zeroizing<Vec<u8>>,
     rows: usize,
     cols: usize,
@@ -439,7 +439,7 @@ pub struct RecoveryTerminalCheckpointV2 {
 }
 
 #[cfg(feature = "use_serde")]
-impl RecoveryTerminalCheckpointV2 {
+impl RecoveryTerminalCheckpointV3 {
     #[must_use]
     pub fn canonical_payload(&self) -> &[u8] {
         &self.canonical_payload
@@ -490,10 +490,10 @@ impl RecoveryTerminalCheckpointV2 {
 }
 
 #[cfg(feature = "use_serde")]
-impl std::fmt::Debug for RecoveryTerminalCheckpointV2 {
+impl std::fmt::Debug for RecoveryTerminalCheckpointV3 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RecoveryTerminalCheckpointV2")
+            .debug_struct("RecoveryTerminalCheckpointV3")
             .field("canonical_payload", &"[REDACTED]")
             .field("payload_bytes", &self.canonical_payload.len())
             .field("rows", &self.rows)
@@ -862,7 +862,7 @@ impl InertTerminal {
         }
         self.terminal.perform_actions(actions);
         if let Err(error) =
-            crate::terminalstate::checkpoint::TerminalCheckpointV2::validate_inert_replay_resources(
+            crate::terminalstate::checkpoint::TerminalCheckpointV3::validate_inert_replay_resources(
                 &self.terminal,
                 &self.replay_projection,
                 &self.custom_cell_width_maps,
@@ -879,7 +879,7 @@ impl InertTerminal {
 
     pub fn checkpoint(
         &self,
-    ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV2, InertTerminalError> {
+    ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV3, InertTerminalError> {
         if self.activation_poisoned {
             return Err(InertTerminalError::ActivationPoisoned);
         }
@@ -889,7 +889,7 @@ impl InertTerminal {
         if !self.terminal.parser.is_recovery_ground() {
             return Err(InertTerminalError::ParserNotRecoveryGround);
         }
-        crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_with_limits(
+        crate::terminalstate::checkpoint::TerminalCheckpointV3::capture_with_limits(
             &self.terminal,
             self.checkpoint_limits,
         )
@@ -1038,7 +1038,7 @@ impl Terminal {
     pub fn capture_recovery_checkpoint(
         &self,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, RecoveryTerminalCheckpointError> {
         let ground = self
             .parser
             .recovery_ground_boundary()
@@ -1052,7 +1052,7 @@ impl Terminal {
     /// The witness is non-constructible and immutably borrows its parser, so
     /// that parser cannot consume more bytes until this capture returns. The
     /// embedding mux must additionally hold the terminal/model lock and bind
-    /// [`RecoveryTerminalCheckpointV2::parser_stream_bytes`] to its durable
+    /// [`RecoveryTerminalCheckpointV3::parser_stream_bytes`] to its durable
     /// output-journal receipt; this method does not claim that higher-level
     /// delivery ordering on its own.
     #[cfg(feature = "use_serde")]
@@ -1060,7 +1060,7 @@ impl Terminal {
         &self,
         ground: RecoveryGroundBoundary<'_>,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, RecoveryTerminalCheckpointError> {
         self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)
     }
 
@@ -1074,7 +1074,7 @@ impl Terminal {
         crate::terminalstate::checkpoint::StagedHotCheckpoint,
         RecoveryTerminalCheckpointError,
     > {
-        crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_staged(&self.state, limits)
+        crate::terminalstate::checkpoint::TerminalCheckpointV3::capture_staged(&self.state, limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)
     }
 
@@ -1104,9 +1104,9 @@ impl Terminal {
         &self,
         parser_stream_bytes: u64,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
-    ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
+    ) -> Result<RecoveryTerminalCheckpointV3, RecoveryTerminalCheckpointError> {
         let checkpoint =
-            crate::terminalstate::checkpoint::TerminalCheckpointV2::capture_with_limits(
+            crate::terminalstate::checkpoint::TerminalCheckpointV3::capture_with_limits(
                 &self.state,
                 limits,
             )
@@ -1115,7 +1115,7 @@ impl Terminal {
             .to_canonical_json(limits)
             .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
         let size = self.state.get_size();
-        Ok(RecoveryTerminalCheckpointV2 {
+        Ok(RecoveryTerminalCheckpointV3 {
             canonical_payload,
             rows: size.rows,
             cols: size.cols,
@@ -1474,7 +1474,7 @@ mod tests {
             .capture_recovery_checkpoint(limits)
             .expect("capture recovery checkpoint");
         let mut inert =
-            crate::terminalstate::checkpoint::TerminalCheckpointV2::decode_canonical_json(
+            crate::terminalstate::checkpoint::TerminalCheckpointV3::decode_canonical_json(
                 checkpoint.canonical_payload(),
                 limits,
             )
@@ -1565,7 +1565,7 @@ mod tests {
         fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         fn require_zeroizing_payload(_: &Zeroizing<Vec<u8>>) {}
 
-        require_zeroize_on_drop::<RecoveryTerminalCheckpointV2>();
+        require_zeroize_on_drop::<RecoveryTerminalCheckpointV3>();
         let checkpoint = make_prop_term(4, 8)
             .capture_recovery_checkpoint(
                 crate::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
