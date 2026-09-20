@@ -6747,8 +6747,7 @@ impl std::fmt::Debug for ValidatedWholeMuxRecovery {
 }
 
 /// Authenticated source retained together with private topology construction.
-/// This value has no live mux, reader activation, or publication capability.
-/// Guardian lease/replay reconciliation is still required before registration.
+/// Guardian lease/replay reconciliation is required before registration.
 #[cfg(feature = "frankenterm-deps")]
 pub struct PreparedWholeMuxTopology {
     source: ValidatedWholeMuxRecovery,
@@ -6763,6 +6762,51 @@ impl PreparedWholeMuxTopology {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         self.topology.counts()
+    }
+
+    pub fn captured_domains(&self) -> &[mux::MuxCapturedDomain] {
+        self.topology.captured_domains()
+    }
+
+    /// Publish the complete recovered graph while preserving the authenticated
+    /// predecessor alongside the exact target-owner publication receipt.
+    pub fn publish(
+        self,
+        owner: &Arc<mux::Mux>,
+        domains: Vec<Arc<dyn mux::domain::Domain>>,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<PublishedWholeMuxTopology> {
+        let (incarnation, _) = owner.topology_snapshot_authority()?;
+        let source_incarnation =
+            uuid::Uuid::parse_str(&self.source.image().header.mux_incarnation_id)?;
+        anyhow::ensure!(
+            incarnation.as_bytes() != *source_incarnation.as_bytes(),
+            "restored topology requires a fresh mux incarnation"
+        );
+        let publication = owner.publish_recovered_topology(self.topology, domains, deadline)?;
+        Ok(PublishedWholeMuxTopology {
+            source: self.source,
+            publication,
+        })
+    }
+}
+
+/// Unforgeable successful publication paired with its authenticated source.
+/// A verified image alone cannot authorize periodic publication by a new mux.
+#[cfg(feature = "frankenterm-deps")]
+pub struct PublishedWholeMuxTopology {
+    source: ValidatedWholeMuxRecovery,
+    publication: mux::RecoveredTopologyPublication,
+}
+
+#[cfg(feature = "frankenterm-deps")]
+impl PublishedWholeMuxTopology {
+    pub fn source(&self) -> &ValidatedWholeMuxRecovery {
+        &self.source
+    }
+
+    pub fn matches_owner(&self, owner: &Arc<mux::Mux>) -> bool {
+        self.publication.matches_owner(owner)
     }
 }
 

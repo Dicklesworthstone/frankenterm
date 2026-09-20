@@ -11,6 +11,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn reserve_recovered_window_ids(maximum: usize) -> anyhow::Result<()> {
+    crate::reserve_recovered_ids(&WIN_ID, maximum, "window")
+}
 pub type WindowId = usize;
 
 /// Maximum tab count represented by the v1 ordered-window authority.
@@ -259,6 +262,17 @@ pub struct Window {
 }
 
 impl Window {
+    pub(crate) fn bind_recovered_owner(
+        &mut self,
+        owner: &std::sync::Arc<Mux>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            std::sync::Weak::ptr_eq(&self.owner, &std::sync::Weak::new()),
+            "recovered window already has an owner"
+        );
+        self.owner = std::sync::Arc::downgrade(owner);
+        Ok(())
+    }
     /// Construct private recovery state. No notification, registration, global
     /// ID allocation, or pane callback is performed by this constructor.
     pub(crate) fn from_recovery_capture(

@@ -2510,6 +2510,17 @@ impl MuxRecoveryImage {
                 "historical image lacks complete live tab/domain runtime metadata",
             ));
         }
+        if !self.topology.domains.is_empty()
+            && self
+                .topology
+                .domain_state
+                .as_ref()
+                .is_none_or(|state| state.default_domain_id.is_none())
+        {
+            return Err(MuxRecoveryImageError::InvalidCapturedTopology(
+                "live nonempty domain registry requires its exact default domain",
+            ));
+        }
         Ok(())
     }
 
@@ -3022,8 +3033,8 @@ impl MuxRecoveryImage {
         }
         for binding in &captured.pane_bindings {
             if !domains.iter().any(|domain| {
-                domain.incarnation_domain_id == binding.domain_id
-                    && domain.domain_name == binding.domain_name
+                (domain.incarnation_domain_id, domain.domain_name.as_str())
+                    == (binding.domain_id, binding.domain_name.as_str())
                     && domain.is_attached
             }) {
                 return Err(MuxRecoveryImageError::InvalidCapturedTopology(
@@ -4140,6 +4151,18 @@ mod tests {
         let reopened =
             MuxRecoveryImage::from_json_slice(&image.to_canonical_json().unwrap()).unwrap();
         assert_eq!(reopened.topology, image.topology);
+        let mut no_default = image.clone();
+        no_default
+            .topology
+            .domain_state
+            .as_mut()
+            .unwrap()
+            .default_domain_id = None;
+        no_default.image_digest = no_default.compute_digest().unwrap();
+        // Offline decoding retains the recorded absence; live reconstruction
+        // cannot synthesize a default or violate the native registry invariant.
+        no_default.validate().unwrap();
+        assert!(no_default.require_live_topology_state().is_err());
         let mut changed = image.clone();
         changed
             .topology

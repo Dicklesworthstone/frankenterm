@@ -33,6 +33,9 @@ pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
 pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
 
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn reserve_recovered_tab_ids(maximum: usize) -> anyhow::Result<()> {
+    crate::reserve_recovered_ids(&TAB_ID, maximum, "tab")
+}
 pub type TabId = usize;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
@@ -5020,6 +5023,38 @@ impl Tab {
             tiled.is_empty() && floating.is_empty(),
             "tab {} is not structurally empty",
             self.tab_id
+        );
+        let next_generation = inner.prepare_mux_owner_binding(mux)?;
+        Ok(PreparedTabMuxOwnerBinding {
+            tab: self,
+            inner,
+            mux: Arc::clone(mux),
+            next_generation,
+        })
+    }
+
+    /// Bind a private recovered tab only when its complete callback-free
+    /// structural census still names the exact admitted pane allocations.
+    pub(crate) fn prepare_recovered_mux_owner_binding<'a>(
+        &'a self,
+        mux: &Arc<Mux>,
+        expected: &[crate::ExactPaneStructuralState],
+    ) -> anyhow::Result<PreparedTabMuxOwnerBinding<'a>> {
+        let inner = self.inner.lock();
+        let (tiled, floating) = inner.snapshot_structural_panes_callback_free_checked()?;
+        anyhow::ensure!(
+            tiled.len() + floating.len() == expected.len()
+                && expected.iter().all(|state| {
+                    match state.lane {
+                        crate::PaneStructuralLane::Tiled => {
+                            tiled.iter().any(|pane| Arc::ptr_eq(pane, &state.pane))
+                        }
+                        crate::PaneStructuralLane::Floating => floating.iter().any(|(id, pane)| {
+                            *id == state.pane_id && Arc::ptr_eq(pane, &state.pane)
+                        }),
+                    }
+                }),
+            "recovered tab structural census changed before publication"
         );
         let next_generation = inner.prepare_mux_owner_binding(mux)?;
         Ok(PreparedTabMuxOwnerBinding {

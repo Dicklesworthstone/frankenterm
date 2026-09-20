@@ -117,37 +117,96 @@ struct CaptureState {
     identity: WholeMuxPublicationIdentity,
 }
 
+#[derive(Clone)]
+struct RestoredPredecessor {
+    incarnation: String,
+    generation: u64,
+    envelope_hash: [u8; 32],
+    image_digest: [u8; 32],
+}
+
+fn open_authority(
+    options: &RecoveryOptions,
+    cx: &Cx,
+) -> anyhow::Result<(SnapshotPublicationStore, Arc<RecoveryKey>)> {
+    cx.checkpoint()
+        .map_err(|_| anyhow::anyhow!("recovery cancelled"))?;
+    let (_, key) = open_recovery_key_enrollment(
+        options
+            .recovery_enrollment
+            .as_ref()
+            .context("missing enrollment")?,
+        options
+            .recovery_kek
+            .as_ref()
+            .context("missing wrapping key")?,
+        &RecoveryWrapContext {
+            namespace_id: options.recovery_namespace.context("missing namespace")?,
+            policy_id: options.recovery_policy.context("missing policy")?,
+        },
+    )?;
+    let store = SnapshotPublicationStore::open_existing(
+        options.recovery_store.as_ref().context("missing store")?,
+        PublicationLimits::default(),
+    )?;
+    Ok((store, Arc::new(key)))
+}
+
+/// Authenticate an existing root before constructing or claiming any live pane.
+/// Ordinary periodic startup never calls this explicit restoration entry point.
+pub fn load_recovery_for_startup(
+    options: &RecoveryOptions,
+    custody: Option<PathBuf>,
+    cx: &Cx,
+) -> anyhow::Result<frankenterm_core::session_restore::ValidatedWholeMuxRecovery> {
+    let session = options
+        .recovery_session
+        .as_deref()
+        .context("missing session")?;
+    anyhow::ensure!(
+        !session.is_empty()
+            && session.len() <= 256
+            && (1..=86400).contains(&options.recovery_interval_seconds.unwrap_or(60))
+            && (1..=604800).contains(&options.recovery_rpo_seconds.unwrap_or(120))
+            && (1..=30).contains(&options.recovery_timeout_seconds.unwrap_or(30)),
+        "invalid startup recovery session or timing bounds"
+    );
+    let (store, key) = open_authority(options, cx)?;
+    let trusted = WholeMuxTrustedIdentityConfig::new(
+        options.recovery_root_id.context("missing root identity")?,
+    )
+    .with_session_id(session);
+    let verifier = WholeMuxRecoveryVerifier::new_production(key, trusted);
+    #[cfg(unix)]
+    let verifier = match custody {
+        Some(path) => verifier.with_existing_guardian_custody(path),
+        None => verifier,
+    };
+    #[cfg(not(unix))]
+    anyhow::ensure!(custody.is_none(), "guardian custody requires Unix");
+    let selected = select_verified_recovery_roots_with_cx(cx, &store, &verifier)?;
+    anyhow::ensure!(
+        selected.torn_or_rejected.is_empty(),
+        "recovery root authority requires reconciliation"
+    );
+    let current = selected.current.context("no authenticated recovery root")?;
+    current.image().require_live_topology_state()?;
+    Ok(current)
+}
+
 impl CaptureState {
     fn open(
         options: &RecoveryOptions,
         mux: &mux::Mux,
         custody: Option<PathBuf>,
         cx: &Cx,
+        restored: Option<&RestoredPredecessor>,
     ) -> anyhow::Result<Self> {
-        cx.checkpoint()
-            .map_err(|_| anyhow::anyhow!("capture cancelled"))?;
-        let (_, key) = open_recovery_key_enrollment(
-            options
-                .recovery_enrollment
-                .as_ref()
-                .context("missing enrollment")?,
-            options
-                .recovery_kek
-                .as_ref()
-                .context("missing wrapping key")?,
-            &RecoveryWrapContext {
-                namespace_id: options.recovery_namespace.context("missing namespace")?,
-                policy_id: options.recovery_policy.context("missing policy")?,
-            },
-        )?;
-        let store = SnapshotPublicationStore::open_existing(
-            options.recovery_store.as_ref().context("missing store")?,
-            PublicationLimits::default(),
-        )?;
+        let (store, key) = open_authority(options, cx)?;
         let topology = mux.capture_topology_coherent(Default::default())?;
         let mut state = Self {
             store,
-            key: Arc::new(key),
+            key,
             identity: WholeMuxPublicationIdentity {
                 generation: 1,
                 session_id: options
@@ -163,16 +222,26 @@ impl CaptureState {
                 existing_guardian_custody: custody,
             },
         };
-        state.select_predecessor(cx, None)?;
+        state.select_predecessor_with_restore(cx, None, restored)?;
         Ok(state)
     }
 
     fn select_predecessor(&mut self, cx: &Cx, receipt: Option<(u64, &str)>) -> anyhow::Result<()> {
+        self.select_predecessor_with_restore(cx, receipt, None)
+    }
+
+    fn select_predecessor_with_restore(
+        &mut self,
+        cx: &Cx,
+        receipt: Option<(u64, &str)>,
+        restored: Option<&RestoredPredecessor>,
+    ) -> anyhow::Result<()> {
         let trusted = WholeMuxTrustedIdentityConfig::new(self.identity.root_object_id)
-            .with_session_id(self.identity.session_id.clone())
-            // Startup restore is deliberately not wired here. A fresh mux must
-            // not rotate away the saved state of a previous incarnation.
-            .with_mux_incarnation_id(self.identity.mux_incarnation_id.clone());
+            .with_session_id(self.identity.session_id.clone());
+        // Verify both retained generations under the trusted key/root/session.
+        // A successful restore leaves the old incarnation in the previous slot;
+        // pinning every candidate to the successor would misclassify that valid
+        // predecessor as corruption. Pin the selected current root below instead.
         let verifier = WholeMuxRecoveryVerifier::new_production(Arc::clone(&self.key), trusted);
         #[cfg(unix)]
         let verifier = match self.identity.existing_guardian_custody.as_ref() {
@@ -187,7 +256,22 @@ impl CaptureState {
         );
         match selected.current {
             Some(current) => {
+                let expected_incarnation = restored
+                    .map(|source| &source.incarnation)
+                    .unwrap_or(&self.identity.mux_incarnation_id);
+                anyhow::ensure!(
+                    current.image().header.mux_incarnation_id == *expected_incarnation,
+                    "selected recovery root belongs to another mux incarnation"
+                );
                 let hash = hex::encode(current.root_envelope_sha256());
+                if let Some(restored) = restored {
+                    anyhow::ensure!(
+                        current.generation() == restored.generation
+                            && current.root_envelope_sha256() == restored.envelope_hash
+                            && current.image().image_digest == restored.image_digest,
+                        "restored predecessor no longer names the selected recovery root"
+                    );
+                }
                 if let Some((generation, expected_hash)) = receipt {
                     anyhow::ensure!(
                         current.generation() == generation && hash == expected_hash,
@@ -204,7 +288,10 @@ impl CaptureState {
                 });
                 self.identity.predecessor_image_digest = Some(current.image().image_digest);
             }
-            None => anyhow::ensure!(receipt.is_none(), "published recovery root is missing"),
+            None => anyhow::ensure!(
+                receipt.is_none() && restored.is_none(),
+                "published or restored recovery root is missing"
+            ),
         }
         Ok(())
     }
@@ -227,6 +314,7 @@ pub struct PeriodicRecovery {
     options: RecoveryOptions,
     mux: Arc<mux::Mux>,
     custody: Option<PathBuf>,
+    restored: Option<RestoredPredecessor>,
     state: Option<CaptureState>,
     active: Option<CaptureFuture>,
     operation_cx: Option<Cx>,
@@ -280,6 +368,7 @@ impl PeriodicRecovery {
             options,
             mux,
             custody,
+            restored: None,
             state: None,
             active: None,
             operation_cx: None,
@@ -294,6 +383,32 @@ impl PeriodicRecovery {
             #[cfg(test)]
             before_capture: None,
         }))
+    }
+
+    /// Resume publication only after the authenticated graph was installed in
+    /// this exact owner. The first attempt re-verifies the source root on disk;
+    /// later attempts are pinned to the successor incarnation as usual.
+    pub fn new_after_restore(
+        options: RecoveryOptions,
+        mux: Arc<mux::Mux>,
+        custody: Option<PathBuf>,
+        restored: &frankenterm_core::session_restore::PublishedWholeMuxTopology,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(restored.matches_owner(&mux), "restored mux owner mismatch");
+        let source = restored.source();
+        anyhow::ensure!(
+            options.recovery_session.as_deref() == Some(source.image().header.session_id.as_str()),
+            "restored recovery session mismatch"
+        );
+        let mut controller = Self::new(options, mux, custody)?
+            .context("restored mux requires configured recovery publication")?;
+        controller.restored = Some(RestoredPredecessor {
+            incarnation: source.image().header.mux_incarnation_id.clone(),
+            generation: source.generation(),
+            envelope_hash: source.root_envelope_sha256(),
+            image_digest: source.image().image_digest,
+        });
+        Ok(controller)
     }
 
     pub fn request_shutdown(&mut self) {
@@ -379,15 +494,15 @@ impl PeriodicRecovery {
         let options = self.options.clone();
         let mux = Arc::clone(&self.mux);
         let custody = self.custody.clone();
+        let restored = self.restored.clone();
         let prior = self.state.take();
         let timeout = self.timeout;
         #[cfg(test)]
         let before_capture = self.before_capture.take();
         self.active = Some(Box::pin(runtime_async::spawn_blocking(move || {
-            let mut state = match prior
-                .map(Ok)
-                .unwrap_or_else(|| CaptureState::open(&options, &mux, custody, &cx))
-            {
+            let mut state = match prior.map(Ok).unwrap_or_else(|| {
+                CaptureState::open(&options, &mux, custody, &cx, restored.as_ref())
+            }) {
                 Ok(state) => state,
                 Err(_) => {
                     return AttemptResult {
@@ -638,6 +753,101 @@ mod tests {
             selected(&options).root_envelope_sha256(),
             second.root_envelope_sha256()
         );
+    }
+
+    #[test]
+    fn periodic_recovery_atomic_restore_advances_only_exact_predecessor() {
+        use mux::domain::{Domain, LocalDomain};
+
+        let _serial = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        for superseded in [false, true] {
+            let (directory, options) = prepared();
+            let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("retained-empty").unwrap());
+            let original = Arc::new(mux::Mux::new(Some(domain)));
+            let mut predecessor = PeriodicRecovery::new(options.clone(), original, None)
+                .unwrap()
+                .unwrap();
+            pump_until(&mut predecessor, &executor, |c| {
+                c.state.as_ref().is_some_and(|s| s.identity.generation == 2)
+            });
+            let source = load_recovery_for_startup(&options, None, &cx::for_request()).unwrap();
+            let source_digest = source.image().image_digest;
+            let successor = Arc::new(mux::Mux::new(None));
+            let published = crate::guardian_proxy::restore_from_options(
+                Arc::clone(&successor),
+                &options,
+                None,
+                wezterm_term::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+            )
+            .unwrap();
+            assert!(
+                PeriodicRecovery::new_after_restore(
+                    options.clone(),
+                    Arc::new(mux::Mux::new(None)),
+                    None,
+                    &published,
+                )
+                .is_err()
+            );
+            if superseded {
+                // Change the durable root after the restored graph was installed.
+                // The successor must refuse rather than overwrite that newer root.
+                predecessor.next_due = Instant::now();
+                pump_until(&mut predecessor, &executor, |c| {
+                    c.state.as_ref().is_some_and(|s| s.identity.generation == 3)
+                });
+            }
+            predecessor.request_shutdown();
+            pump_until(&mut predecessor, &executor, PeriodicRecovery::is_settled);
+            let before = files(directory.path());
+            let mut controller = PeriodicRecovery::new_after_restore(
+                options.clone(),
+                Arc::clone(&successor),
+                None,
+                &published,
+            )
+            .unwrap();
+            if superseded {
+                pump_until(&mut controller, &executor, |c| c.failed && c.is_settled());
+                assert!(controller.last_success.is_none());
+                assert_eq!(files(directory.path()), before);
+            } else {
+                pump_until(&mut controller, &executor, |c| {
+                    c.state.as_ref().is_some_and(|s| s.identity.generation == 3)
+                });
+                let next = selected(&options);
+                assert_eq!(next.generation(), 2);
+                assert_eq!(next.image().header.predecessor_digest, Some(source_digest));
+                assert_eq!(
+                    next.image().header.mux_incarnation_id,
+                    hex::encode(
+                        successor
+                            .topology_snapshot_authority()
+                            .unwrap()
+                            .0
+                            .as_bytes()
+                    )
+                );
+                assert_eq!(next.image().topology.domains.len(), 1);
+                assert_eq!(
+                    next.image().topology.domains[0].domain_name,
+                    "retained-empty"
+                );
+                controller.next_due = Instant::now();
+                pump_until(&mut controller, &executor, |c| {
+                    c.state.as_ref().is_some_and(|s| s.identity.generation == 4)
+                });
+                let following = selected(&options);
+                assert_eq!(following.generation(), 3);
+                assert_eq!(
+                    following.image().header.predecessor_digest,
+                    Some(next.image().image_digest)
+                );
+            }
+            controller.request_shutdown();
+            pump_until(&mut controller, &executor, PeriodicRecovery::is_settled);
+        }
     }
 
     fn files(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {

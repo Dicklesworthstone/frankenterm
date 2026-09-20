@@ -29,6 +29,9 @@ use termwiz::surface::{Line, SequenceNo, SEQ_ZERO};
 use url::Url;
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn reserve_recovered_pane_ids(maximum: usize) -> anyhow::Result<()> {
+    crate::reserve_recovered_ids(&PANE_ID, maximum, "pane")
+}
 pub type PaneId = usize;
 
 /// Refusal before applying any action in the returned batch.

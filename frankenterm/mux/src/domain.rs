@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn reserve_recovered_domain_ids(maximum: usize) -> anyhow::Result<()> {
+    crate::reserve_recovered_ids(&DOMAIN_ID, maximum, "domain")
+}
 pub type DomainId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +88,9 @@ pub struct UnpublishedPane {
 /// preparation retains the normal guardian lease-only rollback behavior.
 pub struct UnpublishedRecoveredTopology {
     // Drop topology references before the last pane custody references.
-    windows: Vec<crate::window::Window>,
-    tabs: HashMap<crate::tab::TabId, Arc<Tab>>,
-    panes: Vec<UnpublishedPane>,
+    pub(crate) windows: Vec<crate::window::Window>,
+    pub(crate) tabs: HashMap<crate::tab::TabId, Arc<Tab>>,
+    pub(crate) panes: Vec<UnpublishedPane>,
     captured_windows: Vec<crate::MuxCapturedWindow>,
     captured_tabs: Vec<crate::tab::MuxCapturedTab>,
     captured_domains: Vec<crate::MuxCapturedDomain>,
@@ -155,6 +158,10 @@ impl UnpublishedRecoveredTopology {
         anyhow::ensure!(
             default_domain_id.is_none_or(|id| domain_ids.contains(&id)),
             "recovered default domain is absent from domain census"
+        );
+        anyhow::ensure!(
+            captured_domains.is_empty() == default_domain_id.is_none(),
+            "nonempty recovered domain census requires its exact default"
         );
         anyhow::ensure!(
             expected_panes

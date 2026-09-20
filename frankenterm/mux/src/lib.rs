@@ -1814,6 +1814,20 @@ pub(crate) fn try_reserve_usize_ids(
     }
 }
 
+/// Recovery reserves numeric identities monotonically. Failed preparations may
+/// leave gaps, but must never roll back a counter another thread has advanced.
+pub(crate) fn reserve_recovered_ids(
+    counter: &AtomicUsize,
+    maximum: usize,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    let next = maximum
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("recovered {namespace} identifier exhausted"))?;
+    counter.fetch_max(next, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Allocate one process-local identifier without ever reusing the terminal
 /// value after exhaustion.
 ///
@@ -9776,6 +9790,35 @@ impl Drop for WindowNotificationDispatch {
     }
 }
 
+/// Minted only after all recovered registries and reader custody have committed.
+pub struct RecoveredTopologyPublication {
+    owner: Weak<Mux>,
+    incarnation: MuxSessionIncarnation,
+    revision: TopologyRevision,
+    counts: (usize, usize, usize),
+}
+
+impl RecoveredTopologyPublication {
+    pub fn matches_owner(&self, owner: &Arc<Mux>) -> bool {
+        Weak::ptr_eq(&self.owner, &Arc::downgrade(owner))
+            && owner
+                .topology_snapshot_authority()
+                .is_ok_and(|(incarnation, _)| incarnation == self.incarnation)
+    }
+
+    pub fn incarnation(&self) -> MuxSessionIncarnation {
+        self.incarnation
+    }
+
+    pub fn revision(&self) -> TopologyRevision {
+        self.revision
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.counts
+    }
+}
+
 pub struct Mux {
     topology: Mutex<MuxTopologyAuthority>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
@@ -9802,6 +9845,7 @@ pub struct Mux {
     activity_count: Arc<AtomicUsize>,
     activity_prune_state: Arc<ActivityPruneState>,
     default_domain_registration: RwLock<Option<Arc<LiveDomainRegistration>>>,
+    recovered_default_workspace: RwLock<Option<String>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
     domain_registrations: RwLock<HashMap<DomainId, Arc<LiveDomainRegistration>>>,
@@ -9837,6 +9881,10 @@ pub struct Mux {
     pane_output_drain_scheduled: AtomicBool,
     #[cfg(test)]
     pane_reader_preparation_fault: Mutex<Option<PaneReaderPreparationFault>>,
+    #[cfg(test)]
+    recovered_reader_failure_at: Mutex<Option<usize>>,
+    #[cfg(test)]
+    recovered_before_publication: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     pane_count_recomputes: AtomicUsize,
     #[cfg(test)]
@@ -11643,6 +11691,7 @@ impl Mux {
             activity_count: Arc::new(AtomicUsize::new(0)),
             activity_prune_state: Arc::new(ActivityPruneState::default()),
             default_domain_registration: RwLock::new(default_domain_registration),
+            recovered_default_workspace: RwLock::new(None),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
             domain_registrations: RwLock::new(domain_registrations),
@@ -11673,6 +11722,10 @@ impl Mux {
             #[cfg(test)]
             pane_reader_preparation_fault: Mutex::new(None),
             #[cfg(test)]
+            recovered_reader_failure_at: Mutex::new(None),
+            #[cfg(test)]
+            recovered_before_publication: Mutex::new(None),
+            #[cfg(test)]
             pane_count_recomputes: AtomicUsize::new(0),
             #[cfg(test)]
             pane_count_window_probes: AtomicUsize::new(0),
@@ -11690,6 +11743,9 @@ impl Mux {
     }
 
     fn get_default_workspace(&self) -> String {
+        if let Some(workspace) = self.recovered_default_workspace.read().as_ref() {
+            return workspace.clone();
+        }
         let config = configuration();
         config
             .default_workspace
@@ -15724,6 +15780,331 @@ impl Mux {
         }
     }
 
+    /// Publish one fully prepared recovery graph into a fresh owner. All
+    /// external callbacks and reader spawning happen before the registry cut;
+    /// cancellation drops start gates and unpublished guardian lease custody.
+    pub fn publish_recovered_topology(
+        self: &Arc<Self>,
+        mut recovered: domain::UnpublishedRecoveredTopology,
+        domains: Vec<Arc<dyn Domain>>,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<RecoveredTopologyPublication> {
+        let check_deadline = || -> anyhow::Result<()> {
+            anyhow::ensure!(
+                deadline.is_none_or(|deadline| Instant::now() < deadline),
+                "recovered topology publication deadline expired"
+            );
+            Ok(())
+        };
+        check_deadline()?;
+        let (incarnation, initial_revision) = self.topology_snapshot_authority()?;
+        anyhow::ensure!(
+            initial_revision == TopologyRevision::INITIAL,
+            "recovery requires a fresh mux"
+        );
+        let counts = recovered.counts();
+        let config = configuration();
+        let mut staged_domains = HashMap::new();
+        let mut staged_domain_names = HashMap::new();
+        let mut staged_registrations = HashMap::new();
+        let mut staged_registration_names = HashMap::new();
+        anyhow::ensure!(
+            domains.len() == recovered.captured_domains().len(),
+            "recovered domain count mismatch"
+        );
+        for domain in domains {
+            check_deadline()?;
+            let id = domain.domain_id();
+            let name = domain.domain_name().to_owned();
+            let expected = recovered
+                .captured_domains()
+                .iter()
+                .find(|entry| entry.domain_id == id)
+                .ok_or_else(|| anyhow!("unexpected recovered domain {id}"))?;
+            anyhow::ensure!(
+                name == expected.name
+                    && domain.state() == expected.state
+                    && domain.recovery_policy(&config)? == expected.policy,
+                "constructed recovered domain differs from authenticated policy"
+            );
+            let registration = LiveDomainRegistration::new(id, name.clone(), Arc::clone(&domain));
+            anyhow::ensure!(
+                staged_domains.insert(id, Arc::clone(&domain)).is_none()
+                    && staged_domain_names.insert(name.clone(), domain).is_none(),
+                "duplicate recovered domain"
+            );
+            staged_registrations.insert(id, Arc::clone(&registration));
+            staged_registration_names.insert(name, registration);
+        }
+        let staged_default = recovered
+            .default_domain_id()
+            .map(|id| {
+                staged_registrations
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing recovered default domain"))
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            staged_domains.is_empty() == staged_default.is_none(),
+            "nonempty recovered domain registry requires a default"
+        );
+        let staged_workspace = recovered.default_workspace().to_owned();
+
+        // Keep claims and custody alive until after every registry lock has
+        // been released, including on a failed final freshness check.
+        let mut claims = Vec::new();
+        let mut readers = Vec::new();
+        let mut reservations = Vec::new();
+        let mut pane_ids = Vec::new();
+        for owned in &recovered.panes {
+            check_deadline()?;
+            let pane = owned.pane();
+            if let Some(identity) = pane
+                .downcast_ref::<crate::localpane::LocalPane>()
+                .and_then(crate::localpane::LocalPane::guardian_lease_identity)
+            {
+                anyhow::ensure!(
+                    identity.mux_incarnation().as_bytes() == &incarnation.as_bytes(),
+                    "recovered guardian lease belongs to another mux incarnation"
+                );
+            }
+            let claim = self
+                .claim_pane_preparation(pane)?
+                .ok_or_else(|| anyhow!("recovered pane is already published"))?;
+            let prepared =
+                self.prepare_claimed_pane_registration(pane, claim.pane_id, &claim.generation)?;
+            check_deadline()?;
+            #[cfg(test)]
+            if *self.recovered_reader_failure_at.lock() == Some(claims.len()) {
+                self.fail_next_pane_reader_preparation(PaneReaderPreparationFault::ParserReady);
+            }
+            let (gate, reservation) =
+                self.spawn_prepared_pane_reader(pane, prepared, &claim.generation)?;
+            pane_ids.push(claim.pane_id);
+            claims.push(claim);
+            readers.push(gate);
+            reservations.push(reservation);
+        }
+
+        let mut staged_authority = PaneAuthorityIndex::default();
+        let mut staged_panes = HashMap::new();
+        let mut bind_callbacks = Vec::new();
+        bind_callbacks.try_reserve_exact(claims.len())?;
+        for (owned, claim) in recovered.panes.iter().zip(&claims) {
+            let pane = owned.pane();
+            let registration = PaneRegistrationHandle::new(pane, &claim.generation);
+            bind_callbacks.push((Arc::clone(pane), registration.clone()));
+            let prepared = staged_authority.prepare_live_registration_insert(
+                claim.pane_id,
+                pane,
+                claim.domain_id,
+                staged_domains.get(&claim.domain_id),
+            )?;
+            staged_authority.insert_live_registration(
+                claim.pane_id,
+                pane,
+                claim.domain_id,
+                registration,
+                prepared,
+            );
+            staged_panes.insert(
+                claim.pane_id,
+                LivePaneRegistration {
+                    pane: Arc::clone(pane),
+                    generation: Arc::clone(&claim.generation),
+                    domain_id: claim.domain_id,
+                },
+            );
+        }
+        let mut staged_parents = HashMap::new();
+        for captured in recovered.captured_tabs() {
+            check_deadline()?;
+            let tab = recovered
+                .tabs
+                .get(&captured.tab_id)
+                .expect("prepared tab metadata remains present");
+            let structural = tab.snapshot_structural_states_for_authority()?;
+            // Only private tab state is changed here. No registered pane or
+            // live topology can observe this owner binding before the cut.
+            let generation = tab
+                .prepare_recovered_mux_owner_binding(self, &structural)?
+                .commit();
+            for state in structural {
+                let live = staged_panes
+                    .get(&state.pane_id)
+                    .ok_or_else(|| anyhow!("recovered structural pane is absent"))?;
+                let binding = staged_authority.prepare_new_structural_bind(
+                    state.pane_id,
+                    state.pane,
+                    Arc::clone(tab),
+                    state.lane,
+                    Some((
+                        PaneRegistrationHandle::new(&live.pane, &live.generation),
+                        live.domain_id,
+                    )),
+                )?;
+                staged_authority.commit_structural_bind(binding, generation);
+            }
+            staged_parents.insert(
+                captured.tab_id,
+                TabParentRegistration {
+                    tab: Arc::downgrade(tab),
+                    mux_owner_generation: generation,
+                    window_id: captured.window_id,
+                },
+            );
+        }
+        let mut staged_counts = HashMap::<String, usize>::new();
+        for captured in recovered.captured_windows() {
+            let count = staged_counts.entry(captured.workspace.clone()).or_default();
+            *count = count
+                .checked_add(captured.structural_pane_count)
+                .ok_or_else(|| anyhow!("recovered workspace count overflow"))?;
+        }
+        staged_counts.retain(|_, count| *count != 0);
+        for window in &mut recovered.windows {
+            window.bind_recovered_owner(self)?;
+        }
+        let staged_windows: HashMap<_, _> = std::mem::take(&mut recovered.windows)
+            .into_iter()
+            .map(|window| (window.window_id(), window))
+            .collect();
+
+        // Reserve global high water marks only after expensive preparation.
+        // A later refusal may leave gaps; IDs must never be rolled backward.
+        if let Some(id) = pane_ids.iter().max() {
+            pane::reserve_recovered_pane_ids(*id)?;
+        }
+        if let Some(id) = recovered.tabs.keys().max() {
+            tab::reserve_recovered_tab_ids(*id)?;
+        }
+        if let Some(id) = staged_windows.keys().max() {
+            window::reserve_recovered_window_ids(*id)?;
+        }
+        if let Some(id) = staged_domains.keys().max() {
+            domain::reserve_recovered_domain_ids(*id)?;
+        }
+        let mut commit_guards = Vec::new();
+        commit_guards.try_reserve_exact(reservations.len())?;
+        let mut notifications = Vec::new();
+        notifications.try_reserve_exact(pane_ids.len())?;
+        #[cfg(test)]
+        if let Some(probe) = self.recovered_before_publication.lock().take() {
+            probe();
+        }
+        let (tickets, revision) = {
+            let _domain_lock = self.domain_registration.lock();
+            let _pane_lock = self.pane_registration.lock();
+            let mut authority = self.pane_authority.lock();
+            let mut live_domains = self.domains.write();
+            let mut live_names = self.domains_by_name.write();
+            let mut live_registrations = self.domain_registrations.write();
+            let mut live_registration_names = self.domain_registrations_by_name.write();
+            let mut default = self.default_domain_registration.write();
+            let mut tabs = self.tabs.write();
+            let mut panes = self.panes.write();
+            let mut windows = self.windows.write();
+            let mut parents = self.tab_parents.write();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let mut workspace = self.recovered_default_workspace.write();
+            let clients = self.clients.read();
+            anyhow::ensure!(
+                live_domains.is_empty()
+                    && live_names.is_empty()
+                    && live_registrations.is_empty()
+                    && live_registration_names.is_empty()
+                    && default.is_none()
+                    && tabs.is_empty()
+                    && panes.is_empty()
+                    && windows.is_empty()
+                    && parents.is_empty()
+                    && workspace_counts.is_empty()
+                    && workspace.is_none()
+                    && authority.structural_by_pane_id.is_empty()
+                    && authority.registrations_by_domain.is_empty()
+                    && authority.pane_ids_by_tab.is_empty()
+                    && authority.live_registration_counts_by_domain.is_empty()
+                    && clients.is_empty()
+                    && self.provisional_windows.lock().is_empty()
+                    && self.retired_domain_ids.lock().is_empty()
+                    && self.retiring_pane_ids.lock().is_empty(),
+                "recovery target ceased to be empty before publication"
+            );
+            anyhow::ensure!(
+                claims
+                    .iter()
+                    .all(PanePreparationClaim::is_authoritative_locked)
+                    && self.pane_preparations.lock().len() == claims.len(),
+                "recovery pane preparation changed"
+            );
+            for reservation in reservations {
+                commit_guards.push(reservation.commit()?);
+            }
+            let lifecycle = self.prepare_pane_lifecycle_batch_enqueue(&pane_ids)?;
+            anyhow::ensure!(
+                lifecycle.pending.by_pane.is_empty()
+                    && lifecycle.pending.ready_panes.is_empty()
+                    && lifecycle.pending.ready_set.is_empty(),
+                "recovery target has pending pane lifecycle work"
+            );
+            let mut topology = self.topology.lock();
+            anyhow::ensure!(
+                topology.session_incarnation == incarnation
+                    && topology.revision == TopologyRevision::INITIAL
+                    && !topology.exhausted,
+                "recovery target topology changed"
+            );
+            check_deadline()?;
+            let revision = topology.reserve_revision()?;
+            // No fallible calls or external callbacks after this point.
+            *live_domains = staged_domains;
+            *live_names = staged_domain_names;
+            *live_registrations = staged_registrations;
+            *live_registration_names = staged_registration_names;
+            *default = staged_default;
+            *authority = staged_authority;
+            *tabs = std::mem::take(&mut recovered.tabs);
+            *panes = staged_panes;
+            *windows = staged_windows;
+            *parents = staged_parents;
+            *workspace_counts = staged_counts;
+            *workspace = Some(staged_workspace);
+            for (&id, gate) in pane_ids.iter().zip(readers) {
+                notifications.push(PreparedPaneLifecycleBatchNotification {
+                    notification: PaneLifecycleNotification::Added(id),
+                    topology: MuxTopologyStamp::Revision(revision),
+                    reader_start_gate: gate,
+                    cleanup_complete: None,
+                    removal_follow_up: PaneRemovalFollowUp::None,
+                });
+            }
+            for claim in &mut claims {
+                claim.retire_locked();
+            }
+            for guard in commit_guards.drain(..) {
+                guard.finalize();
+            }
+            (lifecycle.enqueue(notifications), revision)
+        };
+        // Custody is disarmed before notifications can invoke user code.
+        for owned in std::mem::take(&mut recovered.panes) {
+            owned.into_pane();
+        }
+        for ticket in tickets {
+            self.complete_pane_lifecycle_notification(ticket);
+        }
+        for (pane, registration) in bind_callbacks {
+            self.notify_pane_registration_did_bind(&pane, &registration);
+        }
+        Ok(RecoveredTopologyPublication {
+            owner: Arc::downgrade(self),
+            incarnation,
+            revision,
+            counts,
+        })
+    }
+
     pub fn add_pane(self: &Arc<Self>, pane: &Arc<dyn Pane>) -> Result<(), Error> {
         let Some(mut preparation_claim) = self.claim_pane_preparation(pane)? else {
             return Ok(());
@@ -18764,6 +19145,17 @@ impl Mux {
                     .snapshot()
                     .map_err(|_| MuxTopologyCaptureError::AuthorityExhausted)?
             };
+            let captured_default_workspace = self
+                .recovered_default_workspace
+                .read()
+                .clone()
+                .unwrap_or_else(|| {
+                    captured_config
+                        .default_workspace
+                        .as_deref()
+                        .unwrap_or(DEFAULT_WORKSPACE)
+                        .to_owned()
+                });
 
             // Clone exact domain allocations under their directory lock, then
             // inspect policies outside mux locks. The final revision/config
@@ -19244,11 +19636,7 @@ impl Mux {
                     topology_revision: initial_stamp.1,
                     captured_at_epoch_ms: now_ms,
                     client_workspace,
-                    default_workspace: captured_config
-                        .default_workspace
-                        .as_deref()
-                        .unwrap_or(DEFAULT_WORKSPACE)
-                        .to_owned(),
+                    default_workspace: captured_default_workspace,
                     default_domain_id,
                     domains: captured_domains,
                     workspaces,
@@ -24603,6 +24991,356 @@ mod tests {
             pixel_height: 600,
             dpi: 96,
         }
+    }
+
+    #[cfg(unix)]
+    struct OwnedRecoveryTestPanes(Vec<Arc<dyn Pane>>);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for OwnedRecoveryTestPanes {
+        type Target = Vec<Arc<dyn Pane>>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedRecoveryTestPanes {
+        fn drop(&mut self) {
+            for pane in &self.0 {
+                pane.kill();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn recovered_native_pty_fixture() -> anyhow::Result<(
+        domain::UnpublishedRecoveredTopology,
+        Vec<Arc<dyn Domain>>,
+        OwnedRecoveryTestPanes,
+    )> {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let occupied: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("recovered-occupied")?);
+        let empty: Arc<dyn Domain> = Arc::new(domain::LocalDomain::new("recovered-empty")?);
+        let config = configuration();
+        let domains = vec![occupied, empty];
+        let metadata = domains
+            .iter()
+            .map(|domain| {
+                Ok(MuxCapturedDomain {
+                    domain_id: domain.domain_id(),
+                    name: domain.domain_name().to_owned(),
+                    state: domain.state(),
+                    policy: domain.recovery_policy(&config)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut panes = OwnedRecoveryTestPanes(Vec::new());
+        let mut custody = Vec::new();
+        let mut tabs = Vec::new();
+        let mut windows = Vec::new();
+        let mut expected = HashMap::new();
+        for ordinal in 0..2 {
+            let id = pane::alloc_pane_id()?;
+            let durable = uuid::Uuid::new_v4();
+            let domain_id = domains[0].domain_id();
+            let pair = native_pty_system().openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 600,
+            })?;
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.args(["-c", "printf 'recovered-native-ready\\n'; while IFS= read -r line; do printf 'reply:%s\\n' \"$line\"; done"]);
+            let writer = pair.master.take_writer()?;
+            let terminal = Terminal::new(
+                test_size(),
+                Arc::new(config::TermConfig::new_for_pane(
+                    id,
+                    domain_id,
+                    *durable.as_bytes(),
+                    String::new(),
+                )),
+                "recovery-real-pty",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            let child = pair.slave.spawn_command(cmd)?;
+            drop(pair.slave);
+            let pane: Arc<dyn Pane> = Arc::new(crate::localpane::LocalPane::new(
+                id,
+                terminal,
+                child,
+                pair.master,
+                writer,
+                domain_id,
+                *durable.as_bytes(),
+                String::new(),
+            ));
+            panes.0.push(Arc::clone(&pane));
+            let owned = domain::UnpublishedPane::new(Arc::clone(&pane));
+            let tab = Tab::new(&test_size());
+            tab.assign_pane(&pane);
+            let window_id = 500_000 + ordinal;
+            let captured = tab.capture_tab_topology(window_id, "recovered-workspace")?;
+            windows.push(MuxCapturedWindow {
+                window_id,
+                durable_window_id: uuid::Uuid::new_v4(),
+                workspace: "recovered-workspace".into(),
+                title: format!("recovered window {ordinal}"),
+                order_revision: WindowOrderRevision::INITIAL,
+                ordered_tab_ids: vec![captured.tab_id],
+                active_tab_id: Some(captured.tab_id),
+                active_tab_index: Some(0),
+                last_active_tab_id: Some(captured.tab_id),
+                tab_stacks: Vec::new(),
+                position: None,
+                structural_pane_count: 1,
+            });
+            expected.insert(id, (*durable.as_bytes(), domain_id));
+            custody.push(owned);
+            tabs.push(captured);
+        }
+        let topology = domain::UnpublishedRecoveredTopology::prepare(
+            windows,
+            tabs,
+            metadata,
+            Some(domains[1].domain_id()),
+            "recovered-workspace".into(),
+            &expected,
+            custody,
+        )?;
+        Ok((topology, domains, panes))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_topology_publishes_real_pty_graph_before_readers_and_preserves_authority(
+    ) -> anyhow::Result<()> {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let _installed = ScopedMuxOverride::install(&owner);
+        let (topology, domains, panes) = recovered_native_pty_fixture()?;
+        let expected_windows = topology.captured_windows().to_vec();
+        let expected_tabs = topology.captured_tabs().to_vec();
+        let expected_default = domains[1].domain_id();
+        let before = Arc::new(AtomicBool::new(false));
+        let probe_owner = Arc::clone(&owner);
+        let probe_panes = panes.clone();
+        let probe_before = Arc::clone(&before);
+        *owner.recovered_before_publication.lock() = Some(Box::new(move || {
+            assert!(probe_owner.iter_panes().is_empty());
+            assert!(probe_owner.iter_windows().is_empty());
+            for pane in probe_panes {
+                assert!(!pane
+                    .get_lines(0..24)
+                    .1
+                    .iter()
+                    .any(|line| line.as_str().contains("recovered-native-ready")));
+            }
+            probe_before.store(true, Ordering::Release);
+        }));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::downgrade(&owner);
+        let observed_clone = Arc::clone(&observed);
+        owner.subscribe(move |event| {
+            if matches!(event, MuxNotification::PaneAdded(_)) {
+                if let Some(owner) = observer.upgrade() {
+                    if owner.iter_panes().len() == 2
+                        && owner.iter_windows().len() == 2
+                        && owner.iter_domains().len() == 2
+                    {
+                        observed_clone.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            }
+            true
+        })?;
+        let receipt = owner.publish_recovered_topology(topology, domains, None)?;
+        assert!(before.load(Ordering::Acquire));
+        assert!(receipt.matches_owner(&owner));
+        assert!(!receipt.matches_owner(&Arc::new(Mux::new(None))));
+        assert_eq!(receipt.counts(), (2, 2, 2));
+        assert_eq!(observed.load(Ordering::Acquire), 2);
+        assert_eq!(owner.default_domain()?.domain_id(), expected_default);
+        assert!(domain::alloc_domain_id() > expected_default);
+        assert_eq!(owner.active_workspace(), "recovered-workspace");
+        assert_structural_pane_count_authority(&owner);
+        let captured = owner.capture_topology_coherent(Default::default())?;
+        assert_eq!(captured.default_workspace, "recovered-workspace");
+        assert_eq!(captured.windows.len(), expected_windows.len());
+        for expected in &expected_windows {
+            assert_eq!(
+                captured
+                    .windows
+                    .iter()
+                    .find(|window| window.window_id == expected.window_id),
+                Some(expected)
+            );
+        }
+        for expected in &expected_tabs {
+            let actual = captured
+                .tabs
+                .iter()
+                .find(|tab| tab.tab_id == expected.tab_id)
+                .expect("restored tab");
+            assert_eq!(actual.durable_tab_id, expected.durable_tab_id);
+            assert_eq!(actual.window_id, expected.window_id);
+            assert_eq!(actual.active_pane_id, expected.active_pane_id);
+            assert_eq!(actual.size, expected.size);
+            assert_eq!(actual.runtime_state, expected.runtime_state);
+        }
+        executor.run_until(Duration::from_secs(10), || {
+            panes.iter().all(|pane| {
+                pane.get_lines(0..24)
+                    .1
+                    .iter()
+                    .any(|line| line.as_str().contains("recovered-native-ready"))
+            })
+        });
+        for pane in panes.iter() {
+            pane.writer().write_all(b"after-publication\n")?;
+        }
+        executor.run_until(Duration::from_secs(10), || {
+            panes.iter().all(|pane| {
+                pane.get_lines(0..24)
+                    .1
+                    .iter()
+                    .any(|line| line.as_str().contains("reply:after-publication"))
+            })
+        });
+        let next_window = owner.new_empty_window(None, None);
+        assert!(*next_window > 500_001);
+        assert!(!expected_windows
+            .iter()
+            .any(|window| window.window_id == *next_window));
+        drop(next_window);
+        assert!(pane::alloc_pane_id()? > panes.iter().map(|pane| pane.pane_id()).max().unwrap());
+        assert!(
+            Tab::new(&test_size()).tab_id()
+                > expected_tabs.iter().map(|tab| tab.tab_id).max().unwrap()
+        );
+        for pane in panes.iter() {
+            pane.kill();
+            owner.remove_pane(pane.pane_id());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_topology_expired_deadline_leaves_real_pty_graph_unpublished() -> anyhow::Result<()>
+    {
+        let _guard = global_test_lock();
+        let owner = Arc::new(Mux::new(None));
+        let (topology, domains, panes) = recovered_native_pty_fixture()?;
+        let error = owner
+            .publish_recovered_topology(topology, domains, Some(Instant::now()))
+            .err()
+            .expect("expired deadline must refuse before preparation");
+        assert!(format!("{error:#}").contains("deadline expired"));
+        assert!(owner.iter_domains().is_empty());
+        assert!(owner.iter_panes().is_empty());
+        assert!(owner.iter_windows().is_empty());
+        assert!(owner.tabs.read().is_empty());
+        assert!(owner.tab_parents.read().is_empty());
+        assert!(owner.pane_preparations.lock().is_empty());
+        assert!(owner.pending_pane_lifecycle.lock().by_pane.is_empty());
+        assert_eq!(
+            owner.topology_snapshot_authority()?.1,
+            TopologyRevision::INITIAL
+        );
+        assert!(panes
+            .iter()
+            .all(|pane| pane.mux_registration_slot().load().is_none()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_topology_last_real_reader_failure_leaves_zero_publication() -> anyhow::Result<()> {
+        let _guard = global_test_lock();
+        let _executor = BoundedTestExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let (topology, domains, panes) = recovered_native_pty_fixture()?;
+        *owner.recovered_reader_failure_at.lock() = Some(1);
+        let error = owner
+            .publish_recovered_topology(topology, domains, None)
+            .err()
+            .expect("last reader must fail");
+        assert!(format!("{error:#}").contains("readiness"));
+        assert!(owner.iter_panes().is_empty());
+        assert!(owner.iter_windows().is_empty());
+        assert!(owner.iter_domains().is_empty());
+        assert!(owner.tabs.read().is_empty());
+        assert!(owner.tab_parents.read().is_empty());
+        assert!(owner.pane_preparations.lock().is_empty());
+        assert!(owner.pending_pane_lifecycle.lock().by_pane.is_empty());
+        assert_eq!(
+            owner.topology_snapshot_authority()?.1,
+            TopologyRevision::INITIAL
+        );
+        for pane in panes.iter() {
+            assert!(pane.mux_registration_slot().load().is_none());
+            assert!(!pane
+                .get_lines(0..24)
+                .1
+                .iter()
+                .any(|line| line.as_str().contains("recovered-native-ready")));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_topology_last_domain_policy_mismatch_leaves_zero_publication() -> anyhow::Result<()>
+    {
+        let _guard = global_test_lock();
+        let owner = Arc::new(Mux::new(None));
+        let (topology, mut domains, panes) = recovered_native_pty_fixture()?;
+        let last = domains.last().unwrap();
+        let domain::DomainRecoveryPolicy::Local(mut policy) =
+            last.recovery_policy(&configuration())?
+        else {
+            panic!("native fixture must have local policy");
+        };
+        policy.term.push_str("-substituted");
+        let substituted: Arc<dyn Domain> = Arc::new(domain::LocalDomain::from_recovery_policy(
+            last.domain_id(),
+            last.domain_name().to_owned(),
+            policy,
+        )?);
+        *domains.last_mut().unwrap() = substituted;
+        let error = owner
+            .publish_recovered_topology(topology, domains, None)
+            .err()
+            .expect("changed final domain policy must refuse");
+        assert!(format!("{error:#}").contains("authenticated policy"));
+        assert!(owner.iter_domains().is_empty());
+        assert!(owner.iter_panes().is_empty());
+        assert!(owner.iter_windows().is_empty());
+        assert!(owner.pane_preparations.lock().is_empty());
+        assert_eq!(
+            owner.topology_snapshot_authority()?.1,
+            TopologyRevision::INITIAL
+        );
+        assert!(panes
+            .iter()
+            .all(|pane| pane.mux_registration_slot().load().is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_id_high_water_never_reuses_or_rolls_back_identifiers() -> anyhow::Result<()> {
+        let counter = AtomicUsize::new(7);
+        reserve_recovered_ids(&counter, 91, "test")?;
+        assert_eq!(try_reserve_usize_ids(&counter, 1, "test")?, 92..93);
+        reserve_recovered_ids(&counter, 12, "test")?;
+        assert_eq!(counter.load(Ordering::Relaxed), 93);
+        assert!(reserve_recovered_ids(&counter, usize::MAX, "test").is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 93);
+        Ok(())
     }
 
     fn test_window_reorder_request(

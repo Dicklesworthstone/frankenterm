@@ -67,8 +67,29 @@ const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Explicit, same-incarnation guardian spawning. This is not a successor or
-/// restart attachment domain: an unadopted birth fences further spawning.
+#[derive(Clone, Copy)]
+struct GuardianRestoreBudget<'a> {
+    cx: &'a frankenterm_core::cx::Cx,
+    deadline: Instant,
+}
+
+impl GuardianRestoreBudget<'_> {
+    fn checkpoint(self) -> Result<(), GuardianProxyError> {
+        self.cx
+            .checkpoint()
+            .map_err(|_| GuardianProxyError::InvalidConfiguration("guardian restore cancelled"))?;
+        if Instant::now() >= self.deadline {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "guardian restore deadline expired",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Guardian spawning for an exact mux owner, using current or recovered command
+/// policy. Successor lease attachment belongs to the separate atomic recovery
+/// transaction; an unadopted birth fences further spawning in this domain.
 pub struct GuardianDomain {
     commands: LocalDomain,
     owner: std::sync::Weak<mux::Mux>,
@@ -103,6 +124,39 @@ impl Drop for GuardianDomainSpawnAdmission {
 }
 
 impl GuardianDomain {
+    /// Construct a private domain from authenticated recovery metadata without
+    /// allocating a new domain ID or consulting current command defaults.
+    /// Endpoint authentication still occurs on the guardian connection; this
+    /// constructor neither claims panes nor publishes the domain. The caller
+    /// must reserve recovered IDs and publish the complete cohort atomically.
+    pub fn from_recovery_policy(
+        mux: &Arc<mux::Mux>,
+        id: DomainId,
+        name: String,
+        policy: mux::domain::DomainRecoveryPolicy,
+    ) -> anyhow::Result<Self> {
+        policy.validate()?;
+        let mux::domain::DomainRecoveryPolicy::GuardianLocal {
+            commands,
+            socket_path,
+            token_path,
+        } = policy
+        else {
+            anyhow::bail!("recovered guardian domain requires guardian command policy");
+        };
+        let commands = LocalDomain::from_recovery_policy(id, name, commands)?;
+        let (session, _) = mux.topology_snapshot_authority()?;
+        Ok(Self {
+            commands,
+            owner: Arc::downgrade(mux),
+            mux_incarnation: Uuid::from_bytes(session.as_bytes()),
+            socket_path,
+            token_path,
+            admission: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(GuardianDomainState::default())),
+        })
+    }
+
     pub fn new(
         mux: &Arc<mux::Mux>,
         socket_path: PathBuf,
@@ -775,6 +829,38 @@ trait GuardianReplayTransport: Send {
         request_id: Uuid,
         ack: GuardianReplayAckV1,
     ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError>;
+}
+
+/// Apply the same cohort budget to every page/ACK attempt, including exact
+/// retries and snapshot reopen. A single admitted socket operation retains its
+/// transport I/O timeout; cancellation forbids any subsequent RPC or activation.
+struct BudgetedGuardianReplayTransport<'a> {
+    inner: &'a mut dyn GuardianReplayTransport,
+    budget: GuardianRestoreBudget<'a>,
+}
+
+impl GuardianReplayTransport for BudgetedGuardianReplayTransport<'_> {
+    fn replay(
+        &mut self,
+        request_id: Uuid,
+        request: GuardianReplayRequestV1,
+    ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+        self.budget.checkpoint()?;
+        let page = self.inner.replay(request_id, request)?;
+        self.budget.checkpoint()?;
+        Ok(page)
+    }
+
+    fn replay_ack(
+        &mut self,
+        request_id: Uuid,
+        ack: GuardianReplayAckV1,
+    ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+        self.budget.checkpoint()?;
+        let receipt = self.inner.replay_ack(request_id, ack)?;
+        self.budget.checkpoint()?;
+        Ok(receipt)
+    }
 }
 
 /// Independent checkpoint-stage channel for one exact guardian lease.
@@ -5763,10 +5849,28 @@ impl GuardianProxyStaging {
     /// drift, or reader/writer activation failure leaves no `LocalPane` to
     /// publish.
     pub fn restore_and_activate(
-        mut self,
+        self,
         config: Arc<dyn TerminalConfiguration>,
         limits: TerminalCheckpointLimits,
     ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
+        let cx = frankenterm_core::cx::for_request();
+        self.restore_and_activate_with_budget(
+            config,
+            limits,
+            GuardianRestoreBudget {
+                cx: &cx,
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+        )
+    }
+
+    fn restore_and_activate_with_budget(
+        mut self,
+        config: Arc<dyn TerminalConfiguration>,
+        limits: TerminalCheckpointLimits,
+        budget: GuardianRestoreBudget<'_>,
+    ) -> Result<ActivatedGuardianProxy, GuardianProxyError> {
+        budget.checkpoint()?;
         let identity = self.identity();
         let expected_size = self.actor.lock().size;
         if self.checkpoint_publisher.is_none() {
@@ -5781,13 +5885,17 @@ impl GuardianProxyStaging {
                     "guardian staging has no replay transport bound to its claimed lease",
                 ))?;
         let verified = consume_guardian_replay_for_restore(
-            replay_transport.as_mut(),
+            &mut BudgetedGuardianReplayTransport {
+                inner: replay_transport.as_mut(),
+                budget,
+            },
             identity,
             expected_size,
             config,
             limits,
             self.selected_checkpoint,
         )?;
+        budget.checkpoint()?;
         let tail = GuardianReplayTailReader::new(
             replay_transport,
             identity,
@@ -5796,7 +5904,9 @@ impl GuardianProxyStaging {
             verified.boundary,
             limits,
         )?;
-        self.activate_verified_restore(verified.inert_terminal, Box::new(tail))
+        let activated = self.activate_verified_restore(verified.inert_terminal, Box::new(tail))?;
+        budget.checkpoint()?;
+        Ok(activated)
     }
 
     fn activate_verified_restore(
@@ -5905,12 +6015,182 @@ pub struct ActivatedGuardianProxy {
 }
 
 /// Joint ownership of one authenticated root, its fully reconciled guardian
-/// activations, and private topology. This deliberately exposes no live mux or
-/// publication method while atomic batch registration is being implemented.
+/// activations, and private topology, retained until atomic publication into
+/// the exact fresh target mux.
 pub struct PreparedGuardianWholeMuxTopology {
     owner: Arc<mux::Mux>,
     target_incarnation: Uuid,
     topology: frankenterm_core::session_restore::PreparedWholeMuxTopology,
+}
+
+/// Load existing recovery authority and restore before exposing a listener.
+/// This never creates a recovery store, enrollment, guardian, or child process.
+pub fn restore_from_options(
+    owner: Arc<mux::Mux>,
+    options: &crate::recovery_runtime::RecoveryOptions,
+    guardian_paths: Option<(PathBuf, PathBuf)>,
+    limits: TerminalCheckpointLimits,
+) -> anyhow::Result<frankenterm_core::session_restore::PublishedWholeMuxTopology> {
+    let cx = frankenterm_core::cx::for_request();
+    let source = crate::recovery_runtime::load_recovery_for_startup(
+        options,
+        guardian_paths.as_ref().map(|(_, token)| token.clone()),
+        &cx,
+    )?;
+    restore_authenticated_topology(
+        owner,
+        source,
+        guardian_paths,
+        limits,
+        &cx,
+        Duration::from_secs(options.recovery_timeout_seconds.unwrap_or(30)),
+    )
+}
+
+/// Restore one independently configured guardian's cohort before exposing a
+/// server listener. All metadata and lease plans are admitted before the first
+/// Claim; failed activation/publication retains lease-only rollback custody.
+pub fn restore_authenticated_topology(
+    owner: Arc<mux::Mux>,
+    recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+    guardian_paths: Option<(PathBuf, PathBuf)>,
+    limits: TerminalCheckpointLimits,
+    cx: &frankenterm_core::cx::Cx,
+    timeout: Duration,
+) -> anyhow::Result<frankenterm_core::session_restore::PublishedWholeMuxTopology> {
+    use frankenterm_core::mux_recovery_image::{
+        CheckpointAuthority, RecoveryDomainPolicy, RecoverySpawnCustody,
+    };
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .context("startup recovery deadline overflow")?;
+    let checkpoint = || -> anyhow::Result<()> {
+        cx.checkpoint()
+            .map_err(|_| anyhow::anyhow!("startup recovery cancelled"))?;
+        anyhow::ensure!(
+            started.elapsed() < timeout,
+            "startup recovery deadline expired"
+        );
+        Ok(())
+    };
+    checkpoint()?;
+    recovery.image().require_live_topology_state()?;
+    let (session, revision) = owner.topology_snapshot_authority()?;
+    let target = Uuid::from_bytes(session.as_bytes());
+    anyhow::ensure!(
+        revision == mux::TopologyRevision::INITIAL
+            && owner.is_empty()
+            && owner.iter_windows().is_empty()
+            && owner.iter_domains().is_empty()
+            && Uuid::parse_str(&recovery.image().header.mux_incarnation_id)? != target,
+        "startup recovery requires a fresh empty mux"
+    );
+    let mut domains = HashMap::new();
+    for domain in &recovery.image().topology.domains {
+        let policy = domain
+            .recovery_policy
+            .as_ref()
+            .context("missing recovered domain policy")?;
+        if let RecoveryDomainPolicy::GuardianLocal {
+            socket_path,
+            token_path,
+            ..
+        } = policy
+        {
+            let (socket, token) = guardian_paths
+                .as_ref()
+                .context("recovered guardian domain requires independently configured endpoints")?;
+            anyhow::ensure!(
+                socket.as_os_str() == std::ffi::OsStr::new(socket_path)
+                    && token.as_os_str() == std::ffi::OsStr::new(token_path),
+                "recovered guardian endpoints differ from independently configured endpoints"
+            );
+        }
+        anyhow::ensure!(
+            domains
+                .insert(domain.domain_name.as_str(), policy)
+                .is_none(),
+            "duplicate recovered domain name"
+        );
+    }
+    // Preflight every pane before connecting or writing durable Claim intent.
+    let mut selected = Vec::new();
+    selected.try_reserve_exact(recovery.pane_count())?;
+    let mut guardian = None;
+    for pane in &recovery.image().panes {
+        checkpoint()?;
+        anyhow::ensure!(
+            matches!(
+                domains.get(pane.domain_name.as_str()),
+                Some(RecoveryDomainPolicy::GuardianLocal { .. })
+            ),
+            "live startup recovery requires guardian-backed panes"
+        );
+        let CheckpointAuthority::Guardian {
+            guardian_generation,
+            ..
+        } = &pane.checkpoint.authority
+        else {
+            anyhow::bail!("model-only checkpoint cannot restore a live process");
+        };
+        let RecoverySpawnCustody::Original(custody) = &pane.spawn_custody else {
+            anyhow::bail!("recovered pane lacks authenticated original custody");
+        };
+        anyhow::ensure!(
+            guardian.is_none_or(|id| id == custody.guardian_incarnation),
+            "startup recovery spans multiple guardians"
+        );
+        guardian = Some(custody.guardian_incarnation);
+        selected.push((
+            Uuid::parse_str(&pane.pane_uuid)?,
+            *guardian_generation,
+            PtySize {
+                rows: pane.size.rows.try_into()?,
+                cols: pane.size.cols.try_into()?,
+                pixel_width: pane.size.pixel_width.try_into()?,
+                pixel_height: pane.size.pixel_height.try_into()?,
+            },
+        ));
+    }
+    let mut plans = Vec::new();
+    plans.try_reserve_exact(selected.len())?;
+    if let Some(guardian) = guardian {
+        let (socket, token) = guardian_paths
+            .as_ref()
+            .context("missing configured guardian endpoints")?;
+        let census = Arc::new(GuardianCensusCoordinator::connect(
+            socket, token, guardian, target,
+        )?);
+        for (pane, generation, size) in selected {
+            checkpoint()?;
+            let plan = GuardianProxyLeasePlan::prepare_from_recovery(
+                socket,
+                token,
+                size,
+                Arc::clone(&census),
+                &recovery,
+                pane,
+            )?;
+            plans.push((plan, pane, generation));
+        }
+    }
+    let mut staged = Vec::new();
+    staged.try_reserve_exact(plans.len())?;
+    for (plan, pane, generation) in plans {
+        checkpoint()?;
+        staged.push(plan.claim(pane, generation, Uuid::new_v4(), Uuid::new_v4())?);
+    }
+    checkpoint()?;
+    let prepared = PreparedGuardianWholeMuxTopology::prepare_with_budget(
+        owner,
+        recovery,
+        staged,
+        limits,
+        GuardianRestoreBudget { cx, deadline },
+    )?;
+    checkpoint()?;
+    Ok(prepared.publish_with_budget(Some(GuardianRestoreBudget { cx, deadline }))?)
 }
 
 impl PreparedGuardianWholeMuxTopology {
@@ -5998,6 +6278,27 @@ impl PreparedGuardianWholeMuxTopology {
         staged: Vec<GuardianProxyStaging>,
         limits: TerminalCheckpointLimits,
     ) -> Result<Self, GuardianProxyError> {
+        let cx = frankenterm_core::cx::for_request();
+        Self::prepare_with_budget(
+            owner,
+            recovery,
+            staged,
+            limits,
+            GuardianRestoreBudget {
+                cx: &cx,
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+        )
+    }
+
+    fn prepare_with_budget(
+        owner: Arc<mux::Mux>,
+        recovery: frankenterm_core::session_restore::ValidatedWholeMuxRecovery,
+        staged: Vec<GuardianProxyStaging>,
+        limits: TerminalCheckpointLimits,
+        budget: GuardianRestoreBudget<'_>,
+    ) -> Result<Self, GuardianProxyError> {
+        budget.checkpoint()?;
         let (target_incarnation, by_uuid) =
             Self::validate_staged_cohort(&owner, &recovery, &staged)?;
         let root = SelectedRecoveryRoot::from_validated(&recovery);
@@ -6013,6 +6314,7 @@ impl PreparedGuardianWholeMuxTopology {
             .try_reserve_exact(staged.len())
             .map_err(|_| GuardianProxyError::ReplayCapacity)?;
         for proxy in staged {
+            budget.checkpoint()?;
             let pane = by_uuid.get(&proxy.identity().pane_id()).ok_or(
                 GuardianProxyError::InvalidConfiguration(
                     "recovery pane disappeared during assembly",
@@ -6028,7 +6330,8 @@ impl PreparedGuardianWholeMuxTopology {
                     *proxy.identity().pane_id().as_bytes(),
                     String::new(),
                 ));
-            let activated = proxy.restore_and_activate(config, limits)?;
+            let activated = proxy.restore_and_activate_with_budget(config, limits, budget)?;
+            budget.checkpoint()?;
             activated
                 .selected_checkpoint
                 .ok_or(GuardianProxyError::InvalidConfiguration(
@@ -6044,11 +6347,13 @@ impl PreparedGuardianWholeMuxTopology {
                 .map_err(GuardianProxyError::RestoredModel)?,
             );
         }
+        budget.checkpoint()?;
         let topology = frankenterm_core::session_restore::prepare_unpublished_whole_mux_topology(
             recovery,
             unpublished,
         )
         .map_err(GuardianProxyError::RestoredModel)?;
+        budget.checkpoint()?;
         Ok(Self {
             owner,
             target_incarnation,
@@ -6058,6 +6363,68 @@ impl PreparedGuardianWholeMuxTopology {
 
     pub fn counts(&self) -> (usize, usize, usize) {
         self.topology.counts()
+    }
+
+    /// Publish the entire recovered graph and its captured spawning domains.
+    /// Until the final atomic commit succeeds, every pane retains its lease
+    /// rollback custody; any validation or construction error drops that
+    /// custody without publishing a partial topology.
+    pub fn publish(
+        self,
+    ) -> Result<frankenterm_core::session_restore::PublishedWholeMuxTopology, GuardianProxyError>
+    {
+        self.publish_with_budget(None)
+    }
+
+    fn publish_with_budget(
+        self,
+        budget: Option<GuardianRestoreBudget<'_>>,
+    ) -> Result<frankenterm_core::session_restore::PublishedWholeMuxTopology, GuardianProxyError>
+    {
+        if let Some(budget) = budget {
+            budget.checkpoint()?;
+        }
+        if !self.target_is_current() {
+            return Err(GuardianProxyError::InvalidConfiguration(
+                "recovery target mux incarnation changed before publication",
+            ));
+        }
+        let captured = self.topology.captured_domains();
+        let mut domains: Vec<Arc<dyn Domain>> = Vec::new();
+        domains
+            .try_reserve_exact(captured.len())
+            .map_err(|_| GuardianProxyError::ReplayCapacity)?;
+        for domain in captured {
+            if let Some(budget) = budget {
+                budget.checkpoint()?;
+            }
+            let recovered: Arc<dyn Domain> = match &domain.policy {
+                mux::domain::DomainRecoveryPolicy::Local(commands) => Arc::new(
+                    LocalDomain::from_recovery_policy(
+                        domain.domain_id,
+                        domain.name.clone(),
+                        commands.clone(),
+                    )
+                    .map_err(GuardianProxyError::RestoredModel)?,
+                ),
+                mux::domain::DomainRecoveryPolicy::GuardianLocal { .. } => Arc::new(
+                    GuardianDomain::from_recovery_policy(
+                        &self.owner,
+                        domain.domain_id,
+                        domain.name.clone(),
+                        domain.policy.clone(),
+                    )
+                    .map_err(GuardianProxyError::RestoredModel)?,
+                ),
+            };
+            domains.push(recovered);
+        }
+        if let Some(budget) = budget {
+            budget.checkpoint()?;
+        }
+        self.topology
+            .publish(&self.owner, domains, budget.map(|budget| budget.deadline))
+            .map_err(GuardianProxyError::RestoredModel)
     }
 
     pub fn target_is_current(&self) -> bool {
@@ -6409,6 +6776,138 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV3};
     use wezterm_term::{InertTerminal, Terminal, TerminalConfiguration, TerminalSize};
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_recovered_domain_preserves_command_policy_identity_and_owner() -> anyhow::Result<()>
+    {
+        use mux::domain::{DomainRecoveryPolicy, LocalDomainRecoveryPolicy};
+        use std::ffi::{OsStr, OsString};
+
+        let cwd = std::env::current_dir()?;
+        cwd.read_dir()?;
+        let policy = DomainRecoveryPolicy::GuardianLocal {
+            commands: LocalDomainRecoveryPolicy {
+                default_prog: Some(vec!["/bin/sh".into(), "-l".into()]),
+                default_cwd: Some(cwd.clone()),
+                environment: [("FT_RECOVERED_GUARDIAN_POLICY".into(), "retained".into())].into(),
+                term: "retained-guardian-terminal".into(),
+            },
+            socket_path: cwd.join("retained-guardian.sock"),
+            token_path: cwd.join("retained-guardian.token"),
+        };
+        let mux = Arc::new(Mux::new(None));
+        let domain = GuardianDomain::from_recovery_policy(
+            &mux,
+            917,
+            "restored-guardian".into(),
+            policy.clone(),
+        )?;
+        assert_eq!(domain.domain_id(), 917);
+        assert_eq!(domain.domain_name(), "restored-guardian");
+        assert_eq!(domain.state(), DomainState::Attached);
+        assert_eq!(
+            domain.recovery_policy(&config::ConfigHandle::default_config())?,
+            policy
+        );
+        domain.validate_owner(&mux)?;
+        assert!(domain.validate_owner(&Arc::new(Mux::new(None))).is_err());
+
+        // Exercise the same command builder used by guardian spawn, without
+        // creating a child or pretending this is a live guardian handoff.
+        let command =
+            promise::spawn::block_on(domain.commands.build_command(&mux, None, None, 919))?;
+        assert_eq!(
+            command.get_argv().as_slice(),
+            &[OsString::from("/bin/sh"), OsString::from("-l")]
+        );
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(cwd.as_os_str())
+        );
+        assert_eq!(
+            command.get_env("FT_RECOVERED_GUARDIAN_POLICY"),
+            Some(OsStr::new("retained"))
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(OsStr::new("retained-guardian-terminal"))
+        );
+        assert_eq!(command.get_env("WEZTERM_PANE"), Some(OsStr::new("919")));
+        assert!(mux.iter_panes().is_empty());
+        assert!(domain.state.lock().census.is_none());
+        assert!(domain.state.lock().unadopted_birth.is_none());
+        assert!(domain.state.lock().publication.is_none());
+        assert!(!domain.admission.load(Ordering::Acquire));
+        drop(mux);
+        assert!(domain.owner.upgrade().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_recovered_domain_rejects_invalid_identity_policy_and_endpoints() {
+        use mux::domain::{DomainRecoveryPolicy, LocalDomainRecoveryPolicy};
+
+        let commands = LocalDomainRecoveryPolicy {
+            default_prog: Some(vec!["/bin/sh".into()]),
+            default_cwd: None,
+            environment: Default::default(),
+            term: "xterm".into(),
+        };
+        let policy = DomainRecoveryPolicy::GuardianLocal {
+            commands: commands.clone(),
+            socket_path: PathBuf::from("/private/guardian.sock"),
+            token_path: PathBuf::from("/private/guardian.token"),
+        };
+        let mux = Arc::new(Mux::new(None));
+        for (id, name) in [(usize::MAX, "restored"), (917, ""), (917, "nul\0name")] {
+            assert!(
+                GuardianDomain::from_recovery_policy(&mux, id, name.into(), policy.clone())
+                    .is_err()
+            );
+        }
+        assert!(
+            GuardianDomain::from_recovery_policy(
+                &mux,
+                917,
+                "restored".into(),
+                DomainRecoveryPolicy::Local(commands)
+            )
+            .is_err()
+        );
+        let mut invalid = policy.clone();
+        if let DomainRecoveryPolicy::GuardianLocal { commands, .. } = &mut invalid {
+            commands
+                .environment
+                .insert("invalid=key".into(), "value".into());
+        }
+        assert!(
+            GuardianDomain::from_recovery_policy(&mux, 917, "restored".into(), invalid).is_err()
+        );
+        for invalid_path in [PathBuf::from("relative.sock"), PathBuf::from("/nul\0path")] {
+            for socket in [true, false] {
+                let mut invalid = policy.clone();
+                if let DomainRecoveryPolicy::GuardianLocal {
+                    socket_path,
+                    token_path,
+                    ..
+                } = &mut invalid
+                {
+                    if socket {
+                        *socket_path = invalid_path.clone();
+                    } else {
+                        *token_path = invalid_path.clone();
+                    }
+                }
+                assert!(
+                    GuardianDomain::from_recovery_policy(&mux, 917, "restored".into(), invalid)
+                        .is_err()
+                );
+            }
+        }
+        assert!(mux.iter_panes().is_empty());
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RealBirthFixtureMode {
@@ -8234,6 +8733,44 @@ mod tests {
         };
         assert!(is_child_alive(original_pid));
 
+        // Startup must reject endpoint substitution before Claim or any live
+        // graph mutation, even with an otherwise authenticated recovery root.
+        for wrong_socket in [true, false] {
+            let rejected_target = Arc::new(Mux::new(None));
+            let source = store
+                .select_verified_roots(&verifier)
+                .unwrap()
+                .current
+                .unwrap();
+            let endpoints = if wrong_socket {
+                (directory.join("other-guardian.sock"), token.to_path_buf())
+            } else {
+                (socket.to_path_buf(), directory.join("other-guardian.token"))
+            };
+            let result = restore_authenticated_topology(
+                Arc::clone(&rejected_target),
+                source,
+                Some(endpoints),
+                TerminalCheckpointLimits::default(),
+                &frankenterm_core::cx::Cx::for_testing(),
+                Duration::from_secs(5),
+            );
+            assert_eq!(
+                result
+                    .err()
+                    .expect("substituted endpoint must be refused")
+                    .to_string(),
+                "recovered guardian endpoints differ from independently configured endpoints"
+            );
+            assert!(rejected_target.is_empty());
+            assert!(rejected_target.iter_windows().is_empty());
+            assert!(rejected_target.iter_domains().is_empty());
+            assert!(registration.try_with_current(|_| ()).is_some());
+            assert_eq!(std::fs::read(&births).unwrap(), b"B");
+            assert!(!signaled.exists());
+            assert!(is_child_alive(original_pid));
+        }
+
         // 1. Detach predecessor registration and verify stale predecessor cannot act
         assert!(registration.detach_local_if_current());
         assert!(mux.capture_pane_registration(&pane).is_none());
@@ -8322,22 +8859,7 @@ mod tests {
             );
         }
 
-        // 5. Successor coordinator connection and claim generation 2 on retired lease under successor Mux
-        let successor_domain = Arc::new(
-            GuardianDomain::new(&successor_mux, socket.to_path_buf(), token.to_path_buf()).unwrap(),
-        );
-        assert_eq!(
-            successor_mux_incarnation, successor_domain.mux_incarnation,
-            "derived successor mux incarnation must match guardian domain owner identity"
-        );
-        let registered_successor_domain: Arc<dyn Domain> = successor_domain.clone();
-        successor_mux
-            .add_domain(&registered_successor_domain)
-            .unwrap();
-        successor_mux
-            .set_default_domain(&registered_successor_domain)
-            .unwrap();
-
+        // 5. Claim generation 2 into a still-private, empty successor mux.
         let successor_coordinator = Arc::new(
             GuardianCensusCoordinator::connect(
                 socket,
@@ -8422,38 +8944,10 @@ mod tests {
             staging.selected_checkpoint = Some(exact_selection);
         }
 
-        let successor_pane_id = alloc_pane_id().expect("allocate successor pane id");
-        assert_ne!(
-            successor_pane_id, pane_id,
-            "successor local pane id must be distinct from predecessor local pane id"
-        );
-        let successor_domain_id = registered_successor_domain.domain_id();
-        assert_ne!(
-            successor_domain_id, predecessor_domain_id,
-            "successor domain id must be freshly allocated and distinct from predecessor domain"
-        );
-        let successor_description =
-            format!("recovered guardian pane {}", provenance.original.pane_id);
-        // Match real pane birth: activation requires a storage capability
-        // bound to this successor pane and its preserved durable identity.
-        // TermConfig::new intentionally has no pane-specific spill backend.
-        let successor_term_config: Arc<dyn TerminalConfiguration> =
-            Arc::new(config::TermConfig::new_for_pane(
-                successor_pane_id,
-                successor_domain_id,
-                *provenance.original.pane_id.as_bytes(),
-                successor_description.clone(),
-            ));
-        let activated = staging
-            .restore_and_activate(successor_term_config, TerminalCheckpointLimits::default())
-            .expect("successor restore_and_activate must succeed");
-        let selected = activated
-            .selected_checkpoint
-            .expect("authenticated root selection survives terminal activation");
         let selected_root = SelectedRecoveryRoot::from_validated(&validated);
-        selected
-            .validate_root(selected_root, activated.lease_identity)
-            .expect("activated successor remains bound to the selected authenticated root");
+        exact_selection
+            .validate_root(selected_root, staging.identity())
+            .expect("successor remains bound to the selected authenticated root");
         for control in 0..3 {
             let mut other_root = selected_root;
             match control {
@@ -8463,45 +8957,73 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                selected
-                    .validate_root(other_root, activated.lease_identity)
+                exact_selection
+                    .validate_root(other_root, staging.identity())
                     .is_err(),
                 "same pane and lease must not authorize a different recovery root"
             );
         }
-        let local_pane = activated.into_local_pane(
-            successor_pane_id,
-            successor_domain_id,
-            successor_description,
+        let expected_topology = validated.image().topology.clone();
+        let prepared = PreparedGuardianWholeMuxTopology::prepare(
+            Arc::clone(&successor_mux),
+            validated,
+            vec![staging],
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("prepare the actual claimed guardian cohort and authenticated topology");
+        assert!(successor_mux.is_empty());
+        assert!(successor_mux.iter_windows().is_empty());
+        assert!(successor_mux.get_domain(predecessor_domain_id).is_none());
+        let expected_domains = prepared.topology.captured_domains().to_vec();
+        let restored_publication = prepared
+            .publish()
+            .expect("publish entire recovered mux atomically");
+        assert!(restored_publication.matches_owner(&successor_mux));
+        assert!(!restored_publication.matches_owner(mux));
+        let successor_pane = successor_mux.get_pane(pane_id).expect("preserved pane ID");
+        assert_eq!(successor_pane.pane_id(), pane_id);
+        assert_eq!(successor_pane.domain_id(), predecessor_domain_id);
+        assert_eq!(
+            successor_pane.durable_pane_id(),
+            Some(*provenance.original.pane_id.as_bytes())
         );
-        let unpublished = mux::domain::UnpublishedPane::from_guardian_proxy(local_pane)
-            .expect("local pane converts to unpublished pane");
-        let successor_pane = unpublished
-            .publish(&successor_mux)
-            .expect("successor pane publishes to successor mux");
-        assert_eq!(successor_pane.pane_id(), successor_pane_id);
-        assert_ne!(
-            successor_pane.pane_id(),
-            pane_id,
-            "successor local pane id must be distinct from predecessor local pane id"
+        let registered_successor_domain = successor_mux
+            .get_domain(predecessor_domain_id)
+            .expect("preserved domain ID");
+        assert_eq!(
+            registered_successor_domain.domain_name(),
+            expected_topology.domains[0].domain_name
         );
-        assert_eq!(successor_pane.domain_id(), successor_domain_id);
-
+        let successor_tab = successor_mux
+            .get_tab(expected_topology.windows[0].tabs[0].tab_id)
+            .expect("preserved tab ID");
         let successor_registration = successor_mux
             .capture_pane_registration(&successor_pane)
             .unwrap();
-        let successor_tab = Arc::new(mux::tab::Tab::new(&size));
-        successor_tab.assign_pane(&successor_pane);
-        let bound_successor_registration = successor_mux
-            .add_tab_and_active_pane(&successor_tab)
-            .unwrap()
+        let captured_successor = successor_mux
+            .capture_topology_coherent(Default::default())
             .unwrap();
-        assert!(bound_successor_registration.same_registration(&successor_registration));
-        let successor_window = successor_mux.new_empty_window(None, None);
-        successor_mux
-            .add_tab_to_window(&successor_tab, *successor_window)
-            .unwrap();
-        drop(successor_window);
+        assert_eq!(captured_successor.domains, expected_domains);
+        assert_eq!(
+            captured_successor.default_domain_id,
+            expected_topology
+                .domain_state
+                .as_ref()
+                .unwrap()
+                .default_domain_id
+        );
+        assert_eq!(
+            captured_successor.windows.len(),
+            expected_topology.windows.len()
+        );
+        assert_eq!(
+            captured_successor.windows[0].window_id,
+            expected_topology.windows[0].window_id
+        );
+        assert_eq!(
+            captured_successor.windows[0].ordered_tab_ids,
+            vec![successor_tab.tab_id()]
+        );
 
         assert_eq!(std::fs::read(&births).unwrap(), b"B");
         assert!(!signaled.exists());
@@ -9337,15 +9859,13 @@ mod tests {
 
         assert!(successor_registration.detach_local_if_current());
         drop(successor_registration);
-        drop(bound_successor_registration);
         assert!(successor_mux.remove_tab_local_only_if_same(&successor_tab));
-        assert!(successor_mux.domain_was_detached_if_same(&registered_successor_domain));
+        assert!(successor_mux.domain_was_detached_if_guard(&registered_successor_domain));
         drop(successor_tab);
         drop(successor_pane);
         drop(successor_coordinator);
         drop(successor_observer);
         drop(registered_successor_domain);
-        drop(successor_domain);
         while executor.try_tick().unwrap() {}
 
         let third_request = Uuid::new_v4();
@@ -11056,6 +11576,104 @@ mod tests {
         let descriptor =
             GuardianCheckpointDescriptorV1::for_genesis_artifact(id(0x812), &checkpoint).unwrap();
         (descriptor, checkpoint.into_canonical_payload())
+    }
+
+    #[test]
+    fn guardian_restore_budget_checks_each_page_and_ack_attempt() {
+        struct CancelAfterPage<'a> {
+            inner: FakeReplayTransport,
+            cx: &'a frankenterm_core::cx::Cx,
+            cancel: bool,
+        }
+        impl GuardianReplayTransport for CancelAfterPage<'_> {
+            fn replay(
+                &mut self,
+                request_id: Uuid,
+                request: GuardianReplayRequestV1,
+            ) -> Result<GuardianReplayPageDelivery, GuardianProxyError> {
+                let page = self.inner.replay(request_id, request)?;
+                if self.cancel {
+                    self.cx
+                        .cancel_with(frankenterm_core::outcome::CancelKind::User, None);
+                }
+                Ok(page)
+            }
+            fn replay_ack(
+                &mut self,
+                request_id: Uuid,
+                ack: GuardianReplayAckV1,
+            ) -> Result<GuardianReplayAckReceiptV1, GuardianProxyError> {
+                self.inner.replay_ack(request_id, ack)
+            }
+        }
+        // Transport cancellation is injected at a precise page-return boundary;
+        // this is a unit test of budget enforcement, not a live guardian proof.
+        for mode in 0..3 {
+            let cx = frankenterm_core::cx::Cx::for_testing();
+            let (descriptor, checkpoint) = genesis_checkpoint_fixture();
+            let state = Arc::new(Mutex::new(FakeReplayState {
+                pages: checkpoint_and_complete_pages(descriptor, checkpoint),
+                replay_io_failures: 0,
+                ack_io_failures: 0,
+                requests: Vec::new(),
+                acks: Vec::new(),
+            }));
+            let mut inner = CancelAfterPage {
+                inner: FakeReplayTransport {
+                    state: Arc::clone(&state),
+                },
+                cx: &cx,
+                cancel: mode == 1,
+            };
+            let result = consume_guardian_replay_for_restore(
+                &mut BudgetedGuardianReplayTransport {
+                    inner: &mut inner,
+                    budget: GuardianRestoreBudget {
+                        cx: &cx,
+                        deadline: Instant::now()
+                            + if mode == 2 {
+                                Duration::ZERO
+                            } else {
+                                Duration::from_secs(30)
+                            },
+                    },
+                },
+                identity(),
+                size(24, 80),
+                test_terminal_config(),
+                TerminalCheckpointLimits::default(),
+                None,
+            );
+            let state = state.lock();
+            match mode {
+                0 => {
+                    assert!(result.is_ok());
+                    assert!(state.pages.is_empty());
+                    assert!(!state.acks.is_empty());
+                }
+                1 => {
+                    assert!(matches!(
+                        result,
+                        Err(GuardianProxyError::InvalidConfiguration(
+                            "guardian restore cancelled"
+                        ))
+                    ));
+                    assert_eq!(state.requests.len(), 1);
+                    assert!(state.acks.is_empty());
+                    assert!(!state.pages.is_empty());
+                }
+                _ => {
+                    assert!(matches!(
+                        result,
+                        Err(GuardianProxyError::InvalidConfiguration(
+                            "guardian restore deadline expired"
+                        ))
+                    ));
+                    assert!(state.requests.is_empty());
+                    assert!(state.acks.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
