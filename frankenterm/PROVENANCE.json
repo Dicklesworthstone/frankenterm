@@ -642,20 +642,20 @@
         "docs": 6,
         "feat": 202,
         "fix": 258,
-        "other": 51,
+        "other": 52,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
         "test": 103
       },
-      "fork_side_commit_count": 686,
+      "fork_side_commit_count": 687,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-19T17:35:02-04:00",
-        "sha": "541b7409216233a699d6f794309d3822dda46080",
-        "subject": "fix(recovery): qualify unchanged checkpoint adoptions by capture generation"
+        "classification": "other",
+        "committed_at": "2026-09-19T20:49:53-04:00",
+        "sha": "4f562aa38113907cdca3a01527e1a4b0b3a459d0",
+        "subject": "diagnostics(mux): expose bounded metadata refusal stages"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1064,7 +1064,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2822,
+  "fork_side_commit_total": 2823,
   "generated_at": "2026-09-19T21:41:41.039575Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
