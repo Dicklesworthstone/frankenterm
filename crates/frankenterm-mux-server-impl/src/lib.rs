@@ -107,6 +107,8 @@ std::thread_local! {
     static LIVE_SCROLLBACK_WAL_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_RECORD_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_CHAIN_LINK_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1447,6 +1449,16 @@ struct PreparedAppendWal<'sink> {
     wal: LiveScrollbackAppendWalV1,
 }
 
+/// Fresh construction alone mints this borrow. The chain was computed while
+/// projecting these exact records, and the digest was computed after their
+/// owned copies were installed in this WAL. Holding the borrow prevents record
+/// mutation through the metadata validation boundary; disk reads never mint it.
+struct AppendWalConstructionProof<'wal> {
+    wal: &'wal LiveScrollbackAppendWalV1,
+    record_digest: [u8; 32],
+    chain_tail: [u8; 32],
+}
+
 impl ChecksumVerifiedAppendWal {
     fn verify(wal: LiveScrollbackAppendWalV1) -> anyhow::Result<Self> {
         let checksum =
@@ -1534,6 +1546,8 @@ impl LiveScrollbackAppendWalV1 {
     }
 
     fn records_digest(&self) -> anyhow::Result<[u8; 32]> {
+        #[cfg(test)]
+        LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(|count| count.set(count.get() + 1));
         if self.schema != LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3 {
             return live_scrollback_append_wal_record_digest(&self.encrypted_record);
         }
@@ -1714,6 +1728,8 @@ fn live_scrollback_incremental_chain_next(
     sequence: u64,
     record: &str,
 ) -> anyhow::Result<[u8; 32]> {
+    #[cfg(test)]
+    LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(|count| count.set(count.get() + 1));
     let mut hasher = Sha256::new();
     hasher.update(LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN);
     hasher.update(predecessor);
@@ -3078,8 +3094,22 @@ impl LiveScrollbackSpillSink {
         wal: &LiveScrollbackAppendWalV1,
         durable_pane_id: [u8; 16],
     ) -> anyhow::Result<()> {
+        Self::validate_append_wal_metadata(wal, durable_pane_id, None)
+    }
+
+    fn validate_append_wal_metadata(
+        wal: &LiveScrollbackAppendWalV1,
+        durable_pane_id: [u8; 16],
+        construction: Option<&AppendWalConstructionProof<'_>>,
+    ) -> anyhow::Result<()> {
         #[cfg(test)]
         LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(|count| count.set(count.get() + 1));
+        if let Some(proof) = construction {
+            anyhow::ensure!(
+                std::ptr::eq(proof.wal, wal) && wal.is_incremental(),
+                "append WAL construction proof belongs to another value or schema"
+            );
+        }
         anyhow::ensure!(
             matches!(
                 wal.schema.as_str(),
@@ -3196,19 +3226,27 @@ impl LiveScrollbackSpillSink {
                     })?,
                     "incremental WAL target chain tail",
                 )?;
-                let mut expected_tail = predecessor_tail;
-                for (offset, record) in wal.records().enumerate() {
-                    let sequence = wal
-                        .appended_sequence
-                        .checked_add(u64::try_from(offset)?)
-                        .ok_or_else(|| anyhow::anyhow!("append WAL batch sequence overflows"))?;
-                    expected_tail = live_scrollback_incremental_chain_next(
-                        expected_tail,
-                        wal.ledger_pane_id,
-                        sequence,
-                        record,
-                    )?;
-                }
+                let expected_tail = match construction {
+                    Some(proof) => proof.chain_tail,
+                    None => {
+                        let mut tail = predecessor_tail;
+                        for (offset, record) in wal.records().enumerate() {
+                            let sequence = wal
+                                .appended_sequence
+                                .checked_add(u64::try_from(offset)?)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("append WAL batch sequence overflows")
+                                })?;
+                            tail = live_scrollback_incremental_chain_next(
+                                tail,
+                                wal.ledger_pane_id,
+                                sequence,
+                                record,
+                            )?;
+                        }
+                        tail
+                    }
+                };
                 anyhow::ensure!(
                     expected_tail == target_tail
                         && (wal.evicted_record_count != Some(0)
@@ -3218,8 +3256,12 @@ impl LiveScrollbackSpillSink {
             }
             _ => unreachable!("schema checked above"),
         }
+        let expected_digest = match construction {
+            Some(proof) => proof.record_digest,
+            None => wal.records_digest()?,
+        };
         anyhow::ensure!(
-            wal.records_digest()? == record_digest,
+            expected_digest == record_digest,
             "append WAL encrypted-record digest mismatch"
         );
         anyhow::ensure!(
@@ -3922,12 +3964,21 @@ impl LiveScrollbackSpillSink {
             guardian_authentication: None,
             wal_sha256: String::new(),
         };
-        wal.encrypted_record_sha256 = hex::encode(wal.records_digest()?);
+        let record_digest = wal.records_digest()?;
+        wal.encrypted_record_sha256 = hex::encode(record_digest);
         // Authentication is intentionally absent until every other canonical
         // field is frozen. Validate the non-auth fields with a private marker,
         // then remove it before sealing the canonical authentication bytes.
         wal.guardian_authentication = Some("pending".to_string());
-        Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
+        Self::validate_append_wal_metadata(
+            &wal,
+            self.durable_pane_id,
+            Some(&AppendWalConstructionProof {
+                wal: &wal,
+                record_digest,
+                chain_tail: target_authority.chain_tail,
+            }),
+        )?;
         wal.guardian_authentication = None;
         let canonical = Self::append_wal_authentication_bytes(&wal)?;
         let cipher = {
@@ -11294,6 +11345,20 @@ mod tests {
         line: &Line,
         max_retained_rows: usize,
     ) -> (PreparedAppendWal<'sink>, LiveScrollbackSpillState) {
+        prepare_later_batch_owned_append_wal_for_test(
+            sink,
+            stable_row,
+            std::slice::from_ref(line),
+            max_retained_rows,
+        )
+    }
+
+    fn prepare_later_batch_owned_append_wal_for_test<'sink>(
+        sink: &'sink LiveScrollbackSpillSink,
+        stable_row: wezterm_term::StableRowIndex,
+        lines: &[Line],
+        max_retained_rows: usize,
+    ) -> (PreparedAppendWal<'sink>, LiveScrollbackSpillState) {
         let previous_state = *sink
             .lock_state("prepare test append WAL predecessor")
             .expect("lock test append WAL predecessor state");
@@ -11313,27 +11378,34 @@ mod tests {
         proposed_state.clear_manifest_published = false;
         proposed_state.newest_stable_row_exclusive = Some(
             stable_row
-                .checked_add(1)
+                .checked_add(isize::try_from(lines.len()).unwrap())
                 .expect("test append WAL stable-row endpoint fits"),
         );
         proposed_state.max_retained_rows = max_retained_rows;
-        let row_identity = mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
-            sink.durable_pane_id,
-            proposed_state.content_epoch,
-            proposed_state.revision,
-            i64::try_from(stable_row).expect("test stable row fits i64"),
-            desired_sequence,
-        )
-        .expect("construct test append WAL row identity");
-        let record = {
+        let records: Vec<_> = {
             let mut keyring = sink
                 .lock_keyring("prepare test append WAL row")
                 .expect("lock test append WAL keyring");
             let cipher = keyring
                 .latest_active_cipher()
                 .expect("load test append WAL key");
-            encode_exact_scrollback_line_record(line, &cipher, row_identity)
-                .expect("seal test append WAL row")
+            lines
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| {
+                    let row_identity =
+                        mux::guardian_output_journal::GuardianScrollbackRowIdentity::new(
+                            sink.durable_pane_id,
+                            proposed_state.content_epoch,
+                            proposed_state.revision,
+                            i64::try_from(stable_row).unwrap() + i64::try_from(offset).unwrap(),
+                            desired_sequence + u64::try_from(offset).unwrap(),
+                        )
+                        .expect("construct test append WAL row identity");
+                    encode_exact_scrollback_line_record(line, &cipher, row_identity)
+                        .expect("seal test append WAL row")
+                })
+                .collect()
         };
         let predecessor_manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
             .expect("read test append WAL predecessor")
@@ -11350,7 +11422,7 @@ mod tests {
                 stable_row,
                 desired_sequence,
                 max_retained_rows,
-                std::slice::from_ref(&record),
+                &records,
                 &store,
             )
             .expect("prepare authenticated test append WAL");
@@ -11918,6 +11990,109 @@ mod tests {
         overwrite_private_append_wal_fixture(&path, &wal);
         sink.advance_authenticated_append_wal_supersession()
             .unwrap();
+    }
+
+    #[test]
+    fn append_wal_construction_hashes_each_record_only_once_per_transcript() {
+        for (rows, retained, evicted) in [(1, 8, 0), (3, 8, 0), (3, 3, 1)] {
+            let (_dir, _context, sink, _wal, line) = append_wal_fixture(195, retained);
+            let lines = vec![line; rows];
+            let digests = LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(std::cell::Cell::get);
+            let chains = LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(std::cell::Cell::get);
+            let (prepared, _) =
+                prepare_later_batch_owned_append_wal_for_test(&sink, 11, &lines, retained);
+            assert_eq!(prepared.wal.records().count(), rows);
+            assert_eq!(prepared.wal.evicted_record_count, Some(evicted as u64));
+            assert_eq!(
+                LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(std::cell::Cell::get),
+                digests + 1,
+                "fresh construction hashes its exact record batch once"
+            );
+            assert_eq!(
+                LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(std::cell::Cell::get),
+                chains + rows + evicted,
+                "construction hashes each new row once and preserves necessary eviction hashes"
+            );
+            LiveScrollbackSpillSink::validate_append_wal_identity(
+                &prepared.wal,
+                sink.durable_pane_id,
+            )
+            .unwrap();
+            assert_eq!(
+                LIVE_SCROLLBACK_WAL_RECORD_DIGESTS.with(std::cell::Cell::get),
+                digests + 2,
+                "raw validation independently rehashes the record batch"
+            );
+            assert_eq!(
+                LIVE_SCROLLBACK_CHAIN_LINK_HASHES.with(std::cell::Cell::get),
+                chains + 2 * rows + evicted,
+                "raw validation independently rehashes the chain"
+            );
+        }
+    }
+
+    #[test]
+    fn append_wal_construction_proof_cannot_authorize_copied_or_tampered_wal() {
+        let (_dir, _context, sink, wal, _line) = append_wal_fixture(196, 8);
+        let proof = AppendWalConstructionProof {
+            wal: &wal,
+            record_digest: wal.records_digest().unwrap(),
+            chain_tail: decode_live_scrollback_canonical_digest(
+                wal.target_chain_tail_sha256.as_deref().unwrap(),
+                "test target tail",
+            )
+            .unwrap(),
+        };
+        LiveScrollbackSpillSink::validate_append_wal_metadata(
+            &wal,
+            sink.durable_pane_id,
+            Some(&proof),
+        )
+        .unwrap();
+        let mut copy = wal.clone();
+        assert!(
+            LiveScrollbackSpillSink::validate_append_wal_metadata(
+                &copy,
+                sink.durable_pane_id,
+                Some(&proof),
+            )
+            .is_err(),
+            "an identical separately owned WAL is not the construction borrow"
+        );
+
+        for mutation in 0..4 {
+            copy = wal.clone();
+            match mutation {
+                0 => {
+                    // Keep framing and byte count; invalidate exact ciphertext.
+                    let at = copy.encrypted_record.len() - 5;
+                    let replacement = if &copy.encrypted_record[at..at + 1] == "A" {
+                        "B"
+                    } else {
+                        "A"
+                    };
+                    copy.encrypted_record.replace_range(at..at + 1, replacement);
+                }
+                1 => copy.encrypted_record_sha256 = hex::encode([0x55; 32]),
+                2 => copy.target_chain_tail_sha256 = Some(hex::encode([0x55; 32])),
+                3 => copy.target_next_sequence += 1,
+                _ => unreachable!(),
+            }
+            // Even a correctly recomputed outer checksum cannot replace raw
+            // record, chain and metadata validation after a disk read.
+            copy.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&copy).unwrap();
+            let verified = ChecksumVerifiedAppendWal::verify(copy.clone()).unwrap();
+            assert!(
+                sink.validate_verified_append_wal_identity(&verified)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            let refusal = sink.persist_authenticated_append_wal(&copy).unwrap_err();
+            assert!(
+                !refusal.outcome_indeterminate(),
+                "mutation {mutation} must fail before publication"
+            );
+        }
     }
 
     #[test]
