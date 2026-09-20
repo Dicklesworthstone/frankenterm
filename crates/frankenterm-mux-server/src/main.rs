@@ -130,6 +130,9 @@ fn remove_process_env_for_mux_server_startup(name: &str) {
     trailing_var_arg = true,
 )]
 struct Opt {
+    #[command(flatten)]
+    recovery: frankenterm_mux_server_impl::recovery_runtime::RecoveryOptions,
+
     /// Skip loading wezterm.lua
     #[arg(long, short = 'n')]
     skip_config: bool,
@@ -356,6 +359,10 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     };
 
     #[cfg(unix)]
+    let recovery_custody = opts.guardian_token_path.clone();
+    #[cfg(not(unix))]
+    let recovery_custody = None;
+    #[cfg(unix)]
     let guardian_paths = opts.guardian_socket_path.zip(opts.guardian_token_path);
     #[cfg(not(unix))]
     let guardian_paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
@@ -378,6 +385,12 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
         }
     };
     Mux::set_mux(&mux);
+
+    let mut recovery = frankenterm_mux_server_impl::recovery_runtime::PeriodicRecovery::new(
+        opts.recovery,
+        Arc::clone(&mux),
+        recovery_custody,
+    )?;
 
     let executor = promise::spawn::SimpleExecutor::with_io_runtime()
         .context("initialize headless mux I/O reactor")?;
@@ -408,11 +421,14 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
             "main-thread scheduler rejected mandatory mux-server startup before task construction: {rejected:?}"
         ),
     };
+    let startup_complete = Arc::new(AtomicBool::new(false));
+    let startup_ready = Arc::clone(&startup_complete);
     startup_reservation
         .spawn_local(async move {
             if let Err(err) = async_run(cmd).await {
                 terminate_with_error(err);
             }
+            startup_ready.store(true, Ordering::Release);
             drop(activity);
         })
         .detach();
@@ -422,8 +438,27 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     // every later domain-config reload.
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
-    while !shutdown_requested() {
-        executor.tick()?;
+    let mut executor_error = None;
+    loop {
+        let stopping = shutdown_requested() || executor_error.is_some();
+        if let Some(recovery) = recovery.as_mut() {
+            if stopping {
+                recovery.request_shutdown();
+            }
+            recovery.poll(startup_complete.load(Ordering::Acquire));
+        }
+        if stopping
+            && recovery
+                .as_ref()
+                .is_none_or(|recovery| recovery.is_settled())
+        {
+            break;
+        }
+        // A parser capture may need main-thread work to finish. Continue
+        // ticking after cancellation until the owned blocking task settles.
+        if let Err(error) = executor.tick() {
+            executor_error = Some(error);
+        }
     }
 
     // [ft-gqbpk] Graceful shutdown path. `run()` returns Ok(()) here
@@ -432,7 +467,10 @@ fn run(generation_lifetime: &mut Option<GenerationLifetimeLease>) -> anyhow::Res
     // lets PTY/domain Drop implementations run.
     log::info!("frankenterm-mux-server: shutdown signal received, flushing pending state");
     Mux::shutdown();
-    Ok(())
+    match executor_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
@@ -816,6 +854,7 @@ fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
             DispatchIoBackendArg::Poll => "poll",
         }),
     ];
+    args.extend(opts.recovery.child_args());
     if opts.skip_config {
         args.push(OsString::from("-n"));
     }
@@ -910,6 +949,7 @@ mod tests {
 
     fn make_opt() -> Opt {
         Opt {
+            recovery: Default::default(),
             skip_config: false,
             config_file: None,
             config_override: Vec::new(),
@@ -922,6 +962,46 @@ mod tests {
             cwd: None,
             prog: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_recovery_cli_requires_authority_and_survives_daemon_forwarding() {
+        assert!(Opt::try_parse_from(["mux", "--recovery-store", "/private/store"]).is_err());
+        let identity = "51".repeat(32);
+        let original = Opt::try_parse_from([
+            "mux",
+            "--daemonize=true",
+            "--recovery-store",
+            "/private/store",
+            "--recovery-enrollment",
+            "/private/enrollment",
+            "--recovery-kek",
+            "/private/key",
+            "--recovery-namespace",
+            &identity,
+            "--recovery-policy",
+            &identity,
+            "--recovery-root-id",
+            &identity,
+            "--recovery-session",
+            "test-session",
+            "--recovery-interval-seconds",
+            "7",
+            "--recovery-rpo-seconds",
+            "20",
+            "--recovery-timeout-seconds",
+            "3",
+            "--",
+            "sh",
+        ])
+        .unwrap();
+        let forwarded = daemonized_child_args(&original);
+        let child =
+            Opt::try_parse_from(std::iter::once(OsString::from("mux")).chain(forwarded)).unwrap();
+        assert_eq!(child.recovery.child_args(), original.recovery.child_args());
+        assert_eq!(child.prog, original.prog);
+        assert!(!child.daemonize);
     }
 
     #[cfg(unix)]

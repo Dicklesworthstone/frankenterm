@@ -22,6 +22,7 @@ pub mod guardian_output_keys;
 pub mod guardian_proxy;
 pub mod local;
 pub mod pki;
+pub mod recovery_runtime;
 pub mod sessionhandler;
 
 #[cfg(test)]

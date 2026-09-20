@@ -1015,6 +1015,71 @@ pub struct SnapshotPublicationStore {
 }
 
 impl SnapshotPublicationStore {
+    /// Pin an already prepared store without creating, repairing or syncing
+    /// anything. Missing components fail closed; an empty prepared store is
+    /// valid and may subsequently receive its first authenticated generation.
+    pub fn open_existing(
+        root_path: impl Into<PathBuf>,
+        limits: PublicationLimits,
+    ) -> Result<Self, PublicationError> {
+        if limits.max_store_bytes < STORE_QUOTA_BYTES as u64 || limits.max_store_entries < 5 {
+            return Err(PublicationError::StoreQuotaPolicy);
+        }
+        let root_path = root_path.into();
+        let mut anchor = PathBuf::new();
+        for component in root_path.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    anchor.push(component.as_os_str())
+                }
+                _ => break,
+            }
+        }
+        if anchor.as_os_str().is_empty() {
+            anchor.push(".");
+        }
+        let mut directory = Dir::open_ambient_dir(&anchor, cap_std::ambient_authority())
+            .map_err(|error| PublicationError::io(&root_path, error))?;
+        for component in root_path.components() {
+            match component {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => {
+                    directory = directory
+                        .open_dir_nofollow(name)
+                        .map_err(|error| PublicationError::io(&root_path, error))?;
+                }
+                _ => {
+                    return Err(PublicationError::InsecurePermissions {
+                        path: root_path.clone(),
+                        reason: "existing store path has an unsupported component".to_string(),
+                    });
+                }
+            }
+        }
+        verify_directory_security(&directory, &root_path)?;
+        let child = |name: &str| {
+            let path = root_path.join(name);
+            let child = directory
+                .open_dir_nofollow(name)
+                .map_err(|error| PublicationError::io(&path, error))?;
+            verify_directory_security(&child, &path)?;
+            Ok::<_, PublicationError>(child)
+        };
+        let objects_dir = child(OBJECTS_DIR_NAME)?;
+        let roots_dir = child(ROOTS_DIR_NAME)?;
+        let generations_dir = child(GENERATIONS_DIR_NAME)?;
+        Ok(Self {
+            root_path,
+            root_dir: directory,
+            objects_dir,
+            roots_dir,
+            generations_dir,
+            limits,
+        })
+    }
+
     /// Opens or initializes a snapshot publication store at the designated root path.
     ///
     /// # Security & Symlink Invariants
@@ -4076,6 +4141,44 @@ mod tests {
             Err(PublicationError::Io { .. })
         ));
         assert!(store.publish_object(&object).unwrap().was_already_present);
+    }
+
+    #[test]
+    fn existing_store_open_never_creates_missing_authority() {
+        let temp = private_test_directory();
+        let absent = temp.path().join("absent");
+        assert!(
+            SnapshotPublicationStore::open_existing(&absent, PublicationLimits::default()).is_err()
+        );
+        assert!(!absent.exists());
+        let store_path = temp.path().join("prepared");
+        SnapshotPublicationStore::open(&store_path, PublicationLimits::default()).unwrap();
+        let reopened =
+            SnapshotPublicationStore::open_existing(&store_path, PublicationLimits::default())
+                .unwrap();
+        assert!(reopened.inspect_root_candidates().unwrap().0.is_empty());
+        drop(reopened);
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&store_path, &alias).unwrap();
+            assert!(
+                SnapshotPublicationStore::open_existing(alias, PublicationLimits::default())
+                    .is_err()
+            );
+        }
+        let objects = store_path.join(OBJECTS_DIR_NAME);
+        let retained = temp.path().join("retained-objects");
+        std::fs::rename(&objects, &retained).unwrap();
+        assert!(
+            SnapshotPublicationStore::open_existing(&store_path, PublicationLimits::default())
+                .is_err()
+        );
+        assert!(
+            !objects.exists(),
+            "opening must not repair a missing directory"
+        );
+        assert!(retained.is_dir());
     }
 
     #[test]

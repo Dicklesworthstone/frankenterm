@@ -4412,6 +4412,7 @@ dependencies = [
  "base64 0.23.1",
  "cap-fs-ext",
  "cap-std",
+ "clap",
  "codec",
  "config",
  "criterion",
