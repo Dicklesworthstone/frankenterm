@@ -2418,14 +2418,6 @@ impl LineWrapGeometry {
         self.trimmed_tokens = self.widths.len();
     }
 
-    /// Preserve separators on text-bearing terminal lines while retaining the
-    /// single-row representation of an entirely blank screen row.
-    pub fn preserve_terminal_trailing_spaces(&mut self) {
-        if self.trimmed_tokens != 0 {
-            self.preserve_trailing_spaces();
-        }
-    }
-
     /// Owned allocation plus the inline representation; an external Arc header
     /// and collection slots must be charged separately by their owner.
     pub fn retained_bytes(&self) -> usize {
