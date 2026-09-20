@@ -11634,7 +11634,7 @@ mod tests {
         let other = LiveScrollbackSpillSink::new(other_dir.path().to_path_buf(), &context).unwrap();
         let error = other.persist_prepared_append_wal(&prepared).unwrap_err();
         assert!(!error.outcome_indeterminate());
-        assert!(format!("{error:#}").contains("another sink"));
+        assert!(format!("{:#}", error.source).contains("another sink"));
         assert!(
             !LiveScrollbackSpillSink::append_wal_stage_path(&other.manifest_path)
                 .unwrap()
@@ -11666,7 +11666,7 @@ mod tests {
         }
         let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
         assert!(!error.outcome_indeterminate());
-        assert!(format!("{error:#}").contains("append WAL guardian key"));
+        assert!(format!("{:#}", error.source).contains("append WAL guardian key"));
         let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
         assert!(
             LiveScrollbackSpillSink::read_append_wal(&active)
