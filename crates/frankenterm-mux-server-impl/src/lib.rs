@@ -3919,12 +3919,16 @@ impl LiveScrollbackSpillSink {
         Self::validate_append_wal_identity(&wal, self.durable_pane_id)?;
         wal.guardian_authentication = None;
         let canonical = Self::append_wal_authentication_bytes(&wal)?;
-        let mut keyring = self
-            .lock_keyring("prepare append WAL authentication")
-            .map_err(anyhow::Error::new)?;
-        let cipher = keyring
-            .latest_active_cipher()
-            .context("load guardian append-WAL authentication key")?;
+        let cipher = {
+            let mut keyring = self
+                .lock_keyring("prepare append WAL authentication")
+                .map_err(anyhow::Error::new)?;
+            keyring
+                .latest_active_cipher()
+                .context("load guardian append-WAL authentication key")?
+        };
+        // The cipher owns its key. Do not serialize other panes behind payload
+        // hashing; publication independently authenticates the historical key.
         wal.guardian_authentication = Some(
             cipher
                 .authenticate_scrollback_append_wal(&canonical)
@@ -4214,20 +4218,20 @@ impl LiveScrollbackSpillSink {
         Self::validate_append_wal_identity(&advanced, self.durable_pane_id)?;
         advanced.guardian_authentication = None;
         let canonical = Self::append_wal_authentication_bytes(&advanced)?;
-        {
+        let cipher = {
             let mut keyring = self
                 .lock_keyring("seal append WAL supersession")
                 .map_err(anyhow::Error::new)?;
-            let cipher = keyring
+            keyring
                 .latest_active_cipher()
-                .context("load guardian key for append WAL supersession")?;
-            advanced.guardian_authentication = Some(
-                cipher
-                    .authenticate_scrollback_append_wal(&canonical)
-                    .context("authenticate append WAL supersession")?
-                    .encode(),
-            );
-        }
+                .context("load guardian key for append WAL supersession")?
+        };
+        advanced.guardian_authentication = Some(
+            cipher
+                .authenticate_scrollback_append_wal(&canonical)
+                .context("authenticate append WAL supersession")?
+                .encode(),
+        );
         // Only the authentication marker changed since pre-seal validation;
         // keep the full independent validation at the publication boundary.
         advanced.wal_sha256 = Self::append_wal_checksum(&advanced)?;
