@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 204,
-        "fix": 267,
+        "fix": 268,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 106
       },
-      "fork_side_commit_count": 703,
+      "fork_side_commit_count": 704,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "feat",
-        "committed_at": "2026-09-20T09:20:20-04:00",
-        "sha": "bb6780adefdc933098f6175347aa251473f29b77",
-        "subject": "feat(recovery): retain domain policy in authenticated private topology construction"
+        "classification": "fix",
+        "committed_at": "2026-09-20T16:02:30-04:00",
+        "sha": "b61559b5985935002d311a5dfd17fb3bc9d06564",
+        "subject": "fix(mux): downcast the borrowed PTY trait object during recovery capture"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2865,
-  "generated_at": "2026-09-20T13:20:20Z",
+  "fork_side_commit_total": 2866,
+  "generated_at": "2026-09-20T20:02:39.913192Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
