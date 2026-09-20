@@ -669,6 +669,15 @@ pub struct ColdSeamReflow {
     replacement: Option<(Arc<ColdRowFragments>, Vec<Line>)>,
     source: Option<Range<StableRowIndex>>,
     retired_layout: Option<Arc<ColdVisualLayout>>,
+    pub(crate) cursor: Option<ColdSeamCursor>,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+pub(crate) struct ColdSeamCursor {
+    pub before: CursorPosition,
+    pub physical_row: usize,
+    pub after: Option<(usize, usize, bool)>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -843,6 +852,24 @@ impl ColdSeamReflow {
         if rows.is_empty() {
             return Ok(self);
         }
+        let cursor_offset = if let Some(cursor) = &self.cursor {
+            anyhow::ensure!(
+                cursor.physical_row < self.resident.len(),
+                "cold seam cursor outside source"
+            );
+            let prefix = rows
+                .iter()
+                .chain(&self.resident[..cursor.physical_row])
+                .try_fold(0usize, |sum, line| sum.checked_add(line.len()))
+                .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?;
+            Some(
+                prefix
+                    .checked_add(cursor.before.x)
+                    .ok_or_else(|| anyhow::anyhow!("cold seam cursor offset overflow"))?,
+            )
+        } else {
+            None
+        };
         let load_elapsed = profile_start.map(|start| start.elapsed());
         let mut logical: Option<Line> = None;
         let mut cells = 0usize;
@@ -883,6 +910,41 @@ impl ColdSeamReflow {
             wrapped.len() >= self.resident.len() && wrapped.len() <= ScreenLineRead::MAX_ROWS,
             "cold seam resident geometry unavailable"
         );
+        if let Some(mut remaining) = cursor_offset {
+            let resident_start = wrapped.len() - self.resident.len();
+            let mut mapped = None;
+            for (row, line) in wrapped.iter().enumerate() {
+                if remaining < line.len() || row + 1 == wrapped.len() {
+                    // An insertion point just past a full final row is the
+                    // terminal's delayed-wrap state, not an out-of-range
+                    // cursor or permission to overwrite its final grapheme.
+                    let pending_wrap = remaining == self.witness.cols
+                        && remaining == line.len()
+                        && row + 1 == wrapped.len();
+                    let column = if pending_wrap {
+                        line.visible_cells()
+                            .last()
+                            .map(|cell| cell.cell_index())
+                            .unwrap_or(remaining)
+                    } else {
+                        remaining
+                    };
+                    mapped = row
+                        .checked_sub(resident_start)
+                        .map(|row| (column, row, pending_wrap));
+                    break;
+                }
+                remaining -= line.len();
+            }
+            anyhow::ensure!(
+                mapped.is_some_and(|(column, _, _)| column < self.witness.cols),
+                "cold seam cursor cannot remain resident: mapped={mapped:?} cols={} offset={cursor_offset:?} rows={} resident={}",
+                self.witness.cols, wrapped.len(), self.resident.len()
+            );
+            if let Some(cursor) = &mut self.cursor {
+                cursor.after = mapped;
+            }
+        }
         for line in &mut wrapped {
             let _ = line.cells_mut_for_attr_changes_only();
             serde_json::to_writer(&mut charge, line)?;
@@ -3770,6 +3832,7 @@ impl Screen {
             replacement: None,
             source: None,
             retired_layout: None,
+            cursor: None,
         }))
     }
 
@@ -12501,6 +12564,113 @@ pub(crate) mod tests {
         assert!(
             visible_seams > 0,
             "exercise a seam inside the visible screen"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn active_cursor_cold_paragraph_remains_readable_after_resize() {
+        for (columns, suffix) in [(13, "TAIL"), (17, "TAIL"), (31, "TAIL"), (13, "TAIL界")] {
+            assert_active_cursor_cold_paragraph_after_resize(columns, suffix);
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn assert_active_cursor_cold_paragraph_after_resize(columns: usize, suffix: &str) {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(4, 20, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 10_000,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "active-cold-paragraph-test",
+            Box::new(std::io::sink()),
+        );
+        let original = format!("{}{suffix}", "0123456789 ab 界 e\u{301} 🚀 ".repeat(40));
+        terminal.advance_bytes(original.as_bytes());
+        terminal.resize(test_size(4, columns, 96));
+        let mut stale = terminal
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("capture before cursor movement")
+            .hydrate(|| false)
+            .unwrap();
+        let before = terminal.cursor_pos();
+        assert!(before.y > 0);
+        // Vertical movement preserves the virtual column just beyond the
+        // right edge; horizontal movement intentionally clamps that column.
+        terminal.advance_bytes(b"\x1b[A");
+        let sequence = terminal.current_seqno() + 1;
+        assert!(!terminal
+            .install_cold_seam_reflow(&mut stale, sequence)
+            .unwrap());
+        terminal.advance_bytes(b"\x1b[B");
+        assert_eq!(terminal.cursor_pos().x, before.x);
+        assert_eq!(terminal.cursor_pos().y, before.y);
+        let sequence = terminal.current_seqno() + 1;
+        assert!(
+            !terminal
+                .install_cold_seam_reflow(&mut stale, sequence)
+                .unwrap(),
+            "returning to the same coordinates must not revive stale cursor authority"
+        );
+        let mut seam = terminal
+            .capture_cold_seam_reflow()
+            .unwrap()
+            .expect("capture the active paragraph")
+            .hydrate(|| false)
+            .unwrap();
+        let sequence = terminal.current_seqno() + 1;
+        assert!(terminal
+            .install_cold_seam_reflow(&mut seam, sequence)
+            .unwrap());
+        terminal.increment_seqno();
+        let screen = terminal.screen();
+        let frontier = screen.phys_to_stable_row_index(0);
+        assert!(frontier > 4, "fixture must retain cold history");
+        let read = screen
+            .capture_line_read(frontier - 2..frontier + 2)
+            .unwrap()
+            .hydrate(|| false)
+            .expect("active paragraph history must remain readable");
+        assert_eq!(read.row_count(), 4);
+        let visible: String = read.lines().map(|line| line.as_str()).collect();
+        assert!(!visible.is_empty());
+        assert!(original.contains(&visible));
+        assert!(screen.validates_line_read(&read));
+        terminal.advance_bytes(b"!");
+        let mut layout = terminal
+            .screen()
+            .capture_line_read(0..1)
+            .unwrap()
+            .prepare_cold_layout(|| false)
+            .unwrap();
+        let sequence = terminal.current_seqno();
+        assert!(terminal
+            .screen_mut()
+            .install_prepared_cold_layout(&mut layout, sequence)
+            .unwrap());
+        let screen = terminal.screen();
+        let start = screen.scrollback_top_stable_row();
+        let end = screen.phys_to_stable_row_index(screen.lines.len());
+        let all = screen
+            .capture_line_read(start..end)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let actual: String = all.lines().map(|line| line.as_str()).collect();
+        assert_eq!(
+            actual,
+            format!("{original}!"),
+            "typing must continue at the original text offset"
         );
     }
 

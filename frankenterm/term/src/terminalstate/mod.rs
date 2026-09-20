@@ -1059,15 +1059,32 @@ impl TerminalState {
         })
     }
 
-    /// Prepare the cold/resident paragraph, including completed visible rows
-    /// strictly before both active and saved cursors. Neither cursor's row
-    /// may be rewritten without remapping its position.
+    /// Prefer completed rows before both cursors. An active paragraph may
+    /// include the cursor only with an explicit logical-offset mapping and
+    /// exact cursor validation at commit. Saved cursors and pending autowrap
+    /// currently retain the completed-row-only path.
     #[cfg(feature = "use_serde")]
     pub fn capture_cold_seam_reflow(
         &self,
     ) -> anyhow::Result<Option<crate::screen::ColdSeamReflow>> {
-        self.screen
-            .capture_cold_seam_reflow_before(self.cold_seam_resident_end())
+        let completed = self
+            .screen
+            .capture_cold_seam_reflow_before(self.cold_seam_resident_end())?;
+        if completed.is_some() || self.wrap_next || self.screen.saved_cursor.is_some() {
+            return Ok(completed);
+        }
+        let physical_row = self.screen.phys_row(self.cursor.y);
+        let mut active = self
+            .screen
+            .capture_cold_seam_reflow_before(physical_row.saturating_add(1))?;
+        if let Some(seam) = &mut active {
+            seam.cursor = Some(crate::screen::ColdSeamCursor {
+                before: self.cursor,
+                physical_row,
+                after: None,
+            });
+        }
+        Ok(active)
     }
 
     /// Recheck cursor authority after off-lock preparation. Moving or saving
@@ -1078,9 +1095,43 @@ impl TerminalState {
         prepared: &mut crate::screen::ColdSeamReflow,
         seqno: SequenceNo,
     ) -> anyhow::Result<bool> {
-        let resident_end = self.cold_seam_resident_end();
-        self.screen
-            .install_cold_seam_reflow_before(prepared, seqno, resident_end)
+        let mut resident_end = self.cold_seam_resident_end();
+        let mapped_cursor = if let Some(cursor) = &prepared.cursor {
+            if self.wrap_next
+                || self.screen.saved_cursor.is_some()
+                || self.cursor.x != cursor.before.x
+                || self.cursor.y != cursor.before.y
+                || self.cursor.seqno != cursor.before.seqno
+            {
+                return Ok(false);
+            }
+            let Some((column, row, pending_wrap)) = cursor.after else {
+                return Ok(false);
+            };
+            let visible_start = self.screen.phys_row(0);
+            if row < visible_start
+                || column >= self.screen.physical_cols
+                || (pending_wrap && !self.dec_auto_wrap)
+            {
+                return Ok(false);
+            }
+            resident_end = self.screen.phys_row(self.cursor.y).saturating_add(1);
+            Some((column, (row - visible_start) as i64, pending_wrap))
+        } else {
+            None
+        };
+        let installed =
+            self.screen
+                .install_cold_seam_reflow_before(prepared, seqno, resident_end)?;
+        if installed {
+            if let Some((column, row, pending_wrap)) = mapped_cursor {
+                self.cursor.x = column;
+                self.cursor.y = row;
+                self.cursor.seqno = seqno;
+                self.wrap_next = pending_wrap;
+            }
+        }
+        Ok(installed)
     }
 
     /// Parser-side maintenance of the primary screen, including while the
