@@ -4249,7 +4249,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn store_preparation_rejects_symlink_ancestors_without_mutating_targets() {
-        use std::os::unix::fs::DirBuilderExt as _;
+        use std::os::unix::fs::{DirBuilderExt as _, symlink};
         let temp = private_test_directory();
         let real = temp.path().join("real");
         let nested = real.join("nested");
@@ -4258,7 +4258,7 @@ mod tests {
             std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
         }
         let alias = temp.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        symlink(&real, &alias).unwrap();
         // The parent itself is not a symlink. Ambient prefix resolution used
         // to pass both paths and initialize the directory behind the alias.
         for leaf in ["existing", "missing"] {
