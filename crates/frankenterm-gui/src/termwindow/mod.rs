@@ -10875,7 +10875,8 @@ mod tests {
             })
             .unwrap();
         // The immutable tab-handle slice alone exceeds the old 4 KiB charge.
-        for _ in 0..513 {
+        let tab_count = 4096 / std::mem::size_of::<Arc<mux::tab::Tab>>() + 1;
+        for _ in 0..tab_count {
             let tab = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize::default()));
             owner.add_tab_no_panes(&tab).unwrap();
             owner.add_tab_to_window(&tab, window_id).unwrap();
@@ -10886,7 +10887,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(change.windows().len(), 1);
-        assert_eq!(change.windows()[0].ordered_tabs().len(), 513);
+        assert_eq!(change.windows()[0].ordered_tabs().len(), tab_count);
         assert_eq!(change.attached_tabs().len(), 1);
         assert!(super::TermWindow::mux_notification_targets_window(
             &notification,
