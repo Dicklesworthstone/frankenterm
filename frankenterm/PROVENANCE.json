@@ -640,22 +640,22 @@
         "cleanup": 3,
         "cosmetic": 30,
         "docs": 6,
-        "feat": 204,
-        "fix": 268,
+        "feat": 206,
+        "fix": 269,
         "other": 54,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 106
+        "test": 107
       },
-      "fork_side_commit_count": 704,
+      "fork_side_commit_count": 708,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T16:02:30-04:00",
-        "sha": "b61559b5985935002d311a5dfd17fb3bc9d06564",
-        "subject": "fix(mux): downcast the borrowed PTY trait object during recovery capture"
+        "committed_at": "2026-09-20T16:53:54-04:00",
+        "sha": "21ca88741000a6ba25320b01d5ceaa30e2bb0b16",
+        "subject": "fix(render): preserve cold scrollback viewport identity across reflow"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 58,
-        "fix": 132,
+        "fix": 133,
         "other": 60,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 70
       },
-      "fork_side_commit_count": 354,
+      "fork_side_commit_count": 355,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T05:55:58-04:00",
-        "sha": "124e9263fc715de4dce6bd1e2c0a8ba570e73e93",
-        "subject": "fix(recovery): authenticate historical migration and bound read retries"
+        "committed_at": "2026-09-20T16:53:54-04:00",
+        "sha": "21ca88741000a6ba25320b01d5ceaa30e2bb0b16",
+        "subject": "fix(render): preserve cold scrollback viewport identity across reflow"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2866,
+  "fork_side_commit_total": 2871,
   "generated_at": "2026-09-20T20:02:39.913192Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
