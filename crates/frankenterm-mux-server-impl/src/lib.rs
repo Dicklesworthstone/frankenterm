@@ -79,7 +79,11 @@ const LIVE_SCROLLBACK_INCREMENTAL_CHAIN_DOMAIN: &[u8] =
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str = "frankenterm.live-scrollback-append-wal.v1";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2: &str = "frankenterm.live-scrollback-append-wal.v2";
 const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V3: &str = "frankenterm.live-scrollback-append-wal.v3";
-const LIVE_SCROLLBACK_APPEND_MAX_ROWS: usize = 1024;
+// A 128 KiB parser batch of short output rows otherwise pays several durable
+// append transactions. The independent 16 MiB pending/record byte limits still
+// bound admission; geometry work continues to yield in its existing slices.
+const LIVE_SCROLLBACK_APPEND_MAX_ROWS: usize =
+    frankenterm_core::storage::mmap_store::PANE_APPEND_MAX_ROWS;
 const LIVE_SCROLLBACK_APPEND_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const LIVE_SCROLLBACK_APPEND_WAL_NAME: &str = ".append-wal.v1.json";
 const LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME: &str = ".append-wal.v1.installing";
@@ -10171,34 +10175,39 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn deferred_scrollback_geometry_yields_preserve_durable_batch_sizes() {
-        let (_dir, backing, deferred) = deferred_test_sink();
-        let pane = deferred_test_pane(deferred);
-        let mut corpus = String::new();
-        let row_count = 2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38;
-        for row in 0..row_count {
-            use std::fmt::Write as _;
-            write!(corpus, "row-{row:03} e\u{301} 日本語\r\n").unwrap();
+        for (row_count, expected_revision) in [
+            // A fixed corpus that formerly required four publications: one
+            // establishing authority, then 1023, 1024, and 33 rows. It now fits
+            // one bounded batch, without changing its Unicode/text oracle.
+            (2086, 2),
+            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4),
+        ] {
+            let (_dir, backing, deferred) = deferred_test_sink();
+            let pane = deferred_test_pane(deferred);
+            let mut corpus = String::new();
+            for row in 0..row_count {
+                use std::fmt::Write as _;
+                write!(corpus, "row-{row:03} e\u{301} 日本語\r\n").unwrap();
+            }
+            let mut actions = Vec::new();
+            termwiz::escape::parser::Parser::new()
+                .parse(corpus.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions)
+                .expect("test action admission");
+            assert_eq!(backing.retained_scrollback_rows(), row_count - 5);
+            // Cooperative geometry slices must not create extra generations.
+            assert_eq!(backing.state.lock().unwrap().revision, expected_revision);
+            let (first, lines) = pane.get_lines(0..isize::try_from(row_count + 1).unwrap());
+            assert_eq!(first, 0);
+            assert_eq!(lines.len(), row_count + 1);
+            for (row, line) in lines.iter().take(row_count).enumerate() {
+                assert_eq!(
+                    line.as_str().trim_end(),
+                    format!("row-{row:03} e\u{301} 日本語")
+                );
+            }
+            assert!(lines[row_count].as_str().trim().is_empty());
         }
-        let mut actions = Vec::new();
-        termwiz::escape::parser::Parser::new()
-            .parse(corpus.as_bytes(), |action| actions.push(action));
-        pane.perform_actions(actions)
-            .expect("test action admission");
-        assert_eq!(backing.retained_scrollback_rows(), row_count - 5);
-        // The first batch establishes authority with one row, then writes
-        // its other 1023 rows. Later full and final batches write 1024 and 33.
-        // Cooperative geometry slices must not create extra generations.
-        assert_eq!(backing.state.lock().unwrap().revision, 4);
-        let (first, lines) = pane.get_lines(0..isize::try_from(row_count + 1).unwrap());
-        assert_eq!(first, 0);
-        assert_eq!(lines.len(), row_count + 1);
-        for (row, line) in lines.iter().take(row_count).enumerate() {
-            assert_eq!(
-                line.as_str().trim_end(),
-                format!("row-{row:03} e\u{301} 日本語")
-            );
-        }
-        assert!(lines[row_count].as_str().trim().is_empty());
     }
 
     #[test]
