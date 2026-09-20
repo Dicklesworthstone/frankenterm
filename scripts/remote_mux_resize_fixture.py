@@ -983,6 +983,7 @@ def measure(args):
     server = None
     receipt = {"status": "failed", "scope": "private remote-host Unix socket only",
                "instrumented": args.profile_phases,
+               "client_timeout_seconds": args.timeout_seconds,
                "native_or_network_latency_proven": False, "environment": env,
                "mux_argv": argv, "cpu_idle_admission_fraction": idle / total,
                "binary_sha256": {str(p): file_sha256(p)
@@ -1085,7 +1086,8 @@ def measure(args):
         write_new(root / "panes.json", json.dumps(panes, indent=2) + "\n")
         receipt["client_argv"] = client_argv
         with (root / "trials.jsonl").open("xb") as stdout, (root / "client.stderr").open("xb") as stderr:
-            trial = subprocess.run(client_argv, cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=600)
+            trial = subprocess.run(client_argv, cwd=root, env=env, stdout=stdout, stderr=stderr,
+                                   timeout=args.timeout_seconds)
         receipt["client_exit_code"] = trial.returncode
         with (root / "trials.jsonl").open("rb") as trace:
             trace_bytes = trace.read(2 * 1024 * 1024 + 1)
