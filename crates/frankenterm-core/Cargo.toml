@@ -16,6 +16,7 @@ autobenches = false
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -1030,7 +1031,7 @@ cass-export = []
 vc-export = ["subprocess-bridge"]
 
 # Optional heavy integrations - feature-gated (internal)
-frankenterm-deps = ["dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term", "dep:frankenterm-pty-guardian"]
+frankenterm-deps = ["dep:anyhow", "dep:codec", "dep:config", "dep:mux", "dep:frankenterm-cell", "dep:frankenterm-term", "dep:frankenterm-pty-guardian"]
 vendored-wezterm = ["frankenterm-deps"]  # backward compat alias
 browser-automation = []
 mcp-server = ["dep:fastmcp", "dep:fastmcp-server", "dep:toon_rust"]
