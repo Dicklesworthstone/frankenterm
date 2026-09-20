@@ -1200,7 +1200,9 @@ impl super::TermWindow {
             && !(self.config.swallow_mouse_click_on_pane_focus && is_click_to_focus_pane)
             && self.pane_input_ready(&pane)
         {
-            pane.mouse_event(mouse_event).ok();
+            if let Err(error) = pane.mouse_event(mouse_event) {
+                log::error!("mouse input was not accepted: {error:#}");
+            }
         }
 
         match event.kind {

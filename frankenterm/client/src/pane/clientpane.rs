@@ -4585,10 +4585,11 @@ impl Pane for ClientPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
-        self.mouse.lock().append(event);
-        if MouseState::next(Arc::clone(&self.mouse)) {
-            self.renderable.lock().inner.borrow_mut().update_last_send();
-        }
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("cannot enqueue mouse input for an unregistered remote pane")
+        })?;
+        MouseState::enqueue(&self.mouse, event, registration)?;
+        self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
 
@@ -5936,6 +5937,207 @@ mod tests {
             "binding must not leave unrelated RPCs queued"
         );
         pane
+    }
+
+    fn mouse_test_event(kind: wezterm_term::MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            button: wezterm_term::MouseButton::Left,
+            x: 2,
+            y: 3,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn pump_mouse_test(executor: &promise::spawn::SimpleExecutor) {
+        for _ in 0..16 {
+            if !executor.try_tick().unwrap() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_accepted_release_drains_when_scheduler_is_full() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(2, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        let release = mouse_test_event(wezterm_term::MouseEventKind::Release);
+        pane.mouse_event(press).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty());
+        let occupying = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            16,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("occupy remaining scheduler slot: {other:?}"),
+        };
+        assert!(matches!(
+            promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Input,
+                16,
+            ),
+            promise::spawn::MainThreadReservationOutcome::RetryableFull(_)
+        ));
+        pane.mouse_event(release).unwrap();
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == press));
+        pump_mouse_test(&executor);
+        assert!(
+            !peer.is_empty(),
+            "accepted release must advance without another click or scheduler slot"
+        );
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == release));
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+        drop(occupying);
+    }
+
+    #[test]
+    fn mouse_scheduler_refusal_has_no_hidden_queued_effect() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(1, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let occupying = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            16,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("occupy scheduler slot: {other:?}"),
+        };
+        assert!(pane
+            .mouse_event(mouse_test_event(wezterm_term::MouseEventKind::Press))
+            .is_err());
+        drop(occupying);
+        pump_mouse_test(&executor);
+        assert!(
+            peer.is_empty(),
+            "rejected event must never become a delayed effect"
+        );
+        let fresh = mouse_test_event(wezterm_term::MouseEventKind::Release);
+        pane.mouse_event(fresh).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty());
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == fresh));
+        pump_mouse_test(&executor);
+    }
+
+    #[test]
+    fn mouse_queue_is_bounded_and_retires_unsent_old_generation() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        for _ in 0..256 {
+            pane.mouse_event(press).unwrap();
+        }
+        assert!(pane.mouse_event(press).is_err());
+        assert!(peer.is_empty());
+        peer.replace_ready_generation(&inner.client, codec::CODEC_VERSION)
+            .unwrap();
+        for _ in 0..1024 {
+            if !executor.try_tick().unwrap() {
+                break;
+            }
+        }
+        assert!(
+            peer.is_empty(),
+            "old-generation events must not cross reconnect"
+        );
+        pane.mouse_event(press).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty());
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == press));
+        pump_mouse_test(&executor);
+    }
+
+    #[test]
+    fn mouse_queued_event_rejects_retired_registration_and_same_id_replacement() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let old = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        let press = mouse_test_event(wezterm_term::MouseEventKind::Press);
+        old.mouse_event(press).unwrap();
+        assert!(
+            peer.is_empty(),
+            "accepted input is still awaiting its worker"
+        );
+
+        // Retire only the local registration, without killing the remote pane.
+        *old.ignore_next_kill.lock() = true;
+        mux.remove_pane(40);
+        let replacement = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 30);
+        // The registration helper drains the executor and checks that the only
+        // RPC was the replacement's palette: neither old nor replacement mouse
+        // target may receive the accepted event from the retired registration.
+        assert!(peer.is_empty());
+        assert!(old.mouse_event(press).is_err());
+        pump_mouse_test(&executor);
+        assert!(
+            peer.is_empty(),
+            "stale producer must not admit a new effect"
+        );
+
+        let release = mouse_test_event(wezterm_term::MouseEventKind::Release);
+        replacement.mouse_event(release).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty());
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request)
+            if request.pane_id == 30 && request.event == release));
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn mouse_worker_cancellation_releases_lane_and_discards_unsent_suffix() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 40, 29);
+        pane.mouse_event(mouse_test_event(wezterm_term::MouseEventKind::Press))
+            .unwrap();
+        drop(executor);
+        assert!(peer.is_empty());
+        let executor = promise::spawn::SimpleExecutor::new();
+        let fresh = mouse_test_event(wezterm_term::MouseEventKind::Release);
+        pane.mouse_event(fresh).unwrap();
+        pump_mouse_test(&executor);
+        assert!(!peer.is_empty());
+        let sent = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(sent, Pdu::SendMouseEvent(request) if request.event == fresh));
+        pump_mouse_test(&executor);
+        assert!(
+            peer.is_empty(),
+            "cancelled press must not survive the worker generation"
+        );
     }
 
     #[test]
