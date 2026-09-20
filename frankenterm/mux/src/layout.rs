@@ -220,6 +220,14 @@ pub struct LayoutCycle {
 }
 
 impl LayoutCycle {
+    pub(crate) fn from_recovery_parts(
+        layouts: Vec<SwapLayout>,
+        current: usize,
+    ) -> anyhow::Result<Self> {
+        validate_recovery_layouts(&layouts, current)?;
+        Ok(Self { layouts, current })
+    }
+
     /// Create a new cycle from a non-empty list of layouts.
     pub fn new(layouts: Vec<SwapLayout>) -> Self {
         assert!(
@@ -286,6 +294,52 @@ impl LayoutCycle {
     pub fn layouts(&self) -> &[SwapLayout] {
         &self.layouts
     }
+}
+
+/// Validate the complete borrowed template set before recovery clones recursive
+/// arrangements or strings. This does not execute layouts or pane callbacks.
+pub(crate) fn validate_recovery_layouts(
+    layouts: &[SwapLayout],
+    current: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !layouts.is_empty() && layouts.len() <= 64 && current < layouts.len(),
+        "invalid recovered layout cycle"
+    );
+    let mut nodes = 0usize;
+    let mut text_bytes = 0usize;
+    for layout in layouts {
+        for text in std::iter::once(layout.name.as_str()).chain(layout.description.as_deref()) {
+            anyhow::ensure!(text.len() <= 1024, "recovered layout text exceeds limit");
+            text_bytes = text_bytes
+                .checked_add(text.len())
+                .ok_or_else(|| anyhow::anyhow!("recovered layout text overflow"))?;
+            anyhow::ensure!(text_bytes <= 65_536, "recovered layout text exceeds budget");
+        }
+        let mut pending = vec![(&layout.arrangement, 1usize)];
+        while let Some((node, depth)) = pending.pop() {
+            nodes += 1;
+            anyhow::ensure!(
+                nodes <= 8191 && depth <= 32,
+                "recovered layout exceeds tree limits"
+            );
+            if let LayoutArrangement::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } = node
+            {
+                anyhow::ensure!(
+                    ratio.is_finite() && (0.0..=1.0).contains(ratio),
+                    "invalid recovered layout ratio"
+                );
+                pending.push((second, depth + 1));
+                pending.push((first, depth + 1));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Result of redistributing panes into a new layout.
@@ -732,6 +786,34 @@ mod tests {
         assert!(stacked().arrangement.has_main_slot());
         let no_main = LayoutArrangement::Slot { is_main: false };
         assert!(!no_main.has_main_slot());
+    }
+
+    #[test]
+    fn recovery_layout_bounds_reject_invalid_ratio_depth_and_cycle() {
+        let mut layouts = default_cycle().layouts().to_vec();
+        assert!(validate_recovery_layouts(&layouts, 0).is_ok());
+        assert!(validate_recovery_layouts(&layouts, layouts.len()).is_err());
+        assert!(validate_recovery_layouts(&[], 0).is_err());
+        layouts[0].arrangement = LayoutArrangement::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: f64::NAN,
+            first: Box::new(LayoutArrangement::Slot { is_main: true }),
+            second: Box::new(LayoutArrangement::Slot { is_main: false }),
+        };
+        assert!(validate_recovery_layouts(&layouts, 0).is_err());
+        let mut arrangement = LayoutArrangement::Slot { is_main: false };
+        for _ in 0..32 {
+            arrangement = LayoutArrangement::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(arrangement),
+                second: Box::new(LayoutArrangement::Slot { is_main: false }),
+            };
+        }
+        layouts[0].arrangement = arrangement;
+        assert!(validate_recovery_layouts(&layouts, 0).is_err());
+        let oversized = vec![default_cycle().layouts()[0].clone(); 65];
+        assert!(validate_recovery_layouts(&oversized, 0).is_err());
     }
 
     #[test]

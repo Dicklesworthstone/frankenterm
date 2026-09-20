@@ -1747,6 +1747,7 @@ mod tests {
                 floating_focus: None,
                 pane_stacks: Vec::new(),
                 underlying_tiled_active_pane_id: Some(id),
+                runtime_state: Default::default(),
             };
             let window = crate::MuxCapturedWindow {
                 window_id,

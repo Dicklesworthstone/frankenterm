@@ -13708,6 +13708,7 @@ mod tests {
                 floating_focus: None,
                 pane_stacks: vec![],
                 underlying_tiled_active_pane_id: Some(index),
+                runtime_state: Default::default(),
             })
             .collect();
         let captured = mux::MuxCapturedTopology {

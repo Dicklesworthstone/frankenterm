@@ -233,6 +233,7 @@ impl Fixture {
                 floating_focus: (tab_id == 11).then_some(7),
                 pane_stacks: vec![],
                 underlying_tiled_active_pane_id: Some(first),
+                runtime_state: Default::default(),
             }
         })
         .collect();

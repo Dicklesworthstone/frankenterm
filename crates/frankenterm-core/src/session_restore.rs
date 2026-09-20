@@ -6882,7 +6882,7 @@ pub fn prepare_unpublished_whole_mux_topology(
         })
     }
     let image = source.image();
-    image.require_live_workspace_state()?;
+    image.require_live_topology_state()?;
     let pane_metadata: HashMap<_, _> = image
         .panes
         .iter()
@@ -6956,6 +6956,11 @@ pub fn prepare_unpublished_whole_mux_topology(
                     })
                     .collect(),
                 underlying_tiled_active_pane_id: tab.underlying_tiled_active_pane_id,
+                runtime_state: tab
+                    .runtime_state
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing recovered tab runtime state"))?
+                    .to_mux(),
             });
         }
         captured_windows.push(mux::MuxCapturedWindow {
@@ -14309,6 +14314,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 100,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -14582,6 +14588,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 42,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -14748,6 +14755,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -14858,6 +14866,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -15097,6 +15106,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -15242,6 +15252,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -15441,6 +15452,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 99,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -15644,6 +15656,7 @@ mod tests {
                         floating_focus: None,
                         active_pane_id: 10,
                         underlying_tiled_active_pane_id: None,
+                        runtime_state: Some(Default::default()),
                     }],
                     active_tab_index: 0,
                     title: String::new(),
@@ -15673,6 +15686,7 @@ mod tests {
                         floating_focus: None,
                         active_pane_id: 20,
                         underlying_tiled_active_pane_id: None,
+                        runtime_state: Some(Default::default()),
                     }],
                     active_tab_index: 0,
                     title: String::new(),
@@ -15867,6 +15881,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -16109,6 +16124,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -16411,6 +16427,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 0,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),
@@ -16553,6 +16570,7 @@ mod tests {
                     floating_focus: None,
                     active_pane_id: 1,
                     underlying_tiled_active_pane_id: None,
+                    runtime_state: Some(Default::default()),
                 }],
                 active_tab_index: 0,
                 title: String::new(),

@@ -4937,6 +4937,15 @@ impl Tab {
                     .context("missing recovered zoomed pane")
             })
             .transpose()?;
+        captured.runtime_state.validate(&members)?;
+        let runtime = &captured.runtime_state;
+        let layout_cycle = runtime
+            .layout_cycle
+            .as_ref()
+            .map(|cycle| {
+                LayoutCycle::from_recovery_parts(cycle.layouts.clone(), cycle.current_index)
+            })
+            .transpose()?;
         Ok(Self {
             tab_id: captured.tab_id,
             durable_id: captured.durable_tab_id,
@@ -4955,11 +4964,14 @@ impl Tab {
                 active: active_index,
                 zoomed,
                 title: Arc::from(captured.title.as_str()),
-                recency: Recency::default(),
-                collapsed_panes: HashSet::new(),
-                layout_cycle: Some(crate::layout::default_cycle()),
+                recency: Recency {
+                    count: runtime.recency_count,
+                    by_idx: runtime.recency_by_index.iter().copied().collect(),
+                },
+                collapsed_panes: runtime.collapsed_panes.iter().copied().collect(),
+                layout_cycle,
                 pane_stacks,
-                constraint_overrides: HashMap::new(),
+                constraint_overrides: runtime.constraint_overrides.iter().copied().collect(),
             }),
         })
     }
@@ -5654,6 +5666,8 @@ impl Tab {
                         .collect::<anyhow::Result<_>>()?;
                     pane_stacks.sort_by_key(|stack| stack.slot_index);
 
+                    let members = pane_ids.values().copied().collect();
+                    let runtime_state = MuxCapturedTabRuntime::capture(&inner, &members)?;
                     let underlying_tiled_active = inner.raw_tree_active_pane();
                     Some((
                         inner.pane.clone(),
@@ -5666,6 +5680,7 @@ impl Tab {
                         inner.floating_focus,
                         pane_stacks,
                         underlying_tiled_active,
+                        runtime_state,
                     ))
                 }
             };
@@ -5680,6 +5695,7 @@ impl Tab {
                 floating_focus,
                 pane_stacks,
                 underlying_tiled_active,
+                runtime_state,
             )) = snapshot
             else {
                 continue;
@@ -5727,6 +5743,7 @@ impl Tab {
                 floating_focus,
                 pane_stacks,
                 underlying_tiled_active_pane_id,
+                runtime_state,
             });
         }
 
@@ -14791,6 +14808,109 @@ pub struct MuxCapturedPaneStack {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MuxCapturedLayoutCycle {
+    pub layouts: Vec<SwapLayout>,
+    pub current_index: usize,
+}
+
+/// Canonically ordered, callback-free runtime state required to preserve the
+/// next focus, layout-cycle and constraint operation after private restoration.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MuxCapturedTabRuntime {
+    pub recency_count: usize,
+    pub recency_by_index: Vec<(usize, usize)>,
+    pub layout_cycle: Option<MuxCapturedLayoutCycle>,
+    pub constraint_overrides: Vec<(PaneId, PaneConstraints)>,
+    pub collapsed_panes: Vec<PaneId>,
+}
+
+impl MuxCapturedTabRuntime {
+    pub fn validate(&self, members: &HashSet<PaneId>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recency_by_index.len() <= 4096
+                && self.constraint_overrides.len() <= 4096
+                && self.collapsed_panes.len() <= 4096,
+            "recovered tab runtime exceeds entry limits"
+        );
+        anyhow::ensure!(
+            self.recency_by_index
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+                && self
+                    .recency_by_index
+                    .iter()
+                    .all(|(_, score)| *score <= self.recency_count),
+            "invalid recovered recency state"
+        );
+        anyhow::ensure!(
+            self.constraint_overrides
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+                && self
+                    .constraint_overrides
+                    .iter()
+                    .all(|(id, value)| members.contains(id)
+                        && normalize_runtime_pane_constraints(*value) == *value),
+            "invalid recovered constraint overrides"
+        );
+        anyhow::ensure!(
+            self.collapsed_panes
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+                && self.collapsed_panes.iter().all(|id| members.contains(id)),
+            "invalid recovered collapsed panes"
+        );
+        if let Some(cycle) = &self.layout_cycle {
+            crate::layout::validate_recovery_layouts(&cycle.layouts, cycle.current_index)?;
+        }
+        Ok(())
+    }
+
+    fn capture(inner: &TabInner, members: &HashSet<PaneId>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            inner.recency.by_idx.len() <= 4096
+                && inner.constraint_overrides.len() <= 4096
+                && inner.collapsed_panes.len() <= 4096,
+            "tab runtime exceeds capture entry limits"
+        );
+        if let Some(cycle) = &inner.layout_cycle {
+            crate::layout::validate_recovery_layouts(cycle.layouts(), cycle.current_index())?;
+        }
+        let mut captured = Self {
+            recency_count: inner.recency.count,
+            recency_by_index: inner
+                .recency
+                .by_idx
+                .iter()
+                .map(|(&index, &score)| (index, score))
+                .collect(),
+            layout_cycle: inner
+                .layout_cycle
+                .as_ref()
+                .map(|cycle| MuxCapturedLayoutCycle {
+                    layouts: cycle.layouts().to_vec(),
+                    current_index: cycle.current_index(),
+                }),
+            constraint_overrides: inner
+                .constraint_overrides
+                .iter()
+                .map(|(&id, &value)| (id, value))
+                .collect(),
+            collapsed_panes: inner.collapsed_panes.iter().copied().collect(),
+        };
+        captured
+            .recency_by_index
+            .sort_unstable_by_key(|entry| entry.0);
+        captured
+            .constraint_overrides
+            .sort_unstable_by_key(|entry| entry.0);
+        captured.collapsed_panes.sort_unstable();
+        captured.validate(members)?;
+        Ok(captured)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MuxCapturedTab {
     pub tab_id: TabId,
     pub durable_tab_id: uuid::Uuid,
@@ -14804,6 +14924,7 @@ pub struct MuxCapturedTab {
     pub floating_panes: Vec<MuxCapturedFloatingPane>,
     pub floating_focus: Option<PaneId>,
     pub pane_stacks: Vec<MuxCapturedPaneStack>,
+    pub runtime_state: MuxCapturedTabRuntime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_tiled_active_pane_id: Option<PaneId>,
 }
@@ -24026,6 +24147,23 @@ mod test {
             inner.floating_panes[0].pinned = true;
             inner.floating_panes[0].opacity = 0.375;
             inner.size_before_zoom.pixel_width = 799;
+            inner.recency.count = 29;
+            // A removed slot can remain in Recency. Preserve it rather than
+            // inventing a membership invariant the live implementation lacks.
+            inner.recency.by_idx = HashMap::from([(0, 17), (1, 28), (90, 3)]);
+            inner.collapsed_panes.insert(10);
+            inner.constraint_overrides.insert(
+                20,
+                PaneConstraints {
+                    min_width: 7,
+                    max_width: Some(37),
+                    preferred_width: Some(19),
+                    ..PaneConstraints::default()
+                },
+            );
+            let mut cycle = crate::layout::default_cycle();
+            assert!(cycle.select(1));
+            inner.layout_cycle = Some(cycle);
         }
         for zoomed in [false, true] {
             source.inner.lock().zoomed = zoomed.then(|| Arc::clone(&existing[&20]));
@@ -24061,6 +24199,37 @@ mod test {
                 restored.capture_tab_topology(42, "test-workspace").unwrap(),
                 captured
             );
+            {
+                let original = source.inner.lock();
+                let mut recovered = restored.inner.lock();
+                assert!(recovered.recency.score(1) > recovered.recency.score(0));
+                let mut next_original = original.recency.clone();
+                next_original.tag(0);
+                recovered.recency.tag(0);
+                assert_eq!(recovered.recency.by_idx, next_original.by_idx);
+                assert_eq!(recovered.recency.count, next_original.count);
+                let mut expected_cycle = original.layout_cycle.clone().unwrap();
+                let recovered_cycle = recovered.layout_cycle.as_mut().unwrap();
+                assert_eq!(recovered_cycle.advance(), expected_cycle.advance());
+                assert_eq!(recovered_cycle.prev(), expected_cycle.prev());
+                assert_eq!(recovered.collapsed_panes, original.collapsed_panes);
+                assert_eq!(
+                    recovered.constraint_overrides,
+                    original.constraint_overrides
+                );
+                assert_eq!(
+                    compute_min_size_with_collapsed(
+                        recovered.pane.as_ref().unwrap(),
+                        &recovered.collapsed_panes,
+                        &recovered.constraint_overrides
+                    ),
+                    compute_min_size_with_collapsed(
+                        original.pane.as_ref().unwrap(),
+                        &original.collapsed_panes,
+                        &original.constraint_overrides
+                    )
+                );
+            }
             callbacks.store(0, std::sync::atomic::Ordering::SeqCst);
             let mut invalid = captured.clone();
             invalid
@@ -24070,6 +24239,122 @@ mod test {
             drop(restored);
             assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn recovery_runtime_preserves_directional_mru_choice() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+        let source = Tab::new(&size);
+        source.assign_pane(&FakePane::new(10, size));
+        for (index, direction, id) in [
+            (0, SplitDirection::Horizontal, 20),
+            (1, SplitDirection::Vertical, 30),
+        ] {
+            source
+                .split_and_insert(
+                    index,
+                    SplitRequest {
+                        direction,
+                        target_is_second: true,
+                        top_level: false,
+                        size: SplitSize::Percent(50),
+                    },
+                    FakePane::new(id, size),
+                )
+                .unwrap();
+        }
+        source.set_active_idx(0);
+        {
+            let mut inner = source.inner.lock();
+            inner.recency = Recency {
+                count: 21,
+                by_idx: HashMap::from([(1, 20), (2, 9)]),
+            };
+            assert_eq!(
+                inner.get_pane_direction(PaneDirection::Right, true),
+                Some(1)
+            );
+        }
+        let captured = source.capture_tab_topology(42, "mru").unwrap();
+        let panes = source
+            .snapshot_panes_callback_free()
+            .into_iter()
+            .map(|pane| (pane.pane_id(), pane))
+            .collect();
+        let restored = Tab::from_recovery_capture(&captured, &panes).unwrap();
+        assert_eq!(
+            restored
+                .inner
+                .lock()
+                .get_pane_direction(PaneDirection::Right, true),
+            Some(1)
+        );
+        // Causal control: the former default reconstruction chooses the other
+        // adjacent pane when both candidates have an equal recency score.
+        restored.inner.lock().recency = Recency::default();
+        assert_ne!(
+            restored
+                .inner
+                .lock()
+                .get_pane_direction(PaneDirection::Right, true),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn recovery_runtime_rejects_noncanonical_or_unbounded_state() {
+        let (source, captured) = make_test_captured_tab();
+        let panes: HashMap<_, _> = source
+            .snapshot_panes_callback_free()
+            .into_iter()
+            .map(|pane| (pane.pane_id(), pane))
+            .collect();
+        let mut invalid = captured.clone();
+        invalid.runtime_state.recency_by_index = vec![(1, 0), (1, 0)];
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid.runtime_state.recency_by_index = vec![(0, usize::MAX)];
+        invalid.runtime_state.recency_count = 0;
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid.runtime_state.collapsed_panes = vec![123456];
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid.runtime_state.constraint_overrides = vec![(
+            10,
+            PaneConstraints {
+                min_width: 0,
+                ..PaneConstraints::default()
+            },
+        )];
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid
+            .runtime_state
+            .layout_cycle
+            .as_mut()
+            .unwrap()
+            .current_index = usize::MAX;
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid.runtime_state.layout_cycle.as_mut().unwrap().layouts[0].name = "x".repeat(1025);
+        assert!(Tab::from_recovery_capture(&invalid, &panes).is_err());
+        // None is an intentional disabled cycle, not permission to reinstall
+        // the default cycle during recovery.
+        invalid.runtime_state = captured.runtime_state.clone();
+        invalid.runtime_state.layout_cycle = None;
+        let restored = Tab::from_recovery_capture(&invalid, &panes).unwrap();
+        assert!(restored.inner.lock().layout_cycle.is_none());
+        let mut wire = serde_json::to_value(&captured).unwrap();
+        wire.as_object_mut().unwrap().remove("runtime_state");
+        assert!(serde_json::from_value::<MuxCapturedTab>(wire).is_err());
     }
 
     #[test]

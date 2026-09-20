@@ -46,7 +46,7 @@ use std::io::Write;
 pub const MUX_RECOVERY_IMAGE_MAGIC: [u8; 4] = *b"FTMR";
 
 /// Current schema version.
-pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 5;
+pub const MUX_RECOVERY_IMAGE_SCHEMA_VERSION: u32 = 6;
 
 /// Maximum payload bytes accepted for a recovery image JSON input (16 MiB).
 pub const MAX_RECOVERY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -113,6 +113,9 @@ pub enum MuxRecoveryImageError {
 
     #[error("invalid or incomplete workspace recovery state: {0}")]
     InvalidWorkspaceState(&'static str),
+
+    #[error("invalid recovered tab runtime state: {0}")]
+    InvalidTabRuntimeState(&'static str),
 
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
@@ -600,7 +603,7 @@ pub struct RecoveryTopology {
     pub focused_window_id: Option<usize>,
     /// Active workspace is per-client (`mux/lib.rs:11710`), not global truth.
     pub client_workspace: Option<ClientWorkspaceBinding>,
-    /// Required in schema 5. Absent historical state stays absent and cannot
+    /// Required from schema 5 onward. Absent historical state stays absent and cannot
     /// authorize a complete live restore; omission preserves schema 3/4 hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_state: Option<RecoveryWorkspaceState>,
@@ -754,6 +757,332 @@ pub struct RecoveryTab {
     /// Active pane of the underlying tiled split tree when floating focus is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underlying_tiled_active_pane_id: Option<usize>,
+    /// Schema 6 captures behavior that cannot be reconstructed from geometry.
+    /// Historical absence is preserved in canonical bytes and is not a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<RecoveryTabRuntime>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryTabRuntime {
+    pub recency_count: usize,
+    pub recency_by_index: Vec<(usize, usize)>,
+    #[serde(deserialize_with = "deserialize_required_layout_cycle")]
+    pub layout_cycle: Option<RecoveryLayoutCycle>,
+    pub constraint_overrides: Vec<(usize, RecoveryPaneConstraints)>,
+    pub collapsed_panes: Vec<usize>,
+}
+
+fn deserialize_required_layout_cycle<'de, D>(
+    deserializer: D,
+) -> Result<Option<RecoveryLayoutCycle>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RecoveryLayoutCycle>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPaneConstraints {
+    pub min_width: usize,
+    pub min_height: usize,
+    pub max_width: Option<usize>,
+    pub max_height: Option<usize>,
+    pub preferred_width: Option<usize>,
+    pub preferred_height: Option<usize>,
+    pub fixed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryLayoutCycle {
+    pub layouts: Vec<RecoverySwapLayout>,
+    pub current_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySwapLayout {
+    pub name: String,
+    pub description: Option<String>,
+    pub arrangement: RecoveryLayoutArrangement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum RecoveryLayoutArrangement {
+    Split {
+        direction: SplitDirection,
+        /// Preserve the exact finite IEEE-754 ratio, including signed zero.
+        ratio_bits: u64,
+        first: Box<Self>,
+        second: Box<Self>,
+    },
+    Slot {
+        is_main: bool,
+    },
+}
+
+impl RecoveryTabRuntime {
+    #[cfg(feature = "frankenterm-deps")]
+    fn from_mux(
+        state: &mux::tab::MuxCapturedTabRuntime,
+        pane_ids: &HashSet<usize>,
+    ) -> Result<Self, MuxRecoveryImageError> {
+        fn arrangement(node: &mux::layout::LayoutArrangement) -> RecoveryLayoutArrangement {
+            match node {
+                mux::layout::LayoutArrangement::Slot { is_main } => {
+                    RecoveryLayoutArrangement::Slot { is_main: *is_main }
+                }
+                mux::layout::LayoutArrangement::Split {
+                    direction,
+                    ratio,
+                    first,
+                    second,
+                } => RecoveryLayoutArrangement::Split {
+                    direction: match direction {
+                        mux::tab::SplitDirection::Horizontal => SplitDirection::Horizontal,
+                        mux::tab::SplitDirection::Vertical => SplitDirection::Vertical,
+                    },
+                    ratio_bits: ratio.to_bits(),
+                    first: Box::new(arrangement(first)),
+                    second: Box::new(arrangement(second)),
+                },
+            }
+        }
+        state.validate(pane_ids).map_err(|_| {
+            MuxRecoveryImageError::InvalidTabRuntimeState("invalid captured tab runtime state")
+        })?;
+        Ok(Self {
+            recency_count: state.recency_count,
+            recency_by_index: state.recency_by_index.clone(),
+            layout_cycle: state
+                .layout_cycle
+                .as_ref()
+                .map(|cycle| RecoveryLayoutCycle {
+                    current_index: cycle.current_index,
+                    layouts: cycle
+                        .layouts
+                        .iter()
+                        .map(|layout| RecoverySwapLayout {
+                            name: layout.name.clone(),
+                            description: layout.description.clone(),
+                            arrangement: arrangement(&layout.arrangement),
+                        })
+                        .collect(),
+                }),
+            constraint_overrides: state
+                .constraint_overrides
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        RecoveryPaneConstraints {
+                            min_width: c.min_width,
+                            min_height: c.min_height,
+                            max_width: c.max_width,
+                            max_height: c.max_height,
+                            preferred_width: c.preferred_width,
+                            preferred_height: c.preferred_height,
+                            fixed: c.fixed,
+                        },
+                    )
+                })
+                .collect(),
+            collapsed_panes: state.collapsed_panes.clone(),
+        })
+    }
+
+    #[cfg(feature = "frankenterm-deps")]
+    pub(crate) fn to_mux(&self) -> mux::tab::MuxCapturedTabRuntime {
+        fn arrangement(node: &RecoveryLayoutArrangement) -> mux::layout::LayoutArrangement {
+            match node {
+                RecoveryLayoutArrangement::Slot { is_main } => {
+                    mux::layout::LayoutArrangement::Slot { is_main: *is_main }
+                }
+                RecoveryLayoutArrangement::Split {
+                    direction,
+                    ratio_bits,
+                    first,
+                    second,
+                } => mux::layout::LayoutArrangement::Split {
+                    direction: match direction {
+                        SplitDirection::Horizontal => mux::tab::SplitDirection::Horizontal,
+                        SplitDirection::Vertical => mux::tab::SplitDirection::Vertical,
+                    },
+                    ratio: f64::from_bits(*ratio_bits),
+                    first: Box::new(arrangement(first)),
+                    second: Box::new(arrangement(second)),
+                },
+            }
+        }
+        mux::tab::MuxCapturedTabRuntime {
+            recency_count: self.recency_count,
+            recency_by_index: self.recency_by_index.clone(),
+            layout_cycle: self.layout_cycle.as_ref().map(|cycle| {
+                mux::tab::MuxCapturedLayoutCycle {
+                    current_index: cycle.current_index,
+                    layouts: cycle
+                        .layouts
+                        .iter()
+                        .map(|layout| mux::layout::SwapLayout {
+                            name: layout.name.clone(),
+                            description: layout.description.clone(),
+                            arrangement: arrangement(&layout.arrangement),
+                        })
+                        .collect(),
+                }
+            }),
+            constraint_overrides: self
+                .constraint_overrides
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        mux::pane::PaneConstraints {
+                            min_width: c.min_width,
+                            min_height: c.min_height,
+                            max_width: c.max_width,
+                            max_height: c.max_height,
+                            preferred_width: c.preferred_width,
+                            preferred_height: c.preferred_height,
+                            fixed: c.fixed,
+                        },
+                    )
+                })
+                .collect(),
+            collapsed_panes: self.collapsed_panes.clone(),
+        }
+    }
+
+    fn validate_bounds(&self) -> Result<(), MuxRecoveryImageError> {
+        for (resource, count) in [
+            ("tab_recency", self.recency_by_index.len()),
+            ("tab_constraints", self.constraint_overrides.len()),
+            ("tab_collapsed_panes", self.collapsed_panes.len()),
+        ] {
+            if count > MAX_RECOVERY_PANES {
+                return Err(MuxRecoveryImageError::ResourceLimit {
+                    resource,
+                    count,
+                    limit: MAX_RECOVERY_PANES,
+                });
+            }
+        }
+        if let Some(cycle) = &self.layout_cycle {
+            if cycle.layouts.is_empty()
+                || cycle.layouts.len() > 64
+                || cycle.current_index >= cycle.layouts.len()
+            {
+                return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                    "invalid layout cycle",
+                ));
+            }
+            let mut nodes = 0usize;
+            let mut text_bytes = 0usize;
+            for layout in &cycle.layouts {
+                validate_string_len("layout.name", &layout.name, MAX_STRING_BYTES)?;
+                text_bytes += layout.name.len();
+                if let Some(description) = &layout.description {
+                    validate_string_len("layout.description", description, MAX_STRING_BYTES)?;
+                    text_bytes += description.len();
+                }
+                if text_bytes > 65_536 {
+                    return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                        "layout text budget exceeded",
+                    ));
+                }
+                let mut pending = vec![(&layout.arrangement, 1usize)];
+                while let Some((node, depth)) = pending.pop() {
+                    nodes += 1;
+                    if nodes > 8_191 || depth > MAX_SPLIT_TREE_DEPTH {
+                        return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                            "layout tree budget exceeded",
+                        ));
+                    }
+                    if let RecoveryLayoutArrangement::Split {
+                        ratio_bits,
+                        first,
+                        second,
+                        ..
+                    } = node
+                    {
+                        let ratio = f64::from_bits(*ratio_bits);
+                        if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                            return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                                "invalid layout ratio",
+                            ));
+                        }
+                        pending.push((second, depth + 1));
+                        pending.push((first, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_membership(&self, pane_ids: &[usize]) -> Result<(), MuxRecoveryImageError> {
+        if !self
+            .recency_by_index
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0)
+            || self
+                .recency_by_index
+                .iter()
+                .any(|(_, score)| *score > self.recency_count)
+            || !self
+                .constraint_overrides
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+            || !self
+                .collapsed_panes
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                "noncanonical runtime entries",
+            ));
+        }
+        let members: HashSet<_> = pane_ids.iter().copied().collect();
+        if self
+            .constraint_overrides
+            .iter()
+            .any(|(id, _)| !members.contains(id))
+            || self.collapsed_panes.iter().any(|id| !members.contains(id))
+        {
+            return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                "runtime pane outside tab",
+            ));
+        }
+        for (_, constraints) in &self.constraint_overrides {
+            for (min, max, preferred) in [
+                (
+                    constraints.min_width,
+                    constraints.max_width,
+                    constraints.preferred_width,
+                ),
+                (
+                    constraints.min_height,
+                    constraints.max_height,
+                    constraints.preferred_height,
+                ),
+            ] {
+                if min == 0
+                    || max.is_some_and(|max| max < min)
+                    || preferred
+                        .is_some_and(|value| value < min || max.is_some_and(|max| value > max))
+                {
+                    return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                        "unnormalized pane constraints",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RecoveryTab {
@@ -1119,7 +1448,7 @@ impl MuxRecoveryImage {
         }
         if !matches!(
             self.header.schema_version,
-            3 | 4 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
+            3 | 4 | 5 | MUX_RECOVERY_IMAGE_SCHEMA_VERSION
         ) {
             return Err(MuxRecoveryImageError::UnsupportedSchemaVersion(
                 self.header.schema_version,
@@ -1274,6 +1603,22 @@ impl MuxRecoveryImage {
             }
 
             for tab in &window.tabs {
+                match (&tab.runtime_state, self.header.schema_version) {
+                    (None, 6..) => {
+                        return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                            "schema 6 requires tab runtime state",
+                        ));
+                    }
+                    (Some(_), ..=5) => {
+                        return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                            "historical schema cannot claim schema 6 tab authority",
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(state) = &tab.runtime_state {
+                    state.validate_bounds()?;
+                }
                 validate_string_len("tab.stable_tab_id", &tab.stable_tab_id, MAX_ID_STRING_BYTES)?;
                 validate_string_len("tab.title", &tab.title, MAX_STRING_BYTES)?;
                 if let Some(ref cwd) = tab.working_dir {
@@ -1780,6 +2125,9 @@ impl MuxRecoveryImage {
 
                 // Active pane must exist in tab_panes or pane_stacks
                 let all_tab_pane_ids = tab.all_pane_ids();
+                if let Some(state) = &tab.runtime_state {
+                    state.validate_membership(&all_tab_pane_ids)?;
+                }
                 if !all_tab_pane_ids.is_empty() && !all_tab_pane_ids.contains(&tab.active_pane_id) {
                     return Err(MuxRecoveryImageError::InvalidActivePaneId {
                         tab_id: tab.tab_id,
@@ -1906,6 +2254,18 @@ impl MuxRecoveryImage {
             .ok_or(MuxRecoveryImageError::InvalidWorkspaceState(
                 "historical image lacks complete live workspace metadata",
             ))
+    }
+
+    /// Admit complete live topology only when the authenticated schema carries
+    /// both workspace state and the tab policies that drive future behavior.
+    pub fn require_live_topology_state(&self) -> Result<(), MuxRecoveryImageError> {
+        self.require_live_workspace_state()?;
+        if self.header.schema_version < 6 {
+            return Err(MuxRecoveryImageError::InvalidTabRuntimeState(
+                "historical image lacks complete live tab runtime metadata",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_workspace_state(&self) -> Result<(), MuxRecoveryImageError> {
@@ -2460,7 +2820,7 @@ impl MuxRecoveryImage {
                         })
                         .collect::<Result<Vec<_>, MuxRecoveryImageError>>()?;
 
-                    let tab_stacks = tab
+                    let tab_stacks: Vec<RecoveryPaneStack> = tab
                         .pane_stacks
                         .iter()
                         .map(|s| RecoveryPaneStack {
@@ -2485,6 +2845,16 @@ impl MuxRecoveryImage {
                         }
                     };
 
+                    let mut runtime_members: HashSet<usize> = root_split
+                        .as_ref()
+                        .map(|root| root.leaves().into_iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default();
+                    runtime_members.extend(floating_panes.iter().map(|pane| pane.pane_id));
+                    for stack in &tab_stacks {
+                        runtime_members.extend(stack.pane_ids.iter().copied());
+                    }
+                    let runtime_state =
+                        RecoveryTabRuntime::from_mux(&tab.runtime_state, &runtime_members)?;
                     tabs.push(RecoveryTab {
                         tab_id: tab.tab_id,
                         stable_tab_id: tab.durable_tab_id.to_string(),
@@ -2511,6 +2881,7 @@ impl MuxRecoveryImage {
                         active_pane_id,
                         pane_stacks: tab_stacks,
                         underlying_tiled_active_pane_id: tab.underlying_tiled_active_pane_id,
+                        runtime_state: Some(runtime_state),
                     });
                 }
             }
@@ -2907,6 +3278,14 @@ mod tests {
         let mut legacy = image.clone();
         legacy.header.schema_version = 3;
         legacy.topology.workspace_state = None;
+        for tab in legacy
+            .topology
+            .windows
+            .iter_mut()
+            .flat_map(|window| &mut window.tabs)
+        {
+            tab.runtime_state = None;
+        }
         if let RecoverySpawnCustody::Original(custody) = &mut legacy.panes[0].spawn_custody {
             custody.original_mux_incarnation = uuid::Uuid::from_u128(13);
             custody.current_lease_generation = 2;
@@ -3338,6 +3717,7 @@ mod tests {
             active_pane_id: 1,
             pane_stacks: vec![],
             underlying_tiled_active_pane_id: Some(1),
+            runtime_state: Some(Default::default()),
         };
 
         let window = RecoveryWindow {
@@ -3403,6 +3783,149 @@ mod tests {
     }
 
     #[test]
+    fn tab_runtime_state_requires_schema_six_and_preserves_historical_bytes() {
+        let image = make_valid_test_image();
+        image.require_live_topology_state().unwrap();
+        let mut missing = image.clone();
+        missing.topology.windows[0].tabs[0].runtime_state = None;
+        assert!(matches!(
+            missing.validate(),
+            Err(MuxRecoveryImageError::InvalidTabRuntimeState(_))
+        ));
+        for version in [3, 4, 5] {
+            let mut historical = missing.clone();
+            historical.header.schema_version = version;
+            if version < 5 {
+                historical.topology.workspace_state = None;
+            }
+            historical.image_digest = historical.compute_digest().unwrap();
+            historical.validate().unwrap();
+            let bytes = historical.to_canonical_json().unwrap();
+            assert!(
+                !std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("runtime_state")
+            );
+            let reopened = MuxRecoveryImage::from_json_slice(&bytes).unwrap();
+            assert_eq!(reopened.to_canonical_json().unwrap(), bytes);
+            assert!(reopened.require_live_topology_state().is_err());
+            historical.topology.windows[0].tabs[0].runtime_state = Some(Default::default());
+            assert!(matches!(
+                historical.validate(),
+                Err(MuxRecoveryImageError::InvalidTabRuntimeState(_))
+            ));
+        }
+        for field in [
+            "recency_count",
+            "recency_by_index",
+            "layout_cycle",
+            "constraint_overrides",
+            "collapsed_panes",
+        ] {
+            let mut value = serde_json::to_value(&image).unwrap();
+            value["topology"]["windows"][0]["tabs"][0]["runtime_state"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<MuxRecoveryImage>(value).is_err(),
+                "missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_runtime_state_authenticates_policy_and_rejects_invalid_entries() {
+        let mut image = make_valid_test_image();
+        let state = RecoveryTabRuntime {
+            recency_count: 12,
+            // Stale indices are legitimate: removal does not renumber recency.
+            recency_by_index: vec![(0, 11), (9000, 2)],
+            constraint_overrides: vec![(
+                1,
+                RecoveryPaneConstraints {
+                    min_width: 5,
+                    min_height: 3,
+                    max_width: Some(80),
+                    max_height: None,
+                    preferred_width: Some(40),
+                    preferred_height: None,
+                    fixed: false,
+                },
+            )],
+            collapsed_panes: vec![1],
+            layout_cycle: Some(RecoveryLayoutCycle {
+                current_index: 1,
+                layouts: vec![
+                    RecoverySwapLayout {
+                        name: "one".into(),
+                        description: None,
+                        arrangement: RecoveryLayoutArrangement::Slot { is_main: true },
+                    },
+                    RecoverySwapLayout {
+                        name: "two".into(),
+                        description: Some("split".into()),
+                        arrangement: RecoveryLayoutArrangement::Split {
+                            direction: SplitDirection::Horizontal,
+                            ratio_bits: (-0.0f64).to_bits(),
+                            first: Box::new(RecoveryLayoutArrangement::Slot { is_main: false }),
+                            second: Box::new(RecoveryLayoutArrangement::Slot { is_main: true }),
+                        },
+                    },
+                ],
+            }),
+        };
+        image.topology.windows[0].tabs[0].runtime_state = Some(state.clone());
+        image.image_digest = image.compute_digest().unwrap();
+        image.require_live_topology_state().unwrap();
+        let reopened =
+            MuxRecoveryImage::from_json_slice(&image.to_canonical_json().unwrap()).unwrap();
+        assert_eq!(
+            reopened.topology.windows[0].tabs[0].runtime_state,
+            Some(state.clone())
+        );
+        let mut tampered = image.clone();
+        tampered.topology.windows[0].tabs[0]
+            .runtime_state
+            .as_mut()
+            .unwrap()
+            .recency_count += 1;
+        assert!(matches!(
+            tampered.validate(),
+            Err(MuxRecoveryImageError::DigestMismatch { .. })
+        ));
+        for case in 0..11 {
+            let mut invalid = state.clone();
+            match case {
+                0 => invalid.recency_by_index.push((0, 1)),
+                1 => invalid.recency_by_index[0].1 = 13,
+                2 => invalid.constraint_overrides[0].0 = 999,
+                3 => invalid.constraint_overrides[0].1.min_width = 0,
+                4 => invalid.constraint_overrides[0].1.preferred_width = Some(81),
+                5 => invalid.collapsed_panes.push(1),
+                6 => invalid.collapsed_panes = vec![999],
+                7 => invalid.layout_cycle.as_mut().unwrap().current_index = 2,
+                8 => invalid.layout_cycle.as_mut().unwrap().layouts.clear(),
+                9 => invalid.layout_cycle.as_mut().unwrap().layouts[0].name = "x".repeat(1025),
+                _ => {
+                    if let RecoveryLayoutArrangement::Split { ratio_bits, .. } =
+                        &mut invalid.layout_cycle.as_mut().unwrap().layouts[1].arrangement
+                    {
+                        *ratio_bits = f64::NAN.to_bits();
+                    }
+                }
+            }
+            assert!(
+                invalid
+                    .validate_bounds()
+                    .and_then(|()| invalid.validate_membership(&[1]))
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
     fn workspace_state_requires_explicit_current_authority_and_preserves_history() {
         let image = make_valid_test_image();
         image.require_live_workspace_state().unwrap();
@@ -3415,6 +3938,14 @@ mod tests {
         for version in [3, 4] {
             let mut historical = missing.clone();
             historical.header.schema_version = version;
+            for tab in historical
+                .topology
+                .windows
+                .iter_mut()
+                .flat_map(|window| &mut window.tabs)
+            {
+                tab.runtime_state = None;
+            }
             historical.image_digest = historical.compute_digest().unwrap();
             historical.validate().unwrap();
             let bytes = historical.to_canonical_json().unwrap();
@@ -4112,6 +4643,7 @@ mod tests {
             active_pane_id: 1,
             pane_stacks: vec![],
             underlying_tiled_active_pane_id: Some(1),
+            runtime_state: Some(Default::default()),
         };
 
         let mut image = MuxRecoveryImage {
@@ -4437,6 +4969,7 @@ mod tests {
             active_pane_id: 99,
             pane_stacks: vec![],
             underlying_tiled_active_pane_id: Some(20),
+            runtime_state: Some(Default::default()),
         };
 
         // Standard serialization roundtrip
@@ -4910,6 +5443,7 @@ mod converter_tests {
             floating_focus: None,
             pane_stacks: vec![],
             underlying_tiled_active_pane_id: Some(101),
+            runtime_state: Default::default(),
         };
 
         let window = mux::MuxCapturedWindow {
@@ -5028,6 +5562,53 @@ mod converter_tests {
             restored.topology.client_workspace.unwrap().active_workspace,
             "other"
         );
+    }
+
+    #[test]
+    fn converter_preserves_tab_runtime_bits_and_policy() {
+        let (meta, mut captured, acks, refs) = make_test_fixture();
+        let runtime = &mut captured.tabs[0].runtime_state;
+        runtime.recency_count = 7;
+        runtime.recency_by_index = vec![(0, 6), (90, 1)];
+        runtime.constraint_overrides = vec![(
+            101,
+            mux::pane::PaneConstraints {
+                preferred_width: Some(12),
+                ..Default::default()
+            },
+        )];
+        runtime.collapsed_panes = vec![102];
+        runtime.layout_cycle = Some(mux::tab::MuxCapturedLayoutCycle {
+            current_index: 0,
+            layouts: vec![mux::layout::SwapLayout {
+                name: "signed-zero".into(),
+                description: None,
+                arrangement: mux::layout::LayoutArrangement::Split {
+                    direction: mux::tab::SplitDirection::Vertical,
+                    ratio: -0.0,
+                    first: Box::new(mux::layout::LayoutArrangement::Slot { is_main: true }),
+                    second: Box::new(mux::layout::LayoutArrangement::Slot { is_main: false }),
+                },
+            }],
+        });
+        let image =
+            MuxRecoveryImage::from_mux_captured(meta, &captured, &borrowed_acks(&acks), &refs)
+                .unwrap();
+        image.require_live_topology_state().unwrap();
+        let bytes = image.to_canonical_json().unwrap();
+        let reopened = MuxRecoveryImage::from_json_slice(&bytes).unwrap();
+        let restored = reopened.topology.windows[0].tabs[0]
+            .runtime_state
+            .as_ref()
+            .unwrap()
+            .to_mux();
+        assert_eq!(restored, captured.tabs[0].runtime_state);
+        let mux::layout::LayoutArrangement::Split { ratio, .. } =
+            &restored.layout_cycle.as_ref().unwrap().layouts[0].arrangement
+        else {
+            panic!("split lost")
+        };
+        assert_eq!(ratio.to_bits(), (-0.0f64).to_bits());
     }
 
     #[test]
