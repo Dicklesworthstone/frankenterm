@@ -4119,10 +4119,27 @@ impl LiveScrollbackSpillSink {
                 .with_context(|| format!("publish append WAL {}", active_path.display()))?;
             #[cfg(not(windows))]
             std::fs::File::open(parent)?.sync_all()?;
-            let published = Self::read_append_wal(&active_path)?
+            let published = Self::read_checksum_verified_append_wal(&active_path)?
                 .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
-            anyhow::ensure!(published == *wal, "published append WAL changed");
-            Self::authenticate_append_wal(&published, &keyring)?;
+            anyhow::ensure!(published.wal == *wal, "published append WAL changed");
+            Self::authenticate_append_wal(&published.wal, &keyring)?;
+            // The immutable input passed full identity validation above.
+            // Exact readback equality transfers that proof to these freshly
+            // checksum-verified bytes only after live authentication succeeds.
+            let identity = ValidatedAppendWalIdentity {
+                checksum: published.checksum,
+                durable_pane_id: self.durable_pane_id,
+            };
+            let mut cache = self
+                .append_wal_identity_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("append WAL identity cache is poisoned"))?;
+            if !cache.contains(&Some(identity)) {
+                cache[1] = cache[0];
+                cache[0] = Some(identity);
+                metrics::counter!("mux.scrollback.append_wal_identity_cache_publication_seeds")
+                    .increment(1);
+            }
             #[cfg(test)]
             LIVE_SCROLLBACK_WAL_PUBLICATIONS.with(|count| count.set(count.get() + 1));
             Ok(())
@@ -11517,6 +11534,78 @@ mod tests {
         overwrite_private_append_wal_fixture(&path, &wal);
         sink.advance_authenticated_append_wal_supersession()
             .unwrap();
+    }
+
+    #[test]
+    fn append_wal_publication_seeds_immediate_successor_acknowledgement() {
+        let (_dir, _context, sink, wal, _appended) = append_wal_fixture(190, 8);
+        sink.persist_authenticated_append_wal(&wal).unwrap();
+        let recovered_state = materialize_append_wal_target_for_test(&sink, &wal);
+        *sink
+            .lock_state("install immediate acknowledgement target")
+            .unwrap() = recovered_state;
+        sink.persist_manifest("complete").unwrap();
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        sink.advance_authenticated_append_wal_supersession()
+            .expect("acknowledge the exact authenticated published target");
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before,
+            "successful publication must seed identity reuse for immediate acknowledgement"
+        );
+    }
+
+    #[test]
+    fn append_wal_refused_fresh_publication_does_not_seed_identity_cache() {
+        let (_dir, _context, sink, wal, _appended) = append_wal_fixture(188, 8);
+        let mut occupied = wal.clone();
+        occupied.max_retained_rows += 1;
+        seal_append_wal_fixture(&sink, &mut occupied);
+        let stage = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
+        write_complete_append_wal_fixture(&stage, &occupied);
+        let error = sink
+            .persist_authenticated_append_wal(&wal)
+            .expect_err("another exact stage must reject fresh publication");
+        assert!(!error.outcome_indeterminate());
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(&stage).unwrap(),
+            Some(occupied),
+            "refusal must preserve the occupying stage"
+        );
+        let verified = ChecksumVerifiedAppendWal::verify(wal).unwrap();
+        let before = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        sink.validate_verified_append_wal_identity(&verified)
+            .unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            before + 1,
+            "entry validation on a refused publication must not seed the cache"
+        );
+    }
+
+    #[test]
+    fn append_wal_publication_cache_poison_is_indeterminate_after_durable_readback() {
+        let (_dir, _context, sink, wal, _appended) = append_wal_fixture(189, 8);
+        let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+        assert!(
+            LiveScrollbackSpillSink::read_append_wal(&active)
+                .unwrap()
+                .is_none()
+        );
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = sink.append_wal_identity_cache.lock().unwrap();
+            panic!("test published WAL identity cache poison");
+        }));
+        assert!(poison.is_err());
+        let error = sink
+            .persist_authenticated_append_wal(&wal)
+            .expect_err("cache poisoning after publication must report indeterminate durability");
+        assert!(error.outcome_indeterminate());
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(&active).unwrap(),
+            Some(wal),
+            "the durable publication must not be misreported as absent"
+        );
     }
 
     #[test]
