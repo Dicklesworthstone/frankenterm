@@ -5980,7 +5980,7 @@ mod tests {
             16,
         ) {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
-            other => panic!("occupy remaining scheduler slot: {other:?}"),
+            other => panic!("occupy remaining scheduler slot: {:?}", other),
         };
         assert!(matches!(
             promise::spawn::try_reserve_main_thread(
@@ -6020,7 +6020,7 @@ mod tests {
             16,
         ) {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
-            other => panic!("occupy scheduler slot: {other:?}"),
+            other => panic!("occupy scheduler slot: {:?}", other),
         };
         assert!(pane
             .mouse_event(mouse_test_event(wezterm_term::MouseEventKind::Press))
