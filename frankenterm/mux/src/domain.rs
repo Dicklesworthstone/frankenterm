@@ -914,12 +914,16 @@ impl LocalDomain {
         captured_config: &config::ConfigHandle,
     ) -> anyhow::Result<LocalDomainRecoveryPolicy> {
         #[cfg(unix)]
-        let native_pty = self
-            .pty_system
-            .try_lock()
-            .context("domain PTY construction policy is busy")?
-            .downcast_ref::<portable_pty::unix::UnixPtySystem>()
-            .is_some();
+        let native_pty = {
+            let backend = self
+                .pty_system
+                .try_lock()
+                .context("domain PTY construction policy is busy")?;
+            let backend: &dyn PtySystem = &**backend;
+            backend
+                .downcast_ref::<portable_pty::unix::UnixPtySystem>()
+                .is_some()
+        };
         #[cfg(not(unix))]
         let native_pty = false;
         anyhow::ensure!(
