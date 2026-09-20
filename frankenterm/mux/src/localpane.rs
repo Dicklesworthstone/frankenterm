@@ -57,6 +57,112 @@ use crossbeam::queue::ArrayQueue;
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum MetadataRefusalStage {
+    CaptureTerminal,
+    CaptureScreen,
+    PublishTerminal,
+    PublishScreen,
+    LayoutTerminal,
+    PublishLayoutTerminal,
+    LayoutObservation,
+    SinkInterval,
+    SurfaceTerminal,
+    SurfaceTmux,
+    LayoutUnavailable,
+    DimensionsUnavailable,
+    SinkUsage,
+    SurfaceGeometry,
+    PublicationGeometry,
+}
+
+const METADATA_REFUSAL_STAGES: usize = 15;
+const METADATA_REFUSAL_LOG_LIMIT: usize = 64;
+static METADATA_REFUSALS: [AtomicUsize; METADATA_REFUSAL_STAGES] =
+    [const { AtomicUsize::new(0) }; METADATA_REFUSAL_STAGES];
+static METADATA_REFUSAL_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static LAST_METADATA_REFUSAL: std::cell::Cell<Option<MetadataRefusalStage>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn record_metadata_refusal(stage: MetadataRefusalStage) {
+    #[cfg(test)]
+    LAST_METADATA_REFUSAL.with(|last| last.set(Some(stage)));
+    if log::log_enabled!(target: "mux::metadata_refusal", log::Level::Debug) {
+        let _ = METADATA_REFUSALS[stage as usize].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
+    }
+}
+
+fn metadata_busy(stage: MetadataRefusalStage) -> frankenterm_term::screen::ColdReadMetadataBusy {
+    record_metadata_refusal(stage);
+    frankenterm_term::screen::ColdReadMetadataBusy
+}
+
+fn reserve_metadata_refusal_log(emitted: &AtomicUsize) -> bool {
+    emitted
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < METADATA_REFUSAL_LOG_LIMIT).then_some(count.saturating_add(1))
+        })
+        .is_ok()
+}
+
+/// Declare before any method-local lock guards, so logging runs after they
+/// drop, including early-return paths. No recorder, thread, payload or wire
+/// change: opt in with RUST_LOG=mux::metadata_refusal=debug. At most 64 fixed
+/// cumulative summaries are emitted per process; these are sampled totals,
+/// not a promise of final totals after the emission budget is exhausted.
+struct MetadataRefusalDiagnostic(Option<[usize; METADATA_REFUSAL_STAGES]>);
+
+impl MetadataRefusalDiagnostic {
+    fn new() -> Self {
+        Self(
+            log::log_enabled!(target: "mux::metadata_refusal", log::Level::Debug).then(|| {
+                std::array::from_fn(|index| METADATA_REFUSALS[index].load(Ordering::Relaxed))
+            }),
+        )
+    }
+}
+
+impl Drop for MetadataRefusalDiagnostic {
+    fn drop(&mut self) {
+        let Some(before) = self.0 else { return };
+        let now: [usize; METADATA_REFUSAL_STAGES] =
+            std::array::from_fn(|index| METADATA_REFUSALS[index].load(Ordering::Relaxed));
+        if now == before || !reserve_metadata_refusal_log(&METADATA_REFUSAL_LOGS) {
+            return;
+        }
+        let stages = [
+            "capture_terminal",
+            "capture_screen",
+            "publish_terminal",
+            "publish_screen",
+            "layout_terminal",
+            "publish_layout_terminal",
+            "layout_observation",
+            "sink_interval",
+            "surface_terminal",
+            "surface_tmux",
+            "layout_unavailable",
+            "dimensions_unavailable",
+            "sink_usage",
+            "surface_geometry",
+            "publication_geometry",
+        ];
+        let totals: [(&str, usize); METADATA_REFUSAL_STAGES] =
+            std::array::from_fn(|index| (stages[index], now[index]));
+        log::debug!(target: "mux::metadata_refusal", "metadata_refusal_totals={totals:?}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionAnchorCaptureError {
     Busy,
@@ -1563,11 +1669,22 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         budget: &mut frankenterm_term::screen::LineReadCaptureBudget,
     ) -> Option<anyhow::Result<frankenterm_term::screen::ScreenLineRead>> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
         Some(
             self.terminal
                 .try_lock()
-                .ok_or_else(|| anyhow::Error::new(frankenterm_term::screen::ColdReadMetadataBusy))
-                .and_then(|term| term.screen().capture_line_read_with_budget(lines, budget)),
+                .ok_or_else(|| {
+                    anyhow::Error::new(metadata_busy(MetadataRefusalStage::CaptureTerminal))
+                })
+                .and_then(|term| {
+                    term.screen()
+                        .capture_line_read_with_budget(lines, budget)
+                        .inspect_err(|error| {
+                            if error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
+                                record_metadata_refusal(MetadataRefusalStage::CaptureScreen);
+                            }
+                        })
+                }),
         )
     }
 
@@ -1576,12 +1693,19 @@ impl Pane for LocalPane {
         reads: &[frankenterm_term::screen::ScreenLineRead],
         publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
         let mut term = self
             .terminal
             .try_lock()
-            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishTerminal))?;
         for read in reads {
-            if !term.screen().try_validate_line_read(read)? {
+            if !term
+                .screen()
+                .try_validate_line_read(read)
+                .inspect_err(|_| {
+                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
+                })?
+            {
                 return Ok(false);
             }
         }
@@ -1608,10 +1732,11 @@ impl Pane for LocalPane {
         Option<(SequenceNo, RenderableDimensions)>,
         frankenterm_term::screen::ColdReadMetadataBusy,
     > {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
         let mut term = self
             .terminal
             .try_lock()
-            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::LayoutTerminal))?;
         let Some(floor) =
             Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
         else {
@@ -1630,10 +1755,11 @@ impl Pane for LocalPane {
         expected_dimensions: RenderableDimensions,
         publish: &mut dyn FnMut(),
     ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
         let mut term = self
             .terminal
             .try_lock()
-            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishLayoutTerminal))?;
         let Some(floor) =
             Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
         else {
@@ -1647,10 +1773,17 @@ impl Pane for LocalPane {
             || expected_seqno > term.current_seqno()
             || !crate::renderable::same_line_layout_geometry(&dimensions, &expected_dimensions)
         {
+            record_metadata_refusal(MetadataRefusalStage::PublicationGeometry);
             return Ok(false);
         }
         for read in reads {
-            if !term.screen().try_validate_line_read(read)? {
+            if !term
+                .screen()
+                .try_validate_line_read(read)
+                .inspect_err(|_| {
+                    record_metadata_refusal(MetadataRefusalStage::PublishScreen);
+                })?
+            {
                 return Ok(false);
             }
         }
@@ -1677,9 +1810,10 @@ impl Pane for LocalPane {
         &self,
         baseline: SequenceNo,
     ) -> Option<Result<PaneSurfaceSnapshot, frankenterm_term::screen::ColdReadMetadataBusy>> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
         let mut term = match self.terminal.try_lock() {
             Some(term) => term,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTerminal))),
         };
         #[cfg(feature = "disruptor-pane-io")]
         self.drain_action_ring_locked(&mut term);
@@ -1687,7 +1821,7 @@ impl Pane for LocalPane {
         match self.tmux_domain.try_lock() {
             Some(guard) if guard.is_some() => return None,
             Some(_) => {}
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceTmux))),
         }
 
         let line_layout_floor =
@@ -1696,14 +1830,19 @@ impl Pane for LocalPane {
                 // Let the existing source-fence path retire an exhausted
                 // sequence domain instead of turning it into retryable busy.
                 Ok(None) if term.current_seqno() == SequenceNo::MAX => return None,
-                Ok(None) | Err(_) => {
-                    return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
+                Ok(None) => {
+                    return Some(Err(metadata_busy(MetadataRefusalStage::LayoutUnavailable)))
                 }
+                Err(busy) => return Some(Err(busy)),
             };
 
         let dimensions = match terminal_try_get_dimensions(&mut term) {
             Some(dims) => dims,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => {
+                return Some(Err(metadata_busy(
+                    MetadataRefusalStage::DimensionsUnavailable,
+                )))
+            }
         };
 
         let mouse_grabbed = term.is_mouse_grabbed();
@@ -1711,7 +1850,10 @@ impl Pane for LocalPane {
 
         let tiered_scrollback_status = match term.screen().try_tiered_scrollback_status() {
             Ok(status) => status.map(Into::into),
-            Err(busy) => return Some(Err(busy)),
+            Err(busy) => {
+                record_metadata_refusal(MetadataRefusalStage::SinkUsage);
+                return Some(Err(busy));
+            }
         };
 
         let cursor_position = terminal_get_cursor_position(&mut term);
@@ -1725,7 +1867,7 @@ impl Pane for LocalPane {
             .and_then(|len| dimensions.physical_top.checked_add(len))
         {
             Some(end) => dimensions.physical_top..end,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
         };
 
         let dirty_lines = terminal_get_dirty_lines(&mut term, viewport_range, damage_baseline);
@@ -1734,29 +1876,29 @@ impl Pane for LocalPane {
 
         let phys_start = match screen.stable_row_to_phys(dimensions.physical_top) {
             Some(phys) => phys,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
         };
         let phys_end = match phys_start.checked_add(dimensions.viewport_rows) {
             Some(end) => end,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
         };
         let lines = screen.lines_in_phys_range(phys_start..phys_end);
         if lines.len() != dimensions.viewport_rows {
-            return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy));
+            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
         }
         let viewport_lines = (dimensions.physical_top, lines);
 
         let cursor_phys = match screen.stable_row_to_phys(cursor_position.y) {
             Some(phys) => phys,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
         };
         let cursor_end = match cursor_phys.checked_add(1) {
             Some(end) => end,
-            None => return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy)),
+            None => return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry))),
         };
         let cursor_row_lines = screen.lines_in_phys_range(cursor_phys..cursor_end);
         if cursor_row_lines.len() != 1 {
-            return Some(Err(frankenterm_term::screen::ColdReadMetadataBusy));
+            return Some(Err(metadata_busy(MetadataRefusalStage::SurfaceGeometry)));
         }
         let cursor_lines = (cursor_position.y, cursor_row_lines);
 
@@ -3145,8 +3287,14 @@ impl LocalPane {
     ) -> Result<Option<SequenceNo>, frankenterm_term::screen::ColdReadMetadataBusy> {
         let mut observation = observation
             .try_lock()
-            .ok_or(frankenterm_term::screen::ColdReadMetadataBusy)?;
-        let Some(source_changed) = term.screen_mut().refresh_cold_source_observation()? else {
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::LayoutObservation))?;
+        let Some(source_changed) = term
+            .screen_mut()
+            .refresh_cold_source_observation()
+            .inspect_err(|_| {
+                record_metadata_refusal(MetadataRefusalStage::SinkInterval);
+            })?
+        else {
             return Ok(None);
         };
         let screen_changed = observation
@@ -10893,6 +11041,92 @@ mod tests {
     }
 
     #[test]
+    fn metadata_refusal_logging_is_opt_in_bounded_and_outside_terminal_lock() {
+        const CHILD: &str = "FT_METADATA_REFUSAL_LOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "localpane::tests::metadata_refusal_logging_is_opt_in_bounded_and_outside_terminal_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("metadata diagnostic subprocess exceeded watchdog");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        struct Recorder {
+            terminal: Arc<Mutex<Terminal>>,
+            emitted: AtomicUsize,
+        }
+        impl log::Log for Recorder {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.target() == "mux::metadata_refusal"
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    assert!(
+                        self.terminal.try_lock().is_some(),
+                        "logging held terminal lock"
+                    );
+                    let text = record.args().to_string();
+                    assert!(text.starts_with("metadata_refusal_totals="));
+                    assert!(text.contains("surface_tmux"));
+                    assert!(!text.contains("DO_NOT_LOG_TERMINAL_CONTENT"));
+                    self.emitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn flush(&self) {}
+        }
+        let mut terminal = guardian_lifetime_test_terminal();
+        terminal.advance_bytes(b"DO_NOT_LOG_TERMINAL_CONTENT");
+        let pane = make_legacy_test_pane(783, terminal);
+        let recorder = Box::leak(Box::new(Recorder {
+            terminal: Arc::clone(&pane.terminal),
+            emitted: AtomicUsize::new(0),
+        }));
+        log::set_logger(recorder).unwrap();
+        log::set_max_level(log::LevelFilter::Off);
+        let tmux_guard = pane.tmux_domain.lock();
+        assert!(matches!(pane.capture_surface_snapshot(0), Some(Err(_))));
+        assert_eq!(recorder.emitted.load(Ordering::Relaxed), 0);
+        log::set_max_level(log::LevelFilter::Debug);
+        for _ in 0..METADATA_REFUSAL_LOG_LIMIT + 32 {
+            assert!(matches!(pane.capture_surface_snapshot(0), Some(Err(_))));
+        }
+        assert_eq!(
+            recorder.emitted.load(Ordering::Relaxed),
+            METADATA_REFUSAL_LOG_LIMIT
+        );
+        assert_eq!(
+            METADATA_REFUSALS[MetadataRefusalStage::SurfaceTmux as usize].load(Ordering::Relaxed),
+            METADATA_REFUSAL_LOG_LIMIT + 32
+        );
+        drop(tmux_guard);
+        assert!(matches!(pane.capture_surface_snapshot(0), Some(Ok(_))));
+    }
+
+    #[test]
     fn capture_surface_snapshot_busy_refusal() {
         let terminal = guardian_lifetime_test_terminal();
         let pane = make_legacy_test_pane(783, terminal);
@@ -10908,6 +11142,25 @@ mod tests {
                 ),
                 "terminal lock contention must return Some(Err(ColdReadMetadataBusy))"
             );
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::SurfaceTerminal)
+            );
+            assert!(pane
+                .capture_line_read(0..1, &mut Default::default())
+                .unwrap()
+                .is_err());
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::CaptureTerminal)
+            );
+            assert!(pane
+                .publish_line_reads(&[], &mut || panic!("busy publication"))
+                .is_err());
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::PublishTerminal)
+            );
         }
 
         // 2. Tmux domain lock contention
@@ -10920,6 +11173,10 @@ mod tests {
                     Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
                 ),
                 "tmux domain lock contention must return Some(Err(ColdReadMetadataBusy))"
+            );
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::SurfaceTmux)
             );
         }
 
@@ -10934,11 +11191,25 @@ mod tests {
                 ),
                 "line layout observation lock contention must return Some(Err(ColdReadMetadataBusy))"
             );
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::LayoutObservation)
+            );
         }
 
         // 4. Cold sink busy refusal
         {
             let (cold_pane, _mux, _reg, sink, _token) = cold_resize_fixture(false);
+            sink.busy.store(true, Ordering::Release);
+            assert!(matches!(
+                cold_pane.capture_surface_snapshot(0),
+                Some(Err(_))
+            ));
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::SinkInterval)
+            );
+            sink.busy.store(false, Ordering::Release);
             // Layout admission still succeeds; only the subsequent usage
             // observation is contended, reproducing the gap between probes.
             sink.usage_busy.store(true, Ordering::Release);
@@ -10950,6 +11221,10 @@ mod tests {
                     Some(Err(frankenterm_term::screen::ColdReadMetadataBusy))
                 ),
                 "cold sink busy must return Some(Err(ColdReadMetadataBusy))"
+            );
+            assert_eq!(
+                LAST_METADATA_REFUSAL.with(|last| last.get()),
+                Some(MetadataRefusalStage::SinkUsage)
             );
             sink.usage_busy.store(false, Ordering::Release);
             let result = cold_pane.capture_surface_snapshot(0);
