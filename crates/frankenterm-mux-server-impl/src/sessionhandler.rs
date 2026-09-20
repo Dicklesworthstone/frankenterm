@@ -10057,8 +10057,12 @@ mod tests {
         std::mem::forget(timing);
 
         for index in 0..200 {
-            let mut timing =
-                LineReadTiming::admitted(Instant::now() - std::time::Duration::from_millis(21), 88);
+            let mut timing = LineReadTiming::admitted(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(21))
+                    .expect("test clock must represent the preceding 21 milliseconds"),
+                88,
+            );
             {
                 let _authority = LOGGER.authority.lock().unwrap();
                 let error = anyhow!("sensitive-terminal-content-canary");

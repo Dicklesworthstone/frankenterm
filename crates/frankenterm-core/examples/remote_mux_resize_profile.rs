@@ -1087,10 +1087,7 @@ mod measured {
                             // A fresh observation can fall between parser batches.
                             // Require monotonicity here; the complete interval
                             // below must still prove fresh bytes and throughput.
-                            ensure!(
-                                sequence >= previous[index],
-                                "noise ingestion regressed"
-                            );
+                            ensure!(sequence >= previous[index], "noise ingestion regressed");
                         }
                         emit(
                             json!({"event":"noise_sample", "after_trial":trial, "pane_id":pane,

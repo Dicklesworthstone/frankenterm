@@ -9009,7 +9009,9 @@ mod tests {
         }
 
         // Terminal mutation with same stream bytes advances semantic generation; bound capture witness must be rejected
-        successor_pane.perform_actions(vec![termwiz::escape::Action::Print('!')]);
+        successor_pane
+            .perform_actions(vec![termwiz::escape::Action::Print('!')])
+            .expect("terminal mutation must be admitted before testing witness rejection");
         assert!(
             !successor_mux
                 .guardian_checkpoint_is_current(successor_pane.pane_id(), &gen2_published),
