@@ -7093,6 +7093,53 @@ fn expand_exact_scrollback_plaintext(
 fn serialize_exact_semantic_scrollback_line(
     line: &wezterm_term::Line,
 ) -> Option<Zeroizing<Vec<u8>>> {
+    // Inspect borrowed cells before materializing compressed scrollback. For
+    // printable single-column rows there are no hidden wide-cell spacers, so
+    // the existing compact representation already carries every cell exactly.
+    if line.len() >= 32 && line.len() <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
+        let mut count = 0usize;
+        let mut runs = 0usize;
+        let mut previous = None::<termwiz::surface::line::CellRef<'_>>;
+        let compact = line.visible_cells().all(|cell| {
+            if cell.cell_index() != count
+                || cell.width() != 1
+                || !matches!(cell.str().as_bytes(), [byte] if (b' '..=b'~').contains(byte))
+            {
+                return false;
+            }
+            count += 1;
+            if previous
+                .as_ref()
+                .is_none_or(|prior| prior.attrs() != cell.attrs())
+            {
+                runs += 1;
+            }
+            previous = Some(cell);
+            runs <= line.len() / 8
+        }) && count == line.len();
+        if compact {
+            let mut cell_widths = Vec::new();
+            cell_widths.try_reserve_exact(count).ok()?;
+            cell_widths.resize(count, 1);
+            let mut compact_line = line.clone();
+            compact_line.canonicalize_scrollback_storage();
+            let semantic = ExactSemanticScrollbackLineV1 {
+                schema: 2,
+                line: compact_line,
+                cell_widths,
+            };
+            if let Some(plaintext) = serialize_semantic_scrollback_payload(&semantic) {
+                if compact_scrollback_decoded_charge(&semantic, plaintext.len())
+                    .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
+                {
+                    return Some(plaintext);
+                }
+            }
+        }
+    }
+
+    // Unsupported cells and compact-budget refusal retain the original vector
+    // encoding, including attributes on otherwise invisible wide-cell spacers.
     let mut semantic_line = line.clone();
     let cells = semantic_line.cells_mut();
     if cells.len() > LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE {
@@ -7100,51 +7147,18 @@ fn serialize_exact_semantic_scrollback_line(
     }
     let mut cell_widths = Vec::new();
     cell_widths.try_reserve_exact(cells.len()).ok()?;
-    let mut compact = cells.len() >= 32;
-    // Alternating attributes gain no run compression and add cluster overhead.
-    let mut runs = 0usize;
-    let run_limit = cells.len() / 8;
-    let mut previous_attrs = None;
     for cell in cells.iter() {
         let width = u8::try_from(cell.width()).ok()?;
         if !matches!(width, 1 | 2) {
             return None;
         }
         cell_widths.push(width);
-        if compact {
-            compact = width == 1
-                && matches!(cell.str().as_bytes(), [byte] if (b' '..=b'~').contains(byte));
-            if compact && previous_attrs != Some(cell.attrs()) {
-                runs += 1;
-                previous_attrs = Some(cell.attrs());
-                compact = runs <= run_limit;
-            }
-        }
     }
-    let mut semantic = ExactSemanticScrollbackLineV1 {
+    let semantic = ExactSemanticScrollbackLineV1 {
         schema: 1,
         line: semantic_line,
         cell_widths,
     };
-    if compact {
-        // This is already an owned clone of the caller's line. Reuse it and
-        // its width vector instead of cloning both again for every ASCII row.
-        semantic.schema = 2;
-        semantic.line.compress_for_scrollback();
-        if let Some(plaintext) = serialize_semantic_scrollback_payload(&semantic) {
-            if compact_scrollback_decoded_charge(&semantic, plaintext.len())
-                .is_some_and(|charge| charge <= LIVE_SCROLLBACK_MAX_DECODED_LINE_BYTES_USIZE)
-            {
-                return Some(plaintext);
-            }
-        }
-        // A compact encoding must not admit a row whose expansion exceeds the
-        // existing hard limit. Rebuild the exact original vector representation
-        // only on refusal; do not infer its bytes from a compact round trip.
-        semantic.schema = 1;
-        semantic.line = line.clone();
-        semantic.line.cells_mut();
-    }
     serialize_semantic_scrollback_payload(&semantic)
 }
 
@@ -11140,6 +11154,57 @@ mod tests {
             new_record.len() <= old_record.len(),
             "compact encoding must not grow the measured noise record"
         );
+    }
+
+    #[test]
+    fn compact_scrollback_borrowed_cells_match_materialized_encoding() {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_italic(true);
+        attrs.set_hyperlink(Some(Arc::new(termwiz::cell::Hyperlink::new_with_id(
+            "https://checkpoint.example/borrowed",
+            "borrowed-row",
+        ))));
+        for columns in [32, 49, 80, 256] {
+            let mut line = Line::from_text(&"x".repeat(columns), &attrs, 42, None);
+            let mut alternate = attrs.clone();
+            alternate.set_reverse(true);
+            line.set_cell_grapheme(columns / 2, "Q", 1, alternate, 42);
+            line.set_last_cell_was_wrapped(true, 42);
+            for storage_case in 0..4 {
+                if storage_case != 0 {
+                    line.compress_for_scrollback();
+                }
+                if storage_case == 2 {
+                    line.set_last_cell_was_wrapped(false, 42);
+                } else if storage_case == 3 {
+                    line.set_last_cell_was_wrapped(true, 42);
+                    line.set_last_cell_was_wrapped(false, 42);
+                }
+                let before = varbincode::serialize(&line).unwrap();
+                // The prior encoder always materialized a full vector before
+                // reconstructing compact storage. Keep that independent oracle.
+                let mut materialized = line.clone();
+                let widths = materialized
+                    .cells_mut()
+                    .iter()
+                    .map(|cell| u8::try_from(cell.width()).unwrap())
+                    .collect();
+                materialized.compress_for_scrollback();
+                let expected =
+                    serialize_semantic_scrollback_payload(&ExactSemanticScrollbackLineV1 {
+                        schema: 2,
+                        line: materialized,
+                        cell_widths: widths,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serialize_exact_semantic_scrollback_line(&line).unwrap(),
+                    expected,
+                    "columns={columns} storage_case={storage_case}",
+                );
+                assert_eq!(varbincode::serialize(&line).unwrap(), before);
+            }
+        }
     }
 
     #[test]

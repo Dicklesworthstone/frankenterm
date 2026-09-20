@@ -1839,6 +1839,14 @@ impl Line {
         self.cells = CellStorage::C(Arc::new(cv));
     }
 
+    /// Rebuild canonical attribute runs without materializing a cell vector.
+    /// Unlike `compress_for_scrollback`, this also normalizes already-clustered
+    /// storage whose mutations may have left adjacent identical-attribute runs.
+    pub fn canonicalize_scrollback_storage(&mut self) {
+        let clustered = ClusteredLine::from_cell_vec(self.len(), self.visible_cells());
+        self.cells = CellStorage::C(Arc::new(clustered));
+    }
+
     pub fn cells_mut(&mut self) -> &mut [Cell] {
         self.coerce_vec_storage().as_mut_slice()
     }
