@@ -104,9 +104,13 @@ std::thread_local! {
     static LIVE_SCROLLBACK_AUTHORITY_RECORD_READS: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    static LIVE_SCROLLBACK_AUTHORITY_BATCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_READBACK_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_READ_OPEN_HOOK: std::cell::Cell<Option<fn(&std::path::Path)>> = const { std::cell::Cell::new(None) };
     static LIVE_SCROLLBACK_WAL_RECORD_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CHAIN_LINK_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1471,8 +1475,10 @@ impl ChecksumVerifiedAppendWal {
     }
 }
 
-/// Only the context-free identity checks are memoized. Every filesystem read,
-/// checksum, current key authorization, manifest and store check stays live.
+/// Only the context-free identity checks are memoized. Every untrusted WAL
+/// decode recomputes its checksum; fresh publication readbacks instead prove
+/// exact equality with the validated serialization. Current key authorization,
+/// filesystem, manifest and store checks stay live.
 /// Two fixed-size entries cover the current and predecessor WAL; no ciphertext
 /// is retained. The checksum view binds every identity-validator input (the
 /// checksum claim itself is independently verified by the owned proof above).
@@ -3589,17 +3595,34 @@ impl LiveScrollbackSpillSink {
                 "append WAL target ledger digest or byte count mismatch"
             );
         } else {
-            for (offset, record) in wal.records().enumerate() {
-                let sequence = wal
-                    .appended_sequence
-                    .checked_add(u64::try_from(offset)?)
-                    .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
-                anyhow::ensure!(
-                    live_scrollback_authority_record_at(store, wal.ledger_pane_id, sequence)?
-                        == record,
-                    "append WAL exact target row mismatch"
-                );
-            }
+            let count = wal.records().count();
+            anyhow::ensure!(
+                count <= LIVE_SCROLLBACK_APPEND_MAX_ROWS,
+                "append WAL exact target row count exceeds limit"
+            );
+            let end = wal
+                .appended_sequence
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL exact target sequence overflows"))?;
+            // The caller holds the store lock: cloned ledger descriptors share
+            // their seek position. Read the batch through one bounded reader,
+            // retaining exact equality for every row, including the final row.
+            // Use the WAL's hard size cap rather than trusting its claimed size.
+            let max_stored_bytes = LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("append WAL read byte budget overflows"))?;
+            #[cfg(test)]
+            LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get() + 1));
+            let records = store.lines_range(
+                wal.ledger_pane_id,
+                wal.appended_sequence..end,
+                count,
+                max_stored_bytes,
+            )?;
+            anyhow::ensure!(
+                records.len() == count && records.iter().map(String::as_str).eq(wal.records()),
+                "append WAL exact target row mismatch"
+            );
         }
         anyhow::ensure!(
             store.retained_record_bytes(wal.ledger_pane_id) == wal.target_retained_record_bytes,
@@ -4203,10 +4226,21 @@ impl LiveScrollbackSpillSink {
                 file.write_all(&bytes)?;
                 file.sync_all()?;
             }
-            anyhow::ensure!(
-                Self::read_append_wal(&stage_path)?.as_ref() == Some(wal),
-                "deterministic append WAL stage changed before publication"
-            );
+            #[cfg(test)]
+            if LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.get() == 1) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&stage_path)?
+                    .write_all(b" ")?;
+            }
+            if stage_is_exact {
+                anyhow::ensure!(
+                    Self::read_append_wal(&stage_path)?.as_ref() == Some(wal),
+                    "deterministic append WAL stage changed before publication"
+                );
+            } else {
+                Self::verify_append_wal_readback(&stage_path, &bytes)?;
+            }
             #[cfg(not(windows))]
             std::fs::File::open(parent)?.sync_all()?;
 
@@ -4215,15 +4249,29 @@ impl LiveScrollbackSpillSink {
                 .with_context(|| format!("publish append WAL {}", active_path.display()))?;
             #[cfg(not(windows))]
             std::fs::File::open(parent)?.sync_all()?;
-            let published = Self::read_checksum_verified_append_wal(&active_path)?
-                .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
-            anyhow::ensure!(published.wal == *wal, "published append WAL changed");
-            Self::authenticate_append_wal(&published.wal, &keyring)?;
+            #[cfg(test)]
+            if LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.get() == 2) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&active_path)?
+                    .write_all(b" ")?;
+            }
+            let checksum = if stage_is_exact {
+                let published = Self::read_checksum_verified_append_wal(&active_path)?
+                    .ok_or_else(|| anyhow::anyhow!("published append WAL disappeared"))?;
+                anyhow::ensure!(published.wal == *wal, "published append WAL changed");
+                published.checksum
+            } else {
+                Self::verify_append_wal_readback(&active_path, &bytes)?;
+                decode_live_scrollback_canonical_digest(&wal.wal_sha256, "append WAL checksum")?
+            };
+            Self::authenticate_append_wal(wal, &keyring)?;
             // The immutable input passed full identity validation above.
-            // Exact readback equality transfers that proof to these freshly
-            // checksum-verified bytes only after live authentication succeeds.
+            // Secure exact byte equality transfers that proof to our freshly
+            // written serialization without reparsing or rehashing it. Retained
+            // stages still undergo full decoding and checksum validation.
             let identity = ValidatedAppendWalIdentity {
-                checksum: published.checksum,
+                checksum,
                 durable_pane_id: self.durable_pane_id,
             };
             let mut cache = self
@@ -5687,6 +5735,33 @@ impl LiveScrollbackSpillSink {
     fn read_checksum_verified_append_wal(
         path: &std::path::Path,
     ) -> anyhow::Result<Option<ChecksumVerifiedAppendWal>> {
+        let Some(bytes) = Self::read_private_append_wal_bytes(path)? else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        LIVE_SCROLLBACK_WAL_DECODES.with(|count| count.set(count.get() + 1));
+        let wal: LiveScrollbackAppendWalV1 = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode scrollback append WAL {}", path.display()))?;
+        ChecksumVerifiedAppendWal::verify(wal)
+            .with_context(|| {
+                format!(
+                    "scrollback append WAL checksum failed at {}",
+                    path.display()
+                )
+            })
+            .map(Some)
+    }
+
+    /// Byte equality is useful only to the publisher holding its already
+    /// validated immutable serialization. This grants no decoded WAL authority.
+    fn verify_append_wal_readback(path: &std::path::Path, expected: &[u8]) -> anyhow::Result<()> {
+        let observed = Self::read_private_append_wal_bytes(path)?
+            .ok_or_else(|| anyhow::anyhow!("append WAL readback disappeared"))?;
+        anyhow::ensure!(observed == expected, "append WAL readback bytes changed");
+        Ok(())
+    }
+
+    fn read_private_append_wal_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
         let path_metadata_before = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5753,6 +5828,12 @@ impl LiveScrollbackSpillSink {
                 path.display()
             );
         }
+        #[cfg(test)]
+        LIVE_SCROLLBACK_WAL_READ_OPEN_HOOK.with(|hook| {
+            if let Some(callback) = hook.take() {
+                callback(path);
+            }
+        });
         let mut bytes = Vec::new();
         (&file)
             .take(LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES.saturating_add(1))
@@ -5784,16 +5865,7 @@ impl LiveScrollbackSpillSink {
                 path.display()
             );
         }
-        let wal: LiveScrollbackAppendWalV1 = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decode scrollback append WAL {}", path.display()))?;
-        ChecksumVerifiedAppendWal::verify(wal)
-            .with_context(|| {
-                format!(
-                    "scrollback append WAL checksum failed at {}",
-                    path.display()
-                )
-            })
-            .map(Some)
+        Ok(Some(bytes))
     }
 
     /// A deterministic stage is not authoritative until its complete,
@@ -11605,6 +11677,7 @@ mod tests {
             ));
         }
         reset_authority_record_reads();
+        let batches = LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get);
         assert!(sink.store_scrollback_line(
             isize::try_from(retained_rows).expect("fixture stable row fits isize"),
             &Line::from_text(
@@ -11616,6 +11689,11 @@ mod tests {
             target_retention,
         ));
         let reads = authority_record_reads();
+        assert_eq!(
+            LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get),
+            batches + 2,
+            "prior and current WAL targets each use one bounded batch read"
+        );
         let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
             .expect("read measured v4 manifest")
             .expect("measured v4 manifest exists");
@@ -11635,8 +11713,8 @@ mod tests {
         let short = later_append_authority_reads(8, 16);
         let long = later_append_authority_reads(128, 256);
         assert_eq!(
-            short, 2,
-            "later append reads only prior/current WAL target rows"
+            short, 0,
+            "later append does not issue scalar target-row reads"
         );
         assert_eq!(
             long, short,
@@ -11655,7 +11733,7 @@ mod tests {
         let reads = later_append_authority_reads(retained_rows, target_retention);
         assert_eq!(
             reads,
-            u64::try_from(evicted).expect("fixture eviction count fits u64") + 2,
+            u64::try_from(evicted).expect("fixture eviction count fits u64"),
             "prefix eviction may read each evicted row once and only constant receipt rows"
         );
     }
@@ -11993,6 +12071,57 @@ mod tests {
     }
 
     #[test]
+    fn append_wal_target_bulk_read_preserves_exact_rows_and_rejects_disk_damage() {
+        for rows in [1, 3, LIVE_SCROLLBACK_APPEND_MAX_ROWS] {
+            for damage in ["none", "last-row-byte", "truncated-newline"] {
+                let (_dir, _context, sink, _wal, line) = append_wal_fixture(197, rows + 1);
+                let lines = vec![line; rows];
+                let (prepared, _) =
+                    prepare_later_batch_owned_append_wal_for_test(&sink, 11, &lines, rows + 1);
+                let wal = &prepared.wal;
+                materialize_append_wal_target_for_test(&sink, wal);
+                let store = sink
+                    .lock_store("verify exact target batch fixture")
+                    .unwrap();
+                let path = sink
+                    .manifest_path
+                    .parent()
+                    .unwrap()
+                    .join(format!("{}.log", wal.ledger_pane_id));
+                if damage != "none" {
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    assert_eq!(bytes.last(), Some(&b'\n'));
+                    if damage == "last-row-byte" {
+                        let last_record = wal.records().last().unwrap().as_bytes();
+                        let offset = bytes.len() - 1 - last_record.len();
+                        assert_eq!(&bytes[offset..bytes.len() - 1], last_record);
+                        bytes[offset] ^= 1;
+                    } else {
+                        bytes.pop();
+                    }
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .unwrap();
+                    file.write_all(&bytes).unwrap();
+                    file.sync_all().unwrap();
+                }
+                reset_authority_record_reads();
+                let before = LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get);
+                let result = LiveScrollbackSpillSink::verify_append_wal_target_store(wal, &store);
+                assert_eq!(result.is_ok(), damage == "none", "{rows} rows: {damage}");
+                assert_eq!(authority_record_reads(), 0, "no per-row descriptor reads");
+                assert_eq!(
+                    LIVE_SCROLLBACK_AUTHORITY_BATCH_READS.with(std::cell::Cell::get),
+                    before + 1,
+                    "one bounded batch read regardless of row count"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn append_wal_construction_hashes_each_record_only_once_per_transcript() {
         for (rows, retained, evicted) in [(1, 8, 0), (3, 8, 0), (3, 3, 1)] {
             let (_dir, _context, sink, _wal, line) = append_wal_fixture(195, retained);
@@ -12101,6 +12230,7 @@ mod tests {
         let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
         let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
         sink.persist_prepared_append_wal(&prepared).unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
@@ -12108,12 +12238,17 @@ mod tests {
         );
         assert_eq!(
             LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
-            checksums + 2,
-            "stage and published disk checksums must still be recomputed"
+            checksums,
+            "fresh readbacks must reuse the validated exact serialization"
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get),
+            decodes
         );
         let (_raw_dir, _raw_context, raw_sink, raw, _) = append_wal_fixture(183, 8);
         let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
         let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
         raw_sink.persist_authenticated_append_wal(&raw).unwrap();
         assert_eq!(
             LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
@@ -12121,9 +12256,128 @@ mod tests {
         );
         assert_eq!(
             LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
-            checksums + 3,
-            "raw publication must additionally recompute its input checksum"
+            checksums + 1,
+            "raw publication must still recompute its input checksum"
         );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get),
+            decodes
+        );
+        let active = LiveScrollbackSpillSink::append_wal_path(&raw_sink.manifest_path).unwrap();
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(&active).unwrap(),
+            Some(raw)
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get),
+            decodes + 1
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
+            checksums + 2,
+            "ordinary reopen must still decode and recompute the disk checksum"
+        );
+    }
+
+    #[test]
+    fn append_wal_fresh_readback_rejects_changed_bytes_before_and_after_rename() {
+        for point in [1, 2] {
+            let (_dir, _context, sink, _wal, line) = append_wal_fixture(189 + point, 8);
+            let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
+            LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(point));
+            let result = sink.persist_prepared_append_wal(&prepared);
+            LIVE_SCROLLBACK_WAL_READBACK_FAULT.with(|fault| fault.set(0));
+            let error = result.unwrap_err();
+            assert_eq!(error.outcome_indeterminate(), point == 2);
+            assert!(format!("{:#}", error.source).contains("readback bytes changed"));
+            let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+            let stage =
+                LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
+            assert_eq!(active.exists(), point == 2);
+            // Even semantically harmless whitespace cannot masquerade as the
+            // exact freshly written serialization. The old decoder accepts it,
+            // proving the fast path actually checked bytes, not just metadata.
+            let retained = if point == 1 { stage } else { active };
+            assert_eq!(
+                LiveScrollbackSpillSink::read_append_wal(&retained).unwrap(),
+                Some(prepared.wal.clone())
+            );
+            assert!(
+                sink.append_wal_identity_cache
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none)
+            );
+        }
+    }
+
+    #[test]
+    fn append_wal_retained_stage_keeps_full_validation_and_alternative_format() {
+        let (_dir, _context, sink, _wal, line) = append_wal_fixture(192, 8);
+        let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
+        let stage = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
+        let compact = serde_json::to_vec(&prepared.wal).unwrap();
+        write_private_stage_fixture(&stage, &compact);
+        let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        let decodes = LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get);
+        sink.persist_prepared_append_wal(&prepared).unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
+            checksums + 3
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_DECODES.with(std::cell::Cell::get),
+            decodes + 3
+        );
+        let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+        assert_eq!(std::fs::read(active).unwrap(), compact);
+    }
+
+    #[test]
+    fn append_wal_raw_publication_still_rejects_unverified_input_checksum() {
+        let (_dir, _context, sink, mut raw, _line) = append_wal_fixture(193, 8);
+        raw.wal_sha256 = "0".repeat(64);
+        let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        let error = sink.persist_authenticated_append_wal(&raw).unwrap_err();
+        assert!(!error.outcome_indeterminate());
+        assert!(format!("{:#}", error.source).contains("checksum changed before publication"));
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
+            checksums + 1
+        );
+        assert!(
+            !LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_wal_exact_readback_rejects_replaced_inode_even_with_identical_bytes() {
+        fn replace_opened_inode(path: &std::path::Path) {
+            let bytes = std::fs::read(path).unwrap();
+            std::fs::rename(path, path.with_extension("retained-inode")).unwrap();
+            write_private_stage_fixture(path, &bytes);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readback.json");
+        let expected = b"private readback canary";
+        write_private_stage_fixture(&path, expected);
+        LIVE_SCROLLBACK_WAL_READ_OPEN_HOOK.with(|hook| hook.set(Some(replace_opened_inode)));
+        let result = LiveScrollbackSpillSink::verify_append_wal_readback(&path, expected);
+        LIVE_SCROLLBACK_WAL_READ_OPEN_HOOK.with(|hook| hook.set(None));
+        assert!(
+            result.is_err(),
+            "identical bytes cannot bypass pinned inode checks"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), expected);
     }
 
     #[test]

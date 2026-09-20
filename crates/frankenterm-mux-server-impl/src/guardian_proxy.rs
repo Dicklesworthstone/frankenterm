@@ -10087,6 +10087,11 @@ mod tests {
     }
 
     fn capture_record_checkpoint_fixture() -> RecordCheckpointFixture {
+        // Registered LocalPane parser actions reserve real alert delivery.
+        // Keep this scheduler generation alive through capture and delivery,
+        // serialized with the other process-global scheduler fixtures.
+        let _global_state = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
         let payload = b"guardian-checkpoint-base".to_vec();
         let (sender, receiver) = sync_channel(1);
         let (delivered_sender, delivered_receiver) = sync_channel(1);
@@ -10167,12 +10172,39 @@ mod tests {
             GuardianCheckpointDescriptorV1::from_live_capture(&capture, identity().generation())
                 .expect("bind checkpoint fixture descriptor");
         let checkpoint = Zeroizing::new(capture.terminal_checkpoint().canonical_payload().to_vec());
+        let restored = TerminalCheckpointV3::decode_canonical_json(
+            &checkpoint,
+            TerminalCheckpointLimits::default(),
+        )
+        .expect("validate captured parser fixture")
+        .restore_inert(test_terminal_config())
+        .expect("restore captured parser fixture")
+        .into_live(Box::new(std::io::sink()))
+        .expect("activate captured parser fixture with discard writer");
+        assert_eq!(
+            restored.screen().all_lines()[0].as_str().trim_end(),
+            "guardian-checkpoint-base",
+            "checkpoint must contain the actual admitted parser payload"
+        );
         drop(operation);
         drop(sender);
         mutation_state
             .lock()
             .directives
             .push_back(FakeDirective::Observe(ObservedChildState::Exited(0)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().expect("pump checkpoint fixture alerts") {}
+            let admission = executor.admission_snapshot();
+            if admission.active_tasks == 0 && admission.active_estimated_bytes == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint fixture alerts did not settle"
+            );
+            thread::yield_now();
+        }
         RecordCheckpointFixture {
             capture,
             descriptor,
