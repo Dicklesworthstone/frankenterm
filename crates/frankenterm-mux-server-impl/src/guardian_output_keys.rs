@@ -179,6 +179,49 @@ pub struct GuardianOutputKeyring {
     pending_generation: Option<u64>,
 }
 
+/// Historical authentication cannot mutate or advance the key authority.
+pub(crate) trait GuardianHistoricalKeyLookup {
+    fn cipher_for_key_id(
+        &self,
+        key_id: [u8; 8],
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError>;
+}
+
+/// An independently owned shared lease. It never borrows or reacquires the
+/// process-wide keyring mutex, including while rotation waits for this lease.
+pub(crate) struct GuardianHistoricalAuthority {
+    directory: CapDir,
+    lease: AuthorityFileLease,
+}
+
+impl GuardianHistoricalKeyLookup for GuardianHistoricalAuthority {
+    fn cipher_for_key_id(
+        &self,
+        key_id: [u8; 8],
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        validate_open_authority_lock_file(&self.directory, &self.lease.file)?;
+        historical_cipher(&self.directory, key_id)
+    }
+}
+
+impl GuardianHistoricalKeyLookup for GuardianOutputKeyring {
+    fn cipher_for_key_id(
+        &self,
+        key_id: [u8; 8],
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        GuardianOutputKeyring::cipher_for_key_id(self, key_id)
+    }
+}
+
+impl GuardianHistoricalKeyLookup for std::sync::MutexGuard<'_, GuardianOutputKeyring> {
+    fn cipher_for_key_id(
+        &self,
+        key_id: [u8; 8],
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        GuardianOutputKeyring::cipher_for_key_id(self, key_id)
+    }
+}
+
 /// One serialized persistence operation may authenticate several records with
 /// the same authority. Keep its durable lock lease alive across those lookups,
 /// while every lookup still validates the pinned inode and key inventory.
@@ -208,6 +251,15 @@ impl Drop for GuardianOutputKeyringScope<'_> {
     }
 }
 
+impl GuardianHistoricalKeyLookup for GuardianOutputKeyringScope<'_> {
+    fn cipher_for_key_id(
+        &self,
+        key_id: [u8; 8],
+    ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+        self.keyring.cipher_for_key_id(key_id)
+    }
+}
+
 impl std::fmt::Debug for GuardianOutputKeyring {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -221,6 +273,24 @@ impl std::fmt::Debug for GuardianOutputKeyring {
 }
 
 impl GuardianOutputKeyring {
+    pub(crate) fn historical_authority(
+        shared: &Mutex<Self>,
+    ) -> Result<GuardianHistoricalAuthority, GuardianOutputKeyringError> {
+        let directory = {
+            let keyring = shared
+                .lock()
+                .map_err(|_| GuardianOutputKeyringError::AuthorityChanged)?;
+            if !keyring.use_authority_lock || keyring.scoped_authority.is_some() {
+                return Err(GuardianOutputKeyringError::AuthorityChanged);
+            }
+            keyring.directory.try_clone()?
+        };
+        // Never wait for a filesystem lease while holding the shared mutex.
+        // Rotation may hold that mutex while waiting for earlier readers.
+        let lease = AuthorityFileLease::acquire(&directory, false, false)?;
+        Ok(GuardianHistoricalAuthority { directory, lease })
+    }
+
     /// Return the process-wide guardian output authority for this securely
     /// pinned scrollback store. All live pane sinks sharing the same authority
     /// directory receive the same mutex-protected keyring, so an in-process
@@ -399,18 +469,7 @@ impl GuardianOutputKeyring {
         key_id: [u8; 8],
     ) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
         let _authority_lease = self.acquire_authority_lease(false)?;
-        validate_directory(&self.directory)?;
-        let inventory = inventory(&self.directory)?;
-        if !inventory
-            .activations
-            .iter()
-            .any(|activation| activation.key_id == key_id)
-        {
-            return Err(GuardianOutputKeyringError::UnactivatedKey);
-        }
-        let cipher = load_key(&self.directory, key_id)?.cipher()?;
-        validate_directory(&self.directory)?;
-        Ok(cipher)
+        historical_cipher(&self.directory, key_id)
     }
 
     /// Publish a new active key without altering any existing key or activation
@@ -477,6 +536,24 @@ impl GuardianOutputKeyring {
         validate_directory(&self.directory)?;
         Ok(())
     }
+}
+
+fn historical_cipher(
+    directory: &CapDir,
+    key_id: [u8; 8],
+) -> Result<GuardianOutputCipher, GuardianOutputKeyringError> {
+    validate_directory(directory)?;
+    let inventory = inventory(directory)?;
+    if !inventory
+        .activations
+        .iter()
+        .any(|activation| activation.key_id == key_id)
+    {
+        return Err(GuardianOutputKeyringError::UnactivatedKey);
+    }
+    let cipher = load_key(directory, key_id)?.cipher()?;
+    validate_directory(directory)?;
+    Ok(cipher)
 }
 
 fn open_inventory(
@@ -2212,6 +2289,154 @@ mod tests {
             GuardianOutputKeyring::open_existing_scrollback_sibling(&nonempty_scrollback),
             Err(GuardianOutputKeyringError::UnsafeKeyFile)
         ));
+    }
+
+    #[test]
+    fn historical_authorities_coexist_and_rotation_waits_for_last_reader() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).unwrap();
+        let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback).unwrap();
+        let old_cipher = shared.lock().unwrap().latest_active_cipher().unwrap();
+        let old_key_id = old_cipher.key_id();
+        let first = GuardianOutputKeyring::historical_authority(&shared).unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let second_shared = Arc::clone(&shared);
+        let reader = std::thread::spawn(move || {
+            ready_tx
+                .send(GuardianOutputKeyring::historical_authority(&second_shared))
+                .unwrap();
+        });
+        let second = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                // A mistaken exclusive lease must fail the test, not strand
+                // the second reader behind the first reader during unwind.
+                drop(first);
+                reader.join().unwrap();
+                panic!("historical readers excluded one another: {error}");
+            }
+        };
+        reader.join().unwrap();
+        assert_eq!(
+            first.cipher_for_key_id(old_key_id).unwrap().key_id(),
+            old_key_id
+        );
+        assert_eq!(
+            second.cipher_for_key_id(old_key_id).unwrap().key_id(),
+            old_key_id
+        );
+        assert!(
+            shared.try_lock().is_ok(),
+            "readers must not retain the mutex"
+        );
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (rotated_tx, rotated_rx) = mpsc::sync_channel(1);
+        let rotating_shared = Arc::clone(&shared);
+        let rotation = std::thread::spawn(move || {
+            let mut keyring = rotating_shared.lock().unwrap();
+            started_tx.send(()).unwrap();
+            rotated_tx.send(keyring.rotate()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_two = rotated_rx.recv_timeout(Duration::from_millis(100));
+        drop(first);
+        let while_one = rotated_rx.recv_timeout(Duration::from_millis(100));
+        drop(second);
+        let after_last = rotated_rx.recv_timeout(Duration::from_secs(5));
+        rotation.join().unwrap();
+        assert!(matches!(while_two, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(matches!(while_one, Err(mpsc::RecvTimeoutError::Timeout)));
+        let new_key_id = after_last.unwrap().unwrap();
+        assert_ne!(old_key_id, new_key_id);
+
+        // The batch encoder owns this cipher before releasing the mutex.
+        // Rotation may finish before encoding without invalidating that key.
+        let bytes = b"owned cipher survives concurrent rotation";
+        let authentication = old_cipher.authenticate_scrollback_manifest(bytes).unwrap();
+        let historical = GuardianOutputKeyring::historical_authority(&shared).unwrap();
+        historical
+            .cipher_for_key_id(old_key_id)
+            .unwrap()
+            .verify_scrollback_manifest(&authentication, bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn historical_authority_lookup_never_reacquires_keyring_mutex() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let scrollback = root.path().join("scrollback-lines");
+        std::fs::create_dir(&scrollback).unwrap();
+        let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback).unwrap();
+        let key_id = shared.lock().unwrap().active_key_id();
+        let historical = GuardianOutputKeyring::historical_authority(&shared).unwrap();
+        let mutex_owner = shared.lock().unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let lookup = std::thread::spawn(move || {
+            done_tx
+                .send(
+                    historical
+                        .cipher_for_key_id(key_id)
+                        .map(|cipher| cipher.key_id()),
+                )
+                .unwrap();
+        });
+        let completed_while_locked = done_rx.recv_timeout(Duration::from_secs(5));
+        // Release before joining even on failure, making the inversion
+        // negative control settle instead of deadlocking the test process.
+        drop(mutex_owner);
+        lookup.join().unwrap();
+        assert_eq!(completed_while_locked.unwrap().unwrap(), key_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn historical_authority_rechecks_lock_inventory_and_key_after_acquisition() {
+        for mutation in ["lock", "key", "inventory"] {
+            let root = tempfile::tempdir().unwrap();
+            let scrollback = root.path().join("scrollback-lines");
+            std::fs::create_dir(&scrollback).unwrap();
+            let shared = GuardianOutputKeyring::shared_scrollback_sibling(&scrollback).unwrap();
+            let key_id = shared.lock().unwrap().active_key_id();
+            let historical = GuardianOutputKeyring::historical_authority(&shared).unwrap();
+            historical.cipher_for_key_id(key_id).unwrap();
+            match mutation {
+                "lock" => {
+                    historical
+                        .directory
+                        .rename(
+                            AUTHORITY_LOCK_NAME,
+                            &historical.directory,
+                            ".retained-authority-lock",
+                        )
+                        .unwrap();
+                    create_private_file(&historical.directory, AUTHORITY_LOCK_NAME).unwrap();
+                }
+                "key" => {
+                    let mut options = CapOpenOptions::new();
+                    options.write(true).follow(FollowSymlinks::No);
+                    let mut key = historical
+                        .directory
+                        .open_with(key_name(key_id), &options)
+                        .unwrap();
+                    key.write_all(&[0x5a; GuardianOutputCipher::KEY_BYTES])
+                        .unwrap();
+                    key.sync_all().unwrap();
+                }
+                "inventory" => {
+                    create_private_file(&historical.directory, "unexpected-entry").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(historical.cipher_for_key_id(key_id).is_err(), "{mutation}");
+        }
     }
 
     #[test]

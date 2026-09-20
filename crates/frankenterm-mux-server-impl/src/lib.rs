@@ -3321,7 +3321,7 @@ impl LiveScrollbackSpillSink {
 
     fn authenticate_append_wal(
         wal: &LiveScrollbackAppendWalV1,
-        keyring: &guardian_output_keys::GuardianOutputKeyring,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
     ) -> anyhow::Result<()> {
         let authentication =
             mux::guardian_output_journal::GuardianScrollbackAppendWalAuthentication::parse(
@@ -3946,13 +3946,11 @@ impl LiveScrollbackSpillSink {
         let mut publication_attempted = false;
         let result = (|| -> anyhow::Result<()> {
             Self::validate_append_wal_identity(wal, self.durable_pane_id)?;
-            // The caller serializes this sink's mutation. Its store is
-            // pane-local; hold the shared key authority only for this bounded
-            // publication, including acknowledgement of the published bytes.
-            let mut keyring = self
-                .lock_keyring("persist append WAL authentication")
-                .map_err(anyhow::Error::new)?;
-            let keyring = keyring.scoped_authority()?;
+            // The caller serializes this sink's mutation. Historical key
+            // authentication needs a shared lease, not the process-wide
+            // mutex or an exclusive rotation lease through pane-local I/O.
+            let keyring =
+                guardian_output_keys::GuardianOutputKeyring::historical_authority(&self.keyring)?;
             Self::authenticate_append_wal(wal, &keyring)?;
             anyhow::ensure!(
                 wal.wal_sha256 == Self::append_wal_checksum(wal)?,
@@ -4158,10 +4156,8 @@ impl LiveScrollbackSpillSink {
             &self.manifest_path,
         )?;
         {
-            let mut keyring = self
-                .lock_keyring("advance append WAL supersession authentication")
-                .map_err(anyhow::Error::new)?;
-            let keyring = keyring.scoped_authority()?;
+            let keyring =
+                guardian_output_keys::GuardianOutputKeyring::historical_authority(&self.keyring)?;
             Self::authenticate_append_wal(&active, &keyring)?;
             anyhow::ensure!(
                 Self::authenticate_manifest(&manifest, &keyring)?,
@@ -4257,7 +4253,7 @@ impl LiveScrollbackSpillSink {
 
     fn authenticate_manifest(
         manifest: &LiveScrollbackManifestV1,
-        keyring: &guardian_output_keys::GuardianOutputKeyring,
+        keyring: &dyn guardian_output_keys::GuardianHistoricalKeyLookup,
     ) -> anyhow::Result<bool> {
         let _ledger_pane_id = Self::manifest_ledger_pane_id(manifest)?;
         if !live_scrollback_manifest_is_authenticated(manifest) {
@@ -7334,6 +7330,9 @@ impl LiveScrollbackSpillSink {
             let Ok(cipher) = keyring.latest_active_cipher() else {
                 return false;
             };
+            // The owned cipher remains valid across rotation; encoding this
+            // batch must not exclude other panes from the shared keyring.
+            drop(keyring);
             let mut records = Vec::with_capacity(batch_rows);
             let mut bytes = 0usize;
             for (offset, line) in lines.iter().take(batch_rows).enumerate() {
