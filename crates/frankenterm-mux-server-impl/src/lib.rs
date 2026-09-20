@@ -9978,7 +9978,7 @@ mod tests {
 
     #[cfg(unix)]
     #[derive(Debug)]
-    struct DeferredPaneTestConfig(Arc<dyn ScrollbackSpillSink>);
+    struct DeferredPaneTestConfig(Arc<dyn ScrollbackSpillSink>, usize);
 
     fn deferred_interval(
         sink: &dyn ScrollbackSpillSink,
@@ -10133,7 +10133,7 @@ mod tests {
             wezterm_term::color::ColorPalette::default()
         }
         fn scrollback_size(&self) -> usize {
-            4096
+            self.1
         }
         fn scrollback_tier_config(&self) -> wezterm_term::config::ScrollbackTierConfig {
             wezterm_term::config::ScrollbackTierConfig {
@@ -10148,7 +10148,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn deferred_test_pane(sink: Arc<dyn ScrollbackSpillSink>) -> Arc<dyn mux::pane::Pane> {
+    fn deferred_test_pane(
+        sink: Arc<dyn ScrollbackSpillSink>,
+        scrollback_rows: usize,
+    ) -> Arc<dyn mux::pane::Pane> {
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 4,
@@ -10170,7 +10173,7 @@ mod tests {
                 pixel_height: 4,
                 dpi: 96,
             },
-            Arc::new(DeferredPaneTestConfig(sink)),
+            Arc::new(DeferredPaneTestConfig(sink, scrollback_rows)),
             "FrankenTerm",
             "deferred-test",
             Box::new(Vec::<u8>::new()),
@@ -10198,7 +10201,7 @@ mod tests {
             (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS + 38, 4),
         ] {
             let (_dir, backing, deferred) = deferred_test_sink();
-            let pane = deferred_test_pane(deferred);
+            let pane = deferred_test_pane(deferred, row_count + 1);
             let mut corpus = String::new();
             for row in 0..row_count {
                 use std::fmt::Write as _;
@@ -10235,7 +10238,7 @@ mod tests {
             } else {
                 backing.clone()
             };
-            let pane = deferred_test_pane(Arc::clone(&sink));
+            let pane = deferred_test_pane(Arc::clone(&sink), 4096);
             let lease = acquire_live_scrollback_filesystem_mutation_lease(
                 backing.manifest_path.parent().unwrap(),
                 false,
@@ -10325,7 +10328,7 @@ mod tests {
     #[cfg(unix)]
     fn deferred_scrollback_parser_backpressure_is_readable_and_close_cancellable() {
         let (_dir, backing, deferred) = deferred_test_sink();
-        let pane = deferred_test_pane(deferred.clone());
+        let pane = deferred_test_pane(deferred.clone(), 4096);
         std::fs::write(&backing.manifest_path, b"invalid retained authority").unwrap();
         let mut actions = Vec::new();
         termwiz::escape::parser::Parser::new().parse(
@@ -10529,23 +10532,29 @@ mod tests {
     #[test]
     fn ledger_eviction_read_ahead_matches_scalar_projection_and_retention_shrink() {
         use frankenterm_core::storage::mmap_store::{MmapScrollbackStore, MmapStoreConfig};
-        for (append_count, retention, expected_reads) in [(1024, 2048, 1), (32, 64, 2)] {
+        for (retained, append_count, retention, expected_reads) in [
+            (2048, 1024, 2048, 1),
+            (2048, 32, 64, 1),
+            (2 * LIVE_SCROLLBACK_APPEND_MAX_ROWS, 32, 64, 2),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut store =
                 MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).unwrap();
-            let records: Vec<_> = (0..2048).map(|index| format!("old-{index}-界")).collect();
-            for chunk in records.chunks(1024) {
+            let records: Vec<_> = (0..retained)
+                .map(|index| format!("old-{index}-界"))
+                .collect();
+            for chunk in records.chunks(LIVE_SCROLLBACK_APPEND_MAX_ROWS) {
                 store
                     .append_lines(7, &chunk.iter().map(String::as_str).collect::<Vec<_>>())
                     .unwrap();
             }
             let predecessor = VerifiedLedgerState::scan_store(7, &store, [0; 32]).unwrap();
-            let eviction_end = 2048 + append_count - retention;
+            let eviction_end = retained + append_count - retention;
             let mut reader = LedgerEvictionReader::new(&store, predecessor, eviction_end as u64);
             let mut scalar = predecessor;
             let mut batched = predecessor;
             for offset in 0..append_count {
-                let sequence = 2048 + offset as u64;
+                let sequence = retained as u64 + offset as u64;
                 let record = format!("new-{offset}-é");
                 let (expected, expected_evictions) = scalar
                     .project_append(sequence, &record, retention, &store)
@@ -10566,7 +10575,7 @@ mod tests {
             assert_eq!(reader.scalar_reads, 0);
             assert_eq!(
                 store.next_seq(7).unwrap(),
-                2048,
+                retained as u64,
                 "projection never mutates storage"
             );
         }
