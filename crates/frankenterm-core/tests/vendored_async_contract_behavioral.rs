@@ -16,6 +16,13 @@
 //   B21–B23r: Cross-layer integration scenarios
 // =============================================================================
 
+// This integration target is a separate crate: the core library's recursion
+// budget does not apply here. Pooled get_lines proves Send through the nested
+// client timeout/timer futures, exceeding rustc's default trait-solver depth.
+// Keep the actual proof enabled and fail if this bounded budget is insufficient.
+#![recursion_limit = "256"]
+#![deny(recursion_depth_exceeding_limit)]
+
 #[cfg(all(feature = "vendored", unix))]
 use std::error::Error as StdError;
 use std::sync::Arc;
