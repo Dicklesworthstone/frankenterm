@@ -106,6 +106,7 @@ std::thread_local! {
     };
     static LIVE_SCROLLBACK_WAL_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_SCROLLBACK_WAL_CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_MANIFEST_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_CONTENT_GROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_SCROLLBACK_BATCH_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1436,6 +1437,14 @@ struct LiveScrollbackAppendWalV1 {
 struct ChecksumVerifiedAppendWal {
     wal: LiveScrollbackAppendWalV1,
     checksum: [u8; 32],
+}
+
+/// Construction-only proof for an immutable, locally sealed WAL. The owner
+/// reference prevents moving a preparation to another sink, even one with the
+/// same durable pane identity. Disk reads never manufacture this authority.
+struct PreparedAppendWal<'sink> {
+    owner: &'sink LiveScrollbackSpillSink,
+    wal: LiveScrollbackAppendWalV1,
 }
 
 impl ChecksumVerifiedAppendWal {
@@ -3003,6 +3012,8 @@ impl LiveScrollbackSpillSink {
     }
 
     fn append_wal_checksum(wal: &LiveScrollbackAppendWalV1) -> anyhow::Result<String> {
+        #[cfg(test)]
+        LIVE_SCROLLBACK_WAL_CHECKSUMS.with(|count| count.set(count.get() + 1));
         let view = wal.checksum_view();
         let mut writer = Sha256Writer(Sha256::new());
         serde_json::to_writer(&mut writer, &view)?;
@@ -3791,7 +3802,7 @@ impl LiveScrollbackSpillSink {
         max_retained_rows: usize,
         encrypted_records: &[String],
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
-    ) -> anyhow::Result<(LiveScrollbackAppendWalV1, VerifiedLedgerState)> {
+    ) -> anyhow::Result<(PreparedAppendWal<'_>, VerifiedLedgerState)> {
         let encrypted_record = encrypted_records
             .first()
             .ok_or_else(|| anyhow::anyhow!("append WAL batch is empty"))?;
@@ -3938,28 +3949,58 @@ impl LiveScrollbackSpillSink {
         // The owned WAL's identity and record fields were validated before
         // sealing and have not changed. Replacing the authentication marker
         // preserves the validator's only authentication requirement (Some).
-        // Publication still independently validates identity, MAC and checksum.
+        // Prepared publication retains live MAC and disk validation; the
+        // immutable owned preparation transfers these input-only proofs.
         wal.wal_sha256 = Self::append_wal_checksum(&wal)?;
-        Ok((wal, target_authority))
+        Ok((PreparedAppendWal { owner: self, wal }, target_authority))
     }
 
     fn persist_authenticated_append_wal(
         &self,
         wal: &LiveScrollbackAppendWalV1,
     ) -> Result<(), LiveScrollbackAppendWalPublishError> {
+        let validation = (|| -> anyhow::Result<()> {
+            Self::validate_append_wal_identity(wal, self.durable_pane_id)?;
+            anyhow::ensure!(
+                wal.wal_sha256 == Self::append_wal_checksum(wal)?,
+                "append WAL checksum changed before publication"
+            );
+            Ok(())
+        })();
+        validation.map_err(|source| LiveScrollbackAppendWalPublishError {
+            outcome_indeterminate: false,
+            source,
+        })?;
+        self.publish_validated_append_wal(wal)
+    }
+
+    fn persist_prepared_append_wal(
+        &self,
+        prepared: &PreparedAppendWal<'_>,
+    ) -> Result<(), LiveScrollbackAppendWalPublishError> {
+        if !std::ptr::eq(self, prepared.owner) {
+            return Err(LiveScrollbackAppendWalPublishError {
+                outcome_indeterminate: false,
+                source: anyhow::anyhow!("prepared append WAL belongs to another sink"),
+            });
+        }
+        self.publish_validated_append_wal(&prepared.wal)
+    }
+
+    /// Both entry points prove input identity and checksum before reaching
+    /// here. Authentication and all external state checks remain live.
+    fn publish_validated_append_wal(
+        &self,
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> Result<(), LiveScrollbackAppendWalPublishError> {
         let mut publication_attempted = false;
         let result = (|| -> anyhow::Result<()> {
-            Self::validate_append_wal_identity(wal, self.durable_pane_id)?;
             // The caller serializes this sink's mutation. Historical key
             // authentication needs a shared lease, not the process-wide
             // mutex or an exclusive rotation lease through pane-local I/O.
             let keyring =
                 guardian_output_keys::GuardianOutputKeyring::historical_authority(&self.keyring)?;
             Self::authenticate_append_wal(wal, &keyring)?;
-            anyhow::ensure!(
-                wal.wal_sha256 == Self::append_wal_checksum(wal)?,
-                "append WAL checksum changed before publication"
-            );
             let active_path = Self::append_wal_path(&self.manifest_path)?;
             let stage_path = Self::append_wal_stage_path(&self.manifest_path)?;
             let _parent = active_path
@@ -7448,7 +7489,7 @@ impl LiveScrollbackSpillSink {
                     Err(_) => return false,
                 }
             };
-            if let Err(error) = self.persist_authenticated_append_wal(&wal) {
+            if let Err(error) = self.persist_prepared_append_wal(&wal) {
                 if error.outcome_indeterminate() {
                     if let Ok(mut state) =
                         self.lock_state("store_scrollback_line append WAL quarantine")
@@ -7458,7 +7499,7 @@ impl LiveScrollbackSpillSink {
                 }
                 return false;
             }
-            (Some(wal), target)
+            (Some(wal.wal), target)
         };
         let Ok(mut state) = self.lock_state("store_scrollback_line publish proposed state") else {
             return false;
@@ -10917,6 +10958,17 @@ mod tests {
         line: &Line,
         max_retained_rows: usize,
     ) -> (LiveScrollbackAppendWalV1, LiveScrollbackSpillState) {
+        let (prepared, state) =
+            prepare_later_row_owned_append_wal_for_test(sink, stable_row, line, max_retained_rows);
+        (prepared.wal, state)
+    }
+
+    fn prepare_later_row_owned_append_wal_for_test<'sink>(
+        sink: &'sink LiveScrollbackSpillSink,
+        stable_row: wezterm_term::StableRowIndex,
+        line: &Line,
+        max_retained_rows: usize,
+    ) -> (PreparedAppendWal<'sink>, LiveScrollbackSpillState) {
         let previous_state = *sink
             .lock_state("prepare test append WAL predecessor")
             .expect("lock test append WAL predecessor state");
@@ -11541,6 +11593,102 @@ mod tests {
         overwrite_private_append_wal_fixture(&path, &wal);
         sink.advance_authenticated_append_wal_supersession()
             .unwrap();
+    }
+
+    #[test]
+    fn append_wal_prepared_publication_avoids_only_repeated_input_hashes() {
+        let (_dir, _context, sink, _wal, line) = append_wal_fixture(182, 8);
+        let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
+        let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        sink.persist_prepared_append_wal(&prepared).unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            identities
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
+            checksums + 2,
+            "stage and published disk checksums must still be recomputed"
+        );
+        let (_raw_dir, _raw_context, raw_sink, raw, _) = append_wal_fixture(183, 8);
+        let identities = LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get);
+        let checksums = LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get);
+        raw_sink.persist_authenticated_append_wal(&raw).unwrap();
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_IDENTITY_VALIDATIONS.with(std::cell::Cell::get),
+            identities + 1
+        );
+        assert_eq!(
+            LIVE_SCROLLBACK_WAL_CHECKSUMS.with(std::cell::Cell::get),
+            checksums + 3,
+            "raw publication must additionally recompute its input checksum"
+        );
+    }
+
+    #[test]
+    fn append_wal_prepared_publication_rejects_same_identity_foreign_sink_and_stage() {
+        let (_dir, context, sink, wal, line) = append_wal_fixture(184, 8);
+        let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = LiveScrollbackSpillSink::new(other_dir.path().to_path_buf(), &context).unwrap();
+        let error = other.persist_prepared_append_wal(&prepared).unwrap_err();
+        assert!(!error.outcome_indeterminate());
+        assert!(format!("{error:#}").contains("another sink"));
+        assert!(
+            !LiveScrollbackSpillSink::append_wal_stage_path(&other.manifest_path)
+                .unwrap()
+                .exists()
+        );
+
+        let mut occupied = wal;
+        occupied.max_retained_rows += 1;
+        seal_append_wal_fixture(&sink, &mut occupied);
+        let stage = LiveScrollbackSpillSink::append_wal_stage_path(&sink.manifest_path).unwrap();
+        write_complete_append_wal_fixture(&stage, &occupied);
+        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        assert!(!error.outcome_indeterminate());
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(&stage).unwrap(),
+            Some(occupied)
+        );
+    }
+
+    #[test]
+    fn append_wal_prepared_publication_keeps_live_keys_and_indeterminate_failure() {
+        let (_dir, _context, sink, _wal, line) = append_wal_fixture(185, 8);
+        let (prepared, _) = prepare_later_row_owned_append_wal_for_test(&sink, 11, &line, 8);
+        let (_other_dir, _other_context, other, _, _) = append_wal_fixture(186, 8);
+        {
+            let mut keys = sink.keyring.lock().unwrap();
+            let mut other_keys = other.keyring.lock().unwrap();
+            std::mem::swap(&mut *keys, &mut *other_keys);
+        }
+        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        assert!(!error.outcome_indeterminate());
+        assert!(format!("{error:#}").contains("append WAL guardian key"));
+        let active = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path).unwrap();
+        assert!(
+            LiveScrollbackSpillSink::read_append_wal(&active)
+                .unwrap()
+                .is_none()
+        );
+        {
+            let mut keys = sink.keyring.lock().unwrap();
+            let mut other_keys = other.keyring.lock().unwrap();
+            std::mem::swap(&mut *keys, &mut *other_keys);
+        }
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = sink.append_wal_identity_cache.lock().unwrap();
+            panic!("test prepared publication cache poison");
+        }));
+        assert!(poison.is_err());
+        let error = sink.persist_prepared_append_wal(&prepared).unwrap_err();
+        assert!(error.outcome_indeterminate());
+        assert_eq!(
+            LiveScrollbackSpillSink::read_append_wal(&active).unwrap(),
+            Some(prepared.wal)
+        );
     }
 
     #[test]
