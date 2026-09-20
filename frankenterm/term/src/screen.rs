@@ -7078,14 +7078,14 @@ impl Screen {
 
     fn rewrap_lines(
         &mut self,
-        physical_cols: usize,
-        physical_rows: usize,
+        physical_size: (usize, usize),
         cursor: (usize, PhysRowIndex),
         seqno: SequenceNo,
         verified: Option<VerifiedPreparedResize>,
         selection_anchors: &mut SelectionAnchorRegistry,
         saved_cursor: &mut Option<(usize, PhysRowIndex)>,
     ) -> (usize, PhysRowIndex) {
+        let (physical_cols, physical_rows) = physical_size;
         let (cursor_x, cursor_y) = cursor;
         self.invalidate_coordinate_witnesses();
         let started = Instant::now();
@@ -7733,8 +7733,7 @@ impl Screen {
             if self.allow_scrollback {
                 if self.needs_rewrap_for_width_change(physical_cols) {
                     self.rewrap_lines(
-                        physical_cols,
-                        physical_rows,
+                        (physical_cols, physical_rows),
                         (cursor.x, cursor_phys),
                         seqno,
                         verified_wraps,
@@ -15849,8 +15848,7 @@ pub(crate) mod tests {
             Line::new(1),
         ]);
         let cursor = screen.rewrap_lines(
-            3,
-            1,
+            (3, 1),
             (0, 0),
             2,
             None,
@@ -17000,8 +16998,7 @@ pub(crate) mod tests {
             let mut cursor = (logical_x, 0);
             for cols in [3, 8, 1, 12, 5, 3] {
                 cursor = screen.rewrap_lines(
-                    cols,
-                    1,
+                    (cols, 1),
                     cursor,
                     2,
                     None,
@@ -17037,8 +17034,7 @@ pub(crate) mod tests {
         let mut cursor = (4, 0);
         for cols in [3, 5, 2, 4, 6, 3] {
             cursor = screen.rewrap_lines(
-                cols,
-                1,
+                (cols, 1),
                 cursor,
                 2,
                 None,

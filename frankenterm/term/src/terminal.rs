@@ -13,7 +13,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// replay. Bump this whenever Performer, width, eviction, reset, or checkpoint
 /// semantics can map the same parsed actions to different terminal state.
 pub const RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID: &str =
-    "frankenterm.term.recovery-replay-semantics.v2";
+    "frankenterm.term.recovery-replay-semantics.v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -1197,6 +1197,30 @@ mod tests {
     use crate::{CellAttributes, CursorPosition, Line};
     use proptest::prelude::*;
     use std::sync::Arc;
+
+    #[test]
+    fn saved_wrap_replay_semantics_are_not_compatible_with_v2() {
+        let mut terminal = make_prop_term(4, 10);
+        terminal.advance_bytes(b"\x1b[?69h\x1b[3;6sABCD\x1b[?1049h\x1b[2;9s");
+        let size = terminal.get_size();
+        terminal.resize(TerminalSize { cols: 12, ..size });
+        terminal.advance_bytes(b"\x1b[?1049lZ");
+        let text: Vec<String> = terminal
+            .screen()
+            .all_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(text, vec!["  ABCDZ"]);
+        // V2 did not retain the saved right-margin insertion point. Replaying
+        // these same bytes after resize therefore produced different state;
+        // guardian compatibility must not identify those semantics as current.
+        assert_ne!(
+            RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID,
+            "frankenterm.term.recovery-replay-semantics.v2"
+        );
+    }
 
     #[test]
     fn empty_action_flush_preserves_semantic_generation() {
