@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 202,
-        "fix": 264,
+        "fix": 265,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 104
       },
-      "fork_side_commit_count": 696,
+      "fork_side_commit_count": 697,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T02:28:22-04:00",
-        "sha": "05aff63a842f99c5f312bf5697018bc0890ca5cb",
-        "subject": "fix(term): preserve saved insertion points through resize and checkpoints"
+        "committed_at": "2026-09-20T05:55:58-04:00",
+        "sha": "124e9263fc715de4dce6bd1e2c0a8ba570e73e93",
+        "subject": "fix(recovery): authenticate historical migration and bound read retries"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 58,
-        "fix": 131,
+        "fix": 132,
         "other": 60,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 70
       },
-      "fork_side_commit_count": 353,
+      "fork_side_commit_count": 354,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-20T02:48:39-04:00",
-        "sha": "3afae2d5fb3ec97451013ab7acb6ed01e466ff06",
-        "subject": "test(term): format checkpoint endpoint refusal diagnostics explicitly"
+        "classification": "fix",
+        "committed_at": "2026-09-20T05:55:58-04:00",
+        "sha": "124e9263fc715de4dce6bd1e2c0a8ba570e73e93",
+        "subject": "fix(recovery): authenticate historical migration and bound read retries"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2854,
-  "generated_at": "2026-09-20T06:50:50.342704Z",
+  "fork_side_commit_total": 2856,
+  "generated_at": "2026-09-20T10:00:50Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
