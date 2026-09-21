@@ -370,6 +370,7 @@ impl crate::TermWindow {
             self.selection_frame_stamp_for_position(&pos.pane, pos)
         };
         let complete_selection_frame;
+        let frame_hyperlinks;
         /*
         let zone = {
             let dims = pos.pane.get_dimensions();
@@ -739,6 +740,7 @@ impl crate::TermWindow {
                 error: Option<anyhow::Error>,
                 expected_range: std::ops::Range<StableRowIndex>,
                 complete: bool,
+                hyperlinks: crate::selection::FrameHyperlinks,
                 native_password_input: Option<bool>,
             }
 
@@ -772,6 +774,7 @@ impl crate::TermWindow {
                 error: None,
                 expected_range: stable_range.clone(),
                 complete: false,
+                hyperlinks: crate::selection::FrameHyperlinks::new(&pos.pane),
                 native_password_input: native_frame.as_ref().map(|frame| frame.password_input),
             };
 
@@ -781,7 +784,7 @@ impl crate::TermWindow {
                     stable_top: StableRowIndex,
                     line_idx: usize,
                     line: &&mut Line,
-                ) -> anyhow::Result<()> {
+                ) -> anyhow::Result<Vec<crate::selection::HyperlinkSpan>> {
                     let row_offset = StableRowIndex::try_from(line_idx)
                         .context("visible line index exceeds stable row range")?;
                     let stable_row = stable_top
@@ -855,6 +858,11 @@ impl crate::TermWindow {
                         )
                         .unwrap(),
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
+                        pixel_width: NotNan::new(
+                            self.dims.cols as f32
+                                * self.term_window.render_metrics.cell_size.width as f32,
+                        )
+                        .unwrap(),
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,
                     };
@@ -883,11 +891,10 @@ impl crate::TermWindow {
                                 false
                             };
                             if !expired && !hover_changed {
-                                cached_quad
-                                    .layers
-                                    .apply_to(self.layers)
+                                let hyperlinks = cached_quad
+                                    .apply_to_with_hyperlinks(self.layers)
                                     .context("cached_quad.layers.apply_to")?;
-                                Some(cached_quad.expires)
+                                Some((cached_quad.expires, hyperlinks))
                             } else {
                                 None
                             }
@@ -895,12 +902,12 @@ impl crate::TermWindow {
                             None
                         }
                     };
-                    if let Some(expires) = cached_reuse_expires {
+                    if let Some((expires, hyperlinks)) = cached_reuse_expires {
                         if clean_line_can_reuse_cached_quads {
                             self.term_window.record_clean_line_skipped(self.pane_id);
                         }
                         self.term_window.update_next_frame_time(expires);
-                        return Ok(());
+                        return Ok(hyperlinks);
                     }
 
                     let mut buf = HeapQuadAllocator::default();
@@ -928,8 +935,7 @@ impl crate::TermWindow {
                             RenderScreenLineParams {
                                 top_pixel_y: *quad_key.top_pixel_y,
                                 left_pixel_x: self.left_pixel_x,
-                                pixel_width: self.dims.cols as f32
-                                    * self.term_window.render_metrics.cell_size.width as f32,
+                                pixel_width: *quad_key.pixel_width,
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
@@ -974,6 +980,7 @@ impl crate::TermWindow {
                         layers: buf,
                         expires,
                         invalidate_on_hover_change: render_result.invalidate_on_hover_change,
+                        hyperlinks: render_result.hyperlinks.clone(),
                         current_highlight: if render_result.invalidate_on_hover_change {
                             self.term_window.current_highlight.clone()
                         } else {
@@ -986,7 +993,7 @@ impl crate::TermWindow {
                         .borrow_mut()
                         .put(quad_key, quad_value);
 
-                    Ok(())
+                    Ok(render_result.hyperlinks)
                 }
             }
 
@@ -994,8 +1001,24 @@ impl crate::TermWindow {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
                     self.complete = false;
                     for (line_idx, line) in lines.iter().enumerate() {
-                        if let Err(err) = self.render_line(stable_top, line_idx, line) {
-                            self.error.replace(err);
+                        let hyperlinks = match self.render_line(stable_top, line_idx, line) {
+                            Ok(hyperlinks) => hyperlinks,
+                            Err(err) => {
+                                self.error.replace(err);
+                                return;
+                            }
+                        };
+                        if let Some(row) = StableRowIndex::try_from(line_idx)
+                            .ok()
+                            .and_then(|offset| stable_top.checked_add(offset))
+                        {
+                            self.hyperlinks.retain_line(
+                                row,
+                                hyperlinks,
+                                line.is_double_height_top(),
+                                line.is_double_height_bottom(),
+                            );
+                        } else {
                             return;
                         }
                     }
@@ -1026,6 +1049,7 @@ impl crate::TermWindow {
                     .context("error while calling with_lines_mut_and_apply_hyperlinks");
             }
             complete_selection_frame = render.complete;
+            frame_hyperlinks = render.hyperlinks;
         }
 
         /*
@@ -1037,14 +1061,15 @@ impl crate::TermWindow {
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         let selection_frame_after = self.selection_frame_stamp_for_position(&pos.pane, pos);
-        self.pane_state(pane_id)
-            .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?
-            .selection_frame
-            .stage(
-                selection_frame_before,
-                selection_frame_after,
-                complete_selection_frame,
-            );
+        let mut state = self
+            .pane_state(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?;
+        state.selection_frame.stage(
+            selection_frame_before,
+            selection_frame_after,
+            complete_selection_frame,
+        );
+        state.selection_frame.stage_hyperlinks(frame_hyperlinks);
 
         Ok(())
     }

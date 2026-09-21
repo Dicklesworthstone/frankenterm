@@ -71,6 +71,7 @@ impl crate::TermWindow {
             // rendering the top row, so we have nothing more to do here.
             return Ok(RenderScreenLineResult {
                 invalidate_on_hover_change: false,
+                hyperlinks: Vec::new(),
             });
         }
 
@@ -466,6 +467,7 @@ impl crate::TermWindow {
 
         // Number of cells we've rendered, starting from the edge of the line
         let mut visual_cell_idx = 0;
+        let mut hyperlinks = Vec::new();
 
         let mut cluster_x_pos = match direction {
             Direction::LeftToRight => 0.,
@@ -735,12 +737,20 @@ impl crate::TermWindow {
                         }
                     }
                 }
-                visual_cell_idx += info.pos.num_cells as usize;
-                cluster_x_pos += if params.use_pixel_positioning {
+                let advance = if params.use_pixel_positioning {
                     glyph.x_advance.get() as f32 * width_scale
                 } else {
                     info.pos.num_cells as f32 * cell_width
                 };
+                crate::selection::retain_hyperlink_span(
+                    &mut hyperlinks,
+                    cluster.attrs.hyperlink(),
+                    params.left_pixel_x + cluster_x_pos
+                        ..params.left_pixel_x + cluster_x_pos + advance,
+                    params.left_pixel_x..params.left_pixel_x + params.pixel_width,
+                );
+                visual_cell_idx += info.pos.num_cells as usize;
+                cluster_x_pos += advance;
             }
 
             match direction {
@@ -780,6 +790,7 @@ impl crate::TermWindow {
 
         Ok(RenderScreenLineResult {
             invalidate_on_hover_change,
+            hyperlinks,
         })
     }
 

@@ -750,10 +750,133 @@ pub enum PendingSelectionResolution {
     Invalidated,
 }
 
+/// Hyperlink hit targets from the rule-expanded lines actually drawn. Keeping a
+/// weak pane reference prevents a reused pane ID (or address) from inheriting
+/// another incarnation's links without keeping a retired pane alive.
+#[derive(Debug)]
+pub(crate) struct FrameHyperlinks {
+    pane: std::sync::Weak<dyn Pane>,
+    registration: Option<mux::PaneRegistrationHandle>,
+    rows: Vec<(StableRowIndex, Vec<HyperlinkSpan>)>,
+    double_height_bottom: Option<(StableRowIndex, Vec<HyperlinkSpan>)>,
+}
+
+/// Window-pixel hit interval emitted by the glyph layout used for drawing.
+/// Cell indices cannot represent bidi ordering, double-width lines, ligatures,
+/// or proportional positioning. Mouse movement must never reshape the source.
+#[derive(Clone, Debug)]
+pub(crate) struct HyperlinkSpan {
+    left: f32,
+    right: f32,
+    link: Arc<termwiz::hyperlink::Hyperlink>,
+}
+
+pub(crate) fn retain_hyperlink_span(
+    spans: &mut Vec<HyperlinkSpan>,
+    link: Option<&Arc<termwiz::hyperlink::Hyperlink>>,
+    occupied: Range<f32>,
+    clip: Range<f32>,
+) {
+    let Some(link) = link else { return };
+    if !occupied.start.is_finite()
+        || !occupied.end.is_finite()
+        || !clip.start.is_finite()
+        || !clip.end.is_finite()
+    {
+        return;
+    }
+    let left = occupied.start.max(clip.start);
+    let right = occupied.end.min(clip.end);
+    if left < right {
+        if let Some(previous) = spans.last_mut() {
+            if Arc::ptr_eq(&previous.link, link) && left <= previous.right && previous.left <= right
+            {
+                previous.left = previous.left.min(left);
+                previous.right = previous.right.max(right);
+                return;
+            }
+        }
+        spans.push(HyperlinkSpan {
+            left,
+            right,
+            link: Arc::clone(link),
+        });
+    }
+}
+
+impl FrameHyperlinks {
+    pub(crate) fn new(pane: &Arc<dyn Pane>) -> Self {
+        Self {
+            pane: Arc::downgrade(pane),
+            registration: pane.mux_registration_slot().load(),
+            rows: Vec::new(),
+            double_height_bottom: None,
+        }
+    }
+
+    pub(crate) fn retain_line(
+        &mut self,
+        row: StableRowIndex,
+        mut spans: Vec<HyperlinkSpan>,
+        double_height_top: bool,
+        double_height_bottom: bool,
+    ) {
+        let preceding_top = self.double_height_bottom.take();
+        if double_height_bottom {
+            // The renderer skips this row because the preceding top row drew
+            // both halves. Never invent targets if that top was offscreen.
+            spans = preceding_top
+                .filter(|(expected, _)| *expected == row)
+                .map(|(_, spans)| spans)
+                .unwrap_or_default();
+        }
+        if double_height_top {
+            self.double_height_bottom = row.checked_add(1).map(|next| (next, spans.clone()));
+        }
+        self.rows.push((row, spans));
+    }
+
+    fn link_at(
+        &self,
+        pane: &Arc<dyn Pane>,
+        row: StableRowIndex,
+        pixel_x: f32,
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        let current = pane.mux_registration_slot().load();
+        let same_registration = match (&self.registration, &current) {
+            (Some(expected), Some(current)) => {
+                expected.same_registration(current) && expected.try_with_current(|_| ()).is_some()
+            }
+            // Unregistered embedded panes have allocation identity only. A
+            // later registration must never inherit their displayed targets.
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_registration {
+            return None;
+        }
+        if !self
+            .pane
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, pane))
+        {
+            return None;
+        }
+        let index = self.rows.binary_search_by_key(&row, |(row, _)| *row).ok()?;
+        self.rows[index]
+            .1
+            .iter()
+            .find(|span| pixel_x >= span.left && pixel_x < span.right)
+            .map(|span| Arc::clone(&span.link))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SelectionFrameState {
     pending: Option<SelectionFrameStamp>,
     presented: Option<SelectionFrameStamp>,
+    pending_hyperlinks: Option<FrameHyperlinks>,
+    presented_hyperlinks: Option<FrameHyperlinks>,
 }
 
 impl SelectionFrameState {
@@ -762,6 +885,7 @@ impl SelectionFrameState {
     }
     pub fn begin_attempt(&mut self) {
         self.pending = None;
+        self.pending_hyperlinks = None;
     }
     pub fn stage(
         &mut self,
@@ -776,7 +900,28 @@ impl SelectionFrameState {
     /// An omitted/incomplete pane must not report its previously displayed stamp.
     pub fn presented(&mut self) -> Option<SelectionFrameStamp> {
         self.presented = self.pending.take();
+        self.presented_hyperlinks = self
+            .pending_hyperlinks
+            .take()
+            .filter(|_| self.presented.is_some());
         self.presented
+    }
+    pub(crate) fn stage_hyperlinks(&mut self, links: FrameHyperlinks) {
+        self.pending_hyperlinks = self.pending.map(|_| links);
+    }
+    pub(crate) fn hyperlink_at(
+        &self,
+        pane: &Arc<dyn Pane>,
+        frame: SelectionFrameStamp,
+        row: StableRowIndex,
+        pixel_x: f32,
+    ) -> Option<Arc<termwiz::hyperlink::Hyperlink>> {
+        if self.presented != Some(frame) {
+            return None;
+        }
+        self.presented_hyperlinks
+            .as_ref()?
+            .link_at(pane, row, pixel_x)
     }
     pub fn for_mouse(&self, current: Option<SelectionFrameStamp>) -> Option<SelectionFrameStamp> {
         self.presented
@@ -1429,6 +1574,388 @@ impl SelectionRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn presented_hyperlinks_survive_local_pane_contention_and_reject_unpresented_frames() {
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 80,
+                dpi: 96,
+                pixel_width: 640,
+                pixel_height: 64,
+            },
+            Arc::new(NativeAnchorTestConfig),
+            "presented-links-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"\x1b]8;;https://explicit.example/\x07explicit\x1b]8;;\x07 https://implicit.example/ plain");
+        terminal.advance_bytes("\r\n\x1b]8;;https://wide.example/\x07界🙂\x1b]8;;\x07 plain\r\n界 https://implicit.example/ plain".as_bytes());
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_402,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_402,
+            [0x36; 16],
+            "presented links test".to_owned(),
+        ));
+        struct ChildGuard(Arc<dyn Pane>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _child = ChildGuard(Arc::clone(&pane));
+        let rules = vec![termwiz::hyperlink::Rule::new(r"https://[a-z.]+/", "$0").unwrap()];
+        let native = pane
+            .downcast_ref::<mux::localpane::LocalPane>()
+            .unwrap()
+            .try_capture_render_frame(None, 0, 0, &rules, false)
+            .unwrap();
+        let frame = SelectionFrameStamp {
+            authority: SelectionAuthority::from_native_frame(&*pane, &native).unwrap(),
+            source_sequence: native.source_sequence,
+            viewport: native.first,
+            geometry: [0; 12],
+        };
+        let collect = || {
+            let mut links = FrameHyperlinks::new(&pane);
+            for (index, line) in native.lines.iter().enumerate() {
+                let mut spans = Vec::new();
+                // The fixture uses a unit-width cell grid; production obtains
+                // these intervals from the actual shaped glyph advances.
+                for cell in line.visible_cells() {
+                    retain_hyperlink_span(
+                        &mut spans,
+                        cell.attrs().hyperlink(),
+                        cell.cell_index() as f32..(cell.cell_index() + cell.width()) as f32,
+                        0.0..native.dimensions.cols as f32,
+                    );
+                }
+                links.retain_line(
+                    native.first + isize::try_from(index).unwrap(),
+                    spans,
+                    false,
+                    false,
+                );
+            }
+            links
+        };
+        let mut frames = SelectionFrameState::default();
+        frames.begin_attempt();
+        frames.stage(Some(frame), Some(frame), true);
+        frames.stage_hyperlinks(collect());
+        assert!(
+            frames
+                .hyperlink_at(&pane, frame, native.first, 0.0)
+                .is_none(),
+            "staging is not presentation"
+        );
+        assert_eq!(frames.presented(), Some(frame));
+        assert_eq!(
+            frames
+                .hyperlink_at(&pane, frame, native.first, 0.0)
+                .unwrap()
+                .uri(),
+            "https://explicit.example/"
+        );
+        assert_eq!(
+            frames
+                .hyperlink_at(&pane, frame, native.first, 9.0)
+                .unwrap()
+                .uri(),
+            "https://implicit.example/"
+        );
+        assert!(
+            frames
+                .hyperlink_at(&pane, frame, native.first, 35.0)
+                .is_none(),
+            "plain text must not inherit a neighboring link"
+        );
+        assert!(
+            native.lines[1].get_cell(1).is_none(),
+            "old exact-cell lookup misses the wide continuation"
+        );
+        for pixel in [0.25, 1.25, 2.25, 3.25] {
+            assert_eq!(
+                frames
+                    .hyperlink_at(&pane, frame, native.first + 1, pixel)
+                    .unwrap()
+                    .uri(),
+                "https://wide.example/",
+                "both halves of CJK and emoji glyphs belong to their OSC8 link"
+            );
+        }
+        assert!(
+            frames
+                .hyperlink_at(&pane, frame, native.first + 1, 4.0)
+                .is_none()
+        );
+        assert!(
+            frames
+                .hyperlink_at(&pane, frame, native.first + 2, 1.0)
+                .is_none(),
+            "plain wide glyph must not inherit the following implicit link"
+        );
+        assert_eq!(
+            frames
+                .hyperlink_at(&pane, frame, native.first + 2, 3.0)
+                .unwrap()
+                .uri(),
+            "https://implicit.example/"
+        );
+
+        // Retained glyph intervals are visual window pixels, not logical
+        // columns. An RTL run can be emitted right-to-left, and a ligature's
+        // advance covers multiple cells. Cache reuse must preserve the same
+        // clipped intervals without re-reading or reshaping the terminal.
+        let explicit = frames
+            .hyperlink_at(&pane, frame, native.first, 0.0)
+            .unwrap();
+        let implicit = frames
+            .hyperlink_at(&pane, frame, native.first, 9.0)
+            .unwrap();
+        let mut coalesced = Vec::new();
+        for occupied in [10.0..20.0, 20.0..30.0, 5.0..12.0] {
+            retain_hyperlink_span(&mut coalesced, Some(&explicit), occupied, 0.0..100.0);
+        }
+        assert_eq!(coalesced.len(), 1, "LTR adjacency and RTL overlap coalesce");
+        assert_eq!((coalesced[0].left, coalesced[0].right), (5.0, 30.0));
+        retain_hyperlink_span(&mut coalesced, Some(&explicit), 35.0..40.0, 0.0..100.0);
+        retain_hyperlink_span(&mut coalesced, Some(&implicit), 40.0..45.0, 0.0..100.0);
+        assert_eq!(
+            coalesced.len(),
+            3,
+            "gaps and different targets must stay separate"
+        );
+        let mut visual_spans = Vec::new();
+        retain_hyperlink_span(
+            &mut visual_spans,
+            Some(&explicit),
+            110.0..130.0,
+            100.0..125.0,
+        );
+        retain_hyperlink_span(
+            &mut visual_spans,
+            Some(&implicit),
+            90.0..110.0,
+            100.0..125.0,
+        );
+        retain_hyperlink_span(
+            &mut visual_spans,
+            Some(&implicit),
+            115.0..115.0,
+            100.0..125.0,
+        );
+        let cached = crate::termwindow::render::LineQuadCacheValue {
+            expires: None,
+            layers: crate::quad::HeapQuadAllocator::default(),
+            current_highlight: None,
+            invalidate_on_hover_change: true,
+            hyperlinks: visual_spans.clone(),
+        };
+        let mut quads = crate::quad::HeapQuadAllocator::default();
+        let mut fresh = FrameHyperlinks::new(&pane);
+        fresh.retain_line(native.first, visual_spans, false, false);
+        let mut reused = FrameHyperlinks::new(&pane);
+        reused.retain_line(
+            native.first,
+            cached
+                .apply_to_with_hyperlinks(&mut crate::quad::TripleLayerQuadAllocator::Heap(
+                    &mut quads,
+                ))
+                .unwrap(),
+            false,
+            false,
+        );
+        for (pixel, expected) in [
+            (99.0, None),
+            (100.0, Some("https://implicit.example/")),
+            (109.5, Some("https://implicit.example/")),
+            (110.0, Some("https://explicit.example/")),
+            (119.5, Some("https://explicit.example/")),
+            (124.5, Some("https://explicit.example/")),
+            (125.0, None),
+        ] {
+            for map in [&fresh, &reused] {
+                assert_eq!(
+                    map.link_at(&pane, native.first, pixel)
+                        .as_ref()
+                        .map(|link| link.uri()),
+                    expected
+                );
+            }
+        }
+
+        let mut double_height = FrameHyperlinks::new(&pane);
+        double_height.retain_line(native.first, cached.hyperlinks.clone(), true, false);
+        double_height.retain_line(native.first + 1, Vec::new(), false, true);
+        assert_eq!(
+            double_height
+                .link_at(&pane, native.first + 1, 115.0)
+                .unwrap()
+                .uri(),
+            "https://explicit.example/"
+        );
+        double_height.retain_line(native.first + 2, Vec::new(), false, true);
+        assert!(
+            double_height
+                .link_at(&pane, native.first + 2, 115.0)
+                .is_none(),
+            "a bottom row without its preceding displayed top has no hit targets"
+        );
+
+        // A submitted but failed replacement cannot change the hit targets.
+        let replacement = SelectionFrameStamp {
+            source_sequence: frame.source_sequence + 1,
+            ..frame
+        };
+        frames.begin_attempt();
+        frames.stage(Some(replacement), Some(replacement), true);
+        frames.stage_hyperlinks(FrameHyperlinks::new(&pane));
+        assert!(
+            frames
+                .hyperlink_at(&pane, replacement, native.first, 0.0)
+                .is_none()
+        );
+        assert!(
+            frames
+                .hyperlink_at(&pane, frame, native.first, 0.0)
+                .is_some()
+        );
+        let mut changed_geometry = frame.geometry;
+        changed_geometry[0] = 1;
+        assert!(frames.displayed_for_geometry(changed_geometry).is_none());
+        let changed_layout = SelectionFrameStamp {
+            authority: SelectionAuthority {
+                sequence: frame.authority.sequence + 1,
+                ..frame.authority
+            },
+            ..frame
+        };
+        assert!(frames.for_mouse(Some(changed_layout)).is_none());
+        assert!(
+            frames
+                .hyperlink_at(&pane, changed_layout, native.first, 0.0)
+                .is_none()
+        );
+        // Pointer identity is checked in addition to the coordinate stamp.
+        let mut wrong_owner = collect();
+        wrong_owner.pane = std::sync::Weak::<mux::localpane::LocalPane>::new();
+        assert!(wrong_owner.link_at(&pane, native.first, 0.0).is_none());
+
+        struct HoldTerminal {
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+        }
+        impl mux::pane::WithPaneLines for HoldTerminal {
+            fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut wezterm_term::Line]) {
+                assert!(!lines.is_empty());
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        let (entered, acquired) = sync_channel(1);
+        let (release, wait_release) = sync_channel(1);
+        let held_pane = Arc::clone(&pane);
+        let first = native.first;
+        let holder = std::thread::spawn(move || {
+            held_pane.with_lines_mut(
+                first..first + 1,
+                &mut HoldTerminal {
+                    entered,
+                    release: wait_release,
+                },
+            );
+        });
+        acquired
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (completed, result) = sync_channel(1);
+        let query_pane = Arc::clone(&pane);
+        let query = std::thread::spawn(move || {
+            // This is a real LocalPane terminal acquisition barrier, not a
+            // synthetic busy flag. The old hit-test path loses the link here.
+            assert!(SelectionAuthority::capture_source(&*query_pane).is_none());
+            struct OldLookup(Option<Arc<termwiz::hyperlink::Hyperlink>>);
+            impl mux::pane::WithPaneLines for OldLookup {
+                fn with_lines_mut(
+                    &mut self,
+                    _: StableRowIndex,
+                    lines: &mut [&mut wezterm_term::Line],
+                ) {
+                    self.0 = lines
+                        .first()
+                        .and_then(|line| line.get_cell(0))
+                        .and_then(|cell| cell.attrs().hyperlink().cloned());
+                }
+            }
+            let mut old = OldLookup(None);
+            query_pane.with_lines_mut_and_apply_hyperlinks(first..first + 1, &rules, &mut old);
+            assert!(
+                old.0.is_none(),
+                "negative control must exercise the busy source"
+            );
+            let displayed = frames.displayed_for_geometry(frame.geometry).unwrap();
+            let link = frames
+                .hyperlink_at(&query_pane, displayed, first, 0.0)
+                .unwrap();
+            completed.send(link.uri().to_owned()).unwrap();
+            frames
+        });
+        let observed = result.recv_timeout(std::time::Duration::from_secs(2));
+        // Always release and reap both threads before asserting the deadline.
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let mut frames = query.join().unwrap();
+        assert_eq!(observed.unwrap(), "https://explicit.example/");
+        assert_eq!(
+            frames.for_mouse(Some(frame)),
+            Some(frame),
+            "hit testing must not alter selection authority"
+        );
+
+        // A successful no-link replacement clears the old target, and an
+        // incomplete submitted pane cannot retain a previous frame's links.
+        assert_eq!(frames.presented(), Some(replacement));
+        assert!(
+            frames
+                .hyperlink_at(&pane, replacement, first, 0.0)
+                .is_none()
+        );
+        frames.begin_attempt();
+        frames.stage(Some(frame), Some(frame), false);
+        frames.stage_hyperlinks(collect());
+        assert_eq!(frames.presented(), None);
+        assert!(frames.hyperlink_at(&pane, frame, first, 0.0).is_none());
+
+        // A real registry binding changes authority even for the same pane
+        // allocation. No process-global mux or config is installed by this test.
+        let unregistered = collect();
+        let owner = Arc::new(mux::Mux::new(None));
+        owner.add_pane(&pane).unwrap();
+        assert!(unregistered.link_at(&pane, first, 0.0).is_none());
+        let registered = collect();
+        assert!(registered.link_at(&pane, first, 0.0).is_some());
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        assert!(registration.retire_if_current());
+        assert!(registered.link_at(&pane, first, 0.0).is_none());
+    }
 
     #[derive(Debug)]
     struct NativeAnchorTestConfig;

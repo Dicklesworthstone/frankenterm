@@ -9,7 +9,7 @@ use ::window::{
 use config::MouseEventAltScreen;
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use mux::Mux;
-use mux::pane::{Pane, WithPaneLines};
+use mux::pane::Pane;
 use mux::tab::SplitDirection;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -17,8 +17,6 @@ use std::ops::Sub;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use termwiz::hyperlink::Hyperlink;
-use termwiz::surface::Line;
 use wezterm_dynamic::ToDynamic;
 use wezterm_term::input::{MouseButton, MouseEventKind as TMEK};
 use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
@@ -943,41 +941,18 @@ impl super::TermWindow {
             }
         }
 
-        struct FindCurrentLink {
-            current: Option<Arc<Hyperlink>>,
-            stable_row: StableRowIndex,
-            column: usize,
-        }
-
-        impl WithPaneLines for FindCurrentLink {
-            fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
-                if stable_top == self.stable_row {
-                    if let Some(line) = lines.get(0) {
-                        if let Some(cell) = line.get_cell(self.column) {
-                            self.current = cell.attrs().hyperlink().cloned();
-                        }
-                    }
+        // Hit test the rule-expanded cells that reached presentation. Reading
+        // the terminal here can drain parser work, lose the link on contention,
+        // or pick a URL that has never been displayed beneath the pointer.
+        let new_highlight = mouse_selection_frame
+            .zip(stable_row)
+            .and_then(|(frame, row)| {
+                if !self.pane_input_ready(&pane) {
+                    return None;
                 }
-            }
-        }
-
-        let new_highlight = stable_row
-            .and_then(|stable_row| {
-                frankenterm_gui::checked_stable_row_range_from_top(stable_row, 1)
-                    .map(|stable_range| (stable_row, stable_range))
-            })
-            .and_then(|(stable_row, stable_range)| {
-                let mut find_link = FindCurrentLink {
-                    current: None,
-                    stable_row,
-                    column,
-                };
-                pane.with_lines_mut_and_apply_hyperlinks(
-                    stable_range,
-                    &self.config.hyperlink_rules,
-                    &mut find_link,
-                );
-                find_link.current
+                self.pane_state(pane.pane_id())?
+                    .selection_frame
+                    .hyperlink_at(&pane, frame, row, event.coords.x as f32)
             });
 
         match (self.current_highlight.as_ref(), new_highlight) {

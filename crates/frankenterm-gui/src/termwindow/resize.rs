@@ -1143,6 +1143,7 @@ mod tests {
                     layers: HeapQuadAllocator::default(),
                     current_highlight: None,
                     invalidate_on_hover_change: false,
+                    hyperlinks: Vec::new(),
                 },
             );
         }
@@ -1173,6 +1174,7 @@ mod tests {
             shape_hash: [0; 16],
             top_pixel_y: NotNan::new(0.0).unwrap(),
             left_pixel_x: NotNan::new(0.0).unwrap(),
+            pixel_width: NotNan::new(640.0).unwrap(),
             phys_line_idx: 0,
             pane_id: 1,
             pane_is_active: true,
@@ -1180,6 +1182,21 @@ mod tests {
             reverse_video: false,
             password_input: false,
         }
+    }
+
+    #[test]
+    fn line_quad_cache_separates_pixel_origin_and_clipping_width() {
+        let fixture = CacheFixture::new(41, 29);
+        fixture.seed();
+        let original = quad_key(41, 29);
+        assert!(fixture.quads.borrow_mut().get(&original).is_some());
+        let mut shifted = original.clone();
+        shifted.left_pixel_x = NotNan::new(100.0).unwrap();
+        assert!(fixture.quads.borrow_mut().get(&shifted).is_none());
+        let mut narrower = original.clone();
+        narrower.pixel_width = NotNan::new(320.0).unwrap();
+        assert!(fixture.quads.borrow_mut().get(&narrower).is_none());
+        assert!(fixture.quads.borrow_mut().get(&original).is_some());
     }
 
     #[test]

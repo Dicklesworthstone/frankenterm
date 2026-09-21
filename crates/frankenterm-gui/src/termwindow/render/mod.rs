@@ -111,6 +111,7 @@ pub struct LineQuadCacheKey {
     pub shape_hash: [u8; 16],
     pub top_pixel_y: NotNan<f32>,
     pub left_pixel_x: NotNan<f32>,
+    pub pixel_width: NotNan<f32>,
     pub phys_line_idx: usize,
     pub pane_id: PaneId,
     pub pane_is_active: bool,
@@ -128,6 +129,17 @@ pub struct LineQuadCacheValue {
     // that we can invalidate when it changes
     pub current_highlight: Option<Arc<Hyperlink>>,
     pub invalidate_on_hover_change: bool,
+    pub(crate) hyperlinks: Vec<crate::selection::HyperlinkSpan>,
+}
+
+impl LineQuadCacheValue {
+    pub(crate) fn apply_to_with_hyperlinks(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<crate::selection::HyperlinkSpan>> {
+        self.layers.apply_to(layers)?;
+        Ok(self.hyperlinks.clone())
+    }
 }
 
 pub struct LineToElementParams<'a> {
@@ -168,6 +180,7 @@ pub struct LineToElementShape {
 
 pub struct RenderScreenLineResult {
     pub invalidate_on_hover_change: bool,
+    pub(crate) hyperlinks: Vec<crate::selection::HyperlinkSpan>,
 }
 
 pub struct RenderScreenLineParams<'a> {
