@@ -108,7 +108,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Offline recovery selects the authenticated checkpoint adoption by its complete
   capture identity, including mux incarnation, generation, effect and sequence.
 
-The `0.15.6` changes remain under release qualification. The 50 ms resize target,
+The `0.15.6-rc.51` candidate remains under release qualification. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.
