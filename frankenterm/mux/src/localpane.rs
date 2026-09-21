@@ -170,6 +170,64 @@ pub enum SelectionAnchorCaptureError {
     SourceChanged,
 }
 
+type SelectionPoints = [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3];
+
+#[derive(Clone, PartialEq)]
+enum ColdSelectionRequest {
+    Capture {
+        floor: SequenceNo,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: SelectionPoints,
+    },
+    Resolve(frankenterm_term::screen::ScreenSelectionAnchor),
+}
+
+#[derive(Clone)]
+enum ColdSelectionValue {
+    Busy,
+    Captured(
+        Result<
+            Option<frankenterm_term::screen::ScreenSelectionAnchor>,
+            SelectionAnchorCaptureError,
+        >,
+    ),
+    Resolved(Option<SelectionPoints>),
+}
+
+#[derive(Clone)]
+struct ColdSelectionReady {
+    floor: SequenceNo,
+    sequence: SequenceNo,
+    dimensions: RenderableDimensions,
+    value: ColdSelectionValue,
+}
+
+// Exactly one gesture/query per pane. Finished work retains only an opaque
+// token or three coordinates; decoded payloads and worker permits never live
+// in this slot. Viewport hydration has independent cancellation authority.
+struct ColdSelectionWork {
+    request: ColdSelectionRequest,
+    cancelled: Arc<AtomicBool>,
+    ready: Option<ColdSelectionReady>,
+}
+
+struct ColdSelectionCompletion {
+    slot: Arc<Mutex<Option<ColdSelectionWork>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for ColdSelectionCompletion {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock();
+        if slot.as_ref().is_some_and(|work| {
+            Arc::ptr_eq(&work.cancelled, &self.cancelled) && work.ready.is_none()
+        }) {
+            *slot = None;
+        }
+    }
+}
+
 type LineLayoutObservation = Mutex<
     Option<(
         frankenterm_term::screen::ScreenCoordinateWitness,
@@ -1411,6 +1469,8 @@ pub struct LocalPane {
     cold_viewport_pending: Arc<Mutex<Option<ColdViewportPending>>>,
     cold_viewport_retry: Arc<AtomicBool>,
     cold_viewport_failure: Arc<Mutex<Option<ColdViewportFailure>>>,
+    cold_selection: Arc<Mutex<Option<ColdSelectionWork>>>,
+    cold_selection_retry: Arc<AtomicBool>,
     line_layout_observation: Arc<LineLayoutObservation>,
     // Serializes complete producer batches, including deferred persistence,
     // without preventing GUI readers or resize workers from taking terminal.
@@ -3922,15 +3982,76 @@ impl LocalPane {
             }
             if !term
                 .screen()
-                .selection_anchor_rows_unchanged_since(&points, expected_sequence)
+                .selection_points_resident_span_unchanged_since(&points, expected_sequence)
             {
                 return Err(SelectionAnchorCaptureError::SourceChanged);
             }
         }
-        // A valid source may not support remapping (alternate screen, cold
-        // coordinates, or a full anchor registry). Ordinary selection remains
-        // valid there; callers must not confuse this with a busy acquisition.
-        Ok(term.screen_mut().capture_selection_anchor(sequence, points))
+        if points
+            .iter()
+            .flatten()
+            .any(|point| point.row < dimensions.scrollback_top)
+        {
+            return Ok(None);
+        }
+        let request = ColdSelectionRequest::Capture {
+            floor: expected_floor,
+            sequence: expected_sequence,
+            dimensions: expected_dimensions,
+            points,
+        };
+        match self.cold_selection_ready(&request, floor, sequence, dimensions, &term) {
+            Some(ColdSelectionValue::Captured(value)) => return value,
+            Some(ColdSelectionValue::Busy) => {
+                if let Some(registration) = self.mux_registration.load() {
+                    retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                }
+                return Err(SelectionAnchorCaptureError::Busy);
+            }
+            _ => {}
+        }
+        let ranges = term
+            .screen()
+            .selection_points_read_ranges(&points)
+            .map_err(|_| {
+                if let Some(registration) = self.mux_registration.load() {
+                    retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                }
+                SelectionAnchorCaptureError::Busy
+            })?;
+        // A presented cold frame commonly already owns the endpoint group.
+        if ranges.len() > 3 {
+            return Err(SelectionAnchorCaptureError::SourceChanged);
+        }
+        // Reuse it only under the exact pane and Screen read authority.
+        if let Some(registration) = self.mux_registration.load() {
+            if let Some(cache) = COLD_VIEWPORT_CACHE.try_lock() {
+                let reads: Vec<_> = cache
+                    .iter()
+                    .filter(|entry| entry.registration == registration.wire_identity())
+                    .map(|entry| entry.read.as_ref())
+                    .collect();
+                if let Ok(Some(anchor)) = term
+                    .screen_mut()
+                    .capture_selection_anchor_with_reads(sequence, points, &reads)
+                {
+                    return Ok(Some(anchor));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return term
+                .screen_mut()
+                .capture_selection_anchor_with_reads(sequence, points, &[])
+                .map_err(|_| {
+                    if let Some(registration) = self.mux_registration.load() {
+                        retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                    }
+                    SelectionAnchorCaptureError::Busy
+                });
+        }
+        self.request_cold_selection(&mut term, request, ranges);
+        Err(SelectionAnchorCaptureError::Busy)
     }
 
     /// Outer None means unavailable; an inner None is an invalid token at the
@@ -3951,8 +4072,390 @@ impl LocalPane {
             .flatten()?;
         let dimensions = terminal_try_get_dimensions(&mut term)?;
         let sequence = term.current_seqno();
-        let points = term.screen().resolve_selection_anchor(anchor, sequence);
-        Some((floor, sequence, dimensions, points))
+        let request = ColdSelectionRequest::Resolve(anchor.clone());
+        match self.cold_selection_ready(&request, floor, sequence, dimensions, &term) {
+            Some(ColdSelectionValue::Resolved(points)) => {
+                return Some((floor, sequence, dimensions, points))
+            }
+            Some(ColdSelectionValue::Busy) => {
+                if let Some(registration) = self.mux_registration.load() {
+                    retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                }
+                return None;
+            }
+            _ => {}
+        }
+        let ranges = match term.screen().selection_anchor_read_ranges(anchor, sequence) {
+            Ok(Some(ranges)) => ranges,
+            Ok(None) => return Some((floor, sequence, dimensions, None)),
+            Err(_) => {
+                if let Some(registration) = self.mux_registration.load() {
+                    retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                }
+                return None;
+            }
+        };
+        if ranges.len() > 3 {
+            return Some((floor, sequence, dimensions, None));
+        }
+        if let Some(registration) = self.mux_registration.load() {
+            if let Some(cache) = COLD_VIEWPORT_CACHE.try_lock() {
+                let reads: Vec<_> = cache
+                    .iter()
+                    .filter(|entry| entry.registration == registration.wire_identity())
+                    .map(|entry| entry.read.as_ref())
+                    .collect();
+                if let Ok(Some(points)) = term
+                    .screen()
+                    .resolve_selection_anchor_with_reads(anchor, sequence, &reads)
+                {
+                    return Some((floor, sequence, dimensions, Some(points)));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return match term
+                .screen()
+                .resolve_selection_anchor_with_reads(anchor, sequence, &[])
+            {
+                Ok(points) => Some((floor, sequence, dimensions, points)),
+                Err(_) => {
+                    if let Some(registration) = self.mux_registration.load() {
+                        retry_cold_viewport(registration, Arc::clone(&self.cold_selection_retry));
+                    }
+                    None
+                }
+            };
+        }
+        self.request_cold_selection(&mut term, request, ranges);
+        None
+    }
+
+    fn cold_selection_ready(
+        &self,
+        request: &ColdSelectionRequest,
+        floor: SequenceNo,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        term: &Terminal,
+    ) -> Option<ColdSelectionValue> {
+        let slot = self.cold_selection.try_lock()?;
+        let work = slot.as_ref()?;
+        let ready = work.ready.as_ref()?;
+        if work.request != *request
+            || work.cancelled.load(Ordering::Acquire)
+            || ready.floor != floor
+            || ready.sequence > sequence
+            || ready.dimensions != dimensions
+        {
+            return None;
+        }
+        let anchor = match (&ready.value, request) {
+            (ColdSelectionValue::Captured(Ok(Some(anchor))), _) => Some(anchor),
+            (ColdSelectionValue::Resolved(Some(_)), ColdSelectionRequest::Resolve(anchor)) => {
+                Some(anchor)
+            }
+            _ => None,
+        };
+        if let Some(anchor) = anchor {
+            // A sink can revoke retained identity without advancing terminal
+            // sequence. Revalidate even an exact-sequence cache hit. Conversely,
+            // unrelated output alone must not force another payload hydration.
+            return Some(
+                match term.screen().selection_anchor_read_ranges(anchor, sequence) {
+                    Ok(Some(_)) => ready.value.clone(),
+                    Err(_) => ColdSelectionValue::Busy,
+                    Ok(None) => match request {
+                        ColdSelectionRequest::Capture { .. } => ColdSelectionValue::Captured(Err(
+                            SelectionAnchorCaptureError::SourceChanged,
+                        )),
+                        ColdSelectionRequest::Resolve(_) => ColdSelectionValue::Resolved(None),
+                    },
+                },
+            );
+        }
+        (ready.sequence == sequence).then(|| ready.value.clone())
+    }
+
+    fn request_cold_selection(
+        &self,
+        term: &mut Terminal,
+        request: ColdSelectionRequest,
+        ranges: Vec<Range<StableRowIndex>>,
+    ) {
+        if ranges.is_empty() || ranges.len() > 3 {
+            return;
+        }
+        let Some(registration) = self.mux_registration.load() else {
+            return;
+        };
+        let retry = Arc::clone(&self.cold_selection_retry);
+        let Some(mut slot) = self.cold_selection.try_lock() else {
+            retry_cold_viewport(registration, retry);
+            return;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|work| work.request == request && work.ready.is_none())
+        {
+            return;
+        }
+        if let Some(previous) = slot.take() {
+            previous.cancelled.store(true, Ordering::Release);
+        }
+        let Some(permit) = crate::pane::LineReadPermit::try_acquire() else {
+            drop(slot);
+            retry_cold_viewport(registration, retry);
+            return;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *slot = Some(ColdSelectionWork {
+            request: request.clone(),
+            cancelled: Arc::clone(&cancelled),
+            ready: None,
+        });
+        drop(slot);
+        let completion = ColdSelectionCompletion {
+            slot: Arc::clone(&self.cold_selection),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let terminal = Arc::clone(&self.terminal);
+        let layout = Arc::clone(&self.line_layout_observation);
+        let worker_registration = registration.clone();
+        let worker_retry = Arc::clone(&retry);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let capture_aborted = Arc::new(AtomicBool::new(false));
+        let abort_for_worker = Arc::clone(&capture_aborted);
+        let abort_for_completion = Arc::clone(&capture_aborted);
+        let worker = permit.start(
+            move || {
+                worker_cancelled.load(Ordering::Acquire) || abort_for_worker.load(Ordering::Acquire)
+            },
+            move |result, _permit| {
+                if abort_for_completion.load(Ordering::Acquire) {
+                    drop(completion);
+                    drop(result);
+                    // A caller-side wake can run before this worker retires its
+                    // slot. Always retain a wake after retirement as well.
+                    retry_cold_viewport(worker_registration, worker_retry);
+                    return;
+                }
+                // Registry mutation and completion publication happen under the
+                // exact live pane lease; no main-thread payload cache is needed.
+                let published = worker_registration
+                    .try_with_current(|pane| {
+                        let Some(mut term) = terminal.try_lock() else {
+                            return false;
+                        };
+                        let Some(mut slot) = completion.slot.try_lock() else {
+                            return false;
+                        };
+                        let Some(work) = slot.as_mut().filter(|work| {
+                            Arc::ptr_eq(&work.cancelled, &completion.cancelled)
+                                && !work.cancelled.load(Ordering::Acquire)
+                        }) else {
+                            return true;
+                        };
+                        let Some(floor) = Self::refresh_line_layout_floor(&layout, &mut term)
+                            .ok()
+                            .flatten()
+                        else {
+                            return false;
+                        };
+                        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+                            return false;
+                        };
+                        let sequence = term.current_seqno();
+                        let invalid = match &request {
+                            ColdSelectionRequest::Capture { .. } => ColdSelectionValue::Captured(
+                                Err(SelectionAnchorCaptureError::SourceChanged),
+                            ),
+                            ColdSelectionRequest::Resolve(_) => ColdSelectionValue::Resolved(None),
+                        };
+                        let capture_current = match &request {
+                            ColdSelectionRequest::Capture {
+                                floor: expected_floor,
+                                sequence: expected_sequence,
+                                dimensions: expected_dimensions,
+                                points,
+                            } => {
+                                floor == *expected_floor
+                                    && dimensions == *expected_dimensions
+                                    && sequence >= *expected_sequence
+                                    && term
+                                        .screen()
+                                        .selection_points_resident_span_unchanged_since(
+                                            points,
+                                            *expected_sequence,
+                                        )
+                            }
+                            ColdSelectionRequest::Resolve(_) => true,
+                        };
+                        let value = if !capture_current {
+                            invalid
+                        } else {
+                            let reads = match &result {
+                                Ok(reads) => reads,
+                                Err(error)
+                                    if error
+                                        .is::<frankenterm_term::screen::ColdReadMetadataBusy>() =>
+                                {
+                                    return false
+                                }
+                                Err(_) => {
+                                    work.ready = Some(ColdSelectionReady {
+                                        floor,
+                                        sequence,
+                                        dimensions,
+                                        value: invalid,
+                                    });
+                                    drop(slot);
+                                    drop(term);
+                                    pane.notify_lines_ready();
+                                    return true;
+                                }
+                            };
+                            for read in reads {
+                                match term.screen().try_validate_line_read(read) {
+                                    Ok(true) => {}
+                                    Ok(false) | Err(_) => return false,
+                                }
+                            }
+                            if reads
+                                .iter()
+                                .any(|read| term.screen().line_read_changes_layout(read))
+                            {
+                                if sequence == SequenceNo::MAX {
+                                    return false;
+                                }
+                                term.increment_seqno();
+                                let published_sequence = term.current_seqno();
+                                for read in reads {
+                                    term.screen_mut()
+                                        .install_line_read_layout(read, published_sequence);
+                                }
+                                // The refresh proves layout, not the original numeric
+                                // gesture. Retry under newly observed authority before
+                                // capturing endpoints or resolving the actual groups.
+                                return false;
+                            }
+                            let refs: Vec<_> = reads.iter().collect();
+                            match &request {
+                                ColdSelectionRequest::Capture { points, .. } => {
+                                    let Ok(anchor) =
+                                        term.screen_mut().capture_selection_anchor_with_reads(
+                                            sequence, *points, &refs,
+                                        )
+                                    else {
+                                        return false;
+                                    };
+                                    ColdSelectionValue::Captured(Ok(anchor))
+                                }
+                                ColdSelectionRequest::Resolve(anchor) => {
+                                    let Ok(points) =
+                                        term.screen().resolve_selection_anchor_with_reads(
+                                            anchor, sequence, &refs,
+                                        )
+                                    else {
+                                        return false;
+                                    };
+                                    if points.is_none() {
+                                        match term
+                                            .screen()
+                                            .selection_anchor_read_ranges(anchor, sequence)
+                                        {
+                                            Ok(_) => {}
+                                            Err(_) => return false,
+                                        }
+                                    }
+                                    ColdSelectionValue::Resolved(points)
+                                }
+                            }
+                        };
+                        work.ready = Some(ColdSelectionReady {
+                            floor,
+                            sequence,
+                            dimensions,
+                            value,
+                        });
+                        drop(slot);
+                        drop(term);
+                        pane.notify_lines_ready();
+                        true
+                    })
+                    .unwrap_or(true);
+                drop(completion);
+                // All decoded reads are destroyed on this blocking worker. The
+                // shared permit bounds combined payload across all three groups.
+                drop(result);
+                if !published {
+                    retry_cold_viewport(worker_registration, worker_retry);
+                }
+            },
+        );
+        let Ok(worker) = worker else {
+            retry_cold_viewport(registration, retry);
+            return;
+        };
+        let mut budget = frankenterm_term::screen::LineReadCaptureBudget::default();
+        let mut plans = Vec::with_capacity(ranges.len());
+        let mut capture_error = None;
+        for range in ranges {
+            match term
+                .screen()
+                .capture_line_read_with_budget(range, &mut budget)
+            {
+                Ok(plan) => plans.push(plan),
+                Err(error) => {
+                    capture_error = Some(error);
+                    break;
+                }
+            }
+        }
+        match capture_error {
+            None => worker.submit(plans),
+            Some(error) => {
+                if !error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
+                    if let Some(floor) =
+                        Self::refresh_line_layout_floor(&self.line_layout_observation, term)
+                            .ok()
+                            .flatten()
+                    {
+                        if let Some(dimensions) = terminal_try_get_dimensions(term) {
+                            if let Some(mut slot) = self.cold_selection.try_lock() {
+                                if let Some(work) = slot
+                                    .as_mut()
+                                    .filter(|work| Arc::ptr_eq(&work.cancelled, &cancelled))
+                                {
+                                    let value = match work.request {
+                                        ColdSelectionRequest::Capture { .. } => {
+                                            ColdSelectionValue::Captured(Err(
+                                                SelectionAnchorCaptureError::SourceChanged,
+                                            ))
+                                        }
+                                        ColdSelectionRequest::Resolve(_) => {
+                                            ColdSelectionValue::Resolved(None)
+                                        }
+                                    };
+                                    work.ready = Some(ColdSelectionReady {
+                                        floor,
+                                        sequence: term.current_seqno(),
+                                        dimensions,
+                                        value,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Earlier plans may already own resident payload. Hand every
+                // captured plan to the admitted worker even when a later
+                // capture failed; cancellation prevents hydration there.
+                capture_aborted.store(true, Ordering::Release);
+                worker.submit(plans);
+                retry_cold_viewport(registration, retry);
+            }
+        }
     }
 
     pub fn try_capture_render_frame(
@@ -5636,6 +6139,8 @@ impl LocalPane {
             cold_viewport_pending: Arc::new(Mutex::new(None)),
             cold_viewport_retry: Arc::new(AtomicBool::new(false)),
             cold_viewport_failure: Arc::new(Mutex::new(None)),
+            cold_selection: Arc::new(Mutex::new(None)),
+            cold_selection_retry: Arc::new(AtomicBool::new(false)),
             line_layout_observation: Arc::new(Mutex::new(None)),
             output_application: Mutex::new(()),
             alert_staging,
@@ -5924,6 +6429,9 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
+        if let Some(work) = self.cold_selection.lock().take() {
+            work.cancelled.store(true, Ordering::Release);
+        }
         if let Some(pending) = self.cold_viewport_pending.lock().take() {
             pending.cancelled.store(true, Ordering::Release);
         }
@@ -9272,6 +9780,86 @@ mod tests {
             viewport.cold_anchor.is_some(),
             "fixture must exercise cold identity"
         );
+        // Exercise the real endpoint worker, not just Screen projection or a
+        // fabricated completion. No selected-span payload cache is retained.
+        COLD_VIEWPORT_CACHE.lock().clear();
+        let (selection_floor, selection_sequence, selection_dimensions) =
+            pane.selection_source_snapshot().unwrap();
+        let selection_points = [
+            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                row,
+                column: Some(0),
+            }),
+            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                row,
+                column: Some(0),
+            }),
+            Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                row,
+                column: Some(5),
+            }),
+        ];
+        assert!(matches!(
+            pane.capture_selection_anchor(
+                selection_floor,
+                selection_sequence,
+                selection_dimensions,
+                selection_points
+            ),
+            Err(SelectionAnchorCaptureError::Busy)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let selection_anchor = loop {
+            while executor.try_tick().unwrap() {}
+            match pane.capture_selection_anchor(
+                selection_floor,
+                selection_sequence,
+                selection_dimensions,
+                selection_points,
+            ) {
+                Ok(Some(anchor)) => break anchor,
+                Err(SelectionAnchorCaptureError::Busy) => {}
+                other => panic!("cold selection capture lost exact gesture: {:?}", other),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cold selection worker did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(
+            pane.cold_selection
+                .lock()
+                .as_ref()
+                .unwrap()
+                .ready
+                .as_ref()
+                .unwrap()
+                .value,
+            ColdSelectionValue::Captured(Ok(Some(_)))
+        ));
+        // A superseded completion may only retire its own generation. This
+        // exercises the production RAII guard used by canceled read workers.
+        let old_cancelled = Arc::new(AtomicBool::new(true));
+        let successor_cancelled = Arc::new(AtomicBool::new(false));
+        let successor = Arc::new(Mutex::new(Some(ColdSelectionWork {
+            request: ColdSelectionRequest::Resolve(selection_anchor.clone()),
+            cancelled: Arc::clone(&successor_cancelled),
+            ready: None,
+        })));
+        drop(ColdSelectionCompletion {
+            slot: Arc::clone(&successor),
+            cancelled: old_cancelled,
+        });
+        assert!(successor
+            .lock()
+            .as_ref()
+            .is_some_and(|work| Arc::ptr_eq(&work.cancelled, &successor_cancelled)));
+        drop(ColdSelectionCompletion {
+            slot: Arc::clone(&successor),
+            cancelled: successor_cancelled,
+        });
+        assert!(successor.lock().is_none());
         for (cols, expected) in [
             (13, "lmnopqrUVWXYZ"),
             (40, "abcde\u{301}fghij界klmnopqrUVWXYZ04"),
@@ -9309,6 +9897,53 @@ mod tests {
             );
             let frame = capture(viewport);
             assert_eq!(frame.lines[0].as_str(), expected);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let resolved = loop {
+                while executor.try_tick().unwrap() {}
+                if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&selection_anchor) {
+                    break points.expect("cold selection identity survives reflow");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold selection projection did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let start_column = match cols {
+                13 => 7,
+                40 => 20,
+                20 => 0,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                resolved[0],
+                Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                    row: frame.first,
+                    column: Some(start_column),
+                })
+            );
+            assert_eq!(resolved[1], resolved[0]);
+            assert_eq!(
+                resolved[2],
+                Some(frankenterm_term::screen::SelectionAnchorCoordinate {
+                    row: frame.first,
+                    column: Some(start_column + 5),
+                })
+            );
+            if cols != 20 {
+                assert!(
+                    matches!(
+                        pane.capture_selection_anchor(
+                            selection_floor,
+                            selection_sequence,
+                            selection_dimensions,
+                            selection_points
+                        ),
+                        Err(SelectionAnchorCaptureError::SourceChanged)
+                    ),
+                    "a stale initial gesture must not become fresh after hydration"
+                );
+            }
             viewport = frame.viewport.unwrap();
             assert!(viewport.cold_anchor.is_some());
             if cols == 13 {
