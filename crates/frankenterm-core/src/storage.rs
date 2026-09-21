@@ -3770,10 +3770,19 @@ impl StorageHandle {
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
 
+        // Retain the dispatcher only for explicitly enabled append telemetry;
+        // do not replace the writer thread's ordinary event routing.
+        let writer_dispatch = tracing::enabled!(
+            target: "frankenterm::append_transaction", tracing::Level::TRACE
+        )
+        .then(|| tracing::dispatcher::get_default(Clone::clone));
         // Spawn writer thread
         let writer_handle = thread::Builder::new()
             .name("ft-storage-writer".to_string())
             .spawn(move || {
+                APPEND_TRANSACTION_DISPATCH.with(|slot| {
+                    *slot.borrow_mut() = writer_dispatch;
+                });
                 let backend = init_result;
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
                 writer_loop(
@@ -15922,6 +15931,219 @@ mod writer_io_scheduler_tests {
         );
     }
 
+    #[derive(Clone)]
+    struct AppendTraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AppendTraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn append_trace_subscriber(
+        buffer: &AppendTraceBuffer,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let buffer = buffer.clone();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,frankenterm::append_transaction=trace")
+            .with_writer(move || buffer.clone())
+            .finish()
+    }
+
+    fn append_trace_rows(buffer: &AppendTraceBuffer) -> Vec<serde_json::Value> {
+        let bytes = buffer.0.lock().expect("trace buffer").clone();
+        let text = String::from_utf8(bytes).expect("UTF-8 diagnostic");
+        assert!(!text.contains("fixture-private-payload"));
+        text.lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("JSON event")["fields"]
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn append_transaction_trace_correlates_real_commits_and_rejects_rollback_members() {
+        let buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = append_trace_subscriber(&buffer);
+        tracing::subscriber::with_default(subscriber, || {
+            let backend = real_writer_backend_with_panes(&[71]);
+            let mut redactors = HashMap::new();
+            let single = append_segment_commit_backend(
+                &backend,
+                71,
+                "fixture-private-payload",
+                None,
+                None,
+                None,
+                &mut redactors,
+            )
+            .expect("singleton commit");
+            let writes: Vec<_> = ["fixture-private-payload-a", "fixture-private-payload-b"]
+                .into_iter()
+                .map(|content| {
+                    pending_append_segment_from_command(segment_command(71, content))
+                        .ok()
+                        .expect("append command")
+                })
+                .collect();
+            let grouped = append_segment_group_commit_backend(&backend, &writes, &mut redactors)
+                .expect("group commit");
+            set_append_commit_fault_for_test(AppendCommitFaultForTest::GroupAfterRedaction(1));
+            assert!(
+                append_segment_group_commit_backend(&backend, &writes, &mut redactors).is_err()
+            );
+            assert_eq!(
+                query_segments_backend(&backend, 71, 10)
+                    .expect("stored rows")
+                    .len(),
+                3
+            );
+            let rows = append_trace_rows(&buffer);
+            let results: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"] == "append_transaction_result")
+                .collect();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0]["attempted_members"], 1);
+            assert_eq!(results[1]["attempted_members"], 2);
+            assert_eq!(results[2]["attempted_members"], 2);
+            assert_eq!(results[0]["verified_committed"], true);
+            assert_eq!(results[1]["verified_committed"], true);
+            assert_eq!(results[2]["verified_committed"], false);
+            assert!(
+                results
+                    .iter()
+                    .all(|row| row["elapsed_ns"].as_u64().is_some())
+            );
+            assert_ne!(results[0]["transaction_id"], results[1]["transaction_id"]);
+            assert_ne!(results[1]["transaction_id"], results[2]["transaction_id"]);
+            let members: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"] == "append_transaction_member")
+                .collect();
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0]["segment_id"], single.segment.id);
+            assert_eq!(members[0]["transaction_id"], results[0]["transaction_id"]);
+            for (member, committed) in members[1..].iter().zip(&grouped) {
+                assert_eq!(member["segment_id"], committed.segment.id);
+                assert_eq!(member["sequence"], committed.segment.seq);
+                assert_eq!(member["pane_id"], 71);
+                assert_eq!(member["transaction_id"], results[1]["transaction_id"]);
+            }
+        });
+    }
+
+    #[test]
+    fn append_transaction_dispatch_preserves_ordinary_writer_event_routing() {
+        let ordinary_buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let diagnostic_buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let output = ordinary_buffer.clone();
+        let ordinary_subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,frankenterm::ordinary_writer_test=warn")
+            .with_writer(move || output.clone())
+            .finish();
+        let diagnostic = tracing::Dispatch::new(append_trace_subscriber(&diagnostic_buffer));
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(ordinary_subscriber, || {
+                APPEND_TRANSACTION_DISPATCH.with(|slot| *slot.borrow_mut() = Some(diagnostic));
+                let backend = real_writer_backend_with_panes(&[71]);
+                append_segment_commit_backend(
+                    &backend,
+                    71,
+                    "fixture-private-payload",
+                    None,
+                    None,
+                    None,
+                    &mut HashMap::new(),
+                )
+                .expect("real SQLite append under separate diagnostic dispatcher");
+                tracing::warn!(
+                    target: "frankenterm::ordinary_writer_test",
+                    event = "ordinary_writer_event",
+                );
+            });
+        })
+        .join()
+        .expect("routing thread");
+        let ordinary = append_trace_rows(&ordinary_buffer);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0]["event"], "ordinary_writer_event");
+        let diagnostic = append_trace_rows(&diagnostic_buffer);
+        assert_eq!(diagnostic.len(), 2);
+        assert_eq!(diagnostic[0]["event"], "append_transaction_result");
+        assert_eq!(diagnostic[1]["event"], "append_transaction_member");
+    }
+
+    #[test]
+    fn append_transaction_trace_reaches_real_writer_from_scoped_subscriber() {
+        use tracing::instrument::WithSubscriber;
+        let buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = append_trace_subscriber(&buffer);
+        run_storage_async_test(
+            async {
+                let directory = tempfile::tempdir().expect("owned storage directory");
+                let path = directory.path().join("trace.sqlite3");
+                let storage = StorageHandle::new(&path.to_string_lossy())
+                    .await
+                    .expect("open storage");
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 71,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1,
+                        last_seen_at: 1,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed pane");
+                let stored = storage
+                    .append_segment(71, "fixture-private-payload", None)
+                    .await
+                    .expect("real writer response");
+                storage.shutdown().await.expect("join writer");
+                let rows = append_trace_rows(&buffer);
+                let members: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["event"] == "append_transaction_member")
+                    .collect();
+                assert_eq!(
+                    members.len(),
+                    1,
+                    "scoped subscriber must reach the actual writer thread"
+                );
+                assert_eq!(members[0]["segment_id"], stored.id);
+                assert_eq!(members[0]["sequence"], stored.seq);
+                let result = rows
+                    .iter()
+                    .find(|row| row["event"] == "append_transaction_result")
+                    .expect("verified transaction result");
+                assert_eq!(result["verified_committed"], true);
+                assert_eq!(result["attempted_members"], 1);
+                assert_eq!(result["transaction_id"], members[0]["transaction_id"]);
+            }
+            .with_subscriber(subscriber),
+        );
+    }
+
     #[test]
     fn writer_batch_group_commits_consecutive_append_segments_same_pane() {
         run_storage_async_test(async {
@@ -19700,6 +19922,80 @@ struct CommittedAppendSegment {
     retained_tail_moved: bool,
 }
 
+/// Opt-in timings of the verified transaction call, excluding caller queueing,
+/// mirror publication and reply delivery. No payloads or error strings enter
+/// this stream. IDs are process-local, including across writer instances.
+struct AppendTransactionTrace {
+    transaction_id: u64,
+    attempted_members: usize,
+    started: Instant,
+    dispatch: tracing::Dispatch,
+}
+
+std::thread_local! {
+    static APPEND_TRANSACTION_DISPATCH: std::cell::RefCell<Option<tracing::Dispatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl AppendTransactionTrace {
+    fn start(attempted_members: usize) -> Option<Self> {
+        let dispatch = APPEND_TRANSACTION_DISPATCH.with(|slot| slot.borrow().clone());
+        let enabled = || {
+            tracing::enabled!(
+                target: "frankenterm::append_transaction", tracing::Level::TRACE
+            )
+        };
+        let enabled = match dispatch.as_ref() {
+            Some(dispatch) => tracing::dispatcher::with_default(dispatch, enabled),
+            None => enabled(),
+        };
+        if !enabled {
+            return None;
+        }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let transaction_id = NEXT_ID
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
+                id.checked_add(1)
+            })
+            .ok()?;
+        Some(Self {
+            transaction_id,
+            attempted_members,
+            dispatch: dispatch.unwrap_or_else(|| tracing::dispatcher::get_default(Clone::clone)),
+            started: Instant::now(),
+        })
+    }
+
+    fn finish<'a>(self, committed: Option<impl Iterator<Item = &'a Segment>>) {
+        // Capture the duration before formatting or writing any diagnostics.
+        // None is deliberately not named "rolled_back": poisoned/unknown
+        // transaction outcomes must never be promoted to proven rollback.
+        let elapsed_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            tracing::trace!(
+                target: "frankenterm::append_transaction",
+                event = "append_transaction_result",
+                transaction_id = self.transaction_id,
+                attempted_members = self.attempted_members,
+                verified_committed = committed.is_some(),
+                elapsed_ns,
+            );
+            if let Some(segments) = committed {
+                for segment in segments {
+                    tracing::trace!(
+                        target: "frankenterm::append_transaction",
+                        event = "append_transaction_member",
+                        transaction_id = self.transaction_id,
+                        pane_id = segment.pane_id,
+                        sequence = segment.seq,
+                        segment_id = segment.id,
+                    );
+                }
+            }
+        });
+    }
+}
+
 type SegmentRedactorSnapshots = HashMap<u64, Option<SegmentPersistRedactor>>;
 
 fn snapshot_segment_redactors_for_appends(
@@ -19750,6 +20046,7 @@ fn append_segment_commit_backend(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Result<CommittedAppendSegment> {
     let snapshot = segment_redactors.get(&pane_id).cloned();
+    let transaction_trace = AppendTransactionTrace::start(1);
     let result = run_writer_transaction(
         backend,
         // Reserve the writer before redaction and MAX(seq) establish a read
@@ -19781,6 +20078,14 @@ fn append_segment_commit_backend(
         },
     );
 
+    if let Some(trace) = transaction_trace {
+        trace.finish(
+            result
+                .as_ref()
+                .ok()
+                .map(|committed| std::iter::once(&committed.segment)),
+        );
+    }
     if result
         .as_ref()
         .err()
@@ -19809,12 +20114,21 @@ fn append_segment_group_commit_backend(
     // whole segment group is dropped ("Failed to insert segment: ... database
     // is locked" within 350 ms of watcher start, ft-xxfwy.32). Taking the
     // write lock up front makes the writer wait instead.
+    let transaction_trace = AppendTransactionTrace::start(writes.len());
     let result = run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "append segment group commit",
         || append_segment_group_commit_inner(backend, writes, segment_redactors),
     );
+    if let Some(trace) = transaction_trace {
+        trace.finish(
+            result
+                .as_ref()
+                .ok()
+                .map(|committed| committed.iter().map(|value| &value.segment)),
+        );
+    }
     if result
         .as_ref()
         .err()

@@ -365,11 +365,18 @@ mod live_measurement {
 
         pub fn run() -> Result<bool, String> {
             use tracing::instrument::WithSubscriber;
-            // Only numeric, content-free text-transaction events enter the
-            // already retained stderr. No global subscriber or recorder.
+            if tracing::level_filters::STATIC_MAX_LEVEL < tracing::level_filters::LevelFilter::TRACE
+            {
+                return Err("append transaction diagnostics were compiled out".into());
+            }
+            // Numeric, content-free mux and verified append-transaction events
+            // enter retained stderr. Storage carries this scoped dispatcher
+            // only for append telemetry; ordinary writer logs keep their route.
             let subscriber = tracing_subscriber::fmt()
                 .json()
-                .with_env_filter("off,frankenterm::mux_text_diagnostics=trace")
+                .with_env_filter(
+                    "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace",
+                )
                 .with_writer(std::io::stderr)
                 .finish();
             #[cfg(unix)]
