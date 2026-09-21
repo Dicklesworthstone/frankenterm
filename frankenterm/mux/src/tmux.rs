@@ -3476,8 +3476,14 @@ impl TmuxCmdQueue {
         Err(TmuxEnqueueError::Full)
     }
 
-    pub(crate) fn close(&mut self) -> TmuxCmdQueueTeardown {
+    /// Fence all producers before publishing terminal state. Retain admitted
+    /// commands until terminal publication can dispose of them outside locks.
+    fn seal_admission(&mut self) {
         self.closed = true;
+    }
+
+    pub(crate) fn close(&mut self) -> TmuxCmdQueueTeardown {
+        self.seal_admission();
         self.retained_by_class = [0; TmuxCommandClass::COUNT];
         self.durable_since_intent = 0;
         self.intents_since_retry_deferred_durable = 0;
@@ -5237,7 +5243,9 @@ impl TmuxDomainState {
                         obligations,
                     )
                 } else {
+                    let mut queue = self.cmd_queue.lock();
                     let mut state = self.state.lock();
+                    queue.seal_admission();
                     lifecycle.terminalizing = false;
                     lifecycle.terminal = true;
                     lifecycle.clean_exit = requested_clean_exit;
@@ -5283,17 +5291,9 @@ impl TmuxDomainState {
                         Vec::new(),
                     );
                 }
-                {
-                    let mut lifecycle = self.lifecycle.lock();
-                    lifecycle.terminalizing = false;
-                    lifecycle.terminal = true;
-                    lifecycle.clean_exit = true;
-                    lifecycle.io_operation = None;
-                    lifecycle.detach_disposition = TerminalDetachDisposition::NotNeeded;
-                    *self.state.lock() = State::Exit;
-                    self.clean_exit_requested.store(true, Ordering::Release);
-                }
-                self.publish_terminal_transition(true, true);
+                let (first_transition, clean_exit) =
+                    self.claim_clean_terminal_after_split_cleanup();
+                self.publish_terminal_transition(first_transition, clean_exit);
                 return;
             }
             if first_transition {
@@ -5307,6 +5307,27 @@ impl TmuxDomainState {
             return;
         }
         self.publish_terminal_transition(first_transition, authoritative_clean_exit);
+    }
+
+    fn claim_clean_terminal_after_split_cleanup(&self) -> (bool, bool) {
+        let mut lifecycle = self.lifecycle.lock();
+        // Split cleanup runs outside the lifecycle lock. An I/O failure may
+        // already have won the terminal claim while that cleanup was running.
+        // Never replace its failure/detach disposition with a later clean exit.
+        if lifecycle.terminal {
+            return (false, lifecycle.clean_exit);
+        }
+        let mut queue = self.cmd_queue.lock();
+        let mut state = self.state.lock();
+        queue.seal_admission();
+        lifecycle.terminalizing = false;
+        lifecycle.terminal = true;
+        lifecycle.clean_exit = true;
+        lifecycle.io_operation = None;
+        lifecycle.detach_disposition = TerminalDetachDisposition::NotNeeded;
+        *state = State::Exit;
+        self.clean_exit_requested.store(true, Ordering::Release);
+        (true, true)
     }
 
     fn publish_terminal_transition(&self, first_transition: bool, clean_exit: bool) {
@@ -5433,6 +5454,7 @@ impl TmuxDomainState {
                 return;
             }
             let clean_exit = lifecycle.terminalizing_clean_exit;
+            self.cmd_queue.lock().seal_admission();
             lifecycle.terminalizing = false;
             lifecycle.terminal = true;
             lifecycle.clean_exit = clean_exit;
@@ -5603,10 +5625,14 @@ impl TmuxDomainState {
         if lifecycle.terminal {
             return false;
         }
+        // Sender inspection already uses queue -> state; never acquire the
+        // mailbox while retaining a state guard in the opposite order.
+        let mut queue = self.cmd_queue.lock();
         let mut state = self.state.lock();
         if !predicate(&lifecycle, *state) {
             return false;
         }
+        queue.seal_admission();
         lifecycle.terminal = true;
         lifecycle.terminalizing = false;
         lifecycle.clean_exit = false;
@@ -10204,7 +10230,9 @@ mod tests {
         tmux_domain.inner.send_next_command();
 
         wait_until("missing launcher pane terminal outcome", || {
-            *tmux_domain.inner.state.lock() == State::Exit
+            let terminal = tmux_domain.inner.is_terminal();
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            terminal && queue.is_closed() && queue.is_empty()
         });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         assert!(
@@ -10228,7 +10256,9 @@ mod tests {
         tmux_domain.inner.send_next_command();
 
         wait_until("missing mux terminal outcome", || {
-            *tmux_domain.inner.state.lock() == State::Exit
+            let terminal = tmux_domain.inner.is_terminal();
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            terminal && queue.is_closed() && queue.is_empty()
         });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         let queue = tmux_domain.inner.cmd_queue.lock();
@@ -10262,12 +10292,112 @@ mod tests {
         tmux_domain.inner.send_next_command();
 
         wait_until("launcher write failure terminal outcome", || {
-            *tmux_domain.inner.state.lock() == State::Exit
+            // Exit publishes admission refusal first; disposal follows in
+            // the same failure handler after exact compensation settlement.
+            let terminal = tmux_domain.inner.is_terminal();
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            terminal && queue.is_closed() && queue.is_empty()
         });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert!(queue.is_closed());
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn tmux_terminal_claim_refuses_all_producers_before_command_disposal() {
+        #[derive(Debug)]
+        struct DropWitnessCommand {
+            owner: Weak<TmuxDomainState>,
+            drops: Arc<AtomicUsize>,
+            lock_violation: Arc<AtomicBool>,
+        }
+        impl TmuxCommand for DropWitnessCommand {
+            fn mailbox_class(&self) -> TmuxCommandClass {
+                TmuxCommandClass::RequiredControl
+            }
+            fn get_command(&self, _domain_id: DomainId) -> String {
+                "retained-before-terminal\n".into()
+            }
+            fn process_result(
+                &self,
+                _domain_id: DomainId,
+                _result: &Guarded,
+            ) -> anyhow::Result<()> {
+                panic!("terminalized command must never execute")
+            }
+        }
+        impl Drop for DropWitnessCommand {
+            fn drop(&mut self) {
+                let owner = self.owner.upgrade().expect("retained test domain");
+                let lifecycle_available = owner.lifecycle.try_lock().is_some();
+                let queue_available = owner.cmd_queue.try_lock().is_some();
+                let state_available = owner.state.try_lock().is_some();
+                self.lock_violation.fetch_or(
+                    !lifecycle_available || !queue_available || !state_available,
+                    Ordering::Release,
+                );
+                self.drops.fetch_add(1, Ordering::Release);
+            }
+        }
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(311);
+        let inner = &tmux_domain.inner;
+        install_conditional_test_pane(inner, 71, 711, 7, 80, 24);
+        let remote = Arc::clone(inner.remote_panes.lock().get(&71).unwrap());
+        let (reader, _peer) = filedescriptor::socketpair().unwrap();
+        let mut pty = crate::tmux_pty::TmuxPty {
+            domain_id: inner.domain_id,
+            master_pane: remote,
+            reader,
+            cmd_queue: Arc::clone(&inner.cmd_queue),
+            owner: Arc::downgrade(inner),
+        };
+        let mut writer = portable_pty::MasterPty::take_writer(&pty).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let lock_violation = Arc::new(AtomicBool::new(false));
+        inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(DropWitnessCommand {
+                owner: Arc::downgrade(inner),
+                drops: Arc::clone(&drops),
+                lock_violation: Arc::clone(&lock_violation),
+            }))
+            .unwrap();
+
+        assert!(!inner.try_claim_failure_terminal(|_, _| false));
+        assert!(!inner.cmd_queue.lock().is_closed());
+        // These are the two actual failure-handler phases, deliberately
+        // separated without timing, a mock mailbox, or a cancellation hook.
+        assert!(inner.try_claim_failure_terminal(|_, _| true));
+        assert!(inner.is_terminal());
+        assert_eq!(*inner.state.lock(), State::Exit);
+        assert!(inner.begin_active_operation().is_none());
+        assert!(inner.begin_owned_protocol_operation().is_none());
+        assert!(inner.cmd_queue.lock().is_closed());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        assert_eq!(
+            pty.write(b"direct").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            writer.write(b"cloned").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(inner
+            .enqueue_required_batch(vec![Box::new(ListCommands)], "terminal fence test")
+            .is_err());
+        assert_eq!(inner.cmd_queue.lock().len(), 1);
+        assert!(!inner.try_claim_failure_terminal(|_, _| true));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        inner.publish_terminal_transition(true, false);
+        assert!(inner.cmd_queue.lock().is_closed());
+        assert!(inner.cmd_queue.lock().is_empty());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(!lock_violation.load(Ordering::Acquire));
+        inner.publish_terminal_transition(false, false);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(launcher.recorded_writes().is_empty());
     }
 
     #[test]
@@ -10523,6 +10653,66 @@ mod tests {
         );
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+    }
+
+    #[test]
+    fn tmux_clean_split_completion_preserves_first_terminal_claim() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(mux);
+        let failed = new_tmux_domain(193);
+        failed.inner.lifecycle.lock().terminalizing = true;
+        // Deterministically occupy the unlocked split-cleanup interval with
+        // the production failure claim, then execute the actual second claim.
+        let failure_owner = Arc::clone(&failed.inner);
+        assert!(std::thread::spawn(move || {
+            failure_owner.try_claim_failure_terminal(|_, _| true)
+        })
+        .join()
+        .expect("failure claimant must finish"));
+        assert_eq!(
+            failed.inner.claim_clean_terminal_after_split_cleanup(),
+            (false, false)
+        );
+        {
+            let lifecycle = failed.inner.lifecycle.lock();
+            assert!(lifecycle.terminal);
+            assert!(!lifecycle.clean_exit);
+            assert!(matches!(
+                lifecycle.detach_disposition,
+                TerminalDetachDisposition::Pending
+            ));
+        }
+        assert!(!failed.inner.clean_exit_requested.load(Ordering::Acquire));
+        assert_eq!(*failed.inner.state.lock(), State::Exit);
+        assert!(failed.inner.cmd_queue.lock().is_closed());
+        failed.inner.publish_terminal_transition(false, false);
+
+        let clean = new_tmux_domain(194);
+        clean.inner.lifecycle.lock().terminalizing = true;
+        assert_eq!(
+            clean.inner.claim_clean_terminal_after_split_cleanup(),
+            (true, true)
+        );
+        assert_eq!(
+            clean.inner.claim_clean_terminal_after_split_cleanup(),
+            (false, true)
+        );
+        assert!(!clean.inner.try_claim_failure_terminal(|_, _| true));
+        assert!(clean.inner.cmd_queue.lock().is_closed());
+        assert_eq!(
+            clean
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands)),
+            Err(TmuxEnqueueError::Closed)
+        );
+        assert!(matches!(
+            clean.inner.lifecycle.lock().detach_disposition,
+            TerminalDetachDisposition::NotNeeded
+        ));
+        assert!(clean.inner.clean_exit_requested.load(Ordering::Acquire));
+        clean.inner.publish_terminal_transition(true, true);
     }
 
     #[test]
