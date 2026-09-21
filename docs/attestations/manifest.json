@@ -168,11 +168,9 @@
     },
     {
       "category": "proofs/robot-contracts",
-      "path": null,
+      "path": "docs/attestations/proofs/operating-envelope.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-booek.7",
-      "deferred_to_bead": "ft-booek.7",
-      "deferred_reason": "The retained operating-envelope artifact reports pending bundle verification and the producer remains in progress. Refresh the artifact/source inventory and verify the final artifact bytes through the producing-bead checklist before resolving this slot; target-class capacity remains unproven.",
       "proof_categories": [4, 5],
       "description": "Scoped remote operating-envelope read-only admission and fixture-calendar contract proof. Target-class production capacity remains skipped and unproven; this artifact does not authorize service mutation or promote capacity claims."
     },
