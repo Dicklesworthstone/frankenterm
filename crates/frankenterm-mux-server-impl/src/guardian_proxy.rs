@@ -66,6 +66,9 @@ const GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES: u32 = 64 * 1_024;
 const GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS: usize = 2;
 const GUARDIAN_RETIREMENT_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const GUARDIAN_RETIREMENT_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
+const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
+const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const GUARDIAN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy)]
 struct GuardianRestoreBudget<'a> {
@@ -312,7 +315,8 @@ impl Domain for GuardianDomain {
                         "guardian spawn cancelled before connection"
                     );
                     anyhow::ensure!(
-                        *attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                        *attempts < GUARDIAN_CONNECT_ATTEMPTS
+                            && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
                         "guardian birth connection retry admission exhausted"
                     );
                     *attempts += 1;
@@ -327,9 +331,10 @@ impl Domain for GuardianDomain {
                             return Ok(client);
                         }
                         Err(GuardianClientError::Io(_))
-                            if *attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
+                            if *attempts < GUARDIAN_CONNECT_ATTEMPTS
+                                && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET =>
                         {
-                            thread::sleep(Duration::from_millis(10));
+                            thread::sleep(GUARDIAN_CONNECT_RETRY_DELAY);
                         }
                         Err(error) => return Err(anyhow::Error::new(error)),
                     }
@@ -5041,7 +5046,11 @@ impl GuardianProxyLeasePlan {
             );
         }
         let client = if build_authenticated {
-            GuardianClient::connect_for_genesis(socket_path, token_path, census.mux_incarnation())
+            Self::connect_for_build_authenticated_plan(
+                socket_path,
+                token_path,
+                census.mux_incarnation(),
+            )
         } else {
             GuardianClient::connect(socket_path, token_path, census.mux_incarnation())
         }
@@ -5061,6 +5070,37 @@ impl GuardianProxyLeasePlan {
             selected_checkpoint: None,
             recovery_claim: None,
         })
+    }
+
+    fn connect_for_build_authenticated_plan(
+        socket_path: &Path,
+        token_path: &Path,
+        mux_incarnation: Uuid,
+    ) -> Result<GuardianClient, GuardianClientError> {
+        let started = Instant::now();
+        for attempt in 0..GUARDIAN_CONNECT_ATTEMPTS {
+            match GuardianClient::connect_for_genesis(socket_path, token_path, mux_incarnation) {
+                Err(GuardianClientError::Io(error))
+                    if error.kind() == io::ErrorKind::UnexpectedEof
+                        && attempt + 1 < GUARDIAN_CONNECT_ATTEMPTS
+                        && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET =>
+                {
+                    // The guardian deliberately closes a build-bearing Hello
+                    // while its sole protocol authority belongs to a durable
+                    // worker. Retry only this pre-Claim handshake, retaining
+                    // the exact endpoint, mux and compiled-build authority.
+                    // No pane effect or Claim intent has been sent here.
+                    metrics::counter!("mux.guardian_proxy.plan_hello_busy_retry_total")
+                        .increment(1);
+                    thread::sleep(GUARDIAN_CONNECT_RETRY_DELAY);
+                    if started.elapsed() >= GUARDIAN_CONNECT_RETRY_BUDGET {
+                        return Err(GuardianClientError::Io(error));
+                    }
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final build-authenticated Hello attempt returns its result")
     }
 
     /// Bind independently authenticated existing custody to this unpublished
@@ -12098,6 +12138,165 @@ mod tests {
         RejectFirst,
         ReplaceAfterLostReply,
         WrongClaimReply,
+    }
+
+    #[test]
+    fn guardian_build_plan_retries_only_preclaim_hello_eof() {
+        use mux::guardian_protocol::{
+            GUARDIAN_MAX_FRAME_BYTES, GuardianHelloBuildIdentityV1, GuardianOperation,
+            GuardianResponseEnvelope, GuardianSecret, decode_guardian_request,
+            encode_guardian_response,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Authenticated wire fault injection, not a PTY/custody proof. The
+        // real-birth fixture separately exercises the actual guardian worker.
+        fn receive(stream: &mut UnixStream) -> Vec<u8> {
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).expect("Hello prefix");
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length + 4 <= GUARDIAN_MAX_FRAME_BYTES);
+            let mut frame = vec![0; length + 4];
+            frame[..4].copy_from_slice(&prefix);
+            stream.read_exact(&mut frame[4..]).expect("Hello body");
+            frame
+        }
+
+        for (case, expected_attempts) in [
+            ("busy-then-ready", 2),
+            ("exhausted", GUARDIAN_CONNECT_ATTEMPTS),
+            ("rejected", 1),
+            ("wrong-guardian", 1),
+        ] {
+            let directory = tempfile::Builder::new()
+                .prefix("ft-plan-hello-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+                .unwrap()
+                .keep();
+            let socket = directory.join("guardian.sock");
+            let token = directory.join("token");
+            frankenterm_pty_guardian::provision_guardian_token(&token).unwrap();
+            let secret =
+                GuardianSecret::from_bytes(std::fs::read(&token).unwrap().try_into().unwrap())
+                    .unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let guardian = Uuid::new_v4();
+            let owner = Uuid::new_v4();
+            let expected_build = GuardianHelloBuildIdentityV1::for_compiled_mux()
+                .unwrap()
+                .encode();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let accept = || {
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "bounded Hello accept: {case}");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("Hello accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                };
+                let mut census = accept();
+                let hello = decode_guardian_request(&secret, &receive(&mut census)).unwrap();
+                assert_eq!(hello.header().operation, GuardianOperation::Hello);
+                assert_eq!(hello.header().mux_incarnation, owner);
+                assert!(hello.payload().is_empty());
+                let response = GuardianResponseEnvelope::reply(
+                    &hello,
+                    &GuardianReply::Hello {
+                        guardian_incarnation: guardian,
+                    },
+                )
+                .unwrap();
+                census
+                    .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                    .unwrap();
+                for attempt in 0..expected_attempts {
+                    let mut stream = accept();
+                    let hello = decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
+                    assert_eq!(hello.header().operation, GuardianOperation::Hello);
+                    assert_eq!(hello.header().mux_incarnation, owner);
+                    assert_eq!(hello.payload(), expected_build.as_slice());
+                    if case == "exhausted" || (case == "busy-then-ready" && attempt == 0) {
+                        // Exact busy behavior of a build-bearing Hello while
+                        // the real guardian's protocol is worker-owned.
+                        continue;
+                    }
+                    let response = if case == "rejected" {
+                        GuardianResponseEnvelope::rejection(
+                            &hello,
+                            GuardianRejectionCode::InvalidRequest,
+                        )
+                    } else {
+                        GuardianResponseEnvelope::reply(
+                            &hello,
+                            &GuardianReply::Hello {
+                                guardian_incarnation: if case == "wrong-guardian" {
+                                    Uuid::new_v4()
+                                } else {
+                                    guardian
+                                },
+                            },
+                        )
+                        .unwrap()
+                    };
+                    stream
+                        .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                        .unwrap();
+                    let mut unexpected = [0; 1];
+                    assert_eq!(
+                        stream.read(&mut unexpected).unwrap(),
+                        0,
+                        "plan sent a mutation"
+                    );
+                }
+                expected_attempts
+            });
+            let census = Arc::new(
+                GuardianCensusCoordinator::connect(&socket, &token, guardian, owner).unwrap(),
+            );
+            let result = GuardianProxyLeasePlan::prepare_with_build(
+                &socket,
+                &token,
+                size(24, 80),
+                census,
+                true,
+            );
+            match case {
+                "busy-then-ready" => drop(result.expect("pre-Claim Hello recovers")),
+                "exhausted" => assert!(matches!(
+                    result,
+                    Err(GuardianProxyError::Client(GuardianClientError::Io(ref error)))
+                        if error.kind() == io::ErrorKind::UnexpectedEof
+                )),
+                "rejected" => assert!(matches!(
+                    result,
+                    Err(GuardianProxyError::Client(GuardianClientError::Rejected(
+                        GuardianRejectionCode::InvalidRequest
+                    )))
+                )),
+                "wrong-guardian" => assert!(matches!(
+                    result,
+                    Err(GuardianProxyError::GuardianIncarnationChanged)
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(server.join().unwrap(), expected_attempts);
+        }
     }
 
     fn exercise_authenticated_claim_fault(fault: ClaimReplyFault) {
