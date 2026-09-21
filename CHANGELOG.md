@@ -26,11 +26,14 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.6-rc.53` candidate; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.6-rc.54` candidate; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-The `0.15.6-rc.53` candidate carries forward the RC52 fixes below and remains under release qualification.
+The `0.15.6-rc.54` candidate carries forward the RC53 fixes below and remains under release qualification.
+
+- Bell and user-variable notifications reserve GUI delivery capacity before local or remote pane mutation. Callback completion orders successive historical events without blocking the RPC reader. A fatal admission refusal revokes the exact connection even after readiness completes, while stale scopes cannot revoke a successor. Native qualification remains pending.
+- The legacy macOS Blocks declarations explicitly name the C ABI. The next native copy/invoke/dispose test must qualify these final declarations.
 
 - NTM parity property generators prevent arbitrary extra fields from overwriting the reserved `ok` discriminator. Deterministic coverage retains the RC51 failing seed, and the empty-assertion property explicitly validates its envelope. The 38 parity tests and three schema tests passed remotely.
 - Authenticated root reconstruction can resolve envelope corruption without hiding filesystem, discovery or rejected-root authority failures. Authority checks survive diagnostic truncation. Remote startup/publication coverage and owned native RC53 intact, repairable-corruption and above-budget refusal scenarios passed. These scenarios preserve a surviving guardian-owned shell across mux replacement; they do not establish recovery after guardian death or power failure.
@@ -46,7 +49,7 @@ The `0.15.6-rc.53` candidate carries forward the RC52 fixes below and remains un
 - Guardian recovery preserves separate authenticated adoptions when successor muxes capture identical terminal content. Exact replay and resumed reads retain the selected capture generation; historical checkpoint files remain available. Subprocess tests cover mux death during durable ownership transfer while the original guardian-owned child remains alive. Recovery after guardian or host failure remains unfinished.
 - The mux server adds opt-in `--recovery-restore`: authenticate the saved image, reconcile its original guardian-owned processes, and publish the complete recovered topology before opening listeners. Cancellation or a failed preparation leaves the topology unpublished. Recovered tabs support subsequent window transactions; periodic snapshots continue the exact authenticated predecessor chain across repeated root-slot rotation. Focused remote tests cover these paths; native startup and release qualification remain pending.
 - Cold scrollback retains its logical viewport anchor across repeated reflow and refreshes stale geometry after ordinary output. Hydration stays off the terminal lock; a missing new-width paragraph defers painting instead of substituting an old numeric row. Native position and presentation checks remain pending.
-- GUI redraw notifications survive retirement of a saturated payload subscription. Initial Lua window events retry when scheduler capacity returns, and accepted user-variable events reserve callback and completion capacity together and retain their original pane identity. This does not yet provide lossless admission for every historical mux notification.
+- GUI redraw notifications survive retirement of a saturated payload subscription. Initial Lua window events retry when scheduler capacity returns. Bell and user-variable events use the pre-admitted historical delivery path described above and retain their original pane identity.
 - Recovery images reject the reserved window-order revision sentinel while accepting the last valid revision.
 - Headless mux socket waits use the runtime reactor while session tasks remain on their owner thread. Existing restricted contexts and shutdown ordering are preserved.
 - Line reads reuse four bounded workers instead of creating a thread per request. Admission still precedes row capture, and requests retain their permits through reply retirement.
