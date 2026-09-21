@@ -26,10 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.6-rc.53` candidate; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+The `0.15.6-rc.53` candidate carries forward the RC52 fixes below and remains under release qualification.
+
+- NTM parity property generators prevent arbitrary extra fields from overwriting the reserved `ok` discriminator. Deterministic coverage retains the RC51 failing seed, and the empty-assertion property explicitly validates its envelope. Execution of these regressions remains pending.
 - Authenticated root reconstruction can resolve envelope corruption without hiding filesystem, discovery or rejected-root authority failures. Authority checks survive diagnostic truncation. A remote persisted-repair startup/publication regression passed; rebuilt native corruption recovery remains under qualification.
 - Vendored SSH linkage uses the OpenSSL and zlib dependency crates' static-library declarations. The macOS Blocks binding uses inhabited runtime storage and raw address acquisition, with a native copy/invoke/dispose regression. Cross-platform release qualification remains pending.
 - Optional transaction diagnostics correlate committed segments with verified transaction durations while preserving ordinary writer logging. Extraction timing is recorded before oracle validation; benchmark workloads and acceptance thresholds are unchanged.
