@@ -170,6 +170,43 @@ fn release_advisory_lock(file: &File, phase: &'static str) -> Result<(), LockSid
     })
 }
 
+/// Releases an acquired lock if construction fails before its owner is built.
+/// Closing a File is insufficient when a concurrent fork inherited its handle.
+#[must_use]
+struct AdvisoryUnlockOnDrop<'a> {
+    file: Option<&'a File>,
+    phase: &'static str,
+}
+
+impl<'a> AdvisoryUnlockOnDrop<'a> {
+    fn new(file: &'a File, phase: &'static str) -> Self {
+        Self {
+            file: Some(file),
+            phase,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.file = None;
+    }
+}
+
+impl Drop for AdvisoryUnlockOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file
+            && let Err(failure) = release_advisory_lock(file, self.phase)
+        {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-kullz",
+                phase = failure.phase,
+                kind = failure.kind,
+                "watcher lock construction cleanup failed"
+            );
+        }
+    }
+}
+
 fn report_lock_metadata_read_failure(failure: LockSidecarReadFailure) {
     record_lock_metadata_admission_failure();
     let size_known = failure.observed_bytes.is_some();
@@ -744,6 +781,8 @@ fn write_lock_sidecar_in_directory_atomically(
                     .try_lock_exclusive()
                     .map_err(|_| LockSidecarWriteError::Unavailable)?;
             }
+            let authority_cleanup = lock_for_authority
+                .then(|| AdvisoryUnlockOnDrop::new(&metadata_file, "sidecar_write_unlock"));
             directory
                 .rename(&temp_name, directory, name)
                 .map_err(|_| LockSidecarWriteError::Unavailable)?;
@@ -774,6 +813,8 @@ fn write_lock_sidecar_in_directory_atomically(
                 "sidecar_write_identity",
             )
             .map_err(sidecar_write_error)?;
+            // Consume the entire option before moving the borrowed file.
+            let _ = authority_cleanup.map(AdvisoryUnlockOnDrop::disarm);
             Ok(metadata_file)
         })();
 
@@ -1166,6 +1207,7 @@ impl WatcherLock {
         // Try to acquire exclusive lock (non-blocking)
         match opened.file.try_lock_exclusive() {
             Ok(()) => {
+                let lock_cleanup = AdvisoryUnlockOnDrop::new(&opened.file, "acquire_lock_unlock");
                 opened
                     .verify_namespace()
                     .map_err(lock_path_admission_error)?;
@@ -1180,12 +1222,17 @@ impl WatcherLock {
                     MAX_LOCK_METADATA_BYTES,
                     true,
                 )?;
+                let metadata_cleanup =
+                    AdvisoryUnlockOnDrop::new(&metadata_file, "acquire_metadata_unlock");
 
                 after_metadata_write();
                 opened
                     .verify_namespace()
                     .map_err(lock_path_admission_error)?;
 
+                let lock_path = lock_path.to_path_buf();
+                metadata_cleanup.disarm();
+                lock_cleanup.disarm();
                 let OpenedLockLeaf {
                     directory: lock_directory,
                     name: lock_name,
@@ -1197,7 +1244,7 @@ impl WatcherLock {
                     _lock_file: lock_file,
                     _lock_directory: lock_directory,
                     _lock_name: lock_name,
-                    lock_path: lock_path.to_path_buf(),
+                    lock_path,
                     meta_path,
                     metadata,
                 };
@@ -2519,6 +2566,28 @@ mod tests {
         assert_eq!(reprobe_opened_lock(&opened), Ok(OpenedLockReprobe::Free));
         drop(opened);
         let successor = WatcherLock::acquire(&lock_path).unwrap();
+        drop(inherited);
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(successor.metadata().clone())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn construction_error_releases_lock_with_duplicate_alive() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("construction-error.lock");
+        let opened = open_lock_leaf_nofollow(&lock_path, true).unwrap().unwrap();
+        let inherited = opened.file.try_clone().unwrap();
+        let result: io::Result<()> = (|| {
+            opened.file.try_lock_exclusive()?;
+            let _cleanup = AdvisoryUnlockOnDrop::new(&opened.file, "test_construction_unlock");
+            Err(io::Error::other("construction failed after acquisition"))
+        })();
+        assert!(result.is_err());
+        let successor = WatcherLock::acquire(&lock_path).unwrap();
+        drop(opened);
         drop(inherited);
         assert_eq!(
             check_running(&lock_path),
