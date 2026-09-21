@@ -2861,6 +2861,9 @@ pub enum SnapshotError {
     #[error("clean-shutdown mark failed after final checkpoint settlement")]
     ShutdownMarkFailed {
         checkpoint: Box<SnapshotResult>,
+        /// Whether the enclosing shutdown wait expired before its receipt.
+        /// This is diagnostic context, not evidence that the mutation failed.
+        wait_boundary_exhausted: bool,
         #[source]
         source: Box<SnapshotError>,
     },
@@ -2945,10 +2948,16 @@ impl std::fmt::Debug for SnapshotError {
                 .debug_struct("ShutdownTimedOut")
                 .field("timeout_ms", timeout_ms)
                 .finish(),
-            Self::ShutdownMarkFailed { checkpoint, source } => formatter
+            Self::ShutdownMarkFailed {
+                checkpoint,
+                wait_boundary_exhausted,
+                source,
+            } => formatter
                 .debug_struct("ShutdownMarkFailed")
                 .field("checkpoint_id", &checkpoint.checkpoint_id)
+                .field("wait_boundary_exhausted", wait_boundary_exhausted)
                 .field("source_class", &source.diagnostic_class())
+                .field("source", source)
                 .finish_non_exhaustive(),
             Self::LockTimedOut { deadline_nanos } => formatter
                 .debug_struct("LockTimedOut")
@@ -6426,6 +6435,7 @@ impl SnapshotEngine {
             {
                 return Err(SnapshotError::ShutdownMarkFailed {
                     checkpoint: Box::new(checkpoint),
+                    wait_boundary_exhausted: false,
                     source: Box::new(source),
                 });
             }
@@ -6466,6 +6476,7 @@ impl SnapshotEngine {
                 if let Some(checkpoint) = checkpoint_receipt.take() {
                     Err(SnapshotError::ShutdownMarkFailed {
                         checkpoint: Box::new(checkpoint),
+                        wait_boundary_exhausted: true,
                         source: Box::new(source),
                     })
                 } else {

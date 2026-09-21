@@ -12193,6 +12193,7 @@ impl RuntimeHandle {
                 match pane_list_result {
                     Ok(Ok(panes)) => {
                         let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
+                        let checkpoint_started = Instant::now();
                         match snapshot_engine
                             .shutdown_checkpoint_with_cx(&snapshot_cx, &panes, checkpoint_timeout)
                             .await
@@ -12223,8 +12224,10 @@ impl RuntimeHandle {
                                         "runtime terminal checkpoint committed but clean mark failed"
                                     );
                                     warnings.push(format!(
-                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed: {error:?}",
-                                        checkpoint.checkpoint_id
+                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed after {}ms (wait limit {}ms): {error:?}",
+                                        checkpoint.checkpoint_id,
+                                        checkpoint_started.elapsed().as_millis(),
+                                        checkpoint_timeout.as_millis(),
                                     ));
                                 } else {
                                     warn!(

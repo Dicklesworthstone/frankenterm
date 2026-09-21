@@ -563,8 +563,9 @@ fn snapshot_diagnostic_projections_are_content_free() {
     assert!(!topology_debug.contains(TOPOLOGY_CANARY));
     assert!(!topology_display.contains(TOPOLOGY_CANARY));
 
-    let shutdown_error = SnapshotError::ShutdownMarkFailed {
+    let mut shutdown_error = SnapshotError::ShutdownMarkFailed {
         checkpoint: Box::new(result),
+        wait_boundary_exhausted: false,
         source: Box::new(SnapshotError::Database(format!(
             "{SOURCE_CANARY}\u{001b}[2J"
         ))),
@@ -574,9 +575,31 @@ fn snapshot_diagnostic_projections_are_content_free() {
     let shutdown_display = format!("{shutdown_error}");
     assert!(shutdown_debug.contains("ShutdownMarkFailed"));
     assert!(shutdown_debug.contains("source_class: \"database\""));
+    assert!(shutdown_debug.contains("wait_boundary_exhausted: false"));
+    assert!(shutdown_debug.contains("source: Database"));
     for canary in [SESSION_CANARY, HASH_CANARY, SOURCE_CANARY] {
         assert!(!shutdown_debug.contains(canary));
         assert!(!shutdown_display.contains(canary));
+    }
+
+    if let SnapshotError::ShutdownMarkFailed {
+        wait_boundary_exhausted,
+        source,
+        ..
+    } = &mut shutdown_error
+    {
+        *wait_boundary_exhausted = true;
+        *source = Box::new(SnapshotError::AuthorityReconciliationRequired {
+            operation: SnapshotAuthorityOperation::ShutdownMark,
+            first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCommit),
+        });
+    }
+    let timed_out_debug = format!("{shutdown_error:?}");
+    assert!(timed_out_debug.contains("wait_boundary_exhausted: true"));
+    assert!(timed_out_debug.contains("operation: ShutdownMark"));
+    assert!(timed_out_debug.contains("first_indeterminate_operation: Some(CheckpointCommit)"));
+    for canary in [SESSION_CANARY, HASH_CANARY, SOURCE_CANARY] {
+        assert!(!timed_out_debug.contains(canary));
     }
 
     let latest = format!(
