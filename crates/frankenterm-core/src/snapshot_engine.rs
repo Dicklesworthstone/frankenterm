@@ -4674,10 +4674,10 @@ impl SnapshotEngine {
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
         #[cfg(test)]
-        ShutdownMarkDiagnostic::record(&diagnostic, 2);
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 2);
         let attempt = self.try_begin_snapshot_authority(operation)?;
         #[cfg(test)]
-        ShutdownMarkDiagnostic::record(&diagnostic, 3);
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 3);
         snapshot_cx_checkpoint(cx)?;
 
         let handoff_state = attempt.handoff_state();
@@ -4687,7 +4687,7 @@ impl SnapshotEngine {
         let worker_diagnostic = diagnostic.clone();
         let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
             #[cfg(test)]
-            ShutdownMarkDiagnostic::record(&worker_diagnostic, 4);
+            ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 4);
             // Keep the database-keyed authority alive until the queued closure
             // has either suppressed itself or reached terminal return. A new
             // engine must not prune the Weak registry entry while old work can
@@ -4696,14 +4696,14 @@ impl SnapshotEngine {
             match outcome {
                 AuthorityBlockingOutcome::Executed(result) => {
                     #[cfg(test)]
-                    ShutdownMarkDiagnostic::record(&worker_diagnostic, 11);
+                    ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 11);
                     let refreshed = refresh_snapshot_authority_file_identities(
                         db_path_for_identity_refresh.as_str(),
                         &authority_lifetime,
                         operation,
                     );
                     #[cfg(test)]
-                    ShutdownMarkDiagnostic::record(&worker_diagnostic, 12);
+                    ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 12);
                     match refreshed {
                         Ok(()) => AuthorityBlockingOutcome::Executed(result),
                         Err(error) => AuthorityBlockingOutcome::IdentityRefreshFailed(error),
@@ -4714,7 +4714,7 @@ impl SnapshotEngine {
         })
         .await;
         #[cfg(test)]
-        ShutdownMarkDiagnostic::record(&diagnostic, 13);
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 13);
 
         match outcome {
             Ok(AuthorityBlockingOutcome::Executed(Ok(result))) => {
@@ -6612,7 +6612,7 @@ impl SnapshotEngine {
         #[cfg(test)] diagnostic: Option<Arc<ShutdownMarkDiagnostic>>,
     ) -> std::result::Result<(), SnapshotError> {
         #[cfg(test)]
-        ShutdownMarkDiagnostic::record(&diagnostic, 0);
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 0);
         snapshot_cx_checkpoint(cx)?;
         // Route the session_id read-lock through read_with_cx(cx) so the lock
         // wait honors caller cancellation rather than an ambient context.
@@ -6624,7 +6624,7 @@ impl SnapshotEngine {
                 .clone()
         };
         #[cfg(test)]
-        ShutdownMarkDiagnostic::record(&diagnostic, 1);
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 1);
         // The read may have waited behind a first capture. That capture can
         // lose its result, latch reconciliation, and release the session lock
         // without publishing an ID, so recheck before treating `None` as an
@@ -8275,7 +8275,7 @@ impl ShutdownMarkDiagnostic {
         }
     }
 
-    fn record(diagnostic: &Option<Arc<Self>>, phase: usize) {
+    fn record(diagnostic: Option<&Arc<Self>>, phase: usize) {
         if let Some(diagnostic) = diagnostic {
             diagnostic.reached(phase);
         }
