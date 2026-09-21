@@ -253,6 +253,9 @@ mod live_measurement {
             transient_read_rejections: u32,
             write_ack_ns: u64,
             storage_submit_ns: u64,
+            // Wall-clock return from capture_snapshot, before oracle validation;
+            // this shares the stage epoch and is not a CPU-time measurement.
+            snapshot_extraction_return_ns: u64,
             poll: FramePollDiagnostics,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
@@ -506,7 +509,7 @@ mod live_measurement {
                 "payload_bytes": 4096,
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
-                "diagnostic_timing": "write_ack_ns and storage_submit_ns share the stage epoch; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
+                "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
                 "overlap_bytes": 4096,
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
@@ -619,9 +622,9 @@ mod live_measurement {
                         })
                         .await?;
                     let captured = elapsed(epoch)?;
-                    let segment = cursor
-                        .capture_snapshot(&snapshot, 4096, None)
-                        .ok_or("new frame produced no delta")?;
+                    let segment = cursor.capture_snapshot(&snapshot, 4096, None);
+                    let snapshot_extraction_return_ns = elapsed(epoch)?;
+                    let segment = segment.ok_or("new frame produced no delta")?;
                     if !matches!(segment.kind, CapturedSegmentKind::Delta)
                         || segment.content.trim_matches('\n')
                             != super::frame(sequence).trim_matches('\n')
@@ -640,6 +643,7 @@ mod live_measurement {
                         transient_read_rejections,
                         write_ack_ns,
                         poll_diagnostics,
+                        snapshot_extraction_return_ns,
                     ));
                 }
                 let results = futures::future::join_all(pending.iter().map(
@@ -653,6 +657,7 @@ mod live_measurement {
                         rejections,
                         write_ack_ns,
                         poll,
+                        snapshot_extraction_return_ns,
                     )| async move {
                         let storage_submit_ns = elapsed(epoch)?;
                         let stored = storage
@@ -668,6 +673,7 @@ mod live_measurement {
                             transient_read_rejections: *rejections,
                             write_ack_ns: *write_ack_ns,
                             storage_submit_ns,
+                            snapshot_extraction_return_ns: *snapshot_extraction_return_ns,
                             poll: poll.clone(),
                             stages_ns: [
                                 [*started, *captured],
@@ -956,6 +962,7 @@ mod live_measurement {
                     transient_read_rejections: 0,
                     write_ack_ns: start,
                     storage_submit_ns: start,
+                    snapshot_extraction_return_ns: end,
                     poll: FramePollDiagnostics::default(),
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
