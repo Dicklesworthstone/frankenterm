@@ -19954,7 +19954,7 @@ impl AppendTransactionTrace {
         }
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let transaction_id = NEXT_ID
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
                 id.checked_add(1)
             })
             .ok()?;
