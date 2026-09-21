@@ -906,7 +906,7 @@ mod live_measurement {
                 }
             }
             serde_json::json!({
-                "stage": ["capture", "delta_extract", "storage_write"][stage],
+                "stage": (["capture", "delta_extract", "storage_write"][stage]),
                 "violating_departure_cuts": count,
                 "maximum_deficit_events": maximum_deficit,
                 "sample_limit": MAX_SAMPLES,
