@@ -737,15 +737,15 @@
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
-        "test": 16
+        "test": 17
       },
-      "fork_side_commit_count": 60,
+      "fork_side_commit_count": 61,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "cosmetic",
-        "committed_at": "2026-09-21T10:09:34-04:00",
-        "sha": "c913f623f500b32e387af3500d8266b5f3cae77f",
-        "subject": "style(json): reformat JSON fixtures and configs"
+        "classification": "test",
+        "committed_at": "2026-09-21T12:17:19-04:00",
+        "sha": "adfd20c31c5a5b3bf29abb09a0ac33ae5c88f6a9",
+        "subject": "test: restore serialized fixtures and exercise shared await service"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2891,
+  "fork_side_commit_total": 2892,
   "generated_at": "2026-09-21T14:48:15.720504Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
