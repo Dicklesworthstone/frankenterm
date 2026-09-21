@@ -2931,17 +2931,70 @@ impl Drop for RusqliteReadBackendLoan {
     }
 }
 
+type StorageProviderRegistration = (String, std::sync::Weak<dyn StorageBackendProvider>);
+
+const STORAGE_PROVIDER_SWEEP_BUDGET: usize = 8;
+
+#[derive(Default)]
+struct StorageBackendProviderRegistry {
+    providers: std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
+    sweep: std::collections::VecDeque<StorageProviderRegistration>,
+}
+
+impl StorageBackendProviderRegistry {
+    // Return retired ownership to the caller for disposal outside its lock.
+    // Tickets carry Weak identity: an older registration can never remove a
+    // replacement at the same path. No sweep upgrades a provider or calls it.
+    fn register(
+        &mut self,
+        path: &str,
+        provider: &Arc<dyn StorageBackendProvider>,
+    ) -> Vec<StorageProviderRegistration> {
+        let mut retired = Vec::new();
+        let weak = Arc::downgrade(provider);
+        if self
+            .providers
+            .get(path)
+            .is_some_and(|current| std::sync::Weak::ptr_eq(current, &weak))
+        {
+            // Re-registering the same owner must not create duplicate live
+            // sweep tickets that could accumulate without ever expiring.
+            retired.push((String::new(), weak));
+        } else {
+            if let Some(previous) = self.providers.insert(path.to_string(), weak.clone()) {
+                retired.push((String::new(), previous));
+            }
+            self.sweep.push_back((path.to_string(), weak));
+        }
+        for _ in 0..self.sweep.len().min(STORAGE_PROVIDER_SWEEP_BUDGET) {
+            let ticket = self.sweep.pop_front().expect("bounded sweep ticket");
+            let current = self
+                .providers
+                .get(&ticket.0)
+                .is_some_and(|weak| std::sync::Weak::ptr_eq(weak, &ticket.1));
+            if !current {
+                retired.push(ticket);
+            } else if ticket.1.strong_count() == 0 {
+                if let Some(entry) = self.providers.remove_entry(&ticket.0) {
+                    retired.push(entry);
+                }
+                retired.push(ticket);
+            } else {
+                self.sweep.push_back(ticket);
+            }
+        }
+        retired
+    }
+}
+
 static STORAGE_BACKEND_PROVIDERS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
-    >,
+    std::sync::Mutex<StorageBackendProviderRegistry>,
 > = std::sync::OnceLock::new();
 
-fn storage_backend_provider_registry() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
-> {
+fn storage_backend_provider_registry() -> &'static std::sync::Mutex<StorageBackendProviderRegistry>
+{
     STORAGE_BACKEND_PROVIDERS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| std::sync::Mutex::new(StorageBackendProviderRegistry::default()))
 }
 
 fn default_storage_backend_provider() -> Arc<dyn StorageBackendProvider> {
@@ -2959,10 +3012,11 @@ fn register_storage_backend_provider(db_path: &str, provider: &Arc<dyn StorageBa
     let mut registry = storage_backend_provider_registry()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    registry.insert(db_path.to_string(), Arc::downgrade(provider));
+    let retired = registry.register(db_path, provider);
     // Subscribers may perform storage lookups or block on an output sink.
     // Publication is complete; neither callback belongs under this global lock.
     drop(registry);
+    drop(retired);
     tracing::debug!(
         target: "ft.storage.backend",
         db_path = db_path,
@@ -2975,11 +3029,18 @@ fn storage_backend_provider_for_path(db_path: &str) -> Option<Arc<dyn StorageBac
     let mut registry = storage_backend_provider_registry()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let Some(provider) = registry.get(db_path).and_then(std::sync::Weak::upgrade) else {
-        registry.remove(db_path);
-        return None;
+    let provider = registry
+        .providers
+        .get(db_path)
+        .and_then(std::sync::Weak::upgrade);
+    let retired = if provider.is_none() {
+        registry.providers.remove_entry(db_path)
+    } else {
+        None
     };
-    Some(provider)
+    drop(registry);
+    drop(retired);
+    provider
 }
 
 fn with_provider_read_backend<F, R>(
@@ -8586,12 +8647,87 @@ impl StorageHandle {
         Self::checkpoint_storage_operation(cx, "get_events_stream_page")?;
         let db_path = Arc::clone(&self.db_path);
 
+        #[cfg(test)]
+        return Self::diagnose_await_event_read(cx, "event_page", db_path, move |backend| {
+            query_events_stream_page_backend(backend, &query)
+        })
+        .await;
+
+        #[cfg(not(test))]
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_events_stream_page_backend(backend, &query)
             })
         })
         .await
+    }
+
+    /// Test-build observation of the unchanged blocking read path. Only slow
+    /// operations emit fixed labels and monotonic timings; no database identity
+    /// or event data is logged. Separate pool return from executor resumption.
+    #[cfg(test)]
+    async fn diagnose_await_event_read<T, F>(
+        cx: &crate::cx::Cx,
+        operation: &'static str,
+        db_path: Arc<String>,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn StorageBackend) -> Result<T> + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let started = std::time::Instant::now();
+        let stamps = Arc::new(std::array::from_fn::<_, 4, _>(|_| AtomicU64::new(0)));
+        let worker_stamps = Arc::clone(&stamps);
+        let result = Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Task join error",
+            move || {
+                let stamp = |index: usize| {
+                    worker_stamps[index].store(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        Ordering::Release,
+                    );
+                };
+                stamp(0);
+                let result = pooled_backend(db_path.as_str(), |backend| {
+                    stamp(1);
+                    let result = work(backend);
+                    stamp(2);
+                    result
+                });
+                stamp(3);
+                let marks = worker_stamps.each_ref().map(|mark| mark.load(Ordering::Acquire));
+                let sql_ns = marks[2].saturating_sub(marks[1]);
+                if sql_ns >= 100_000_000 {
+                    let (tid, unix_us) = slow_storage_worker_identity();
+                    eprintln!(
+                        "AWAIT_STORAGE_WORKER operation={operation} tid={tid:?} unix_us={unix_us} sql_us={} since_sql_end_us={}",
+                        sql_ns / 1_000,
+                        started.elapsed().as_micros().saturating_sub(u128::from(marks[2] / 1_000)),
+                    );
+                }
+                result
+            },
+        )
+        .await;
+        let total = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if total >= 100_000_000 {
+            let marks = stamps.each_ref().map(|stamp| stamp.load(Ordering::Acquire));
+            eprintln!(
+                "AWAIT_STORAGE_TIMING operation={operation} total_us={} dispatch_us={} reader_us={} sql_us={} pool_return_us={} resume_us={} completed_marks={:?} ok={}",
+                total / 1_000,
+                marks[0] / 1_000,
+                marks[1].saturating_sub(marks[0]) / 1_000,
+                marks[2].saturating_sub(marks[1]) / 1_000,
+                marks[3].saturating_sub(marks[2]) / 1_000,
+                total.saturating_sub(marks[3]) / 1_000,
+                marks.map(|mark| mark != 0),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// Read the singleton retention summary.  This is a one-row query intended
@@ -8674,6 +8810,13 @@ impl StorageHandle {
         validate_event_retention_cursor_epoch(cursor_epoch, "event retention cursor epoch")?;
         let db_path = Arc::clone(&self.db_path);
         let cursor_epoch = cursor_epoch.to_string();
+        #[cfg(test)]
+        return Self::diagnose_await_event_read(cx, "event_retention", db_path, move |backend| {
+            check_event_retention_backend(backend, after_id, through_id, Some(&cursor_epoch))
+        })
+        .await;
+
+        #[cfg(not(test))]
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 check_event_retention_backend(backend, after_id, through_id, Some(&cursor_epoch))
@@ -22253,12 +22396,32 @@ where
 const DEFAULT_READ_POOL_MAX_PER_PATH: usize = 8;
 const MAX_IDLE_READ_BACKENDS: usize = 64;
 
+struct IdleReadBackend {
+    backend: RusqliteBackend,
+    returned_at: std::time::Instant,
+}
+
 static READ_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>,
 > = std::sync::OnceLock::new();
 
-fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>
+#[cfg(test)]
+thread_local! {
+    // Pool regressions must retain their exact backends across real
+    // returns/acquires without unrelated parallel tests evicting them.
+    static CACHE_REUSE_TEST_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>
 {
+    #[cfg(test)]
+    if CACHE_REUSE_TEST_POOL.with(std::cell::Cell::get) {
+        static ISOLATED_POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>,
+        > = std::sync::OnceLock::new();
+        return ISOLATED_POOL
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    }
     READ_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -22797,23 +22960,25 @@ impl PooledReadConn {
                 // the pool Mutex turned every subsequent database read
                 // into a re-panic. Post-fix bumps the observability
                 // counter (visible via PoolTelemetrySnapshot.pool_lock_poisoned)
-                // and continues with the recovered HashMap. The .get_mut+pop
-                // pattern below is safe under recovery — if the inner Vec
-                // is in a transient state, get_mut returns None or the pop
-                // is a no-op; worst case a stale entry survives until the
-                // next return.
+                // and continues with the recovered HashMap. Remove drained
+                // entries under the same lock: a discarded or panicked loan
+                // may never return a backend to reclaim its path key.
                 let mut pool = read_pool().lock().unwrap_or_else(|poison| {
                     saturating_atomic_u64_add(&POOL_LOCK_POISONED, 1);
                     poison.into_inner()
                 });
-                pool.get_mut(db_path).and_then(|v| v.pop())
+                let recycled = pool.get_mut(db_path).and_then(|entry| entry.pop());
+                if pool.get(db_path).is_some_and(Vec::is_empty) {
+                    pool.remove(db_path);
+                }
+                recycled
             };
             let backend = match recycled {
                 Some(c) => {
                     // br-ft-rvt1z: pool hit — recycled an existing
                     // pre-warmed connection.
                     saturating_atomic_u64_add(&POOL_HITS, 1);
-                    c
+                    c.backend
                 }
                 None => {
                     // br-ft-rvt1z: pool miss — first acquire for this
@@ -22871,19 +23036,65 @@ impl PooledReadConn {
     }
 }
 
+// Resolve worker identity only for an already-observed slow operation. Never
+// log database paths or contents, and do not add filesystem work to fast loans.
+#[cfg(test)]
+fn slow_storage_worker_identity() -> (Option<u64>, u128) {
+    #[cfg(target_os = "linux")]
+    let tid = std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|path| path.file_name()?.to_str()?.parse().ok());
+    #[cfg(not(target_os = "linux"))]
+    let tid = None;
+    let unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros());
+    (tid, unix_us)
+}
+
+#[cfg(test)]
+fn diagnose_pool_return(started: std::time::Instant, marks: [u128; 4], autocommit: bool) {
+    if marks[3] >= 100_000 {
+        let (tid, unix_us) = slow_storage_worker_identity();
+        eprintln!(
+            "STORAGE_POOL_RETURN tid={tid:?} unix_us={unix_us} total_us={} state_us={} pool_mutex_selection_us={} evicted_close_us={} returning_close_us={} autocommit={autocommit} since_return_end_us={}",
+            marks[3],
+            marks[0],
+            marks[1].saturating_sub(marks[0]),
+            marks[2].saturating_sub(marks[1]),
+            marks[3].saturating_sub(marks[2]),
+            started.elapsed().as_micros().saturating_sub(marks[3]),
+        );
+    }
+}
+
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
         if let Some(backend) = self.backend.take() {
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             // If the closure panicked or returned mid-transaction, the
             // backend has an open transaction. Returning it to the pool
             // would leak that transaction state to the next consumer.
             // Discard the connection in that case; rusqlite's Drop closes it
             // cleanly (which also rolls back the open transaction).
-            let is_autocommit = backend
-                .with_connection(|conn| conn.is_autocommit())
-                .unwrap_or(false);
+            // This is an authoritative state query, not a raw connection
+            // loan. A raw loan reinstalls the authorizer and flushes prepared
+            // statements on return, defeating the read pool's cache reuse.
+            let is_autocommit = matches!(
+                backend.transaction_state(),
+                Ok(BackendTransactionState::Autocommit)
+            );
+            #[cfg(test)]
+            let state_us = started.elapsed().as_micros();
             if !is_autocommit {
                 drop(backend);
+                #[cfg(test)]
+                diagnose_pool_return(
+                    started,
+                    [state_us, state_us, state_us, started.elapsed().as_micros()],
+                    false,
+                );
                 return;
             }
             let mut returning_backend = Some(backend);
@@ -22904,18 +23115,26 @@ impl Drop for PooledReadConn {
                         .values()
                         .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
                     if path_has_capacity && total_idle >= MAX_IDLE_READ_BACKENDS {
-                        let evict_path = pool
+                        // At most MAX_IDLE_READ_BACKENDS entries are inspected.
+                        // Evict the oldest idle return, never an arbitrary hash
+                        // bucket that may contain a just-used hot connection.
+                        let evict = pool
                             .iter()
-                            .find(|(path, entry)| {
-                                path.as_str() != self.db_path.as_str() && !entry.is_empty()
+                            .filter(|(path, _)| path.as_str() != self.db_path.as_str())
+                            .flat_map(|(path, entry)| {
+                                entry
+                                    .iter()
+                                    .enumerate()
+                                    .map(move |(index, idle)| (path, index, idle.returned_at))
                             })
-                            .map(|(path, _)| path.clone());
-                        if let Some(evict_path) = evict_path {
+                            .min_by_key(|(_, _, returned_at)| *returned_at)
+                            .map(|(path, index, _)| (path.clone(), index));
+                        if let Some((evict_path, evict_index)) = evict {
                             let remove_entry = {
                                 let entry = pool
                                     .get_mut(&evict_path)
                                     .expect("selected read-pool entry must still exist");
-                                evicted_backend = entry.pop();
+                                evicted_backend = Some(entry.remove(evict_index).backend);
                                 entry.is_empty()
                             };
                             if remove_entry {
@@ -22932,11 +23151,12 @@ impl Drop for PooledReadConn {
                         .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
                     if path_has_capacity && total_after_eviction < MAX_IDLE_READ_BACKENDS {
                         let entry = pool.entry(self.db_path.clone()).or_default();
-                        entry.push(
-                            returning_backend
+                        entry.push(IdleReadBackend {
+                            backend: returning_backend
                                 .take()
                                 .expect("returning read backend must still be owned"),
-                        );
+                            returned_at: std::time::Instant::now(),
+                        });
                         // br-ft-rvt1z: counted only on successful return.
                         saturating_atomic_u64_add(&POOL_RETURNS, 1);
                     } else {
@@ -22949,8 +23169,23 @@ impl Drop for PooledReadConn {
             }
             // Close evicted or unretained backends after releasing the pool
             // mutex so SQLite teardown never serializes unrelated borrowers.
+            #[cfg(test)]
+            let selected_us = started.elapsed().as_micros();
             drop(evicted_backend);
+            #[cfg(test)]
+            let evicted_us = started.elapsed().as_micros();
             drop(returning_backend);
+            #[cfg(test)]
+            diagnose_pool_return(
+                started,
+                [
+                    state_us,
+                    selected_us,
+                    evicted_us,
+                    started.elapsed().as_micros(),
+                ],
+                true,
+            );
         }
     }
 }
@@ -44302,9 +44537,197 @@ mod pool_telemetry_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn provider_registry_reclaims_unique_expired_registrations() {
+        let mut registry = super::StorageBackendProviderRegistry::default();
+        for index in 0..256 {
+            let provider = default_storage_backend_provider();
+            drop(registry.register(&format!("expired-{index}"), &provider));
+            assert_eq!(Arc::strong_count(&provider), 1);
+            assert_eq!(registry.providers.len(), 1);
+            assert_eq!(registry.sweep.len(), 1);
+        }
+        let survivor = default_storage_backend_provider();
+        drop(registry.register("survivor", &survivor));
+        assert_eq!(registry.providers.len(), 1);
+        assert!(registry.providers["survivor"].upgrade().is_some());
+    }
+
+    #[test]
+    fn provider_registry_preserves_replacements_and_external_owners() {
+        let mut registry = super::StorageBackendProviderRegistry::default();
+        let owners: Vec<_> = (0..32)
+            .map(|_| default_storage_backend_provider())
+            .collect();
+        for (index, provider) in owners.iter().enumerate() {
+            drop(registry.register(&format!("live-{index}"), provider));
+        }
+        let old = default_storage_backend_provider();
+        drop(registry.register("replaced", &old));
+        let replacement = default_storage_backend_provider();
+        drop(registry.register("replaced", &replacement));
+        drop(old);
+        // Advance beyond a full sweep while repeatedly registering the same
+        // owner. Duplicate live tickets must not accumulate either.
+        for _ in 0..256 {
+            drop(registry.register("replaced", &replacement));
+        }
+        assert_eq!(registry.providers.len(), 33);
+        assert_eq!(registry.sweep.len(), 33);
+        assert!(Arc::ptr_eq(
+            &registry.providers["replaced"].upgrade().unwrap(),
+            &replacement,
+        ));
+        for (index, provider) in owners.iter().enumerate() {
+            assert!(Arc::ptr_eq(
+                &registry.providers[&format!("live-{index}")]
+                    .upgrade()
+                    .unwrap(),
+                provider,
+            ));
+            assert_eq!(Arc::strong_count(provider), 1);
+        }
+        drop(owners);
+        for _ in 0..32 {
+            drop(registry.register("replaced", &replacement));
+        }
+        assert_eq!(registry.providers.len(), 1);
+        assert_eq!(registry.sweep.len(), 1);
+    }
+
     fn pool_counter_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    // Callers hold pool_counter_test_lock for this guard's entire lifetime.
+    struct IsolatedPool;
+
+    impl IsolatedPool {
+        fn enter() -> Self {
+            super::CACHE_REUSE_TEST_POOL.with(|isolated| {
+                assert!(!isolated.replace(true), "isolated pool cannot nest");
+            });
+            Self
+        }
+    }
+
+    impl Drop for IsolatedPool {
+        fn drop(&mut self) {
+            let retired = {
+                let mut pool = read_pool()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *pool)
+            };
+            super::CACHE_REUSE_TEST_POOL.with(|isolated| isolated.set(false));
+            drop(retired);
+        }
+    }
+
+    #[test]
+    fn pooled_return_preserves_cached_statement_and_immutable_authorizer() {
+        use rusqlite::hooks::{AuthAction, Authorization};
+
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        let directory = tempfile::tempdir().expect("cache regression directory");
+        let _isolated_pool = IsolatedPool::enter();
+        let path = directory
+            .path()
+            .join("cached.db")
+            .to_string_lossy()
+            .into_owned();
+        let connection = rusqlite::Connection::open(&path).expect("open SQLite");
+        connection
+            .execute_batch(
+                "CREATE TABLE protected (value INTEGER); INSERT INTO protected VALUES (42)",
+            )
+            .expect("seed actual SQLite value");
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let prepare_counter = Arc::clone(&prepares);
+        let backend =
+            RusqliteBackend::new_with_authorizer(connection, move |context| match context.action {
+                AuthAction::Select => {
+                    prepare_counter.fetch_add(1, Ordering::Relaxed);
+                    Authorization::Allow
+                }
+                AuthAction::Delete { .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })
+            .expect("install immutable authorizer");
+        read_pool().lock().expect("isolated pool").insert(
+            path.clone(),
+            vec![super::IdleReadBackend {
+                backend,
+                returned_at: std::time::Instant::now(),
+            }],
+        );
+        let first = PooledReadConn::acquire(&path).expect("acquire authored SQLite backend");
+        let query = "SELECT value FROM protected";
+        let expected = Some(vec![super::SqlCell::Integer(42)]);
+        assert_eq!(
+            first.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert!(
+            first
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        assert_eq!(prepares.load(Ordering::Relaxed), 1);
+        drop(first);
+
+        let second = PooledReadConn::acquire(&path).expect("reacquire actual returned backend");
+        assert_eq!(
+            second.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prepares.load(Ordering::Relaxed),
+            1,
+            "returning an autocommit backend must preserve its prepared statement"
+        );
+        assert!(
+            second
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        // Causal negative control: the former return-time probe performs a
+        // raw loan, which reinstalls the authorizer and invalidates the cache.
+        assert!(
+            second
+                .backend_ref()
+                .with_connection(rusqlite::Connection::is_autocommit)
+                .expect("former raw return probe")
+        );
+        assert_eq!(
+            second.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prepares.load(Ordering::Relaxed),
+            2,
+            "the former raw probe must demonstrate actual cache invalidation"
+        );
+        drop(second);
+
+        let third = PooledReadConn::acquire(&path).expect("reacquire after negative control");
+        assert_eq!(
+            third.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(prepares.load(Ordering::Relaxed), 2);
+        assert!(
+            third
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        drop(third);
     }
 
     #[test]
@@ -44446,6 +44869,71 @@ mod pool_telemetry_tests {
     }
 
     #[test]
+    fn read_pool_evicts_oldest_idle_backend_instead_of_hot_hash_bucket() {
+        let _guard = pool_counter_test_lock().lock().expect("pool test lock");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _isolated_pool = IsolatedPool::enter();
+        for index in 0..MAX_IDLE_READ_BACKENDS {
+            let path = temp_dir.path().join(format!("lru-{index}.db"));
+            std::fs::File::create(&path).expect("seed database");
+            PooledReadConn::acquire(&path.to_string_lossy())
+                .expect("acquire real backend")
+                .with_borrowed_backend(|backend| {
+                    backend.execute_batch(
+                        "CREATE TEMP TABLE connection_marker(value); INSERT INTO connection_marker VALUES (42)",
+                    ).expect("seed connection-local marker");
+                });
+        }
+        let (hot_path, cold_path) = {
+            let mut pool = read_pool().lock().expect("isolated pool");
+            // Deliberately choose the former algorithm's victim as the hot
+            // path. Assign exact idle ages, avoiding clock-resolution or sleep
+            // assumptions while exercising real acquisition/return/eviction.
+            let hot = pool.keys().next().unwrap().clone();
+            let cold = pool.keys().find(|path| **path != hot).unwrap().clone();
+            let now = std::time::Instant::now();
+            for (path, entries) in pool.iter_mut() {
+                entries[0].returned_at = if *path == hot {
+                    now
+                } else if *path == cold {
+                    now.checked_sub(std::time::Duration::from_secs(2)).unwrap()
+                } else {
+                    now.checked_sub(std::time::Duration::from_secs(1)).unwrap()
+                };
+            }
+            (hot, cold)
+        };
+        let pressure_path = temp_dir.path().join("lru-pressure.db");
+        std::fs::File::create(&pressure_path).expect("seed pressure database");
+        drop(PooledReadConn::acquire(&pressure_path.to_string_lossy()).unwrap());
+        {
+            let pool = read_pool().lock().expect("isolated pool");
+            assert!(
+                pool.contains_key(&hot_path),
+                "recent idle backend was evicted"
+            );
+            assert!(
+                !pool.contains_key(&cold_path),
+                "oldest idle backend survived"
+            );
+            assert_eq!(
+                pool.values().map(Vec::len).sum::<usize>(),
+                MAX_IDLE_READ_BACKENDS
+            );
+        }
+        let loan = PooledReadConn::acquire(&hot_path).expect("reacquire hot backend");
+        assert_eq!(
+            loan.backend_ref()
+                .query_row_cells("SELECT value FROM connection_marker", &[])
+                .unwrap(),
+            Some(vec![super::SqlCell::Integer(42)]),
+        );
+        let before_return = std::time::Instant::now();
+        drop(loan);
+        assert!(read_pool().lock().unwrap()[&hot_path][0].returned_at >= before_return);
+    }
+
+    #[test]
     fn read_pool_process_wide_idle_capacity_is_bounded_across_paths() {
         let _guard = pool_counter_test_lock()
             .lock()
@@ -44491,6 +44979,51 @@ mod pool_telemetry_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for db_path in db_paths {
             pool.remove(&db_path);
+        }
+    }
+
+    #[test]
+    fn read_pool_panicked_borrow_does_not_retain_empty_path_entries() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _isolated_pool = IsolatedPool::enter();
+
+        // Exceed the idle-backend cap with completed failed loans. The cap
+        // counts backends, so it cannot reclaim an empty path entry.
+        for index in 0..=MAX_IDLE_READ_BACKENDS {
+            let path = temp_dir.path().join(format!("panicked-read-{index}.db"));
+            std::fs::File::create(&path).expect("seed database file");
+            let path = path.to_string_lossy().into_owned();
+            drop(PooledReadConn::acquire(&path).expect("warm read pool"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PooledReadConn::acquire(&path)
+                    .expect("borrow warmed backend")
+                    .with_borrowed_backend(|backend| {
+                        assert!(
+                            backend
+                                .with_connection(|conn| conn.is_autocommit())
+                                .expect("probe real borrowed backend")
+                        );
+                        panic!("read-pool borrower panic");
+                    });
+            }));
+            let payload = result.expect_err("borrower must panic");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"read-pool borrower panic")
+            );
+
+            let retained = read_pool()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&path);
+            assert!(
+                !retained,
+                "failed read loan retained its empty path: {path}"
+            );
         }
     }
 

@@ -8116,6 +8116,11 @@ impl ToolHandler for WaAwaitEventTool {
         #[cfg(test)]
         let iteration_observer = self.iteration_observer.as_ref().map(Arc::clone);
         let request_cx_for_operation = request_cx.clone();
+        #[cfg(test)]
+        let diagnostic_caller = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
         let request_operation: McpAwaitEventRequestOperation = Box::new(move |storage| {
             Box::pin(async move {
                 let mut delivery_leases = Vec::new();
@@ -8130,6 +8135,13 @@ impl ToolHandler for WaAwaitEventTool {
                 }
                 let redactor = crate::redactor::Redactor::new();
                 let started = Instant::now();
+                // First-scan milestones identify whether an unmet timeout
+                // expired before reading, during either read, or before row
+                // processing. Storage emits the inner breakdown for slow reads.
+                #[cfg(test)]
+                let mut diagnostic_first_scan = [None; 4];
+                #[cfg(test)]
+                let mut diagnostic_pages = 0_u64;
                 let timeout = std::time::Duration::from_secs(params.timeout_secs);
                 let poll = std::time::Duration::from_millis(params.poll_interval_ms);
                 // `scan_after_id` is a monotonic query high-watermark. Temporarily
@@ -8419,9 +8431,16 @@ impl ToolHandler for WaAwaitEventTool {
                         since: None,
                         until: None,
                     };
+                    #[cfg(test)]
+                    {
+                        diagnostic_pages += 1;
+                        diagnostic_first_scan[0].get_or_insert_with(|| started.elapsed());
+                    }
                     let page_result = storage
                         .get_events_stream_page_with_cx(&cx, query)
                         .await;
+                    #[cfg(test)]
+                    diagnostic_first_scan[1].get_or_insert_with(|| started.elapsed());
                     mcp_await_event_record_storage_call_health(
                         &storage_reusable,
                         &page_result,
@@ -8464,11 +8483,15 @@ impl ToolHandler for WaAwaitEventTool {
                     )
                     .await;
                     reconciliation?;
+                    #[cfg(test)]
+                    diagnostic_first_scan[2].get_or_insert_with(|| started.elapsed());
                     let checked_through = mcp_await_event_page_checked_through(&page);
                     let batch_len = page.events.len();
                     let mut processed_all_events = true;
 
                     for (event_index, event) in page.events.into_iter().enumerate() {
+                        #[cfg(test)]
+                        diagnostic_first_scan[3].get_or_insert_with(|| started.elapsed());
                         let event_id = event.id;
                         #[cfg(test)]
                         if let Some(observer) = iteration_observer.as_ref() {
@@ -8773,6 +8796,14 @@ impl ToolHandler for WaAwaitEventTool {
                 })
                 }
                 .await;
+                #[cfg(test)]
+                if operation.as_ref().is_ok_and(|data| data.timed_out) {
+                    eprintln!(
+                        "AWAIT_REQUEST_TIMING caller={diagnostic_caller} total_us={} pages={diagnostic_pages} first_scan_us[before_page,after_page,after_retention,first_row]={:?}",
+                        started.elapsed().as_micros(),
+                        diagnostic_first_scan.map(|time| time.map(|time| time.as_micros())),
+                    );
+                }
                 let storage_reusable = storage_reusable.load(Ordering::Acquire);
                 McpAwaitEventRequestTaskOutput::new(operation, delivery_leases, storage_reusable)
             })
