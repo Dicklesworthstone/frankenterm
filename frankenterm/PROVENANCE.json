@@ -1039,20 +1039,20 @@
         "cosmetic": 8,
         "docs": 2,
         "feat": 18,
-        "fix": 97,
+        "fix": 98,
         "other": 14,
         "refactor": 6,
         "rename": 1,
         "runtime-swap": 1,
         "test": 3
       },
-      "fork_side_commit_count": 154,
+      "fork_side_commit_count": 155,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-19T13:51:49-04:00",
-        "sha": "ba8765cc322e359126618e56970eb3bfb3103626",
-        "subject": "fix(gui): retain queued Lua successors through bounded admission retry"
+        "committed_at": "2026-09-21T02:09:34-04:00",
+        "sha": "49c0fd325664d9c2b6ff6a52ebde379c2f309963",
+        "subject": "fix(macos): use inhabited opaque Blocks runtime storage"
       },
       "name": "window",
       "path": "frankenterm/window",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2882,
-  "generated_at": "2026-09-21T03:19:28.224785Z",
+  "fork_side_commit_total": 2883,
+  "generated_at": "2026-09-21T06:13:20.538065Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
