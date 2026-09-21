@@ -18,22 +18,14 @@
         "raw_text_stored": false,
         "policy_id": "ft.read_path.redaction.v1"
       },
-      "reason_codes": [
-        "pane.capture_gap",
-        "source.redacted_summary_only"
-      ],
-      "artifact_paths": [
-        "tests/e2e/logs/pane-runtime-ft-ogr3n2.jsonl"
-      ],
+      "reason_codes": ["pane.capture_gap", "source.redacted_summary_only"],
+      "artifact_paths": ["tests/e2e/logs/pane-runtime-ft-ogr3n2.jsonl"],
       "payload": {
         "summary": "Pane emitted a redacted capture gap and two pattern detections.",
         "env": {
           "API_TOKEN": "ghp_examplefixturetoken"
         },
-        "detected_patterns": [
-          "rate_limit",
-          "prompt_ready"
-        ]
+        "detected_patterns": ["rate_limit", "prompt_ready"]
       }
     }
   ],
@@ -43,20 +35,12 @@
       "issue_id": "ft-ogr3n.2",
       "status": "in_progress",
       "updated_at_ms": 1778000002000,
-      "dependency_ids": [
-        "ft-ogr3n.1",
-        "ft-ogr3n.5"
-      ],
+      "dependency_ids": ["ft-ogr3n.1", "ft-ogr3n.5"],
       "comment_count": 3,
       "dirty_tree_guard_comment_count": 1,
       "close_reason": null,
-      "reason_codes": [
-        "beads.claimed",
-        "git.dirty_tree_guard_present"
-      ],
-      "artifact_paths": [
-        ".beads/issues.jsonl"
-      ],
+      "reason_codes": ["beads.claimed", "git.dirty_tree_guard_present"],
+      "artifact_paths": [".beads/issues.jsonl"],
       "payload": {
         "summary": "Direct blockers are closed; parent remains blocked by convergence child."
       }
@@ -81,13 +65,8 @@
       "exit_code": 0,
       "cancellation_reason": null,
       "preflight_refusal_reason": null,
-      "artifact_paths": [
-        "tests/e2e/logs/rch-ft-ogr3n2.json"
-      ],
-      "reason_codes": [
-        "rch.remote_worker_reached",
-        "rch.exit_zero"
-      ],
+      "artifact_paths": ["tests/e2e/logs/rch-ft-ogr3n2.json"],
+      "reason_codes": ["rch.remote_worker_reached", "rch.exit_zero"],
       "payload": {
         "duration_ms": 6000,
         "remote_cargo_reached": true
@@ -107,17 +86,9 @@
       ],
       "branch_ahead": 0,
       "branch_behind": 0,
-      "protected_deletion_warnings": [
-        "crates/frankenterm-core deletion guard clean"
-      ],
-      "artifact_paths": [
-        "tests/e2e/logs/git-status-ft-ogr3n2.json",
-        "../unsafe/status.json"
-      ],
-      "reason_codes": [
-        "git.dirty_tree_snapshot",
-        "git.protected_delete_guard_present"
-      ],
+      "protected_deletion_warnings": ["crates/frankenterm-core deletion guard clean"],
+      "artifact_paths": ["tests/e2e/logs/git-status-ft-ogr3n2.json", "../unsafe/status.json"],
+      "reason_codes": ["git.dirty_tree_snapshot", "git.protected_delete_guard_present"],
       "payload": {
         "summary": "Tracked dirty paths are captured without mutating the worktree."
       }
@@ -134,13 +105,8 @@
       "ack_required_count": 0,
       "contact_count": 2,
       "unavailable_reason": null,
-      "reason_codes": [
-        "agent_mail.healthy",
-        "source.metadata_only"
-      ],
-      "artifact_paths": [
-        "tests/e2e/logs/agent-mail-ft-ogr3n2.json"
-      ],
+      "reason_codes": ["agent_mail.healthy", "source.metadata_only"],
+      "artifact_paths": ["tests/e2e/logs/agent-mail-ft-ogr3n2.json"],
       "payload": {
         "summary": "Only message counters, ack counters, and contact counts are persisted."
       }

@@ -101,7 +101,7 @@
       "actor_id": "quiet-shell",
       "dimension": "quiet_shell",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.quiet-shell.v1", "args": []},
+      "command": { "driver": "builtin", "program": "ft.soak.quiet-shell.v1", "args": [] },
       "asset_ids": [],
       "payload_profile": "shell-prompt-heartbeat-v1",
       "output_bytes_per_second": 0,
@@ -111,8 +111,12 @@
       "actor_id": "editor-tui",
       "dimension": "editor_tui",
       "activation": "persistent",
-      "shutdown": {"kind": "interrupt"},
-      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_alt_screen.sh", "args": ["660"]},
+      "shutdown": { "kind": "interrupt" },
+      "command": {
+        "driver": "isolated_argv",
+        "program": "fixtures/e2e/dummy_alt_screen.sh",
+        "args": ["660"]
+      },
       "asset_ids": ["dummy-alt-screen-v1"],
       "payload_profile": "alternate-screen-editor-v1",
       "output_bytes_per_second": 512,
@@ -122,7 +126,11 @@
       "actor_id": "build-test-output",
       "dimension": "build_test_output",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.fixture-replay.v1", "args": ["build-output-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.fixture-replay.v1",
+        "args": ["build-output-v1"]
+      },
       "asset_ids": ["build-output-v1"],
       "payload_profile": "paced-build-log-v1",
       "output_bytes_per_second": 32768,
@@ -132,7 +140,11 @@
       "actor_id": "progress-redraw",
       "dimension": "progress_redraw",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.progress-redraw.v1", "args": ["ansi", "carriage-return"]},
+      "command": {
+        "driver": "builtin",
+        "program": "ft.soak.progress-redraw.v1",
+        "args": ["ansi", "carriage-return"]
+      },
       "asset_ids": [],
       "payload_profile": "ansi-progress-redraw-v1",
       "output_bytes_per_second": 8192,
@@ -142,8 +154,12 @@
       "actor_id": "agent-like-stream",
       "dimension": "agent_like_stream",
       "activation": "persistent",
-      "shutdown": {"kind": "stdin_line", "line": "exit"},
-      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_agent.sh", "args": ["1", "5", "1", "660"]},
+      "shutdown": { "kind": "stdin_line", "line": "exit" },
+      "command": {
+        "driver": "isolated_argv",
+        "program": "fixtures/e2e/dummy_agent.sh",
+        "args": ["1", "5", "1", "660"]
+      },
       "asset_ids": ["dummy-agent-v1", "agent-output-v1"],
       "payload_profile": "agent-prompt-tool-stream-v1",
       "output_bytes_per_second": 4096,
@@ -153,7 +169,11 @@
       "actor_id": "images",
       "dimension": "images",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.image-replay.v1", "args": ["static-image-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.image-replay.v1",
+        "args": ["static-image-v1"]
+      },
       "asset_ids": ["static-image-v1"],
       "payload_profile": "static-image-redraw-v1",
       "output_bytes_per_second": 2048,
@@ -163,7 +183,11 @@
       "actor_id": "glyph-diversity",
       "dimension": "glyph_diversity",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.glyph-replay.v1", "args": ["glyph-combining-v1", "glyph-emoji-v1", "glyph-rtl-v1", "glyph-cjk-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.glyph-replay.v1",
+        "args": ["glyph-combining-v1", "glyph-emoji-v1", "glyph-rtl-v1", "glyph-cjk-v1"]
+      },
       "asset_ids": ["glyph-combining-v1", "glyph-emoji-v1", "glyph-rtl-v1", "glyph-cjk-v1"],
       "payload_profile": "unicode-combining-rtl-emoji-cjk-v1",
       "output_bytes_per_second": 4096,
@@ -173,7 +197,11 @@
       "actor_id": "search",
       "dimension": "search",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.search.v1", "args": ["lexical", "semantic", "hybrid"]},
+      "command": {
+        "driver": "builtin",
+        "program": "ft.soak.search.v1",
+        "args": ["lexical", "semantic", "hybrid"]
+      },
       "asset_ids": ["agent-output-v1"],
       "payload_profile": "search-query-mix-v1",
       "output_bytes_per_second": 512,
@@ -183,7 +211,11 @@
       "actor_id": "capture",
       "dimension": "capture",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.capture-replay.v1", "args": ["agent-output-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.capture-replay.v1",
+        "args": ["agent-output-v1"]
+      },
       "asset_ids": ["agent-output-v1"],
       "payload_profile": "capture-delta-gap-v1",
       "output_bytes_per_second": 2048,
@@ -193,7 +225,11 @@
       "actor_id": "workflow",
       "dimension": "workflow",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.workflow.v1", "args": ["trigger", "policy", "complete"]},
+      "command": {
+        "driver": "builtin",
+        "program": "ft.soak.workflow.v1",
+        "args": ["trigger", "policy", "complete"]
+      },
       "asset_ids": [],
       "payload_profile": "workflow-policy-loop-v1",
       "output_bytes_per_second": 512,
@@ -203,7 +239,11 @@
       "actor_id": "maintenance",
       "dimension": "maintenance",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.maintenance.v1", "args": ["wal", "gc", "backup", "prune"]},
+      "command": {
+        "driver": "builtin",
+        "program": "ft.soak.maintenance.v1",
+        "args": ["wal", "gc", "backup", "prune"]
+      },
       "asset_ids": [],
       "payload_profile": "maintenance-overlap-v1",
       "output_bytes_per_second": 256,
@@ -213,7 +253,11 @@
       "actor_id": "layout-churn",
       "dimension": "layout_churn",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.layout-replay.v1", "args": ["mixed-scale-resize-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.layout-replay.v1",
+        "args": ["mixed-scale-resize-v1"]
+      },
       "asset_ids": ["mixed-scale-resize-v1"],
       "payload_profile": "window-tab-split-focus-v1",
       "output_bytes_per_second": 128,
@@ -223,7 +267,11 @@
       "actor_id": "resize-zoom",
       "dimension": "resize_zoom",
       "activation": "scheduled",
-      "command": {"driver": "fixture_replay", "program": "ft.soak.resize-replay.v1", "args": ["interactive-resize-v1"]},
+      "command": {
+        "driver": "fixture_replay",
+        "program": "ft.soak.resize-replay.v1",
+        "args": ["interactive-resize-v1"]
+      },
       "asset_ids": ["interactive-resize-v1"],
       "payload_profile": "continuous-resize-font-zoom-v1",
       "output_bytes_per_second": 128,
@@ -233,7 +281,11 @@
       "actor_id": "reconnect",
       "dimension": "reconnect",
       "activation": "scheduled",
-      "command": {"driver": "builtin", "program": "ft.soak.reconnect.v1", "args": ["interrupt", "retry", "resync", "ack"]},
+      "command": {
+        "driver": "builtin",
+        "program": "ft.soak.reconnect.v1",
+        "args": ["interrupt", "retry", "resync", "ack"]
+      },
       "asset_ids": [],
       "payload_profile": "generation-bound-reconnect-v1",
       "output_bytes_per_second": 128,
@@ -243,7 +295,11 @@
       "actor_id": "output-burst",
       "dimension": "output_burst",
       "activation": "scheduled",
-      "command": {"driver": "isolated_argv", "program": "fixtures/e2e/dummy_burst.sh", "args": ["6509", "FT_SOAK_BURST_V1_XX"]},
+      "command": {
+        "driver": "isolated_argv",
+        "program": "fixtures/e2e/dummy_burst.sh",
+        "args": ["6509", "FT_SOAK_BURST_V1_XX"]
+      },
       "asset_ids": ["dummy-burst-v1"],
       "payload_profile": "paced-adversarial-burst-v1",
       "output_bytes_per_second": 802688,
@@ -258,21 +314,21 @@
       "interactive_pane_count": 1,
       "aggregate_output_bytes_per_second": 903168,
       "allocations": [
-        {"actor_id": "quiet-shell", "pane_count": 3},
-        {"actor_id": "editor-tui", "pane_count": 1},
-        {"actor_id": "build-test-output", "pane_count": 2},
-        {"actor_id": "progress-redraw", "pane_count": 2},
-        {"actor_id": "agent-like-stream", "pane_count": 2},
-        {"actor_id": "images", "pane_count": 1},
-        {"actor_id": "glyph-diversity", "pane_count": 1},
-        {"actor_id": "search", "pane_count": 1},
-        {"actor_id": "capture", "pane_count": 1},
-        {"actor_id": "workflow", "pane_count": 1},
-        {"actor_id": "maintenance", "pane_count": 1},
-        {"actor_id": "layout-churn", "pane_count": 1},
-        {"actor_id": "resize-zoom", "pane_count": 1},
-        {"actor_id": "reconnect", "pane_count": 1},
-        {"actor_id": "output-burst", "pane_count": 1}
+        { "actor_id": "quiet-shell", "pane_count": 3 },
+        { "actor_id": "editor-tui", "pane_count": 1 },
+        { "actor_id": "build-test-output", "pane_count": 2 },
+        { "actor_id": "progress-redraw", "pane_count": 2 },
+        { "actor_id": "agent-like-stream", "pane_count": 2 },
+        { "actor_id": "images", "pane_count": 1 },
+        { "actor_id": "glyph-diversity", "pane_count": 1 },
+        { "actor_id": "search", "pane_count": 1 },
+        { "actor_id": "capture", "pane_count": 1 },
+        { "actor_id": "workflow", "pane_count": 1 },
+        { "actor_id": "maintenance", "pane_count": 1 },
+        { "actor_id": "layout-churn", "pane_count": 1 },
+        { "actor_id": "resize-zoom", "pane_count": 1 },
+        { "actor_id": "reconnect", "pane_count": 1 },
+        { "actor_id": "output-burst", "pane_count": 1 }
       ]
     },
     {
@@ -282,21 +338,21 @@
       "interactive_pane_count": 5,
       "aggregate_output_bytes_per_second": 1048576,
       "allocations": [
-        {"actor_id": "quiet-shell", "pane_count": 10},
-        {"actor_id": "editor-tui", "pane_count": 4},
-        {"actor_id": "build-test-output", "pane_count": 5},
-        {"actor_id": "progress-redraw", "pane_count": 4},
-        {"actor_id": "agent-like-stream", "pane_count": 5},
-        {"actor_id": "images", "pane_count": 2},
-        {"actor_id": "glyph-diversity", "pane_count": 3},
-        {"actor_id": "search", "pane_count": 3},
-        {"actor_id": "capture", "pane_count": 3},
-        {"actor_id": "workflow", "pane_count": 3},
-        {"actor_id": "maintenance", "pane_count": 2},
-        {"actor_id": "layout-churn", "pane_count": 2},
-        {"actor_id": "resize-zoom", "pane_count": 2},
-        {"actor_id": "reconnect", "pane_count": 1},
-        {"actor_id": "output-burst", "pane_count": 1}
+        { "actor_id": "quiet-shell", "pane_count": 10 },
+        { "actor_id": "editor-tui", "pane_count": 4 },
+        { "actor_id": "build-test-output", "pane_count": 5 },
+        { "actor_id": "progress-redraw", "pane_count": 4 },
+        { "actor_id": "agent-like-stream", "pane_count": 5 },
+        { "actor_id": "images", "pane_count": 2 },
+        { "actor_id": "glyph-diversity", "pane_count": 3 },
+        { "actor_id": "search", "pane_count": 3 },
+        { "actor_id": "capture", "pane_count": 3 },
+        { "actor_id": "workflow", "pane_count": 3 },
+        { "actor_id": "maintenance", "pane_count": 2 },
+        { "actor_id": "layout-churn", "pane_count": 2 },
+        { "actor_id": "resize-zoom", "pane_count": 2 },
+        { "actor_id": "reconnect", "pane_count": 1 },
+        { "actor_id": "output-burst", "pane_count": 1 }
       ]
     },
     {
@@ -306,52 +362,123 @@
       "interactive_pane_count": 10,
       "aggregate_output_bytes_per_second": 5802880,
       "allocations": [
-        {"actor_id": "quiet-shell", "pane_count": 40},
-        {"actor_id": "editor-tui", "pane_count": 15},
-        {"actor_id": "build-test-output", "pane_count": 20},
-        {"actor_id": "progress-redraw", "pane_count": 15},
-        {"actor_id": "agent-like-stream", "pane_count": 25},
-        {"actor_id": "images", "pane_count": 8},
-        {"actor_id": "glyph-diversity", "pane_count": 10},
-        {"actor_id": "search", "pane_count": 12},
-        {"actor_id": "capture", "pane_count": 12},
-        {"actor_id": "workflow", "pane_count": 12},
-        {"actor_id": "maintenance", "pane_count": 8},
-        {"actor_id": "layout-churn", "pane_count": 6},
-        {"actor_id": "resize-zoom", "pane_count": 6},
-        {"actor_id": "reconnect", "pane_count": 5},
-        {"actor_id": "output-burst", "pane_count": 6}
+        { "actor_id": "quiet-shell", "pane_count": 40 },
+        { "actor_id": "editor-tui", "pane_count": 15 },
+        { "actor_id": "build-test-output", "pane_count": 20 },
+        { "actor_id": "progress-redraw", "pane_count": 15 },
+        { "actor_id": "agent-like-stream", "pane_count": 25 },
+        { "actor_id": "images", "pane_count": 8 },
+        { "actor_id": "glyph-diversity", "pane_count": 10 },
+        { "actor_id": "search", "pane_count": 12 },
+        { "actor_id": "capture", "pane_count": 12 },
+        { "actor_id": "workflow", "pane_count": 12 },
+        { "actor_id": "maintenance", "pane_count": 8 },
+        { "actor_id": "layout-churn", "pane_count": 6 },
+        { "actor_id": "resize-zoom", "pane_count": 6 },
+        { "actor_id": "reconnect", "pane_count": 5 },
+        { "actor_id": "output-burst", "pane_count": 6 }
       ]
     }
   ],
   "phases": [
-    {"phase_id": "quiet-baseline", "start_offset_ms": 0, "duration_ms": 60000, "action_cadence_ms": 5000, "dimensions": ["quiet_shell"]},
-    {"phase_id": "interactive-warmup", "start_offset_ms": 60000, "duration_ms": 120000, "action_cadence_ms": 1000, "dimensions": ["editor_tui", "progress_redraw", "agent_like_stream"]},
-    {"phase_id": "sustained-services", "start_offset_ms": 180000, "duration_ms": 120000, "action_cadence_ms": 500, "dimensions": ["build_test_output", "capture", "search", "workflow", "maintenance"]},
-    {"phase_id": "visual-glyph-pressure", "start_offset_ms": 300000, "duration_ms": 90000, "action_cadence_ms": 1000, "dimensions": ["images", "glyph_diversity"]},
-    {"phase_id": "layout-resize-zoom", "start_offset_ms": 390000, "duration_ms": 90000, "action_cadence_ms": 500, "dimensions": ["layout_churn", "resize_zoom"]},
-    {"phase_id": "reconnect-recovery", "start_offset_ms": 480000, "duration_ms": 60000, "action_cadence_ms": 2000, "dimensions": ["reconnect"]},
-    {"phase_id": "adversarial-burst", "start_offset_ms": 540000, "duration_ms": 30000, "action_cadence_ms": 250, "dimensions": ["output_burst"]},
-    {"phase_id": "cooldown-final-state", "start_offset_ms": 570000, "duration_ms": 60000, "action_cadence_ms": 5000, "dimensions": ["quiet_shell", "editor_tui", "build_test_output", "progress_redraw", "agent_like_stream", "images", "glyph_diversity", "search", "capture", "workflow", "maintenance", "layout_churn", "resize_zoom", "reconnect", "output_burst"]}
+    {
+      "phase_id": "quiet-baseline",
+      "start_offset_ms": 0,
+      "duration_ms": 60000,
+      "action_cadence_ms": 5000,
+      "dimensions": ["quiet_shell"]
+    },
+    {
+      "phase_id": "interactive-warmup",
+      "start_offset_ms": 60000,
+      "duration_ms": 120000,
+      "action_cadence_ms": 1000,
+      "dimensions": ["editor_tui", "progress_redraw", "agent_like_stream"]
+    },
+    {
+      "phase_id": "sustained-services",
+      "start_offset_ms": 180000,
+      "duration_ms": 120000,
+      "action_cadence_ms": 500,
+      "dimensions": ["build_test_output", "capture", "search", "workflow", "maintenance"]
+    },
+    {
+      "phase_id": "visual-glyph-pressure",
+      "start_offset_ms": 300000,
+      "duration_ms": 90000,
+      "action_cadence_ms": 1000,
+      "dimensions": ["images", "glyph_diversity"]
+    },
+    {
+      "phase_id": "layout-resize-zoom",
+      "start_offset_ms": 390000,
+      "duration_ms": 90000,
+      "action_cadence_ms": 500,
+      "dimensions": ["layout_churn", "resize_zoom"]
+    },
+    {
+      "phase_id": "reconnect-recovery",
+      "start_offset_ms": 480000,
+      "duration_ms": 60000,
+      "action_cadence_ms": 2000,
+      "dimensions": ["reconnect"]
+    },
+    {
+      "phase_id": "adversarial-burst",
+      "start_offset_ms": 540000,
+      "duration_ms": 30000,
+      "action_cadence_ms": 250,
+      "dimensions": ["output_burst"]
+    },
+    {
+      "phase_id": "cooldown-final-state",
+      "start_offset_ms": 570000,
+      "duration_ms": 60000,
+      "action_cadence_ms": 5000,
+      "dimensions": [
+        "quiet_shell",
+        "editor_tui",
+        "build_test_output",
+        "progress_redraw",
+        "agent_like_stream",
+        "images",
+        "glyph_diversity",
+        "search",
+        "capture",
+        "workflow",
+        "maintenance",
+        "layout_churn",
+        "resize_zoom",
+        "reconnect",
+        "output_burst"
+      ]
+    }
   ],
   "final_oracles": [
-    {"oracle": "no_owned_workspace", "authority": "logical_replay"},
-    {"oracle": "no_live_actors", "authority": "logical_replay"},
-    {"oracle": "no_open_panes", "authority": "logical_replay"},
-    {"oracle": "no_open_tabs", "authority": "logical_replay"},
-    {"oracle": "no_open_windows", "authority": "logical_replay"},
-    {"oracle": "no_pending_actions", "authority": "logical_replay"},
-    {"oracle": "all_dimensions_observed", "authority": "logical_replay"},
-    {"oracle": "stable_fleet_identity_map", "authority": "logical_replay"},
-    {"oracle": "final_terminal_state_hash", "authority": "production_runner"},
-    {"oracle": "final_layout_state_hash", "authority": "production_runner"},
-    {"oracle": "capture_search_quiescent", "authority": "production_runner"},
-    {"oracle": "no_orphan_children", "authority": "production_runner"},
-    {"oracle": "no_open_transports", "authority": "production_runner"},
-    {"oracle": "resource_ownership_at_baseline", "authority": "production_runner"}
+    { "oracle": "no_owned_workspace", "authority": "logical_replay" },
+    { "oracle": "no_live_actors", "authority": "logical_replay" },
+    { "oracle": "no_open_panes", "authority": "logical_replay" },
+    { "oracle": "no_open_tabs", "authority": "logical_replay" },
+    { "oracle": "no_open_windows", "authority": "logical_replay" },
+    { "oracle": "no_pending_actions", "authority": "logical_replay" },
+    { "oracle": "all_dimensions_observed", "authority": "logical_replay" },
+    { "oracle": "stable_fleet_identity_map", "authority": "logical_replay" },
+    { "oracle": "final_terminal_state_hash", "authority": "production_runner" },
+    { "oracle": "final_layout_state_hash", "authority": "production_runner" },
+    { "oracle": "capture_search_quiescent", "authority": "production_runner" },
+    { "oracle": "no_orphan_children", "authority": "production_runner" },
+    { "oracle": "no_open_transports", "authority": "production_runner" },
+    { "oracle": "resource_ownership_at_baseline", "authority": "production_runner" }
   ],
   "dogfood": {
     "excluded_from_deterministic_verdict": true,
-    "required_identity_fields": ["agent_name", "agent_version", "model_id", "config_digest", "session_id", "transcript_digest"]
+    "required_identity_fields": [
+      "agent_name",
+      "agent_version",
+      "model_id",
+      "config_digest",
+      "session_id",
+      "transcript_digest"
+    ]
   }
 }

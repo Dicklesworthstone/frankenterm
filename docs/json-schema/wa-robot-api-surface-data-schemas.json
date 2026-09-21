@@ -112,11 +112,7 @@
           "required": ["state", "sensitivity_tier", "redacted_field_count"],
           "properties": {
             "state": {
-              "enum": [
-                "redacted",
-                "no_sensitive_fields",
-                "rejected_unredactable"
-              ]
+              "enum": ["redacted", "no_sensitive_fields", "rejected_unredactable"]
             },
             "sensitivity_tier": { "type": "string", "minLength": 1 },
             "redacted_field_count": { "type": "integer", "minimum": 0 }

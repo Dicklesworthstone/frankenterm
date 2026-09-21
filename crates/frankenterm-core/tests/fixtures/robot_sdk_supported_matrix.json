@@ -13,10 +13,7 @@
         "FrankentermRobotError",
         "FrankentermTransportError"
       ],
-      "forbidden_source_markers": [
-        "transport not wired",
-        "NotImplementedError"
-      ]
+      "forbidden_source_markers": ["transport not wired", "NotImplementedError"]
     },
     {
       "language": "TypeScript",
@@ -31,9 +28,7 @@
         "FrankentermTransportError",
         "FrankentermUnsupportedCommandError"
       ],
-      "forbidden_source_markers": [
-        "transport not wired"
-      ]
+      "forbidden_source_markers": ["transport not wired"]
     },
     {
       "language": "Rust",
@@ -47,10 +42,7 @@
         "RustSdkTransportError",
         "pub struct FrankentermClient"
       ],
-      "forbidden_source_markers": [
-        "transport not wired",
-        "unimplemented!"
-      ]
+      "forbidden_source_markers": ["transport not wired", "unimplemented!"]
     },
     {
       "language": "Go",
@@ -65,10 +57,7 @@
         "FrankentermTransportError",
         "FrankentermUnsupportedCommandError"
       ],
-      "forbidden_source_markers": [
-        "transport not wired",
-        "panic("
-      ]
+      "forbidden_source_markers": ["transport not wired", "panic("]
     }
   ]
 }

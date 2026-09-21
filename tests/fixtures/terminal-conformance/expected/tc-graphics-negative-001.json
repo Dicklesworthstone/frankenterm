@@ -4,15 +4,7 @@
   "required_action_kinds": {
     "PrintString": 1
   },
-  "forbidden_action_kinds": [
-    "KittyImage",
-    "Sixel"
-  ],
-  "required_input_hex": [
-    "1b5f47743d662c533d393939",
-    "1b5071213132"
-  ],
-  "required_display_utf8": [
-    "after"
-  ]
+  "forbidden_action_kinds": ["KittyImage", "Sixel"],
+  "required_input_hex": ["1b5f47743d662c533d393939", "1b5071213132"],
+  "required_display_utf8": ["after"]
 }

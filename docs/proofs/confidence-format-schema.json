@@ -3,10 +3,7 @@
   "$id": "https://frankenterm.dev/schemas/proofs/confidence-format/v1.json",
   "title": "FrankenTerm Proof Confidence Format",
   "description": "Canonical confidence/bound record shape for proof-emitting beads and release-attestation confidence summaries. Defined by ft-tf6g3.34.",
-  "oneOf": [
-    { "$ref": "#/$defs/confidenceRecord" },
-    { "$ref": "#/$defs/confidenceSummary" }
-  ],
+  "oneOf": [{ "$ref": "#/$defs/confidenceRecord" }, { "$ref": "#/$defs/confidenceSummary" }],
   "$defs": {
     "confidenceType": {
       "description": "Method family that gives meaning to confidence_value.",
@@ -149,12 +146,7 @@
     },
     "confidenceSummary": {
       "type": "object",
-      "required": [
-        "schema_version",
-        "schema_path",
-        "records",
-        "best_confidence_by_category"
-      ],
+      "required": ["schema_version", "schema_path", "records", "best_confidence_by_category"],
       "additionalProperties": false,
       "properties": {
         "schema_version": { "const": "1.0.0" },

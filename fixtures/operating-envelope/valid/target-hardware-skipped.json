@@ -11,10 +11,7 @@
     "requested_cpu_cores": 64,
     "requested_memory_gib": 256,
     "proof_state": "skipped_not_proven",
-    "reason_codes": [
-      "target_hardware.skipped_not_proven",
-      "capacity.target_class_unproven"
-    ]
+    "reason_codes": ["target_hardware.skipped_not_proven", "capacity.target_class_unproven"]
   },
   "input_domains": {
     "capacity_resource": {
@@ -30,9 +27,7 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Simulated capacity cannot prove target-class admission."
-        ]
+        "notes": ["Simulated capacity cannot prove target-class admission."]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
@@ -48,17 +43,11 @@
           "category": "target_hardware",
           "state": "warn",
           "subject": "64-core 256GiB target class",
-          "reason_codes": [
-            "target_hardware.skipped_not_proven"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-          ]
+          "reason_codes": ["target_hardware.skipped_not_proven"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
     },
     "rch": {
       "source_id": "rch-available-non-target",
@@ -73,15 +62,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "RCH is healthy but not proven on target-class hardware."
-        ]
+        "notes": ["RCH is healthy but not proven on target-class hardware."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "rch.worker_selection.pass",
-        "target_hardware.not_target_class"
-      ],
+      "reason_codes": ["rch.worker_selection.pass", "target_hardware.not_target_class"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -90,17 +74,11 @@
           "category": "rch_worker_selection",
           "state": "warn",
           "subject": "non-target worker",
-          "reason_codes": [
-            "target_hardware.not_target_class"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-          ]
+          "reason_codes": ["target_hardware.not_target_class"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
     },
     "beads": {
       "source_id": "beads-target-class-plan",
@@ -115,14 +93,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Target-class planning bead exists."
-        ]
+        "notes": ["Target-class planning bead exists."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.ready_available"
-      ],
+      "reason_codes": ["beads.ready_available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -131,17 +105,11 @@
           "category": "beads_ready_queue",
           "state": "pass",
           "subject": "target-class planning",
-          "reason_codes": [
-            "beads.ready_available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-          ]
+          "reason_codes": ["beads.ready_available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
     },
     "agent_mail": {
       "source_id": "agent-mail-available",
@@ -156,14 +124,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "Mailbox summary only."
-        ]
+        "notes": ["Mailbox summary only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "agent_mail.available"
-      ],
+      "reason_codes": ["agent_mail.available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -172,17 +136,11 @@
           "category": "agent_mail_availability",
           "state": "pass",
           "subject": "fetch_inbox",
-          "reason_codes": [
-            "agent_mail.available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-          ]
+          "reason_codes": ["agent_mail.available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
     },
     "git": {
       "source_id": "git-clean-target",
@@ -197,15 +155,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Clean for target-class planning docs."
-        ]
+        "notes": ["Clean for target-class planning docs."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.clean_for_scope",
-        "dirty_overlap.none"
-      ],
+      "reason_codes": ["git.clean_for_scope", "dirty_overlap.none"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -214,17 +167,11 @@
           "category": "dirty_path_overlap",
           "state": "pass",
           "subject": "target-class docs",
-          "reason_codes": [
-            "dirty_overlap.none"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-          ]
+          "reason_codes": ["dirty_overlap.none"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/target-hardware-skipped.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/target-hardware-skipped.json"]
     }
   },
   "decision": {
@@ -275,15 +222,8 @@
         "worker_drain",
         "raw_pane_content_capture"
       ],
-      "source_ids": [
-        "capacity-simulated",
-        "rch-available-non-target",
-        "beads-target-class-plan"
-      ],
-      "reason_codes": [
-        "target_hardware.skipped_not_proven",
-        "proof.static_only"
-      ]
+      "source_ids": ["capacity-simulated", "rch-available-non-target", "beads-target-class-plan"],
+      "reason_codes": ["target_hardware.skipped_not_proven", "proof.static_only"]
     }
   ],
   "fail_closed_policy": {
@@ -292,9 +232,7 @@
     "contradictory_signal_behavior": "block",
     "privacy_redaction_behavior": "lower_envelope",
     "target_hardware_gap_behavior": "defer_target_class_claim",
-    "reason_codes": [
-      "fail_closed.defer_target_class_claim"
-    ]
+    "reason_codes": ["fail_closed.defer_target_class_claim"]
   },
   "side_effect_policy": {
     "dry_run_only": true,
@@ -308,15 +246,10 @@
     "policy_id": "ft.redaction.operating_envelope.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Target-class fixture stores proof posture, not raw worker logs."
-    ]
+    "notes": ["Target-class fixture stores proof posture, not raw worker logs."]
   },
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "envelope.defer",
-    "target_hardware.skipped_not_proven"
-  ],
+  "reason_codes": ["envelope.defer", "target_hardware.skipped_not_proven"],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
     "fixtures/operating-envelope/valid/target-hardware-skipped.json"

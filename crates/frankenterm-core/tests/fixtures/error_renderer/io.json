@@ -7,9 +7,7 @@
     "hint": "Check filesystem permissions and paths, then retry.",
     "ok": false,
     "remediation": {
-      "alternatives": [
-        "Verify the workspace directory exists and is writable."
-      ],
+      "alternatives": ["Verify the workspace directory exists and is writable."],
       "commands": [
         {
           "command": "ft doctor",

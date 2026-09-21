@@ -12,9 +12,7 @@
   },
   "thread_id": "ft-dezx8.1",
   "recipients": {
-    "to": [
-      "SapphireCardinal"
-    ],
+    "to": ["SapphireCardinal"],
     "cc": [],
     "bcc": []
   },
@@ -45,11 +43,7 @@
   "retention": {
     "retain_until": "2026-06-28T13:39:00Z",
     "automatic_discard": false,
-    "redaction": [
-      "body_digest_only",
-      "body_preview_redacted",
-      "attachment_refs_only"
-    ]
+    "redaction": ["body_digest_only", "body_preview_redacted", "attachment_refs_only"]
   },
   "reservation_intent": null,
   "beads_fallback": {

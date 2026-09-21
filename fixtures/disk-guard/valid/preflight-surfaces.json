@@ -8,11 +8,7 @@
   "side_effect_policy": {
     "read_only": true,
     "cleanup_requires_operator_approval": true,
-    "performed_actions": [
-      "stat_filesystem",
-      "bounded_write_probe",
-      "read_status"
-    ],
+    "performed_actions": ["stat_filesystem", "bounded_write_probe", "read_status"],
     "forbidden_actions": [
       "delete_file",
       "delete_directory",
@@ -33,9 +29,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "disk.system_data_volume.healthy"
-      ],
+      "reason_codes": ["disk.system_data_volume.healthy"],
       "next_safe_action": "Proceed within normal proof and edit policy."
     },
     {
@@ -44,9 +38,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "disk.private_tmp.healthy"
-      ],
+      "reason_codes": ["disk.private_tmp.healthy"],
       "next_safe_action": "Temporary target creation is allowed within normal policy."
     },
     {
@@ -55,9 +47,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "write_probe.repo.pass"
-      ],
+      "reason_codes": ["write_probe.repo.pass"],
       "next_safe_action": "Repository writes are allowed within owned paths."
     },
     {
@@ -66,9 +56,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "beads.db.writeable"
-      ],
+      "reason_codes": ["beads.db.writeable"],
       "next_safe_action": "Use normal Beads coordination."
     },
     {
@@ -77,9 +65,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "beads.jsonl.export_clean"
-      ],
+      "reason_codes": ["beads.jsonl.export_clean"],
       "next_safe_action": "Auto-flush is healthy."
     },
     {
@@ -88,9 +74,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "agent_mail.db.open"
-      ],
+      "reason_codes": ["agent_mail.db.open"],
       "next_safe_action": "Use Agent Mail plus Beads coordination."
     },
     {
@@ -99,9 +83,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "rch.cache.writeable"
-      ],
+      "reason_codes": ["rch.cache.writeable"],
       "next_safe_action": "RCH proof lanes may be admitted when worker selection also passes."
     },
     {
@@ -110,9 +92,7 @@
       "sampled_at_ms": 1779014102000,
       "state": "pass",
       "severity": "green",
-      "reason_codes": [
-        "external_scratch.available"
-      ],
+      "reason_codes": ["external_scratch.available"],
       "next_safe_action": "External scratch is available for retained artifacts."
     }
   ],
@@ -124,9 +104,7 @@
     "preflight.rch_proof_lane.evaluated",
     "preflight.static_verifier_creation.evaluated"
   ],
-  "artifact_paths": [
-    "fixtures/disk-guard/valid/preflight-surfaces.json"
-  ],
+  "artifact_paths": ["fixtures/disk-guard/valid/preflight-surfaces.json"],
   "preflight_results": [
     {
       "surface": "patch_application",
@@ -134,9 +112,7 @@
       "write_allowed": true,
       "external_scratch_required": false,
       "blocking_probe_ids": [],
-      "reason_codes": [
-        "preflight.patch_application.evaluated"
-      ],
+      "reason_codes": ["preflight.patch_application.evaluated"],
       "next_safe_action": "Patch application may proceed in the shared checkout within owned paths."
     },
     {
@@ -145,9 +121,7 @@
       "write_allowed": true,
       "external_scratch_required": false,
       "blocking_probe_ids": [],
-      "reason_codes": [
-        "preflight.static_verifier_creation.evaluated"
-      ],
+      "reason_codes": ["preflight.static_verifier_creation.evaluated"],
       "next_safe_action": "Static verifier creation may use the normal workspace proof surface."
     },
     {
@@ -156,9 +130,7 @@
       "write_allowed": true,
       "external_scratch_required": false,
       "blocking_probe_ids": [],
-      "reason_codes": [
-        "preflight.beads_comment_export.evaluated"
-      ],
+      "reason_codes": ["preflight.beads_comment_export.evaluated"],
       "next_safe_action": "Beads comment and JSONL export work may proceed under normal coordination."
     },
     {
@@ -167,9 +139,7 @@
       "write_allowed": true,
       "external_scratch_required": false,
       "blocking_probe_ids": [],
-      "reason_codes": [
-        "preflight.rch_proof_lane.evaluated"
-      ],
+      "reason_codes": ["preflight.rch_proof_lane.evaluated"],
       "next_safe_action": "RCH proof lanes may be admitted when worker selection also passes."
     }
   ]

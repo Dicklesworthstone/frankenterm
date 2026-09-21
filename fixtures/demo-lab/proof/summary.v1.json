@@ -12,11 +12,7 @@
     "contract_id": "ft.demo_lab.proof_ledger.v1",
     "entries": 3
   },
-  "scenario_ids": [
-    "quickstart",
-    "usage_limit",
-    "compaction"
-  ],
+  "scenario_ids": ["quickstart", "usage_limit", "compaction"],
   "commands_per_scenario": [
     "ft demo <scenario> --manifest fixtures/demo-lab/manifest.v1.json --format json",
     "ft demo <scenario> --manifest fixtures/demo-lab/manifest.v1.json --format toon",
@@ -228,10 +224,7 @@
       "bead_id": "ft-lecbn.5",
       "status": "closed",
       "acceptance": "Operator docs explain ft demo workflows, simulate relationship, artifact links, degradation behavior, and conservative proof boundaries.",
-      "artifact_paths": [
-        "README.md",
-        "docs/demo-scenarios.md"
-      ],
+      "artifact_paths": ["README.md", "docs/demo-scenarios.md"],
       "proof_commands": [
         {
           "command": "bash tests/e2e/test_demo_lab_fixture_manifest.sh",
@@ -250,10 +243,7 @@
       "bead_id": "ft-lecbn.7",
       "status": "closed",
       "acceptance": "Static manifest verifier prevents manifest, scenario YAML, retained JSON/TOON golden, path, degradation, hash, and secret-scan drift.",
-      "artifact_paths": [
-        "tests/e2e/test_demo_lab_fixture_manifest.sh",
-        "README.md"
-      ],
+      "artifact_paths": ["tests/e2e/test_demo_lab_fixture_manifest.sh", "README.md"],
       "proof_commands": [
         {
           "command": "bash -n tests/e2e/test_demo_lab_fixture_manifest.sh && tests/e2e/test_demo_lab_fixture_manifest.sh",

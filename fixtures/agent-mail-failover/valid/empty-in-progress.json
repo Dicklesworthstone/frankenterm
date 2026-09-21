@@ -12,10 +12,7 @@
     "registered": false,
     "inbox_checked": false,
     "failure_class": "database_error",
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ],
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"],
     "forbidden_actions": [
       "am_service_restart",
       "am_service_stop",
@@ -65,7 +62,5 @@
     "Claim the first ready non-overlapping bead.",
     "Do not invent stale work when in-progress count is zero."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/empty-in-progress.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/empty-in-progress.json"]
 }

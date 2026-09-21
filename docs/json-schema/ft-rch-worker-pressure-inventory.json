@@ -76,10 +76,7 @@
     },
     "source_context": {
       "type": "object",
-      "required": [
-        "parent_bead",
-        "seed_evidence"
-      ],
+      "required": ["parent_bead", "seed_evidence"],
       "additionalProperties": false,
       "properties": {
         "parent_bead": {
@@ -235,51 +232,26 @@
         },
         "pressure_state": {
           "type": "string",
-          "enum": [
-            "normal",
-            "warning",
-            "critical",
-            "telemetry_gap",
-            "unknown"
-          ]
+          "enum": ["normal", "warning", "critical", "telemetry_gap", "unknown"]
         },
         "admission_state": {
           "type": "string",
-          "enum": [
-            "admissible",
-            "blocked",
-            "unreachable",
-            "unknown"
-          ]
+          "enum": ["admissible", "blocked", "unreachable", "unknown"]
         },
         "root_usage_percent": {
-          "type": [
-            "number",
-            "integer",
-            "null"
-          ],
+          "type": ["number", "integer", "null"],
           "minimum": 0
         },
         "free_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "free_size_text": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "scan_status": {
           "type": "string",
-          "enum": [
-            "complete",
-            "partial_timeout",
-            "telemetry_gap"
-          ]
+          "enum": ["complete", "partial_timeout", "telemetry_gap"]
         },
         "source_commands": {
           "type": "array",
@@ -306,13 +278,7 @@
     },
     "source_command": {
       "type": "object",
-      "required": [
-        "command",
-        "scan_kind",
-        "timeout_state",
-        "partial_output",
-        "artifact_path"
-      ],
+      "required": ["command", "scan_kind", "timeout_state", "partial_output", "artifact_path"],
       "additionalProperties": false,
       "properties": {
         "command": {
@@ -350,14 +316,10 @@
       "additionalProperties": false,
       "anyOf": [
         {
-          "required": [
-            "size_bytes"
-          ]
+          "required": ["size_bytes"]
         },
         {
-          "required": [
-            "size_text"
-          ]
+          "required": ["size_text"]
         }
       ],
       "properties": {
@@ -382,11 +344,7 @@
         },
         "freshness": {
           "type": "string",
-          "enum": [
-            "fresh",
-            "stale",
-            "unknown"
-          ]
+          "enum": ["fresh", "stale", "unknown"]
         },
         "timeout_state": {
           "$ref": "#/$defs/timeout_state"
@@ -421,12 +379,7 @@
     },
     "timeout_state": {
       "type": "string",
-      "enum": [
-        "completed",
-        "timed_out",
-        "not_run",
-        "partial"
-      ]
+      "enum": ["completed", "timed_out", "not_run", "partial"]
     }
   }
 }

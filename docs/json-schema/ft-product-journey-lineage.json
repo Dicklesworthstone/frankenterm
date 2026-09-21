@@ -152,9 +152,7 @@
     },
     "delegated_key": {
       "type": "object",
-      "required": [
-        "key_id"
-      ],
+      "required": ["key_id"],
       "additionalProperties": false,
       "properties": {
         "key_id": {
@@ -164,9 +162,7 @@
     },
     "delegation": {
       "type": "object",
-      "required": [
-        "authorized_successor_keys"
-      ],
+      "required": ["authorized_successor_keys"],
       "additionalProperties": false,
       "properties": {
         "authorized_successor_keys": {

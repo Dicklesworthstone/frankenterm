@@ -49,10 +49,7 @@
       "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "source_text_sha256": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^[0-9a-f]{64}$"
     },
     "command_argv": {
@@ -67,10 +64,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "name",
-          "value"
-        ],
+        "required": ["name", "value"],
         "properties": {
           "name": {
             "type": "string",
@@ -83,31 +77,19 @@
       }
     },
     "target_dir": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^/tmp/ft-[A-Za-z0-9._-]+$"
     },
     "selected_worker": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^vmi[0-9]+$"
     },
     "rch_job_id": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^j-[0-9]+$"
     },
     "remote_exit_status": {
-      "type": [
-        "integer",
-        "null"
-      ]
+      "type": ["integer", "null"]
     },
     "outcome": {
       "type": "string",
@@ -147,22 +129,13 @@
       "type": "boolean"
     },
     "stdout_path": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": ["string", "null"]
     },
     "stderr_path": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": ["string", "null"]
     },
     "attempt_record_path": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": ["string", "null"]
     },
     "note": {
       "type": "string",

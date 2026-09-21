@@ -10,21 +10,10 @@
     "outcome": "source_unavailable",
     "proof_admissible": false,
     "frame_count": 2,
-    "required_sources": [
-      "beads",
-      "source_unavailable"
-    ],
-    "required_causal_classes": [
-      "communication_outage",
-      "source_pass"
-    ],
-    "required_inadmissible_reason_codes": [
-      "proof.no_remote_rch_pass",
-      "proof.source_unavailable"
-    ],
-    "required_error_codes": [
-      "agent_mail.unavailable"
-    ],
+    "required_sources": ["beads", "source_unavailable"],
+    "required_causal_classes": ["communication_outage", "source_pass"],
+    "required_inadmissible_reason_codes": ["proof.no_remote_rch_pass", "proof.source_unavailable"],
+    "required_error_codes": ["agent_mail.unavailable"],
     "required_frame_reason_codes": [
       "agent_mail.no_service_repair",
       "beads.fallback_surface",
@@ -41,11 +30,6 @@
       "\"service_restart_attempted\": false",
       "\"mail_fallback_used\": true"
     ],
-    "forbidden_substrings": [
-      "ghp_",
-      "API_TOKEN",
-      "sk-live-",
-      "password="
-    ]
+    "forbidden_substrings": ["ghp_", "API_TOKEN", "sk-live-", "password="]
   }
 }

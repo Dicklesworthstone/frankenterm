@@ -40,48 +40,30 @@
           {
             "row_id": "crates/frankenterm-core/Cargo.toml",
             "state": "degraded",
-            "reason_codes": [
-              "git.dirty_overlap_risk"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-            ]
+            "reason_codes": ["git.dirty_overlap_risk"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
           },
           {
             "row_id": "crates/frankenterm-core/benches/atlas_stability.rs",
             "state": "degraded",
-            "reason_codes": [
-              "git.dirty_overlap_risk"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-            ]
+            "reason_codes": ["git.dirty_overlap_risk"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
           },
           {
             "row_id": "crates/frankenterm-core/src/tui/ftui_backend.rs",
             "state": "degraded",
-            "reason_codes": [
-              "git.dirty_overlap_risk"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-            ]
+            "reason_codes": ["git.dirty_overlap_risk"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
           },
           {
             "row_id": "crates/frankenterm-gui/src/frontend.rs",
             "state": "degraded",
-            "reason_codes": [
-              "git.dirty_overlap_risk"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-            ]
+            "reason_codes": ["git.dirty_overlap_risk"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
     },
     {
       "source_id": "beads-active-owner",
@@ -111,28 +93,19 @@
           {
             "row_id": "ft-tf6g3.3.10",
             "state": "degraded",
-            "reason_codes": [
-              "beads.in_progress_active",
-              "beads.stale_do_not_reopen"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-            ]
+            "reason_codes": ["beads.in_progress_active", "beads.stale_do_not_reopen"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/dirty-overlap.json"]
     }
   ],
   "redaction_policy": {
     "policy_id": "ft.redaction.objective_sources.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Dirty-overlap fixture stores path ids and reason codes only."
-    ]
+    "notes": ["Dirty-overlap fixture stores path ids and reason codes only."]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

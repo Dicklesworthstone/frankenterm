@@ -16,10 +16,7 @@
     "stateright_version": "0.31.0",
     "bounded_model": {
       "claim_count": 2,
-      "agents": [
-        1,
-        2
-      ],
+      "agents": [1, 2],
       "max_events": 7,
       "checker_target_max_depth": 14,
       "covered_paths": [

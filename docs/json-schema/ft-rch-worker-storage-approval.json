@@ -58,10 +58,7 @@
       "$ref": "#/$defs/evidence_artifact_path"
     },
     "evidence_artifact_sha256": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^[0-9a-f]{64}$"
     },
     "approval_decision": {
@@ -81,10 +78,7 @@
       "$ref": "#/$defs/sha256"
     },
     "approved_path_set_sha256": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^[0-9a-f]{64}$"
     },
     "requested_paths": {
@@ -200,19 +194,11 @@
     },
     "live_use_state": {
       "type": "string",
-      "enum": [
-        "inactive",
-        "active",
-        "unknown"
-      ]
+      "enum": ["inactive", "active", "unknown"]
     },
     "approval_match": {
       "type": "string",
-      "enum": [
-        "exact",
-        "mismatch",
-        "absent"
-      ]
+      "enum": ["exact", "mismatch", "absent"]
     },
     "protected_reason": {
       "type": "string",
@@ -241,31 +227,19 @@
       "additionalProperties": false,
       "properties": {
         "approver_identity": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "approval_reference": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "approved_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "expires_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "approval_scope": {
@@ -273,10 +247,7 @@
           "minLength": 1
         },
         "approval_text_sha256": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9a-f]{64}$"
         }
       }
@@ -317,10 +288,7 @@
           "$ref": "#/$defs/evidence_artifact_path"
         },
         "inventory_evidence_sha256": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[0-9a-f]{64}$"
         },
         "approval_match": {
@@ -394,12 +362,7 @@
     },
     "expiration": {
       "type": "object",
-      "required": [
-        "checked_at_ms",
-        "expires_at_ms",
-        "expired",
-        "max_age_ms"
-      ],
+      "required": ["checked_at_ms", "expires_at_ms", "expired", "max_age_ms"],
       "additionalProperties": false,
       "properties": {
         "checked_at_ms": {
@@ -407,10 +370,7 @@
           "minimum": 0
         },
         "expires_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "expired": {

@@ -10,14 +10,8 @@
     "outcome": "source_pass",
     "proof_admissible": true,
     "frame_count": 3,
-    "required_sources": [
-      "beads",
-      "git",
-      "rch"
-    ],
-    "required_causal_classes": [
-      "source_pass"
-    ],
+    "required_sources": ["beads", "git", "rch"],
+    "required_causal_classes": ["source_pass"],
     "required_inadmissible_reason_codes": [],
     "required_error_codes": [],
     "required_frame_reason_codes": [
@@ -31,22 +25,13 @@
       "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl",
       "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"
     ],
-    "required_rch_build_ids": [
-      "j-29871232832766580"
-    ],
-    "required_rch_worker_ids": [
-      "vmi1227854"
-    ],
+    "required_rch_build_ids": ["j-29871232832766580"],
+    "required_rch_worker_ids": ["vmi1227854"],
     "required_source_set_substrings": [
       "\"dep_cycles_count\": 0",
       "\"legacy_branch_mirror\": \"main_synced_to_master\"",
       "\"mirror_command\": \"git push origin main:master\""
     ],
-    "forbidden_substrings": [
-      "ghp_",
-      "API_TOKEN",
-      "sk-live-",
-      "password="
-    ]
+    "forbidden_substrings": ["ghp_", "API_TOKEN", "sk-live-", "password="]
   }
 }

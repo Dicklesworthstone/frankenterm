@@ -88,9 +88,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -102,15 +100,7 @@
             "reason"
           ],
           "rows": [
-            [
-              "healthy-quota",
-              "openai",
-              "standard",
-              800000,
-              "clear",
-              "assign",
-              "quota.healthy"
-            ]
+            ["healthy-quota", "openai", "standard", 800000, "clear", "assign", "quota.healthy"]
           ]
         }
       }
@@ -176,9 +166,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -264,9 +252,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -352,9 +338,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -455,9 +439,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -543,9 +525,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -631,9 +611,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -719,9 +697,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",
@@ -807,9 +783,7 @@
           "local_cargo_proof",
           "raw_secret_storage"
         ],
-        "artifact_paths": [
-          "fixtures/mission-planner/provider-quota-assignment/cases.v1.json"
-        ],
+        "artifact_paths": ["fixtures/mission-planner/provider-quota-assignment/cases.v1.json"],
         "toon_projection": {
           "columns": [
             "case_id",

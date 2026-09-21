@@ -113,12 +113,7 @@
           "enum": ["clean", "single_regression", "consecutive_regression"]
         },
         "transition": {
-          "enum": [
-            "no_change",
-            "entered_single_regression",
-            "entered_consecutive",
-            "recovered"
-          ]
+          "enum": ["no_change", "entered_single_regression", "entered_consecutive", "recovered"]
         }
       }
     },
@@ -153,12 +148,7 @@
           "enum": ["clean", "single_regression", "consecutive_regression"]
         },
         "transition": {
-          "enum": [
-            "no_change",
-            "entered_single_regression",
-            "entered_consecutive",
-            "recovered"
-          ]
+          "enum": ["no_change", "entered_single_regression", "entered_consecutive", "recovered"]
         },
         "delta_pct": { "type": ["number", "null"] },
         "generated_at": { "type": "string" }

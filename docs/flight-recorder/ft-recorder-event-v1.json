@@ -199,12 +199,7 @@
     },
     "control_marker_type": {
       "type": "string",
-      "enum": [
-        "prompt_boundary",
-        "resize",
-        "policy_decision",
-        "approval_checkpoint"
-      ]
+      "enum": ["prompt_boundary", "resize", "policy_decision", "approval_checkpoint"]
     },
     "lifecycle_phase": {
       "type": "string",

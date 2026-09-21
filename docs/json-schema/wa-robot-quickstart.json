@@ -4,14 +4,7 @@
   "title": "WA Robot Quick Start Response",
   "description": "Schema for the data field when calling 'wa robot quick-start' or defaulting to 'wa robot' with no subcommand. Returns the machine-oriented quick-start guide.",
   "type": "object",
-  "required": [
-    "description",
-    "global_flags",
-    "core_loop",
-    "commands",
-    "tips",
-    "error_handling"
-  ],
+  "required": ["description", "global_flags", "core_loop", "commands", "tips", "error_handling"],
   "properties": {
     "description": {
       "type": "string",

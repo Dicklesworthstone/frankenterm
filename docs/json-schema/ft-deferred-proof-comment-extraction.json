@@ -59,10 +59,7 @@
     },
     "env_var": {
       "type": "object",
-      "required": [
-        "name",
-        "value"
-      ],
+      "required": ["name", "value"],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -88,11 +85,7 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "beads_comment",
-            "closeout_footer",
-            "static_proof_note"
-          ]
+          "enum": ["beads_comment", "closeout_footer", "static_proof_note"]
         },
         "comment_id": {
           "type": "integer",
@@ -118,20 +111,12 @@
     },
     "extraction": {
       "type": "object",
-      "required": [
-        "state",
-        "reason_codes",
-        "provenance_preserved"
-      ],
+      "required": ["state", "reason_codes", "provenance_preserved"],
       "additionalProperties": false,
       "properties": {
         "state": {
           "type": "string",
-          "enum": [
-            "receipt_emitted",
-            "ineligible",
-            "duplicate"
-          ]
+          "enum": ["receipt_emitted", "ineligible", "duplicate"]
         },
         "reason_codes": {
           "type": "array",
@@ -189,11 +174,7 @@
         },
         "source_state": {
           "type": "string",
-          "enum": [
-            "source_landed",
-            "static_clean",
-            "planning_only"
-          ]
+          "enum": ["source_landed", "static_clean", "planning_only"]
         },
         "command": {
           "type": "object",
@@ -209,10 +190,7 @@
           "properties": {
             "command_shape_version": {
               "type": "string",
-              "enum": [
-                "rch-no-self-healing-v1",
-                "static-verifier-v1"
-              ]
+              "enum": ["rch-no-self-healing-v1", "static-verifier-v1"]
             },
             "argv": {
               "type": "array",
@@ -238,10 +216,7 @@
               }
             },
             "target_dir": {
-              "type": [
-                "string",
-                "null"
-              ],
+              "type": ["string", "null"],
               "pattern": "^/tmp/[A-Za-z0-9._-]+$"
             },
             "material_remote_required": {
@@ -263,24 +238,13 @@
           "properties": {
             "expected_kind": {
               "type": "string",
-              "enum": [
-                "cargo_check",
-                "cargo_test",
-                "cargo_clippy",
-                "static_verifier"
-              ]
+              "enum": ["cargo_check", "cargo_test", "cargo_clippy", "static_verifier"]
             },
             "package": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "test_filter": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": ["string", "null"]
             },
             "feature_set": {
               "type": "array",
@@ -304,10 +268,7 @@
         },
         "paths": {
           "type": "object",
-          "required": [
-            "owned_paths",
-            "dirty_paths_at_capture"
-          ],
+          "required": ["owned_paths", "dirty_paths_at_capture"],
           "additionalProperties": false,
           "properties": {
             "owned_paths": {
@@ -329,11 +290,7 @@
         },
         "coordination": {
           "type": "object",
-          "required": [
-            "prerequisite_beads",
-            "agent_mail_state",
-            "rch_admission_state"
-          ],
+          "required": ["prerequisite_beads", "agent_mail_state", "rch_admission_state"],
           "additionalProperties": false,
           "properties": {
             "prerequisite_beads": {
@@ -345,40 +302,22 @@
             },
             "agent_mail_state": {
               "type": "string",
-              "enum": [
-                "available",
-                "unavailable_after_retry",
-                "unknown"
-              ]
+              "enum": ["available", "unavailable_after_retry", "unknown"]
             },
             "rch_admission_state": {
               "type": "string",
-              "enum": [
-                "admitted",
-                "blocked_worker_pressure",
-                "not_required",
-                "unknown"
-              ]
+              "enum": ["admitted", "blocked_worker_pressure", "not_required", "unknown"]
             }
           }
         },
         "eligibility": {
           "type": "object",
-          "required": [
-            "state",
-            "reason_codes",
-            "replay_allowed"
-          ],
+          "required": ["state", "reason_codes", "replay_allowed"],
           "additionalProperties": false,
           "properties": {
             "state": {
               "type": "string",
-              "enum": [
-                "eligible",
-                "wait_rch",
-                "stale_command_shape",
-                "local_fallback_invalid"
-              ]
+              "enum": ["eligible", "wait_rch", "stale_command_shape", "local_fallback_invalid"]
             },
             "reason_codes": {
               "type": "array",

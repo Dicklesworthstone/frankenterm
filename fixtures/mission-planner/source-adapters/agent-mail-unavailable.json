@@ -40,18 +40,14 @@
           {
             "row_id": "macro_start_session",
             "state": "unavailable",
-            "reason_codes": [
-              "agent_mail.database_error"
-            ],
+            "reason_codes": ["agent_mail.database_error"],
             "artifact_paths": [
               "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
             ]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"]
     },
     {
       "source_id": "beads-fallback",
@@ -81,27 +77,21 @@
           {
             "row_id": "ft-auy2g.2",
             "state": "available",
-            "reason_codes": [
-              "beads.ready_available"
-            ],
+            "reason_codes": ["beads.ready_available"],
             "artifact_paths": [
               "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
             ]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/agent-mail-unavailable.json"]
     }
   ],
   "redaction_policy": {
     "policy_id": "ft.redaction.objective_sources.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Agent Mail failure payload stores the error class, not mailbox bodies."
-    ]
+    "notes": ["Agent Mail failure payload stores the error class, not mailbox bodies."]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

@@ -134,12 +134,7 @@
     },
     "planning_window": {
       "type": "object",
-      "required": [
-        "window_id",
-        "starts_at_ms",
-        "expires_at_ms",
-        "deterministic_ordering"
-      ],
+      "required": ["window_id", "starts_at_ms", "expires_at_ms", "deterministic_ordering"],
       "additionalProperties": false,
       "properties": {
         "window_id": {
@@ -147,17 +142,11 @@
           "minLength": 1
         },
         "starts_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "expires_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "deterministic_ordering": {
@@ -180,22 +169,11 @@
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "within_budget",
-        "stale",
-        "unknown",
-        "not_collected"
-      ]
+      "enum": ["fresh", "within_budget", "stale", "unknown", "not_collected"]
     },
     "publication_state": {
       "type": "string",
-      "enum": [
-        "published",
-        "local_closed_not_published",
-        "unpublished",
-        "unknown"
-      ]
+      "enum": ["published", "local_closed_not_published", "unpublished", "unknown"]
     },
     "input_summary": {
       "type": "object",
@@ -246,14 +224,7 @@
     },
     "recommendation": {
       "type": "string",
-      "enum": [
-        "run_now",
-        "run_next",
-        "wait",
-        "defer",
-        "block",
-        "require_operator_approval"
-      ]
+      "enum": ["run_now", "run_next", "wait", "defer", "block", "require_operator_approval"]
     },
     "work_class_decision": {
       "type": "object",
@@ -296,14 +267,7 @@
     },
     "source_kind": {
       "type": "string",
-      "enum": [
-        "beads",
-        "rch",
-        "agent_mail",
-        "git",
-        "proof_artifact",
-        "target_hardware"
-      ]
+      "enum": ["beads", "rch", "agent_mail", "git", "proof_artifact", "target_hardware"]
     },
     "source_snapshot": {
       "type": "object",
@@ -345,12 +309,7 @@
     },
     "lane": {
       "type": "string",
-      "enum": [
-        "now",
-        "next",
-        "wait",
-        "blocked"
-      ]
+      "enum": ["now", "next", "wait", "blocked"]
     },
     "calendar_entry": {
       "type": "object",
@@ -407,12 +366,7 @@
         },
         "confidence": {
           "type": "string",
-          "enum": [
-            "high",
-            "medium",
-            "low",
-            "none"
-          ]
+          "enum": ["high", "medium", "low", "none"]
         },
         "blockers": {
           "$ref": "#/$defs/reason_codes"
@@ -560,10 +514,7 @@
     },
     "toon_projection": {
       "type": "object",
-      "required": [
-        "columns",
-        "rows"
-      ],
+      "required": ["columns", "rows"],
       "additionalProperties": false,
       "properties": {
         "columns": {

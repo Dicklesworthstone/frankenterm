@@ -96,7 +96,12 @@
   "verification": {
     "claim": "Scoped remote maintenance, catalog and backup regression proof; release manifest remains deferred until producing-bead bundle qualification completes.",
     "not_claimed": "No whole-corpus cleanliness claim: scans are per-segment, resumed scans exclude earlier rows, and catalog coverage is finite. Tantivy rebuild_requested records required external work; no rebuild is queued or performed. mmap mirrors, archived backups and external indexes are not certified by a SQLite maintenance receipt.",
-    "required_proofs": ["redact_backfill::tests", "redactor::tests::catalog_identity_changes_with_expression_order_and_family", "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip", "attestation_manifest_schema::redaction_hygiene_attestation_matches_live_catalog"],
+    "required_proofs": [
+      "redact_backfill::tests",
+      "redactor::tests::catalog_identity_changes_with_expression_order_and_family",
+      "backup::tests::export_redacts_backup_database_sql_dump_and_import_roundtrip",
+      "attestation_manifest_schema::redaction_hygiene_attestation_matches_live_catalog"
+    ],
     "retained_remote_receipts": [
       {
         "transcript": "/Volumes/USB_NVME/ft-release-20260915/rc40-redaction-proof-rch.log",

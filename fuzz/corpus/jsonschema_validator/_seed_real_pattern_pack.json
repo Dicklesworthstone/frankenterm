@@ -26,14 +26,7 @@
   "$defs": {
     "Rule": {
       "type": "object",
-      "required": [
-        "id",
-        "agent_type",
-        "event_type",
-        "severity",
-        "anchors",
-        "description"
-      ],
+      "required": ["id", "agent_type", "event_type", "severity", "anchors", "description"],
       "additionalProperties": false,
       "properties": {
         "id": {

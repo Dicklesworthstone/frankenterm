@@ -40,9 +40,7 @@
       "runtime_async::Runtime",
       "cx::Cx"
     ],
-    "known_transitive_only_surfaces": [
-      "runtime_async::notify::Notify"
-    ],
+    "known_transitive_only_surfaces": ["runtime_async::notify::Notify"],
     "policy": "Foreign runtime primitives cannot implement RuntimeProof because the Sealed supertrait is private to runtime_proof.rs."
   },
   "negative_canary": {

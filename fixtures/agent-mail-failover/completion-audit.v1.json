@@ -11,10 +11,7 @@
     "command": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
     "mode": "agent_mail_unavailable_beads_only",
     "agent_mail_status": "unavailable",
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ]
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"]
   },
   "graph_evidence": {
     "dep_cycles_command": "br dep cycles --json",
@@ -62,9 +59,7 @@
         "fixtures/agent-mail-failover/valid/*.json",
         "tests/e2e/test_agent_mail_failover_snapshot_contract.sh"
       ],
-      "verifiers": [
-        "bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh"
-      ]
+      "verifiers": ["bash tests/e2e/test_agent_mail_failover_snapshot_contract.sh"]
     },
     {
       "id": "ft-5lsqo.2",
@@ -79,9 +74,7 @@
         "fixtures/agent-mail-failover/retry-classifier-cases.json",
         "tests/e2e/test_agent_mail_retry_classifier_contract.sh"
       ],
-      "verifiers": [
-        "bash tests/e2e/test_agent_mail_retry_classifier_contract.sh"
-      ]
+      "verifiers": ["bash tests/e2e/test_agent_mail_retry_classifier_contract.sh"]
     },
     {
       "id": "ft-5lsqo.3",
@@ -95,9 +88,7 @@
         "fixtures/agent-mail-stale-reopen/policy.v1.json",
         "fixtures/agent-mail-stale-reopen/verify-policy.sh"
       ],
-      "verifiers": [
-        "bash fixtures/agent-mail-stale-reopen/verify-policy.sh"
-      ]
+      "verifiers": ["bash fixtures/agent-mail-stale-reopen/verify-policy.sh"]
     },
     {
       "id": "ft-5lsqo.4",
@@ -110,9 +101,7 @@
         "fixtures/agent-mail-failover/no-service-action-gate.json",
         "tests/e2e/test_agent_mail_no_service_action_gate.sh"
       ],
-      "verifiers": [
-        "bash tests/e2e/test_agent_mail_no_service_action_gate.sh"
-      ]
+      "verifiers": ["bash tests/e2e/test_agent_mail_no_service_action_gate.sh"]
     },
     {
       "id": "ft-5lsqo.5",
@@ -125,9 +114,7 @@
         "docs/robot-contracts/agent-mail-failover-runbook.md",
         "tests/e2e/test_agent_mail_failover_runbook_contract.sh"
       ],
-      "verifiers": [
-        "bash tests/e2e/test_agent_mail_failover_runbook_contract.sh"
-      ]
+      "verifiers": ["bash tests/e2e/test_agent_mail_failover_runbook_contract.sh"]
     }
   ]
 }

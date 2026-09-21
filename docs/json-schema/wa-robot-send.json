@@ -80,25 +80,20 @@
       "properties": {
         "state": {
           "type": "string",
-            "enum": [
-              "submitted",
-              "queued_behind_operation",
-              "stuck_in_composer",
-              "pane_crashed_to_shell",
-              "verification_unavailable",
-              "policy_denied",
-              "requires_approval",
-              "send_failed"
+          "enum": [
+            "submitted",
+            "queued_behind_operation",
+            "stuck_in_composer",
+            "pane_crashed_to_shell",
+            "verification_unavailable",
+            "policy_denied",
+            "requires_approval",
+            "send_failed"
           ]
         },
         "guarantee_level": {
           "type": "string",
-          "enum": [
-            "write",
-            "composer",
-            "submitted",
-            "working"
-          ]
+          "enum": ["write", "composer", "submitted", "working"]
         },
         "guarantee_met": {
           "type": "boolean"

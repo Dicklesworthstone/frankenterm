@@ -99,29 +99,37 @@
       "type": "array",
       "maxItems": 8192,
       "uniqueItems": true,
-      "items": {"$ref": "#/$defs/bead_id"}
+      "items": { "$ref": "#/$defs/bead_id" }
     },
     "bead_work_candidate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "status", "issue_type", "priority", "pagerank_billionths", "blocker_ids", "exclusions"],
+      "required": [
+        "id",
+        "status",
+        "issue_type",
+        "priority",
+        "pagerank_billionths",
+        "blocker_ids",
+        "exclusions"
+      ],
       "properties": {
-        "id": {"$ref": "#/$defs/bead_id"},
-        "status": {"$ref": "#/$defs/bead_status"},
+        "id": { "$ref": "#/$defs/bead_id" },
+        "status": { "$ref": "#/$defs/bead_status" },
         "issue_type": {
           "type": "string",
           "minLength": 1,
           "maxLength": 64,
           "pattern": "^[A-Za-z0-9_.-]+$"
         },
-        "priority": {"type": "integer", "minimum": 0, "maximum": 4},
-        "pagerank_billionths": {"type": "integer", "minimum": 0, "maximum": 1000000000},
-        "blocker_ids": {"$ref": "#/$defs/bead_ids"},
+        "priority": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "pagerank_billionths": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "blocker_ids": { "$ref": "#/$defs/bead_ids" },
         "exclusions": {
           "type": "array",
           "maxItems": 5,
           "uniqueItems": true,
-          "items": {"$ref": "#/$defs/bead_exclusion"}
+          "items": { "$ref": "#/$defs/bead_exclusion" }
         }
       }
     },
@@ -130,49 +138,66 @@
       "description": "Advisory selection from every record in the exact supplied br JSONL export; file age and input hash do not establish current database state or ownership authority.",
       "additionalProperties": false,
       "required": [
-        "schema_version", "input_format", "input_sha256", "source_bytes",
-        "snapshot_modified_at_ms", "evaluated_at_ms", "live_database_validated",
-        "node_count", "edge_count", "type_population", "status_population",
-        "exclusion_population", "selected_id", "ordered_ready_ids", "candidates",
-        "pagerank_iterations", "tie_break"
+        "schema_version",
+        "input_format",
+        "input_sha256",
+        "source_bytes",
+        "snapshot_modified_at_ms",
+        "evaluated_at_ms",
+        "live_database_validated",
+        "node_count",
+        "edge_count",
+        "type_population",
+        "status_population",
+        "exclusion_population",
+        "selected_id",
+        "ordered_ready_ids",
+        "candidates",
+        "pagerank_iterations",
+        "tie_break"
       ],
       "properties": {
-        "schema_version": {"const": 1},
-        "input_format": {"const": "br-jsonl-v1"},
-        "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "source_bytes": {"type": "integer", "minimum": 0, "maximum": 67108864},
-        "snapshot_modified_at_ms": {"type": "integer", "minimum": 0},
-        "evaluated_at_ms": {"type": "integer", "minimum": 0},
-        "live_database_validated": {"const": false},
-        "node_count": {"type": "integer", "minimum": 0, "maximum": 8192},
-        "edge_count": {"type": "integer", "minimum": 0, "maximum": 65536},
+        "schema_version": { "const": 1 },
+        "input_format": { "const": "br-jsonl-v1" },
+        "input_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "source_bytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "snapshot_modified_at_ms": { "type": "integer", "minimum": 0 },
+        "evaluated_at_ms": { "type": "integer", "minimum": 0 },
+        "live_database_validated": { "const": false },
+        "node_count": { "type": "integer", "minimum": 0, "maximum": 8192 },
+        "edge_count": { "type": "integer", "minimum": 0, "maximum": 65536 },
         "type_population": {
           "type": "object",
           "maxProperties": 8192,
-          "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.-]+$"},
-          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_.-]+$"
+          },
+          "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 8192 }
         },
         "status_population": {
           "type": "object",
-          "propertyNames": {"$ref": "#/$defs/bead_status"},
-          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+          "propertyNames": { "$ref": "#/$defs/bead_status" },
+          "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 8192 }
         },
         "exclusion_population": {
           "type": "object",
-          "propertyNames": {"$ref": "#/$defs/bead_exclusion"},
-          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 8192}
+          "propertyNames": { "$ref": "#/$defs/bead_exclusion" },
+          "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 8192 }
         },
         "selected_id": {
-          "anyOf": [{"$ref": "#/$defs/bead_id"}, {"type": "null"}]
+          "anyOf": [{ "$ref": "#/$defs/bead_id" }, { "type": "null" }]
         },
-        "ordered_ready_ids": {"$ref": "#/$defs/bead_ids"},
+        "ordered_ready_ids": { "$ref": "#/$defs/bead_ids" },
         "candidates": {
           "type": "array",
           "maxItems": 8192,
-          "items": {"$ref": "#/$defs/bead_work_candidate"}
+          "items": { "$ref": "#/$defs/bead_work_candidate" }
         },
-        "pagerank_iterations": {"type": "integer", "minimum": 0, "maximum": 100},
-        "tie_break": {"const": "priority_ascending,pagerank_billionths_descending,id_ascending"}
+        "pagerank_iterations": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "tie_break": { "const": "priority_ascending,pagerank_billionths_descending,id_ascending" }
       }
     },
     "string_array": {
@@ -296,13 +321,7 @@
     },
     "source_state": {
       "type": "string",
-      "enum": [
-        "available",
-        "degraded",
-        "unavailable",
-        "stale",
-        "blocked"
-      ]
+      "enum": ["available", "degraded", "unavailable", "stale", "blocked"]
     },
     "source_snapshot": {
       "type": "object",
@@ -334,17 +353,11 @@
           "$ref": "#/$defs/source_state"
         },
         "collected_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_state": {
@@ -382,40 +395,20 @@
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "within_budget",
-        "stale",
-        "unknown",
-        "not_collected"
-      ]
+      "enum": ["fresh", "within_budget", "stale", "unknown", "not_collected"]
     },
     "redaction_posture": {
       "type": "object",
-      "required": [
-        "pane_content",
-        "secret_material",
-        "notes"
-      ],
+      "required": ["pane_content", "secret_material", "notes"],
       "additionalProperties": false,
       "properties": {
         "pane_content": {
           "type": "string",
-          "enum": [
-            "not_collected",
-            "redacted",
-            "not_applicable",
-            "raw_forbidden"
-          ]
+          "enum": ["not_collected", "redacted", "not_applicable", "raw_forbidden"]
         },
         "secret_material": {
           "type": "string",
-          "enum": [
-            "not_collected",
-            "redacted",
-            "not_applicable",
-            "raw_forbidden"
-          ]
+          "enum": ["not_collected", "redacted", "not_applicable", "raw_forbidden"]
         },
         "notes": {
           "$ref": "#/$defs/string_array"
@@ -457,14 +450,7 @@
     },
     "source_evidence": {
       "type": "object",
-      "required": [
-        "evidence_id",
-        "category",
-        "state",
-        "subject",
-        "reason_codes",
-        "artifact_paths"
-      ],
+      "required": ["evidence_id", "category", "state", "subject", "reason_codes", "artifact_paths"],
       "additionalProperties": false,
       "properties": {
         "evidence_id": {
@@ -491,44 +477,20 @@
     },
     "capacity_admission": {
       "type": "object",
-      "required": [
-        "action",
-        "pressure_tier",
-        "proof_state",
-        "reason_codes"
-      ],
+      "required": ["action", "pressure_tier", "proof_state", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "action": {
           "type": "string",
-          "enum": [
-            "admit",
-            "defer",
-            "degrade",
-            "shed",
-            "unavailable"
-          ]
+          "enum": ["admit", "defer", "degrade", "shed", "unavailable"]
         },
         "pressure_tier": {
           "type": "string",
-          "enum": [
-            "green",
-            "yellow",
-            "orange",
-            "red",
-            "black",
-            "unknown"
-          ]
+          "enum": ["green", "yellow", "orange", "red", "black", "unknown"]
         },
         "proof_state": {
           "type": "string",
-          "enum": [
-            "measured",
-            "simulated",
-            "stale",
-            "unavailable",
-            "not_required"
-          ]
+          "enum": ["measured", "simulated", "stale", "unavailable", "not_required"]
         },
         "reason_codes": {
           "$ref": "#/$defs/string_array"
@@ -612,14 +574,7 @@
     },
     "proof_requirement": {
       "type": "object",
-      "required": [
-        "proof_id",
-        "proof_kind",
-        "required",
-        "status",
-        "command",
-        "artifact_paths"
-      ],
+      "required": ["proof_id", "proof_kind", "required", "status", "command", "artifact_paths"],
       "additionalProperties": false,
       "properties": {
         "proof_id": {
@@ -642,13 +597,7 @@
         },
         "status": {
           "type": "string",
-          "enum": [
-            "pending",
-            "passed",
-            "failed",
-            "blocked",
-            "not_required"
-          ]
+          "enum": ["pending", "passed", "failed", "blocked", "not_required"]
         },
         "command": {
           "type": "string",
@@ -661,10 +610,7 @@
     },
     "forbidden_action": {
       "type": "object",
-      "required": [
-        "action_class",
-        "reason"
-      ],
+      "required": ["action_class", "reason"],
       "additionalProperties": false,
       "properties": {
         "action_class": {
@@ -678,12 +624,7 @@
     },
     "redaction_policy": {
       "type": "object",
-      "required": [
-        "policy_id",
-        "raw_pane_content_allowed",
-        "secret_material_allowed",
-        "notes"
-      ],
+      "required": ["policy_id", "raw_pane_content_allowed", "secret_material_allowed", "notes"],
       "additionalProperties": false,
       "properties": {
         "policy_id": {

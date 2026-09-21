@@ -128,9 +128,6 @@
     "evaluation_ready_without_chat_history": true,
     "operator_story_accepted": true,
     "release_candidate_accepted": false,
-    "release_blockers": [
-      "REL-01-leak-oracle",
-      "REL-04-performance-budget"
-    ]
+    "release_blockers": ["REL-01-leak-oracle", "REL-04-performance-budget"]
   }
 }

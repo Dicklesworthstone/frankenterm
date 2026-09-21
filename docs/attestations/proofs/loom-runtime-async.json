@@ -24,10 +24,7 @@
       "sticky close and version monotonicity"
     ]
   },
-  "source_documents": [
-    "docs/runtime/loom-conventions.md",
-    "docs/runtime/mazurkiewicz-traces.md"
-  ],
+  "source_documents": ["docs/runtime/loom-conventions.md", "docs/runtime/mazurkiewicz-traces.md"],
   "proof_files": [
     "crates/frankenterm-core/tests/loom_oneshot.rs",
     "crates/frankenterm-core/tests/loom_notify.rs",
@@ -49,11 +46,7 @@
         "loom_oneshot_recv_idempotent_after_terminal",
         "loom_oneshot_send_during_receiver_drop_no_panic"
       ],
-      "anti_patterns_rejected": [
-        "double-delivery",
-        "lost-update",
-        "sender panic on receiver drop"
-      ],
+      "anti_patterns_rejected": ["double-delivery", "lost-update", "sender panic on receiver drop"],
       "status": "pass"
     },
     {

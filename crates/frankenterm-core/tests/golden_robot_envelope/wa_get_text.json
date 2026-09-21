@@ -9,10 +9,7 @@
       },
       "format": {
         "description": "Optional output format override for this call",
-        "enum": [
-          "json",
-          "toon"
-        ],
+        "enum": ["json", "toon"],
         "maxLength": 16,
         "type": "string"
       },
@@ -29,9 +26,7 @@
         "type": "integer"
       }
     },
-    "required": [
-      "pane_id"
-    ],
+    "required": ["pane_id"],
     "type": "object"
   },
   "invalid_args_response": {

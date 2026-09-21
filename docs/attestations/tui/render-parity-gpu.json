@@ -1,11 +1,7 @@
 {
   "artifacts": {
     "run_directory": "GPU_HARNESS_RUN_DIR or /tmp/gpu-harness-<timestamp>-<pid>",
-    "failure_globs": [
-      "diffs/*.actual.png",
-      "diffs/*.diff.png",
-      "diffs/*.report.json"
-    ],
+    "failure_globs": ["diffs/*.actual.png", "diffs/*.diff.png", "diffs/*.report.json"],
     "runtime_report": "<run_directory>/render-parity-gpu.json",
     "summary": "<run_directory>/summary.json",
     "events": "<run_directory>/events.jsonl",

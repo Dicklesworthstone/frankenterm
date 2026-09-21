@@ -11,17 +11,11 @@
     "requested_cpu_cores": 1,
     "requested_memory_gib": 1,
     "proof_state": "not_required",
-    "reason_codes": [
-      "target_hardware.not_required"
-    ]
+    "reason_codes": ["target_hardware.not_required"]
   },
   "input_domains": {},
   "admission_windows": [],
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "invalid.missing_decision"
-  ],
-  "artifact_paths": [
-    "fixtures/operating-envelope/invalid/missing-field.json"
-  ]
+  "reason_codes": ["invalid.missing_decision"],
+  "artifact_paths": ["fixtures/operating-envelope/invalid/missing-field.json"]
 }

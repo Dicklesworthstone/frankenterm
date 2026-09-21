@@ -54,12 +54,8 @@
       "priority": "blocking",
       "ntm_equivalent": "ntm wait-for pattern",
       "ft_command": "ft robot --format json wait-for <pane_id> \"Done\" --timeout-secs 60",
-      "success_assertions": [
-        { "path": "$.ok", "op": "eq", "value": true }
-      ],
-      "failure_assertions": [
-        { "path": "$.error.code", "op": "eq", "value": "robot.timeout" }
-      ],
+      "success_assertions": [{ "path": "$.ok", "op": "eq", "value": true }],
+      "failure_assertions": [{ "path": "$.error.code", "op": "eq", "value": "robot.timeout" }],
       "artifact_key": "wait_for_trace"
     },
     {
@@ -146,9 +142,7 @@
       "priority": "blocking",
       "ntm_equivalent": "ntm approval/policy deny envelope",
       "ft_command": "ft robot --format json send <pane_id> \"dangerous command\"",
-      "success_assertions": [
-        { "path": "$.ok", "op": "eq", "value": true }
-      ],
+      "success_assertions": [{ "path": "$.ok", "op": "eq", "value": true }],
       "failure_assertions": [
         {
           "path": "$.error.code",
@@ -164,9 +158,7 @@
       "priority": "high",
       "ntm_equivalent": "machine-efficient output mode",
       "ft_command": "ft robot --format toon --stats state",
-      "success_assertions": [
-        { "path": "$stderr", "op": "contains", "value": "tokens" }
-      ],
+      "success_assertions": [{ "path": "$stderr", "op": "contains", "value": "tokens" }],
       "failure_assertions": [],
       "artifact_key": "toon_stats_capture"
     }

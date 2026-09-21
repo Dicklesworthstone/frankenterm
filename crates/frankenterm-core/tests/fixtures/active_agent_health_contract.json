@@ -24,9 +24,7 @@
       "provider": "codex",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "continue_work",
         "reason": "recent pane output is quiet but the bead claim is fresh"
       },
@@ -57,9 +55,7 @@
       "provider": "claude",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "continue_work",
         "reason": "agent is producing output and proof is not due yet"
       },
@@ -96,9 +92,7 @@
       "provider": "codex",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "inspect_pane",
         "reason": "stale status age plus repeated error event needs inspection"
       },
@@ -137,9 +131,7 @@
       "provider": "gemini",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "wait",
         "reason": "rate-limit evidence is current and should not be reassigned yet"
       },
@@ -197,9 +189,7 @@
       "provider": "codex",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "mark_converged",
         "reason": "bead is closed and the proof lane passed"
       },
@@ -222,9 +212,7 @@
       "provider": "unknown",
       "recommended_action": {
         "confidence": "high",
-        "evidence_indices": [
-          0
-        ],
+        "evidence_indices": [0],
         "kind": "escalate_human",
         "reason": "agent has no pane, no bead assignment, and no proof trail"
       },

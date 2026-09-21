@@ -6,10 +6,7 @@
   "source": {
     "script": "scripts/stamp-readme-counts.sh",
     "count_source": "head",
-    "docs": [
-      "README.md",
-      "AGENTS.md"
-    ]
+    "docs": ["README.md", "AGENTS.md"]
   },
   "check": {
     "status": "passed",

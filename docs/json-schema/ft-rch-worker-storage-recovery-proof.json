@@ -54,10 +54,7 @@
       "const": "ft.rch_worker_storage_approval.v1"
     },
     "approval_artifact_path": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "approval_artifact_sha256": {
@@ -71,10 +68,7 @@
       ]
     },
     "operator_recovery_reference": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "gate_result": {
@@ -87,10 +81,7 @@
       "type": "boolean"
     },
     "stable_reason_code": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "agent_side_effect_policy": {
@@ -149,21 +140,11 @@
     },
     "daemon_posture": {
       "type": "string",
-      "enum": [
-        "healthy",
-        "degraded",
-        "unreachable"
-      ]
+      "enum": ["healthy", "degraded", "unreachable"]
     },
     "transfer_state": {
       "type": "string",
-      "enum": [
-        "completed",
-        "skipped_no_worker",
-        "skipped_dry_run_only",
-        "failed",
-        "not_attempted"
-      ]
+      "enum": ["completed", "skipped_no_worker", "skipped_dry_run_only", "failed", "not_attempted"]
     },
     "remote_execution_state": {
       "type": "string",
@@ -315,22 +296,13 @@
           "$ref": "#/$defs/sha256"
         },
         "remote_cargo_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "remote_rustc_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "test_binary_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         }
       }
     },
@@ -365,29 +337,18 @@
         },
         "classification": {
           "type": "string",
-          "enum": [
-            "cargo_test",
-            "cargo_check",
-            "cargo_clippy",
-            "status_only"
-          ]
+          "enum": ["cargo_test", "cargo_check", "cargo_clippy", "status_only"]
         },
         "would_intercept": {
           "type": "boolean",
           "const": true
         },
         "selected_worker": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "selection_reason": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "transfer_state": {
@@ -397,10 +358,7 @@
           "$ref": "#/$defs/remote_execution_state"
         },
         "exit_status": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "artifact_path": {
@@ -411,33 +369,19 @@
           "$ref": "#/$defs/sha256"
         },
         "remote_cargo_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "remote_rustc_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "test_binary_reached": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         }
       }
     },
     "br_dep_cycles": {
       "type": "object",
-      "required": [
-        "command",
-        "count",
-        "artifact_path",
-        "artifact_sha256"
-      ],
+      "required": ["command", "count", "artifact_path", "artifact_sha256"],
       "additionalProperties": false,
       "properties": {
         "command": {

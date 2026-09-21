@@ -26,14 +26,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.2.1",
-        "ft-3681t.2.2"
-      ],
-      "surfaces": [
-        "ft watch",
-        "ft status"
-      ],
+      "mapped_bead_ids": ["ft-3681t.2.1", "ft-3681t.2.2"],
+      "surfaces": ["ft watch", "ft status"],
       "implementation_anchors": [
         "crates/frankenterm/src/main.rs",
         "crates/frankenterm-core/src/runtime.rs",
@@ -47,11 +41,7 @@
       "source_domain": "frankenterm",
       "status": "partial",
       "gap_severity": "low",
-      "mapped_bead_ids": [
-        "ft-e34d9.10.2.3",
-        "ft-3681t.2",
-        "ft-3681t.3"
-      ],
+      "mapped_bead_ids": ["ft-e34d9.10.2.3", "ft-3681t.2", "ft-3681t.3"],
       "surfaces": [
         "ft watch bootstrap",
         "ft distributed agent",
@@ -69,13 +59,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.2.1"
-      ],
-      "surfaces": [
-        "ft watch",
-        "ft status"
-      ],
+      "mapped_bead_ids": ["ft-3681t.2.1"],
+      "surfaces": ["ft watch", "ft status"],
       "implementation_anchors": [
         "crates/frankenterm-core/src/lock.rs",
         "crates/frankenterm/src/main.rs"
@@ -88,14 +73,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.4.1",
-        "ft-3681t.4.4"
-      ],
-      "surfaces": [
-        "ft robot state/get-text/send/wait-for/search/events",
-        "ft mcp serve"
-      ],
+      "mapped_bead_ids": ["ft-3681t.4.1", "ft-3681t.4.4"],
+      "surfaces": ["ft robot state/get-text/send/wait-for/search/events", "ft mcp serve"],
       "implementation_anchors": [
         "crates/frankenterm/src/main.rs",
         "crates/frankenterm-core/src/robot_types.rs",
@@ -109,11 +88,7 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.4.1",
-        "ft-3681t.4.5",
-        "ft-3681t.7.1"
-      ],
+      "mapped_bead_ids": ["ft-3681t.4.1", "ft-3681t.4.5", "ft-3681t.7.1"],
       "surfaces": [
         "ft robot search-explain",
         "ft robot search-index stats",
@@ -135,16 +110,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.3.1.1",
-        "ft-3681t.4.1",
-        "ft-3681t.8.5"
-      ],
-      "surfaces": [
-        "ft robot agents list",
-        "ft robot agents running",
-        "ft robot agents detect"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.1.1", "ft-3681t.4.1", "ft-3681t.8.5"],
+      "surfaces": ["ft robot agents list", "ft robot agents running", "ft robot agents detect"],
       "implementation_anchors": [
         "crates/frankenterm/src/main.rs",
         "crates/frankenterm-core/src/agent_correlator.rs",
@@ -160,12 +127,7 @@
       "source_domain": "frankenterm",
       "status": "partial",
       "gap_severity": "low",
-      "mapped_bead_ids": [
-        "ft-3681t.3.7.1",
-        "ft-3681t.4.3",
-        "ft-3681t.4.4",
-        "ft-3681t.4.5"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.7.1", "ft-3681t.4.3", "ft-3681t.4.4", "ft-3681t.4.5"],
       "surfaces": [
         "ft robot mission state",
         "ft robot mission decisions",
@@ -189,14 +151,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.3.5"
-      ],
-      "surfaces": [
-        "ft rules *",
-        "ft robot rules *",
-        "ft events"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.5"],
+      "surfaces": ["ft rules *", "ft robot rules *", "ft events"],
       "implementation_anchors": [
         "crates/frankenterm-core/src/patterns.rs",
         "crates/frankenterm-core/src/events.rs"
@@ -209,18 +165,9 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.3.5",
-        "ft-3681t.7.1"
-      ],
-      "surfaces": [
-        "workflow triggers",
-        "notification routing",
-        "robot events feed"
-      ],
-      "implementation_anchors": [
-        "crates/frankenterm-core/src/events.rs"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.5", "ft-3681t.7.1"],
+      "surfaces": ["workflow triggers", "notification routing", "robot events feed"],
+      "implementation_anchors": ["crates/frankenterm-core/src/events.rs"],
       "evidence_notes": "EventBus routes by channel type and tracks subscriber lag/drop telemetry."
     },
     {
@@ -229,14 +176,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.3.5"
-      ],
-      "surfaces": [
-        "ft workflow *",
-        "ft robot workflow run",
-        "ft robot workflow status"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.5"],
+      "surfaces": ["ft workflow *", "ft robot workflow run", "ft robot workflow status"],
       "implementation_anchors": [
         "crates/frankenterm/src/main.rs",
         "crates/frankenterm-core/src/workflows/engine.rs",
@@ -250,15 +191,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.6.1",
-        "ft-3681t.6.2"
-      ],
-      "surfaces": [
-        "ft send",
-        "ft robot send",
-        "workflow action execution"
-      ],
+      "mapped_bead_ids": ["ft-3681t.6.1", "ft-3681t.6.2"],
+      "surfaces": ["ft send", "ft robot send", "workflow action execution"],
       "implementation_anchors": [
         "crates/frankenterm-core/src/policy.rs",
         "crates/frankenterm-core/src/approval.rs",
@@ -272,19 +206,9 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "none",
-      "mapped_bead_ids": [
-        "ft-3681t.7.1",
-        "ft-3681t.7.5"
-      ],
-      "surfaces": [
-        "ft search",
-        "ft events",
-        "ft workflow status",
-        "ft audit"
-      ],
-      "implementation_anchors": [
-        "crates/frankenterm-core/src/storage.rs"
-      ],
+      "mapped_bead_ids": ["ft-3681t.7.1", "ft-3681t.7.5"],
+      "surfaces": ["ft search", "ft events", "ft workflow status", "ft audit"],
+      "implementation_anchors": ["crates/frankenterm-core/src/storage.rs"],
       "evidence_notes": "SQLite schema tracks output segments, events, workflows, approvals, and audit actions."
     },
     {
@@ -293,10 +217,7 @@
       "source_domain": "frankenterm",
       "status": "partial",
       "gap_severity": "low",
-      "mapped_bead_ids": [
-        "ft-3681t.7.1",
-        "ft-e34d9.10.7"
-      ],
+      "mapped_bead_ids": ["ft-3681t.7.1", "ft-e34d9.10.7"],
       "surfaces": [
         "runtime health incident enrichment",
         "policy metrics dashboard snapshots",
@@ -315,15 +236,8 @@
       "source_domain": "frankenterm",
       "status": "implemented",
       "gap_severity": "low",
-      "mapped_bead_ids": [
-        "ft-3681t.2.5",
-        "ft-3681t.8.3"
-      ],
-      "surfaces": [
-        "ft snapshot *",
-        "ft session *",
-        "ft watch restore prompts"
-      ],
+      "mapped_bead_ids": ["ft-3681t.2.5", "ft-3681t.8.3"],
+      "surfaces": ["ft snapshot *", "ft session *", "ft watch restore prompts"],
       "implementation_anchors": [
         "crates/frankenterm-core/src/snapshot_engine.rs",
         "crates/frankenterm-core/src/session_restore.rs"
@@ -336,13 +250,8 @@
       "source_domain": "frankenterm",
       "status": "partial",
       "gap_severity": "medium",
-      "mapped_bead_ids": [
-        "ft-nu4.4.3",
-        "ft-nu4.4.3.2"
-      ],
-      "surfaces": [
-        "ft distributed agent"
-      ],
+      "mapped_bead_ids": ["ft-nu4.4.3", "ft-nu4.4.3.2"],
+      "surfaces": ["ft distributed agent"],
       "implementation_anchors": [
         "crates/frankenterm-core/src/distributed.rs",
         "crates/frankenterm/src/main.rs"
@@ -355,10 +264,7 @@
       "source_domain": "ntm",
       "status": "partial",
       "gap_severity": "medium",
-      "mapped_bead_ids": [
-        "ft-3681t.3.1",
-        "ft-3681t.3.2"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.1", "ft-3681t.3.2"],
       "surfaces": [
         "fleet launch plan metadata",
         "deterministic phase ordering",
@@ -377,10 +283,7 @@
       "source_domain": "ntm",
       "status": "partial",
       "gap_severity": "medium",
-      "mapped_bead_ids": [
-        "ft-3681t.3.3",
-        "ft-3681t.3.4"
-      ],
+      "mapped_bead_ids": ["ft-3681t.3.3", "ft-3681t.3.4"],
       "surfaces": [
         "swarm work queue sync",
         "mission deconfliction/conflict reports",
@@ -400,11 +303,7 @@
       "source_domain": "fcp",
       "status": "partial",
       "gap_severity": "medium",
-      "mapped_bead_ids": [
-        "ft-3681t.5.1",
-        "ft-3681t.5.2",
-        "ft-3681t.5.3"
-      ],
+      "mapped_bead_ids": ["ft-3681t.5.1", "ft-3681t.5.2", "ft-3681t.5.3"],
       "surfaces": [
         "connector host lifecycle/runtime APIs",
         "connector health and liveness snapshots",
@@ -423,11 +322,7 @@
       "source_domain": "fcp",
       "status": "partial",
       "gap_severity": "medium",
-      "mapped_bead_ids": [
-        "ft-3681t.5.6",
-        "ft-3681t.5.7",
-        "ft-3681t.5.8"
-      ],
+      "mapped_bead_ids": ["ft-3681t.5.6", "ft-3681t.5.7", "ft-3681t.5.8"],
       "surfaces": [
         "connector inbound signal routing",
         "connector outbound action dispatch",

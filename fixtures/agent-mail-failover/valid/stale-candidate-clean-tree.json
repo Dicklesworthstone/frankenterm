@@ -12,10 +12,7 @@
     "registered": false,
     "inbox_checked": false,
     "failure_class": "timeout",
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ],
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"],
     "forbidden_actions": [
       "am_service_restart",
       "am_service_stop",
@@ -45,10 +42,7 @@
           "assignee": "BlueLake",
           "age_seconds": 9000,
           "recommended_action": "comment_status_check",
-          "reason_codes": [
-            "stale_candidate.clean_tree",
-            "coordination.status_check_required"
-          ]
+          "reason_codes": ["stale_candidate.clean_tree", "coordination.status_check_required"]
         }
       ],
       "dirty_overlap_unknown": []
@@ -76,7 +70,5 @@
     "Add a Beads status-check comment before reopening.",
     "Re-run fallback snapshot after the waiting window."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/stale-candidate-clean-tree.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/stale-candidate-clean-tree.json"]
 }

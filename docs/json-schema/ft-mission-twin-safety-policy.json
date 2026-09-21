@@ -52,12 +52,7 @@
     },
     "retention_policy": {
       "type": "object",
-      "required": [
-        "snapshots",
-        "replay_logs",
-        "plan_outputs",
-        "artifacts"
-      ],
+      "required": ["snapshots", "replay_logs", "plan_outputs", "artifacts"],
       "additionalProperties": false,
       "properties": {
         "snapshots": {
@@ -84,12 +79,7 @@
     },
     "failure_behaviors": {
       "type": "object",
-      "required": [
-        "missing",
-        "stale",
-        "contradictory",
-        "unredacted"
-      ],
+      "required": ["missing", "stale", "contradictory", "unredacted"],
       "additionalProperties": false,
       "properties": {
         "missing": {
@@ -153,11 +143,7 @@
       "properties": {
         "retention_class": {
           "type": "string",
-          "enum": [
-            "metadata_only",
-            "redacted_artifact",
-            "schema_fixture"
-          ]
+          "enum": ["metadata_only", "redacted_artifact", "schema_fixture"]
         },
         "max_contains_raw_content": {
           "type": "boolean",
@@ -196,11 +182,7 @@
     },
     "failure_behavior": {
       "type": "object",
-      "required": [
-        "fail_closed",
-        "outcome",
-        "reason_code"
-      ],
+      "required": ["fail_closed", "outcome", "reason_code"],
       "additionalProperties": false,
       "properties": {
         "fail_closed": {
@@ -209,12 +191,7 @@
         },
         "outcome": {
           "type": "string",
-          "enum": [
-            "reject",
-            "mark_unavailable",
-            "lower_confidence",
-            "operator_review_required"
-          ]
+          "enum": ["reject", "mark_unavailable", "lower_confidence", "operator_review_required"]
         },
         "reason_code": {
           "type": "string",

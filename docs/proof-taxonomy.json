@@ -10,7 +10,12 @@
       "bridge_plan_core": true,
       "description": "Compile-time proof encoded in Rust types, sealed traits, trait bounds, lint gates, or dependency bans.",
       "example_path": "docs/attestations/proofs/runtime-proof-trait.json",
-      "accepted_shapes": ["compile-fail gate", "sealed trait audit", "dependency ban", "lint report"]
+      "accepted_shapes": [
+        "compile-fail gate",
+        "sealed trait audit",
+        "dependency ban",
+        "lint report"
+      ]
     },
     {
       "id": 2,
@@ -37,7 +42,12 @@
       "bridge_plan_core": true,
       "description": "Golden, schema, protocol, contract, visual, or wire-format check against an explicit expected shape.",
       "example_path": "crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json",
-      "accepted_shapes": ["golden fixture", "schema validation", "protocol transcript", "visual parity report"]
+      "accepted_shapes": [
+        "golden fixture",
+        "schema validation",
+        "protocol transcript",
+        "visual parity report"
+      ]
     },
     {
       "id": 5,
@@ -55,7 +65,12 @@
       "bridge_plan_core": true,
       "description": "Explicit model, theorem, state-machine proof, or model-checking artifact with a verifiable invariant.",
       "example_path": "docs/proofs/transaction_model.tla",
-      "accepted_shapes": ["TLA+ spec", "model checker output", "state-machine invariant", "proof obligation report"]
+      "accepted_shapes": [
+        "TLA+ spec",
+        "model checker output",
+        "state-machine invariant",
+        "proof obligation report"
+      ]
     },
     {
       "id": 7,
@@ -64,7 +79,12 @@
       "bridge_plan_core": true,
       "description": "Entropy, leakage, distinguishability, or recall/precision bound with stated assumptions and data.",
       "example_path": "docs/security/redactor-coverage.json",
-      "accepted_shapes": ["entropy bound", "leakage matrix", "Fano inequality report", "classification metric table"]
+      "accepted_shapes": [
+        "entropy bound",
+        "leakage matrix",
+        "Fano inequality report",
+        "classification metric table"
+      ]
     },
     {
       "id": 8,
@@ -82,7 +102,12 @@
       "bridge_plan_core": true,
       "description": "Comparison against another implementation, oracle, previous release, or independent backend.",
       "example_path": "docs/perf/competitor-matrix.json",
-      "accepted_shapes": ["competitor matrix", "oracle diff", "A/B transcript", "cross-backend parity run"]
+      "accepted_shapes": [
+        "competitor matrix",
+        "oracle diff",
+        "A/B transcript",
+        "cross-backend parity run"
+      ]
     },
     {
       "id": 10,
@@ -91,7 +116,12 @@
       "bridge_plan_core": true,
       "description": "Signature, content-addressed manifest, hash chain, transparency-log, or provenance proof.",
       "example_path": "docs/attestations/0.0.0-dev.json",
-      "accepted_shapes": ["signed bundle", "sigstore bundle", "hash manifest", "provenance statement"]
+      "accepted_shapes": [
+        "signed bundle",
+        "sigstore bundle",
+        "hash manifest",
+        "provenance statement"
+      ]
     },
     {
       "id": 11,
@@ -100,7 +130,14 @@
       "bridge_plan_core": false,
       "description": "Graph, topology, reachability, cut-set, packing, or persistent-homology invariant that proves structural behavior beyond the core ten categories.",
       "example_path": "docs/attestations/tui/topology-parity.json",
-      "accepted_shapes": ["graph invariant", "reachability proof", "packing invariant", "persistent homology diagram", "Betti curve", "bottleneck distance"]
+      "accepted_shapes": [
+        "graph invariant",
+        "reachability proof",
+        "packing invariant",
+        "persistent homology diagram",
+        "Betti curve",
+        "bottleneck distance"
+      ]
     }
   ],
   "non_proof_classifications": [

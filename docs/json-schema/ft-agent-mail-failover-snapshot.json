@@ -57,11 +57,7 @@
   "$defs": {
     "agent_mail_status": {
       "type": "string",
-      "enum": [
-        "healthy",
-        "unavailable",
-        "transient_database_recovery"
-      ]
+      "enum": ["healthy", "unavailable", "transient_database_recovery"]
     },
     "forbidden_action": {
       "type": "string",
@@ -82,12 +78,7 @@
     },
     "agent_mail": {
       "type": "object",
-      "required": [
-        "status",
-        "marker",
-        "retry_count",
-        "forbidden_actions"
-      ],
+      "required": ["status", "marker", "retry_count", "forbidden_actions"],
       "additionalProperties": false,
       "properties": {
         "status": {
@@ -102,10 +93,7 @@
           "minimum": 0
         },
         "last_error": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "forbidden_actions": {
           "type": "array",
@@ -119,13 +107,7 @@
     },
     "issue_ref": {
       "type": "object",
-      "required": [
-        "id",
-        "title",
-        "status",
-        "priority",
-        "assignee"
-      ],
+      "required": ["id", "title", "status", "priority", "assignee"],
       "additionalProperties": true,
       "properties": {
         "id": {
@@ -136,31 +118,19 @@
           "type": "string"
         },
         "status": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "priority": {
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": ["integer", "null"]
         },
         "assignee": {
           "type": "string"
         },
         "updated_at": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "age_seconds": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "stale_over_2h": {
@@ -170,11 +140,7 @@
     },
     "active_agent": {
       "type": "object",
-      "required": [
-        "assignee",
-        "active_count",
-        "beads"
-      ],
+      "required": ["assignee", "active_count", "beads"],
       "additionalProperties": false,
       "properties": {
         "assignee": {
@@ -277,24 +243,15 @@
           "type": "string"
         },
         "updated_at": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "age_seconds": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "recommendation": {
           "type": "string",
-          "enum": [
-            "do_not_reopen",
-            "status_check_before_reopen"
-          ]
+          "enum": ["do_not_reopen", "status_check_before_reopen"]
         },
         "reason": {
           "type": "string"
@@ -346,12 +303,7 @@
     },
     "dirty_risk_level": {
       "type": "string",
-      "enum": [
-        "clean",
-        "low",
-        "medium",
-        "high"
-      ]
+      "enum": ["clean", "low", "medium", "high"]
     },
     "dirty_category": {
       "type": "string",
@@ -364,13 +316,7 @@
     },
     "dirty_path": {
       "type": "object",
-      "required": [
-        "raw",
-        "status",
-        "path",
-        "category",
-        "severity"
-      ],
+      "required": ["raw", "status", "path", "category", "severity"],
       "additionalProperties": false,
       "properties": {
         "raw": {
@@ -387,23 +333,13 @@
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
+          "enum": ["low", "medium", "high"]
         }
       }
     },
     "dirty_overlap": {
       "type": "object",
-      "required": [
-        "path",
-        "status",
-        "category",
-        "severity",
-        "recommendation"
-      ],
+      "required": ["path", "status", "category", "severity", "recommendation"],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -417,10 +353,7 @@
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "medium",
-            "high"
-          ]
+          "enum": ["medium", "high"]
         },
         "recommendation": {
           "type": "string",
@@ -430,12 +363,7 @@
     },
     "dirty_domain": {
       "type": "object",
-      "required": [
-        "category",
-        "severity",
-        "count",
-        "paths"
-      ],
+      "required": ["category", "severity", "count", "paths"],
       "additionalProperties": false,
       "properties": {
         "category": {
@@ -458,13 +386,7 @@
     },
     "conflict_hint": {
       "type": "object",
-      "required": [
-        "path",
-        "status",
-        "category",
-        "severity",
-        "guidance"
-      ],
+      "required": ["path", "status", "category", "severity", "guidance"],
       "additionalProperties": false,
       "properties": {
         "path": {

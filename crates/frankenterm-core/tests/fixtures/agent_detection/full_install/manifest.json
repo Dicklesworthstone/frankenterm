@@ -3,14 +3,14 @@
   "expected_detected_count": 9,
   "expected_total_count": 9,
   "agents": [
-    {"slug": "claude", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "cline", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "codex", "detected": true, "evidence_contains": "config.yaml"},
-    {"slug": "cursor", "detected": true, "evidence_contains": "settings.json"},
-    {"slug": "factory", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "gemini", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "github-copilot", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "opencode", "detected": true, "evidence_contains": "config.json"},
-    {"slug": "windsurf", "detected": true, "evidence_contains": "settings.json"}
+    { "slug": "claude", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "cline", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "codex", "detected": true, "evidence_contains": "config.yaml" },
+    { "slug": "cursor", "detected": true, "evidence_contains": "settings.json" },
+    { "slug": "factory", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "gemini", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "github-copilot", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "opencode", "detected": true, "evidence_contains": "config.json" },
+    { "slug": "windsurf", "detected": true, "evidence_contains": "settings.json" }
   ]
 }

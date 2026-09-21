@@ -58,9 +58,7 @@
         "size_bytes": 0,
         "source_surface": "fixture::agent_mail_snapshot",
         "status": "unavailable",
-        "warning_ids": [
-          "agent_mail.unavailable"
-        ]
+        "warning_ids": ["agent_mail.unavailable"]
       },
       {
         "elapsed_ms": 5,
@@ -72,9 +70,7 @@
         "size_bytes": 0,
         "source_surface": "fixture::process_sample",
         "status": "unavailable",
-        "warning_ids": [
-          "process_sample.unavailable"
-        ]
+        "warning_ids": ["process_sample.unavailable"]
       },
       {
         "elapsed_ms": 300000,
@@ -90,9 +86,7 @@
         "size_bytes": 346,
         "source_surface": "fixture::rch_timeout_evidence",
         "status": "failed",
-        "warning_ids": [
-          "rch.timeout"
-        ]
+        "warning_ids": ["rch.timeout"]
       },
       {
         "elapsed_ms": 6,

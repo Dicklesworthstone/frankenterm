@@ -7,17 +7,9 @@
     "requested_by": "fixture",
     "summary": "Expected-invalid fixture: raw pane content was included in a source snapshot.",
     "workspace_root": "/Users/jemanuel/projects/frankenterm",
-    "target_bead_ids": [
-      "ft-auy2g.1"
-    ],
-    "allowed_action_classes": [
-      "read_status"
-    ],
-    "forbidden_action_classes": [
-      "pane_mutation",
-      "service_mutation",
-      "destructive_filesystem"
-    ],
+    "target_bead_ids": ["ft-auy2g.1"],
+    "allowed_action_classes": ["read_status"],
+    "forbidden_action_classes": ["pane_mutation", "service_mutation", "destructive_filesystem"],
     "freshness_budget_ms": 300000,
     "proof_strictness": "static_only"
   },
@@ -35,14 +27,10 @@
       "redaction_posture": {
         "pane_content": "raw_forbidden",
         "secret_material": "raw_forbidden",
-        "notes": [
-          "This expected-invalid fixture proves raw pane content is rejected."
-        ]
+        "notes": ["This expected-invalid fixture proves raw pane content is rejected."]
       },
       "raw_pane_content_stored": true,
-      "reason_codes": [
-        "fixture.expected_invalid.raw_pane_content"
-      ],
+      "reason_codes": ["fixture.expected_invalid.raw_pane_content"],
       "evidence": [
         {
           "evidence_id": "evidence-raw-pane-content-forbidden",
@@ -58,18 +46,14 @@
           ]
         }
       ],
-      "artifact_paths": [
-        "fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/objective-plan/invalid-raw-pane-content.json"]
     }
   ],
   "capacity_admission": {
     "action": "unavailable",
     "pressure_tier": "unknown",
     "proof_state": "not_required",
-    "reason_codes": [
-      "fixture.expected_invalid"
-    ]
+    "reason_codes": ["fixture.expected_invalid"]
   },
   "steps": [
     {
@@ -81,12 +65,8 @@
       "side_effect_class": "none",
       "requires_approval": false,
       "forbidden": true,
-      "reason_codes": [
-        "raw_pane_content_forbidden"
-      ],
-      "proof_requirement_ids": [
-        "proof-schema-rejects-raw-pane-content"
-      ]
+      "reason_codes": ["raw_pane_content_forbidden"],
+      "proof_requirement_ids": ["proof-schema-rejects-raw-pane-content"]
     }
   ],
   "proof_requirements": [
@@ -120,9 +100,7 @@
     "policy_id": "ft.redaction.objective_plan.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "This fixture is intentionally invalid and should be rejected."
-    ]
+    "notes": ["This fixture is intentionally invalid and should be rejected."]
   },
   "raw_pane_content_stored": true,
   "artifact_paths": [

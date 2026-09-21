@@ -7,9 +7,7 @@
     "hint": "Check terminal-backend bridge configuration (current: WezTerm) and filesystem permissions.",
     "ok": false,
     "remediation": {
-      "alternatives": [
-        "Create a wezterm.lua config file if it doesn't exist."
-      ],
+      "alternatives": ["Create a wezterm.lua config file if it doesn't exist."],
       "commands": [
         {
           "command": "ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'",

@@ -6,13 +6,8 @@
       "config_path": "/Users/demo/.claude/settings.json",
       "detected": true,
       "display_name": "Claude Code",
-      "evidence": [
-        "found ~/.claude",
-        "binary: /usr/local/bin/claude"
-      ],
-      "root_paths": [
-        "/Users/demo/.claude"
-      ],
+      "evidence": ["found ~/.claude", "binary: /usr/local/bin/claude"],
+      "root_paths": ["/Users/demo/.claude"],
       "slug": "claude",
       "version": "1.2.3"
     },
@@ -20,18 +15,14 @@
       "binary_path": "/usr/local/bin/codex",
       "detected": true,
       "display_name": "Codex",
-      "root_paths": [
-        "/Users/demo/.codex"
-      ],
+      "root_paths": ["/Users/demo/.codex"],
       "slug": "codex",
       "version": "0.9.0"
     },
     {
       "config_path": "/Users/demo/.config/aider/aider.conf.yml",
       "detected": true,
-      "evidence": [
-        "detected via ~/.config/aider"
-      ],
+      "evidence": ["detected via ~/.config/aider"],
       "slug": "aider"
     },
     {
@@ -39,22 +30,15 @@
       "config_path": "/Users/demo/.gemini/antigravity-cli/AGENTS.md",
       "detected": true,
       "display_name": "Antigravity",
-      "evidence": [
-        "found ~/.gemini/antigravity-cli",
-        "binary: /usr/local/bin/agy"
-      ],
-      "root_paths": [
-        "/Users/demo/.gemini/antigravity-cli"
-      ],
+      "evidence": ["found ~/.gemini/antigravity-cli", "binary: /usr/local/bin/agy"],
+      "root_paths": ["/Users/demo/.gemini/antigravity-cli"],
       "slug": "agy",
       "version": "Gemini 3.1 Pro (High)"
     },
     {
       "detected": false,
       "display_name": "Gemini CLI",
-      "evidence": [
-        "not installed"
-      ],
+      "evidence": ["not installed"],
       "slug": "gemini"
     }
   ],

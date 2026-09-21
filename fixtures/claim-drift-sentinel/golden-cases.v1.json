@@ -20,11 +20,7 @@
       },
       "expected": {
         "verdict": "pass",
-        "reason_codes": [
-          "fixture.claim_fresh",
-          "fixture.head_source",
-          "fixture.artifact_present"
-        ]
+        "reason_codes": ["fixture.claim_fresh", "fixture.head_source", "fixture.artifact_present"]
       }
     },
     {
@@ -43,9 +39,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.count_drift"
-        ]
+        "reason_codes": ["fixture.count_drift"]
       }
     },
     {
@@ -64,10 +58,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.release_source_not_head",
-          "fixture.dirty_worktree_contaminated"
-        ]
+        "reason_codes": ["fixture.release_source_not_head", "fixture.dirty_worktree_contaminated"]
       }
     },
     {
@@ -84,10 +75,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.artifact_path_null",
-          "fixture.artifact_missing"
-        ]
+        "reason_codes": ["fixture.artifact_path_null", "fixture.artifact_missing"]
       }
     },
     {
@@ -104,9 +92,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.artifact_missing"
-        ]
+        "reason_codes": ["fixture.artifact_missing"]
       }
     },
     {
@@ -123,9 +109,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.planned_only_advertised_supported"
-        ]
+        "reason_codes": ["fixture.planned_only_advertised_supported"]
       }
     },
     {
@@ -142,9 +126,7 @@
       },
       "expected": {
         "verdict": "fail",
-        "reason_codes": [
-          "fixture.unsupported_advertised_supported"
-        ]
+        "reason_codes": ["fixture.unsupported_advertised_supported"]
       }
     }
   ]

@@ -31,10 +31,7 @@
       }
     },
     "fixture_coverage": {
-      "oneOf": [
-        { "$ref": "#/$defs/fixture_coverage" },
-        { "type": "null" }
-      ],
+      "oneOf": [{ "$ref": "#/$defs/fixture_coverage" }, { "type": "null" }],
       "description": "Optional fixture coverage statistics"
     },
     "passed": {

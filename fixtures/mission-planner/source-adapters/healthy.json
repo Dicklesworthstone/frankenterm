@@ -22,10 +22,7 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.ready_available",
-        "source.redacted_summary_only"
-      ],
+      "reason_codes": ["beads.ready_available", "source.redacted_summary_only"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "payload": {
@@ -39,18 +36,12 @@
           {
             "row_id": "ft-auy2g.2",
             "state": "available",
-            "reason_codes": [
-              "beads.ready_available"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/healthy.json"
-            ]
+            "reason_codes": ["beads.ready_available"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/healthy.json"]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/healthy.json"]
     },
     {
       "source_id": "git-clean",
@@ -63,10 +54,7 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.clean_for_scope",
-        "source.redacted_summary_only"
-      ],
+      "reason_codes": ["git.clean_for_scope", "source.redacted_summary_only"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "payload": {
@@ -77,18 +65,14 @@
         },
         "rows": []
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/healthy.json"]
     }
   ],
   "redaction_policy": {
     "policy_id": "ft.redaction.objective_sources.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Adapter fixtures store counters, ids, and reason codes only."
-    ]
+    "notes": ["Adapter fixtures store counters, ids, and reason codes only."]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

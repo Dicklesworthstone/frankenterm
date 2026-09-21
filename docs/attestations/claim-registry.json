@@ -16,10 +16,7 @@
     "dirty_worktree_measurements_allowed_for_release_claims": false,
     "missing_artifact_behavior": "fail_closed",
     "planned_only_behavior": "must_not_advertise_supported",
-    "diagnostic_formats": [
-      "json",
-      "toon"
-    ]
+    "diagnostic_formats": ["json", "toon"]
   },
   "claims": [
     {
@@ -68,14 +65,9 @@
       "freshness_rule": "High-scale wording cannot graduate until status is no longer skipped_not_proven and the target-class summary is retained.",
       "release_source_required": true,
       "dirty_worktree_measurement_allowed": false,
-      "status_json_path": [
-        "status"
-      ],
+      "status_json_path": ["status"],
       "expected_artifact_status": "skipped_not_proven",
-      "required_terms": [
-        "skipped_not_proven",
-        "high-scale memory-envelope wording must wait"
-      ]
+      "required_terms": ["skipped_not_proven", "high-scale memory-envelope wording must wait"]
     },
     {
       "claim_id": "robot_contracts.attention_router_live_read_only",
@@ -146,14 +138,9 @@
       "freshness_rule": "High-scale wording remains blocked while the retained target-class artifact status is skipped_not_proven.",
       "release_source_required": true,
       "dirty_worktree_measurement_allowed": false,
-      "status_json_path": [
-        "status"
-      ],
+      "status_json_path": ["status"],
       "expected_artifact_status": "skipped_not_proven",
-      "required_terms": [
-        "skipped_not_proven",
-        "Target-class memory envelope claims"
-      ]
+      "required_terms": ["skipped_not_proven", "Target-class memory envelope claims"]
     }
   ]
 }

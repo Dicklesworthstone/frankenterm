@@ -81,10 +81,7 @@
       "claim_id": "operating_envelope.operator_runbook",
       "bead_id": "ft-booek.6",
       "readiness_state": "measured",
-      "evidence": [
-        "docs/operator-runbook.md",
-        "docs/robot-contracts/operating-envelope.md"
-      ]
+      "evidence": ["docs/operator-runbook.md", "docs/robot-contracts/operating-envelope.md"]
     },
     {
       "claim_id": "operating_envelope.proof_calendar",

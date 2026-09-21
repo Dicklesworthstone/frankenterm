@@ -12,10 +12,7 @@
   "success": {
     "ok": true,
     "data": {
-      "items": [
-        "pane-1",
-        "pane-2"
-      ],
+      "items": ["pane-1", "pane-2"],
       "status": "ready"
     },
     "elapsed_ms": 12,

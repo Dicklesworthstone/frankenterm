@@ -369,13 +369,7 @@
       "seed": 3928213961229344453
     }
   ],
-  "flavors": [
-    "baseline-30d",
-    "regression-injected",
-    "regime-shift",
-    "heavy-tail",
-    "sparse"
-  ],
+  "flavors": ["baseline-30d", "regression-injected", "regime-shift", "heavy-tail", "sparse"],
   "generated_by": "scripts/regenerate-evidence-corpus.py",
   "schema_ref": "docs/perf/evidence-stream-schema.json",
   "schema_version": "ft.perf.evidence-corpus.v1"

@@ -93,9 +93,9 @@
       "completed_at": "2026-09-12T11:25:44Z",
       "transcript": "/tmp/ft-8r43i.5kXohF/rch-ts1-preview-installer-1240.log",
       "overall_exit_code": 101,
-      "core_result": {"passed": 31556, "failed": 0, "ignored": 5},
-      "cli_binary_result": {"passed": 966, "failed": 0, "ignored": 1},
-      "cli_integration_result": {"passed": 86, "failed": 0, "ignored": 7},
+      "core_result": { "passed": 31556, "failed": 0, "ignored": 5 },
+      "cli_binary_result": { "passed": 966, "failed": 0, "ignored": 1 },
+      "cli_integration_result": { "passed": 86, "failed": 0, "ignored": 7 },
       "oracles": ["contract_doctor_cli_mcp_read_and_refresh_parity"],
       "proved_cells": ["workflow-run:PAR"],
       "boundary": "Known and unknown previews compare exactly across actual CLI and MCP with no workflow mutations. Sole failing target was the obsolete compact MCP preview golden, manually updated after validating the actual rich report. Golden rerun and full producer checklist remain pending; no overall green or producer closure claimed."
@@ -107,7 +107,7 @@
       "transcript": "/tmp/ft-8r43i.5kXohF/rch-ts1-doctor-abort-final-1208.log",
       "transcript_sha256": "f27204c7bc81ece2626cd2a25a12e3ed007fe1cc835fd543850fb6ac525af62d",
       "overall_exit_code": 101,
-      "core_result": {"passed": 31554, "failed": 0, "ignored": 5},
+      "core_result": { "passed": 31554, "failed": 0, "ignored": 5 },
       "oracles": [
         "contract_doctor_send_policy_denial_preserves_pane_and_audit",
         "contract_doctor_reservation_and_refresh_gates_preserve_state_and_audit",
@@ -115,7 +115,16 @@
         "contract_doctor_explicit_abort_is_atomic_with_audit_and_undo",
         "contract_doctor_workflow_gate_audits_without_starting_execution"
       ],
-      "proved_cells": ["send-text:POL", "reserve:POL", "release:POL", "accounts-refresh:POL", "tx-run:POL", "tx-rollback:POL", "workflow-abort:POL", "workflow-run:POL"],
+      "proved_cells": [
+        "send-text:POL",
+        "reserve:POL",
+        "release:POL",
+        "accounts-refresh:POL",
+        "tx-run:POL",
+        "tx-rollback:POL",
+        "workflow-abort:POL",
+        "workflow-run:POL"
+      ],
       "boundary": "Named policy oracles passed; overall command failed preview roundtrip and CLI parity. Later preview repairs and the full strict release gate remain pending. No stable release verdict or producer closure follows from this focused receipt."
     },
     {
@@ -132,7 +141,13 @@
         "contract_doctor_cli_mcp_read_and_refresh_parity",
         "tests::redact_pane_text_results_for_output_scrubs_ok_and_error_payloads"
       ],
-      "proved_cells": ["dom:PAR", "workflow-status:PAR", "accounts-list:PAR", "accounts-refresh:PAR", "batch-get-text:RED"],
+      "proved_cells": [
+        "dom:PAR",
+        "workflow-status:PAR",
+        "accounts-list:PAR",
+        "accounts-refresh:PAR",
+        "batch-get-text:RED"
+      ],
       "boundary": "Focused older-snapshot proof only. Shared workflow preview, fifth parity surface, recursive metadata redaction, and the full strict producer gate remain unproven by this run. This receipt does not close the producer or establish a stable release verdict."
     }
   ],

@@ -7,9 +7,7 @@
     "hint": "Restart the watcher or retry the command.",
     "ok": false,
     "remediation": {
-      "alternatives": [
-        "If the issue persists, restart ft watch."
-      ],
+      "alternatives": ["If the issue persists, restart ft watch."],
       "commands": [
         {
           "command": "ft doctor",

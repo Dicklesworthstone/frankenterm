@@ -74,7 +74,5 @@
     "Stop retrying Agent Mail for this session.",
     "Use scripts/swarm-tick.sh --agent-mail-fallback frankenterm and Beads state."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/database-recovery-retry-exhausted.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/database-recovery-retry-exhausted.json"]
 }

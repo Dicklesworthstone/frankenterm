@@ -14,11 +14,7 @@
       "timeout 15s find /data/projects/frankenterm/target -maxdepth 2 -type d -prune -print",
       "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target"
     ],
-    "paths": [
-      "/",
-      "/tmp",
-      "/data/projects/frankenterm/target"
-    ],
+    "paths": ["/", "/tmp", "/data/projects/frankenterm/target"],
     "timeout_ms": 30000,
     "partial_allowed": true,
     "side_effect_policy": {
@@ -35,15 +31,11 @@
   "summary": {
     "workers_total": 1,
     "workers_sampled": 1,
-    "worker_ids": [
-      "vmi1227860"
-    ],
+    "worker_ids": ["vmi1227860"],
     "workers_with_critical_pressure": 1,
     "workers_with_telemetry_gap": 0,
     "workers_with_partial_output": 1,
-    "pressure_reasons": [
-      "scan_timeout"
-    ]
+    "pressure_reasons": ["scan_timeout"]
   },
   "worker_inventories": [
     {
@@ -64,9 +56,7 @@
           "used_percent": 86.7,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-df.json",
-          "notes": [
-            "Df sample completed; follow-on scans timed out."
-          ]
+          "notes": ["Df sample completed; follow-on scans timed out."]
         }
       ],
       "shallow_scans": [
@@ -85,9 +75,7 @@
           "entry_count": 214,
           "pressure_reason": "scan_timeout",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-target-shallow.partial.json",
-          "notes": [
-            "Target shallow scan retained partial output and timeout marker."
-          ]
+          "notes": ["Target shallow scan retained partial output and timeout marker."]
         }
       ],
       "project_du_samples": [
@@ -106,9 +94,7 @@
           "entry_count": 43,
           "pressure_reason": "scan_timeout",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/partial-timeout/vmi1227860-project-du.partial.json",
-          "notes": [
-            "Bounded du retained partial rows; no cleanup was attempted."
-          ]
+          "notes": ["Bounded du retained partial rows; no cleanup was attempted."]
         }
       ],
       "artifact_paths": [

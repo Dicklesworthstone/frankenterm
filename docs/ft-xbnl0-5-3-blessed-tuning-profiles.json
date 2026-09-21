@@ -14,12 +14,7 @@
     "soak_matrix_summary": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix/20260419T125312Z/summary.json"
   },
   "global_thresholds": {
-    "required_pane_scales": [
-      1,
-      50,
-      100,
-      200
-    ],
+    "required_pane_scales": [1, 50, 100, 200],
     "release_gate_max_duration_s": 3.0,
     "release_gate_max_peak_rss_mb": 32.0,
     "required_backpressure_tier": "Black",

@@ -22,10 +22,7 @@
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -242,10 +239,7 @@
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -493,20 +487,12 @@
               "type": "string"
             }
           },
-          "required": [
-            "mission_id",
-            "generation",
-            "revision",
-            "content_sha256"
-          ],
+          "required": ["mission_id", "generation", "revision", "content_sha256"],
           "type": "object"
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -523,9 +509,7 @@
           "type": "string"
         }
       },
-      "required": [
-        "reason"
-      ],
+      "required": ["reason"],
       "type": "object"
     },
     "json_success_envelope": {
@@ -627,20 +611,12 @@
               "type": "string"
             }
           },
-          "required": [
-            "mission_id",
-            "generation",
-            "revision",
-            "content_sha256"
-          ],
+          "required": ["mission_id", "generation", "revision", "content_sha256"],
           "type": "object"
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -758,20 +734,12 @@
               "type": "string"
             }
           },
-          "required": [
-            "mission_id",
-            "generation",
-            "revision",
-            "content_sha256"
-          ],
+          "required": ["mission_id", "generation", "revision", "content_sha256"],
           "type": "object"
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -788,9 +756,7 @@
           "type": "string"
         }
       },
-      "required": [
-        "reason"
-      ],
+      "required": ["reason"],
       "type": "object"
     },
     "json_success_envelope": {

@@ -10,16 +10,12 @@
       "state": "available",
       "freshness_state": "fresh",
       "redaction_posture": "redacted",
-      "reason_codes": [
-        "beads.ready_available"
-      ],
+      "reason_codes": ["beads.ready_available"],
       "evidence": [
         {
           "category": "beads_ready_queue",
           "summary": "one unassigned ready bead",
-          "reason_codes": [
-            "beads.ready_available"
-          ]
+          "reason_codes": ["beads.ready_available"]
         }
       ]
     },
@@ -29,16 +25,12 @@
       "state": "available",
       "freshness_state": "fresh",
       "redaction_posture": "redacted",
-      "reason_codes": [
-        "git.clean_for_scope"
-      ],
+      "reason_codes": ["git.clean_for_scope"],
       "evidence": [
         {
           "category": "dirty_path_overlap",
           "summary": "mission-planner corpus paths clean",
-          "reason_codes": [
-            "dirty_overlap.none"
-          ]
+          "reason_codes": ["dirty_overlap.none"]
         }
       ]
     }
@@ -61,9 +53,7 @@
       "dependency_ready": true,
       "proof_availability": "not_required",
       "capacity_posture": "admit",
-      "reason_codes": [
-        "scope.mission_planner_corpus"
-      ]
+      "reason_codes": ["scope.mission_planner_corpus"]
     }
   ]
 }

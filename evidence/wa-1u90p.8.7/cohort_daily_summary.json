@@ -86,9 +86,7 @@
       "opened_at_utc": "2026-02-22T17:53:16Z",
       "last_updated_at_utc": "2026-03-23T01:19:29Z",
       "summary": "Observed resize volume, alt-screen coverage, hardware-tier coverage, and feedback volume remain below the documented C2 thresholds.",
-      "linked_feedback_ids": [
-        "checkpoint-2026-02-22-fixture-only"
-      ],
+      "linked_feedback_ids": ["checkpoint-2026-02-22-fixture-only"],
       "linked_artifacts": [
         "evidence/wa-1u90p.8.7/cohort_daily_summary.json",
         "evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv",
@@ -99,10 +97,7 @@
         "docs/resize-controlled-beta-feedback-loop-wa-1u90p.8.7.md#current-checkpoint-2026-03-22",
         "evidence/wa-1u90p.8.7/decision_checkpoint_20260322.md"
       ],
-      "tracking_issue_ids": [
-        "ft-1u90p.8.7",
-        "ft-1u90p.8.5"
-      ]
+      "tracking_issue_ids": ["ft-1u90p.8.7", "ft-1u90p.8.5"]
     },
     {
       "anomaly_id": "fixture-only-feedback-source-2026-03-12",
@@ -116,9 +111,7 @@
       "opened_at_utc": "2026-02-22T17:53:16Z",
       "last_updated_at_utc": "2026-03-23T01:19:29Z",
       "summary": "The current checkpoint still derives from synthetic alt-screen evidence, so telemetry-to-feedback joins do not yet include real-user survey responses.",
-      "linked_feedback_ids": [
-        "checkpoint-2026-02-22-fixture-only"
-      ],
+      "linked_feedback_ids": ["checkpoint-2026-02-22-fixture-only"],
       "linked_artifacts": [
         "evidence/wa-1u90p.8.7/beta_feedback_log.jsonl",
         "evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv",
@@ -129,9 +122,7 @@
         "evidence/wa-1u90p.8.7/decision_checkpoint_20260322.md",
         "tests/e2e/logs/ft_1u90p_8_7_20260322_211929.jsonl"
       ],
-      "tracking_issue_ids": [
-        "ft-1u90p.8.7"
-      ]
+      "tracking_issue_ids": ["ft-1u90p.8.7"]
     }
   ],
   "next_actions": [

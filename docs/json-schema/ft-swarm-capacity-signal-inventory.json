@@ -79,14 +79,7 @@
   "$defs": {
     "evidence_state": {
       "type": "string",
-      "enum": [
-        "measured",
-        "inferred",
-        "simulated",
-        "stale",
-        "unavailable",
-        "mixed"
-      ]
+      "enum": ["measured", "inferred", "simulated", "stale", "unavailable", "mixed"]
     },
     "domain": {
       "type": "string",
@@ -130,15 +123,7 @@
     },
     "source_kind": {
       "type": "string",
-      "enum": [
-        "artifact",
-        "cli",
-        "doc",
-        "external_tool",
-        "rust",
-        "schema",
-        "script"
-      ]
+      "enum": ["artifact", "cli", "doc", "external_tool", "rust", "schema", "script"]
     },
     "repo_path": {
       "type": "string",
@@ -147,10 +132,7 @@
     },
     "source_ref": {
       "type": "object",
-      "required": [
-        "path",
-        "source_kind"
-      ],
+      "required": ["path", "source_kind"],
       "additionalProperties": false,
       "properties": {
         "path": {

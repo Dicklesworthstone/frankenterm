@@ -150,10 +150,7 @@
     {
       "if": { "required": ["order"] },
       "then": {
-        "anyOf": [
-          { "required": ["cursor"] },
-          { "required": ["start_at_tail"] }
-        ]
+        "anyOf": [{ "required": ["cursor"] }, { "required": ["start_at_tail"] }]
       }
     },
     {
@@ -180,7 +177,16 @@
     "event": {
       "type": "object",
       "description": "A detected event from pattern matching",
-      "required": ["id", "pane_id", "rule_id", "pack_id", "event_type", "severity", "confidence", "captured_at"],
+      "required": [
+        "id",
+        "pane_id",
+        "rule_id",
+        "pack_id",
+        "event_type",
+        "severity",
+        "confidence",
+        "captured_at"
+      ],
       "properties": {
         "id": {
           "type": "integer",

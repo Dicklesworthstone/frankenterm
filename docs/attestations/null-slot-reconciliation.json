@@ -17,12 +17,7 @@
     "slot_deletion": 0,
     "human_review_required": 0
   },
-  "allowed_dispositions": [
-    "populate-from",
-    "substrate-recovery",
-    "deferred",
-    "slot-deletion"
-  ],
+  "allowed_dispositions": ["populate-from", "substrate-recovery", "deferred", "slot-deletion"],
   "slots": [
     {
       "category": "perf/headline-claims",
@@ -37,9 +32,7 @@
       "artifact_size_bytes": 5985,
       "follow_up_bead": null,
       "reason_code": "artifact_found",
-      "evidence_commits": [
-        "f3e235393a68303c408efca22f9c0183354e123d"
-      ],
+      "evidence_commits": ["f3e235393a68303c408efca22f9c0183354e123d"],
       "evidence": [
         "br show ft-syqcz.3 reports closed and cites docs/perf/headline-claims.json.",
         "git show --name-only f3e235393a68303c408efca22f9c0183354e123d lists docs/perf/headline-claims.json.",
@@ -85,9 +78,7 @@
       "artifact_size_bytes": null,
       "follow_up_bead": "ft-e87u6.10",
       "reason_code": "closed_producer_without_manifest_compatible_artifact",
-      "evidence_commits": [
-        "e7af11df29c87031e439ea7e394d55d2c1fd93d4"
-      ],
+      "evidence_commits": ["e7af11df29c87031e439ea7e394d55d2c1fd93d4"],
       "evidence": [
         "git show --name-only e7af11df29c87031e439ea7e394d55d2c1fd93d4 lists ftui default cutover files and docs, not a render-parity JSON report.",
         "docs/attestations/tui/render-parity-gpu.json is already a populated adjunct slot for ft-35yac.1.2 and explicitly says the full byte-level report remains separate.",
@@ -108,9 +99,7 @@
       "artifact_size_bytes": null,
       "follow_up_bead": "ft-e87u6.11",
       "reason_code": "closed_producer_without_manifest_compatible_artifact",
-      "evidence_commits": [
-        "b280143778eca77c385a202f37d4e262aa535171"
-      ],
+      "evidence_commits": ["b280143778eca77c385a202f37d4e262aa535171"],
       "evidence": [
         "git show --name-only b280143778eca77c385a202f37d4e262aa535171 lists passive_watch_invariant.rs, fuzz target, corpus, and docs/security/passive-watch-attestation.md.",
         "docs/security/passive-watch-attestation.md states the production attestation surface dumps PassiveWatchHealth into a per-release JSON artifact.",
@@ -131,9 +120,7 @@
       "artifact_size_bytes": 2493,
       "follow_up_bead": null,
       "reason_code": "artifact_found",
-      "evidence_commits": [
-        "c3bf363cdbdec4fe5b11d677b47a7f8509f30aab"
-      ],
+      "evidence_commits": ["c3bf363cdbdec4fe5b11d677b47a7f8509f30aab"],
       "evidence": [
         "git show --name-only c3bf363cdbdec4fe5b11d677b47a7f8509f30aab lists docs/security/redactor-coverage.json.",
         "jq parsed docs/security/redactor-coverage.json as JSON and found bead=ft-x0666.2.",
@@ -154,9 +141,7 @@
       "artifact_size_bytes": 7050,
       "follow_up_bead": null,
       "reason_code": "artifact_found",
-      "evidence_commits": [
-        "974ed1af38ee1d20d8d00ed1b20f7bf655d00b67"
-      ],
+      "evidence_commits": ["974ed1af38ee1d20d8d00ed1b20f7bf655d00b67"],
       "evidence": [
         "git show --name-only 974ed1af38ee1d20d8d00ed1b20f7bf655d00b67 lists docs/security/distributed-threat-model.md.",
         "The manifest media type for this slot is text/markdown, matching docs/security/distributed-threat-model.md.",
@@ -177,9 +162,7 @@
       "artifact_size_bytes": null,
       "follow_up_bead": "ft-e87u6.12",
       "reason_code": "closed_producer_without_manifest_compatible_artifact",
-      "evidence_commits": [
-        "7ff0f9e373ad8112d69c485a31d4a1c450ac1fc7"
-      ],
+      "evidence_commits": ["7ff0f9e373ad8112d69c485a31d4a1c450ac1fc7"],
       "evidence": [
         "git show --name-only 7ff0f9e373ad8112d69c485a31d4a1c450ac1fc7 lists loom test files and docs/runtime/loom-conventions.md.",
         "br show ft-syqcz.7 reports the exhaustive proof program complete and points to docs/runtime/mazurkiewicz-traces.md.",
@@ -200,9 +183,7 @@
       "artifact_size_bytes": null,
       "follow_up_bead": "ft-e87u6.13",
       "reason_code": "closed_producer_without_manifest_compatible_artifact",
-      "evidence_commits": [
-        "34b447b44cb4f91909e9f4783ebf03e37e08d2cf"
-      ],
+      "evidence_commits": ["34b447b44cb4f91909e9f4783ebf03e37e08d2cf"],
       "evidence": [
         "br show ft-i2eni.1 reports closed; its close note names a stale commit in this checkout, while git log shows 34b447b44 as the current commit that touched runtime_proof.rs and docs/runtime/runtime-proof-trait.md.",
         "git show --name-only 34b447b44cb4f91909e9f4783ebf03e37e08d2cf lists runtime_proof.rs and docs/runtime/runtime-proof-trait.md.",
@@ -223,9 +204,7 @@
       "artifact_size_bytes": null,
       "follow_up_bead": "ft-e87u6.14",
       "reason_code": "closed_producer_without_manifest_compatible_artifact",
-      "evidence_commits": [
-        "f87686c79f26beeafd578de506bfcda7fee631e2"
-      ],
+      "evidence_commits": ["f87686c79f26beeafd578de506bfcda7fee631e2"],
       "evidence": [
         "git show --name-only f87686c79f26beeafd578de506bfcda7fee631e2 lists scripts/stamp-readme-counts.sh, README.md, AGENTS.md, and docs/contributing/auto-stamped-counts.md.",
         "scripts/stamp-readme-counts.sh defines a seven-entry MANIFEST and text-mode check/write behavior.",

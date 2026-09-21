@@ -31,9 +31,7 @@
       "inventory_evidence_sha256": "8989898989898989898989898989898989898989898989898989898989898989",
       "approval_match": "exact",
       "protected_reason": "unknown_live_use",
-      "notes": [
-        "The retained scan cannot prove the path is not in use by an active RCH build."
-      ]
+      "notes": ["The retained scan cannot prove the path is not in use by an active RCH build."]
     }
   ],
   "allowed_operations": [],
@@ -95,10 +93,7 @@
       "exact approved path-set hash",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
   "review_notes": [
     "Unknown live-use state fails closed even with matching approval and evidence hash."

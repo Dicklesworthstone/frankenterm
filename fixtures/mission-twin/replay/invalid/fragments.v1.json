@@ -23,22 +23,16 @@
     {
       "case_id": "destructive-suggestion",
       "description": "Replay output may recommend coordination or static verification only, not destructive cleanup.",
-      "reason_codes": [
-        "mission_twin_replay.invalid.destructive_suggestion"
-      ],
+      "reason_codes": ["mission_twin_replay.invalid.destructive_suggestion"],
       "invalid_fragment": {
         "suggested_action": "delete tracked source files without written approval",
-        "next_actions": [
-          "mutate_workspace"
-        ]
+        "next_actions": ["mutate_workspace"]
       }
     },
     {
       "case_id": "ambiguous-artifact-path",
       "description": "Replay artifacts must be concrete repo-relative files, not ambiguous globs or absolute paths.",
-      "reason_codes": [
-        "mission_twin_replay.invalid.ambiguous_artifact_path"
-      ],
+      "reason_codes": ["mission_twin_replay.invalid.ambiguous_artifact_path"],
       "invalid_fragment": {
         "artifact_paths": [
           "fixtures/mission-twin/replay/*",
@@ -50,9 +44,7 @@
     {
       "case_id": "stale-timestamp",
       "description": "Replay fixtures must use explicit retained epoch milliseconds and reject stale freshness claims.",
-      "reason_codes": [
-        "mission_twin_replay.invalid.stale_timestamp"
-      ],
+      "reason_codes": ["mission_twin_replay.invalid.stale_timestamp"],
       "invalid_fragment": {
         "generated_at_ms": 1,
         "freshness_state": "fresh"
@@ -61,9 +53,7 @@
     {
       "case_id": "live-mutation-attempt",
       "description": "Replay harnesses must never perform live Beads, Agent Mail, git, RCH, or pane mutations.",
-      "reason_codes": [
-        "mission_twin_replay.invalid.live_mutation_attempt"
-      ],
+      "reason_codes": ["mission_twin_replay.invalid.live_mutation_attempt"],
       "invalid_fragment": {
         "live_attempt": true,
         "mutation_surface": "rch_build_cancellation",

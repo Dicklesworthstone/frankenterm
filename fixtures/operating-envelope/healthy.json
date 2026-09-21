@@ -11,9 +11,7 @@
     "requested_cpu_cores": 64,
     "requested_memory_gib": 256,
     "proof_state": "measured",
-    "reason_codes": [
-      "target_hardware.measured"
-    ]
+    "reason_codes": ["target_hardware.measured"]
   },
   "input_domains": {
     "capacity_resource": {
@@ -29,15 +27,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Capacity summary stores pressure tiers only."
-        ]
+        "notes": ["Capacity summary stores pressure tiers only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "capacity.green",
-        "capacity.measured"
-      ],
+      "reason_codes": ["capacity.green", "capacity.measured"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -46,17 +39,11 @@
           "category": "capacity_pressure",
           "state": "pass",
           "subject": "resource cockpit",
-          "reason_codes": [
-            "capacity.green"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["capacity.green"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     },
     "rch": {
       "source_id": "rch-healthy",
@@ -71,9 +58,7 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "RCH summary records verdict classes, not build logs."
-        ]
+        "notes": ["RCH summary records verdict classes, not build logs."]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
@@ -89,17 +74,11 @@
           "category": "rch_cargo_reached",
           "state": "pass",
           "subject": "remote cargo proof",
-          "reason_codes": [
-            "rch.remote_cargo_reached_true"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["rch.remote_cargo_reached_true"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     },
     "beads": {
       "source_id": "beads-ready",
@@ -114,15 +93,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Beads summary records ids and statuses only."
-        ]
+        "notes": ["Beads summary records ids and statuses only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.ready_available",
-        "assignee_overlap.none"
-      ],
+      "reason_codes": ["beads.ready_available", "assignee_overlap.none"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -131,17 +105,11 @@
           "category": "beads_ready_queue",
           "state": "pass",
           "subject": "ready queue",
-          "reason_codes": [
-            "beads.ready_available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["beads.ready_available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     },
     "agent_mail": {
       "source_id": "agent-mail-healthy",
@@ -156,14 +124,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "Agent Mail summary omits message bodies."
-        ]
+        "notes": ["Agent Mail summary omits message bodies."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "agent_mail.available"
-      ],
+      "reason_codes": ["agent_mail.available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -172,17 +136,11 @@
           "category": "agent_mail_availability",
           "state": "pass",
           "subject": "macro_start_session",
-          "reason_codes": [
-            "agent_mail.available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["agent_mail.available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     },
     "git": {
       "source_id": "git-clean",
@@ -197,16 +155,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Git summary records path classes only."
-        ]
+        "notes": ["Git summary records path classes only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.clean_for_scope",
-        "dirty_overlap.none",
-        "deletion_risk.none"
-      ],
+      "reason_codes": ["git.clean_for_scope", "dirty_overlap.none", "deletion_risk.none"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -215,17 +167,11 @@
           "category": "git_dirty_tree",
           "state": "pass",
           "subject": "owned paths",
-          "reason_codes": [
-            "git.clean_for_scope"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["git.clean_for_scope"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     },
     "robot_inventory": {
       "source_id": "robot-inventory",
@@ -240,15 +186,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Robot inventory fixture omits pane text."
-        ]
+        "notes": ["Robot inventory fixture omits pane text."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "robot.inventory_available",
-        "robot.raw_pane_text_skipped"
-      ],
+      "reason_codes": ["robot.inventory_available", "robot.raw_pane_text_skipped"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -257,17 +198,11 @@
           "category": "robot_inventory",
           "state": "pass",
           "subject": "pane inventory",
-          "reason_codes": [
-            "robot.inventory_available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/healthy.json"
-          ]
+          "reason_codes": ["robot.inventory_available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/healthy.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/healthy.json"]
     }
   },
   "decision": {
@@ -281,11 +216,7 @@
     "dirty_tree_state": "clean",
     "max_parallel_agents": 32,
     "max_parallel_proofs": 8,
-    "reason_codes": [
-      "capacity.green",
-      "rch.remote_cargo_reached_true",
-      "git.clean_for_scope"
-    ]
+    "reason_codes": ["capacity.green", "rch.remote_cargo_reached_true", "git.clean_for_scope"]
   },
   "admission_windows": [
     {
@@ -324,10 +255,7 @@
         "agent-mail-healthy",
         "git-clean"
       ],
-      "reason_codes": [
-        "envelope.admit",
-        "proof.remote_only"
-      ]
+      "reason_codes": ["envelope.admit", "proof.remote_only"]
     }
   ],
   "fail_closed_policy": {
@@ -336,10 +264,7 @@
     "contradictory_signal_behavior": "block",
     "privacy_redaction_behavior": "lower_envelope",
     "target_hardware_gap_behavior": "defer_target_class_claim",
-    "reason_codes": [
-      "fail_closed.lower_missing",
-      "fail_closed.block_contradiction"
-    ]
+    "reason_codes": ["fail_closed.lower_missing", "fail_closed.block_contradiction"]
   },
   "side_effect_policy": {
     "dry_run_only": true,
@@ -353,15 +278,10 @@
     "policy_id": "ft.redaction.operating_envelope.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Envelope stores source summaries and reason codes only."
-    ]
+    "notes": ["Envelope stores source summaries and reason codes only."]
   },
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "envelope.admit",
-    "source.redacted_summary_only"
-  ],
+  "reason_codes": ["envelope.admit", "source.redacted_summary_only"],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
     "fixtures/operating-envelope/valid/healthy.json"

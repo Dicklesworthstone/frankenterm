@@ -31,9 +31,7 @@
       "inventory_evidence_sha256": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
       "approval_match": "absent",
       "protected_reason": "source_checkout",
-      "notes": [
-        "The source checkout and frankenterm-core are protected paths."
-      ]
+      "notes": ["The source checkout and frankenterm-core are protected paths."]
     }
   ],
   "allowed_operations": [],
@@ -95,12 +93,7 @@
       "source checkout integrity proof",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
-  "review_notes": [
-    "Protected paths fail closed even if a retained inventory names them."
-  ]
+  "review_notes": ["Protected paths fail closed even if a retained inventory names them."]
 }

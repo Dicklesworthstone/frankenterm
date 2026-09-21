@@ -13,10 +13,7 @@
           "value": "5"
         }
       ],
-      "suggestions": [
-        "Check pane status: ft list",
-        "Verify the watcher is running: ft status"
-      ],
+      "suggestions": ["Check pane status: ft list", "Verify the watcher is running: ft status"],
       "summary": "1 observed pane(s) have not been seen recently. They may be closed or disconnected."
     }
   ],

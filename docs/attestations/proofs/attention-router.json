@@ -6,9 +6,7 @@
   "generated_at": "2026-07-05T04:20:00Z",
   "epic_id": "ft-x3nsb",
   "status": "pass",
-  "proof_categories": [
-    4
-  ],
+  "proof_categories": [4],
   "scope": "Closeout-readiness record for the ft.attention_router.v1 read-only attention-router contract, retained scenario inventory, nudge-plan receipt vocabulary, Robot/MCP/CLI surface goldens, and release-attestation posture.",
   "contract": {
     "contract_id": "ft.attention_router.v1",
@@ -70,12 +68,7 @@
       "verifier": "bash fixtures/attention-router/verify-nudge-plan-receipts.sh"
     },
     {
-      "bead_ids": [
-        "ft-x3nsb.6",
-        "ft-x3nsb.6.1",
-        "ft-x3nsb.6.3",
-        "ft-x3nsb.6.4"
-      ],
+      "bead_ids": ["ft-x3nsb.6", "ft-x3nsb.6.1", "ft-x3nsb.6.3", "ft-x3nsb.6.4"],
       "status": "closed",
       "evidence_state": "static_validated",
       "claim": "Golden scenario corpus covers ready, blocked, comms, stale-claim, dirty-overlap, proof-starved, reservation-firewall, and disk-pressure approval cases.",

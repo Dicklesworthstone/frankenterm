@@ -4,11 +4,7 @@
       "covered": 11,
       "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [
-        "capture_authority.rs",
-        "ingest.rs",
-        "recorder_migration.rs"
-      ],
+      "files": ["capture_authority.rs", "ingest.rs", "recorder_migration.rs"],
       "independent_adapter": 0,
       "total": 18,
       "uncovered": 0,
@@ -18,9 +14,7 @@
       "covered": 5,
       "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [
-        "connector_host_runtime.rs"
-      ],
+      "files": ["connector_host_runtime.rs"],
       "independent_adapter": 0,
       "total": 5,
       "uncovered": 0,
@@ -30,9 +24,7 @@
       "covered": 2,
       "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [
-        "distributed.rs"
-      ],
+      "files": ["distributed.rs"],
       "independent_adapter": 0,
       "total": 2,
       "uncovered": 0,
@@ -134,11 +126,7 @@
       "covered": 6,
       "eager_settled_future": 0,
       "exempt_file": 0,
-      "files": [
-        "web.rs",
-        "web/server.rs",
-        "webhook.rs"
-      ],
+      "files": ["web.rs", "web/server.rs", "webhook.rs"],
       "independent_adapter": 0,
       "total": 11,
       "uncovered": 0,

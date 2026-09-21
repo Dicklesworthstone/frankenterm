@@ -119,30 +119,18 @@
   "representative_modules": [
     {
       "path": "crates/frankenterm-core/src/cpu_pressure.rs",
-      "must_contain_any": [
-        "runtime_compat::sleep"
-      ],
-      "must_not_contain": [
-        "tokio::"
-      ]
+      "must_contain_any": ["runtime_compat::sleep"],
+      "must_not_contain": ["tokio::"]
     },
     {
       "path": "crates/frankenterm-core/src/memory_pressure.rs",
-      "must_contain_any": [
-        "runtime_compat::sleep"
-      ],
-      "must_not_contain": [
-        "tokio::"
-      ]
+      "must_contain_any": ["runtime_compat::sleep"],
+      "must_not_contain": ["tokio::"]
     },
     {
       "path": "crates/frankenterm-core/src/survival.rs",
-      "must_contain_any": [
-        "runtime_compat::sleep"
-      ],
-      "must_not_contain": [
-        "tokio::"
-      ]
+      "must_contain_any": ["runtime_compat::sleep"],
+      "must_not_contain": ["tokio::"]
     }
   ],
   "validation_contract": {

@@ -108,42 +108,22 @@
         },
         "task_urgency": {
           "type": "string",
-          "enum": [
-            "low",
-            "normal",
-            "high",
-            "critical"
-          ]
+          "enum": ["low", "normal", "high", "critical"]
         },
         "proof_criticality": {
           "type": "string",
-          "enum": [
-            "not_required",
-            "static_only",
-            "rch_required",
-            "target_hardware_required"
-          ]
+          "enum": ["not_required", "static_only", "rch_required", "target_hardware_required"]
         },
         "expected_token_class": {
           "type": "string",
-          "enum": [
-            "small",
-            "medium",
-            "large",
-            "extra_large"
-          ]
+          "enum": ["small", "medium", "large", "extra_large"]
         },
         "expected_cost_class": {
           "$ref": "#/$defs/cost_class"
         },
         "required_model_class": {
           "type": "string",
-          "enum": [
-            "economy",
-            "standard",
-            "frontier",
-            "any"
-          ]
+          "enum": ["economy", "standard", "frontier", "any"]
         },
         "mission_objective_plan_ref": {
           "type": "string",
@@ -180,76 +160,41 @@
         },
         "model_class": {
           "type": "string",
-          "enum": [
-            "economy",
-            "standard",
-            "frontier"
-          ]
+          "enum": ["economy", "standard", "frontier"]
         },
         "account_class": {
           "type": "string",
-          "enum": [
-            "free",
-            "pro",
-            "team",
-            "enterprise",
-            "unknown"
-          ]
+          "enum": ["free", "pro", "team", "enterprise", "unknown"]
         },
         "quota_remaining": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "quota_window_reset_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "observed_rate_limit_state": {
           "type": "string",
-          "enum": [
-            "clear",
-            "near_limit",
-            "hard_limited",
-            "unknown"
-          ]
+          "enum": ["clear", "near_limit", "hard_limited", "unknown"]
         },
         "marginal_cost_class": {
           "$ref": "#/$defs/cost_class"
         },
         "confidence": {
           "type": "string",
-          "enum": [
-            "high",
-            "medium",
-            "low",
-            "none"
-          ]
+          "enum": ["high", "medium", "low", "none"]
         },
         "freshness_state": {
           "type": "string",
-          "enum": [
-            "fresh",
-            "near_stale",
-            "stale",
-            "unknown"
-          ]
+          "enum": ["fresh", "near_stale", "stale", "unknown"]
         },
         "source_artifact": {
           "$ref": "#/$defs/artifact_path"
         },
         "redaction_state": {
           "type": "string",
-          "enum": [
-            "redacted_summary",
-            "privacy_redacted",
-            "raw_forbidden"
-          ]
+          "enum": ["redacted_summary", "privacy_redacted", "raw_forbidden"]
         },
         "provider_available": {
           "type": "boolean"
@@ -279,23 +224,12 @@
           ]
         },
         "target_provider": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "target_model_class": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "enum": [
-            "economy",
-            "standard",
-            "frontier",
-            null
-          ]
+          "type": ["string", "null"],
+          "enum": ["economy", "standard", "frontier", null]
         },
         "requires_approval": {
           "type": "boolean"
@@ -306,20 +240,13 @@
         },
         "fallback_action": {
           "type": "string",
-          "enum": [
-            "defer",
-            "request_fresh_quota_evidence",
-            "require_approval"
-          ]
+          "enum": ["defer", "request_fresh_quota_evidence", "require_approval"]
         }
       }
     },
     "toon_projection": {
       "type": "object",
-      "required": [
-        "columns",
-        "rows"
-      ],
+      "required": ["columns", "rows"],
       "additionalProperties": false,
       "properties": {
         "columns": {
@@ -337,12 +264,7 @@
             "type": "array",
             "minItems": 6,
             "items": {
-              "type": [
-                "string",
-                "number",
-                "boolean",
-                "null"
-              ]
+              "type": ["string", "number", "boolean", "null"]
             }
           }
         }
@@ -350,12 +272,7 @@
     },
     "cost_class": {
       "type": "string",
-      "enum": [
-        "low",
-        "medium",
-        "high",
-        "unknown"
-      ]
+      "enum": ["low", "medium", "high", "unknown"]
     },
     "reason_code": {
       "type": "string",

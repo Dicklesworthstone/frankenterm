@@ -15,9 +15,7 @@
           "raw_pane_content_stored": false
         },
         "expected_state": "ineligible",
-        "expected_reason_codes": [
-          "ambiguous_comment"
-        ]
+        "expected_reason_codes": ["ambiguous_comment"]
       }
     },
     {
@@ -35,9 +33,7 @@
           "source_text": "raw pane transcript should never be stored here"
         },
         "expected_state": "ineligible",
-        "expected_reason_codes": [
-          "ambiguous_comment"
-        ]
+        "expected_reason_codes": ["ambiguous_comment"]
       }
     },
     {
@@ -55,9 +51,7 @@
           "source_text": "Proof-State: static_clean\nCommand: bash tests/e2e/test_deferred_proof_receipt_contract.sh"
         },
         "expected_state": "maybe",
-        "expected_reason_codes": [
-          "ambiguous_comment"
-        ]
+        "expected_reason_codes": ["ambiguous_comment"]
       }
     }
   ]

@@ -6,14 +6,8 @@
     {
       "window_id": 100,
       "title": "controller",
-      "position": [
-        32,
-        64
-      ],
-      "size": [
-        1440,
-        900
-      ],
+      "position": [32, 64],
+      "size": [1440, 900],
       "tabs": [
         {
           "tab_id": 200,

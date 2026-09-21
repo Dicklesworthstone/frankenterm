@@ -14,32 +14,16 @@
     "script_intent": "daily via cron or launchd",
     "configured_in_repo": false,
     "alignment_status": "manual_and_misaligned",
-    "script_repo_roots": [
-      "/dp/ghostty",
-      "/dp/wezterm",
-      "/dp/zellij",
-      "/dp/rio"
-    ],
-    "in_repo_legacy_clones": [
-      "legacy_ghostty",
-      "legacy_wezterm",
-      "legacy_zellij",
-      "legacy_rio"
-    ],
+    "script_repo_roots": ["/dp/ghostty", "/dp/wezterm", "/dp/zellij", "/dp/rio"],
+    "in_repo_legacy_clones": ["legacy_ghostty", "legacy_wezterm", "legacy_zellij", "legacy_rio"],
     "notes": "The helper exists, but no repo-local cron/launchd wiring was found during this pass, and the configured pull targets do not match the in-repo legacy_* checkouts."
   },
   "projects": [
     {
       "source_project": "ghostty",
       "legacy_research_status": "closed",
-      "research_bead_ids": [
-        "ft-3bja",
-        "ft-3bja.5"
-      ],
-      "primary_artifacts": [
-        "docs/ghostty-analysis-synthesis.md",
-        "evidence/ghostty"
-      ],
+      "research_bead_ids": ["ft-3bja", "ft-3bja.5"],
+      "primary_artifacts": ["docs/ghostty-analysis-synthesis.md", "evidence/ghostty"],
       "had_preexisting_live_matrix": false,
       "coverage_before_this_artifact": "partial",
       "notes": "Primary synthesis doc still uses legacy wa-* bead references."
@@ -69,11 +53,7 @@
     {
       "source_project": "rio",
       "legacy_research_status": "closed",
-      "research_bead_ids": [
-        "ft-34sko",
-        "ft-34sko.7",
-        "ft-34sko.8"
-      ],
+      "research_bead_ids": ["ft-34sko", "ft-34sko.7", "ft-34sko.8"],
       "primary_artifacts": [
         "docs/rio-analysis-synthesis.md",
         "docs/rio-implementation-validation-matrix.md",
@@ -85,14 +65,8 @@
     {
       "source_project": "wezterm",
       "legacy_research_status": "closed",
-      "research_bead_ids": [
-        "ft-wyr1",
-        "ft-od8xy"
-      ],
-      "primary_artifacts": [
-        "docs/vendored-wezterm-design.md",
-        "frankenterm/PROVENANCE.md"
-      ],
+      "research_bead_ids": ["ft-wyr1", "ft-od8xy"],
+      "primary_artifacts": ["docs/vendored-wezterm-design.md", "frankenterm/PROVENANCE.md"],
       "had_preexisting_live_matrix": false,
       "coverage_before_this_artifact": "partial",
       "notes": "Vendored crate base and native-event design are closed, but current product docs still treat WezTerm as an active compatibility bridge."
@@ -102,10 +76,7 @@
     {
       "id": "ghostty.coalesced_notifications",
       "source_project": "ghostty",
-      "legacy_doc_bead_refs": [
-        "wa-x4rq",
-        "wa-7o4f"
-      ],
+      "legacy_doc_bead_refs": ["wa-x4rq", "wa-7o4f"],
       "idea": "Coalesced wakeups and drain-once notifications",
       "source_artifacts": [
         "docs/ghostty-analysis-synthesis.md",
@@ -128,10 +99,7 @@
     {
       "id": "ghostty.data_control_plane_split",
       "source_project": "ghostty",
-      "legacy_doc_bead_refs": [
-        "wa-3dfxb.13",
-        "wa-x4rq"
-      ],
+      "legacy_doc_bead_refs": ["wa-3dfxb.13", "wa-x4rq"],
       "idea": "Separate data-plane deltas from control-plane events",
       "source_artifacts": [
         "docs/ghostty-analysis-synthesis.md",
@@ -155,11 +123,7 @@
     {
       "id": "ghostty.memory_budgeting",
       "source_project": "ghostty",
-      "legacy_doc_bead_refs": [
-        "wa-2ahu0",
-        "wa-8vla",
-        "wa-3axa"
-      ],
+      "legacy_doc_bead_refs": ["wa-2ahu0", "wa-8vla", "wa-3axa"],
       "idea": "Byte-budgeted memory pressure, eviction, and reuse",
       "source_artifacts": [
         "docs/ghostty-analysis-synthesis.md",
@@ -189,14 +153,9 @@
     {
       "id": "zellij.versioned_local_ipc",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-1u9qw"
-      ],
+      "legacy_doc_bead_refs": ["wa-1u9qw"],
       "idea": "Versioned local IPC namespace and compatibility handshake",
-      "source_artifacts": [
-        "docs/zellij-analysis-synthesis.md",
-        "evidence/zellij/ipc-protocol.md"
-      ],
+      "source_artifacts": ["docs/zellij-analysis-synthesis.md", "evidence/zellij/ipc-protocol.md"],
       "mapped_beads": [
         {
           "id": "ft-1u9qw",
@@ -209,11 +168,7 @@
     {
       "id": "zellij.bounded_fanout_degradation",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-x4rq",
-        "wa-7o4f",
-        "wa-9dp"
-      ],
+      "legacy_doc_bead_refs": ["wa-x4rq", "wa-7o4f", "wa-9dp"],
       "idea": "Explicit overload and fanout degradation semantics",
       "source_artifacts": [
         "docs/zellij-analysis-synthesis.md",
@@ -239,10 +194,7 @@
     {
       "id": "zellij.session_index_vs_resurrection",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-rsaf",
-        "wa-3r5e"
-      ],
+      "legacy_doc_bead_refs": ["wa-rsaf", "wa-3r5e"],
       "idea": "Split live session index from resurrection checkpoints",
       "source_artifacts": [
         "docs/zellij-analysis-synthesis.md",
@@ -264,10 +216,7 @@
     {
       "id": "zellij.logical_slot_layouts",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-2dd4s.2",
-        "wa-2dd4s.3"
-      ],
+      "legacy_doc_bead_refs": ["wa-2dd4s.2", "wa-2dd4s.3"],
       "idea": "Stable logical slot identity for floating/swap layout reconciliation",
       "source_artifacts": [
         "docs/zellij-analysis-synthesis.md",
@@ -289,13 +238,9 @@
     {
       "id": "zellij.completion_tokens",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-33uf8"
-      ],
+      "legacy_doc_bead_refs": ["wa-33uf8"],
       "idea": "Cross-subsystem completion tokens and cause-chain context",
-      "source_artifacts": [
-        "docs/zellij-analysis-synthesis.md"
-      ],
+      "source_artifacts": ["docs/zellij-analysis-synthesis.md"],
       "mapped_beads": [
         {
           "id": "ft-33uf8",
@@ -308,13 +253,9 @@
     {
       "id": "zellij.watcher_clients",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-3jewu"
-      ],
+      "legacy_doc_bead_refs": ["wa-3jewu"],
       "idea": "Watcher clients and per-client view-state model",
-      "source_artifacts": [
-        "docs/zellij-analysis-synthesis.md"
-      ],
+      "source_artifacts": ["docs/zellij-analysis-synthesis.md"],
       "mapped_beads": [
         {
           "id": "ft-3jewu",
@@ -327,15 +268,9 @@
     {
       "id": "zellij.capability_gated_extensions",
       "source_project": "zellij",
-      "legacy_doc_bead_refs": [
-        "wa-dr6zv",
-        "wa-3kxe"
-      ],
+      "legacy_doc_bead_refs": ["wa-dr6zv", "wa-3kxe"],
       "idea": "Capability-gated extension actions and mediated side effects",
-      "source_artifacts": [
-        "docs/zellij-analysis-synthesis.md",
-        "evidence/zellij/wasm-plugins.md"
-      ],
+      "source_artifacts": ["docs/zellij-analysis-synthesis.md", "evidence/zellij/wasm-plugins.md"],
       "mapped_beads": [
         {
           "id": "ft-dr6zv",
@@ -497,10 +432,7 @@
       "id": "wezterm.vendored_substrate",
       "source_project": "wezterm",
       "idea": "In-tree vendored crate substrate for native mux/gui evolution",
-      "source_artifacts": [
-        "docs/vendored-wezterm-design.md",
-        "frankenterm/PROVENANCE.md"
-      ],
+      "source_artifacts": ["docs/vendored-wezterm-design.md", "frankenterm/PROVENANCE.md"],
       "mapped_beads": [
         {
           "id": "ft-od8xy",
@@ -514,9 +446,7 @@
       "id": "wezterm.native_event_contract",
       "source_project": "wezterm",
       "idea": "Native event sink and IPC contract for pane output/state events",
-      "source_artifacts": [
-        "docs/vendored-wezterm-design.md"
-      ],
+      "source_artifacts": ["docs/vendored-wezterm-design.md"],
       "mapped_beads": [
         {
           "id": "ft-wyr1",

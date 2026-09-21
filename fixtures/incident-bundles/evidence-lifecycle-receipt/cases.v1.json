@@ -20,9 +20,7 @@
     "digest": "sha256",
     "receipt_id_digest_hex_chars": 32
   },
-  "required_cases": [
-    "delimiter-injection-collision"
-  ],
+  "required_cases": ["delimiter-injection-collision"],
   "cases": [
     {
       "case_id": "delimiter-injection-collision",

@@ -7,9 +7,7 @@
     "hint": "Pane 42 was missing while performing 'inject'.",
     "ok": false,
     "remediation": {
-      "alternatives": [
-        "Refresh pane state and retry with a valid pane id."
-      ],
+      "alternatives": ["Refresh pane state and retry with a valid pane id."],
       "commands": [
         {
           "command": "ft list",

@@ -40,13 +40,7 @@
     },
     "decision": {
       "type": "string",
-      "enum": [
-        "proceed",
-        "static_only",
-        "external_scratch_only",
-        "block",
-        "unknown"
-      ]
+      "enum": ["proceed", "static_only", "external_scratch_only", "block", "unknown"]
     },
     "side_effect_policy": {
       "$ref": "#/$defs/side_effect_policy"
@@ -195,13 +189,7 @@
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "green",
-            "yellow",
-            "red",
-            "black",
-            "unknown"
-          ]
+          "enum": ["green", "yellow", "red", "black", "unknown"]
         },
         "path": {
           "type": "string",
@@ -263,12 +251,7 @@
         },
         "action": {
           "type": "string",
-          "enum": [
-            "allow",
-            "static_only",
-            "external_scratch_only",
-            "block"
-          ]
+          "enum": ["allow", "static_only", "external_scratch_only", "block"]
         },
         "write_allowed": {
           "type": "boolean"
@@ -339,13 +322,7 @@
         },
         "risk_tier": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high",
-            "protected",
-            "unknown"
-          ]
+          "enum": ["low", "medium", "high", "protected", "unknown"]
         },
         "operator_approval_required": {
           "type": "boolean",
@@ -380,11 +357,7 @@
         },
         "live_use": {
           "type": "string",
-          "enum": [
-            "not_referenced",
-            "referenced",
-            "not_checked"
-          ]
+          "enum": ["not_referenced", "referenced", "not_checked"]
         },
         "reason_codes": {
           "$ref": "#/$defs/reason_codes"

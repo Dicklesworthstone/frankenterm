@@ -2,9 +2,7 @@
   "fixture_kind": "swarm_capacity_gauntlet_negative_rch_meta",
   "selected_worker": "vmi-stale-mirror",
   "probe_worker_count": 1,
-  "probe_worker_ids": [
-    "vmi-stale-mirror"
-  ],
+  "probe_worker_ids": ["vmi-stale-mirror"],
   "sync_duration_ms": null,
   "remote_duration_ms": null,
   "remote_exit_code": null,

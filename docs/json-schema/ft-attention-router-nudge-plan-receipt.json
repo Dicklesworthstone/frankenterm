@@ -203,29 +203,16 @@
     },
     "urgency": {
       "type": "string",
-      "enum": [
-        "low",
-        "normal",
-        "high",
-        "urgent"
-      ]
+      "enum": ["low", "normal", "high", "urgent"]
     },
     "target": {
       "type": "object",
-      "required": [
-        "kind"
-      ],
+      "required": ["kind"],
       "additionalProperties": false,
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "agent",
-            "bead",
-            "thread",
-            "operator",
-            "none"
-          ]
+          "enum": ["agent", "bead", "thread", "operator", "none"]
         },
         "agent_name": {
           "type": "string",
@@ -242,11 +229,7 @@
     },
     "evidence": {
       "type": "object",
-      "required": [
-        "sources_checked",
-        "reason_codes",
-        "summary"
-      ],
+      "required": ["sources_checked", "reason_codes", "summary"],
       "additionalProperties": false,
       "properties": {
         "sources_checked": {
@@ -316,10 +299,7 @@
       "properties": {
         "body_handling": {
           "type": "string",
-          "enum": [
-            "metadata_only",
-            "summarized"
-          ]
+          "enum": ["metadata_only", "summarized"]
         },
         "raw_pane_text_allowed": {
           "type": "boolean",

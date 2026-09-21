@@ -1,6 +1,6 @@
 {
   "schema_version": "ft.interaction-trace.v2",
-  "trace_id": {"run_id": {"epoch_nonce_hi": 65261, "epoch_nonce_lo": 48879}, "sequence": 1},
+  "trace_id": { "run_id": { "epoch_nonce_hi": 65261, "epoch_nonce_lo": 48879 }, "sequence": 1 },
   "path": "keypress",
   "events": [],
   "raw_key": "this field is forbidden",

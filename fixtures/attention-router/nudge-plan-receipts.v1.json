@@ -35,16 +35,9 @@
         "thread_ref": "[THREAD_ID]"
       },
       "evidence": {
-        "sources_checked": [
-          "agent_mail.inbox"
-        ],
-        "reason_codes": [
-          "agent_mail.ack_required_present",
-          "coordination.direct_request"
-        ],
-        "subjects": [
-          "[MESSAGE_ID]"
-        ],
+        "sources_checked": ["agent_mail.inbox"],
+        "reason_codes": ["agent_mail.ack_required_present", "coordination.direct_request"],
+        "subjects": ["[MESSAGE_ID]"],
         "minimum_source_count": 1,
         "summary": "A direct ack-required message is present; acknowledge or reply before claiming unrelated work."
       },
@@ -85,20 +78,14 @@
         "bead_id": "ft-x3nsb.5"
       },
       "evidence": {
-        "sources_checked": [
-          "beads.in_progress",
-          "git.history",
-          "agent_mail.search"
-        ],
+        "sources_checked": ["beads.in_progress", "git.history", "agent_mail.search"],
         "reason_codes": [
           "beads.in_progress_present",
           "beads.no_recent_update",
           "git.no_recent_owner_commit",
           "agent_mail.no_recent_owner_message_or_unavailable"
         ],
-        "subjects": [
-          "ft-x3nsb.5"
-        ],
+        "subjects": ["ft-x3nsb.5"],
         "minimum_source_count": 3,
         "summary": "A claim looks stale across tracker, git, and mail evidence, but the receipt still recommends a status-check before any takeover review."
       },
@@ -139,20 +126,14 @@
         "agent_name": "[OWNER_AGENT]"
       },
       "evidence": {
-        "sources_checked": [
-          "git.status",
-          "agent_mail.reservations",
-          "beads.owner_state"
-        ],
+        "sources_checked": ["git.status", "agent_mail.reservations", "beads.owner_state"],
         "reason_codes": [
           "git.dirty_paths_present",
           "git.dirty_overlap_risk",
           "reservation.owner_present_or_dirty_owner_inferred",
           "beads.owner_active_or_recent"
         ],
-        "subjects": [
-          "[PATH_PATTERN]"
-        ],
+        "subjects": ["[PATH_PATTERN]"],
         "minimum_source_count": 3,
         "summary": "Dirty paths overlap an active owner or reservation; the only safe recommendation is a handoff request or disjoint work."
       },
@@ -205,9 +186,7 @@
           "git.no_recent_owner_commit",
           "pane.idle_placeholder_not_stuck_evidence"
         ],
-        "subjects": [
-          "ft-x3nsb.5"
-        ],
+        "subjects": ["ft-x3nsb.5"],
         "minimum_source_count": 4,
         "summary": "Even after a status-check, the router may only recommend force-release review; it does not release reservations or reopen work."
       },
@@ -247,22 +226,14 @@
         "kind": "none"
       },
       "evidence": {
-        "sources_checked": [
-          "br.ready",
-          "bv.triage",
-          "rch.diagnose",
-          "beads.blocker_state"
-        ],
+        "sources_checked": ["br.ready", "bv.triage", "rch.diagnose", "beads.blocker_state"],
         "reason_codes": [
           "beads.ready_empty",
           "bv.recommends_blocked_issue",
           "rch.no_admissible_workers",
           "rch.remote_cargo_reached_false"
         ],
-        "subjects": [
-          "ft-4tp7g",
-          "ft-5xwsu.3"
-        ],
+        "subjects": ["ft-4tp7g", "ft-5xwsu.3"],
         "minimum_source_count": 4,
         "summary": "RCH selected no admissible worker and remote Cargo was not reached; there is no communication nudge or mutation to send, only blocker recording or disjoint static work."
       },

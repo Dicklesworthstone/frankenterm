@@ -75,24 +75,14 @@
   "$defs": {
     "mode": {
       "type": "string",
-      "enum": [
-        "agent_mail_available",
-        "agent_mail_unavailable_beads_only"
-      ]
+      "enum": ["agent_mail_available", "agent_mail_unavailable_beads_only"]
     },
     "source_state": {
       "type": "string",
-      "enum": [
-        "available",
-        "degraded",
-        "unavailable"
-      ]
+      "enum": ["available", "degraded", "unavailable"]
     },
     "failure_class": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "enum": [
         "none",
         "database_recovery_notice",
@@ -174,21 +164,13 @@
           "uniqueItems": true
         },
         "error_summary": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
     "beads": {
       "type": "object",
-      "required": [
-        "ready_count",
-        "in_progress_count",
-        "active_agents",
-        "stale_reopen"
-      ],
+      "required": ["ready_count", "in_progress_count", "active_agents", "stale_reopen"],
       "additionalProperties": false,
       "properties": {
         "ready_count": {
@@ -212,20 +194,12 @@
     },
     "stale_reopen": {
       "type": "object",
-      "required": [
-        "default_action",
-        "threshold_seconds",
-        "candidates",
-        "dirty_overlap_unknown"
-      ],
+      "required": ["default_action", "threshold_seconds", "candidates", "dirty_overlap_unknown"],
       "additionalProperties": false,
       "properties": {
         "default_action": {
           "type": "string",
-          "enum": [
-            "do_not_reopen",
-            "status_check_before_reopen"
-          ]
+          "enum": ["do_not_reopen", "status_check_before_reopen"]
         },
         "threshold_seconds": {
           "type": "integer",
@@ -247,13 +221,7 @@
     },
     "stale_candidate": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "assignee",
-        "age_seconds",
-        "recommended_action",
-        "reason_codes"
-      ],
+      "required": ["bead_id", "assignee", "age_seconds", "recommended_action", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -261,10 +229,7 @@
           "pattern": "^ft-[a-z0-9]+(\\.[0-9]+)?$"
         },
         "assignee": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "age_seconds": {
           "type": "integer",
@@ -272,11 +237,7 @@
         },
         "recommended_action": {
           "type": "string",
-          "enum": [
-            "do_not_reopen",
-            "comment_status_check",
-            "reopen_after_status_check"
-          ]
+          "enum": ["do_not_reopen", "comment_status_check", "reopen_after_status_check"]
         },
         "reason_codes": {
           "type": "array",
@@ -312,11 +273,7 @@
         },
         "risk_level": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
+          "enum": ["low", "medium", "high"]
         },
         "dirty_paths": {
           "type": "array",
@@ -328,13 +285,7 @@
     },
     "dirty_path": {
       "type": "object",
-      "required": [
-        "path",
-        "status",
-        "category",
-        "severity",
-        "recommendation"
-      ],
+      "required": ["path", "status", "category", "severity", "recommendation"],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -347,19 +298,11 @@
         },
         "category": {
           "type": "string",
-          "enum": [
-            "tracked_overlap_risk",
-            "untracked_review_required",
-            "none"
-          ]
+          "enum": ["tracked_overlap_risk", "untracked_review_required", "none"]
         },
         "severity": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
+          "enum": ["low", "medium", "high"]
         },
         "recommendation": {
           "type": "string",

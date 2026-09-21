@@ -60,14 +60,7 @@
     },
     "sources": {
       "type": "object",
-      "required": [
-        "beads",
-        "rch",
-        "agent_mail",
-        "git",
-        "reservations",
-        "operating_envelope"
-      ],
+      "required": ["beads", "rch", "agent_mail", "git", "reservations", "operating_envelope"],
       "additionalProperties": false,
       "properties": {
         "beads": {
@@ -117,31 +110,15 @@
     },
     "source_status": {
       "type": "string",
-      "enum": [
-        "available",
-        "degraded",
-        "unavailable",
-        "blocked"
-      ]
+      "enum": ["available", "degraded", "unavailable", "blocked"]
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "stale",
-        "unknown",
-        "not_collected"
-      ]
+      "enum": ["fresh", "stale", "unknown", "not_collected"]
     },
     "evidence_level": {
       "type": "string",
-      "enum": [
-        "live_command",
-        "retained_artifact",
-        "fixture",
-        "manual_note",
-        "not_collected"
-      ]
+      "enum": ["live_command", "retained_artifact", "fixture", "manual_note", "not_collected"]
     },
     "evidence_fields": {
       "type": "object",
@@ -167,17 +144,11 @@
           "$ref": "#/$defs/freshness_state"
         },
         "collected_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 1
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "evidence_level": {
@@ -269,12 +240,7 @@
     },
     "dependency_blocker": {
       "type": "object",
-      "required": [
-        "blocked_bead_id",
-        "blocking_bead_id",
-        "blocker_status",
-        "reason_codes"
-      ],
+      "required": ["blocked_bead_id", "blocking_bead_id", "blocker_status", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "blocked_bead_id": {
@@ -320,11 +286,7 @@
         },
         "owner_state": {
           "type": "string",
-          "enum": [
-            "active",
-            "stale_candidate",
-            "unknown"
-          ]
+          "enum": ["active", "stale_candidate", "unknown"]
         },
         "age_seconds": {
           "type": "integer",
@@ -345,13 +307,7 @@
     },
     "stale_owner_candidate": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "assignee",
-        "age_seconds",
-        "last_activity_source",
-        "reason_codes"
-      ],
+      "required": ["bead_id", "assignee", "age_seconds", "last_activity_source", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -408,11 +364,7 @@
             "artifact_paths": true,
             "admission_state": {
               "type": "string",
-              "enum": [
-                "ready",
-                "not_ready",
-                "unavailable"
-              ]
+              "enum": ["ready", "not_ready", "unavailable"]
             },
             "healthy_workers": {
               "type": "integer",
@@ -445,11 +397,7 @@
     },
     "blocked_proof_lane": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "command_family",
-        "reason_codes"
-      ],
+      "required": ["bead_id", "command_family", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -476,11 +424,7 @@
         },
         {
           "type": "object",
-          "required": [
-            "availability_state",
-            "active_agents",
-            "fallback_reason_codes"
-          ],
+          "required": ["availability_state", "active_agents", "fallback_reason_codes"],
           "additionalProperties": false,
           "properties": {
             "source_id": true,
@@ -495,12 +439,7 @@
             "artifact_paths": true,
             "availability_state": {
               "type": "string",
-              "enum": [
-                "healthy",
-                "red",
-                "fallback",
-                "unknown"
-              ]
+              "enum": ["healthy", "red", "fallback", "unknown"]
             },
             "active_agents": {
               "type": "array",
@@ -521,11 +460,7 @@
     },
     "active_agent": {
       "type": "object",
-      "required": [
-        "agent_name",
-        "task_summary",
-        "last_active_age_seconds"
-      ],
+      "required": ["agent_name", "task_summary", "last_active_age_seconds"],
       "additionalProperties": false,
       "properties": {
         "agent_name": {
@@ -604,10 +539,7 @@
     },
     "remote_head": {
       "type": "object",
-      "required": [
-        "name",
-        "commit"
-      ],
+      "required": ["name", "commit"],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -622,11 +554,7 @@
     },
     "dirty_path": {
       "type": "object",
-      "required": [
-        "path",
-        "status",
-        "overlaps_owned_path"
-      ],
+      "required": ["path", "status", "overlaps_owned_path"],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -648,9 +576,7 @@
         },
         {
           "type": "object",
-          "required": [
-            "active_reservations"
-          ],
+          "required": ["active_reservations"],
           "additionalProperties": false,
           "properties": {
             "source_id": true,
@@ -675,12 +601,7 @@
     },
     "reservation": {
       "type": "object",
-      "required": [
-        "holder",
-        "path_pattern",
-        "exclusive",
-        "reason"
-      ],
+      "required": ["holder", "path_pattern", "exclusive", "reason"],
       "additionalProperties": false,
       "properties": {
         "holder": {
@@ -707,11 +628,7 @@
         },
         {
           "type": "object",
-          "required": [
-            "verdict",
-            "reason_codes",
-            "source_snapshot_artifact_paths"
-          ],
+          "required": ["verdict", "reason_codes", "source_snapshot_artifact_paths"],
           "additionalProperties": false,
           "properties": {
             "source_id": true,
@@ -726,12 +643,7 @@
             "artifact_paths": true,
             "verdict": {
               "type": "string",
-              "enum": [
-                "admit",
-                "deny",
-                "shed",
-                "unknown"
-              ]
+              "enum": ["admit", "deny", "shed", "unknown"]
             },
             "source_snapshot_artifact_paths": {
               "type": "array",
@@ -755,11 +667,7 @@
       "properties": {
         "validation_state": {
           "type": "string",
-          "enum": [
-            "accepted",
-            "rejected",
-            "operator_review_required"
-          ]
+          "enum": ["accepted", "rejected", "operator_review_required"]
         },
         "rejected_inputs": {
           "type": "array",
@@ -782,10 +690,7 @@
     },
     "rejected_input": {
       "type": "object",
-      "required": [
-        "input_id",
-        "reason_code"
-      ],
+      "required": ["input_id", "reason_code"],
       "additionalProperties": false,
       "properties": {
         "input_id": {

@@ -7,10 +7,7 @@
   "artifact_basis": {
     "data_origin": "deterministic recovery fixture from scripts/competitor-bench.sh --simulate",
     "live_benchmark": false,
-    "source_beads": [
-      "ft-syqcz.5",
-      "ft-t101b"
-    ],
+    "source_beads": ["ft-syqcz.5", "ft-t101b"],
     "live_publish_contract": "scripts/competitor-bench.sh --input-dir <raw-json-dir> --release-version <version> --baseline <hardware-baseline>",
     "snapshot_schema": "docs/perf/competitor-resize-schema.json"
   },
@@ -32,25 +29,13 @@
     "runner_sku": "artifact-recovery-smoke"
   },
   "competitor_sets": {
-    "g3_requested": [
-      "wezterm",
-      "zellij",
-      "ghostty"
-    ],
-    "ft_t101b_harness": [
-      "wezterm",
-      "ghostty",
-      "rio"
-    ],
+    "g3_requested": ["wezterm", "zellij", "ghostty"],
+    "ft_t101b_harness": ["wezterm", "ghostty", "rio"],
     "coverage_note": "The checked-in ft-t101b resize harness uses Rio for the fourth terminal. Add a Zellij raw source before treating this artifact as full G3 live competitor coverage."
   },
   "regression_policy": {
     "delta_pct_regression_threshold": -10.0,
-    "state_machine": [
-      "clean",
-      "single_regression",
-      "consecutive_regression"
-    ],
+    "state_machine": ["clean", "single_regression", "consecutive_regression"],
     "p1_trigger": "second consecutive regressed release",
     "p1_regressions": []
   },

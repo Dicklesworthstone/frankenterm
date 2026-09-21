@@ -31,9 +31,7 @@
       "inventory_evidence_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
       "approval_match": "exact",
       "protected_reason": "none",
-      "notes": [
-        "Approval expired before the checked_at timestamp."
-      ]
+      "notes": ["Approval expired before the checked_at timestamp."]
     }
   ],
   "allowed_operations": [],
@@ -95,12 +93,7 @@
       "fresh retained inventory evidence",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
-  "review_notes": [
-    "Expired approvals fail closed even when the path and evidence hash match."
-  ]
+  "review_notes": ["Expired approvals fail closed even when the path and evidence hash match."]
 }

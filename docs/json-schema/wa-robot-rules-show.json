@@ -4,14 +4,7 @@
   "title": "WA Robot Rules Show Response",
   "description": "Schema for the data field when calling 'wa robot rules show <rule_id>'. Returns the full detail payload for a single detection rule.",
   "type": "object",
-  "required": [
-    "id",
-    "agent_type",
-    "event_type",
-    "severity",
-    "description",
-    "anchors"
-  ],
+  "required": ["id", "agent_type", "event_type", "severity", "description", "anchors"],
   "properties": {
     "id": {
       "type": "string",

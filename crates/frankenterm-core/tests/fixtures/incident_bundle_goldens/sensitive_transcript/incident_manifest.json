@@ -61,9 +61,7 @@
         "size_bytes": 354,
         "source_surface": "fixture::pane_text_summaries",
         "status": "collected",
-        "warning_ids": [
-          "pane_text.redacted"
-        ]
+        "warning_ids": ["pane_text.redacted"]
       }
     ],
     "total_size_bytes": 354,

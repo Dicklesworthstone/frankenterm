@@ -67,21 +67,14 @@
       "level": "MUST",
       "statement": "When no in-progress Beads exist, no stale reopen is possible; agents should use br ready or stay idle when no ready work exists.",
       "decision": "continue_disjoint_ready_bead",
-      "required_evidence": [
-        "br list --status in_progress --json",
-        "br ready --json"
-      ]
+      "required_evidence": ["br list --status in_progress --json", "br ready --json"]
     },
     {
       "id": "RULE-ACTIVE-NOT-STALE",
       "level": "MUST",
       "statement": "An in-progress bead below the stale threshold, or with recent owner evidence, is active and must not be reopened.",
       "decision": "wait_for_owner",
-      "required_evidence": [
-        "age_seconds",
-        "last_owner_signal_at",
-        "assignee"
-      ]
+      "required_evidence": ["age_seconds", "last_owner_signal_at", "assignee"]
     },
     {
       "id": "RULE-CLEAN-STALE",
@@ -101,21 +94,14 @@
       "level": "MUST",
       "statement": "Dirty tracked overlap keeps the decision at do_not_reopen unless the owner explicitly clears the overlap.",
       "decision": "do_not_reopen",
-      "required_evidence": [
-        "dirty_tracked_paths",
-        "overlap_category",
-        "candidate_bead_id"
-      ]
+      "required_evidence": ["dirty_tracked_paths", "overlap_category", "candidate_bead_id"]
     },
     {
       "id": "RULE-UNTRACKED-REVIEW",
       "level": "MUST",
       "statement": "Relevant untracked files with unclear ownership require review and block stale reopen.",
       "decision": "do_not_reopen",
-      "required_evidence": [
-        "untracked_paths",
-        "ownership_unknown"
-      ]
+      "required_evidence": ["untracked_paths", "ownership_unknown"]
     },
     {
       "id": "RULE-ASSIGNEE-RECENCY",
@@ -133,20 +119,14 @@
       "level": "MUST",
       "statement": "If br in-progress is empty but bv reports blocked actionable work, inspect the exact bead with br show and do not claim it unless Beads marks it ready or safely reopenable.",
       "decision": "verify_br_show_then_do_not_claim",
-      "required_evidence": [
-        "bv_robot_triage_reference",
-        "br_show_status",
-        "dependency_state"
-      ]
+      "required_evidence": ["bv_robot_triage_reference", "br_show_status", "dependency_state"]
     }
   ],
   "fixtures": [
     {
       "id": "CASE-EMPTY-IN-PROGRESS",
       "description": "No in-progress Beads exist and no stale reopen candidates exist.",
-      "covers": [
-        "RULE-EMPTY-IN-PROGRESS"
-      ],
+      "covers": ["RULE-EMPTY-IN-PROGRESS"],
       "input_summary": {
         "in_progress_count": 0,
         "ready_count": 1,
@@ -155,18 +135,12 @@
       "expected_action": "continue_disjoint_ready_bead",
       "immediate_reopen_allowed": false,
       "status_check_comment_required": false,
-      "required_evidence": [
-        "br list --status in_progress --json",
-        "br ready --json"
-      ]
+      "required_evidence": ["br list --status in_progress --json", "br ready --json"]
     },
     {
       "id": "CASE-ACTIVE-IN-PROGRESS",
       "description": "An in-progress bead is below threshold or has recent owner evidence.",
-      "covers": [
-        "RULE-ACTIVE-NOT-STALE",
-        "RULE-ASSIGNEE-RECENCY"
-      ],
+      "covers": ["RULE-ACTIVE-NOT-STALE", "RULE-ASSIGNEE-RECENCY"],
       "input_summary": {
         "in_progress_count": 1,
         "age_seconds": 1200,
@@ -176,18 +150,12 @@
       "expected_action": "wait_for_owner",
       "immediate_reopen_allowed": false,
       "status_check_comment_required": false,
-      "required_evidence": [
-        "age_seconds",
-        "last_owner_signal_at",
-        "assignee"
-      ]
+      "required_evidence": ["age_seconds", "last_owner_signal_at", "assignee"]
     },
     {
       "id": "CASE-CLEAN-STALE",
       "description": "A stale candidate is above threshold, has no dirty overlap, and has no active owner evidence.",
-      "covers": [
-        "RULE-CLEAN-STALE"
-      ],
+      "covers": ["RULE-CLEAN-STALE"],
       "input_summary": {
         "in_progress_count": 1,
         "age_seconds": 9000,
@@ -208,9 +176,7 @@
     {
       "id": "CASE-DIRTY-TRACKED-OVERLAP",
       "description": "A stale candidate has dirty tracked paths in the same likely work surface.",
-      "covers": [
-        "RULE-DIRTY-TRACKED"
-      ],
+      "covers": ["RULE-DIRTY-TRACKED"],
       "input_summary": {
         "in_progress_count": 1,
         "age_seconds": 9200,
@@ -220,18 +186,12 @@
       "expected_action": "do_not_reopen",
       "immediate_reopen_allowed": false,
       "status_check_comment_required": false,
-      "required_evidence": [
-        "dirty_tracked_paths",
-        "overlap_category",
-        "candidate_bead_id"
-      ]
+      "required_evidence": ["dirty_tracked_paths", "overlap_category", "candidate_bead_id"]
     },
     {
       "id": "CASE-UNTRACKED-REVIEW-REQUIRED",
       "description": "A stale candidate or adjacent work surface has relevant untracked files with unclear ownership.",
-      "covers": [
-        "RULE-UNTRACKED-REVIEW"
-      ],
+      "covers": ["RULE-UNTRACKED-REVIEW"],
       "input_summary": {
         "in_progress_count": 1,
         "age_seconds": 9300,
@@ -241,17 +201,12 @@
       "expected_action": "do_not_reopen",
       "immediate_reopen_allowed": false,
       "status_check_comment_required": false,
-      "required_evidence": [
-        "untracked_paths",
-        "ownership_unknown"
-      ]
+      "required_evidence": ["untracked_paths", "ownership_unknown"]
     },
     {
       "id": "CASE-BR-EMPTY-BV-BLOCKED",
       "description": "br shows no in-progress work while bv reports blocked actionable work.",
-      "covers": [
-        "RULE-BR-EMPTY-BV-BLOCKED"
-      ],
+      "covers": ["RULE-BR-EMPTY-BV-BLOCKED"],
       "input_summary": {
         "in_progress_count": 0,
         "br_ready_count": 0,
@@ -261,11 +216,7 @@
       "expected_action": "verify_br_show_then_do_not_claim",
       "immediate_reopen_allowed": false,
       "status_check_comment_required": false,
-      "required_evidence": [
-        "bv_robot_triage_reference",
-        "br_show_status",
-        "dependency_state"
-      ]
+      "required_evidence": ["bv_robot_triage_reference", "br_show_status", "dependency_state"]
     }
   ],
   "coverage": {

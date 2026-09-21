@@ -49,19 +49,14 @@
       "script": "scripts/check_supported_path_stub_markers.sh",
       "output_artifact": "docs/ft-xbnl0-3-6-supported-path-stub-markers-validation.json",
       "upstream_bead": "ft-g6lfc",
-      "failure_signatures": [
-        "unexpected_supported_path_stub_marker"
-      ]
+      "failure_signatures": ["unexpected_supported_path_stub_marker"]
     },
     {
       "guard_id": "finish_line_verification_contract_shape",
       "invariant": "Every finish-line E2E harness under tests/e2e/ that follows the artifact contract emits summary.json and structured.log into its per-run directory; deterministic scripts use the shared rch guard helper.",
       "script_check": "scripts/check_finish_line_guards.sh (internal verify_artifact_contract step)",
       "upstream_bead": "ft-xbnl0.1.4",
-      "failure_signatures": [
-        "e2e_missing_summary_json",
-        "e2e_missing_structured_log"
-      ]
+      "failure_signatures": ["e2e_missing_summary_json", "e2e_missing_structured_log"]
     },
     {
       "guard_id": "attestation_verify_self_test",
@@ -78,10 +73,7 @@
   "release_binding": {
     "system": "dsr",
     "gate_path": "scripts/release-gates.sh",
-    "required_commands": [
-      "dsr quality frankenterm",
-      "bash scripts/check_finish_line_guards.sh"
-    ]
+    "required_commands": ["dsr quality frankenterm", "bash scripts/check_finish_line_guards.sh"]
   },
   "local_contributor_path": {
     "summary": "Contributors can run the full finish-line guard sweep locally before submitting a PR.",

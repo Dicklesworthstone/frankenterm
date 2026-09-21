@@ -7,15 +7,8 @@
     "requested_by": "fixture",
     "summary": "Find useful work when no Beads-ready task is available and RCH proof is blocked.",
     "workspace_root": "/Users/jemanuel/projects/frankenterm",
-    "target_bead_ids": [
-      "ft-4tp7g"
-    ],
-    "allowed_action_classes": [
-      "read_status",
-      "add_beads_comment",
-      "create_bead",
-      "wait"
-    ],
+    "target_bead_ids": ["ft-4tp7g"],
+    "allowed_action_classes": ["read_status", "add_beads_comment", "create_bead", "wait"],
     "forbidden_action_classes": [
       "run_rch_proof",
       "pane_mutation",
@@ -39,31 +32,21 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Beads adapter records queue shape without raw pane text."
-        ]
+        "notes": ["Beads adapter records queue shape without raw pane text."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.ready_empty"
-      ],
+      "reason_codes": ["beads.ready_empty"],
       "evidence": [
         {
           "evidence_id": "evidence-beads-ready-empty",
           "category": "beads_ready_queue",
           "state": "warn",
           "subject": "ready queue",
-          "reason_codes": [
-            "beads.ready_empty"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["beads.ready_empty"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
     },
     {
       "source_id": "agent-mail-db-error",
@@ -77,33 +60,21 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Agent Mail unavailable is recorded as degraded metadata only."
-        ]
+        "notes": ["Agent Mail unavailable is recorded as degraded metadata only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "agent_mail.database_error",
-        "fallback.beads_only"
-      ],
+      "reason_codes": ["agent_mail.database_error", "fallback.beads_only"],
       "evidence": [
         {
           "evidence_id": "evidence-agent-mail-db-error",
           "category": "agent_mail_availability",
           "state": "unavailable",
           "subject": "macro_start_session",
-          "reason_codes": [
-            "agent_mail.database_error",
-            "fallback.beads_only"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["agent_mail.database_error", "fallback.beads_only"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
     },
     {
       "source_id": "rch-update-stale-release",
@@ -117,9 +88,7 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "RCH adapter records proof substrate state and verdict classes, not build logs."
-        ]
+        "notes": ["RCH adapter records proof substrate state and verdict classes, not build logs."]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
@@ -137,54 +106,35 @@
           "category": "rch_worker_selection",
           "state": "blocked",
           "subject": "worker selection",
-          "reason_codes": [
-            "rch.worker_selection.no_attested_worker"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["rch.worker_selection.no_attested_worker"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         },
         {
           "evidence_id": "evidence-rch-active-project-not-evaluated",
           "category": "rch_active_project_exclusion",
           "state": "unknown",
           "subject": "active project exclusion",
-          "reason_codes": [
-            "rch.active_project_exclusion.not_evaluated"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["rch.active_project_exclusion.not_evaluated"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         },
         {
           "evidence_id": "evidence-rch-topology-not-reached",
           "category": "rch_topology_preflight",
           "state": "blocked",
           "subject": "topology preflight",
-          "reason_codes": [
-            "rch.topology_preflight.not_reached"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["rch.topology_preflight.not_reached"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         },
         {
           "evidence_id": "evidence-rch-cargo-not-run",
           "category": "rch_cargo_verdict",
           "state": "blocked",
           "subject": "cargo/test verdict",
-          "reason_codes": [
-            "rch.cargo_verdict.not_run",
-            "local_cargo_forbidden"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["rch.cargo_verdict.not_run", "local_cargo_forbidden"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
     },
     {
       "source_id": "git-dirty-overlap",
@@ -198,54 +148,36 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Git adapter records dirty path classes and overlap risk only."
-        ]
+        "notes": ["Git adapter records dirty path classes and overlap risk only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.dirty_paths_present",
-        "git.avoid_renderer_overlap"
-      ],
+      "reason_codes": ["git.dirty_paths_present", "git.avoid_renderer_overlap"],
       "evidence": [
         {
           "evidence_id": "evidence-git-dirty-present",
           "category": "git_dirty_tree",
           "state": "warn",
           "subject": "tracked dirty paths",
-          "reason_codes": [
-            "git.dirty_paths_present"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["git.dirty_paths_present"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         },
         {
           "evidence_id": "evidence-git-avoid-renderer-overlap",
           "category": "dirty_path_overlap",
           "state": "warn",
           "subject": "renderer and atlas active work",
-          "reason_codes": [
-            "git.avoid_renderer_overlap"
-          ],
-          "artifact_paths": [
-            "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-          ]
+          "reason_codes": ["git.avoid_renderer_overlap"],
+          "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/objective-plan/no-ready-rch-blocked.json"]
     }
   ],
   "capacity_admission": {
     "action": "defer",
     "pressure_tier": "unknown",
     "proof_state": "unavailable",
-    "reason_codes": [
-      "capacity.no_remote_proof_available",
-      "rch_substrate_blocked"
-    ]
+    "reason_codes": ["capacity.no_remote_proof_available", "rch_substrate_blocked"]
   },
   "steps": [
     {
@@ -257,13 +189,8 @@
       "side_effect_class": "beads_metadata",
       "requires_approval": false,
       "forbidden": false,
-      "reason_codes": [
-        "coordination.beads_only",
-        "rch.release_not_available"
-      ],
-      "proof_requirement_ids": [
-        "proof-static-json"
-      ]
+      "reason_codes": ["coordination.beads_only", "rch.release_not_available"],
+      "proof_requirement_ids": ["proof-static-json"]
     },
     {
       "step_id": "step-do-not-run-local-cargo",
@@ -274,13 +201,8 @@
       "side_effect_class": "proof_run",
       "requires_approval": false,
       "forbidden": true,
-      "reason_codes": [
-        "rch.installed_hook_old",
-        "local_cargo_forbidden"
-      ],
-      "proof_requirement_ids": [
-        "proof-rch-cargo"
-      ]
+      "reason_codes": ["rch.installed_hook_old", "local_cargo_forbidden"],
+      "proof_requirement_ids": ["proof-rch-cargo"]
     }
   ],
   "proof_requirements": [
@@ -301,9 +223,7 @@
       "required": false,
       "status": "blocked",
       "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
-      "artifact_paths": [
-        "ft-4tp7g"
-      ]
+      "artifact_paths": ["ft-4tp7g"]
     }
   ],
   "forbidden_actions": [
@@ -328,9 +248,7 @@
     "policy_id": "ft.redaction.objective_plan.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Planner fixtures record reason codes and artifact ids, not pane contents."
-    ]
+    "notes": ["Planner fixtures record reason codes and artifact ids, not pane contents."]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

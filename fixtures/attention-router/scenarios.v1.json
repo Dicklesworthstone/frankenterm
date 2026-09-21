@@ -17,10 +17,7 @@
   },
   "golden_strategy": {
     "artifact_kind": "canonicalized_structural_golden",
-    "formats_required": [
-      "json",
-      "toon"
-    ],
+    "formats_required": ["json", "toon"],
     "canonicalization": [
       "replace wall-clock timestamps with [TIMESTAMP]",
       "replace generated message ids and reservation ids with [ID]",
@@ -50,9 +47,7 @@
         {
           "source_id": "beads-ready",
           "command_or_api": "br ready --json",
-          "required_reason_codes": [
-            "beads.ready_empty"
-          ],
+          "required_reason_codes": ["beads.ready_empty"],
           "required_counters": {
             "ready_count": 0
           }
@@ -60,20 +55,13 @@
         {
           "source_id": "bv-next",
           "command_or_api": "bv --robot-next",
-          "required_reason_codes": [
-            "bv.recommends_blocked_issue"
-          ],
-          "required_subjects": [
-            "ft-4tp7g"
-          ]
+          "required_reason_codes": ["bv.recommends_blocked_issue"],
+          "required_subjects": ["ft-4tp7g"]
         },
         {
           "source_id": "beads-blocker-state",
           "command_or_api": "br show ft-4tp7g --json",
-          "required_reason_codes": [
-            "beads.status_blocked",
-            "beads.assignee_present"
-          ]
+          "required_reason_codes": ["beads.status_blocked", "beads.assignee_present"]
         }
       ],
       "expected": {
@@ -106,10 +94,7 @@
         {
           "source_id": "rch-diagnose",
           "command_or_api": "RCH_NO_SELF_HEALING=1 rch --no-self-healing diagnose --dry-run --json -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/ft-<bead>-proof cargo test ...",
-          "required_reason_codes": [
-            "rch.no_admissible_workers",
-            "rch.remote_cargo_reached_false"
-          ],
+          "required_reason_codes": ["rch.no_admissible_workers", "rch.remote_cargo_reached_false"],
           "required_counters": {
             "selected_workers": 0,
             "remote_cargo_reached": 0
@@ -118,9 +103,7 @@
         {
           "source_id": "beads-blocker",
           "command_or_api": "br show ft-4tp7g --json",
-          "required_reason_codes": [
-            "beads.status_blocked"
-          ]
+          "required_reason_codes": ["beads.status_blocked"]
         }
       ],
       "expected": {
@@ -153,9 +136,7 @@
         {
           "source_id": "agent-mail-inbox",
           "command_or_api": "fetch_inbox(project_key, agent_name, include_bodies=false, limit=20)",
-          "required_reason_codes": [
-            "agent_mail.ack_required_present"
-          ],
+          "required_reason_codes": ["agent_mail.ack_required_present"],
           "required_counters": {
             "ack_required_count_min": 1
           }
@@ -190,24 +171,17 @@
         {
           "source_id": "beads-in-progress",
           "command_or_api": "br list --status in_progress --json",
-          "required_reason_codes": [
-            "beads.in_progress_present",
-            "beads.no_recent_update"
-          ]
+          "required_reason_codes": ["beads.in_progress_present", "beads.no_recent_update"]
         },
         {
           "source_id": "git-history",
           "command_or_api": "git log --since=<window> --format=<agent-aware-format>",
-          "required_reason_codes": [
-            "git.no_recent_owner_commit"
-          ]
+          "required_reason_codes": ["git.no_recent_owner_commit"]
         },
         {
           "source_id": "agent-mail-thread",
           "command_or_api": "search_messages(project_key, query=<bead-id>, ranking=recency)",
-          "required_reason_codes": [
-            "agent_mail.no_recent_owner_message_or_unavailable"
-          ]
+          "required_reason_codes": ["agent_mail.no_recent_owner_message_or_unavailable"]
         }
       ],
       "expected": {
@@ -239,24 +213,17 @@
         {
           "source_id": "git-status",
           "command_or_api": "git status --short --branch --untracked-files=all",
-          "required_reason_codes": [
-            "git.dirty_paths_present",
-            "git.dirty_overlap_risk"
-          ]
+          "required_reason_codes": ["git.dirty_paths_present", "git.dirty_overlap_risk"]
         },
         {
           "source_id": "agent-mail-reservations",
           "command_or_api": "file reservation snapshot or reduced Agent Mail metadata",
-          "required_reason_codes": [
-            "reservation.owner_present_or_dirty_owner_inferred"
-          ]
+          "required_reason_codes": ["reservation.owner_present_or_dirty_owner_inferred"]
         },
         {
           "source_id": "beads-owner-state",
           "command_or_api": "br list --status in_progress --json or br show <bead> --json",
-          "required_reason_codes": [
-            "beads.owner_active_or_recent"
-          ]
+          "required_reason_codes": ["beads.owner_active_or_recent"]
         }
       ],
       "expected": {
@@ -288,21 +255,13 @@
         {
           "source_id": "beads-local-closeout",
           "command_or_api": "br show <bead> --json",
-          "required_reason_codes": [
-            "beads.status_closed",
-            "beads.close_reason_present"
-          ],
-          "required_subjects": [
-            "<bead>"
-          ]
+          "required_reason_codes": ["beads.status_closed", "beads.close_reason_present"],
+          "required_subjects": ["<bead>"]
         },
         {
           "source_id": "git-owned-closeout-diff",
           "command_or_api": "git status --short -- .beads/issues.jsonl <owned paths>",
-          "required_reason_codes": [
-            "git.tracker_dirty",
-            "git.owned_paths_dirty"
-          ]
+          "required_reason_codes": ["git.tracker_dirty", "git.owned_paths_dirty"]
         },
         {
           "source_id": "git-remote-closeout-state",
@@ -319,10 +278,7 @@
         {
           "source_id": "agent-mail-owner-context",
           "command_or_api": "fetch_inbox or search_messages for <bead> plus file reservation snapshot",
-          "required_reason_codes": [
-            "agent_mail.active_owner_claim",
-            "reservation.owner_present"
-          ]
+          "required_reason_codes": ["agent_mail.active_owner_claim", "reservation.owner_present"]
         }
       ],
       "expected": {
@@ -360,25 +316,17 @@
             "bv.uses_legacy_bd",
             "bv.claim_hint_present"
           ],
-          "required_subjects": [
-            "bd update <candidate> --status=in_progress",
-            "bd show <candidate>"
-          ]
+          "required_subjects": ["bd update <candidate> --status=in_progress", "bd show <candidate>"]
         },
         {
           "source_id": "beads-authoritative-show",
           "command_or_api": "br show <candidate> --json",
-          "required_reason_codes": [
-            "beads.status_blocked_or_unready",
-            "beads.command_surface_br"
-          ]
+          "required_reason_codes": ["beads.status_blocked_or_unready", "beads.command_surface_br"]
         },
         {
           "source_id": "beads-ready-reconciliation",
           "command_or_api": "br ready --json",
-          "required_reason_codes": [
-            "beads.candidate_absent_from_ready"
-          ]
+          "required_reason_codes": ["beads.candidate_absent_from_ready"]
         },
         {
           "source_id": "external-tool-defect-note",
@@ -419,10 +367,7 @@
         {
           "source_id": "beads-ready-static",
           "command_or_api": "br ready --json",
-          "required_reason_codes": [
-            "beads.ready_one_or_more",
-            "beads.static_or_docs_slice"
-          ]
+          "required_reason_codes": ["beads.ready_one_or_more", "beads.static_or_docs_slice"]
         },
         {
           "source_id": "git-disjoint",
@@ -435,10 +380,7 @@
         {
           "source_id": "proof-policy",
           "command_or_api": "bead proof section plus AGENTS.md RCH policy",
-          "required_reason_codes": [
-            "proof.static_only",
-            "proof.local_cargo_not_required"
-          ]
+          "required_reason_codes": ["proof.static_only", "proof.local_cargo_not_required"]
         }
       ],
       "expected": {
@@ -471,33 +413,19 @@
         {
           "source_id": "agent-mail-reservation-snapshot",
           "command_or_api": "file reservation snapshot or reduced Agent Mail reservation metadata",
-          "required_reason_codes": [
-            "reservation.exclusive_active",
-            "reservation.path_overlap"
-          ],
-          "required_subjects": [
-            "fixtures/attention-router/*",
-            "[OWNER_AGENT]"
-          ]
+          "required_reason_codes": ["reservation.exclusive_active", "reservation.path_overlap"],
+          "required_subjects": ["fixtures/attention-router/*", "[OWNER_AGENT]"]
         },
         {
           "source_id": "beads-candidate-state",
           "command_or_api": "br show <candidate> --json",
-          "required_reason_codes": [
-            "beads.status_open_or_ready",
-            "beads.candidate_path_known"
-          ],
-          "required_subjects": [
-            "<candidate>"
-          ]
+          "required_reason_codes": ["beads.status_open_or_ready", "beads.candidate_path_known"],
+          "required_subjects": ["<candidate>"]
         },
         {
           "source_id": "git-candidate-paths",
           "command_or_api": "git status --short --branch -- <candidate paths>",
-          "required_reason_codes": [
-            "git.path_scope_checked",
-            "dirty_overlap.reservation_overlap"
-          ]
+          "required_reason_codes": ["git.path_scope_checked", "dirty_overlap.reservation_overlap"]
         }
       ],
       "expected": {
@@ -535,10 +463,7 @@
             "agent_mail.publication_message_present",
             "agent_mail.closeout_claim_present"
           ],
-          "required_subjects": [
-            "<bead>",
-            "[OWNER_AGENT]"
-          ]
+          "required_subjects": ["<bead>", "[OWNER_AGENT]"]
         },
         {
           "source_id": "reservation-lease-state",
@@ -556,9 +481,7 @@
         {
           "source_id": "git-publication-state",
           "command_or_api": "git rev-parse HEAD origin/main refs/remotes/origin/<legacy-mirror>",
-          "required_reason_codes": [
-            "git.publication_refs_checked"
-          ]
+          "required_reason_codes": ["git.publication_refs_checked"]
         }
       ],
       "expected": {
@@ -596,9 +519,7 @@
             "beads.assignee_present",
             "beads.owner_conflicts_with_reservation"
           ],
-          "required_subjects": [
-            "[BEADS_OWNER]"
-          ]
+          "required_subjects": ["[BEADS_OWNER]"]
         },
         {
           "source_id": "reservation-holder",
@@ -607,9 +528,7 @@
             "reservation.owner_present",
             "reservation.owner_conflicts_with_beads"
           ],
-          "required_subjects": [
-            "[RESERVATION_HOLDER]"
-          ]
+          "required_subjects": ["[RESERVATION_HOLDER]"]
         },
         {
           "source_id": "dirty-path-attribution",
@@ -619,9 +538,7 @@
             "git.dirty_owner_inferred",
             "git.dirty_owner_conflicts_with_tracker"
           ],
-          "required_subjects": [
-            "[DIRTY_OWNER]"
-          ]
+          "required_subjects": ["[DIRTY_OWNER]"]
         }
       ],
       "expected": {
@@ -655,13 +572,8 @@
         {
           "source_id": "beads-local-state",
           "command_or_api": "br show <bead> --json",
-          "required_reason_codes": [
-            "beads.status_closed",
-            "beads.close_reason_present"
-          ],
-          "required_subjects": [
-            "<bead>"
-          ]
+          "required_reason_codes": ["beads.status_closed", "beads.close_reason_present"],
+          "required_subjects": ["<bead>"]
         },
         {
           "source_id": "git-publication-gap",
@@ -716,14 +628,8 @@
         {
           "source_id": "beads-stale-owner",
           "command_or_api": "br list --status in_progress --json && br show <bead> --json",
-          "required_reason_codes": [
-            "beads.in_progress_present",
-            "beads.no_recent_update"
-          ],
-          "required_subjects": [
-            "<bead>",
-            "[OWNER_AGENT]"
-          ]
+          "required_reason_codes": ["beads.in_progress_present", "beads.no_recent_update"],
+          "required_subjects": ["<bead>", "[OWNER_AGENT]"]
         },
         {
           "source_id": "agent-mail-freshness",
@@ -736,9 +642,7 @@
         {
           "source_id": "git-owner-freshness",
           "command_or_api": "git log --since=<window> --format=<agent-aware-format> -- <owned paths>",
-          "required_reason_codes": [
-            "git.no_recent_owner_commit"
-          ]
+          "required_reason_codes": ["git.no_recent_owner_commit"]
         },
         {
           "source_id": "pane-state-optional",
@@ -779,10 +683,7 @@
         {
           "source_id": "filesystem-capacity",
           "command_or_api": "df -h /System/Volumes/Data /tmp .",
-          "required_reason_codes": [
-            "local_disk.capacity_critical",
-            "local_disk.write_blocked"
-          ],
+          "required_reason_codes": ["local_disk.capacity_critical", "local_disk.write_blocked"],
           "required_counters": {
             "available_gib_max": 1
           }
@@ -790,10 +691,7 @@
         {
           "source_id": "cleanup-inventory",
           "command_or_api": "du -sh /private/tmp/* 2>/dev/null | sort -h | tail",
-          "required_reason_codes": [
-            "cleanup.candidates_identified",
-            "cleanup.read_only_inventory"
-          ],
+          "required_reason_codes": ["cleanup.candidates_identified", "cleanup.read_only_inventory"],
           "required_counters": {
             "candidate_count_min": 1
           }

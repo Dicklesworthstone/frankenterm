@@ -21,9 +21,9 @@
   "swarm": {
     "panes_count": 3,
     "agents": [
-      {"idx": 0, "type": "user",   "pane": "%41"},
-      {"idx": 1, "type": "claude", "pane": "%42"},
-      {"idx": 2, "type": "claude", "pane": "%43"}
+      { "idx": 0, "type": "user", "pane": "%41" },
+      { "idx": 1, "type": "claude", "pane": "%42" },
+      { "idx": 2, "type": "claude", "pane": "%43" }
     ]
   },
   "coordinator": {

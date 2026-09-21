@@ -6,10 +6,6 @@
   "objective_id": "objective-invalid-unknown-version",
   "controller_mode": "dry_run",
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "invalid.unknown_version"
-  ],
-  "artifact_paths": [
-    "fixtures/operating-envelope/invalid/unknown-version.json"
-  ]
+  "reason_codes": ["invalid.unknown_version"],
+  "artifact_paths": ["fixtures/operating-envelope/invalid/unknown-version.json"]
 }

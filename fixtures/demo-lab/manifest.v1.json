@@ -9,17 +9,8 @@
       "purpose": "Validate the first-run demo path for pane setup, capture, detection, and machine-readable state output.",
       "scenario_path": "fixtures/demo-lab/scenarios/quickstart.yaml",
       "deterministic_seed": "demo-lab-v1-quickstart-1001",
-      "required_features": [
-        "simulation",
-        "robot-json",
-        "robot-toon"
-      ],
-      "supported_outputs": [
-        "human",
-        "json",
-        "toon",
-        "jsonl"
-      ],
+      "required_features": ["simulation", "robot-json", "robot-toon"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
       "redaction_tier": "t1_standard",
       "proof_category": "conformance",
       "max_output_bytes": 262144,
@@ -99,18 +90,8 @@
       "purpose": "Validate rate-limit text classification, event emission, and policy-safe recovery guidance without calling an external provider.",
       "scenario_path": "fixtures/demo-lab/scenarios/usage_limit.yaml",
       "deterministic_seed": "demo-lab-v1-usage-limit-2002",
-      "required_features": [
-        "simulation",
-        "patterns",
-        "events",
-        "robot-json"
-      ],
-      "supported_outputs": [
-        "human",
-        "json",
-        "toon",
-        "jsonl"
-      ],
+      "required_features": ["simulation", "patterns", "events", "robot-json"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
       "redaction_tier": "t1_standard",
       "proof_category": "golden",
       "max_output_bytes": 262144,
@@ -175,18 +156,8 @@
       "purpose": "Validate context-compaction signal detection, event classification, and operator-safe follow-up guidance.",
       "scenario_path": "fixtures/demo-lab/scenarios/compaction.yaml",
       "deterministic_seed": "demo-lab-v1-compaction-3003",
-      "required_features": [
-        "simulation",
-        "patterns",
-        "events",
-        "robot-toon"
-      ],
-      "supported_outputs": [
-        "human",
-        "json",
-        "toon",
-        "jsonl"
-      ],
+      "required_features": ["simulation", "patterns", "events", "robot-toon"],
+      "supported_outputs": ["human", "json", "toon", "jsonl"],
       "redaction_tier": "t1_standard",
       "proof_category": "e2e",
       "max_output_bytes": 262144,

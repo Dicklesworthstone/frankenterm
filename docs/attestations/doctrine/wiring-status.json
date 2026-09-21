@@ -7,12 +7,7 @@
   "produced_by_bead": "ft-7h5da.5.5",
   "status": "substrate_pending_ci_invocation",
   "scope": "Machine-readable wiring inventory schema and deadwire analyzer for designated decision API entry points.",
-  "designated_entrypoint_names": [
-    "allow_operation",
-    "evaluate",
-    "execute",
-    "observe"
-  ],
+  "designated_entrypoint_names": ["allow_operation", "evaluate", "execute", "observe"],
   "library_surface": {
     "crate": "frankenterm-topo",
     "schema_version_constant": "DEADWIRE_WIRING_STATUS_SCHEMA_VERSION",
@@ -23,10 +18,7 @@
   "gate_semantics": {
     "production_caller_required": true,
     "test_only_callers_count_as_wired": false,
-    "dormant_exemption_required_fields": [
-      "bead_id",
-      "expires_on"
-    ],
+    "dormant_exemption_required_fields": ["bead_id", "expires_on"],
     "dormant_exemption_expiry_format": "YYYY-MM-DD",
     "dormant_exemption_expired_status": "deadwire",
     "failed_status": "deadwire"
@@ -90,9 +82,6 @@
     "manifest_path": "docs/attestations/manifest.json",
     "required_category": true,
     "slot_path": "docs/attestations/doctrine/wiring-status.json",
-    "proof_categories": [
-      4,
-      11
-    ]
+    "proof_categories": [4, 11]
   }
 }

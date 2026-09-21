@@ -55,12 +55,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "rch.ssh_timeout"
-            ],
-            "next_actions": [
-              "rerun focused proof on a warmed remote worker"
-            ],
+            "blockers": ["rch.ssh_timeout"],
+            "next_actions": ["rerun focused proof on a warmed remote worker"],
             "note": "remote proof did not return a terminal verdict"
           }
         ],
@@ -73,9 +69,7 @@
           }
         ],
         "generated_at": "2026-06-03T05:18:56Z",
-        "notes": [
-          "blocked proof remains visible in the aggregate rollup"
-        ]
+        "notes": ["blocked proof remains visible in the aggregate rollup"]
       }
     },
     {
@@ -130,9 +124,7 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "rch.remote_proof_not_admissible"
-            ],
+            "blockers": ["rch.remote_proof_not_admissible"],
             "next_actions": [
               "rerun proof with RCH_REQUIRE_REMOTE=1 and retain only remote worker output"
             ],
@@ -148,9 +140,7 @@
           }
         ],
         "generated_at": "2026-06-04T06:35:00Z",
-        "notes": [
-          "local fallback output is retained as a blocker, not proof"
-        ]
+        "notes": ["local fallback output is retained as a blocker, not proof"]
       }
     },
     {
@@ -205,12 +195,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "secret token remained visible after outbound read"
-            ],
-            "next_actions": [
-              "capture failing payload and tighten redactor rule"
-            ],
+            "blockers": ["secret token remained visible after outbound read"],
+            "next_actions": ["capture failing payload and tighten redactor rule"],
             "note": "hard privacy failures dominate aggregate verdicts"
           }
         ],
@@ -264,20 +250,14 @@
             "verdict": "skipped",
             "confidence_percent": 60,
             "evidence": [],
-            "blockers": [
-              "agent mail outage during rehearsal setup"
-            ],
-            "next_actions": [
-              "retry once and continue with bead/git handoff if still down"
-            ],
+            "blockers": ["agent mail outage during rehearsal setup"],
+            "next_actions": ["retry once and continue with bead/git handoff if still down"],
             "note": ""
           }
         ],
         "source_artifacts": [],
         "generated_at": "2026-06-03T05:19:10Z",
-        "notes": [
-          "TOON output must preserve the same typed receipt vocabulary"
-        ]
+        "notes": ["TOON output must preserve the same typed receipt vocabulary"]
       }
     },
     {
@@ -332,9 +312,7 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "agent_mail.unavailable_after_retry"
-            ],
+            "blockers": ["agent_mail.unavailable_after_retry"],
             "next_actions": [
               "continue with scripts/swarm-tick.sh --agent-mail-fallback frankenterm and Beads/git handoff"
             ],
@@ -350,9 +328,7 @@
           }
         ],
         "generated_at": "2026-06-04T06:35:30Z",
-        "notes": [
-          "Agent Mail fallback remains visible instead of being collapsed into pass"
-        ]
+        "notes": ["Agent Mail fallback remains visible instead of being collapsed into pass"]
       }
     },
     {
@@ -390,12 +366,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "rch.critical_pressure"
-            ],
-            "next_actions": [
-              "wait for operator-approved RCH worker recovery"
-            ],
+            "blockers": ["rch.critical_pressure"],
+            "next_actions": ["wait for operator-approved RCH worker recovery"],
             "note": "deferred proof replay receipt records blocked state rather than green proof"
           },
           {
@@ -411,12 +383,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "target_hardware.skipped_not_proven"
-            ],
-            "next_actions": [
-              "retain skipped state until target-class proof artifact exists"
-            ],
+            "blockers": ["target_hardware.skipped_not_proven"],
+            "next_actions": ["retain skipped state until target-class proof artifact exists"],
             "note": "operating envelope fixture is advisory until target-class proof graduates"
           },
           {
@@ -432,12 +400,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "agent_mail.replay_receipt_missing"
-            ],
-            "next_actions": [
-              "retry Agent Mail once, then record Beads/git fallback handoff"
-            ],
+            "blockers": ["agent_mail.replay_receipt_missing"],
+            "next_actions": ["retry Agent Mail once, then record Beads/git fallback handoff"],
             "note": ""
           }
         ],
@@ -567,9 +531,7 @@
           }
         ],
         "generated_at": "2026-06-04T06:30:00Z",
-        "notes": [
-          "no-mock harness uses the bundled demo manifest and retained quickstart golden"
-        ]
+        "notes": ["no-mock harness uses the bundled demo manifest and retained quickstart golden"]
       }
     },
     {
@@ -624,12 +586,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "dirty_overlap.owner_unclear"
-            ],
-            "next_actions": [
-              "confirm ownership or narrow the patch before claiming proof"
-            ],
+            "blockers": ["dirty_overlap.owner_unclear"],
+            "next_actions": ["confirm ownership or narrow the patch before claiming proof"],
             "note": "shared dirty files must block ownership-sensitive rehearsals"
           }
         ],
@@ -697,12 +655,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "policy.require_approval"
-            ],
-            "next_actions": [
-              "request explicit operator approval before executing the action"
-            ],
+            "blockers": ["policy.require_approval"],
+            "next_actions": ["request explicit operator approval before executing the action"],
             "note": ""
           }
         ],
@@ -763,9 +717,7 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "redaction.audit_missing"
-            ],
+            "blockers": ["redaction.audit_missing"],
             "next_actions": [
               "attach redaction audit evidence before treating the rehearsal as proven"
             ],
@@ -829,12 +781,8 @@
                 "digest": null
               }
             ],
-            "blockers": [
-              "resource.pressure_degraded"
-            ],
-            "next_actions": [
-              "rerun with retained resource envelope below pressure thresholds"
-            ],
+            "blockers": ["resource.pressure_degraded"],
+            "next_actions": ["rerun with retained resource envelope below pressure thresholds"],
             "note": ""
           }
         ],

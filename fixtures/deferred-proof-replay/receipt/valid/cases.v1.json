@@ -63,9 +63,7 @@
           "evidence_classification": "blocked_infra"
         },
         "paths": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/recorder_storage.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/recorder_storage.rs"],
           "dirty_paths_at_capture": [],
           "artifact_paths": [
             "docs/json-schema/ft-deferred-proof-receipt.json",
@@ -80,10 +78,7 @@
         },
         "eligibility": {
           "state": "wait_rch",
-          "reason_codes": [
-            "rch.critical_pressure",
-            "proof.remote_required"
-          ],
+          "reason_codes": ["rch.critical_pressure", "proof.remote_required"],
           "freshness_deadline": "2026-05-20T02:00:43Z",
           "replay_allowed": false
         },
@@ -143,11 +138,7 @@
               "value": "1"
             }
           ],
-          "env_allowlist": [
-            "CARGO_TARGET_DIR",
-            "RCH_NO_SELF_HEALING",
-            "RCH_REQUIRE_REMOTE"
-          ],
+          "env_allowlist": ["CARGO_TARGET_DIR", "RCH_NO_SELF_HEALING", "RCH_REQUIRE_REMOTE"],
           "target_dir": "/tmp/ft-bf4cg-core-test",
           "material_remote_required": true
         },
@@ -269,9 +260,7 @@
           "evidence_classification": "blocked_infra"
         },
         "paths": {
-          "owned_paths": [
-            "crates/frankenterm-core-replay-types/src/lib.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core-replay-types/src/lib.rs"],
           "dirty_paths_at_capture": [],
           "artifact_paths": [
             "docs/json-schema/ft-deferred-proof-receipt.json",
@@ -292,10 +281,7 @@
         },
         "eligibility": {
           "state": "wait_rch",
-          "reason_codes": [
-            "rch.active_project_exclusion",
-            "proof.remote_required"
-          ],
+          "reason_codes": ["rch.active_project_exclusion", "proof.remote_required"],
           "freshness_deadline": "2026-05-25T21:12:00Z",
           "replay_allowed": false
         },
@@ -355,11 +341,7 @@
               "value": "1"
             }
           ],
-          "env_allowlist": [
-            "CARGO_TARGET_DIR",
-            "RCH_NO_SELF_HEALING",
-            "RCH_REQUIRE_REMOTE"
-          ],
+          "env_allowlist": ["CARGO_TARGET_DIR", "RCH_NO_SELF_HEALING", "RCH_REQUIRE_REMOTE"],
           "target_dir": "/tmp/ft-zbnz4-12-insufficient",
           "material_remote_required": true
         },
@@ -397,10 +379,7 @@
         },
         "eligibility": {
           "state": "wait_rch",
-          "reason_codes": [
-            "rch.insufficient_slots",
-            "proof.remote_required"
-          ],
+          "reason_codes": ["rch.insufficient_slots", "proof.remote_required"],
           "freshness_deadline": "2026-05-25T22:20:00Z",
           "replay_allowed": false
         },
@@ -457,11 +436,7 @@
               "value": "1"
             }
           ],
-          "env_allowlist": [
-            "CARGO_TARGET_DIR",
-            "RCH_NO_SELF_HEALING",
-            "RCH_REQUIRE_REMOTE"
-          ],
+          "env_allowlist": ["CARGO_TARGET_DIR", "RCH_NO_SELF_HEALING", "RCH_REQUIRE_REMOTE"],
           "target_dir": "/tmp/ft-zbnz4-12-telemetry",
           "material_remote_required": true
         },
@@ -499,10 +474,7 @@
         },
         "eligibility": {
           "state": "wait_rch",
-          "reason_codes": [
-            "rch.telemetry_gap",
-            "proof.remote_required"
-          ],
+          "reason_codes": ["rch.telemetry_gap", "proof.remote_required"],
           "freshness_deadline": "2026-05-25T22:21:00Z",
           "replay_allowed": false
         },
@@ -536,10 +508,7 @@
         },
         "command": {
           "command_shape_version": "static-verifier-v1",
-          "argv": [
-            "bash",
-            "tests/e2e/test_rch_admission_contract.sh"
-          ],
+          "argv": ["bash", "tests/e2e/test_rch_admission_contract.sh"],
           "env": [],
           "env_allowlist": [],
           "target_dir": null,
@@ -572,9 +541,7 @@
         },
         "eligibility": {
           "state": "eligible",
-          "reason_codes": [
-            "proof.static_clean"
-          ],
+          "reason_codes": ["proof.static_clean"],
           "freshness_deadline": "2026-05-20T02:28:42Z",
           "replay_allowed": true
         },
@@ -659,12 +626,8 @@
             "crates/frankenterm-core/src/latency_stages/pipeline_run.rs",
             "crates/frankenterm-core/src/latency_stages/tests.rs"
           ],
-          "dirty_paths_at_capture": [
-            "crates/frankenterm-core/src/latency_stages/pipeline_run.rs"
-          ],
-          "artifact_paths": [
-            "fixtures/deferred-proof-replay/receipt/valid/cases.v1.json"
-          ]
+          "dirty_paths_at_capture": ["crates/frankenterm-core/src/latency_stages/pipeline_run.rs"],
+          "artifact_paths": ["fixtures/deferred-proof-replay/receipt/valid/cases.v1.json"]
         },
         "coordination": {
           "prerequisite_beads": [],
@@ -674,10 +637,7 @@
         },
         "eligibility": {
           "state": "dirty_overlap",
-          "reason_codes": [
-            "git.dirty_overlap",
-            "rch.critical_pressure"
-          ],
+          "reason_codes": ["git.dirty_overlap", "rch.critical_pressure"],
           "freshness_deadline": "2026-05-20T02:13:02Z",
           "replay_allowed": false
         },
@@ -755,28 +715,19 @@
           "evidence_classification": "remote_required_pending"
         },
         "paths": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/rch_admission.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/rch_admission.rs"],
           "dirty_paths_at_capture": [],
-          "artifact_paths": [
-            "docs/robot-contracts/deferred-proof-receipt.md"
-          ]
+          "artifact_paths": ["docs/robot-contracts/deferred-proof-receipt.md"]
         },
         "coordination": {
-          "prerequisite_beads": [
-            "ft-5xwsu.3"
-          ],
+          "prerequisite_beads": ["ft-5xwsu.3"],
           "agent_mail_state": "degraded_read_only",
           "rch_admission_state": "critical_pressure",
           "operator_cancelled": false
         },
         "eligibility": {
           "state": "prerequisite_blocked",
-          "reason_codes": [
-            "beads.prerequisite_blocked",
-            "rch.critical_pressure"
-          ],
+          "reason_codes": ["beads.prerequisite_blocked", "rch.critical_pressure"],
           "freshness_deadline": "2026-05-20T02:21:46Z",
           "replay_allowed": false
         },
@@ -810,10 +761,7 @@
         },
         "command": {
           "command_shape_version": "static-verifier-v1",
-          "argv": [
-            "bash",
-            "tests/e2e/test_deferred_proof_receipt_contract.sh"
-          ],
+          "argv": ["bash", "tests/e2e/test_deferred_proof_receipt_contract.sh"],
           "env": [],
           "env_allowlist": [],
           "target_dir": null,
@@ -833,9 +781,7 @@
             "tests/e2e/test_deferred_proof_receipt_contract.sh"
           ],
           "dirty_paths_at_capture": [],
-          "artifact_paths": [
-            "fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"
-          ]
+          "artifact_paths": ["fixtures/deferred-proof-replay/receipt/invalid/fragments.v1.json"]
         },
         "coordination": {
           "prerequisite_beads": [],
@@ -845,9 +791,7 @@
         },
         "eligibility": {
           "state": "operator_cancelled",
-          "reason_codes": [
-            "operator.cancelled"
-          ],
+          "reason_codes": ["operator.cancelled"],
           "freshness_deadline": "2026-05-20T02:30:27Z",
           "replay_allowed": false
         },

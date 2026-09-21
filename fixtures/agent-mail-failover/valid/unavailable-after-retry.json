@@ -12,10 +12,7 @@
     "registered": false,
     "inbox_checked": false,
     "failure_class": "api_unreachable",
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ],
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"],
     "forbidden_actions": [
       "am_service_restart",
       "am_service_stop",
@@ -65,7 +62,5 @@
     "Record fallback mode in the Beads comment.",
     "Use br ready and bv robot output to choose non-overlapping work."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/unavailable-after-retry.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/unavailable-after-retry.json"]
 }

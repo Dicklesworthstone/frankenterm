@@ -11,11 +11,7 @@
   "policy": {
     "direct_tokio_usage": "forbidden in first-party supported paths",
     "async_test_policy": "new async tests use common::asupersync_test!, RuntimeFixture, or run_lab_test instead of #[tokio::test]",
-    "supported_paths": [
-      "crates/**/*.rs",
-      "frankenterm/**/*.rs",
-      "tests/**/*.rs"
-    ]
+    "supported_paths": ["crates/**/*.rs", "frankenterm/**/*.rs", "tests/**/*.rs"]
   },
   "classification": {
     "document": "docs/tokio-test-classification.md",

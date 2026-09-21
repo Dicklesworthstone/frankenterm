@@ -16,12 +16,7 @@
     "scrub_selected_worker",
     "scrub_artifact_root"
   ],
-  "privacy_sentinel_classes": [
-    "prompt_body",
-    "bearer_token",
-    "session_cookie",
-    "raw_pane_excerpt"
-  ],
+  "privacy_sentinel_classes": ["prompt_body", "bearer_token", "session_cookie", "raw_pane_excerpt"],
   "scenarios": [
     {
       "scenario_id": "synchronized_compaction",
@@ -88,10 +83,7 @@
         "admission_action": "shed",
         "dominant_kind": "retry",
         "min_calendar_rows": 16,
-        "required_reason_codes": [
-          "herd_wave.kind.retry",
-          "herd_wave.admission.herd_wave_pressure"
-        ],
+        "required_reason_codes": ["herd_wave.kind.retry", "herd_wave.admission.herd_wave_pressure"],
         "required_plan_reason_codes": [
           "herd_wave.next.operator_review_before_shed",
           "herd_wave.next.confirm_noncritical_before_shed"
@@ -126,12 +118,7 @@
     {
       "scenario_id": "mixed_wave",
       "kind": "mixed",
-      "signal_kinds": [
-        "compaction",
-        "retry",
-        "search_burst",
-        "compaction"
-      ],
+      "signal_kinds": ["compaction", "retry", "search_burst", "compaction"],
       "pane_count": 4,
       "request": "background",
       "telemetry_mode": "fresh",
@@ -148,10 +135,7 @@
           "herd_wave.kind.compaction",
           "herd_wave.threshold.distinct_panes"
         ],
-        "required_plan_reason_codes": [
-          "herd_wave.kind.retry",
-          "herd_wave.kind.search_burst"
-        ]
+        "required_plan_reason_codes": ["herd_wave.kind.retry", "herd_wave.kind.search_burst"]
       }
     },
     {
@@ -173,9 +157,7 @@
           "herd_wave.telemetry.missing_queue",
           "herd_wave.admission.fail_closed_missing_telemetry"
         ],
-        "required_plan_reason_codes": [
-          "herd_wave.admission.fail_closed_missing_telemetry"
-        ]
+        "required_plan_reason_codes": ["herd_wave.admission.fail_closed_missing_telemetry"]
       }
     },
     {
@@ -193,13 +175,8 @@
         "admission_action": "defer",
         "dominant_kind": "compaction",
         "min_calendar_rows": 3,
-        "required_reason_codes": [
-          "herd_wave.telemetry.stale",
-          "herd_wave.kind.compaction"
-        ],
-        "required_plan_reason_codes": [
-          "herd_wave.dry_run.no_live_mutation"
-        ]
+        "required_reason_codes": ["herd_wave.telemetry.stale", "herd_wave.kind.compaction"],
+        "required_plan_reason_codes": ["herd_wave.dry_run.no_live_mutation"]
       }
     },
     {
@@ -217,13 +194,8 @@
         "admission_action": "defer",
         "dominant_kind": "wake",
         "min_calendar_rows": 16,
-        "required_reason_codes": [
-          "herd_wave.priority.protected",
-          "herd_wave.kind.wake"
-        ],
-        "required_plan_reason_codes": [
-          "herd_wave.next.preserve_priority_protected_work"
-        ]
+        "required_reason_codes": ["herd_wave.priority.protected", "herd_wave.kind.wake"],
+        "required_plan_reason_codes": ["herd_wave.next.preserve_priority_protected_work"]
       }
     },
     {
@@ -266,10 +238,7 @@
         "admission_action": "shed",
         "dominant_kind": "retry",
         "min_calendar_rows": 16,
-        "required_reason_codes": [
-          "herd_wave.kind.retry",
-          "herd_wave.admission.herd_wave_pressure"
-        ],
+        "required_reason_codes": ["herd_wave.kind.retry", "herd_wave.admission.herd_wave_pressure"],
         "required_plan_reason_codes": [
           "herd_wave.cooldown.pressure_action_active",
           "herd_wave.circuit_breaker.operator_review_required_before_live_shed"
@@ -306,10 +275,7 @@
         "admission_action": "shed",
         "dominant_kind": "retry",
         "min_calendar_rows": 200,
-        "required_reason_codes": [
-          "herd_wave.kind.retry",
-          "herd_wave.admission.herd_wave_pressure"
-        ],
+        "required_reason_codes": ["herd_wave.kind.retry", "herd_wave.admission.herd_wave_pressure"],
         "required_plan_reason_codes": [
           "herd_wave.next.operator_review_before_shed",
           "herd_wave.next.confirm_noncritical_before_shed"
@@ -331,13 +297,8 @@
         "admission_action": "admit",
         "dominant_kind": "wake",
         "min_calendar_rows": 0,
-        "required_reason_codes": [
-          "herd_wave.kind.wake"
-        ],
-        "required_plan_reason_codes": [
-          "herd_wave.next.noop",
-          "herd_wave.dry_run.no_live_mutation"
-        ]
+        "required_reason_codes": ["herd_wave.kind.wake"],
+        "required_plan_reason_codes": ["herd_wave.next.noop", "herd_wave.dry_run.no_live_mutation"]
       }
     }
   ],
@@ -350,11 +311,7 @@
       "volatility": 2,
       "comparison_strategy": "canonical_json",
       "canonicalizer": "herd_wave_v1_static",
-      "contract_requirements": [
-        "root_fields",
-        "reason_codes",
-        "privacy_flags"
-      ],
+      "contract_requirements": ["root_fields", "reason_codes", "privacy_flags"],
       "owner_command": "cargo test -p frankenterm-core --test herd_wave_conformance",
       "update_command": "UPDATE_HERD_WAVE_GOLDENS=1 tests/e2e/test_herd_wave_contract.sh --update-goldens",
       "review_required": true
@@ -367,11 +324,7 @@
       "volatility": 2,
       "comparison_strategy": "canonical_toon",
       "canonicalizer": "herd_wave_v1_static",
-      "contract_requirements": [
-        "toon_roundtrip",
-        "reason_codes",
-        "unavailable_sources"
-      ],
+      "contract_requirements": ["toon_roundtrip", "reason_codes", "unavailable_sources"],
       "owner_command": "cargo test -p frankenterm-core --test herd_wave_conformance",
       "update_command": "UPDATE_HERD_WAVE_GOLDENS=1 tests/e2e/test_herd_wave_contract.sh --update-goldens",
       "review_required": true
@@ -384,10 +337,7 @@
       "volatility": 3,
       "comparison_strategy": "structural",
       "canonicalizer": "herd_wave_v1_static",
-      "contract_requirements": [
-        "state_distinction",
-        "dry_run_only"
-      ],
+      "contract_requirements": ["state_distinction", "dry_run_only"],
       "owner_command": "cargo test -p frankenterm --bin ft herd_wave",
       "update_command": "none",
       "review_required": true
@@ -417,9 +367,7 @@
       "volatility": 2,
       "comparison_strategy": "planned_follow_up",
       "canonicalizer": "herd_wave_v1_static",
-      "contract_requirements": [
-        "read_only_mcp_parity"
-      ],
+      "contract_requirements": ["read_only_mcp_parity"],
       "owner_command": "br show ft-5bwjf.8 --json",
       "update_command": "none",
       "review_required": true

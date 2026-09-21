@@ -7,9 +7,7 @@
     "hint": "Pattern evaluation timed out. Simplify patterns or reduce input size.",
     "ok": false,
     "remediation": {
-      "alternatives": [
-        "Tighten regex or reduce scan scope."
-      ],
+      "alternatives": ["Tighten regex or reduce scan scope."],
       "commands": [
         {
           "command": "ft watch --no-patterns",

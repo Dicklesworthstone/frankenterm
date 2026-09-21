@@ -246,10 +246,7 @@
     "journey_phase": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "contract_role",
-        "steps"
-      ],
+      "required": ["contract_role", "steps"],
       "properties": {
         "contract_role": {
           "$ref": "#/$defs/lifecycle_role"
@@ -294,11 +291,7 @@
     "journey_producer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "journey_id",
-        "field_bead_id",
-        "lifecycle"
-      ],
+      "required": ["journey_id", "field_bead_id", "lifecycle"],
       "properties": {
         "journey_id": {
           "$ref": "#/$defs/non_empty_string"
@@ -313,37 +306,20 @@
     },
     "product_persona": {
       "type": "string",
-      "enum": [
-        "interactive_human",
-        "meta_agent_operator",
-        "automation_agent",
-        "incident_responder"
-      ]
+      "enum": ["interactive_human", "meta_agent_operator", "automation_agent", "incident_responder"]
     },
     "fleet_point": {
       "type": "string",
-      "enum": [
-        "q002",
-        "q020",
-        "q050",
-        "q200"
-      ]
+      "enum": ["q002", "q020", "q050", "q200"]
     },
     "topology": {
       "type": "string",
-      "enum": [
-        "local_only",
-        "mac_lan_remote"
-      ]
+      "enum": ["local_only", "mac_lan_remote"]
     },
     "coverage_key": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "persona",
-        "fleet_point",
-        "topology"
-      ],
+      "required": ["persona", "fleet_point", "topology"],
       "properties": {
         "persona": {
           "$ref": "#/$defs/product_persona"
@@ -359,11 +335,7 @@
     "closure_consumer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "claim_id",
-        "coverage",
-        "journey_ids"
-      ],
+      "required": ["claim_id", "coverage", "journey_ids"],
       "properties": {
         "claim_id": {
           "$ref": "#/$defs/non_empty_string"

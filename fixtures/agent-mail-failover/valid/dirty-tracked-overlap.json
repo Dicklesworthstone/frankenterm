@@ -46,10 +46,7 @@
           "assignee": "SilverTrout",
           "age_seconds": 9200,
           "recommended_action": "do_not_reopen",
-          "reason_codes": [
-            "dirty_overlap.present",
-            "coordination.wait_for_owner"
-          ]
+          "reason_codes": ["dirty_overlap.present", "coordination.wait_for_owner"]
         }
       ],
       "dirty_overlap_unknown": [
@@ -93,7 +90,5 @@
     "Leave the bead in its current state.",
     "Pick a disjoint docs or fixture slice."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/dirty-tracked-overlap.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/dirty-tracked-overlap.json"]
 }

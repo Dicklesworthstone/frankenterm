@@ -10,19 +10,12 @@
       "issue_id": "ft-ogr3n.6",
       "status": "in_progress",
       "updated_at_ms": 1780696798000,
-      "dependency_ids": [
-        "ft-ogr3n.4"
-      ],
+      "dependency_ids": ["ft-ogr3n.4"],
       "comment_count": 2,
       "dirty_tree_guard_comment_count": 0,
       "close_reason": null,
-      "reason_codes": [
-        "beads.claimed",
-        "beads.remote_proof_pending"
-      ],
-      "artifact_paths": [
-        ".beads/issues.jsonl"
-      ],
+      "reason_codes": ["beads.claimed", "beads.remote_proof_pending"],
+      "artifact_paths": [".beads/issues.jsonl"],
       "payload": {
         "summary": "Incident corpus lane claimed before proof admission; no source verdict has been produced."
       }
@@ -47,9 +40,7 @@
       "exit_code": null,
       "cancellation_reason": null,
       "preflight_refusal_reason": "remote worker mirror missing or stale before Cargo admission",
-      "artifact_paths": [
-        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
-      ],
+      "artifact_paths": ["fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"],
       "reason_codes": [
         "rch.worker_mirror_stale",
         "rch.cargo_not_reached",

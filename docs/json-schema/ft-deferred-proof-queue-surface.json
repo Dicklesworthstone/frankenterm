@@ -81,10 +81,7 @@
       ]
     },
     "target_dir": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "pattern": "^/tmp/[A-Za-z0-9._-]+$"
     },
     "guardrails": {
@@ -148,12 +145,7 @@
     },
     "summary": {
       "type": "object",
-      "required": [
-        "total",
-        "queued",
-        "completed",
-        "by_status"
-      ],
+      "required": ["total", "queued", "completed", "by_status"],
       "additionalProperties": false,
       "properties": {
         "total": {
@@ -249,11 +241,7 @@
     },
     "latest_replay": {
       "type": "object",
-      "required": [
-        "attempted_at",
-        "outcome",
-        "rch_admission_state"
-      ],
+      "required": ["attempted_at", "outcome", "rch_admission_state"],
       "additionalProperties": false,
       "properties": {
         "attempted_at": {
@@ -276,12 +264,7 @@
         },
         "rch_admission_state": {
           "type": "string",
-          "enum": [
-            "admitted",
-            "blocked_worker_pressure",
-            "not_required",
-            "unknown"
-          ]
+          "enum": ["admitted", "blocked_worker_pressure", "not_required", "unknown"]
         }
       }
     },
@@ -387,13 +370,7 @@
     },
     "explain_entry": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "status",
-        "why",
-        "blocking_reason_codes",
-        "remediation"
-      ],
+      "required": ["bead_id", "status", "why", "blocking_reason_codes", "remediation"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -421,12 +398,7 @@
     "dispatch_entry": {
       "type": "object",
       "description": "Compact TOON-serializable row for AI-to-AI dispatch: one object per queue entry, minimal keys.",
-      "required": [
-        "bead_id",
-        "status",
-        "target_dir",
-        "replay_allowed"
-      ],
+      "required": ["bead_id", "status", "target_dir", "replay_allowed"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {

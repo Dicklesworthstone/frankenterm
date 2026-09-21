@@ -20,10 +20,7 @@
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -32,17 +29,13 @@
           "type": "string"
         }
       },
-      "required": [
-        "event_id"
-      ],
+      "required": ["event_id"],
       "type": "object"
     },
     "success_envelope": {
       "data": {
         "annotations": {
-          "labels": [
-            "customer-impacting"
-          ],
+          "labels": ["customer-impacting"],
           "note": "Investigating customer impact",
           "note_updated_at": 0,
           "note_updated_by": "ops",
@@ -82,10 +75,7 @@
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -94,17 +84,13 @@
           "type": "string"
         }
       },
-      "required": [
-        "event_id"
-      ],
+      "required": ["event_id"],
       "type": "object"
     },
     "success_envelope": {
       "data": {
         "annotations": {
-          "labels": [
-            "urgent"
-          ],
+          "labels": ["urgent"],
           "note": null,
           "note_updated_at": 0,
           "note_updated_by": null,
@@ -143,10 +129,7 @@
         },
         "format": {
           "description": "Optional output format override for this call",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "type": "string"
         },
@@ -160,18 +143,13 @@
           "type": "string"
         }
       },
-      "required": [
-        "event_id"
-      ],
+      "required": ["event_id"],
       "type": "object"
     },
     "success_envelope": {
       "data": {
         "annotations": {
-          "labels": [
-            "customer-impacting",
-            "urgent"
-          ],
+          "labels": ["customer-impacting", "urgent"],
           "note": null,
           "note_updated_at": 0,
           "note_updated_by": null,

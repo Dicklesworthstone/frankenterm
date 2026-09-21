@@ -26,10 +26,7 @@
       "format": {
         "maxLength": 16,
         "description": "Optional output format override for this call",
-        "enum": [
-          "json",
-          "toon"
-        ],
+        "enum": ["json", "toon"],
         "type": "string"
       },
       "mission_file": {
@@ -45,9 +42,7 @@
         "type": "string"
       }
     },
-    "required": [
-      "reason"
-    ],
+    "required": ["reason"],
     "type": "object"
   },
   "invalid_args_envelope": {

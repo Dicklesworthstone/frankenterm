@@ -154,14 +154,7 @@
   "$defs": {
     "evidence_state": {
       "type": "string",
-      "enum": [
-        "measured",
-        "inferred",
-        "simulated",
-        "stale",
-        "unavailable",
-        "mixed"
-      ]
+      "enum": ["measured", "inferred", "simulated", "stale", "unavailable", "mixed"]
     },
     "overall_state": {
       "type": "string",
@@ -181,13 +174,7 @@
     },
     "pressure_tier": {
       "type": "string",
-      "enum": [
-        "normal",
-        "elevated",
-        "critical",
-        "emergency",
-        "unknown"
-      ]
+      "enum": ["normal", "elevated", "critical", "emergency", "unknown"]
     },
     "herd_wave_event_kind": {
       "type": "string",
@@ -206,14 +193,7 @@
     },
     "admission_action": {
       "type": "string",
-      "enum": [
-        "admit",
-        "defer",
-        "degrade",
-        "shed",
-        "none",
-        "unavailable"
-      ]
+      "enum": ["admit", "defer", "degrade", "shed", "none", "unavailable"]
     },
     "forbidden_action": {
       "type": "string",
@@ -255,17 +235,11 @@
       "additionalProperties": false,
       "properties": {
         "generated_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "max_age_ms": {
@@ -314,17 +288,11 @@
           "minimum": 1
         },
         "first_seen_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "last_seen_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "dominant_kind": {
@@ -372,20 +340,10 @@
         },
         "pane_priority_tier": {
           "type": "string",
-          "enum": [
-            "background",
-            "low",
-            "medium",
-            "high",
-            "critical",
-            "unknown"
-          ]
+          "enum": ["background", "low", "medium", "high", "critical", "unknown"]
         },
         "work_priority": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "mission_critical": {
@@ -401,37 +359,22 @@
     },
     "operator_override": {
       "type": "object",
-      "required": [
-        "active",
-        "override_id",
-        "scope",
-        "approved_by",
-        "reason_codes"
-      ],
+      "required": ["active", "override_id", "scope", "approved_by", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "active": {
           "type": "boolean"
         },
         "override_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "scope": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "approved_by": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "reason_codes": {
@@ -459,10 +402,7 @@
           "minLength": 1
         },
         "pane_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "cohort_rank": {
@@ -521,24 +461,15 @@
           "minLength": 1
         },
         "subject_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "generated_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "artifact_path": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "reason_codes": {
@@ -596,13 +527,7 @@
     },
     "unavailable_source": {
       "type": "object",
-      "required": [
-        "source",
-        "evidence_state",
-        "freshness_ms",
-        "max_age_ms",
-        "reason_codes"
-      ],
+      "required": ["source", "evidence_state", "freshness_ms", "max_age_ms", "reason_codes"],
       "additionalProperties": false,
       "properties": {
         "source": {
@@ -611,16 +536,10 @@
         },
         "evidence_state": {
           "type": "string",
-          "enum": [
-            "stale",
-            "unavailable"
-          ]
+          "enum": ["stale", "unavailable"]
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "max_age_ms": {
@@ -684,65 +603,38 @@
           "type": "boolean"
         },
         "cpu_cores": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "memory_gib": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "host_fingerprint": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "rch_worker": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "run_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "artifact_path": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "command": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "exit_status": {
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": ["integer", "null"]
         },
         "measured_window_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "reason_codes": {

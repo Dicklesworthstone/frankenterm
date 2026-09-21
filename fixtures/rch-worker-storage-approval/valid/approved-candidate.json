@@ -31,14 +31,10 @@
       "inventory_evidence_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "approval_match": "exact",
       "protected_reason": "none",
-      "notes": [
-        "Fixture models an exact inactive retained target path with complete evidence."
-      ]
+      "notes": ["Fixture models an exact inactive retained target path with complete evidence."]
     }
   ],
-  "allowed_operations": [
-    "move_to_quarantine"
-  ],
+  "allowed_operations": ["move_to_quarantine"],
   "forbidden_operations": [
     "delete_unlisted_path",
     "wildcard_path_expansion",
@@ -99,12 +95,7 @@
       "remote execution state and exit status",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
-  "review_notes": [
-    "Positive fixture only; agents still have no authority to perform the recovery."
-  ]
+  "review_notes": ["Positive fixture only; agents still have no authority to perform the recovery."]
 }

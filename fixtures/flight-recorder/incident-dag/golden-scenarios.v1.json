@@ -28,12 +28,7 @@
           {
             "source_id": "rch-preflight",
             "build_id": "29871232832766280",
-            "command_argv": [
-              "cargo",
-              "test",
-              "-p",
-              "frankenterm-core-replay-types"
-            ],
+            "command_argv": ["cargo", "test", "-p", "frankenterm-core-replay-types"],
             "started_at_ms": 1778000200200,
             "completed_at_ms": null,
             "location": "local",
@@ -85,12 +80,7 @@
             "source_id": "rch-pass-dirty",
             "build_id": "29871232832766281",
             "worker_id": "vmi1149989",
-            "command_argv": [
-              "cargo",
-              "clippy",
-              "-p",
-              "frankenterm-core-replay-types"
-            ],
+            "command_argv": ["cargo", "clippy", "-p", "frankenterm-core-replay-types"],
             "started_at_ms": 1778000300200,
             "completed_at_ms": 1778000305000,
             "location": "remote",

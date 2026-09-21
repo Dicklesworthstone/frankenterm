@@ -30,24 +30,14 @@
       "items": { "$ref": "#/$defs/SubmitProfile" }
     },
     "supply_chain": {
-      "oneOf": [
-        { "$ref": "#/$defs/SupplyChain" },
-        { "type": "null" }
-      ],
+      "oneOf": [{ "$ref": "#/$defs/SupplyChain" }, { "type": "null" }],
       "description": "Optional supply-chain verification manifest for user or extension pattern packs."
     }
   },
   "$defs": {
     "Rule": {
       "type": "object",
-      "required": [
-        "id",
-        "agent_type",
-        "event_type",
-        "severity",
-        "anchors",
-        "description"
-      ],
+      "required": ["id", "agent_type", "event_type", "severity", "anchors", "description"],
       "additionalProperties": false,
       "properties": {
         "id": {
@@ -207,10 +197,7 @@
         },
         "rollout": { "$ref": "#/$defs/SupplyChainRollout" },
         "signature": {
-          "oneOf": [
-            { "$ref": "#/$defs/SupplyChainSignature" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/SupplyChainSignature" }, { "type": "null" }]
         }
       }
     },
@@ -272,11 +259,7 @@
     },
     "SupplyChainRollout": {
       "type": "object",
-      "required": [
-        "stage",
-        "dry_run_match_telemetry",
-        "observe_only_until_verified"
-      ],
+      "required": ["stage", "dry_run_match_telemetry", "observe_only_until_verified"],
       "additionalProperties": false,
       "properties": {
         "stage": {
