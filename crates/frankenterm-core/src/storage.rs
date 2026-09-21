@@ -15992,8 +15992,7 @@ mod writer_io_scheduler_tests {
                 .into_iter()
                 .map(|content| {
                     pending_append_segment_from_command(segment_command(71, content))
-                        .ok()
-                        .expect("append command")
+                        .unwrap_or_else(|_| panic!("append command"))
                 })
                 .collect();
             let grouped = append_segment_group_commit_backend(&backend, &writes, &mut redactors)

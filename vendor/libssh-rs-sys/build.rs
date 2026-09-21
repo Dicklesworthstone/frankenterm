@@ -169,15 +169,6 @@ fn main() {
         );
     }
 
-    if false {
-        for (k, v) in std::env::vars() {
-            if k.starts_with("CARGO") || k.starts_with("DEP") {
-                eprintln!("{}={}", k, v);
-            }
-        }
-        panic!("boo");
-    }
-
     cfg.warnings(false);
     for f in &[
         "agent.c",
