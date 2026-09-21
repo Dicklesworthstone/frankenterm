@@ -126,7 +126,7 @@ fn append_mux_text_line(out: &mut String, line: &str, cap: usize) -> Result<(), 
     Ok(())
 }
 
-fn get_lines_retry_delay(attempt: usize) -> Duration {
+fn mux_read_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(if attempt == 0 { 1 } else { 10 })
 }
 
@@ -1474,6 +1474,8 @@ pub struct DirectMuxClient {
     render_retention_codec_stats: RenderRetentionCodecStats,
     #[cfg(test)]
     get_lines_retry_delays: [Option<Duration>; 3],
+    #[cfg(test)]
+    render_read_retry_delays: [Option<Duration>; 2],
 }
 
 impl std::fmt::Debug for DirectMuxClient {
@@ -2323,6 +2325,8 @@ impl DirectMuxClient {
             render_retention_codec_stats: RenderRetentionCodecStats::default(),
             #[cfg(test)]
             get_lines_retry_delays: [None; 3],
+            #[cfg(test)]
+            render_read_retry_delays: [None; 2],
             config,
         };
 
@@ -2525,6 +2529,10 @@ impl DirectMuxClient {
         // PTY output may invalidate a render snapshot while it is being
         // prepared. Only an authoritative, replay-safe rejection permits
         // another read. All attempts share the original operation's budget.
+        #[cfg(test)]
+        {
+            self.render_read_retry_delays = [None; 2];
+        }
         let budget = self
             .config
             .write_timeout
@@ -2579,7 +2587,16 @@ impl DirectMuxClient {
                     if crate::runtime_async::timer_now_with_cx(cx) >= deadline {
                         return Err(DirectMuxError::ReadTimeout);
                     }
-                    crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(10))
+                    // A short-lived parser/capture race uses the same bounded
+                    // first backoff as a line read. Starting at 10ms stalls a
+                    // complete text transaction even when the next fence is
+                    // already ready; persistent contention still backs off.
+                    let delay = mux_read_retry_delay(attempt);
+                    #[cfg(test)]
+                    {
+                        self.render_read_retry_delays[attempt] = Some(delay);
+                    }
+                    crate::runtime_async::sleep_with_cx(cx, delay)
                         .await
                         .map_err(|error| cancelled_mux_error("render_read_backoff", error))?;
                     continue;
@@ -2656,7 +2673,7 @@ impl DirectMuxClient {
                             // A completed producer write can make the next read ready
                             // immediately. Still use a timer; repeated contention keeps
                             // the conservative delay and the original retry cap.
-                            let delay = get_lines_retry_delay(busy_retries);
+                            let delay = mux_read_retry_delay(busy_retries);
                             #[cfg(test)]
                             {
                                 self.get_lines_retry_delays[busy_retries] = Some(delay);
@@ -2804,7 +2821,7 @@ impl DirectMuxClient {
                         if error.code == codec::MuxErrorCode::RESOURCE_BUSY
                             && busy_retries < MAX_RESOURCE_BUSY_RETRIES
                         {
-                            let delay = get_lines_retry_delay(busy_retries);
+                            let delay = mux_read_retry_delay(busy_retries);
                             #[cfg(test)]
                             {
                                 self.get_lines_retry_delays[busy_retries] = Some(delay);
@@ -11954,7 +11971,7 @@ mod tests {
                 ("wrong-request", 1),
                 ("persistent", 3),
                 ("cancel", 1),
-                ("deadline", 1),
+                ("deadline", 2),
                 ("extreme", 3),
                 ("extreme-cancel", 1),
                 ("eof", 1),
@@ -12069,6 +12086,11 @@ mod tests {
                         result.expect("safe retry succeeds").title,
                         "fresh-after-retry"
                     );
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [Some(Duration::from_millis(1)), None],
+                        "a transient read race must not impose the sustained-contention delay"
+                    );
                 } else if matches!(case, "cancel" | "extreme-cancel") {
                     let error = result.expect_err("cancelled");
                     assert!(error.is_cancelled(), "{case}: {error:?}");
@@ -12081,10 +12103,25 @@ mod tests {
                 } else {
                     assert!(result.is_err(), "rejection must not become a frame: {case}");
                 }
+                if matches!(case, "persistent" | "busy-persistent" | "extreme") {
+                    assert_eq!(
+                        client.render_read_retry_delays,
+                        [
+                            Some(Duration::from_millis(1)),
+                            Some(Duration::from_millis(10))
+                        ],
+                        "persistent read contention keeps the bounded longer backoff"
+                    );
+                } else if matches!(case, "never" | "effect" | "wrong-request" | "eof") {
+                    assert_eq!(client.render_read_retry_delays, [None; 2]);
+                }
                 drop(client);
                 let requests = server.await.expect("server");
                 if case == "deadline" {
-                    assert!(requests <= 1, "expired deadline must prevent a retry");
+                    assert!(
+                        requests <= 2,
+                        "expired deadline must prevent the final retry"
+                    );
                 } else {
                     assert_eq!(requests, expected_requests, "{case}");
                 }
@@ -20229,7 +20266,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         /// Build a LabRuntime, spawn a root task running `f`, and auto-advance
-        /// to quiescence. Panics if the runtime gets stuck.
+        /// to quiescence. Reject scheduler exhaustion and failed root tasks.
         fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
         where
             F: std::future::Future<Output = ()> + Send + 'static,
@@ -20243,7 +20280,7 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (task_id, _handle) = runtime
+            let (task_id, mut handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
@@ -20252,14 +20289,22 @@ mod tests {
             runtime.scheduler.lock().schedule(task_id, 0);
 
             let report = runtime.run_with_auto_advance();
-            assert!(
-                !matches!(
-                    report.termination,
-                    asupersync::lab::AutoAdvanceTermination::StuckBailout
-                ),
-                "LabRuntime got stuck; termination: {:?}",
+            assert_eq!(
                 report.termination,
+                asupersync::lab::AutoAdvanceTermination::Quiescent,
+                "LabRuntime must finish before checking its root task",
             );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "LabRuntime root task did not complete successfully")]
+        fn lab_helper_propagates_root_assertion_failure() {
+            run_lab(848, || async { panic!("intentional root task failure") });
         }
 
         /// Direct reserve/commit send using the caller's LabRuntime Cx. The
@@ -20274,12 +20319,12 @@ mod tests {
         }
 
         #[test]
-        fn get_lines_retry_timers_advance_virtual_time_and_cancel() {
+        fn mux_read_retry_timers_advance_virtual_time_and_cancel() {
             run_lab(849, || async move {
                 let cx = asupersync::Cx::current().expect("lab Cx");
                 let started = crate::runtime_async::timer_now_with_cx(&cx);
                 for (attempt, expected_ns) in [(0, 1_000_000), (1, 11_000_000), (2, 21_000_000)] {
-                    crate::runtime_async::sleep_with_cx(&cx, get_lines_retry_delay(attempt))
+                    crate::runtime_async::sleep_with_cx(&cx, mux_read_retry_delay(attempt))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -20287,17 +20332,27 @@ mod tests {
                         expected_ns
                     );
                 }
-                cx.cancel_with(crate::outcome::CancelKind::User, Some("retry timer test"));
+                // Cancel the request context, not this fixture's root task:
+                // the runtime correctly gives a cancelled root a Cancelled
+                // outcome even when its future reaches the end of the body.
+                let request_cx = Cx::for_testing();
+                request_cx.cancel_with(crate::outcome::CancelKind::User, Some("retry timer test"));
                 let before_cancelled_wait = crate::runtime_async::timer_now_with_cx(&cx);
+                // sleep_with_cx wakes early on direct cancellation; the
+                // operation's next checkpoint, not the timer, reports it.
+                crate::runtime_async::sleep_with_cx(&request_cx, mux_read_retry_delay(0))
+                    .await
+                    .unwrap();
                 assert!(
-                    crate::runtime_async::sleep_with_cx(&cx, get_lines_retry_delay(0))
-                        .await
-                        .is_err()
+                    checkpoint_mux_cx(&request_cx, 0, "render_read_retry")
+                        .unwrap_err()
+                        .is_cancelled()
                 );
                 assert_eq!(
                     crate::runtime_async::timer_now_with_cx(&cx),
                     before_cancelled_wait
                 );
+                assert!(!cx.is_cancel_requested());
             });
         }
 
