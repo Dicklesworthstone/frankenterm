@@ -2960,6 +2960,9 @@ fn register_storage_backend_provider(db_path: &str, provider: &Arc<dyn StorageBa
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     registry.insert(db_path.to_string(), Arc::downgrade(provider));
+    // Subscribers may perform storage lookups or block on an output sink.
+    // Publication is complete; neither callback belongs under this global lock.
+    drop(registry);
     tracing::debug!(
         target: "ft.storage.backend",
         db_path = db_path,
@@ -42875,10 +42878,16 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
         });
         let authority = Arc::new(WriterJoinAuthority::new(native_writer));
         let queued_authority = Arc::clone(&authority);
+        let (retirement_tx, retirement_rx) = std::sync::mpsc::channel::<()>();
         let cx = crate::cx::for_testing();
         let mut queued = Box::pin(crate::runtime_async::spawn_blocking_with_cx(
             &cx,
-            move || queued_authority.drive(std::time::Duration::from_secs(5)),
+            move || {
+                // This sender is owned by the queued closure, so receiver
+                // disconnection proves the worker actually discarded it.
+                let _retirement_signal = retirement_tx;
+                queued_authority.drive(std::time::Duration::from_secs(5))
+            },
         ));
         let first_poll = std::future::poll_fn(|poll_cx| {
             Poll::Ready(queued.as_mut().poll(poll_cx))
@@ -42888,12 +42897,7 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
             matches!(first_poll, Poll::Pending),
             "join settlement must queue behind the occupied worker"
         );
-        for _ in 0..1_000 {
-            if pool.pending_count() == 1 {
-                break;
-            }
-            crate::runtime_async::task::yield_now().await;
-        }
+        // The first poll synchronously enqueues before awaiting its reply.
         assert_eq!(pool.pending_count(), 1, "join settlement must be queued");
 
         drop(queued);
@@ -42904,12 +42908,11 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
             blocker.wait_timeout(std::time::Duration::from_secs(5)),
             "occupied blocking worker did not finish"
         );
-        for _ in 0..1_000 {
-            if pool.pending_count() == 0 {
-                break;
-            }
-            crate::runtime_async::task::yield_now().await;
-        }
+        assert_eq!(
+            retirement_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "cancelled closure must relinquish its captured state"
+        );
         assert_eq!(pool.pending_count(), 0, "cancelled queued join must retire");
         assert!(
             matches!(
@@ -44302,6 +44305,77 @@ mod pool_telemetry_tests {
     fn pool_counter_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn backend_registration_releases_registry_before_subscriber_callback() {
+        use tracing_subscriber::prelude::*;
+
+        struct LookupSubscriber {
+            path: String,
+            provider: Arc<dyn StorageBackendProvider>,
+            events: Arc<AtomicUsize>,
+            completed: Arc<std::sync::atomic::AtomicBool>,
+            worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LookupSubscriber {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "ft.storage.backend" {
+                    return;
+                }
+                self.events.fetch_add(1, Ordering::Relaxed);
+                let path = self.path.clone();
+                let expected = Arc::clone(&self.provider);
+                let (reply, result) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::spawn(move || {
+                    let found = super::storage_backend_provider_for_path(&path)
+                        .is_some_and(|actual| Arc::ptr_eq(&actual, &expected));
+                    let _ = reply.send(found);
+                });
+                *self.worker.lock().expect("lookup worker slot") = Some(worker);
+                // Bound the negative case: the old code held the registry
+                // while waiting here. Returning releases it, so even a failing
+                // regression can join its worker instead of leaking a thread.
+                self.completed.store(
+                    result.recv_timeout(std::time::Duration::from_secs(5)) == Ok(true),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("registry test directory");
+        let path = directory
+            .path()
+            .join("subscriber.db")
+            .to_string_lossy()
+            .into_owned();
+        let provider = default_storage_backend_provider();
+        let events = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = Arc::new(Mutex::new(None));
+        let subscriber = tracing_subscriber::registry().with(LookupSubscriber {
+            path: path.clone(),
+            provider: Arc::clone(&provider),
+            events: Arc::clone(&events),
+            completed: Arc::clone(&completed),
+            worker: Arc::clone(&worker),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            register_storage_backend_provider(&path, &provider);
+        });
+        if let Some(worker) = worker.lock().expect("lookup worker slot").take() {
+            worker.join().expect("lookup worker did not panic");
+        }
+        assert_eq!(events.load(Ordering::Relaxed), 1, "subscriber must execute");
+        assert!(
+            completed.load(Ordering::Acquire),
+            "subscriber must observe the published provider before returning"
+        );
     }
 
     /// Snapshot the process-global counters for delta assertions.
