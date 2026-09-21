@@ -821,8 +821,6 @@ dependencies = [
 [[package]]
 name = "block"
 version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
 
 [[package]]
 name = "block-buffer"
@@ -13094,6 +13092,7 @@ dependencies = [
  "async-task",
  "async-trait",
  "bitflags 2.13.2",
+ "block",
  "bytes",
  "cgl",
  "clipboard-win",

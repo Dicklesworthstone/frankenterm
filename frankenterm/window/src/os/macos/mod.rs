@@ -40,3 +40,61 @@ unsafe fn nsstring_to_str<'a>(mut ns: *mut Object) -> &'a str {
     let bytes = std::slice::from_raw_parts(data, len);
     std::str::from_utf8_unchecked(bytes)
 }
+
+#[cfg(test)]
+mod block_abi_regression {
+    use block::{ConcreteBlock, RcBlock};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct Capture {
+        drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        owned: String,
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Capture {
+        fn invoke(&self, a: u64, b: u64) -> u64 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            a.wrapping_mul(3).wrapping_add(b) + self.owned.len() as u64
+        }
+    }
+
+    #[test]
+    fn native_block_stack_heap_copy_invoke_and_final_dispose() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heap: RcBlock<(u64, u64), u64> = {
+            let capture = Capture {
+                drops: Arc::clone(&drops),
+                calls: Arc::clone(&calls),
+                owned: String::from("native-capture"),
+            };
+            let stack = ConcreteBlock::new(move |a: u64, b: u64| capture.invoke(a, b));
+            // SAFETY: exact argument/return ABI; immutable capture, atomic counts.
+            // This is the existing macOS FFI boundary, not an arbitrary callback.
+            assert_eq!(unsafe { stack.call((7, 11)) }, 46);
+            // Invokes libSystem _Block_copy: stack ownership moves to heap.
+            stack.copy()
+        };
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // Heap copy invokes the runtime retain path, not Rust closure Clone.
+        let retained = heap.clone();
+        drop(heap);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // SAFETY: retained runtime block remains live after its creation scope;
+        // the argument tuple and return type still match its invocation function.
+        assert_eq!(unsafe { retained.call((13, 17)) }, 70);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(retained);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
