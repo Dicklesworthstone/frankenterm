@@ -30659,6 +30659,8 @@ mod tests {
 
     #[test]
     fn ready_reader_workers_cannot_read_until_pane_added_callback_finishes() {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let reads = Arc::new(AtomicUsize::new(0));
         let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
@@ -30709,6 +30711,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("released EOF reader should finish");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+        executor.run_until(Duration::from_secs(30), || mux.get_pane(120).is_none());
     }
 
     #[test]
@@ -31709,14 +31712,22 @@ mod tests {
 
     #[test]
     fn add_tab_starts_reader_only_after_topology_and_pane_added_are_visible() {
+        // The reader's EOF path uses the process-wide main-thread scheduler.
+        // Own it until EOF cleanup has completed, not just until the first read.
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let tab = Arc::new(Tab::new(&test_size()));
         let tab_id = tab.tab_id();
         let pane_added = Arc::new(AtomicBool::new(false));
         let pane_added_for_subscriber = Arc::clone(&pane_added);
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
         mux.subscribe(move |notification| {
             if matches!(notification, MuxNotification::PaneAdded(80)) {
                 pane_added_for_subscriber.store(true, Ordering::SeqCst);
+            }
+            if matches!(notification, MuxNotification::PaneRemoved(80)) {
+                let _ = removed_tx.send(());
             }
             true
         })
@@ -31741,6 +31752,8 @@ mod tests {
         assert!(pane_was_registered);
         assert!(tab_contained_pane);
         assert!(pane_added_was_emitted);
+        executor.run_until(Duration::from_secs(30), || removed_rx.try_recv().is_ok());
+        assert!(mux.get_pane(80).is_none());
     }
 
     #[test]
