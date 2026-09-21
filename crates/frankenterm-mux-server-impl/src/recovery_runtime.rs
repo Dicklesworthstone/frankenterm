@@ -855,7 +855,6 @@ mod tests {
                 assert!(!selection.has_unresolved_authority());
                 assert_eq!(selection.current.unwrap().generation(), 1);
                 // Authenticated repair must not forgive a filesystem authority failure.
-                use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
                 assert!(load_recovery_for_startup(&options, None, &cx::for_request()).is_err());
                 let zero_evidence_store = SnapshotPublicationStore::open_existing(
