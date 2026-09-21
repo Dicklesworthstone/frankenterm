@@ -2974,6 +2974,96 @@ struct ClientSemanticState {
     last_exit_code: Option<i32>,
 }
 
+struct PreparedClientHistoricalAlerts {
+    output: mux::PaneAlertOutput,
+    receipts: mux::AdmittedHistoricalAlerts,
+    dispatch: mux::FundedPaneAlertDispatch,
+    alerts: Vec<Alert>,
+}
+
+impl PreparedClientHistoricalAlerts {
+    fn prepare<'a>(
+        registration: &mux::PaneRegistrationHandle,
+        alerts: impl Iterator<Item = &'a Alert>,
+    ) -> Result<Option<Self>, mux::pane::PaneActionAdmissionRefusal> {
+        use mux::pane::PaneActionAdmissionRefusal as Refusal;
+        let mut demands = Vec::new();
+        let mut retained = Vec::new();
+        let mut bytes = 4096_usize;
+        for alert in alerts {
+            let Some(demand) = mux::HistoricalAlertDemand::for_alert(alert) else {
+                continue;
+            };
+            if demands.len() == 256 {
+                return Err(Refusal::SizeOverflow);
+            }
+            demands.try_reserve(1).map_err(|_| Refusal::Allocation)?;
+            retained.try_reserve(1).map_err(|_| Refusal::Allocation)?;
+            bytes = bytes
+                .checked_add(match demand {
+                    mux::HistoricalAlertDemand::Bell => 0,
+                    mux::HistoricalAlertDemand::UserVar { text_bytes } => text_bytes,
+                })
+                .ok_or(Refusal::SizeOverflow)?;
+            demands.push(demand);
+            retained.push(alert.clone());
+        }
+        if demands.is_empty() {
+            return Ok(None);
+        }
+        let output = registration
+            .reserve_alert_output()
+            .ok_or(Refusal::Retired)?;
+        let receipts = output.reserve_historical(&demands)?;
+        bytes = bytes
+            .checked_add(receipts.retained_bytes())
+            .and_then(|n| {
+                n.checked_add(
+                    retained
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<Alert>())?,
+                )
+            })
+            .ok_or(Refusal::SizeOverflow)?;
+        receipts.check_dispatch_fit(bytes)?;
+        let dispatch = mux::FundedPaneAlertDispatch::reserve(bytes)?;
+        Ok(Some(Self {
+            output,
+            receipts,
+            dispatch,
+            alerts: retained,
+        }))
+    }
+
+    /// Link FIFO while the RPC commit still owns mutation ordering. The
+    /// returned gate is fulfilled only after commit_sync returns successfully;
+    /// dropping it aborts delivery. The RPC reader never awaits GUI completion.
+    fn publish(self, queue: &mux::PaneAlertDispatchQueue) -> promise::Promise<()> {
+        let mut gate = promise::Promise::new();
+        let committed = gate.get_future().expect("new historical commit gate");
+        let Self {
+            output,
+            mut receipts,
+            dispatch,
+            alerts,
+        } = self;
+        dispatch.publish(queue, std::future::ready(()), async move {
+            if committed.await.is_err() {
+                return;
+            }
+            for alert in alerts {
+                if !output.dispatch_historical(&mut receipts, alert) {
+                    return;
+                }
+                receipts.finish_delivered().await;
+            }
+            receipts.finish().await;
+            drop(output);
+        });
+        gate
+    }
+}
+
 pub struct ClientPane {
     client: Arc<ClientInner>,
     local_pane_id: PaneId,
@@ -2990,6 +3080,7 @@ pub struct ClientPane {
     alt_screen_active: Mutex<bool>,
     ignore_next_kill: Mutex<bool>,
     user_vars: Mutex<HashMap<String, String>>,
+    historical_alert_dispatch: mux::PaneAlertDispatchQueue,
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
@@ -3405,6 +3496,7 @@ impl ClientPane {
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
             user_vars: Mutex::new(HashMap::new()),
+            historical_alert_dispatch: mux::PaneAlertDispatchQueue::default(),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
             semantic_state: Mutex::new(ClientSemanticState::default()),
@@ -3737,6 +3829,31 @@ impl ClientPane {
                 RenderApplicationObservedState::NotApplicable,
             ));
         }
+        let mut historical = match PreparedClientHistoricalAlerts::prepare(
+            registration,
+            alerts.iter().map(|notification| &notification.alert),
+        ) {
+            Ok(historical) => historical,
+            Err(reason) => {
+                if !matches!(reason, mux::pane::PaneActionAdmissionRefusal::Capacity) {
+                    // A permanent refusal cannot become an unbounded retry of
+                    // the identical render batch on this connection generation.
+                    if let Ok(abort) = rpc.abort_guard("historical render admission refused") {
+                        drop(abort);
+                    }
+                }
+                guard.nack();
+                return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                    connection_identity,
+                    identity,
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: RenderApplicationStage::Commit,
+                    },
+                    RenderApplicationObservedState::NotApplicable,
+                ));
+            }
+        };
+        let mut historical_commit = None;
         let application = rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
             let mut geometry_changed = false;
             let result = registration.try_with_current_output(|current| {
@@ -3792,7 +3909,12 @@ impl ClientPane {
                         }
                         _ => {}
                     }
-                    current.dispatch_alert(alert);
+                    if mux::HistoricalAlertDemand::for_alert(&alert).is_none() {
+                        current.dispatch_alert(alert);
+                    }
+                }
+                if let Some(historical) = historical.take() {
+                    historical_commit = Some(historical.publish(&self.historical_alert_dispatch));
                 }
                 Some(true)
             });
@@ -3807,6 +3929,9 @@ impl ClientPane {
 
         let failure_stage = match application {
             Ok(Some(Some(true))) => {
+                if let Some(mut gate) = historical_commit.take() {
+                    gate.result(Ok(()));
+                }
                 guard.acknowledge();
                 return ClientRenderApplicationDisposition::Settlement(render_application_ack(
                     connection_identity,
@@ -3984,6 +4109,20 @@ impl ClientPane {
                 .map_err(anyhow::Error::new)?;
             }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
+                let mut historical = match PreparedClientHistoricalAlerts::prepare(
+                    registration,
+                    std::iter::once(&alert),
+                ) {
+                    Ok(historical) => historical,
+                    Err(reason) => {
+                        // Legacy alerts have no replay/NACK authority. A failed
+                        // pre-mutation admission must retire this exact stream,
+                        // never silently acknowledge and lose its history.
+                        let _abort = rpc.abort_guard("historical alert admission refused")?;
+                        bail!("historical alert admission refused before mutation: {reason:?}");
+                    }
+                };
+                let mut historical_commit = None;
                 rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
                     let _ = registration.try_with_current(|current| {
                         match &alert {
@@ -3998,10 +4137,18 @@ impl ClientPane {
                             }
                             _ => {}
                         }
-                        current.dispatch_alert(alert);
+                        if let Some(historical) = historical.take() {
+                            historical_commit =
+                                Some(historical.publish(&self.historical_alert_dispatch));
+                        } else {
+                            current.dispatch_alert(alert);
+                        }
                     });
                 })
                 .map_err(anyhow::Error::new)?;
+                if let Some(mut gate) = historical_commit {
+                    gate.result(Ok(()));
+                }
             }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
@@ -8348,6 +8495,206 @@ mod tests {
             self.callback_ran.store(true, Ordering::Release);
             Ok(())
         }
+    }
+
+    #[test]
+    fn historical_remote_delivery_waits_off_reader_in_event_and_commit_order() {
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(64, 1024 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let names = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let held = Arc::new(StdMutex::new(None::<mux::HistoricalAlertCompletion>));
+        let callback_names = Arc::clone(&names);
+        let callback_held = Arc::clone(&held);
+        let _subscriber = mux
+            .subscribe_historical_alerts(
+                |_| true,
+                |_| Some((0, 0)),
+                move |_| {
+                    let names = Arc::clone(&callback_names);
+                    let held = Arc::clone(&callback_held);
+                    Ok(Box::new(move |_, alert, completion| {
+                        let Alert::SetUserVar { name, .. } = alert else {
+                            panic!("expected historical user variable")
+                        };
+                        names.lock().unwrap().push(name);
+                        assert!(held.lock().unwrap().replace(completion).is_none());
+                    }))
+                },
+            )
+            .unwrap();
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        let mut update = test_render_application_update(
+            rpc.connection_generation().unwrap().get(),
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let alert = |name: &str| NotifyAlert {
+            pane_id: pane.remote_pane_id,
+            alert: Alert::SetUserVar {
+                name: name.into(),
+                value: "value".into(),
+            },
+        };
+        update.alerts = vec![alert("first"), alert("second")];
+        let result = promise::spawn::block_on(pane.apply_render_application(
+            &registration,
+            &rpc,
+            update.clone(),
+        ));
+        settlement(result).validate_for(&update).unwrap();
+        let pump = |count: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while names.lock().unwrap().len() < count {
+                while executor.try_tick().unwrap() {}
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "historical remote delivery stalled"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        pump(1);
+        // The first consumer is still pending, but a real subsequent reader
+        // application on the same RPC scope must commit and return now.
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::NotifyAlert(alert("legacy")),
+        ))
+        .unwrap();
+        assert_eq!(
+            pane.user_vars.lock().get("legacy").map(String::as_str),
+            Some("value")
+        );
+        while executor.try_tick().unwrap() {}
+        assert_eq!(&*names.lock().unwrap(), &["first"]);
+        drop(held.lock().unwrap().take());
+        pump(2);
+        assert_eq!(&*names.lock().unwrap(), &["first", "second"]);
+        drop(held.lock().unwrap().take());
+        pump(3);
+        assert_eq!(&*names.lock().unwrap(), &["first", "second", "legacy"]);
+        drop(held.lock().unwrap().take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while executor.admission_snapshot().active_tasks != 0 {
+            while executor.try_tick().unwrap() {}
+            assert!(
+                std::time::Instant::now() < deadline,
+                "historical credits did not return"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn historical_subscriber_refusal_precedes_both_remote_mutations() {
+        use std::sync::atomic::AtomicUsize;
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let returned = Arc::new(AtomicUsize::new(0));
+        struct ReturnCredit(Arc<AtomicUsize>);
+        impl Drop for ReturnCredit {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let count = Arc::clone(&admitted);
+        let returns = Arc::clone(&returned);
+        let _first = mux
+            .subscribe_historical_alerts(
+                |_| true,
+                |_| Some((1, 4096)),
+                move |_| {
+                    let permit = match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Render,
+                        4096,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(permit) => permit,
+                        _ => return Err(mux::pane::PaneActionAdmissionRefusal::Capacity),
+                    };
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let credit = ReturnCredit(Arc::clone(&returns));
+                    Ok(Box::new(move |_, _, completion| {
+                        drop((permit, credit, completion));
+                    }))
+                },
+            )
+            .unwrap();
+        let _second = mux
+            .subscribe_historical_alerts(
+                |_| true,
+                |_| Some((1, 4096)),
+                |_| Err(mux::pane::PaneActionAdmissionRefusal::Capacity),
+            )
+            .unwrap();
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let dynamic: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&dynamic).unwrap();
+        let registration = mux.capture_pane_registration(&dynamic).unwrap();
+        let rpc = inner.client.rpc_scope();
+        let generation = rpc.connection_generation().unwrap().get();
+        let mut update = test_render_application_update(
+            generation,
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let alert = Alert::SetUserVar {
+            name: "funded-test".into(),
+            value: "must-not-commit".into(),
+        };
+        update.alerts = vec![NotifyAlert {
+            pane_id: pane.remote_pane_id,
+            alert: alert.clone(),
+        }];
+        let before_sequence = pane.get_current_seqno();
+        let before_title = pane.get_title();
+        let _settlement =
+            promise::spawn::block_on(pane.apply_render_application(&registration, &rpc, update));
+        assert_eq!(pane.get_current_seqno(), before_sequence);
+        assert_eq!(pane.get_title(), before_title);
+        assert!(!pane.user_vars.lock().contains_key("funded-test"));
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert_eq!(returned.load(Ordering::SeqCst), 1);
+        // Temporary render refusal leaves the reader generation usable. The
+        // legacy protocol has no NACK, so it must fail this exact generation
+        // explicitly instead of committing then losing the historical event.
+        assert!(rpc.connection_generation().is_some());
+        let result = promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: pane.remote_pane_id,
+                alert,
+            }),
+        ));
+        assert!(result.is_err());
+        assert!(!pane.user_vars.lock().contains_key("funded-test"));
+        assert_eq!(admitted.load(Ordering::SeqCst), 2);
+        assert_eq!(returned.load(Ordering::SeqCst), 2);
+        assert!(rpc
+            .commit_sync(RpcConsumerKind::PaneUnilateral, || ())
+            .is_err());
     }
 
     #[test]

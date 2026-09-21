@@ -3162,6 +3162,7 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
 struct PaneAlertPreflight {
     count: usize,
     text_bytes: usize,
+    historical: Vec<crate::HistoricalAlertDemand>,
 }
 
 impl PaneAlertPreflight {
@@ -3197,7 +3198,27 @@ impl PaneAlertPreflight {
         }
         let mut count = usize::from(!actions.is_empty());
         let mut text_bytes = 0usize;
+        let mut historical = Vec::new();
         for action in actions {
+            let demand = match action {
+                Action::Control(ControlCode::Bell) => Some(crate::HistoricalAlertDemand::Bell),
+                Action::OperatingSystemCommand(command) => match command.as_ref() {
+                    OperatingSystemCommand::ITermProprietary(ITermProprietary::SetUserVar {
+                        name,
+                        value,
+                    }) => Some(crate::HistoricalAlertDemand::UserVar {
+                        text_bytes: name.capacity().checked_add(value.capacity())?,
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(demand) = demand {
+                if historical.len() == 256 || historical.try_reserve(1).is_err() {
+                    return None;
+                }
+                historical.push(demand);
+            }
             let action_count = match action {
                 Action::OperatingSystemCommand(command) => match command.as_ref() {
                     OperatingSystemCommand::SetIconNameAndWindowTitle(_) => 2,
@@ -3283,13 +3304,22 @@ impl PaneAlertPreflight {
             };
             text_bytes = text_bytes.checked_add(additional)?;
         }
-        Some(Self { count, text_bytes })
+        Some(Self {
+            count,
+            text_bytes,
+            historical,
+        })
     }
 
     fn retained_bytes(&self) -> Option<usize> {
         self.count
             .checked_mul(std::mem::size_of::<Alert>())?
             .checked_add(self.text_bytes)?
+            .checked_add(
+                self.historical
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<crate::HistoricalAlertDemand>())?,
+            )?
             .checked_add(LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES)
     }
 }
@@ -3301,7 +3331,7 @@ struct LocalPaneNotifHandler {
 #[derive(Default)]
 struct PaneAlertStaging {
     active: Option<ActivePaneAlerts>,
-    tail: Option<promise::Future<()>>,
+    dispatch: Arc<crate::PaneAlertDispatchQueue>,
 }
 
 struct ActivePaneAlerts {
@@ -3310,7 +3340,6 @@ struct ActivePaneAlerts {
 }
 
 struct PaneAlertCompletion {
-    _successor: promise::Promise<()>,
     delivered: bool,
 }
 
@@ -3331,12 +3360,12 @@ impl Drop for PaneAlertCompletion {
 }
 
 struct FundedPaneAlerts {
-    reservation: Option<promise::spawn::BackgroundSpawnReservation>,
-    main: Option<promise::spawn::MainThreadSpawnReservation>,
+    dispatch: Option<crate::FundedPaneAlertDispatch>,
     output: Option<crate::PaneAlertOutput>,
     alerts: Vec<Alert>,
     text_bytes: usize,
     terminal: std::sync::Weak<Mutex<Terminal>>,
+    historical: Option<crate::AdmittedHistoricalAlerts>,
 }
 
 struct AdmittedPaneActions {
@@ -3370,7 +3399,6 @@ impl FundedPaneAlerts {
         output: &mut Option<crate::PaneAlertOutput>,
         terminal: &Arc<Mutex<Terminal>>,
     ) -> Result<Option<Self>, PaneActionAdmissionRefusal> {
-        use promise::spawn::{MainThreadReservationOutcome as Outcome, MainThreadServiceClass};
         if output.is_none() {
             return Ok(None);
         }
@@ -3380,23 +3408,15 @@ impl FundedPaneAlerts {
         if !promise::spawn::is_scheduler_configured() {
             return Err(PaneActionAdmissionRefusal::SchedulerUnavailable);
         }
-        let reservation =
-            promise::spawn::try_reserve_background_task(bytes).map_err(background_alert_refusal)?;
-        let main = match promise::spawn::try_reserve_main_thread(
-            MainThreadServiceClass::Interactive,
-            bytes,
-        ) {
-            Outcome::Reserved(main) => main,
-            Outcome::RetryableFull(_) => return Err(PaneActionAdmissionRefusal::Capacity),
-            Outcome::SchedulerUnavailable => {
-                return Err(PaneActionAdmissionRefusal::SchedulerUnavailable)
-            }
-            Outcome::InvalidSize(_) => return Err(PaneActionAdmissionRefusal::SizeOverflow),
-            Outcome::RetiredGeneration(_) | Outcome::AuthorityExhausted(_) => {
-                return Err(PaneActionAdmissionRefusal::Retired)
-            }
-            Outcome::Coalesced(_) => unreachable!("historical alert batches cannot coalesce"),
-        };
+        let historical = output
+            .as_ref()
+            .expect("checked output authority")
+            .reserve_historical(&preflight.historical)?;
+        let bytes = bytes
+            .checked_add(historical.retained_bytes())
+            .ok_or(PaneActionAdmissionRefusal::SizeOverflow)?;
+        historical.check_dispatch_fit(bytes)?;
+        let dispatch = crate::FundedPaneAlertDispatch::reserve(bytes)?;
         let mut alerts = Vec::new();
         alerts
             .try_reserve_exact(preflight.count)
@@ -3406,58 +3426,56 @@ impl FundedPaneAlerts {
             return Err(PaneActionAdmissionRefusal::Allocation);
         }
         Ok(Some(Self {
-            reservation: Some(reservation),
-            main: Some(main),
+            dispatch: Some(dispatch),
             output: output.take(),
             alerts,
             text_bytes: preflight.text_bytes,
             terminal: Arc::downgrade(terminal),
+            historical: Some(historical),
         }))
     }
 
-    fn publish(
-        mut self,
-        predecessor: Option<promise::Future<()>>,
-        completion: promise::Promise<()>,
-    ) {
-        let reservation = self.reservation.take().expect("funded batch owns custody");
-        let main = self
-            .main
+    fn publish(mut self, queue: &crate::PaneAlertDispatchQueue) {
+        let dispatch = self
+            .dispatch
             .take()
-            .expect("funded batch owns main-thread admission");
+            .expect("funded batch owns dispatch admission");
         let output = self
             .output
             .take()
             .expect("funded batch owns output authority");
         let alerts = std::mem::take(&mut self.alerts);
         let terminal = self.terminal.clone();
-        let mut completion = PaneAlertCompletion {
-            _successor: completion,
-            delivered: false,
-        };
-        reservation.spawn(async move {
-            // Both an unpolled cancellation and a completed callback release
-            // this link. Later batches wait for actual completion, not enqueue.
-            if let Some(predecessor) = predecessor {
-                let _ = predecessor.await;
-            }
-            wait_for_alert_terminal_unlock(&terminal).await;
-            metrics::counter!("mux.pane_alerts.main_handoff").increment(1);
-            #[cfg(test)]
-            ALERT_MAIN_HANDOFFS.fetch_add(1, Ordering::Release);
-            main.spawn(async move {
+        let mut historical = self.historical.take().expect("funded historical receipts");
+        let mut completion = PaneAlertCompletion { delivered: false };
+        dispatch.publish(
+            queue,
+            async move {
+                wait_for_alert_terminal_unlock(&terminal).await;
+                metrics::counter!("mux.pane_alerts.main_handoff").increment(1);
+                #[cfg(test)]
+                ALERT_MAIN_HANDOFFS.fetch_add(1, Ordering::Release);
+            },
+            async move {
                 for alert in alerts {
+                    if crate::HistoricalAlertDemand::for_alert(&alert).is_some()
+                        && !output.deliver_historical(&mut historical, &alert)
+                    {
+                        return;
+                    }
                     if !output.dispatch_alert(alert) {
                         return;
                     }
+                    historical.finish_delivered().await;
                 }
+                historical.finish().await;
+                drop(output);
                 completion.delivered = true;
                 // Keep the whole guard in this callback until delivery ends;
                 // capturing only the flag would release its FIFO successor early.
                 drop(completion);
-            })
-            .detach();
-        });
+            },
+        );
     }
 }
 
@@ -3476,20 +3494,22 @@ async fn wait_for_alert_terminal_unlock(terminal: &std::sync::Weak<Mutex<Termina
 
 impl Drop for FundedPaneAlerts {
     fn drop(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
+        let Some(dispatch) = self.dispatch.take() else {
             return;
         };
         let output = self.output.take();
-        let main = self.main.take();
+        let historical = self.historical.take();
+        let alerts = std::mem::take(&mut self.alerts);
         let terminal = self.terminal.clone();
         // The global background executor has no main-binding close path and
         // never polls inline. Even cancellation of an unapplied ring entry
         // must not release its lifecycle continuation under a terminal/tab lock.
-        reservation.spawn(async move {
-            wait_for_alert_terminal_unlock(&terminal).await;
-            drop(main);
-            drop(output);
-        });
+        dispatch.retire_after(
+            async move {
+                wait_for_alert_terminal_unlock(&terminal).await;
+            },
+            (output, historical, alerts),
+        );
     }
 }
 
@@ -3552,25 +3572,24 @@ impl Drop for PaneAlertApplication {
         let Some(mut batch) = self.alerts.take() else {
             return;
         };
-        let (predecessor, completion) = {
-            let mut state = self.staging.lock();
-            batch.alerts = state
-                .active
-                .take()
-                .expect("funded alert staging remains installed")
-                .alerts;
-            if batch.alerts.is_empty() {
-                // Ordinary output often changes only the terminal model. It
-                // needs no historical callback or FIFO node. Preserve the last
-                // nonempty tail; funded Drop releases output custody off-thread.
-                drop(state);
-                return;
-            }
-            let mut completion = promise::Promise::<()>::new();
-            let successor = completion.get_future().expect("new completion future");
-            (state.tail.replace(successor), completion)
-        };
-        batch.publish(predecessor, completion);
+        let mut state = self.staging.lock();
+        batch.alerts = state
+            .active
+            .take()
+            .expect("funded alert staging remains installed")
+            .alerts;
+        if batch.alerts.is_empty() {
+            // Ordinary output often changes only the terminal model. It
+            // needs no historical callback or FIFO node. Preserve the last
+            // nonempty tail; funded Drop releases output custody off-thread.
+            drop(state);
+            return;
+        }
+        let dispatch = Arc::clone(&state.dispatch);
+        // Link the successor before releasing staging authority. Scheduling
+        // consumes prepaid credits and never waits for terminal or GUI work.
+        batch.publish(&dispatch);
+        drop(state);
     }
 }
 
@@ -6587,6 +6606,87 @@ mod tests {
             promise::spawn::MainThreadAdmissionLimits::new(32, 1024 * 1024, 0, 0).unwrap(),
         )
         .unwrap();
+        // Exercise the production dispatch owner with a consumer that needs
+        // another reader turn to finish. Publishing must return before that
+        // turn; the second event must still wait for consumer completion.
+        // This is the reader/completion dependency itself, not a native Lua test.
+        let dispatch_queue = crate::PaneAlertDispatchQueue::default();
+        let first_dispatch = crate::FundedPaneAlertDispatch::reserve(4096).unwrap();
+        let second_dispatch = crate::FundedPaneAlertDispatch::reserve(4096).unwrap();
+        let delivery_order = Arc::new(Mutex::new(Vec::new()));
+        let first_started = Arc::new(AtomicBool::new(false));
+        let mut reader_reply = promise::Promise::<()>::new();
+        let consumer_reply = reader_reply.get_future().unwrap();
+        let first_order = Arc::clone(&delivery_order);
+        let started = Arc::clone(&first_started);
+        first_dispatch.publish(&dispatch_queue, std::future::ready(()), async move {
+            started.store(true, Ordering::Release);
+            consumer_reply.await.unwrap();
+            first_order.lock().push(1);
+        });
+        let second_order = Arc::clone(&delivery_order);
+        second_dispatch.publish(&dispatch_queue, std::future::ready(()), async move {
+            second_order.lock().push(2);
+        });
+        pump_until(&executor, || first_started.load(Ordering::Acquire));
+        // A ready successor cannot pass the consumer still awaiting its reply.
+        assert!(delivery_order.lock().is_empty());
+        assert!(reader_reply.result(Ok(())));
+        pump_until(&executor, || delivery_order.lock().len() == 2);
+        assert_eq!(*delivery_order.lock(), [1, 2]);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+        // The first subscriber owns a real Render permit; refusal by the
+        // second must roll it back before any terminal action is performed.
+        let first_subscriber = mux
+            .subscribe_historical_alerts(
+                |_| true,
+                |_| Some((1, 4096)),
+                |_| {
+                    let permit = match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Render,
+                        4096,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(permit) => permit,
+                        _ => return Err(PaneActionAdmissionRefusal::Capacity),
+                    };
+                    Ok(Box::new(move |_, _, completion| {
+                        drop(permit);
+                        drop(completion);
+                    }))
+                },
+            )
+            .unwrap();
+        let refusing_subscriber = mux
+            .subscribe_historical_alerts(
+                |_| true,
+                |_| Some((1, 4096)),
+                |_| Err(PaneActionAdmissionRefusal::Capacity),
+            )
+            .unwrap();
+        let before_title = pane.get_title();
+        let refused = pane
+            .perform_actions(vec![
+                title("must-not-commit"),
+                Action::Control(termwiz::escape::ControlCode::Bell),
+            ])
+            .unwrap_err();
+        assert_eq!(refused.reason, PaneActionAdmissionRefusal::Capacity);
+        assert_eq!(pane.get_title(), before_title);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        drop(refusing_subscriber);
+        // All credits are known to belong to this batch, without consulting
+        // occupancy: 32 Bell consumers plus its dispatcher cannot fit 32 slots.
+        let oversized = pane
+            .perform_actions(vec![
+                Action::Control(termwiz::escape::ControlCode::Bell);
+                32
+            ])
+            .unwrap_err();
+        assert_eq!(oversized.reason, PaneActionAdmissionRefusal::SizeOverflow);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        drop(first_subscriber);
         let tab = Arc::new(crate::tab::Tab::new(&term_size(80, 24)));
         mux.add_tab_no_panes(&tab).unwrap();
         let window = mux.new_empty_window(None, None);
@@ -6594,6 +6694,71 @@ mod tests {
         mux.add_tab_to_window(&tab, window_id).unwrap();
         drop(window);
         tab.assign_pane(&dynamic);
+        // Actual parser batch, two historical events: a pending first
+        // consumer must prevent the second callback from even starting.
+        let held = Arc::new(Mutex::new(None::<crate::HistoricalAlertCompletion>));
+        let historical_names = Arc::new(Mutex::new(Vec::new()));
+        let held_for_callback = Arc::clone(&held);
+        let names_for_callback = Arc::clone(&historical_names);
+        let history = mux
+            .subscribe_historical_alerts(
+                move |window| window == Some(window_id),
+                |_| Some((0, 0)),
+                move |_| {
+                    let held = Arc::clone(&held_for_callback);
+                    let names = Arc::clone(&names_for_callback);
+                    Ok(Box::new(move |_, alert, completion| {
+                        let Alert::SetUserVar { name, .. } = alert else {
+                            panic!("expected user variable")
+                        };
+                        names.lock().push(name);
+                        assert!(held.lock().replace(completion).is_none());
+                    }))
+                },
+            )
+            .unwrap();
+        // An unrelated window must not charge or invoke its admission at all.
+        let unrelated = mux
+            .subscribe_historical_alerts(
+                move |window| window != Some(window_id),
+                |_| Some((usize::MAX, usize::MAX)),
+                |_| panic!("unrelated historical subscriber was admitted"),
+            )
+            .unwrap();
+        let user_var = |name: &str| {
+            Action::OperatingSystemCommand(Box::new(
+                termwiz::escape::osc::OperatingSystemCommand::ITermProprietary(
+                    termwiz::escape::osc::ITermProprietary::SetUserVar {
+                        name: name.into(),
+                        value: "value".into(),
+                    },
+                ),
+            ))
+        };
+        pane.perform_actions(vec![user_var("first"), user_var("second")])
+            .unwrap();
+        pump_until(&executor, || historical_names.lock().len() == 1);
+        while executor.try_tick().unwrap() {}
+        assert_eq!(&*historical_names.lock(), &["first"]);
+        drop(held.lock().take());
+        pump_until(&executor, || historical_names.lock().len() == 2);
+        assert_eq!(&*historical_names.lock(), &["first", "second"]);
+        drop(held.lock().take());
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+        // Retirement cancels an admitted, not-yet-called successor receipt.
+        // Neither that receipt nor its FIFO successor can wait forever.
+        pane.perform_actions(vec![user_var("third"), user_var("cancelled")])
+            .unwrap();
+        pump_until(&executor, || historical_names.lock().len() == 3);
+        drop(history);
+        drop(held.lock().take());
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
+        assert_eq!(&*historical_names.lock(), &["first", "second", "third"]);
+        drop(unrelated);
         let received = Arc::new(Mutex::new(Vec::<Alert>::new()));
         let observed = received.clone();
         let weak_pane = Arc::downgrade(&pane);
