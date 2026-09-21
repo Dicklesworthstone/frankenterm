@@ -2067,6 +2067,8 @@ fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
 #[derive(Clone)]
 struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
+    #[cfg(test)]
+    receive_gate: WriterReceiveGateForTest,
     queued_depth: Arc<AtomicUsize>,
     terminal_state: Arc<AtomicU8>,
     terminal_admission_gate: Arc<AtomicUsize>,
@@ -2483,6 +2485,8 @@ impl WriteCommandSender {
     fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
         Self {
             inner,
+            #[cfg(test)]
+            receive_gate: Arc::new(Mutex::new(None)),
             queued_depth: Arc::new(AtomicUsize::new(0)),
             terminal_state: Arc::new(AtomicU8::new(WRITER_TERMINAL_HEALTHY)),
             terminal_admission_gate: Arc::new(AtomicUsize::new(0)),
@@ -3769,6 +3773,8 @@ impl StorageHandle {
         let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
+        #[cfg(test)]
+        let receive_gate = Arc::clone(&write_tx.receive_gate);
 
         // Retain the dispatcher only for explicitly enabled append telemetry;
         // do not replace the writer thread's ordinary event routing.
@@ -3780,6 +3786,10 @@ impl StorageHandle {
         let writer_handle = thread::Builder::new()
             .name("ft-storage-writer".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                WRITER_RECEIVE_GATE_FOR_TEST.with(|slot| {
+                    *slot.borrow_mut() = Some(receive_gate);
+                });
                 APPEND_TRANSACTION_DISPATCH.with(|slot| {
                     *slot.borrow_mut() = writer_dispatch;
                 });
@@ -7038,6 +7048,18 @@ impl StorageHandle {
     #[must_use]
     pub fn write_queue_capacity(&self) -> usize {
         self.write_tx.max_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_writer_before_receive_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut gate = self.write_tx.receive_gate.lock().expect("writer test gate");
+        assert!(gate.is_none(), "one owned writer barrier at a time");
+        *gate = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     /// Maximum idle read connections retained per database path.
@@ -13583,6 +13605,17 @@ fn close_and_drain_writer_queue(
     }
 }
 
+/// Per-handle test barrier before the real writer receives its next batch.
+#[cfg(test)]
+type WriterReceiveGateForTest =
+    Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static WRITER_RECEIVE_GATE_FOR_TEST: std::cell::RefCell<Option<WriterReceiveGateForTest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Main loop for the writer thread.
 ///
 /// Opportunistically processes burst traffic while preserving caller-visible
@@ -13639,6 +13672,18 @@ fn writer_loop(
     // whether by `Disconnected` (sender dropped) or `Cancelled`
     // (cx-aware shutdown) — terminates the loop cleanly.
     'main: loop {
+        #[cfg(test)]
+        WRITER_RECEIVE_GATE_FOR_TEST.with(|slot| {
+            let gate = slot
+                .borrow()
+                .as_ref()
+                .and_then(|gate| gate.lock().expect("writer test gate").take());
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                // A failing test drops its sender; no writer can be stranded.
+                let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+            }
+        });
         match rx.try_recv() {
             Ok(first_cmd) => {
                 WriteCommandSender::mark_command_dequeued(queued_depth);

@@ -453,6 +453,11 @@ impl CaptureEvent {
         self
     }
 
+    /// Whether this event requires a singleton durable resync decision.
+    pub(crate) fn has_resync_decision(&self) -> bool {
+        self.resync_decision.is_some()
+    }
+
     /// Transfer the optional resync decision to the persistence consumer.
     pub(crate) fn take_resync_decision(&mut self) -> Option<CaptureResyncDecision> {
         self.resync_decision.take()
