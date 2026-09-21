@@ -502,9 +502,97 @@ impl PendingMuxOutput {
 struct RetainedMuxRefresh {
     output: Arc<PendingMuxOutput>,
     reconciliation: Arc<AtomicBool>,
+    geometry: Arc<Mutex<PendingMuxGeometry>>,
+    owner: Weak<Mux>,
     title_pending: Arc<AtomicBool>,
     title: Arc<Mutex<Option<PendingMuxTitleRefresh>>>,
     wake: flume::Sender<()>,
+}
+
+// Both the pending set and one admitted drain fit the enforced window bound.
+// Weak handles do not prolong detached tab/pane lifetimes.
+const MUX_GEOMETRY_RETAINED_BYTES: usize =
+    2 * mux::window::MAX_TABS_PER_ORDERED_WINDOW * std::mem::size_of::<Weak<mux::tab::Tab>>();
+
+struct PendingMuxGeometry {
+    window_id: Option<MuxWindowId>,
+    durable_id: Option<uuid::Uuid>,
+    revision: Option<mux::window::WindowOrderRevision>,
+    attachments: Vec<Weak<mux::tab::Tab>>,
+}
+
+impl Default for PendingMuxGeometry {
+    fn default() -> Self {
+        Self {
+            window_id: None,
+            durable_id: None,
+            revision: None,
+            attachments: Vec::with_capacity(mux::window::MAX_TABS_PER_ORDERED_WINDOW),
+        }
+    }
+}
+
+impl PendingMuxGeometry {
+    fn record(&mut self, owner: &Mux, notification: &MuxNotification, window_id: MuxWindowId) {
+        let MuxNotification::WindowTopologyChanged(change) = notification else { return };
+        let Some(window) = change.windows().iter().find(|window| window.window_id() == window_id) else { return };
+        let Some(current) = owner.get_window(window_id) else { self.attachments.clear(); return };
+        let durable_id = current.durable_id();
+        let current_tabs: HashSet<_> = current.iter().map(Arc::as_ptr).collect();
+        drop(current);
+        if self.window_id != Some(window_id) || self.durable_id != Some(durable_id) {
+            self.attachments.clear();
+            self.revision = None;
+            self.window_id = Some(window_id);
+            self.durable_id = Some(durable_id);
+        }
+        if self.revision.is_some_and(|revision| revision > window.order_revision()) {
+            return;
+        }
+        self.revision = Some(window.order_revision());
+        let live: HashSet<_> = window.ordered_tabs().iter().map(Arc::as_ptr).collect();
+        self.attachments.retain(|tab| live.contains(&tab.as_ptr()) && current_tabs.contains(&tab.as_ptr()));
+        for &(tab_id, destination) in change.attached_tabs() {
+            if destination != window_id { continue; }
+            if let Some(tab) = window.ordered_tabs().iter().find(|tab| tab.tab_id() == tab_id) {
+                if !current_tabs.contains(&Arc::as_ptr(tab)) { continue; }
+                if !self.attachments.iter().any(|retained| retained.as_ptr() == Arc::as_ptr(tab)) {
+                    self.attachments.push(Arc::downgrade(tab));
+                }
+            }
+        }
+        debug_assert!(self.attachments.len() <= mux::window::MAX_TABS_PER_ORDERED_WINDOW);
+    }
+
+    fn take(&mut self, window_id: MuxWindowId) -> Option<(uuid::Uuid, Vec<Weak<mux::tab::Tab>>)> {
+        if self.window_id != Some(window_id) { return None; }
+        Some((self.durable_id?, self.attachments.drain(..).collect()))
+    }
+}
+
+fn current_attached_tabs(
+    owner: &Mux,
+    window_id: MuxWindowId,
+    pending: &Option<(uuid::Uuid, Vec<Weak<mux::tab::Tab>>)>,
+) -> Vec<Arc<mux::tab::Tab>> {
+    let Some((durable_id, pending)) = pending else { return Vec::new() };
+    let Some(window) = owner.get_window(window_id) else { return Vec::new() };
+    if window.durable_id() != *durable_id { return Vec::new(); }
+    let tabs: Vec<_> = pending.iter().filter_map(Weak::upgrade)
+        .filter(|tab| window.iter().any(|live| Arc::ptr_eq(live, tab)))
+        .collect();
+    drop(window);
+    tabs.into_iter().filter(|tab| owner.get_tab(tab.tab_id()).is_some_and(|live| Arc::ptr_eq(&live, tab))).collect()
+}
+
+fn attached_tab_geometry(size: TerminalSize, tabs: &[Arc<mux::tab::Tab>]) -> TerminalSize {
+    let mut target = size;
+    for tab in tabs {
+        let tab_size = tab.get_size();
+        target.rows = target.rows.max(tab_size.rows);
+        target.cols = target.cols.max(tab_size.cols);
+    }
+    target
 }
 
 impl RetainedMuxRefresh {
@@ -516,11 +604,22 @@ impl RetainedMuxRefresh {
                     alert: Alert::PaletteChanged | Alert::ImageAltText { .. },
                     ..
                 }
-        ) || TermWindow::mux_notification_reconciles_window(notification, window_id)
+        ) || matches!(notification,
+            MuxNotification::TabAddedToWindow { .. } | MuxNotification::WindowTopologyChanged(_)
+        ) && TermWindow::mux_notification_targets_window(notification, window_id)
+            || TermWindow::mux_notification_reconciles_window(notification, window_id)
             || TermWindow::mux_notification_only_refreshes_title(notification)
     }
 
     fn record(&self, notification: &MuxNotification, window_id: MuxWindowId) -> bool {
+        if matches!(notification, MuxNotification::TabAddedToWindow { .. } | MuxNotification::WindowTopologyChanged(_)) {
+            // Legacy numeric-only TabAdded is a current-state wake, never
+            // authority to resize a potentially reused tab allocation.
+            if let Some(owner) = self.owner.upgrade() {
+                self.geometry.lock().unwrap_or_else(|p| p.into_inner()).record(&owner, notification, window_id);
+            }
+            self.reconciliation.store(true, Ordering::Release);
+        }
         if !self.output.record_notification(notification) {
             if TermWindow::mux_notification_reconciles_window(notification, window_id) {
                 self.reconciliation.store(true, Ordering::Release);
@@ -903,6 +1002,7 @@ pub enum TermWindowNotif {
         invalidations: MuxOutputInvalidations,
         title_refresh: Option<PendingMuxTitleRefresh>,
         reconcile: bool,
+        attached_tabs: Option<(uuid::Uuid, Vec<Weak<mux::tab::Tab>>)>,
         actions: Arc<::window::AdmittedWindowActions>,
     },
     RenderWake {
@@ -5167,6 +5267,7 @@ impl TermWindow {
                 invalidations,
                 title_refresh,
                 reconcile,
+                attached_tabs,
                 actions,
             } => {
                 let Some(owner) = mux_owner.upgrade() else {
@@ -5204,6 +5305,17 @@ impl TermWindow {
                 // state admission through the ordinary paced native repaint.
                 actions.request_repaint();
                 if reconcile {
+                    let tabs = current_attached_tabs(&owner, self.mux_window_id, &attached_tabs);
+                    let size = attached_tab_geometry(self.terminal_size, &tabs);
+                    if size != self.terminal_size {
+                        self.set_window_size(size, window)?;
+                    } else {
+                        for tab in tabs {
+                            if tab.get_size() != self.terminal_size {
+                                tab.resize(self.terminal_size);
+                            }
+                        }
+                    }
                     self.prune_tab_state_to_live_window();
                     self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                     actions.request_repaint();
@@ -6188,10 +6300,11 @@ impl TermWindow {
         let pending_title_refresh = Arc::new(AtomicBool::new(false));
         let retained_title_refresh = Arc::new(Mutex::new(None));
         let pending_reconciliation = Arc::new(AtomicBool::new(false));
+        let pending_geometry = Arc::new(Mutex::new(PendingMuxGeometry::default()));
         // Reserve retry ownership before accepting the subscription. The
         // capacity-one channel stores only a level-triggered output bit;
         // structural notifications retain their existing ordered path below.
-        let output_worker = promise::spawn::try_reserve_background_task(4 * 1024)
+        let output_worker = promise::spawn::try_reserve_background_task(4 * 1024 + MUX_GEOMETRY_RETAINED_BYTES)
             .context("reserving GUI pane-output retry owner")?;
         let render_worker = promise::spawn::try_reserve_background_task(8 * 1024)
             .context("reserving GUI render-wake retry owner")?;
@@ -6209,6 +6322,8 @@ impl TermWindow {
         let retained_refresh = RetainedMuxRefresh {
             output: Arc::clone(&output_interest),
             reconciliation: Arc::clone(&pending_reconciliation),
+            geometry: Arc::clone(&pending_geometry),
+            owner: Arc::downgrade(&mux),
             title_pending: pending_title_refresh,
             title: Arc::clone(&retained_title_refresh),
             wake: output_tx.clone(),
@@ -6358,7 +6473,7 @@ impl TermWindow {
                 if matches!(
                     &n,
                     MuxNotification::WindowRemoved(window_id) if *window_id == mux_window_id
-                ) {
+                ) || matches!(&n, MuxNotification::WindowTopologyChanged(change) if change.removed_windows().binary_search(&mux_window_id).is_ok()) {
                     // This notification is sufficient to retire the subscriber
                     // synchronously.  Do not enqueue a GUI-thread callback and
                     // wait for some later notification to observe `dead`.
@@ -6518,6 +6633,7 @@ impl TermWindow {
                                 invalidations: output_interest.take_invalidations(),
                                 interest: output_interest.take(),
                                 reconcile: pending_reconciliation.swap(false, Ordering::AcqRel),
+                                attached_tabs: pending_geometry.lock().unwrap_or_else(|p| p.into_inner()).take(mux_window_id),
                                 title_refresh: retained_title_refresh
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
@@ -11017,7 +11133,7 @@ mod tests {
             &notification,
             window_id,
         ));
-        assert!(!super::RetainedMuxRefresh::handles(
+        assert!(super::RetainedMuxRefresh::handles(
             &notification,
             window_id
         ));
@@ -11843,6 +11959,125 @@ mod tests {
     }
 
     #[test]
+    fn retained_attachment_geometry_survives_pressure_without_growing_from_hidden_tabs() {
+        if run_scheduler_test_in_child("retained_attachment_geometry_survives_pressure_without_growing_from_hidden_tabs") { return; }
+        use promise::spawn::{MainThreadAdmissionLimits, MainThreadReservationOutcome, MainThreadServiceClass, SimpleExecutor, try_reserve_main_thread};
+        use std::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let exec = SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap()).unwrap();
+        let owner = Arc::new(mux::Mux::new(None));
+        mux::Mux::set_mux(&owner);
+        let activity = mux::activity::Activity::new_for_mux(&owner);
+        let window = owner.new_empty_window(None, None);
+        let window_id = *window;
+        let grid = wezterm_term::TerminalSize { rows: 24, cols: 80, ..Default::default() };
+        let hidden = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize { rows: 70, cols: 200, ..grid }));
+        owner.add_tab_no_panes(&hidden).unwrap();
+        owner.add_tab_to_window(&hidden, window_id).unwrap();
+        let geometry = Arc::new(Mutex::new(super::PendingMuxGeometry::default()));
+        let (wake, receive) = flume::bounded(1);
+        let retained = super::RetainedMuxRefresh {
+            output: Arc::new(super::PendingMuxOutput::new()),
+            reconciliation: Arc::new(AtomicBool::new(false)),
+            geometry: Arc::clone(&geometry),
+            owner: Arc::downgrade(&owner),
+            title_pending: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(None)),
+            wake,
+        };
+        let seen = Arc::new(AtomicUsize::new(0));
+        let callback_seen = Arc::clone(&seen);
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let subscription = owner.subscribe(move |notification| {
+            if super::RetainedMuxRefresh::handles(&notification, window_id) {
+                if matches!(&notification, mux::MuxNotification::WindowTopologyChanged(_)) {
+                    *capture.lock().unwrap() = Some(notification.clone());
+                }
+                callback_seen.fetch_add(1, Ordering::AcqRel);
+                return retained.record(&notification, window_id);
+            }
+            true
+        }).unwrap();
+        let occupying = match try_reserve_main_thread(MainThreadServiceClass::Render, 4096) {
+            MainThreadReservationOutcome::Reserved(value) => value,
+            other => panic!("expected occupying reservation: {other:?}"),
+        };
+        let identity = occupying.admission_receipt();
+        let small = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize { rows: 20, cols: 70, ..grid }));
+        owner.add_tab_no_panes(&small).unwrap();
+        owner.add_tab_to_window(&small, window_id).unwrap();
+        let stale = captured.lock().unwrap().clone().unwrap();
+        owner.notify(mux::MuxNotification::TabAddedToWindow { tab_id: hidden.tab_id(), window_id });
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let worker_delivered = Arc::clone(&delivered);
+        let worker_geometry = Arc::clone(&geometry);
+        let worker_owner = Arc::clone(&owner);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let worker_targets = Arc::clone(&targets);
+        let (attempted, attempts) = flume::bounded(2);
+        let worker = std::thread::spawn(move || {
+            promise::spawn::block_on(super::run_mux_output_refresh(receive, identity, || {
+                let _ = attempted.try_send(());
+                true
+            }, |reservation| {
+                let pending = worker_geometry.lock().unwrap().take(window_id);
+                let owner = Arc::clone(&worker_owner);
+                let delivered = Arc::clone(&worker_delivered);
+                let targets = Arc::clone(&worker_targets);
+                reservation.spawn(async move {
+                    let tabs = super::current_attached_tabs(&owner, window_id, &pending);
+                    let target = super::attached_tab_geometry(grid, &tabs);
+                    for tab in tabs { tab.resize(target); }
+                    targets.lock().unwrap().push(target);
+                    delivered.fetch_add(1, Ordering::AcqRel);
+                })
+            }, None, None));
+        });
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(delivered.load(Ordering::Acquire), 0);
+        drop(occupying);
+        let tick_until = |count| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while delivered.load(Ordering::Acquire) < count {
+                assert!(Instant::now() < deadline, "retained geometry failed to drain");
+                let _ = exec.try_tick().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        tick_until(1);
+        assert_eq!(targets.lock().unwrap()[0], grid);
+        assert_eq!(small.get_size(), grid);
+        assert_eq!(hidden.get_size().cols, 200, "unrelated tab must not supply geometry");
+        let larger = Arc::new(mux::tab::Tab::new(&wezterm_term::TerminalSize { rows: 40, cols: 110, ..grid }));
+        owner.add_tab_no_panes(&larger).unwrap();
+        owner.add_tab_to_window(&larger, window_id).unwrap();
+        tick_until(2);
+        assert_eq!(targets.lock().unwrap()[1].cols, 110);
+        assert!(seen.load(Ordering::Acquire) >= 3, "subscriber must survive saturation and legacy event");
+        // An old exact attachment cannot resize a tab that has left the window.
+        owner.remove_tab(small.tab_id());
+        let mut pending = super::PendingMuxGeometry::default();
+        pending.record(&owner, &stale, window_id);
+        assert!(super::current_attached_tabs(&owner, window_id, &pending.take(window_id)).is_empty());
+        // A batch from another window incarnation has no authority here.
+        let wrong_owner = Some((uuid::Uuid::new_v4(), vec![Arc::downgrade(&larger)]));
+        assert!(super::current_attached_tabs(&owner, window_id, &wrong_owner).is_empty());
+        assert!(owner.unsubscribe(subscription));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "retained worker did not stop");
+            let _ = exec.try_tick().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().unwrap();
+        drop(window);
+        drop(activity);
+        mux::Mux::shutdown();
+    }
+
+    #[test]
     fn mux_output_refresh_survives_saturation_without_an_unrelated_wake() {
         if run_scheduler_test_in_child(
             "mux_output_refresh_survives_saturation_without_an_unrelated_wake",
@@ -12483,6 +12718,8 @@ mod tests {
         let retained_refresh = super::RetainedMuxRefresh {
             output: Arc::clone(&retained_output),
             reconciliation: Arc::clone(&retained_reconciliation),
+            geometry: Arc::new(Mutex::new(super::PendingMuxGeometry::default())),
+            owner: Arc::downgrade(mux),
             title_pending: Arc::new(AtomicBool::new(false)),
             title: Arc::clone(&retained_title),
             wake,
