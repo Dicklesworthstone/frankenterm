@@ -18260,6 +18260,7 @@ mod tests {
         );
         let mut cancelled_requests = 0_usize;
         let mut rejected_requests = 0_usize;
+        let mut waiter_cancellations = 0_u64;
         for doomed_request in doomed_requests {
             let (request_result, request_leases) = doomed_request
                 .join()
@@ -18269,8 +18270,17 @@ mod tests {
             let error =
                 request_result.expect_err("epoch-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:invalidated-epoch-") {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else if error.code == MCP_ERR_TIMEOUT {
+                // Epoch invalidation cancels the Cx shared by the task and
+                // its response waiter. Either may observe cancellation first;
+                // the waiter returns the canonical envelope, not our label.
+                assert_eq!(error.message, "Request timed out or was cancelled");
+                waiter_cancellations = waiter_cancellations.saturating_add(1);
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
                 assert!(
                     error
                         .message
@@ -18351,6 +18361,7 @@ mod tests {
         assert_eq!(stopped.request_jobs_cancelled_for_shutdown, 0);
         assert_eq!(stopped.request_jobs_rejected_for_epoch, 1);
         assert_eq!(stopped.request_jobs_rejected_for_shutdown, 0);
+        assert_eq!(stopped.request_waiter_cancellations, waiter_cancellations);
 
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -19392,15 +19403,40 @@ mod tests {
                     .await
                     .unwrap()
             );
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(probe_lease) = reservation
+            else {
+                panic!("stale finalization must leave durable retryability: {reservation:?}");
+            };
+            assert!(
+                storage.release_event_delivery(&probe_lease).await.unwrap(),
+                "release the exact probe token before the unchanged await request"
+            );
             storage.shutdown().await.unwrap();
         });
 
         let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let page_scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed_page_scans = Arc::clone(&page_scans);
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
-        );
+        )
+        .with_iteration_observer(Arc::new(move |phase, scanned_event_id| {
+            if phase == super::McpAwaitEventIterationPhase::PageScan && scanned_event_id == event_id
+            {
+                observed_page_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
         tool.wait_for_delivery_completion_ready_for_test();
+        let completion_stats = tool
+            .delivery_completion
+            .as_ref()
+            .expect("claim-completion executor must exist")
+            .stats_for_test();
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -19417,6 +19453,13 @@ mod tests {
             .expect("event must remain retryable after stale-token finalization returns false"),
         );
         assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(
+            envelope["data"]["satisfied"],
+            true,
+            "retryable event was not satisfied; envelope={envelope}; page_scans={}; service={:?}",
+            page_scans.load(std::sync::atomic::Ordering::Relaxed),
+            completion_stats.snapshot(),
+        );
         assert_eq!(envelope["data"]["final_cursor"], 0);
         assert_eq!(envelope["data"]["candidate_cursor"], event_id);
         assert_eq!(envelope["data"]["pending_finalize"], true);
