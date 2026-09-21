@@ -6639,17 +6639,36 @@ mod tests {
         });
         // The first subscriber owns a real Render permit; refusal by the
         // second must roll it back before any terminal action is performed.
+        struct SubscriberPermit {
+            permit: Option<promise::spawn::MainThreadSpawnReservation>,
+            released: Arc<AtomicUsize>,
+        }
+        impl Drop for SubscriberPermit {
+            fn drop(&mut self) {
+                drop(self.permit.take());
+                self.released.fetch_add(1, Ordering::Release);
+            }
+        }
+        let subscriber_admissions = Arc::new(AtomicUsize::new(0));
+        let subscriber_releases = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::clone(&subscriber_admissions);
+        let released = Arc::clone(&subscriber_releases);
         let first_subscriber = mux
             .subscribe_historical_alerts(
                 |_| true,
                 |_| Some((1, 4096)),
-                |_| {
+                move |_| {
                     let permit = match promise::spawn::try_reserve_main_thread(
                         promise::spawn::MainThreadServiceClass::Render,
                         4096,
                     ) {
                         promise::spawn::MainThreadReservationOutcome::Reserved(permit) => permit,
                         _ => return Err(PaneActionAdmissionRefusal::Capacity),
+                    };
+                    admitted.fetch_add(1, Ordering::Release);
+                    let permit = SubscriberPermit {
+                        permit: Some(permit),
+                        released: Arc::clone(&released),
                     };
                     Ok(Box::new(move |_, _, completion| {
                         drop(permit);
@@ -6673,8 +6692,20 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(refused.reason, PaneActionAdmissionRefusal::Capacity);
+        assert_eq!(refused.actions.len(), 2);
         assert_eq!(pane.get_title(), before_title);
+        assert_eq!(subscriber_admissions.load(Ordering::Acquire), 1);
+        assert_eq!(subscriber_releases.load(Ordering::Acquire), 1);
+        // Output authority reserves its ordinary notification drain before
+        // historical admission. That queued task is not a leaked subscriber
+        // permit: the witness above proves rollback before any executor turn.
+        assert!(mux.pane_output_drain_scheduled.load(Ordering::Acquire));
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
         assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert!(!mux.pane_output_drain_scheduled.load(Ordering::Acquire));
         drop(refusing_subscriber);
         // All credits are known to belong to this batch, without consulting
         // occupancy: 32 Bell consumers plus its dispatcher cannot fit 32 slots.
@@ -6685,7 +6716,16 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(oversized.reason, PaneActionAdmissionRefusal::SizeOverflow);
+        assert_eq!(oversized.actions.len(), 32);
+        assert_eq!(subscriber_admissions.load(Ordering::Acquire), 1);
+        assert_eq!(subscriber_releases.load(Ordering::Acquire), 1);
+        assert!(mux.pane_output_drain_scheduled.load(Ordering::Acquire));
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+        pump_until(&executor, || {
+            executor.admission_snapshot().active_tasks == 0
+        });
         assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        assert!(!mux.pane_output_drain_scheduled.load(Ordering::Acquire));
         drop(first_subscriber);
         let tab = Arc::new(crate::tab::Tab::new(&term_size(80, 24)));
         mux.add_tab_no_panes(&tab).unwrap();
