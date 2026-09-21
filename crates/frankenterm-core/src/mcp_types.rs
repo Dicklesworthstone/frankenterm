@@ -1252,6 +1252,7 @@ pub(super) struct McpEventMutationData {
 // ── IPC pane state (internal) ────────────────────────────────────────────
 
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct IpcPaneState {
     pub pane_id: u64,
     pub known: bool,
