@@ -12467,7 +12467,12 @@ mod tests {
             };
             let client = connect().unwrap();
             let started = if case == "exhausted" {
-                Instant::now() - (GUARDIAN_CONNECT_RETRY_BUDGET - Duration::from_millis(200))
+                let elapsed = GUARDIAN_CONNECT_RETRY_BUDGET
+                    .checked_sub(Duration::from_millis(200))
+                    .expect("retry budget exceeds the remaining test window");
+                Instant::now()
+                    .checked_sub(elapsed)
+                    .expect("monotonic clock supports the retry test interval")
             } else {
                 Instant::now()
             };
