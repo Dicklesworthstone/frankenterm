@@ -5,6 +5,7 @@ RUST_MIN_STACK = "16777216"
 
 [build]
 rustflags = ["-Z", "threads=4"]
+fingerprint = "content"
 
 # RCH and DSR preserve source timestamps while reusing compilation directories.
 # A different snapshot can therefore contain changed files older than cached
