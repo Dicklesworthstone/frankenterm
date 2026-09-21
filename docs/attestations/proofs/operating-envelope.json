@@ -3,7 +3,7 @@
   "kind": "operating-envelope-convergence-attestation",
   "category": "proofs/robot-contracts",
   "release_version": "0.0.0-substrate",
-  "generated_at": "2026-09-21T17:53:11Z",
+  "generated_at": "2026-09-21T18:57:59Z",
   "produced_by_bead": "ft-booek.7",
   "status": "scoped_remote_and_development_integrity_verified",
   "current_proof": {
@@ -18,16 +18,16 @@
       "controlled_fixture_records": {"count": 10, "path": "rc53-operating-envelope-fixture-records.jsonl"}
     },
     "current_mcp_results": {
-      "job": "j-30023644042233721",
+      "job": "j-30023644042233729",
       "worker": "ts1",
       "worker_host": "ubuntu@100.74.254.33",
-      "sync_hash": "83e573730840008b",
-      "log": "rc55-registry-phases-full-rch.log",
+      "sync_hash": "01e3da8f8db2804f",
+      "log": "rc55-manifest-capability-imports-full-rch.log",
       "passed": 3,
       "tests": ["operating_envelope_tool_explains_reason_code", "operating_envelope_tool_rejects_execute_attempt", "operating_envelope_tool_returns_dry_run_status"],
-      "aggregate": {"passed": 31901, "failed": 7, "ignored": 5, "exit_code": 101},
-      "source_fences": ["rc55-registry-phases-source.sha256", "rc55-registry-phases-remote-before.sha256", "rc55-registry-phases-remote-after.sha256"],
-      "source_boundary": "Eight-file local/before/after worker hashes agree, including mcp_tools.rs. This is scoped source proof, not an exact whole-workspace tree receipt. The aggregate failed unrelated await-event and snapshot tests; only the three named MCP outcomes are counted here."
+      "aggregate": {"passed": 31912, "failed": 0, "ignored": 5, "filtered_out": 0, "test_threads": 64, "duration_seconds": 150.38, "exit_code": 0},
+      "source_fences": ["rc55-manifest-capability-imports-source.sha256", "rc55-manifest-capability-imports-remote-before.sha256", "rc55-manifest-capability-imports-remote-after.sha256"],
+      "source_boundary": "Eight-file local/before/after worker hashes agree, including the final b24011a4 MCP source inventory below. All 31912 executed full-core library tests passed with 64 test threads; five tests were ignored. This is scoped source proof, not an exact whole-workspace tree receipt or native executable qualification."
     },
     "manifest_completeness": {
       "job": "j-30023644042233725",
@@ -49,6 +49,10 @@
   },
   "proof_categories": [4, 5],
   "retained_evidence_sha256": {
+    "rc55-manifest-capability-imports-full-rch.log": "1ee452c628a466fe2c0f23283959cd0264fef1f106b94a910554dd74aee0dec0",
+    "rc55-manifest-capability-imports-source.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
+    "rc55-manifest-capability-imports-remote-before.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
+    "rc55-manifest-capability-imports-remote-after.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
     "rc53-envelope-cli-ts1-rch-attempt2.log": "699cb2881935553a4a12f0ec97fe66f1e5a5d51893a909e57c44679eefb1eea5",
     "rc53-envelope-mcp-ts1-rch.log": "47807dbf21d7fd6fca220b328d5a77bbdccf3b901900b063afb95d70358a36af",
     "rc53-envelope-records-ts1-rch.log": "c6a02f82cbb605fdeddc7f6fa169f6ed585780dd4452f9380a6f531de6b08e46",
@@ -64,7 +68,7 @@
   },
   "current_source_sha256": {
     "README.md": "171da9f5812c4a6f319e1aaf361a24fe0023c73e1c89a723f087699666bf1dd5",
-    "crates/frankenterm-core/src/mcp_tools.rs": "a7e4dce09b44b9825a23b6aee59f72e3c5d2fec10549d8e1424e93acdfdf7558",
+    "crates/frankenterm-core/src/mcp_tools.rs": "b24011a4dd1d55755f713983055a0795b192ab5e3271794f397ebb364b6d66ee",
     "crates/frankenterm-core/src/operating_envelope.rs": "7d1d05c1369f392fc7d764126d062c5e5fd2a5004a6458eef9dae5520a96e4e0",
     "crates/frankenterm-core/tests/attestation_manifest_completeness.rs": "8c3fc0eee299de17d094838ff28f060db1d87fd63e6e06f29cfac606640efd4a",
     "crates/frankenterm-core/tests/operating_envelope_schema.rs": "cb8b0478cfd60ed71919912ee4531549beea5b0e0d3df1ce2bdbf6029c2f11e3",
@@ -98,8 +102,8 @@
     "tests/e2e/test_operating_envelope_fixture_manifest.sh": "5ba6e1dea19ed8b948dd26d3302941d00d3425817d83a4e045d31813040aca15"
   },
   "current_inventory_verification": {
-    "verified_at": "2026-09-21T17:57:00Z",
-    "identity": "The 33 SHA-256 values in current_source_sha256 and twelve retained_evidence_sha256 values identify the recorded source and evidence inventory; no whole-workspace commit equivalence is asserted.",
+    "verified_at": "2026-09-21T18:57:59Z",
+    "identity": "The 33 SHA-256 values in current_source_sha256 and sixteen retained_evidence_sha256 values identify the recorded source and evidence inventory; no whole-workspace commit equivalence is asserted.",
     "manifest_binding": "The selected docs/attestations/manifest.json now resolves this producer only. Its exact hash is bound externally by the development bundle; it is deliberately excluded from current_source_sha256. All 32 slots and required categories are preserved, and Lindley, redaction and Doctor remain deferred.",
     "boundary": "Recheck these hashes after source edits. The eight-file RCH fence qualifies the named MCP results only; inventory hashing is not additional runtime proof. Selected-manifest Cargo completeness passed with the actual closed producer export.",
     "closure_metadata": "The first selected-manifest run retained the actual in-progress producer export and correctly failed its closure predicate (16 passed, one failed). After closing ft-booek.7 and exporting the real graph, j-30023644042233725 passed all 17 tests. Embedded fallback metadata agrees with that closed graph; generic producer-closure predicates and negative controls are unchanged."
@@ -207,7 +211,7 @@
     {
       "claim_id": "operating_envelope.release_attestation_wiring",
       "bead_id": "ft-booek.7",
-      "readiness_state": "development_integrity_verified_pending_current_manifest_completeness",
+      "readiness_state": "development_integrity_and_manifest_completeness_verified",
       "evidence": [
         "docs/attestations/manifest.json",
         "docs/attestations/proofs/operating-envelope.json",
@@ -499,18 +503,13 @@
       "verify_exit_code": 0,
       "artifact_count": 29,
       "deferred_slot_count": 3,
-      "bundle": "/private/var/tmp/ft-release-20260921/operating-envelope-wired-final/0.0.0-dev.json",
-      "build_log": "/private/var/tmp/ft-release-20260921/operating-envelope-wired-final-build.log",
-      "verify_log": "/private/var/tmp/ft-release-20260921/operating-envelope-wired-final-verify.json",
-      "ft_verify_log": "/private/var/tmp/ft-release-20260921/operating-envelope-wired-final-ft-verify.json",
-      "ft_verify_exit_code": 0,
-      "ft_executable": "/private/var/tmp/ft-release-20260921/rc53-native-dsr-state/artifacts/519230ea-0785-48da-8de3-41de017d732f-darwin-arm64.khyn399c/ft",
-      "ft_executable_sha256": "0f747cdec0272aad070e134dc6afd523f60406ce4380ca690c0f0df787bea2c6",
-      "ft_dsr_run": "519230ea-0785-48da-8de3-41de017d732f",
+      "bundle": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final/0.0.0-dev.json",
+      "build_log": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final-build.log",
+      "verify_log": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final-verify.json",
       "verification_mode": "development_integrity",
       "publisher_authenticated": false,
       "release_ready": false,
-      "boundary": "Unsigned development verification of selected on-disk artifact bytes, not a clean-source release binding. The retained RC53 CLI dispatches the current repository shell verifier; it is not a rebuilt RC55 verifier. Lindley, redaction and Doctor remain deferred. Root must run current selected-manifest completeness before producer closure and final DSR/signing qualification before publication. Bundle hashes are retained outside this artifact to avoid a self-referential hash cycle."
+      "boundary": "Unsigned development verification of selected on-disk artifact bytes by the existing shell assembler and verifier, not a clean-source release binding or native CLI execution proof. Selected-manifest completeness passed with the actual closed producer graph. Lindley, redaction and Doctor remain deferred, and final DSR/signing qualification is required before publication. Bundle hashes are retained outside this artifact to avoid a self-referential hash cycle."
     }
   }
 }
