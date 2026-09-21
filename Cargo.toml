@@ -93,6 +93,7 @@ members = [
 exclude = [
     "frankenterm/char-props/codegen",
     "frankenterm/bidi/generate",
+    "vendor/libssh-rs-sys",
 ]
 
 # Limit default workspace operations (check/clippy/test) to the ft crates.
@@ -688,8 +689,8 @@ strip = "none"
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 
-# [patch.crates-io] redirects crates.io-sourced deps to pinned upstream GitHub revs
-# so the graph single-sources and resolves on any machine (CI runners, cargo install,
+# [patch.crates-io] redirects crates.io-sourced deps to pinned upstream revisions
+# or committed relative vendor paths so the graph resolves on any machine (cargo install,
 # external contributors). Do NOT use absolute /dp/... path patches: they break every
 # build outside the dev fleet (and CI's --locked jobs), since /dp only exists there.
 #
@@ -697,6 +698,9 @@ debug = 1
 # [workspace.dependencies]. Git-pinned integrations resolve their own declared
 # versions; keep those aligned before passing runtime types across crate boundaries.
 [patch.crates-io]
+# Preserve dependency-owned static OpenSSL/zlib linkage in vendored libssh.
+# Published crate identity and local changes: vendor/libssh-rs-sys/README.md.
+libssh-rs-sys = { path = "vendor/libssh-rs-sys" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
