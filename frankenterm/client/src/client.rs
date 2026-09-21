@@ -3037,6 +3037,20 @@ impl RpcGenerationScope {
             .begin_consumer_commit(generation, consumer)
     }
 
+    /// Refuse further work on this exact reader after an unrecoverable
+    /// application failure, including after readiness has already committed.
+    /// Unlike a readiness participant, this revokes admission immediately.
+    pub(crate) fn abort_exact_generation(&self, reason: &'static str) -> bool {
+        let Some(authority) = self.reader_abort.as_ref() else {
+            return false;
+        };
+        if self.generation != Some(authority.generation) {
+            return false;
+        }
+        self.rpc_transport
+            .request_generation_abort(authority, reason)
+    }
+
     pub(crate) fn abort_guard(
         &self,
         reason: &'static str,
@@ -13715,6 +13729,7 @@ mod tests {
     #[test]
     fn stale_generation_abort_authority_cannot_revoke_successor() {
         let (client, receiver) = client_with_idle_rpc_queue();
+        let first_scope = client.rpc_scope();
         let authority = client.test_dispatch_authority(Weak::new());
         let first_generation = authority
             .rpc_transport
@@ -13742,6 +13757,12 @@ mod tests {
             .rpc_transport
             .reader_abort_for(successor_generation)
             .expect("successor has fresh reader abort authority");
+
+        assert!(!first_scope.abort_exact_generation("stale application refusal"));
+        assert!(client
+            .rpc_scope()
+            .commit_sync(RpcConsumerKind::PaneUnilateral, || ())
+            .is_ok());
 
         assert!(!authority
             .rpc_transport
@@ -14192,6 +14213,23 @@ mod tests {
         let state = authority.state.lock();
         assert_eq!(state.participants, 0);
         assert_eq!(state.phase, RpcReadinessAuthorityPhase::Ready);
+    }
+
+    #[test]
+    fn ready_application_refusal_aborts_exact_generation() {
+        let (scope, _receiver, rpc_transport) = pending_readiness_scope_for_test();
+        rpc_transport.mark_current_generation_ready_for_test();
+        assert!(scope
+            .commit_sync(RpcConsumerKind::PaneUnilateral, || ())
+            .is_ok());
+        assert!(scope.abort_exact_generation("ready application admission refused"));
+        assert!(scope
+            .commit_sync(RpcConsumerKind::PaneUnilateral, || ())
+            .is_err());
+        assert_eq!(
+            scope.reader_abort.as_ref().unwrap().cause(),
+            Some("ready application admission refused")
+        );
     }
 
     #[test]

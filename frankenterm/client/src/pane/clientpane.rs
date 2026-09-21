@@ -3838,9 +3838,7 @@ impl ClientPane {
                 if !matches!(reason, mux::pane::PaneActionAdmissionRefusal::Capacity) {
                     // A permanent refusal cannot become an unbounded retry of
                     // the identical render batch on this connection generation.
-                    if let Ok(abort) = rpc.abort_guard("historical render admission refused") {
-                        drop(abort);
-                    }
+                    rpc.abort_exact_generation("historical render admission refused");
                 }
                 guard.nack();
                 return ClientRenderApplicationDisposition::Settlement(render_application_nack(
@@ -4118,7 +4116,7 @@ impl ClientPane {
                         // Legacy alerts have no replay/NACK authority. A failed
                         // pre-mutation admission must retire this exact stream,
                         // never silently acknowledge and lose its history.
-                        let _abort = rpc.abort_guard("historical alert admission refused")?;
+                        rpc.abort_exact_generation("historical alert admission refused");
                         bail!("historical alert admission refused before mutation: {reason:?}");
                     }
                 };
