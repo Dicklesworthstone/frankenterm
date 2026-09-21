@@ -589,10 +589,10 @@ fn snapshot_diagnostic_projections_are_content_free() {
     } = &mut shutdown_error
     {
         *wait_boundary_exhausted = true;
-        *source = Box::new(SnapshotError::AuthorityReconciliationRequired {
+        **source = SnapshotError::AuthorityReconciliationRequired {
             operation: SnapshotAuthorityOperation::ShutdownMark,
             first_indeterminate_operation: Some(SnapshotAuthorityOperation::CheckpointCommit),
-        });
+        };
     }
     let timed_out_debug = format!("{shutdown_error:?}");
     assert!(timed_out_debug.contains("wait_boundary_exhausted: true"));
