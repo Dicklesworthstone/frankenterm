@@ -1,0 +1,5 @@
+{"path": ".beads/issues.jsonl", "sha256": "d24101067ae610fb27956fc0509035bb061a2221049d16d8abbee1630d53f9ef"}
+{"path": "crates/frankenterm-core/tests/attestation_manifest_completeness.rs", "sha256": "8c3fc0eee299de17d094838ff28f060db1d87fd63e6e06f29cfac606640efd4a"}
+{"path": "docs/attestations/manifest.json", "sha256": "3db2d2823f0a94a7477f5c994e3f84c3b71b0c8f3800ebd51aaaf2ea5042cbb0"}
+{"path": "docs/attestations/proofs/operating-envelope.json", "sha256": "28310665f2bf6a915fdaa1ec720e30688e7346c1d54afb1df4027834fb99d254"}
+{"bead": "ft-booek.7", "status": "closed", "closed_at": "2026-09-21T18:15:25.340938Z"}
