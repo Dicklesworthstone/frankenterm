@@ -30,6 +30,9 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+- Authenticated root reconstruction can resolve envelope corruption without hiding filesystem, discovery or rejected-root authority failures. Authority checks survive diagnostic truncation. A remote persisted-repair startup/publication regression passed; rebuilt native corruption recovery remains under qualification.
+- Vendored SSH linkage uses the OpenSSL and zlib dependency crates' static-library declarations. The macOS Blocks binding uses inhabited runtime storage and raw address acquisition, with a native copy/invoke/dispose regression. Cross-platform release qualification remains pending.
+- Optional transaction diagnostics correlate committed segments with verified transaction durations while preserving ordinary writer logging. Extraction timing is recorded before oracle validation; benchmark workloads and acceptance thresholds are unchanged.
 - Selection retains its drag origin and both range endpoints across cold-history reflow, spill admission and seam replacement. Bounded endpoint hydration runs outside the terminal lock; source and gesture checks reject stale completions.
 - Same-path GUI upgrades start the successor executable instead of delegating to the older running process. Unix discovery publishes atomically under a bounded lock; updated publishers check inode ownership before removing their discovery pointer.
 - Standalone Unix listeners no longer create dormant client domains that reject recovered topology. Guardian startup retries reconciliation of the same Genesis request within its existing bounded budget, retaining unresolved-birth and cancellation safeguards. Native acceptance of these changes remains pending.
