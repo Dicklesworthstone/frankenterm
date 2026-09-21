@@ -12147,7 +12147,9 @@ mod tests {
             GuardianResponseEnvelope, GuardianSecret, decode_guardian_request,
             encode_guardian_response,
         };
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
         use std::os::unix::net::{UnixListener, UnixStream};
 
         // Authenticated wire fault injection, not a PTY/custody proof. The
