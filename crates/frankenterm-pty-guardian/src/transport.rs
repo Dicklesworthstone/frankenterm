@@ -56,6 +56,17 @@ const TOKEN_PUBLICATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 const TOKEN_STAGE_COMMIT_MAGIC: [u8; 4] = *b"FTGC";
 const TOKEN_STAGE_COMMIT_BYTES: usize = TOKEN_STAGE_COMMIT_MAGIC.len() + 32;
 
+// Keep the original I/O error intact for retry classification. Diagnostics
+// deliberately omit request bytes, identities, token paths, and error text.
+fn log_client_io_failure(site: &'static str, error: &std::io::Error) {
+    log::debug!(
+        target: "guardian::client_io",
+        "guardian client I/O failure site={site} kind={:?} os_code={:?}",
+        error.kind(),
+        error.raw_os_error(),
+    );
+}
+
 fn partition_endpoint_tokens(max_connections: usize) -> Option<(Token, usize)> {
     let output_completion_token = Token(max_connections.checked_add(1)?);
     let first_pty_token = output_completion_token.0.checked_add(1)?;
@@ -2404,9 +2415,14 @@ impl GuardianClient {
         validate_private_parent(socket_path)?;
         validate_existing_socket(socket_path)?;
         let secret = load_guardian_secret(token_path)?;
-        let stream = BlockingUnixStream::connect(socket_path)?;
-        stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
+        let stream = BlockingUnixStream::connect(socket_path)
+            .inspect_err(|error| log_client_io_failure("connect", error))?;
+        stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .inspect_err(|error| log_client_io_failure("initial_read_timeout", error))?;
+        stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .inspect_err(|error| log_client_io_failure("initial_write_timeout", error))?;
         let mut client = Self {
             stream,
             secret,
@@ -3044,8 +3060,8 @@ impl GuardianClient {
         let result = operation(self, deadline);
         let reset_read = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let reset_write = self.stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
-        reset_read?;
-        reset_write?;
+        reset_read.inspect_err(|error| log_client_io_failure("reset_read_timeout", error))?;
+        reset_write.inspect_err(|error| log_client_io_failure("reset_write_timeout", error))?;
         result
     }
 
@@ -3104,8 +3120,12 @@ impl GuardianClient {
                 )
                 .into());
             }
-            self.stream.set_read_timeout(Some(remaining))?;
-            self.stream.set_write_timeout(Some(remaining))?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .inspect_err(|error| log_client_io_failure("census_read_timeout", error))?;
+            self.stream
+                .set_write_timeout(Some(remaining))
+                .inspect_err(|error| log_client_io_failure("census_write_timeout", error))?;
             let page = GuardianCensusPageRequest::new(
                 snapshot_id,
                 cursor,
@@ -3283,7 +3303,9 @@ impl GuardianClient {
                     .store(authenticated.payload().is_empty(), Ordering::SeqCst);
             }
         }
-        self.stream.write_all(frame.as_slice())?;
+        self.stream
+            .write_all(frame.as_slice())
+            .inspect_err(|error| log_client_io_failure("request_write", error))?;
         frame.zeroize_after_write();
         let response_frame = read_blocking_frame(&mut self.stream)?;
         let response = decode_guardian_response(&self.secret, &response_frame)?;
@@ -4278,7 +4300,9 @@ fn read_blocking_frame(
     stream: &mut BlockingUnixStream,
 ) -> Result<Zeroizing<Vec<u8>>, GuardianClientError> {
     let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
+    stream
+        .read_exact(&mut prefix)
+        .inspect_err(|error| log_client_io_failure("response_prefix", error))?;
     let body_len = usize::try_from(u32::from_be_bytes(prefix))
         .map_err(|_| GuardianProtocolError::FrameTooLarge)?;
     let total_len = body_len
@@ -4293,7 +4317,9 @@ fn read_blocking_frame(
         .map_err(|_| GuardianProtocolError::FrameTooLarge)?;
     frame.extend_from_slice(&prefix);
     frame.resize(total_len, 0);
-    stream.read_exact(&mut frame[prefix.len()..])?;
+    stream
+        .read_exact(&mut frame[prefix.len()..])
+        .inspect_err(|error| log_client_io_failure("response_body", error))?;
     Ok(frame)
 }
 
@@ -5427,7 +5453,7 @@ mod tests {
             boundary("drop(request);"),
             boundary("decode_guardian_request"),
             boundary("retire_authenticated_input_plaintext(&mut authenticated);"),
-            boundary("self.stream.write_all(frame.as_slice())?;"),
+            boundary(".write_all(frame.as_slice())"),
             boundary("frame.zeroize_after_write();"),
             boundary("read_blocking_frame(&mut self.stream)?"),
         ];

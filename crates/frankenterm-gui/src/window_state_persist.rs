@@ -9959,7 +9959,7 @@ mod tests {
         // lock. The child must publish a success marker; a misspelled test
         // filter therefore cannot silently turn this into a zero-test pass.
         let child_marker = temp.path().join("external-growth-committed");
-        let child = Command::new(std::env::current_exe().expect("resolve test executable"))
+        let mut child = Command::new(std::env::current_exe().expect("resolve test executable"))
             .env_clear()
             .args(["--exact", CROSS_PROCESS_GROWTH_HELPER, "--nocapture"])
             .env(CROSS_PROCESS_STATE_PATH_ENV, &path)
@@ -9968,14 +9968,37 @@ mod tests {
                 external_growth_workspace.as_str(),
             )
             .env(CROSS_PROCESS_MARKER_ENV, &child_marker)
-            .output()
+            // Keep diagnostics visible while polling the child with a deadline.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
             .expect("run external authority writer process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let kill = child.kill();
+                    let reap = child.wait();
+                    panic!(
+                        "poll external authority writer failed: {error}; kill={kill:?}; reap={reap:?}"
+                    );
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill = child.kill();
+                let reap = child.wait();
+                panic!(
+                    "external authority writer exceeded 60s deadline; kill={kill:?}; reap={reap:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert!(
-            child.status.success(),
-            "external authority writer failed: status={:?}\nstdout={}\nstderr={}",
-            child.status.code(),
-            String::from_utf8_lossy(&child.stdout),
-            String::from_utf8_lossy(&child.stderr),
+            status.success(),
+            "external authority writer failed: status={status:?}",
         );
         assert_eq!(
             std::fs::read_to_string(&child_marker)

@@ -737,7 +737,7 @@ mod live_measurement {
             // neither held-out delays nor the agreement threshold enter fitting.
             let mut best: Option<(f64, Vec<LindleyStageTelemetry>)> = None;
             for step in -80..=160 {
-                let rate = 2.0_f64.powf(f64::from(step) / 8.0);
+                let rate = (f64::from(step) / 8.0).exp2();
                 if rate <= arrival_rate {
                     continue;
                 }

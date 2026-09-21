@@ -5246,9 +5246,14 @@ impl TermWindow {
                     self.render_wake_state.cancel();
                     metrics::counter!("gui.render.retry", "action" => "native_frame_ready")
                         .increment(1);
+                    // Retained PaneOutput delivery owns native readiness too.
+                    // Spend the same bounded early attempt as the ordinary
+                    // notification path, validating the frame in paint.
+                    self.paint_if_admitted(window)?;
                 }
-                // The backend invalidates under this same admission after the
-                // callback, preserving its native frame pacing.
+                // Preserve paced invalidation for the other retained effects
+                // under this admission, including when the early attempt is
+                // unavailable or its frame is still pending.
                 actions.request_repaint();
             }
             TermWindowNotif::MuxNotification {
@@ -12624,17 +12629,46 @@ mod tests {
         let thread = std::thread::current();
         let test_name = thread.name().expect("libtest supplies the exact test name");
         assert!(test_name.ends_with(name));
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        // File-backed output retains diagnostics without a full pipe blocking
+        // the child while this thread waits for process completion.
+        let stdout_file = tempfile::NamedTempFile::new().unwrap();
+        let stderr_file = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg(test_name)
             .args(["--exact", "--nocapture"])
             .env(marker, name)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout_file.reopen().unwrap())
+            .stderr(stderr_file.reopen().unwrap())
+            .spawn()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(format!("child status polling failed: {error}")),
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err("child exceeded its 60s deadline".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Reap on both timeout and polling error before reading diagnostics or
+        // panicking. Successful try_wait already reaps the completed child.
+        let cleanup = if status.is_err() {
+            Some((child.kill(), child.wait()))
+        } else {
+            None
+        };
+        let stdout_bytes = std::fs::read(stdout_file.path()).unwrap();
+        let stderr_bytes = std::fs::read(stderr_file.path()).unwrap();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         assert!(
-            output.status.success() && stdout.contains("1 passed; 0 failed"),
-            "isolated scheduler regression failed or selected no test: {name}\n{stdout}\n{stderr}"
+            status.as_ref().is_ok_and(|status| status.success())
+                && stdout.contains("1 passed; 0 failed"),
+            "isolated scheduler regression failed or selected no test: {name}; status={status:?}; cleanup={cleanup:?}\n{stdout}\n{stderr}"
         );
         true
     }

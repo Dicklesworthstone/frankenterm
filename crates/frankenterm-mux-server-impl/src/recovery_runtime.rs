@@ -144,11 +144,17 @@ fn open_authority(
             namespace_id: options.recovery_namespace.context("missing namespace")?,
             policy_id: options.recovery_policy.context("missing policy")?,
         },
-    )?;
+    )
+    .inspect_err(|_| {
+        log::error!("mux recovery authority rejection stage=key_enrollment");
+    })?;
     let store = SnapshotPublicationStore::open_existing(
         options.recovery_store.as_ref().context("missing store")?,
         PublicationLimits::default(),
-    )?;
+    )
+    .inspect_err(|_| {
+        log::error!("mux recovery authority rejection stage=store_reopen");
+    })?;
     Ok((store, Arc::new(key)))
 }
 
@@ -203,7 +209,32 @@ impl CaptureState {
         restored: Option<&RestoredPredecessor>,
     ) -> anyhow::Result<Self> {
         let (store, key) = open_authority(options, cx)?;
-        let topology = mux.capture_topology_coherent(Default::default())?;
+        let topology = mux
+            .capture_topology_coherent(Default::default())
+            .inspect_err(|error| {
+                // Never format error payloads: tab errors can contain arbitrary
+                // messages and topology errors carry live object identities.
+                let reason = match error {
+                    mux::MuxTopologyCaptureError::UnsupportedDomainPolicy => "domain_policy",
+                    mux::MuxTopologyCaptureError::AuthorityExhausted => "authority_exhausted",
+                    mux::MuxTopologyCaptureError::ConcurrentMutation { .. } => {
+                        "concurrent_mutation"
+                    }
+                    mux::MuxTopologyCaptureError::WindowOrder { .. } => "window_order",
+                    mux::MuxTopologyCaptureError::TabCapture { .. } => "tab_capture",
+                    mux::MuxTopologyCaptureError::TooManyWindows { .. } => "window_limit",
+                    mux::MuxTopologyCaptureError::TooManyTabs { .. } => "tab_limit",
+                    mux::MuxTopologyCaptureError::TooManyPanes { .. } => "pane_limit",
+                    mux::MuxTopologyCaptureError::TreeDepthExceeded { .. } => "tree_depth",
+                    mux::MuxTopologyCaptureError::MissingPaneRegistration(_) => "pane_registration",
+                    mux::MuxTopologyCaptureError::MissingDomain(_) => "missing_domain",
+                    mux::MuxTopologyCaptureError::MissingDurablePaneId(_) => {
+                        "missing_pane_identity"
+                    }
+                    mux::MuxTopologyCaptureError::NilDurablePaneId(_) => "nil_pane_identity",
+                };
+                log::error!("mux recovery authority rejection stage=topology reason={reason}");
+            })?;
         let mut state = Self {
             store,
             key,
@@ -222,7 +253,11 @@ impl CaptureState {
                 existing_guardian_custody: custody,
             },
         };
-        state.select_predecessor_with_restore(cx, None, restored)?;
+        state
+            .select_predecessor_with_restore(cx, None, restored)
+            .inspect_err(|_| {
+                log::error!("mux recovery authority rejection stage=predecessor_selection");
+            })?;
         Ok(state)
     }
 
@@ -623,6 +658,18 @@ mod tests {
         while !done(controller) {
             controller.poll(true);
             executor.try_tick().unwrap();
+            // Expected rejection tests satisfy `done` on terminal failure;
+            // successful-publication tests must not turn rejection into a
+            // misleading scheduling timeout.
+            assert!(
+                done(controller) || !controller.failed,
+                "recovery became terminal before the requested state: settled={} next_generation={:?}",
+                controller.is_settled(),
+                controller
+                    .state
+                    .as_ref()
+                    .map(|state| state.identity.generation),
+            );
             assert!(Instant::now() < deadline, "owned capture did not settle");
             std::thread::sleep(Duration::from_millis(1));
         }

@@ -9812,7 +9812,15 @@ fn update_mux_domains_impl(
     is_standalone_mux: bool,
 ) -> anyhow::Result<MuxDomainUpdateOutcome> {
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    let client_configs = configured_client_domains(config);
+    let client_configs: Vec<_> = configured_client_domains(config)
+        .into_iter()
+        // The standalone server binds every configured Unix endpoint itself.
+        // Registering those listeners again as client domains creates a dormant
+        // self-connection with no durable recovery policy. GUI reconciliation
+        // still needs these entries as clients; SSH/TLS clients remain distinct
+        // from the server's local listeners in both modes.
+        .filter(|client| !is_standalone_mux || !matches!(client, ClientDomainConfig::Unix(_)))
+        .collect();
     let desired_client_names = client_configs
         .iter()
         .map(|client| client.name().to_string())
@@ -17397,14 +17405,20 @@ mod tests {
             multiplexing: SshMultiplexing::None,
             ..SshDomain::default()
         };
-        let handle = make_test_handle(vec![raw_ssh]);
+        let mux_ssh = SshDomain {
+            name: "mux-ssh".to_string(),
+            remote_address: "mux.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ..SshDomain::default()
+        };
+        let handle = make_test_handle(vec![raw_ssh, mux_ssh]);
 
         let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
         let mux = Arc::new(Mux::new(Some(local_domain)));
         Mux::set_mux(&mux);
 
-        // update_mux_domains_for_server should work the same as update_mux_domains
-        // for domain registration (the difference is in default_domain handling)
+        // Remote raw and multiplexed transports remain registered in server
+        // mode; only its own Unix listeners are excluded from client domains.
         update_mux_domains_for_server(&handle)?;
 
         let domain = mux
@@ -17414,7 +17428,61 @@ mod tests {
             domain.is::<RemoteSshDomain>(),
             "should use RemoteSshDomain for non-multiplexed SSH"
         );
+        assert!(
+            mux.get_domain_by_name("mux-ssh")
+                .is_some_and(|domain| domain.is::<ClientDomain>()),
+            "intentional remote mux clients remain available in server mode"
+        );
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_unix_listener_does_not_create_unrecoverable_client_domain() -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let handle = make_test_handle_with(Vec::new(), |config| {
+            config.unix_domains = vec![config::UnixDomain {
+                name: "owned-listener".to_string(),
+                socket_path: Some(std::path::PathBuf::from(
+                    "/tmp/owned-recovery-listener.sock",
+                )),
+                no_serve_automatically: true,
+                ..config::UnixDomain::default()
+            }];
+            config.default_mux_server_domain = Some("guardian".to_string());
+        });
+        let mux = Arc::new(Mux::new(None));
+        let guardian: Arc<dyn Domain> = Arc::new(crate::guardian_proxy::GuardianDomain::new(
+            &mux,
+            std::path::PathBuf::from("/tmp/owned-recovery-guardian.sock"),
+            std::path::PathBuf::from("/tmp/owned-recovery-guardian.token"),
+        )?);
+        mux.add_domain(&guardian)?;
+        mux.set_default_domain(&guardian)?;
+        Mux::set_mux(&mux);
+
+        update_mux_domains_for_server(&handle)?;
+        assert!(mux.get_domain_by_name("owned-listener").is_none());
+        assert_eq!(mux.default_domain()?.domain_name(), "guardian");
+        let captured = mux.capture_topology_coherent(Default::default())?;
+        assert_eq!(captured.domains.len(), 1);
+        assert!(matches!(
+            captured.domains[0].policy,
+            mux::domain::DomainRecoveryPolicy::GuardianLocal { .. }
+        ));
+
+        // The same Unix entry is still a real connectable client in GUI mode.
+        // Its unsupported recovery policy must continue to refuse capture.
+        update_mux_domains(&handle)?;
+        assert!(
+            mux.get_domain_by_name("owned-listener")
+                .is_some_and(|domain| domain.is::<ClientDomain>())
+        );
+        assert!(matches!(
+            mux.capture_topology_coherent(Default::default()),
+            Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+        ));
         Ok(())
     }
 

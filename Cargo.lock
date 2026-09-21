@@ -4478,6 +4478,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "libc",
+ "log",
  "mio",
  "mux",
  "nix 0.31.3",
