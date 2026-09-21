@@ -8245,7 +8245,7 @@ pub fn select_verified_recovery_roots_with_cx(
     store: &SnapshotPublicationStore,
     verifier: &WholeMuxRecoveryVerifier,
 ) -> Result<VerifiedRootSelection<ValidatedWholeMuxRecovery>, WholeMuxRecoveryError> {
-    use crate::snapshot_publication::{RootSlot, TornRootDiagnostic};
+    use crate::snapshot_publication::{RootDiagnosticAuthority, RootSlot, TornRootDiagnostic};
     use crate::snapshot_repair::{
         RepairObjectDescriptor, RepairObjectLimits, decode_repair_object,
         shared_admission_controller,
@@ -8266,7 +8266,7 @@ pub fn select_verified_recovery_roots_with_cx(
     let (discoveries, discovery_diagnostics) =
         store.inspect_repair_discovery(&namespace, &root_id, key.as_ref())?;
     diagnostics.extend(discovery_diagnostics);
-    diagnostics.truncate(store.limits().max_error_records);
+    // At most two slots and two attempts per slot; bound evidence after authority.
     let admission = verifier
         .admission
         .as_deref()
@@ -8371,6 +8371,21 @@ pub fn select_verified_recovery_roots_with_cx(
                 .map_err(|_| WholeMuxRecoveryError::Cancelled)?;
             match result {
                 Ok(graph) => {
+                    // Successful reconstruction is bound to this slot's authenticated
+                    // committed discovery and the complete verified graph above.
+                    // Never forgive rejected ordinary candidates, even when an older
+                    // discovery reconstructs: that would conceal a newer authority.
+                    if repair && ordinary.is_none() {
+                        for diagnostic in &mut diagnostics {
+                            if diagnostic.slot == slot
+                                && diagnostic.authority
+                                    == RootDiagnosticAuthority::EnvelopeCorruption
+                            {
+                                diagnostic.authority =
+                                    RootDiagnosticAuthority::AuthenticatedReconstruction;
+                            }
+                        }
+                    }
                     accepted_roots.push((generation, graph));
                     break;
                 }
@@ -8390,18 +8405,17 @@ pub fn select_verified_recovery_roots_with_cx(
                     ))),
                 ) => return Err(error),
                 Err(_) => {
-                    if diagnostics.len() < store.limits().max_error_records {
-                        diagnostics.push(TornRootDiagnostic {
-                            slot,
-                            generation: Some(generation),
-                            reason: if repair {
-                                "authenticated root repair or graph rejected"
-                            } else {
-                                "root graph rejected"
-                            }
-                            .to_owned(),
-                        });
-                    }
+                    diagnostics.push(TornRootDiagnostic {
+                        slot,
+                        generation: Some(generation),
+                        authority: RootDiagnosticAuthority::Unresolved,
+                        reason: if repair {
+                            "authenticated root repair or graph rejected"
+                        } else {
+                            "root graph rejected"
+                        }
+                        .to_owned(),
+                    });
                 }
             }
         }
@@ -8413,10 +8427,15 @@ pub fn select_verified_recovery_roots_with_cx(
         }
         .into());
     }
+    let unresolved_authority = diagnostics.iter().any(|diagnostic| {
+        diagnostic.authority != RootDiagnosticAuthority::AuthenticatedReconstruction
+    });
+    diagnostics.truncate(store.limits().max_error_records);
     let mut accepted_roots = accepted_roots.into_iter();
     Ok(VerifiedRootSelection {
         current: accepted_roots.next().map(|(_, graph)| graph),
         previous: accepted_roots.next().map(|(_, graph)| graph),
+        unresolved_authority,
         torn_or_rejected: diagnostics,
     })
 }
