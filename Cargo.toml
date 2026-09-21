@@ -615,7 +615,7 @@ frankensearch = { version = "=0.6.0", git = "https://github.com/Dicklesworthston
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
 frankensearch-index-acl = { package = "frankensearch-index", version = "=0.3.0", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
-franken-agent-detection = "0.2.2"
+franken-agent-detection = "0.3.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }
