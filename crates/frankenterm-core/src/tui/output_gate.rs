@@ -453,6 +453,16 @@ pub(crate) mod tests {
         GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(debug_assertions)]
+    struct ResetGateOnDrop;
+
+    #[cfg(debug_assertions)]
+    impl Drop for ResetGateOnDrop {
+        fn drop(&mut self) {
+            set_phase(GatePhase::Inactive);
+        }
+    }
+
     #[test]
     fn gate_phase_roundtrip() {
         // Pure conversion test — no global mutation.
@@ -694,10 +704,10 @@ pub(crate) mod tests {
     )]
     fn gated_write_stdout_panics_in_debug_when_active() {
         let _lock = lock_gate();
+        // Restore the gate during unwinding, before releasing the test lock.
+        let _reset = ResetGateOnDrop;
         set_phase(GatePhase::Active);
         gated_write_stdout(format_args!("boom"));
-        // Cleanup won't run due to panic, but the GATE is process-global
-        // and the test harness will continue on the next test.
     }
 
     #[test]
@@ -707,6 +717,7 @@ pub(crate) mod tests {
     )]
     fn gated_write_stderr_panics_in_debug_when_active() {
         let _lock = lock_gate();
+        let _reset = ResetGateOnDrop;
         set_phase(GatePhase::Active);
         gated_write_stderr(format_args!("boom"));
     }
@@ -772,7 +783,6 @@ pub(crate) mod tests {
 
         // Spawn reader thread that continuously checks the gate
         let reader = std::thread::spawn(move || {
-            reader_ready_clone.store(true, AOrdering::Release);
             while !stop_clone.load(AOrdering::Relaxed) {
                 // is_output_suppressed must never panic
                 let _suppressed = is_output_suppressed();
@@ -789,10 +799,13 @@ pub(crate) mod tests {
                     "invalid gate phase: {p:?}"
                 );
                 read_count_clone.fetch_add(1, AOrdering::Relaxed);
+                // Readiness means an observation completed, not just that the
+                // thread started: the writer may finish before we run again.
+                reader_ready_clone.store(true, AOrdering::Release);
             }
         });
 
-        // Wait for reader thread to be ready
+        // Wait for the reader's first completed observation.
         while !reader_ready.load(AOrdering::Acquire) {
             std::thread::yield_now();
         }
@@ -810,7 +823,7 @@ pub(crate) mod tests {
         stop.store(true, AOrdering::Relaxed);
         reader.join().expect("reader thread panicked");
         let reads = read_count.load(AOrdering::Relaxed);
-        // Verify reader did work (may be 0 on very fast single-core, so warn only)
+        // The readiness handshake guarantees at least one completed read.
         assert!(reads > 0, "reader thread should have performed reads");
 
         // Gate must be back to Inactive
