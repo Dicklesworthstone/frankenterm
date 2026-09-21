@@ -1882,6 +1882,347 @@ fn try_decrement_atomic_count(counter: &AtomicUsize) -> bool {
 
 type MuxSubscriber = dyn Fn(MuxNotificationEnvelope) -> bool + Send + Sync;
 
+/// A finite pre-mutation demand; no terminal or native GUI access is needed
+/// to reserve its downstream delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalAlertDemand {
+    Bell,
+    UserVar { text_bytes: usize },
+}
+
+impl HistoricalAlertDemand {
+    pub fn for_alert(alert: &Alert) -> Option<Self> {
+        match alert {
+            Alert::Bell => Some(Self::Bell),
+            Alert::SetUserVar { name, value } => Some(Self::UserVar {
+                // Overflow remains historical and is refused during checked
+                // byte admission; it must never fall through as an ordinary alert.
+                text_bytes: name.capacity().saturating_add(value.capacity()),
+            }),
+            _ => None,
+        }
+    }
+
+    fn covers(self, alert: &Alert) -> bool {
+        match (self, Self::for_alert(alert)) {
+            (Self::Bell, Some(Self::Bell)) => true,
+            (Self::UserVar { text_bytes }, Some(Self::UserVar { text_bytes: actual })) => {
+                actual <= text_bytes
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Drop this only at the final consumer completion or cancellation, including
+/// when a native event is retired before its first poll.
+pub struct HistoricalAlertCompletion {
+    _completion: promise::Promise<()>,
+}
+
+pub type HistoricalAlertDelivery =
+    Box<dyn FnOnce(Arc<dyn Pane>, Alert, HistoricalAlertCompletion) + Send + 'static>;
+type HistoricalAlertAdmission = dyn Fn(HistoricalAlertDemand) -> Result<HistoricalAlertDelivery, pane::PaneActionAdmissionRefusal>
+    + Send
+    + Sync;
+
+struct HistoricalAlertSubscriber {
+    active: AtomicBool,
+    interested: Box<dyn Fn(Option<WindowId>) -> bool + Send + Sync>,
+    cost: Box<dyn Fn(HistoricalAlertDemand) -> Option<(usize, usize)> + Send + Sync>,
+    admit: Box<HistoricalAlertAdmission>,
+}
+
+/// Separate ingress lifetime: ordinary notification saturation cannot retire
+/// the historical subscriber or revoke its previously admitted receipts.
+pub struct HistoricalAlertSubscription {
+    owner: Weak<Mux>,
+    subscriber: Arc<HistoricalAlertSubscriber>,
+}
+
+impl Drop for HistoricalAlertSubscription {
+    fn drop(&mut self) {
+        self.subscriber.active.store(false, Ordering::Release);
+        if let Some(owner) = self.owner.upgrade() {
+            owner
+                .historical_alert_subscribers
+                .write()
+                .retain(|subscriber| !Arc::ptr_eq(subscriber, &self.subscriber));
+        }
+    }
+}
+
+struct AdmittedHistoricalDelivery {
+    subscriber: Arc<HistoricalAlertSubscriber>,
+    callback: HistoricalAlertDelivery,
+    completion: HistoricalAlertCompletion,
+}
+
+struct AdmittedHistoricalEvent {
+    demand: HistoricalAlertDemand,
+    deliveries: Option<Vec<AdmittedHistoricalDelivery>>,
+    completions: std::ops::Range<usize>,
+}
+
+/// A batch contains only already-funded deliveries and their completion
+/// futures. Admission is all-or-none and bounded before producer mutation.
+pub struct AdmittedHistoricalAlerts {
+    events: Vec<AdmittedHistoricalEvent>,
+    completions: Vec<Option<promise::Future<()>>>,
+    delivered_completions: Option<std::ops::Range<usize>>,
+    general_tasks: usize,
+    general_bytes: usize,
+}
+
+impl AdmittedHistoricalAlerts {
+    pub fn check_dispatch_fit(
+        &self,
+        dispatch_bytes: usize,
+    ) -> Result<(), pane::PaneActionAdmissionRefusal> {
+        use pane::PaneActionAdmissionRefusal as Refusal;
+        let bytes = self
+            .general_bytes
+            .checked_add(dispatch_bytes)
+            .ok_or(Refusal::SizeOverflow)?;
+        match promise::spawn::main_thread_general_batch_fits(self.general_tasks + 1, bytes) {
+            Some(true) => Ok(()),
+            Some(false) => Err(Refusal::SizeOverflow),
+            None => Err(Refusal::SchedulerUnavailable),
+        }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        // Counts were checked against 256 events and 64 subscribers at admission.
+        self.events.capacity() * std::mem::size_of::<AdmittedHistoricalEvent>()
+            + self.completions.capacity() * std::mem::size_of::<Option<promise::Future<()>>>()
+            + self
+                .events
+                .iter()
+                .map(|event| {
+                    event.deliveries.as_ref().map_or(0, |v| {
+                        v.capacity() * std::mem::size_of::<AdmittedHistoricalDelivery>()
+                    })
+                })
+                .sum::<usize>()
+    }
+
+    fn reserve(
+        subscribers: &[Arc<HistoricalAlertSubscriber>],
+        demands: &[HistoricalAlertDemand],
+    ) -> Result<Self, pane::PaneActionAdmissionRefusal> {
+        use pane::PaneActionAdmissionRefusal as Refusal;
+        // Oversized batches are refused intact; producers must not retry a
+        // permanent size refusal as temporary scheduler pressure.
+        if demands.len() > 256 || subscribers.len() > 64 {
+            return Err(Refusal::SizeOverflow);
+        }
+        let mut general_tasks = 0usize;
+        let mut general_bytes = 0usize;
+        for demand in demands {
+            for subscriber in subscribers {
+                let (tasks, bytes) = (subscriber.cost)(*demand).ok_or(Refusal::SizeOverflow)?;
+                general_tasks = general_tasks
+                    .checked_add(tasks)
+                    .ok_or(Refusal::SizeOverflow)?;
+                general_bytes = general_bytes
+                    .checked_add(bytes)
+                    .ok_or(Refusal::SizeOverflow)?;
+            }
+        }
+        // Include the dispatch task even before any subscriber credit is held.
+        // Otherwise a batch can fill the general partition with its own
+        // receipts and retry forever waiting for credits only it can release.
+        match promise::spawn::main_thread_general_batch_fits(
+            general_tasks.checked_add(1).ok_or(Refusal::SizeOverflow)?,
+            general_bytes,
+        ) {
+            Some(true) => (),
+            Some(false) => return Err(Refusal::SizeOverflow),
+            None => return Err(Refusal::SchedulerUnavailable),
+        }
+        let mut events = Vec::new();
+        let mut completions = Vec::new();
+        events
+            .try_reserve_exact(demands.len())
+            .map_err(|_| Refusal::Allocation)?;
+        completions
+            .try_reserve_exact(demands.len() * subscribers.len())
+            .map_err(|_| Refusal::Allocation)?;
+        for demand in demands {
+            let completion_start = completions.len();
+            let mut deliveries = Vec::new();
+            deliveries
+                .try_reserve_exact(subscribers.len())
+                .map_err(|_| Refusal::Allocation)?;
+            for subscriber in subscribers {
+                if !subscriber.active.load(Ordering::Acquire) {
+                    continue;
+                }
+                let callback = (subscriber.admit)(*demand)?;
+                let mut completion = promise::Promise::new();
+                completions.push(Some(
+                    completion.get_future().expect("new historical completion"),
+                ));
+                deliveries.push(AdmittedHistoricalDelivery {
+                    subscriber: Arc::clone(subscriber),
+                    callback,
+                    completion: HistoricalAlertCompletion {
+                        _completion: completion,
+                    },
+                });
+            }
+            events.push(AdmittedHistoricalEvent {
+                demand: *demand,
+                deliveries: Some(deliveries),
+                completions: completion_start..completions.len(),
+            });
+        }
+        Ok(Self {
+            events,
+            completions,
+            delivered_completions: None,
+            general_tasks,
+            general_bytes,
+        })
+    }
+
+    /// Must run outside terminal/native borrows. The producer retained the
+    /// exact pane registration's output custody through this dispatch.
+    pub fn deliver(&mut self, pane: &Arc<dyn Pane>, alert: &Alert) -> bool {
+        if self.delivered_completions.is_some() {
+            return false;
+        }
+        let Some(event) = self
+            .events
+            .iter_mut()
+            .find(|event| event.deliveries.is_some() && event.demand.covers(alert))
+        else {
+            return false;
+        };
+        self.delivered_completions = Some(event.completions.clone());
+        for delivery in event.deliveries.take().expect("selected historical event") {
+            if delivery.subscriber.active.load(Ordering::Acquire) {
+                (delivery.callback)(Arc::clone(pane), alert.clone(), delivery.completion);
+            }
+        }
+        true
+    }
+
+    /// One event must finish before the next event, even inside one parser or
+    /// render batch. This wait runs in the funded dispatcher, never a reader.
+    pub async fn finish_delivered(&mut self) {
+        if let Some(range) = self.delivered_completions.take() {
+            for index in range {
+                if let Some(completion) = self.completions[index].take() {
+                    let _ = completion.await;
+                }
+            }
+        }
+    }
+
+    pub async fn finish(self) {
+        let Self {
+            events,
+            completions,
+            ..
+        } = self;
+        // Unemitted actions (e.g. user variables disabled by config) release
+        // their receipts before waiting, rather than waiting on ourselves.
+        drop(events);
+        for completion in completions.into_iter().flatten() {
+            let _ = completion.await;
+        }
+    }
+}
+
+/// Per-pane FIFO for admitted historical delivery. Publishing never waits for
+/// a consumer: an RPC reader can continue receiving the reply a Lua callback
+/// needs. The successor is released only after delivery completes or cancels.
+#[derive(Default)]
+pub struct PaneAlertDispatchQueue {
+    tail: Mutex<Option<promise::Future<()>>>,
+}
+
+/// Both executor hops are funded before a producer changes its model. Dropping
+/// an unpublished reservation returns admission without scheduling any work.
+pub struct FundedPaneAlertDispatch {
+    background: promise::spawn::BackgroundSpawnReservation,
+    main: promise::spawn::MainThreadSpawnReservation,
+}
+
+impl FundedPaneAlertDispatch {
+    pub(crate) fn retire_after<F, T>(self, ready: F, retained: T)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Self { background, main } = self;
+        background.spawn(async move {
+            ready.await;
+            drop(main);
+            drop(retained);
+        });
+    }
+    pub fn reserve(bytes: usize) -> Result<Self, pane::PaneActionAdmissionRefusal> {
+        use pane::PaneActionAdmissionRefusal as Refusal;
+        use promise::spawn::{BackgroundSpawnError, MainThreadReservationOutcome as Outcome};
+        let background =
+            promise::spawn::try_reserve_background_task(bytes).map_err(|error| match error {
+                BackgroundSpawnError::TaskCapacityExhausted { .. } => Refusal::Capacity,
+                BackgroundSpawnError::EstimatedByteCapacityExhausted {
+                    requested,
+                    capacity,
+                    ..
+                } if requested <= capacity => Refusal::Capacity,
+                BackgroundSpawnError::EstimatedByteCapacityExhausted { .. }
+                | BackgroundSpawnError::ZeroEstimatedBytes => Refusal::SizeOverflow,
+                BackgroundSpawnError::WorkerUnavailable(_) => Refusal::SchedulerUnavailable,
+            })?;
+        let main = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            bytes,
+        ) {
+            Outcome::Reserved(main) => main,
+            Outcome::RetryableFull(_) => return Err(Refusal::Capacity),
+            Outcome::SchedulerUnavailable => return Err(Refusal::SchedulerUnavailable),
+            Outcome::InvalidSize(_) => return Err(Refusal::SizeOverflow),
+            Outcome::RetiredGeneration(_) | Outcome::AuthorityExhausted(_) => {
+                return Err(Refusal::Retired);
+            }
+            Outcome::Coalesced(_) => unreachable!("historical delivery cannot coalesce"),
+        };
+        Ok(Self { background, main })
+    }
+
+    /// Call only after the producer's successful commit, in commit order.
+    /// `ready` runs off the main thread (e.g. awaiting terminal unlock), while
+    /// `deliver` may await the final GUI/Lua receipt without occupying a reader.
+    pub fn publish<B, D>(self, queue: &PaneAlertDispatchQueue, ready: B, deliver: D)
+    where
+        B: std::future::Future<Output = ()> + Send + 'static,
+        D: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut completion = promise::Promise::<()>::new();
+        let successor = completion
+            .get_future()
+            .expect("new alert completion future");
+        let predecessor = queue.tail.lock().replace(successor);
+        let Self { background, main } = self;
+        background.spawn(async move {
+            if let Some(predecessor) = predecessor {
+                let _ = predecessor.await;
+            }
+            ready.await;
+            main.spawn(async move {
+                // Capture the entire promise before polling deliver: even an
+                // unpolled cancellation must release the next admitted batch.
+                let _completion = completion;
+                deliver.await;
+            })
+            .detach();
+        });
+    }
+}
+
 struct PreparedPaneRegistration {
     pane_id: PaneId,
     reader: Option<PreparedPaneReader>,
@@ -4676,12 +5017,39 @@ mod pane_registration_handle {
     /// Exact-generation authority retained by a funded historical alert batch.
     /// Weak owners avoid a cycle through a pane's unapplied action ring. The
     /// output continuation fences removal/reuse until dispatch or cancellation.
-    pub(crate) struct PaneAlertOutput {
+    pub struct PaneAlertOutput {
         registration: PaneRegistrationHandle,
         _output: PaneOutputContinuation,
+        historical_subscribers: Vec<Arc<HistoricalAlertSubscriber>>,
     }
 
     impl PaneAlertOutput {
+        pub fn reserve_historical(
+            &self,
+            demands: &[HistoricalAlertDemand],
+        ) -> Result<AdmittedHistoricalAlerts, pane::PaneActionAdmissionRefusal> {
+            AdmittedHistoricalAlerts::reserve(&self.historical_subscribers, demands)
+        }
+
+        pub fn deliver_historical(
+            &self,
+            batch: &mut AdmittedHistoricalAlerts,
+            alert: &Alert,
+        ) -> bool {
+            self.registration
+                .pane
+                .upgrade()
+                .is_some_and(|pane| batch.deliver(&pane, alert))
+        }
+
+        pub fn dispatch_historical(
+            &self,
+            batch: &mut AdmittedHistoricalAlerts,
+            alert: Alert,
+        ) -> bool {
+            self.deliver_historical(batch, &alert) && self.dispatch_alert(alert)
+        }
+
         pub(crate) fn dispatch_alert(&self, alert: Alert) -> bool {
             let Some(owner) = self.registration.generation.owner.upgrade() else {
                 return false;
@@ -6111,7 +6479,9 @@ mod pane_registration_handle {
             Some(result)
         }
 
-        pub(crate) fn reserve_alert_output(&self) -> Option<PaneAlertOutput> {
+        /// Capture recipients outside terminal/tab mutation locks. Membership
+        /// is an admission snapshot; delivery revalidates current membership.
+        pub fn reserve_alert_output(&self) -> Option<PaneAlertOutput> {
             let pane = self.pane.upgrade()?;
             let owner = self.generation.owner.upgrade()?;
             let output = owner.reserve_pane_output_for_reader(
@@ -6119,9 +6489,19 @@ mod pane_registration_handle {
                 &self.generation,
                 promise::spawn::is_scheduler_configured(),
             )?;
+            let mut subscribers = owner.historical_alert_subscribers.read().clone();
+            if !subscribers.is_empty() {
+                let window = owner
+                    .resolve_pane_id(pane.pane_id())
+                    .map(|(_, window, _)| window);
+                subscribers.retain(|subscriber| {
+                    subscriber.active.load(Ordering::Acquire) && (subscriber.interested)(window)
+                });
+            }
             Some(PaneAlertOutput {
                 registration: self.clone(),
                 _output: output,
+                historical_subscribers: subscribers,
             })
         }
 
@@ -6435,7 +6815,7 @@ mod pane_registration_handle {
     }
 }
 
-pub(crate) use pane_registration_handle::PaneAlertOutput;
+pub use pane_registration_handle::PaneAlertOutput;
 pub use pane_registration_handle::{
     CurrentPane, CurrentPaneOutput, FloatingPaneCommitReceipt, FloatingSpawnTarget,
     FrozenFloatingPaneSpawn, MoveCommitReceipt, PaneOperationGuard, PaneRegistrationHandle,
@@ -9878,6 +10258,7 @@ pub struct Mux {
     // only after the exact generation and its indexed cleanup quiesce.
     retired_domain_ids: Mutex<HashSet<DomainId>>,
     subscribers: RwLock<HashMap<usize, Arc<MuxSubscriber>>>,
+    historical_alert_subscribers: RwLock<Vec<Arc<HistoricalAlertSubscriber>>>,
     pending_pane_output: Mutex<PendingPaneOutputNotifications>,
     pane_output_drain_scheduled: AtomicBool,
     #[cfg(test)]
@@ -11718,6 +12099,7 @@ impl Mux {
             domain_retirement_pane_registry_probes: AtomicUsize::new(0),
             retired_domain_ids: Mutex::new(HashSet::new()),
             subscribers: RwLock::new(HashMap::new()),
+            historical_alert_subscribers: RwLock::new(Vec::new()),
             pending_pane_output: Mutex::new(PendingPaneOutputNotifications::default()),
             pane_output_drain_scheduled: AtomicBool::new(false),
             #[cfg(test)]
@@ -13099,6 +13481,42 @@ impl Mux {
         F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
     {
         self.subscribe_with_topology(move |envelope| subscriber(envelope.notification))
+    }
+
+    pub fn subscribe_historical_alerts<I, C, F>(
+        self: &Arc<Self>,
+        interested: I,
+        cost: C,
+        admit: F,
+    ) -> Result<HistoricalAlertSubscription, pane::PaneActionAdmissionRefusal>
+    where
+        I: Fn(Option<WindowId>) -> bool + Send + Sync + 'static,
+        C: Fn(HistoricalAlertDemand) -> Option<(usize, usize)> + Send + Sync + 'static,
+        F: Fn(
+                HistoricalAlertDemand,
+            ) -> Result<HistoricalAlertDelivery, pane::PaneActionAdmissionRefusal>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut subscribers = self.historical_alert_subscribers.write();
+        if subscribers.len() >= 64 {
+            return Err(pane::PaneActionAdmissionRefusal::SizeOverflow);
+        }
+        subscribers
+            .try_reserve(1)
+            .map_err(|_| pane::PaneActionAdmissionRefusal::Allocation)?;
+        let subscriber = Arc::new(HistoricalAlertSubscriber {
+            active: AtomicBool::new(true),
+            interested: Box::new(interested),
+            cost: Box::new(cost),
+            admit: Box::new(admit),
+        });
+        subscribers.push(Arc::clone(&subscriber));
+        Ok(HistoricalAlertSubscription {
+            owner: Arc::downgrade(self),
+            subscriber,
+        })
     }
 
     /// Subscribe with an exact cleanup lease for each authoritative

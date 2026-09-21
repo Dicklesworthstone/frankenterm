@@ -12334,7 +12334,9 @@ mod tests {
             GuardianResponseEnvelope, GuardianSecret, decode_guardian_request,
             encode_guardian_response,
         };
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
         use std::os::unix::net::{UnixListener, UnixStream};
 
         fn receive(stream: &mut UnixStream) -> Vec<u8> {
@@ -12465,7 +12467,12 @@ mod tests {
             };
             let client = connect().unwrap();
             let started = if case == "exhausted" {
-                Instant::now() - (GUARDIAN_CONNECT_RETRY_BUDGET - Duration::from_millis(200))
+                let elapsed = GUARDIAN_CONNECT_RETRY_BUDGET
+                    .checked_sub(Duration::from_millis(200))
+                    .expect("retry budget exceeds the remaining test window");
+                Instant::now()
+                    .checked_sub(elapsed)
+                    .expect("monotonic clock supports the retry test interval")
             } else {
                 Instant::now()
             };

@@ -1589,6 +1589,19 @@ pub fn try_reserve_main_thread(
     try_reserve_main_thread_impl(service_class, estimated_bytes, true)
 }
 
+/// Checks intrinsic fit, ignoring occupancy. This is not a reservation:
+/// callers must still acquire each permit before mutation. Both Interactive
+/// and Render consume the general partition; critical reserves are excluded.
+pub fn main_thread_general_batch_fits(tasks: usize, bytes: usize) -> Option<bool> {
+    let binding = capture_bounded_main_thread_scheduler()?;
+    let limits = binding.admission.inner.limits;
+    Some(
+        tasks <= limits.task_capacity() - limits.reserved_critical_tasks()
+            && bytes
+                <= limits.estimated_byte_capacity() - limits.reserved_critical_estimated_bytes(),
+    )
+}
+
 /// Low-priority variant of [`try_reserve_main_thread`].
 pub fn try_reserve_main_thread_with_low_priority(
     service_class: MainThreadServiceClass,
@@ -3799,6 +3812,19 @@ mod tests {
     }
 
     #[test]
+    fn general_batch_fit_excludes_critical_reserves_without_admitting() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(4, 32, 2, 16).unwrap())
+                .unwrap();
+        assert_eq!(main_thread_general_batch_fits(2, 16), Some(true));
+        assert_eq!(main_thread_general_batch_fits(3, 16), Some(false));
+        assert_eq!(main_thread_general_batch_fits(2, 17), Some(false));
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        assert_eq!(exec.admission_snapshot().active_estimated_bytes, 0);
+    }
+
+    #[test]
     fn two_phase_reservation_rejects_before_producer_state_is_constructed() {
         let _lock = TEST_LOCK.lock().unwrap();
         let exec =
@@ -3809,6 +3835,11 @@ mod tests {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
             outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
+        assert_eq!(main_thread_general_batch_fits(1, 16), Some(true));
+        assert_eq!(main_thread_general_batch_fits(2, 16), Some(false));
+        assert_eq!(main_thread_general_batch_fits(1, 17), Some(false));
+        // Intrinsic fit ignores the occupying permit; actual admission below
+        // must still reject before producer state is constructed.
         let producer_state_constructions = AtomicUsize::new(0);
 
         match try_reserve_main_thread(MainThreadServiceClass::Input, 1) {

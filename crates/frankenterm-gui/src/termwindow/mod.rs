@@ -148,6 +148,7 @@ struct GuiMuxSubscription {
     owner: Weak<Mux>,
     id: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
+    _historical: Option<mux::HistoricalAlertSubscription>,
 }
 
 /// Credits belong to a GUI owner, not the mux. Live GUI state and retired
@@ -890,6 +891,7 @@ pub enum TermWindowNotif {
         pane_removal_cleanup: Option<PaneRemovalCleanupLease>,
         pending_title_refresh: Option<PendingMuxTitleRefresh>,
         user_var_admission: Option<(UserVarEventOwner, Mutex<Option<WindowEventAdmission>>)>,
+        historical_completion: Option<mux::HistoricalAlertCompletion>,
     },
     /// A level-triggered refresh of current state, with no historical pane ID
     /// or lifecycle payload to replay after a delayed delivery.
@@ -5190,6 +5192,7 @@ impl TermWindow {
                             pane_removal_cleanup: None,
                             pending_title_refresh: None,
                             user_var_admission: None,
+                            historical_completion: None,
                         },
                         window,
                     )
@@ -5262,6 +5265,7 @@ impl TermWindow {
                 pane_removal_cleanup,
                 pending_title_refresh,
                 user_var_admission,
+                historical_completion,
             } => {
                 let Some(notification_owner) = mux_owner.upgrade() else {
                     return Ok(());
@@ -5298,7 +5302,13 @@ impl TermWindow {
                             log::error!("user-variable prepaid admission was already consumed");
                             return Ok(());
                         };
-                        self.emit_user_var_event(pane_id, name, value, owner, admission);
+                        self.emit_historical_pane_event(
+                            pane_id,
+                            Alert::SetUserVar { name, value },
+                            owner,
+                            admission,
+                            historical_completion,
+                        );
                     }
                     MuxNotification::WindowTitleChanged { .. }
                     | MuxNotification::Alert {
@@ -5357,7 +5367,23 @@ impl TermWindow {
                         }
 
                         log::trace!("Ding! (this is the bell) in pane {}", pane_id);
-                        self.emit_window_event("bell", Some(pane_id));
+                        let Some((owner, admission)) = user_var_admission else {
+                            log::error!("bell arrived without prepaid Lua admission");
+                            return Ok(());
+                        };
+                        let Some(admission) =
+                            admission.into_inner().unwrap_or_else(|p| p.into_inner())
+                        else {
+                            log::error!("bell prepaid admission was already consumed");
+                            return Ok(());
+                        };
+                        self.emit_historical_pane_event(
+                            pane_id,
+                            Alert::Bell,
+                            owner,
+                            admission,
+                            historical_completion,
+                        );
 
                         if let Some(mut per_pane) = self.pane_state(pane_id) {
                             per_pane.bell_start.replace(Instant::now());
@@ -5964,11 +5990,20 @@ impl TermWindow {
             Option<PendingMuxTitleRefresh>,
             promise::spawn::MainThreadSpawnReservation,
             Option<(promise::spawn::MainThreadSpawnReservation, Arc<dyn Pane>)>,
+            Option<mux::HistoricalAlertCompletion>,
         ),
     ) -> bool {
-        let (pane_removal_cleanup, pending_title_refresh, reservation, user_var_callback) =
-            deferred_authority;
-        if mux_payload_delivery_cancelled(dead, user_var_callback.is_some()) {
+        let (
+            pane_removal_cleanup,
+            pending_title_refresh,
+            reservation,
+            user_var_callback,
+            historical_completion,
+        ) = deferred_authority;
+        if mux_payload_delivery_cancelled(
+            dead,
+            user_var_callback.is_some() || historical_completion.is_some(),
+        ) {
             // Subscription cancelled asynchronously
             return false;
         }
@@ -6110,6 +6145,7 @@ impl TermWindow {
                         pane_removal_cleanup,
                         pending_title_refresh,
                         user_var_admission: Some((owner, Mutex::new(Some((callback, completion))))),
+                        historical_completion,
                     }
                 })
                 .detach();
@@ -6124,6 +6160,7 @@ impl TermWindow {
                     pane_removal_cleanup,
                     pending_title_refresh,
                     user_var_admission: None,
+                    historical_completion,
                 },
                 reservation,
                 None,
@@ -6213,6 +6250,7 @@ impl TermWindow {
             owner: Arc::downgrade(&mux),
             id: Arc::new(AtomicUsize::new(cleanup_id)),
             dead: Arc::clone(&cleanup_dead),
+            _historical: None,
         });
         let event_retry_pending = Arc::new(AtomicBool::new(false));
         self.window_event_retry = Some(WindowEventRetryRequest {
@@ -6233,8 +6271,80 @@ impl TermWindow {
         let render_mux = Arc::downgrade(&mux);
         let render_mux_window_id = Arc::clone(&mux_window_id);
         let render_dead = Arc::clone(&cleanup_dead);
+        let historical_window = window.clone();
+        let historical_mux = Arc::downgrade(&mux);
+        let historical_window_id = Arc::clone(&mux_window_id);
+        let historical_interest_window_id = Arc::clone(&mux_window_id);
+        let historical = mux
+            .subscribe_historical_alerts(
+                move |current_window| {
+                    let window = *historical_interest_window_id
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    current_window.is_none_or(|current| current == window)
+                },
+                |demand| match demand {
+                    mux::HistoricalAlertDemand::Bell => Some((2, 12288)),
+                    mux::HistoricalAlertDemand::UserVar { text_bytes } => {
+                        Some((2, text_bytes.checked_add(12288)?))
+                    }
+                },
+                move |demand| {
+                    use mux::pane::PaneActionAdmissionRefusal as Refusal;
+                    use promise::spawn::MainThreadReservationOutcome as Outcome;
+                    let classify = |outcome: Outcome| match outcome {
+                        Outcome::RetryableFull(_) => Refusal::Capacity,
+                        Outcome::InvalidSize(_) => Refusal::SizeOverflow,
+                        Outcome::RetiredGeneration(_) | Outcome::AuthorityExhausted(_) => {
+                            Refusal::Retired
+                        }
+                        _ => Refusal::SchedulerUnavailable,
+                    };
+                    let (reservation, callback) = match demand {
+                        mux::HistoricalAlertDemand::Bell => {
+                            let (callback, completion) = reserve_lua_event_admission(8192)
+                                .map_err(|outcome| classify(*outcome))?;
+                            (completion, Some(callback))
+                        }
+                        mux::HistoricalAlertDemand::UserVar { text_bytes } => {
+                            let bytes =
+                                text_bytes.checked_add(8192).ok_or(Refusal::SizeOverflow)?;
+                            let (callback, completion) = reserve_lua_event_admission(bytes)
+                                .map_err(|outcome| classify(*outcome))?;
+                            (completion, Some(callback))
+                        }
+                    };
+                    let window = historical_window.clone();
+                    let owner = historical_mux.clone();
+                    let window_id = Arc::clone(&historical_window_id);
+                    Ok(Box::new(
+                        move |pane: Arc<dyn Pane>,
+                              alert: Alert,
+                              completion: mux::HistoricalAlertCompletion| {
+                            let id = *window_id.lock().unwrap_or_else(|p| p.into_inner());
+                            let pane_id = pane.pane_id();
+                            let callback = callback.map(|callback| (callback, pane));
+                            Self::mux_pane_output_event_callback(
+                                MuxNotification::Alert { pane_id, alert },
+                                &window,
+                                id,
+                                &Arc::new(AtomicBool::new(false)),
+                                &owner,
+                                (None, None, reservation, callback, Some(completion)),
+                            );
+                        },
+                    ) as mux::HistoricalAlertDelivery)
+                },
+            )
+            .map_err(|reason| {
+                anyhow!("historical GUI admission registration refused: {reason:?}")
+            })?;
         let allocated_subscription_id = mux
             .subscribe_with_pane_removal_cleanup(move |n, pane_removal_cleanup| {
+                if matches!(&n, MuxNotification::Alert { alert: Alert::Bell | Alert::SetUserVar { .. }, .. }) {
+                    // Exact producer pre-admission owns these histories.
+                    return true;
+                }
                 if dead.load(Ordering::Relaxed) {
                     return false;
                 }
@@ -6323,7 +6433,7 @@ impl TermWindow {
                                     mux_window_id,
                                     &dead,
                                     &mux,
-                                    (pane_removal_cleanup, None, reservation, user_var_callback),
+                                    (pane_removal_cleanup, None, reservation, user_var_callback, None),
                                 ) {
                                     dead.store(true, Ordering::Release);
                                     unsubscribe_requested.store(true, Ordering::Release);
@@ -6360,6 +6470,7 @@ impl TermWindow {
             owner: Arc::downgrade(&mux),
             id: Arc::clone(&subscription_id),
             dead: owner_dead,
+            _historical: Some(historical),
         });
         self.pane_cleanup.open_admission();
         let (output_abort, output_registration) = AbortHandle::new_pair();
@@ -7046,13 +7157,13 @@ impl TermWindow {
         return window_id == self.mux_window_id;
     }
 
-    fn emit_user_var_event(
+    fn emit_historical_pane_event(
         &mut self,
         pane_id: PaneId,
-        name: String,
-        value: String,
+        alert: Alert,
         owner: UserVarEventOwner,
         admission: WindowEventAdmission,
+        historical_completion: Option<mux::HistoricalAlertCompletion>,
     ) {
         if owner.pane.pane_id() != pane_id || !owner.is_current() {
             return;
@@ -7071,20 +7182,27 @@ impl TermWindow {
 
         async fn do_event(
             lua: Option<Rc<mlua::Lua>>,
-            name: String,
-            value: String,
+            alert: Alert,
             window: GuiWin,
             pane: MuxPane,
         ) -> anyhow::Result<()> {
             if let Some(lua) = lua {
-                let args = lua.pack_multi((window.clone(), pane, name, value))?;
-                if let Err(err) = config::lua::emit_event(
-                    lua.as_ref().clone(),
-                    ("user-var-changed".to_string(), args),
-                )
-                .await
+                let (event, args) = match alert {
+                    Alert::Bell => ("bell", lua.pack_multi((window.clone(), pane))?),
+                    Alert::SetUserVar { name, value } => (
+                        "user-var-changed",
+                        lua.pack_multi((window.clone(), pane, name, value))?,
+                    ),
+                    _ => {
+                        return Err(anyhow!(
+                            "nonhistorical alert reached historical Lua delivery"
+                        ));
+                    }
+                };
+                if let Err(err) =
+                    config::lua::emit_event(lua.as_ref().clone(), (event.to_string(), args)).await
                 {
-                    log::error!("while processing user-var-changed event: {:#}", err);
+                    log::error!("while processing {event} event: {err:#}");
                 }
             }
 
@@ -7097,15 +7215,14 @@ impl TermWindow {
         spawn_admitted_user_var_event(
             admission,
             owner,
-            config::with_lua_config_on_main_thread(move |lua| {
-                do_event(lua, name, value, window, pane)
-            }),
+            config::with_lua_config_on_main_thread(move |lua| do_event(lua, alert, window, pane)),
             move |completion| {
                 let actions = Arc::new(::window::AdmittedWindowActions::default());
                 let native_actions = Arc::clone(&actions);
                 finish_window
                     .notify_with_reservation(
                         TermWindowNotif::Apply(Box::new(move |term_window| {
+                            let _historical_completion = historical_completion;
                             if term_window.mux_window_id == mux_window_id
                                 && finish_owner.is_current()
                             {
@@ -12157,6 +12274,7 @@ mod tests {
             owner: Arc::downgrade(&owner),
             id: Arc::new(AtomicUsize::new(id)),
             dead: Arc::clone(&dead),
+            _historical: None,
         };
         let exec =
             SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 4096, 0, 0).unwrap())
@@ -12417,6 +12535,7 @@ mod tests {
             owner: Arc::downgrade(mux),
             id: Arc::new(AtomicUsize::new(id)),
             dead: Arc::new(AtomicBool::new(false)),
+            _historical: None,
         };
         cleanup.open_admission();
         cleanup.admit(&first).unwrap();

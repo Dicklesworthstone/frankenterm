@@ -477,10 +477,39 @@ proptest! {
 // Envelope validation
 // =============================================================================
 
+#[test]
+fn envelope_rejects_overwritten_ok_from_regression_seed() {
+    // RC51 seed 941a4c2ee5bfd0ac33229d4203580505cba7305e91283cec18891afd62b3072e
+    // shrank to extra_key="ok", extra_val="aa": the generated field replaced
+    // the discriminator, so the alleged valid envelope was actually invalid.
+    let scenario = NtmParityScenario {
+        id: "TEST".to_string(),
+        domain: "test".to_string(),
+        priority: NtmParityPriority::Blocking,
+        ntm_equivalent: "test".to_string(),
+        ft_command: "ft robot --format json state".to_string(),
+        success_assertions: vec![],
+        failure_assertions: vec![],
+        artifact_key: "test".to_string(),
+    };
+    let extra_key = "ok";
+    let stdout = json!({"ok": true, extra_key: "aa"});
+    assert_eq!(stdout, json!({"ok": "aa"}));
+    let output = arb_command_output("TEST".to_string(), stdout);
+    let result = evaluate_scenario(&scenario, &output, vec!["a.json".to_string()], None);
+    assert!(!result.envelope_valid);
+
+    let output = arb_command_output("TEST".to_string(), json!({"ok": true, "extra": "aa"}));
+    let result = evaluate_scenario(&scenario, &output, vec!["a.json".to_string()], None);
+    assert!(result.envelope_valid);
+    assert!(result.status.is_pass());
+    assert_eq!(result.matched_branch.as_deref(), Some("success"));
+}
+
 proptest! {
     #[test]
     fn envelope_valid_for_ok_true_json(
-        extra_key in "[a-z]{2,6}",
+        extra_key in "[a-z]{2,6}".prop_filter("extra fields must not replace ok", |key| key != "ok"),
         extra_val in "[a-z]{2,6}",
     ) {
         let stdout = json!({"ok": true, extra_key: extra_val});
@@ -1025,7 +1054,7 @@ proptest! {
 proptest! {
     #[test]
     fn empty_assertions_with_valid_envelope_passes(
-        extra_key in "[a-z]{2,6}",
+        extra_key in "[a-z]{2,6}".prop_filter("extra fields must not replace ok", |key| key != "ok"),
     ) {
         let scenario = NtmParityScenario {
             id: "EMPTY".to_string(),
@@ -1040,6 +1069,7 @@ proptest! {
         let stdout = json!({"ok": true, extra_key: "val"});
         let output = arb_command_output("EMPTY".to_string(), stdout);
         let result = evaluate_scenario(&scenario, &output, vec!["a.json".to_string()], None);
+        prop_assert!(result.envelope_valid);
         // Empty success_assertions means success_passed = true (vacuous truth)
         prop_assert!(result.status.is_pass(), "empty assertions with valid envelope should pass");
         prop_assert_eq!(result.matched_branch.as_deref(), Some("success"));

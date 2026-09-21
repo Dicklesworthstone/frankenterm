@@ -253,6 +253,9 @@ mod live_measurement {
             transient_read_rejections: u32,
             write_ack_ns: u64,
             storage_submit_ns: u64,
+            // Wall-clock return from capture_snapshot, before oracle validation;
+            // this shares the stage epoch and is not a CPU-time measurement.
+            snapshot_extraction_return_ns: u64,
             poll: FramePollDiagnostics,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
@@ -365,11 +368,18 @@ mod live_measurement {
 
         pub fn run() -> Result<bool, String> {
             use tracing::instrument::WithSubscriber;
-            // Only numeric, content-free text-transaction events enter the
-            // already retained stderr. No global subscriber or recorder.
+            if tracing::level_filters::STATIC_MAX_LEVEL < tracing::level_filters::LevelFilter::TRACE
+            {
+                return Err("append transaction diagnostics were compiled out".into());
+            }
+            // Numeric, content-free mux and verified append-transaction events
+            // enter retained stderr. Storage carries this scoped dispatcher
+            // only for append telemetry; ordinary writer logs keep their route.
             let subscriber = tracing_subscriber::fmt()
                 .json()
-                .with_env_filter("off,frankenterm::mux_text_diagnostics=trace")
+                .with_env_filter(
+                    "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace",
+                )
                 .with_writer(std::io::stderr)
                 .finish();
             #[cfg(unix)]
@@ -480,6 +490,9 @@ mod live_measurement {
             let service_holds: Vec<bool> = (0..3)
                 .map(|index| service_conforms(held_out, index, &model.stages[index]))
                 .collect();
+            let service_violations: Vec<_> = (0..3)
+                .map(|index| service_violation_diagnostics(held_out, index, &model.stages[index]))
+                .collect();
             let trace_json =
                 serde_json::to_string(&observations).map_err(|error| error.to_string())?;
             let trace_hash = hex::encode(Sha256::digest(trace_json.as_bytes()));
@@ -499,7 +512,7 @@ mod live_measurement {
                 "payload_bytes": 4096,
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
-                "diagnostic_timing": "write_ack_ns and storage_submit_ns share the stage epoch; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
+                "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
                 "overlap_bytes": 4096,
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
@@ -508,6 +521,7 @@ mod live_measurement {
                 "observed_delay_bound_holds": observed_bound_holds,
                 "arrival_envelope_holds": arrival_holds,
                 "held_out_service_curves_hold": service_holds,
+                "held_out_service_violations": service_violations,
                 "calibration_method": "minimum composed bound over a predetermined common-rate grid, fitting stage arrival/departure envelopes and independently checking calibration conformance; frozen before held-out requests",
                 "calibration_rate_grid": "2^(k/8) events/ms for integer k=-80..160, restricted to rates strictly above declared arrival rate; fitted rates are not saturated throughput measurements",
                 "latency_field_semantics": "model p99_latency_ms fields contain fitted finite-trace service latencies with a fixed 1ns rounding margin, not quantile guarantees",
@@ -518,7 +532,7 @@ mod live_measurement {
                 "telemetry_model": model,
                 "observations": observations,
                 "excluded": ["production_watch_scheduler", "pattern_detection", "event_dispatch", "renderer", "future_workload_guarantee", "power_loss_durability"],
-                "grouping": "concurrent append_segment requests through production writer; physical transaction group size not observed",
+                "grouping": "concurrent append_segment requests through production writer; correlate retained append_transaction_result/member stderr by process-local transaction_id and pane_id/sequence for verified physical groups; no fixed batch size or power-loss durability claim",
             });
             println!("{JSON_BEGIN}");
             println!(
@@ -612,9 +626,9 @@ mod live_measurement {
                         })
                         .await?;
                     let captured = elapsed(epoch)?;
-                    let segment = cursor
-                        .capture_snapshot(&snapshot, 4096, None)
-                        .ok_or("new frame produced no delta")?;
+                    let segment = cursor.capture_snapshot(&snapshot, 4096, None);
+                    let snapshot_extraction_return_ns = elapsed(epoch)?;
+                    let segment = segment.ok_or("new frame produced no delta")?;
                     if !matches!(segment.kind, CapturedSegmentKind::Delta)
                         || segment.content.trim_matches('\n')
                             != super::frame(sequence).trim_matches('\n')
@@ -633,6 +647,7 @@ mod live_measurement {
                         transient_read_rejections,
                         write_ack_ns,
                         poll_diagnostics,
+                        snapshot_extraction_return_ns,
                     ));
                 }
                 let results = futures::future::join_all(pending.iter().map(
@@ -646,6 +661,7 @@ mod live_measurement {
                         rejections,
                         write_ack_ns,
                         poll,
+                        snapshot_extraction_return_ns,
                     )| async move {
                         let storage_submit_ns = elapsed(epoch)?;
                         let stored = storage
@@ -661,6 +677,7 @@ mod live_measurement {
                             transient_read_rejections: *rejections,
                             write_ack_ns: *write_ack_ns,
                             storage_submit_ns,
+                            snapshot_extraction_return_ns: *snapshot_extraction_return_ns,
                             poll: poll.clone(),
                             stages_ns: [
                                 [*started, *captured],
@@ -822,21 +839,80 @@ mod live_measurement {
             departures.sort_unstable();
             departures.iter().all(|departure| {
                 let time = departure.saturating_sub(1);
-                let completed = departures.partition_point(|value| *value <= time);
-                let lower = arrivals
-                    .iter()
-                    .enumerate()
-                    .take_while(|(_, start)| **start <= time)
-                    .map(|(count, start)| {
-                        model.service_rate_events_per_ms.mul_add(
-                            (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
-                            count as f64,
-                        )
-                    })
-                    .fold(f64::INFINITY, f64::min);
-                // s=t is also a candidate in the min-plus convolution.
-                let arrived = arrivals.partition_point(|value| *value <= time);
-                lower.min(arrived as f64) <= completed as f64 + 1e-9
+                let (completed, lower) = service_cut(&arrivals, &departures, time, model);
+                lower <= completed as f64 + 1e-9
+            })
+        }
+
+        fn service_cut(
+            arrivals: &[u64],
+            departures: &[u64],
+            time: u64,
+            model: &LindleyStageTelemetry,
+        ) -> (usize, f64) {
+            let completed = departures.partition_point(|value| *value <= time);
+            let lower = arrivals
+                .iter()
+                .enumerate()
+                .take_while(|(_, start)| **start <= time)
+                .map(|(count, start)| {
+                    model.service_rate_events_per_ms.mul_add(
+                        (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
+                        count as f64,
+                    )
+                })
+                .fold(f64::INFINITY, f64::min);
+            // s=t is also a candidate in the min-plus convolution.
+            let arrived = arrivals.partition_point(|value| *value <= time);
+            (completed, lower.min(arrived as f64))
+        }
+
+        fn service_violation_diagnostics(
+            rows: &[Observation],
+            stage: usize,
+            model: &LindleyStageTelemetry,
+        ) -> serde_json::Value {
+            const MAX_SAMPLES: usize = 8;
+            let mut arrivals: Vec<_> = rows.iter().map(|row| row.stages_ns[stage][0]).collect();
+            let mut ordered: Vec<_> = rows.iter().collect();
+            arrivals.sort_unstable();
+            ordered.sort_unstable_by_key(|row| (row.stages_ns[stage][1], row.sequence));
+            let departures: Vec<_> = ordered.iter().map(|row| row.stages_ns[stage][1]).collect();
+            let mut count = 0;
+            let mut maximum_deficit = 0.0_f64;
+            let mut samples = Vec::new();
+            for row in ordered {
+                let cut = row.stages_ns[stage][1].saturating_sub(1);
+                let (completed, lower) = service_cut(&arrivals, &departures, cut, model);
+                if lower <= completed as f64 + 1e-9 {
+                    continue;
+                }
+                count += 1;
+                maximum_deficit = maximum_deficit.max(lower - completed as f64);
+                if samples.len() < MAX_SAMPLES {
+                    samples.push(serde_json::json!({
+                        "departure_sequence": row.sequence,
+                        "cut_ns": cut,
+                        "completed_events": completed,
+                        "required_departures": lower,
+                        "deficit_events": lower - completed as f64,
+                        "stages_ns": row.stages_ns,
+                        "write_ack_elapsed_ns": row.write_ack_ns.checked_sub(row.stages_ns[0][0]),
+                        "snapshot_extraction_elapsed_ns": row.snapshot_extraction_return_ns.checked_sub(row.stages_ns[1][0]),
+                        "extraction_to_submit_ns": row.storage_submit_ns.checked_sub(row.stages_ns[2][0]),
+                        "submit_to_completion_ns": row.stages_ns[2][1].checked_sub(row.storage_submit_ns),
+                        "poll": row.poll,
+                    }));
+                }
+            }
+            serde_json::json!({
+                "stage": (["capture", "delta_extract", "storage_write"][stage]),
+                "violating_departure_cuts": count,
+                "maximum_deficit_events": maximum_deficit,
+                "sample_limit": MAX_SAMPLES,
+                "samples_truncated": count > samples.len(),
+                "samples": samples,
+                "semantics": "departure minus 1ns; simultaneous departures repeat the same cut as the acceptance check; departure_sequence identifies the cut witness, not an individually attributable service debt; timing components are wall-clock, not CPU or isolated commit time",
             })
         }
 
@@ -949,6 +1025,7 @@ mod live_measurement {
                     transient_read_rejections: 0,
                     write_ack_ns: start,
                     storage_submit_ns: start,
+                    snapshot_extraction_return_ns: end,
                     poll: FramePollDiagnostics::default(),
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
@@ -961,6 +1038,85 @@ mod live_measurement {
                     LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
                 assert!(service_conforms(&[row(0, 0, 1_000_000)], 0, &model));
                 assert!(!service_conforms(&[row(0, 0, 3_000_000)], 0, &model));
+            }
+
+            #[test]
+            fn service_violation_diagnostics_use_predeparture_cut() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
+                // At 1ms + 1ns the predeparture cut is exactly the latency:
+                // checking at departure instead would incorrectly report debt.
+                let boundary = [row(7, 0, 1_000_001)];
+                assert!(service_conforms(&boundary, 0, &model));
+                assert_eq!(
+                    service_violation_diagnostics(&boundary, 0, &model)["violating_departure_cuts"],
+                    0
+                );
+                let delayed = [row(7, 0, 1_000_002)];
+                assert!(!service_conforms(&delayed, 0, &model));
+                let diagnostic = service_violation_diagnostics(&delayed, 0, &model);
+                assert_eq!(diagnostic["violating_departure_cuts"], 1);
+                assert_eq!(diagnostic["samples"][0]["cut_ns"], 1_000_001);
+                assert_eq!(diagnostic["samples"][0]["completed_events"], 0);
+                assert_eq!(diagnostic["samples"][0]["departure_sequence"], 7);
+                assert!(diagnostic["maximum_deficit_events"].as_f64().unwrap() > 1e-9);
+                assert!(service_conforms(&[row(0, 0, 0)], 0, &model));
+                assert_eq!(
+                    service_violation_diagnostics(&[row(0, 0, 0)], 0, &model)["violating_departure_cuts"],
+                    0
+                );
+            }
+
+            #[test]
+            fn service_violation_diagnostics_bound_samples_and_preserve_ties() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
+                let rows: Vec<_> = (0..10).rev().map(|seq| row(seq, 0, 3_000_000)).collect();
+                let diagnostic = service_violation_diagnostics(&rows, 0, &model);
+                assert!(!service_conforms(&rows, 0, &model));
+                assert_eq!(diagnostic["violating_departure_cuts"], 10);
+                assert_eq!(diagnostic["samples_truncated"], true);
+                let samples = diagnostic["samples"].as_array().unwrap();
+                assert_eq!(samples.len(), 8);
+                for (index, sample) in samples.iter().enumerate() {
+                    assert_eq!(sample["departure_sequence"].as_u64(), Some(index as u64));
+                    assert_eq!(sample["cut_ns"], 2_999_999);
+                    assert_eq!(sample["completed_events"], 0);
+                }
+                // Non-FIFO completion must identify the departing observation,
+                // not associate the sorted departure with an arrival ordinal.
+                let reordered = [row(99, 0, 3_000_000), row(7, 0, 2_000_000)];
+                let diagnostic = service_violation_diagnostics(&reordered, 0, &model);
+                assert_eq!(diagnostic["samples"][0]["departure_sequence"], 7);
+                assert_eq!(diagnostic["samples"][1]["departure_sequence"], 99);
+                assert_eq!(diagnostic["samples"][1]["completed_events"], 1);
+            }
+
+            #[test]
+            fn service_violation_diagnostics_separate_batch_wait_from_storage_completion() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::StorageWrite, 1.0, 0.1).unwrap();
+                let mut observation = row(23, 0, 3_000_000);
+                observation.stages_ns = [
+                    [0, 1_000_000],
+                    [1_000_000, 1_000_010],
+                    [1_000_010, 3_000_000],
+                ];
+                observation.write_ack_ns = 100;
+                observation.snapshot_extraction_return_ns = 1_000_005;
+                observation.storage_submit_ns = 2_000_000;
+                observation.poll.read_elapsed_ns = 700_000;
+                observation.poll.wait_elapsed_ns = 299_900;
+                let diagnostic = service_violation_diagnostics(&[observation], 2, &model);
+                assert_eq!(diagnostic["stage"], "storage_write");
+                assert_eq!(diagnostic["violating_departure_cuts"], 1);
+                let sample = &diagnostic["samples"][0];
+                assert_eq!(sample["write_ack_elapsed_ns"], 100);
+                assert_eq!(sample["snapshot_extraction_elapsed_ns"], 5);
+                assert_eq!(sample["extraction_to_submit_ns"], 999_990);
+                assert_eq!(sample["submit_to_completion_ns"], 1_000_000);
+                assert_eq!(sample["poll"]["read_elapsed_ns"], 700_000);
+                assert_eq!(sample["poll"]["wait_elapsed_ns"], 299_900);
             }
 
             #[test]

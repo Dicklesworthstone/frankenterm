@@ -2,9 +2,9 @@
   "schema_version": "ft.security.redaction_hygiene.v1",
   "category": "security/redaction-hygiene",
   "produced_by_bead": "ft-7h5da.1.5",
-  "generated_at": "2026-09-19T22:13:49Z",
-  "status": "scoped_remote_tests_passed_release_qualification_pending",
-  "summary": "Atomic offline redaction maintenance, catalog identity and backup roundtrip passed retained remote regression tests on the recorded source. An owned RC46 native smoke database separately demonstrates ingest catalog stamping. Final candidate execution and signed release qualification remain pending. This file does not certify deployment corpus cleanliness.",
+  "generated_at": "2026-09-21T04:50:18.900654+00:00",
+  "status": "scoped_remote_and_native_maintenance_passed_release_qualification_pending",
+  "summary": "Atomic offline redaction maintenance, catalog identity and backup roundtrip passed retained remote regression tests on the recorded source. RC51 native backfill and purge each passed dry-run, mutation and idempotence against an owned full-schema smoke database copy. Historical RC46 ingest-stamping evidence remains separately scoped. Producing-bead bundle closeout and signed release qualification remain pending. This file does not certify deployment corpus cleanliness.",
   "attestation_manifest_slot": {
     "category": "security/redaction-hygiene",
     "path": "docs/security/redaction-hygiene.json",
@@ -143,17 +143,23 @@
       }
     ],
     "scoped_source_comparison": {
-      "verified_at": "2026-09-19T22:13:49Z",
+      "verified_at": "2026-09-21",
       "tested_commit": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
-      "compared_checkout_commit": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
+      "compared_checkout_commit": "abc5c9357aa3553c5faf4acc05f79a343769db92",
       "unchanged_files": [
         "crates/frankenterm-core/src/redact_backfill.rs",
         "crates/frankenterm-core/src/redactor.rs",
         "crates/frankenterm-core/src/backup.rs",
         "crates/frankenterm-core/tests/attestation_manifest_schema.rs"
       ],
-      "method": "git diff from the tested commit to the checkout returned no changes for these four files",
-      "limit": "Source equality is limited to the listed files. Dependencies, the rest of the workspace, final RC47 binaries and native execution are not qualified by this comparison."
+      "file_sha256": {
+        "crates/frankenterm-core/src/redact_backfill.rs": "941f362a70a24eadf18711980ce5fedceeba61e7a7a9826653d28243f9765573",
+        "crates/frankenterm-core/src/redactor.rs": "f97e7936de0ebdd2561d5e23ce9da95da143fa540aa763519ca5452146e49a86",
+        "crates/frankenterm-core/src/backup.rs": "79e3fd8a570fa9c7c36dbdcb50c883fb87eca004016597f3393bd417acf1d9cc",
+        "crates/frankenterm-core/tests/attestation_manifest_schema.rs": "64b83975f7962567caf226ec4d5b325ddde7230794c02a87f6ac024b87a9d111"
+      },
+      "method": "git diff from the tested commit to the RC51 source commit returned no changes for these four files; their current bytes were hashed independently",
+      "limit": "Source equality is limited to the listed files. Dependencies, the rest of the workspace and native execution are not qualified by this comparison. Native maintenance has its own receipt below."
     },
     "native_ingest_receipt": {
       "path": "/Volumes/USB_NVME/ft-release-20260915/rc46-native-ingest-catalog-stamp.json",
@@ -164,6 +170,25 @@
       "maintenance_receipts": 0,
       "scope": "Owned RC46 native DSR smoke database only; all three captured rows carry the catalog fingerprint above. No backfill or purge was performed. The diagnostic DSR build later timed out during packaging and is not a publishable release."
     },
-    "release_qualification": "Pending producing-bead bundle build/verify, manifest completeness, and final candidate DSR qualification. Referenced external receipts must be retained with the release evidence; this artifact alone does not embed their bytes."
+    "native_maintenance_receipt": {
+      "path": "/private/var/tmp/ft-release-20260921/native-redaction-vh9kr356/receipt.json",
+      "sha256": "6b9a4341313c1373ffca803b0f5ed1ca0177df26b62384c6d3c659999542081c",
+      "identity_receipt": "/private/var/tmp/ft-release-20260921/rc51-redaction-seed-h8fg211w/identity.json",
+      "identity_receipt_sha256": "607b986aea3770ba50a276eebf4682b2b7bedb284e0ab30493bd5be28571be53",
+      "source_revision": "abc5c9357aa3553c5faf4acc05f79a343769db92",
+      "source_tree": "e875e3fadbd539c937c9000e8b91376ec49d5626",
+      "dsr_run_id": "e325be75-473d-4db7-89a0-155932a18c35",
+      "version": "0.15.6-rc.51",
+      "profile": "release-interactive",
+      "target": "aarch64-apple-darwin",
+      "ft_sha256": "b01c713078e0a8bc5ce52c5ce0ce9c7307a86a22355da0461f7869ccae30b065",
+      "full_candidate_schema": true,
+      "schema_version": 47,
+      "passed_steps": ["backfill/dry-run", "backfill/mutate", "backfill/idempotence", "purge/dry-run", "purge/mutate", "purge/idempotence"],
+      "scope": "Native CLI over a read-only SQLite backup of the stopped owned RC51 smoke database. Each operation scans two added synthetic rows after cursor 3; original rows and embeddings are preserved. Real mutation validates catalog stamping, SQLite FTS rebuild, embedding invalidation and durable receipt equality. Dry-run preserves database bytes and state; repetition changes no content or embeddings.",
+      "provenance_boundary": "The identity receipt records root's independent terminal DSR success and offline family verification review. The maintenance driver verifies executable hash binding but does not establish provenance itself.",
+      "not_claimed": ["deployment corpus cleanliness", "whole-corpus or cross-segment coverage", "Tantivy rebuild", "backup archive purge", "schema migration", "ingest stamping", "signed release qualification"]
+    },
+    "release_qualification": "Pending producing-bead bundle build/verify, manifest completeness, retained evidence packaging and signed release qualification. RC51 native maintenance passed for the exact source and executable above; this does not qualify other release gates. Referenced external receipts must be retained with the release evidence; this artifact alone does not embed their bytes."
   }
 }

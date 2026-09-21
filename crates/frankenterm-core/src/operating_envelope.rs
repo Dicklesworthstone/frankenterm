@@ -4098,6 +4098,10 @@ mod tests {
                 }
             };
             assert_eq!(decoded, artifact);
+            // Actual planner output for controlled fixtures; embedded command/worker
+            // fields describe fixture inputs, not live service execution receipts.
+            // Retain all ten records with the successful --nocapture test transcript.
+            println!("OPERATING_ENVELOPE_FIXTURE_SCENARIO_V1 {jsonl}");
         }
     }
 

@@ -285,27 +285,34 @@ fn injection_scan_checkpoints_at_the_bounded_interval() {
             .map(|pane_id| (pane_id, mock_scrollback(vec!["unmapped"])))
             .collect::<HashMap<_, _>>();
         let below_cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(2));
+        let below_checkpoints = below_cx.checkpoint_state().checkpoint_count;
         let report = injector
             .inject_with_cx(&below_cx, &pane_id_map, &below_interval)
             .await
             .expect("preflight plus final checkpoint must admit 256 unmapped panes");
         assert_eq!(report.skipped_count(), 256);
+        assert_eq!(
+            below_cx.checkpoint_state().checkpoint_count - below_checkpoints,
+            2
+        );
+        assert_eq!(below_cx.budget().poll_quota, 2);
 
         let crosses_interval = (0_u64..257)
             .map(|pane_id| (pane_id, mock_scrollback(vec!["unmapped"])))
             .collect::<HashMap<_, _>>();
         let crossing_cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(2));
-        let error = injector
+        let crossing_checkpoints = crossing_cx.checkpoint_state().checkpoint_count;
+        let report = injector
             .inject_with_cx(&crossing_cx, &pane_id_map, &crosses_interval)
             .await
-            .expect_err("the 257th scan entry must observe the bounded checkpoint");
-        assert!(matches!(
-            error,
-            frankenterm_core::Error::RuntimeOperation {
-                operation: "restore_scrollback.inject.preflight",
-                source: RuntimeOperationSource::PollQuotaExhausted,
-            }
-        ));
+            .expect("synchronous checkpoints do not consume scheduler poll quota");
+        assert_eq!(report.skipped_count(), 257);
+        // Removing the interval checkpoint makes this count two and fails.
+        assert_eq!(
+            crossing_cx.checkpoint_state().checkpoint_count - crossing_checkpoints,
+            3
+        );
+        assert_eq!(crossing_cx.budget().poll_quota, 2);
     });
 }
 
@@ -370,10 +377,16 @@ fn mapped_intersection_wins_after_the_entry_checkpoint() {
             mock_scrollback(Vec::new()),
         )]);
         let cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(1));
+        let checkpoints_before = cx.checkpoint_state().checkpoint_count;
         let error = injector
             .inject_with_cx(&cx, &pane_id_map, &scrollbacks)
             .await
             .expect_err("mapped data must identify the unsupported channel first");
+        assert_eq!(
+            cx.checkpoint_state().checkpoint_count - checkpoints_before,
+            1
+        );
+        assert_eq!(cx.budget().poll_quota, 1);
         assert!(matches!(
             error,
             frankenterm_core::Error::RuntimeOperation {

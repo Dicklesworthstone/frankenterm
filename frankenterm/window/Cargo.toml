@@ -118,3 +118,6 @@ objc.workspace = true
 objc2-core-graphics.workspace = true
 plist.workspace = true
 shlex.workspace = true
+
+[target.'cfg(target_os="macos")'.dev-dependencies]
+block = "=0.1.6"

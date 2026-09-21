@@ -161,6 +161,9 @@ struct SelectionAnchorEntry {
     source_sequence: SequenceNo,
     witness: ScreenCoordinateWitness,
     points: [Option<SelectionAnchorCoordinate>; 3],
+    normalized_start: Option<usize>,
+    #[cfg(feature = "use_serde")]
+    cold_points: [Option<ColdSelectionPointAnchor>; 3],
 }
 
 /// Access is serialized by the existing terminal lock. Entries are weak and
@@ -323,6 +326,9 @@ pub struct ScreenLineRead {
         crate::config::ScrollbackInterval,
     )>,
     hydrated: Vec<Line>,
+    // Effective source lengths, captured on the hydration worker before
+    // joining/reflow. No selected text is retained by selection tokens.
+    selection_source_lengths: Vec<(StableRowIndex, usize)>,
     payload_bytes: usize,
     complete: bool,
     cold_context: Option<Range<StableRowIndex>>,
@@ -361,6 +367,28 @@ impl ColdViewportAnchor {
                 .as_ref()
                 .is_none_or(|current| current.rows.range(self.source.clone()).next().is_none()),
         }
+    }
+}
+
+/// One selection endpoint in an immutable cold source row. This
+/// retains source identity and cell offsets, never decoded lines. Endpoint
+/// affinity distinguishes an inclusive cell from the boundary before it.
+#[cfg(feature = "use_serde")]
+#[derive(Clone)]
+pub struct ColdSelectionPointAnchor {
+    group: ColdViewportAnchor,
+    before: bool,
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Debug for ColdSelectionPointAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ColdSelectionPointAnchor")
+            .field("source", &self.group.source)
+            .field("cells", &self.group.cells)
+            .field("before", &self.before)
+            .finish_non_exhaustive()
     }
 }
 
@@ -701,6 +729,7 @@ pub struct ColdSeamReflow {
     previous: Option<Arc<ColdRowFragments>>,
     policy: ResizeWrapPolicy,
     replacement: Option<(Arc<ColdRowFragments>, Vec<Line>)>,
+    selection_source_lengths: Vec<usize>,
     source: Option<Range<StableRowIndex>>,
     retired_layout: Option<Arc<ColdVisualLayout>>,
     pub(crate) cursor: Option<ColdSeamCursor>,
@@ -1047,6 +1076,13 @@ impl ColdSeamReflow {
         );
         anyhow::ensure!(!cancelled(), "cold seam cancelled");
         self.source = Some(first..self.frontier);
+        charge.used = rows
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|bytes| charge.used.checked_add(bytes))
+            .filter(|used| *used <= charge.limit)
+            .ok_or(ColdReadPayloadLimit)?;
+        self.selection_source_lengths = rows.iter().map(Line::len).collect();
         self.replacement = Some((
             Arc::new(ColdRowFragments {
                 sink: Arc::clone(&self.sink),
@@ -1888,6 +1924,16 @@ impl ScreenLineRead {
                     let mut line = prefetched
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("cold logical context unavailable"))?;
+                    anyhow::ensure!(
+                        self.selection_source_lengths.len() < Self::MAX_ROWS,
+                        "cold source coordinate row limit"
+                    );
+                    charge.used = charge
+                        .used
+                        .checked_add(std::mem::size_of::<(StableRowIndex, usize)>())
+                        .filter(|used| *used <= charge.limit)
+                        .ok_or(ColdReadPayloadLimit)?;
+                    self.selection_source_lengths.push((source_row, line.len()));
                     if layout.stored_physical() {
                         // The admission receipt binds these exact physical
                         // rows to the unchanged coordinate generation. Joining
@@ -2129,6 +2175,17 @@ impl ScreenLineRead {
             }
             self.cold_context = Some(checked_first..context_end);
             let cold_len = context.len();
+            charge.used = context
+                .len()
+                .checked_mul(std::mem::size_of::<(StableRowIndex, usize)>())
+                .and_then(|bytes| charge.used.checked_add(bytes))
+                .filter(|used| *used <= charge.limit)
+                .ok_or(ColdReadPayloadLimit)?;
+            self.selection_source_lengths = context
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| (context_first + offset as StableRowIndex, line.len()))
+                .collect();
             context.extend(self.resident.iter().cloned());
             let source: Vec<Line> = context.into_iter().collect();
             let mut output = Vec::with_capacity(source.len());
@@ -2382,6 +2439,138 @@ impl ScreenLineRead {
                 return visual
                     .start
                     .checked_add(StableRowIndex::try_from(offset).ok()?);
+            }
+            remaining = remaining.checked_sub(line.len())?;
+        }
+        None
+    }
+
+    /// Capture after the terminal owner validates this read. `is_end` means
+    /// the normalized inclusive range end, not necessarily drag array slot 2.
+    /// Origins and normalized starts pass false. A BeforeZero end excludes
+    /// the first cell, whereas a BeforeZero start includes it.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_cold_selection_point(
+        &self,
+        point: SelectionAnchorCoordinate,
+        is_end: bool,
+    ) -> Option<ColdSelectionPointAnchor> {
+        if !self.complete {
+            return None;
+        }
+        let layout = self.layout.as_ref()?;
+        let (source, visual) = layout
+            .groups
+            .iter()
+            .find(|(_, visual)| visual.contains(&point.row))?;
+        let (_, visual_lines) = self.cached_lines(visual.clone())?;
+        let visual_offset = usize::try_from(point.row.checked_sub(visual.start)?).ok()?;
+        let mut cells = visual_lines
+            .get(..visual_offset)?
+            .iter()
+            .try_fold(0usize, |sum, line| sum.checked_add(line.len()))?;
+        let (_, lines) = self.cached_lines(point.row..point.row.checked_add(1)?)?;
+        let line = lines.first()?;
+        let column = point.column.unwrap_or(0);
+        if column == usize::MAX || (line.last_cell_was_wrapped() && column >= line.len()) {
+            return None;
+        }
+        cells = cells.checked_add(column)?;
+        let first = self
+            .selection_source_lengths
+            .partition_point(|(row, _)| *row < source.start);
+        let end = self
+            .selection_source_lengths
+            .partition_point(|(row, _)| *row < source.end);
+        let source_lengths = self.selection_source_lengths.get(first..end)?;
+        if source_lengths.len() != usize::try_from(source.end.checked_sub(source.start)?).ok()? {
+            return None;
+        }
+        let mut selected = None;
+        for (index, &(row, len)) in source_lengths.iter().enumerate() {
+            if cells < len || index + 1 == source_lengths.len() {
+                selected = Some(row);
+                break;
+            }
+            cells = cells.checked_sub(len)?;
+        }
+        let row = selected?;
+        let (sink, interval) = self.cold.as_ref()?;
+        let source = row..row.checked_add(1)?;
+        let group = ColdViewportAnchor {
+            sink: Arc::downgrade(sink),
+            interval: interval.clone(),
+            fragments: self
+                .fragments
+                .as_ref()
+                .filter(|fragments| fragments.rows.range(source.clone()).next().is_some())
+                .map(Arc::downgrade),
+            source,
+            cells,
+        };
+        Some(ColdSelectionPointAnchor {
+            group,
+            before: point.column.is_none() && is_end,
+        })
+    }
+
+    /// Project through the actual chosen visual row lengths. Division by the
+    /// terminal width is incorrect for wide graphemes and underfull wrap rows.
+    /// The caller must validate this hydrated read against the live Screen in
+    /// the same terminal critical section that publishes all selection points.
+    #[cfg(feature = "use_serde")]
+    pub fn resolve_cold_selection_point(
+        &self,
+        anchor: &ColdSelectionPointAnchor,
+    ) -> Option<SelectionAnchorCoordinate> {
+        let group = &anchor.group;
+        let (sink, interval) = self.cold.as_ref()?;
+        if !self.complete
+            || !std::ptr::addr_eq(Arc::as_ptr(sink), group.sink.as_ptr())
+            || !interval.retains(&group.interval, group.source.clone())
+            || !group.matches_fragments(&self.fragments)
+        {
+            return None;
+        }
+        let (source, visual) = self
+            .layout
+            .as_ref()?
+            .groups
+            .iter()
+            .find(|(source, _)| source.contains(&group.source.start))?;
+        let (_, lines) = self.cached_lines(visual.clone())?;
+        if lines.len() > Self::MAX_ROWS {
+            return None;
+        }
+        let mut remaining = group.cells;
+        let mut expected = source.start;
+        for &(row, len) in &self.selection_source_lengths {
+            if row < source.start || row >= group.source.start {
+                continue;
+            }
+            if row != expected {
+                return None;
+            }
+            remaining = remaining.checked_add(len)?;
+            expected = expected.checked_add(1)?;
+        }
+        if expected != group.source.start {
+            return None;
+        }
+        for (offset, line) in lines.iter().enumerate() {
+            // Like resident selection mapping, virtual columns beyond the
+            // logical text remain on its final hard-ended visual row.
+            if remaining < line.len() || offset + 1 == lines.len() {
+                return Some(SelectionAnchorCoordinate {
+                    row: visual
+                        .start
+                        .checked_add(StableRowIndex::try_from(offset).ok()?)?,
+                    column: if anchor.before {
+                        remaining.checked_sub(1)
+                    } else {
+                        Some(remaining)
+                    },
+                });
             }
             remaining = remaining.checked_sub(line.len())?;
         }
@@ -3937,6 +4126,7 @@ impl Screen {
             previous: self.cold_row_fragments.clone(),
             policy: self.resize_wrap_policy,
             replacement: None,
+            selection_source_lengths: Vec::new(),
             source: None,
             retired_layout: None,
             cursor: None,
@@ -4000,9 +4190,131 @@ impl Screen {
         let Some((replacement, rows)) = prepared.replacement.as_mut() else {
             return Ok(false);
         };
+        let source_lengths = &prepared.selection_source_lengths;
+        let source_resident = &prepared.resident;
+        let frontier = prepared.frontier;
         if !Self::fragments_match_interval(replacement, &sink, &now) {
             return Ok(false);
         }
+        let mut anchors = std::mem::take(&mut self.selection_anchors);
+        anchors.0.retain_mut(|entry| {
+            if entry.owner.strong_count() == 0
+                || !self.matches_coordinate_witness(&entry.witness)
+                || !self.selection_entry_rows_unchanged(entry)
+                || !self.selection_anchor_points_are_resident(&entry.points)
+            {
+                return false;
+            }
+            let Some(old_cold_cells) = source_lengths
+                .iter()
+                .try_fold(0usize, |sum, len| sum.checked_add(*len))
+            else {
+                return false;
+            };
+            for index in 0..3 {
+                let logical = if let Some(cold) = &entry.cold_points[index] {
+                    if !std::ptr::addr_eq(Arc::as_ptr(&sink), cold.group.sink.as_ptr())
+                        || !now.retains(&cold.group.interval, cold.group.source.clone())
+                        || !cold.group.matches_fragments(&self.cold_row_fragments)
+                    {
+                        return false;
+                    }
+                    if source.contains(&cold.group.source.start) {
+                        let Ok(offset) = usize::try_from(cold.group.source.start - source.start)
+                        else {
+                            return false;
+                        };
+                        let Some(prefix) = source_lengths.get(..offset).and_then(|lengths| {
+                            lengths
+                                .iter()
+                                .try_fold(0usize, |sum, len| sum.checked_add(*len))
+                        }) else {
+                            return false;
+                        };
+                        let Some(cells) = prefix.checked_add(cold.group.cells) else {
+                            return false;
+                        };
+                        Some((cells, cold.before))
+                    } else {
+                        // The seam copies fragments outside its source range
+                        // without changing their cells. Rebind only after the
+                        // old identity and retained interval passed above.
+                        let cold = entry.cold_points[index].as_mut().unwrap();
+                        cold.group.fragments = replacement
+                            .rows
+                            .range(cold.group.source.clone())
+                            .next()
+                            .map(|_| Arc::downgrade(replacement));
+                        continue;
+                    }
+                } else if let Some(point) = entry.points[index] {
+                    let Some(row) = self.stable_row_to_phys(point.row) else {
+                        return false;
+                    };
+                    if row >= source_resident.len() {
+                        continue;
+                    }
+                    let Some(cells) = source_resident[..row]
+                        .iter()
+                        .try_fold(old_cold_cells, |sum, line| sum.checked_add(line.len()))
+                        .and_then(|sum| sum.checked_add(point.column.unwrap_or(0)))
+                    else {
+                        return false;
+                    };
+                    Some((
+                        cells,
+                        point.column.is_none() && entry.normalized_start != Some(index),
+                    ))
+                } else {
+                    None
+                };
+                let Some((mut remaining, before)) = logical else {
+                    continue;
+                };
+                let mut mapped = false;
+                for (&row, line) in replacement.rows.range(source.clone()) {
+                    if remaining < line.len() {
+                        entry.cold_points[index] = Some(ColdSelectionPointAnchor {
+                            group: ColdViewportAnchor {
+                                sink: Arc::downgrade(&sink),
+                                interval: now.clone(),
+                                source: row..row + 1,
+                                cells: remaining,
+                                fragments: Some(Arc::downgrade(replacement)),
+                            },
+                            before,
+                        });
+                        entry.points[index] = None;
+                        mapped = true;
+                        break;
+                    }
+                    remaining -= line.len();
+                }
+                if mapped {
+                    continue;
+                }
+                for (row, line) in rows.iter().enumerate() {
+                    if remaining < line.len() || row + 1 == rows.len() {
+                        entry.points[index] = Some(SelectionAnchorCoordinate {
+                            row: frontier + row as StableRowIndex,
+                            column: if before {
+                                remaining.checked_sub(1)
+                            } else {
+                                Some(remaining)
+                            },
+                        });
+                        entry.cold_points[index] = None;
+                        mapped = true;
+                        break;
+                    }
+                    remaining -= line.len();
+                }
+                if !mapped {
+                    return false;
+                }
+            }
+            true
+        });
         for (live, replacement) in self.lines.iter_mut().zip(rows) {
             replacement.update_last_change_seqno(seqno);
             std::mem::swap(live, replacement);
@@ -4012,6 +4324,7 @@ impl Screen {
         prepared.retired_layout = self.cold_visual_layout.take();
         self.invalidate_coordinate_witnesses();
         self.cold_visual_seqno = seqno;
+        self.finish_selection_anchor_resize(anchors, seqno);
         Ok(true)
     }
     /// Capture a bounded request without invoking any blocking sink method.
@@ -4128,6 +4441,7 @@ impl Screen {
             resident,
             cold,
             hydrated: Vec::new(),
+            selection_source_lengths: Vec::new(),
             payload_bytes: 0,
             complete: false,
             cold_context: None,
@@ -4312,6 +4626,50 @@ impl Screen {
         // reflowed layout without scheduling a resize worker. The cold visual
         // interval ends at this frontier at every width, so its last row is a
         // bounded refresh request even while the visual origin is unknown.
+        let frontier = self.phys_to_stable_row_index(0);
+        let rows = interval.rows().ok_or(ColdReadMetadataBusy)?;
+        let last = frontier.checked_sub(1).ok_or(ColdReadMetadataBusy)?;
+        if last < rows.start || frontier > rows.end {
+            return Err(ColdReadMetadataBusy);
+        }
+        Ok(Some(last..frontier))
+    }
+
+    /// Plan only this endpoint's complete group, or the bounded geometry
+    /// refresh needed to find it. Busy and invalid remain distinct outcomes.
+    #[cfg(feature = "use_serde")]
+    pub fn cold_selection_anchor_read_range(
+        &self,
+        anchor: &ColdSelectionPointAnchor,
+    ) -> Result<Option<Range<StableRowIndex>>, ColdReadMetadataBusy> {
+        let group = &anchor.group;
+        let Some(sink) = self.config.scrollback_spill_sink() else {
+            return Ok(None);
+        };
+        if !std::ptr::addr_eq(Arc::as_ptr(&sink), group.sink.as_ptr())
+            || !group.matches_fragments(&self.cold_row_fragments)
+        {
+            return Ok(None);
+        }
+        let interval = match sink.try_capture_scrollback_interval() {
+            crate::config::ScrollbackIntervalCapture::Ready(interval) => interval,
+            crate::config::ScrollbackIntervalCapture::Busy => return Err(ColdReadMetadataBusy),
+            crate::config::ScrollbackIntervalCapture::Unavailable => return Ok(None),
+        };
+        if !interval.retains(&group.interval, group.source.clone()) {
+            return Ok(None);
+        }
+        if let Some(layout) = self.cold_visual_layout_for_interval(&interval) {
+            // A retained open seam can temporarily be absent from a closed
+            // layout. Its source identity remains valid while the seam worker
+            // completes; absence is not evidence of pruning or replacement.
+            return layout
+                .groups
+                .iter()
+                .find(|(source, _)| source.contains(&group.source.start))
+                .map(|(_, visual)| Some(visual.clone()))
+                .ok_or(ColdReadMetadataBusy);
+        }
         let frontier = self.phys_to_stable_row_index(0);
         let rows = interval.rows().ok_or(ColdReadMetadataBusy)?;
         let last = frontier.checked_sub(1).ok_or(ColdReadMetadataBusy)?;
@@ -4797,6 +5155,9 @@ impl Screen {
             source_sequence,
             witness: self.capture_coordinate_witness(),
             points,
+            normalized_start: Self::selection_normalized_start(&points),
+            #[cfg(feature = "use_serde")]
+            cold_points: std::array::from_fn(|_| None),
         };
         self.selection_anchors.0.push(entry);
         Some(token)
@@ -4814,6 +5175,12 @@ impl Screen {
                 && self.matches_coordinate_witness(&entry.witness)
                 && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
         })?;
+        #[cfg(feature = "use_serde")]
+        if entry.cold_points.iter().any(Option::is_some) {
+            // Callers needing mixed/cold points must supply validated reads;
+            // never return a partial drag through the resident-only API.
+            return None;
+        }
         self.selection_anchor_points_are_resident(&entry.points)
             .then_some(entry.points)
     }
@@ -4822,15 +5189,234 @@ impl Screen {
         &self,
         points: &[Option<SelectionAnchorCoordinate>; 3],
     ) -> bool {
-        points.iter().flatten().all(|point| {
-            let Some(row) = self.stable_row_to_phys(point.row) else {
-                return false;
-            };
-            let line = &self.lines[row];
-            point.column != Some(usize::MAX)
-                && (!line.last_cell_was_wrapped()
-                    || point.column.is_none_or(|column| column < line.len()))
+        points
+            .iter()
+            .flatten()
+            .all(|point| self.selection_point_is_resident(*point))
+    }
+
+    fn selection_normalized_start(
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+    ) -> Option<usize> {
+        points[1].zip(points[2]).map(|(start, end)| {
+            if (start.row, start.column) <= (end.row, end.column) {
+                1
+            } else {
+                2
+            }
         })
+    }
+
+    fn selection_entry_rows_unchanged(&self, entry: &SelectionAnchorEntry) -> bool {
+        #[cfg(feature = "use_serde")]
+        if entry.cold_points.iter().any(Option::is_some) {
+            // A mixed selection includes every resident row between the cold
+            // frontier and its furthest resident point, including interior rows.
+            let last = entry.points.iter().flatten().map(|point| point.row).max();
+            return last.is_none_or(|last| {
+                self.stable_row_to_phys(last).is_some_and(|last| {
+                    self.lines
+                        .range(..=last)
+                        .all(|line| !line.changed_since(entry.source_sequence))
+                })
+            });
+        }
+        self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn selection_points_read_ranges(
+        &self,
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+    ) -> Result<Vec<Range<StableRowIndex>>, ColdReadMetadataBusy> {
+        let frontier = self.phys_to_stable_row_index(0);
+        let mut ranges = Vec::with_capacity(3);
+        for point in points.iter().flatten().filter(|point| point.row < frontier) {
+            let end = point.row.checked_add(1).ok_or(ColdReadMetadataBusy)?;
+            let range = self.expand_cold_logical_range(point.row..end);
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Cold source immutability is checked by the hydrated read's retained
+    /// interval. This check covers the entire resident portion, not merely
+    /// the endpoints, before source-sequence advancement may be accepted.
+    #[cfg(feature = "use_serde")]
+    pub fn selection_points_resident_span_unchanged_since(
+        &self,
+        points: &[Option<SelectionAnchorCoordinate>; 3],
+        sequence: SequenceNo,
+    ) -> bool {
+        let frontier = self.phys_to_stable_row_index(0);
+        let mut rows = points.iter().flatten().map(|point| point.row);
+        let Some(first) = rows.next() else {
+            return false;
+        };
+        let (first, last) = rows.fold((first, first), |(first, last), row| {
+            (first.min(row), last.max(row))
+        });
+        if last < frontier {
+            return true;
+        }
+        let Some(first) = self.stable_row_to_phys(first.max(frontier)) else {
+            return false;
+        };
+        let Some(last) = self.stable_row_to_phys(last) else {
+            return false;
+        };
+        self.lines
+            .range(first..=last)
+            .all(|line| !line.changed_since(sequence))
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn capture_selection_anchor_with_reads(
+        &mut self,
+        source_sequence: SequenceNo,
+        points: [Option<SelectionAnchorCoordinate>; 3],
+        reads: &[&ScreenLineRead],
+    ) -> Result<Option<ScreenSelectionAnchor>, ColdReadMetadataBusy> {
+        if !self.allow_scrollback
+            || source_sequence == SequenceNo::MAX
+            || reads.len() > 3
+            || points.iter().all(Option::is_none)
+            || points[1].is_some() != points[2].is_some()
+            || points[0].is_some_and(|point| point.column.is_none())
+            || (points[1] == points[2] && points[1].is_some_and(|point| point.column.is_none()))
+        {
+            return Ok(None);
+        }
+        let normalized_start = Self::selection_normalized_start(&points);
+        let mut resident = points;
+        let mut cold_points = std::array::from_fn(|_| None);
+        for index in 0..3 {
+            let Some(point) = points[index] else {
+                continue;
+            };
+            if self.selection_point_is_resident(point) {
+                continue;
+            }
+            if point.row >= self.phys_to_stable_row_index(0) {
+                return Ok(None);
+            }
+            for read in reads {
+                if self.try_validate_line_read(read)? {
+                    cold_points[index] = read.capture_cold_selection_point(
+                        point,
+                        index != 0 && normalized_start != Some(index),
+                    );
+                    if cold_points[index].is_some() {
+                        break;
+                    }
+                }
+            }
+            if cold_points[index].is_none() {
+                return Ok(None);
+            }
+            resident[index] = None;
+        }
+        self.selection_anchors
+            .0
+            .retain(|entry| entry.owner.strong_count() != 0);
+        if self.selection_anchors.0.len() >= 16 {
+            return Ok(None);
+        }
+        let token = ScreenSelectionAnchor(Arc::new(()));
+        self.selection_anchors.0.push(SelectionAnchorEntry {
+            owner: Arc::downgrade(&token.0),
+            source_sequence,
+            witness: self.capture_coordinate_witness(),
+            points: resident,
+            normalized_start,
+            cold_points,
+        });
+        Ok(Some(token))
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn selection_anchor_read_ranges(
+        &self,
+        token: &ScreenSelectionAnchor,
+        sequence: SequenceNo,
+    ) -> Result<Option<Vec<Range<StableRowIndex>>>, ColdReadMetadataBusy> {
+        let Some(entry) = self.selection_anchors.0.iter().find(|entry| {
+            entry.owner.as_ptr() == Arc::as_ptr(&token.0)
+                && sequence != SequenceNo::MAX
+                && entry.source_sequence <= sequence
+                && self.matches_coordinate_witness(&entry.witness)
+                && self.selection_anchor_points_are_resident(&entry.points)
+                && self.selection_entry_rows_unchanged(entry)
+        }) else {
+            return Ok(None);
+        };
+        let mut ranges = Vec::with_capacity(3);
+        for point in entry.cold_points.iter().flatten() {
+            let Some(range) = self.cold_selection_anchor_read_range(point)? else {
+                return Ok(None);
+            };
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
+        Ok(Some(ranges))
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub fn resolve_selection_anchor_with_reads(
+        &self,
+        token: &ScreenSelectionAnchor,
+        sequence: SequenceNo,
+        reads: &[&ScreenLineRead],
+    ) -> Result<Option<[Option<SelectionAnchorCoordinate>; 3]>, ColdReadMetadataBusy> {
+        if reads.len() > 3 {
+            return Ok(None);
+        }
+        if self
+            .selection_anchor_read_ranges(token, sequence)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(entry) = self
+            .selection_anchors
+            .0
+            .iter()
+            .find(|entry| entry.owner.as_ptr() == Arc::as_ptr(&token.0))
+        else {
+            return Ok(None);
+        };
+        let mut points = entry.points;
+        for (index, cold) in entry.cold_points.iter().enumerate() {
+            if let Some(cold) = cold {
+                let mut mapped = None;
+                for read in reads {
+                    if self.try_validate_line_read(read)? {
+                        mapped = read.resolve_cold_selection_point(cold);
+                        if mapped.is_some() {
+                            break;
+                        }
+                    }
+                }
+                let Some(mapped) = mapped else {
+                    return Ok(None);
+                };
+                points[index] = Some(mapped);
+            }
+        }
+        Ok(Some(points))
+    }
+
+    fn selection_point_is_resident(&self, point: SelectionAnchorCoordinate) -> bool {
+        let Some(row) = self.stable_row_to_phys(point.row) else {
+            return false;
+        };
+        let line = &self.lines[row];
+        point.column != Some(usize::MAX)
+            && (!line.last_cell_was_wrapped()
+                || point.column.is_none_or(|column| column < line.len()))
     }
 
     /// The terminal owner supplies the current source sequence. Advancing
@@ -4903,7 +5489,7 @@ impl Screen {
                     .is_some_and(|before| entry.source_sequence <= before)
                 && self.matches_coordinate_witness(&entry.witness)
                 && self.selection_anchor_points_are_resident(&entry.points)
-                && self.selection_anchor_rows_unchanged_since(&entry.points, entry.source_sequence)
+                && self.selection_entry_rows_unchanged(entry)
         });
         anchors
     }
@@ -5775,6 +6361,7 @@ impl Screen {
                 crate::config::ScrollbackLineAdmission::Admitted {
                     interval: Some(interval),
                 } => {
+                    self.transport_selection_anchors_to_cold(&sink, &interval, stable_row, line);
                     self.advance_cold_seam_alignment(&sink, &interval, stable_row);
                     self.record_cold_geometry_row(
                         Arc::clone(&sink),
@@ -5800,6 +6387,72 @@ impl Screen {
 
     #[cfg(feature = "use_serde")]
     fn advance_cold_seam_alignment(
+        &mut self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        row: StableRowIndex,
+    ) {
+        let previous = self.cold_row_fragments.clone();
+        self.advance_cold_seam_alignment_inner(sink, interval, row);
+        if let (Some(previous), Some(current)) = (previous, &self.cold_row_fragments) {
+            if !Arc::ptr_eq(&previous, current) && Arc::ptr_eq(&previous.rows, &current.rows) {
+                for entry in &mut self.selection_anchors.0 {
+                    for point in entry.cold_points.iter_mut().flatten() {
+                        if point
+                            .group
+                            .fragments
+                            .as_ref()
+                            .is_some_and(|old| old.as_ptr() == Arc::as_ptr(&previous))
+                        {
+                            point.group.fragments = Some(Arc::downgrade(current));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn transport_selection_anchors_to_cold(
+        &mut self,
+        sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
+        interval: &crate::config::ScrollbackInterval,
+        row: StableRowIndex,
+        line: &Line,
+    ) {
+        self.selection_anchors.0.retain_mut(|entry| {
+            let last = entry.points.iter().flatten().map(|point| point.row).max();
+            let first = entry.points.iter().flatten().map(|point| point.row).min();
+            let includes = last.is_some_and(|last| row <= last)
+                && (entry.cold_points.iter().any(Option::is_some)
+                    || first.is_some_and(|first| row >= first));
+            if includes && line.changed_since(entry.source_sequence) {
+                return false;
+            }
+            for index in 0..3 {
+                if let Some(point) = entry.points[index].filter(|point| point.row == row) {
+                    let Some(end) = row.checked_add(1) else {
+                        return false;
+                    };
+                    entry.cold_points[index] = Some(ColdSelectionPointAnchor {
+                        group: ColdViewportAnchor {
+                            sink: Arc::downgrade(sink),
+                            interval: interval.clone(),
+                            source: row..end,
+                            cells: point.column.unwrap_or(0),
+                            fragments: None,
+                        },
+                        before: point.column.is_none() && entry.normalized_start != Some(index),
+                    });
+                    entry.points[index] = None;
+                }
+            }
+            true
+        });
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn advance_cold_seam_alignment_inner(
         &mut self,
         sink: &Arc<dyn crate::config::ScrollbackSpillSink>,
         interval: &crate::config::ScrollbackInterval,
@@ -7259,13 +7912,7 @@ impl Screen {
             .0
             .iter()
             .map(|entry| {
-                let normalized_start = entry.points[1].zip(entry.points[2]).map(|(start, end)| {
-                    if (start.row, start.column) <= (end.row, end.column) {
-                        1
-                    } else {
-                        2
-                    }
-                });
+                let normalized_start = entry.normalized_start;
                 std::array::from_fn::<_, 3, _>(|index| {
                     let point = entry.points[index];
                     point.and_then(|point| {
@@ -10866,6 +11513,675 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn cold_selection_points_preserve_endpoint_affinity_through_real_reflow() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut prefix = Line::from_text(
+            "abcde\u{301}fghij界klmnopqr",
+            &CellAttributes::blank(),
+            1,
+            None,
+        );
+        prefix.set_last_cell_was_wrapped(true, 1);
+        let prefix_len = prefix.len();
+        for (row, line) in [
+            prefix,
+            Line::from_text("UVWXYZ10", &CellAttributes::blank(), 1, None),
+            Line::from_text("other", &CellAttributes::blank(), 1, None),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(sink.store_scrollback_line(row as StableRowIndex, line, 100));
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            20,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 3;
+        let initial = screen
+            .capture_line_read(0..2)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&initial));
+        screen.install_line_read_layout(&initial, 1);
+        let origin = initial
+            .capture_cold_selection_point(
+                SelectionAnchorCoordinate {
+                    row: 0,
+                    column: Some(3),
+                },
+                false,
+            )
+            .unwrap();
+        let start = initial
+            .capture_cold_selection_point(
+                SelectionAnchorCoordinate {
+                    row: 1,
+                    column: None,
+                },
+                false,
+            )
+            .unwrap();
+        let end = initial
+            .capture_cold_selection_point(
+                SelectionAnchorCoordinate {
+                    row: 1,
+                    column: None,
+                },
+                true,
+            )
+            .unwrap();
+        let inclusive_end = initial
+            .capture_cold_selection_point(
+                SelectionAnchorCoordinate {
+                    row: 1,
+                    column: Some(2),
+                },
+                true,
+            )
+            .unwrap();
+        let virtual_end = initial
+            .capture_cold_selection_point(
+                SelectionAnchorCoordinate {
+                    row: 1,
+                    column: Some(12),
+                },
+                true,
+            )
+            .unwrap();
+        let forward = [
+            Some(SelectionAnchorCoordinate {
+                row: 0,
+                column: Some(3),
+            }),
+            Some(SelectionAnchorCoordinate {
+                row: 0,
+                column: Some(3),
+            }),
+            Some(SelectionAnchorCoordinate {
+                row: 1,
+                column: None,
+            }),
+        ];
+        let reverse = [forward[0], forward[2], forward[1]];
+        let tokens = [forward, reverse].map(|points| {
+            screen
+                .capture_selection_anchor_with_reads(1, points, &[&initial])
+                .unwrap()
+                .unwrap()
+        });
+        let mixed_points = [
+            forward[0],
+            forward[1],
+            Some(SelectionAnchorCoordinate {
+                row: 5,
+                column: Some(0),
+            }),
+        ];
+        let mixed = screen
+            .capture_selection_anchor_with_reads(1, mixed_points, &[&initial])
+            .unwrap()
+            .unwrap();
+        screen.lines[1].update_last_change_seqno(2);
+        assert!(!screen.selection_points_resident_span_unchanged_since(&mixed_points, 1));
+        assert!(screen.selection_anchor_read_ranges(&mixed, 2).unwrap().is_none(),
+            "a changed resident interior revokes a mixed selection even when endpoints are unchanged");
+        assert!(
+            initial
+                .capture_cold_selection_point(
+                    SelectionAnchorCoordinate {
+                        row: 0,
+                        column: Some(prefix_len)
+                    },
+                    false,
+                )
+                .is_none(),
+            "a virtual column in a wrapped row is ambiguous"
+        );
+        drop(initial);
+        let mut cursor = test_cursor(0, 0, 1);
+        for (index, cols) in [11, 13, 40, 20].iter().copied().enumerate() {
+            let sequence = index as SequenceNo + 2;
+            cursor = screen.resize(test_size(3, cols, 96), cursor, sequence, false);
+            let refresh = screen
+                .cold_selection_anchor_read_range(&origin)
+                .unwrap()
+                .unwrap();
+            let layout = screen
+                .capture_line_read(refresh)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&layout));
+            screen.install_line_read_layout(&layout, sequence);
+            let group = screen
+                .cold_selection_anchor_read_range(&origin)
+                .unwrap()
+                .unwrap();
+            let ready = screen
+                .capture_line_read(group.clone())
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&ready));
+            let (_, rows) = ready.cached_lines(group.clone()).unwrap();
+            for token in &tokens {
+                let points = screen
+                    .resolve_selection_anchor_with_reads(token, sequence, &[&ready])
+                    .unwrap()
+                    .unwrap();
+                let (mut start, mut end) = (points[1].unwrap(), points[2].unwrap());
+                if (start.row, start.column) > (end.row, end.column) {
+                    std::mem::swap(&mut start, &mut end);
+                }
+                let mut selected = String::new();
+                for (offset, line) in rows.iter().enumerate() {
+                    let row = group.start + offset as StableRowIndex;
+                    if row < start.row || row > end.row {
+                        continue;
+                    }
+                    for cell in line.visible_cells() {
+                        if (row != start.row || cell.cell_index() >= start.column.unwrap_or(0))
+                            && (row != end.row
+                                || end.column.is_some_and(|end| cell.cell_index() <= end))
+                        {
+                            selected.push_str(cell.str());
+                        }
+                    }
+                }
+                assert_eq!(selected, "de\u{301}fghij界klmnopqr");
+                assert_eq!(
+                    points[0],
+                    Some(ready.resolve_cold_selection_point(&origin).unwrap())
+                );
+            }
+            let point_offset = |point: SelectionAnchorCoordinate, exclusive: bool| {
+                let row = usize::try_from(point.row - group.start).unwrap();
+                let prefix: usize = rows[..row].iter().map(Line::len).sum();
+                prefix
+                    + point
+                        .column
+                        .map_or(0, |column| column + usize::from(exclusive))
+            };
+            // Check all original endpoint roles independently; swapping drag
+            // slots must not change normalized start/end affinity.
+            for order in [[&origin, &start, &end], [&origin, &end, &start]] {
+                let mapped =
+                    order.map(|anchor| ready.resolve_cold_selection_point(anchor).unwrap());
+                assert_eq!(point_offset(mapped[0], false), 3);
+                assert_eq!(
+                    point_offset(mapped[1], std::ptr::eq(order[1], &end)),
+                    prefix_len
+                );
+                assert_eq!(
+                    point_offset(mapped[2], std::ptr::eq(order[2], &end)),
+                    prefix_len
+                );
+            }
+            assert_eq!(
+                point_offset(
+                    ready.resolve_cold_selection_point(&inclusive_end).unwrap(),
+                    false
+                ),
+                prefix_len + 2
+            );
+            assert_eq!(
+                point_offset(
+                    ready.resolve_cold_selection_point(&virtual_end).unwrap(),
+                    false
+                ),
+                prefix_len + 12
+            );
+        }
+        sink.force_busy_probe.store(true, Ordering::Relaxed);
+        assert_eq!(
+            screen.cold_selection_anchor_read_range(&origin),
+            Err(ColdReadMetadataBusy)
+        );
+        sink.force_busy_probe.store(false, Ordering::Relaxed);
+        let pruned = sink.rows.lock().unwrap().remove(&0).unwrap();
+        assert_eq!(screen.cold_selection_anchor_read_range(&origin), Ok(None));
+        sink.rows.lock().unwrap().insert(0, pruned);
+        *sink.interval_identity.lock().unwrap() =
+            crate::config::ScrollbackIntervalIdentity::default();
+        assert_eq!(screen.cold_selection_anchor_read_range(&origin), Ok(None));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_selection_three_groups_and_mixed_span_keep_exact_bytes() {
+        fn resolve(
+            screen: &mut Screen,
+            token: &ScreenSelectionAnchor,
+            sequence: SequenceNo,
+        ) -> [Option<SelectionAnchorCoordinate>; 3] {
+            let refresh = screen
+                .selection_anchor_read_ranges(token, sequence)
+                .unwrap()
+                .unwrap();
+            for range in refresh {
+                let read = screen
+                    .capture_line_read(range)
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                assert!(screen.validates_line_read(&read));
+                screen.install_line_read_layout(&read, sequence);
+            }
+            let ranges = screen
+                .selection_anchor_read_ranges(token, sequence)
+                .unwrap()
+                .unwrap();
+            assert!(ranges.len() <= 3);
+            let reads: Vec<_> = ranges
+                .into_iter()
+                .map(|range| {
+                    screen
+                        .capture_line_read(range)
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap()
+                })
+                .collect();
+            screen
+                .resolve_selection_anchor_with_reads(
+                    token,
+                    sequence,
+                    &reads.iter().collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .unwrap()
+        }
+        fn selected_bytes(
+            screen: &Screen,
+            points: [Option<SelectionAnchorCoordinate>; 3],
+        ) -> String {
+            let (mut start, mut end) = (points[1].unwrap(), points[2].unwrap());
+            if (start.row, start.column) > (end.row, end.column) {
+                std::mem::swap(&mut start, &mut end);
+            }
+            // Full-span hydration is an independent small-fixture oracle,
+            // never the production endpoint capture implementation.
+            let read = screen
+                .capture_line_read(start.row..end.row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&read));
+            let mut selected = String::new();
+            for (offset, line) in read.lines().enumerate() {
+                let row = start.row + offset as StableRowIndex;
+                for cell in line.visible_cells() {
+                    if (row != start.row || cell.cell_index() >= start.column.unwrap_or(0))
+                        && (row != end.row
+                            || end.column.is_some_and(|end| cell.cell_index() <= end))
+                    {
+                        selected.push_str(cell.str());
+                    }
+                }
+                if row < end.row && !line.last_cell_was_wrapped() {
+                    selected.push('\n');
+                }
+            }
+            selected
+        }
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        for (row, text) in ["alpha-one", "bravo-two", "charlie-three"]
+            .iter()
+            .enumerate()
+        {
+            assert!(sink.store_scrollback_line(
+                row as StableRowIndex,
+                &Line::from_text(text, &CellAttributes::blank(), 1, None),
+                100
+            ));
+        }
+        let mut screen = test_screen_with_config(
+            3,
+            20,
+            96,
+            TestTermConfig {
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        screen.stable_row_index_offset = 3;
+        for (row, text) in ["resident-four", "resident-five", "resident-six"]
+            .iter()
+            .enumerate()
+        {
+            screen.lines[row] = Line::from_text(text, &CellAttributes::blank(), 1, None);
+        }
+        let layout = screen
+            .capture_line_read(0..3)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&layout));
+        screen.install_line_read_layout(&layout, 1);
+        drop(layout);
+        let point = |row, column| {
+            Some(SelectionAnchorCoordinate {
+                row,
+                column: Some(column),
+            })
+        };
+        let all_cold = [point(1, 2), point(0, 3), point(2, 4)];
+        let mixed = [point(1, 2), point(0, 3), point(4, 6)];
+        let ranges = screen.selection_points_read_ranges(&all_cold).unwrap();
+        assert_eq!(
+            ranges,
+            [1..2, 0..1, 2..3],
+            "origin and endpoints occupy three distinct groups"
+        );
+        let reads: Vec<_> = ranges
+            .into_iter()
+            .map(|range| {
+                screen
+                    .capture_line_read(range)
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap()
+            })
+            .collect();
+        let refs: Vec<_> = reads.iter().collect();
+        assert!(
+            screen
+                .capture_selection_anchor_with_reads(1, all_cold, &refs[..2])
+                .unwrap()
+                .is_none(),
+            "two groups cannot authorize an omitted third endpoint"
+        );
+        let cold = screen
+            .capture_selection_anchor_with_reads(1, all_cold, &refs)
+            .unwrap()
+            .unwrap();
+        let mixed_token = screen
+            .capture_selection_anchor_with_reads(1, mixed, &refs)
+            .unwrap()
+            .unwrap();
+        drop(reads);
+        let mut cursor = test_cursor(0, 0, 1);
+        let mut sequence = 1;
+        for cols in [7, 12, 20].iter().copied() {
+            sequence += 1;
+            cursor = screen.resize(test_size(3, cols, 96), cursor, sequence, false);
+            let cold_points = resolve(&mut screen, &cold, sequence);
+            let mixed_points = resolve(&mut screen, &mixed_token, sequence);
+            assert_eq!(
+                selected_bytes(&screen, cold_points),
+                "ha-one\nbravo-two\ncharl"
+            );
+            assert_eq!(
+                selected_bytes(&screen, mixed_points),
+                "ha-one\nbravo-two\ncharlie-three\nresident-four\nresiden"
+            );
+            assert_eq!(
+                cold_points[0], mixed_points[0],
+                "origin identity must travel independently of either range"
+            );
+            let origin = cold_points[0].unwrap();
+            let row = screen
+                .capture_line_read(origin.row..origin.row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(
+                row.lines()
+                    .next()
+                    .unwrap()
+                    .visible_cells()
+                    .find(|cell| cell.cell_index() == origin.column.unwrap())
+                    .unwrap()
+                    .str(),
+                "a"
+            );
+        }
+        // The final width restores one row per resident record. Change only
+        // an interior record: neither origin nor either endpoint is touched.
+        assert_eq!(screen.lines[0].as_str(), "resident-four");
+        screen.lines[0] =
+            Line::from_text("mutated-four", &CellAttributes::blank(), sequence + 1, None);
+        assert!(screen
+            .selection_anchor_read_ranges(&mixed_token, sequence + 1)
+            .unwrap()
+            .is_none());
+        let cold_points = resolve(&mut screen, &cold, sequence + 1);
+        assert_eq!(
+            selected_bytes(&screen, cold_points),
+            "ha-one\nbravo-two\ncharl",
+            "unrelated resident mutation must not revoke an all-cold selection"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_selection_fragment_identity_follows_unrelated_spill() {
+        let original = Line::from_text("original", &CellAttributes::blank(), 1, None);
+        let replacement = Line::from_text("kept-fragment", &CellAttributes::blank(), 1, None);
+        let (mut screen, sink) = streamed_cold_fragment_fixture(
+            &[
+                original,
+                Line::from_text("other", &CellAttributes::blank(), 1, None),
+            ],
+            [(0, replacement)].into(),
+            20,
+        );
+        screen.config = Arc::new(TestTermConfig {
+            scrollback: 100,
+            scrollback_tier: crate::config::ScrollbackTierConfig {
+                enabled: true,
+                hot_lines: 1,
+                warm_max_bytes: 0,
+            },
+            cold_sink: Some(sink.clone()),
+            ..TestTermConfig::default()
+        });
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 1);
+        let point = |column| {
+            Some(SelectionAnchorCoordinate {
+                row: 0,
+                column: Some(column),
+            })
+        };
+        let token = screen
+            .capture_selection_anchor_with_reads(1, [point(2), point(0), point(4)], &[&read])
+            .unwrap()
+            .unwrap();
+        let previous = screen.cold_row_fragments.as_ref().unwrap().clone();
+        drop(read);
+        // Exercise the successful spill receipt path while the retained
+        // selection refers to a different source row with a real fragment.
+        screen.lines[0] = Line::from_text("fresh", &CellAttributes::blank(), 1, None);
+        screen.lines.push_back(Line::new(1));
+        let spilled = screen.lines.pop_front().unwrap();
+        assert!(screen.record_scrollback_spill(2, &spilled, 2));
+        screen.advance_stable_row_index_offset(1);
+        let current = screen.cold_row_fragments.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(&previous, current));
+        assert!(
+            Arc::ptr_eq(&previous.rows, &current.rows),
+            "only frontier metadata changed"
+        );
+        assert_eq!(current.aligned_frontier, 3);
+        assert_eq!(sink.load_scrollback_line(2).unwrap().as_str(), "fresh");
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        screen.install_line_read_layout(&read, 2);
+        let mapped = screen
+            .resolve_selection_anchor_with_reads(&token, 2, &[&read])
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapped, [point(2), point(0), point(4)]);
+        let mut selected = String::new();
+        for cell in read.lines().next().unwrap().visible_cells() {
+            if cell.cell_index() <= 4 {
+                selected.push_str(cell.str());
+            }
+        }
+        assert_eq!(selected, "kept-");
+        // An unrelated identity must not be blessed merely because row
+        // numbers still exist; replacement retains the old payload fixture.
+        *sink.interval_identity.lock().unwrap() =
+            crate::config::ScrollbackIntervalIdentity::default();
+        assert!(screen
+            .selection_anchor_read_ranges(&token, 2)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_selection_registry_survives_native_spill_and_reflow() {
+        let sink = Arc::new(TestColdScrollbackSink::default());
+        let mut terminal = crate::Terminal::new(
+            test_size(3, 8, 96),
+            Arc::new(TestTermConfig {
+                scrollback: 100,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(sink.clone()),
+                ..TestTermConfig::default()
+            }),
+            "FrankenTerm",
+            "selection-spill-test",
+            Box::new(std::io::sink()),
+        );
+        terminal.advance_bytes(b"abcdefghijklmno\r\n");
+        let sequence = terminal.current_seqno();
+        let points = [
+            Some(SelectionAnchorCoordinate {
+                row: 0,
+                column: Some(3),
+            }),
+            Some(SelectionAnchorCoordinate {
+                row: 0,
+                column: Some(2),
+            }),
+            Some(SelectionAnchorCoordinate {
+                row: 1,
+                column: Some(3),
+            }),
+        ];
+        let token = terminal
+            .screen_mut()
+            .capture_selection_anchor(sequence, points)
+            .unwrap();
+        terminal.advance_bytes("tail\r\n".repeat(8));
+        assert!(terminal.screen().phys_to_stable_row_index(0) > 1);
+        assert!(sink.rows.lock().unwrap().contains_key(&0));
+        for cols in [5, 11, 8].iter().copied() {
+            terminal.resize(test_size(3, cols, 96));
+            let sequence = terminal.current_seqno();
+            let refresh = terminal
+                .screen()
+                .selection_anchor_read_ranges(&token, sequence)
+                .unwrap()
+                .unwrap();
+            for range in refresh {
+                let read = terminal
+                    .screen()
+                    .capture_line_read(range)
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                assert!(terminal.screen().validates_line_read(&read));
+                terminal
+                    .screen_mut()
+                    .install_line_read_layout(&read, sequence);
+            }
+            let reads: Vec<_> = terminal
+                .screen()
+                .selection_anchor_read_ranges(&token, sequence)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|range| {
+                    terminal
+                        .screen()
+                        .capture_line_read(range)
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap()
+                })
+                .collect();
+            let refs: Vec<_> = reads.iter().collect();
+            let mapped = terminal
+                .screen()
+                .resolve_selection_anchor_with_reads(&token, sequence, &refs)
+                .unwrap()
+                .unwrap();
+            let start = mapped[1].unwrap();
+            let end = mapped[2].unwrap();
+            let read = terminal
+                .screen()
+                .capture_line_read(start.row..end.row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            let mut selected = String::new();
+            for (offset, line) in read.lines().enumerate() {
+                let row = start.row + offset as StableRowIndex;
+                for cell in line.visible_cells() {
+                    if (row != start.row || cell.cell_index() >= start.column.unwrap())
+                        && (row != end.row || cell.cell_index() <= end.column.unwrap())
+                    {
+                        selected.push_str(cell.str());
+                    }
+                }
+            }
+            assert_eq!(selected, "cdefghijkl");
+            let origin = mapped[0].unwrap();
+            let origin_read = terminal
+                .screen()
+                .capture_line_read(origin.row..origin.row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert_eq!(
+                origin_read
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .visible_cells()
+                    .find(|cell| cell.cell_index() == origin.column.unwrap())
+                    .unwrap()
+                    .str(),
+                "d"
+            );
+        }
+        assert!(sink.rows.lock().unwrap().remove(&0).is_some());
+        assert!(
+            terminal
+                .screen()
+                .selection_anchor_read_ranges(&token, terminal.current_seqno())
+                .unwrap()
+                .is_none(),
+            "pruning still revokes the source identity"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn cold_viewport_anchor_does_not_retain_payload_or_depend_on_unrelated_fragments() {
         let originals = [
             Line::from_text(
@@ -10943,6 +12259,7 @@ pub(crate) mod tests {
                     0
                 }
                 + serde_json::to_vec(&output).unwrap().len();
+            let exact = exact + std::mem::size_of::<(StableRowIndex, usize)>();
             let request = row as StableRowIndex..row as StableRowIndex + 1;
             let mut captured = screen.capture_line_read(request.clone()).unwrap();
             captured.layout = Some(Arc::clone(&layout));
@@ -12902,8 +14219,14 @@ pub(crate) mod tests {
                     };
                     let selection = terminal
                         .screen_mut()
-                        .capture_selection_anchor(sequence, [Some(point), None, None])
+                        .capture_selection_anchor(sequence, [Some(point); 3])
                         .unwrap();
+                    let selected_cell = terminal.screen().lines[0]
+                        .visible_cells()
+                        .next()
+                        .unwrap()
+                        .str()
+                        .to_string();
                     let sequence = terminal.current_seqno() + 1;
                     assert!(terminal
                         .install_cold_seam_reflow(&mut seam, sequence)
@@ -12912,10 +14235,62 @@ pub(crate) mod tests {
                     assert_eq!(terminal.cursor_pos().x, cursor.x);
                     assert_eq!(terminal.cursor_pos().y, cursor.y);
                     assert_eq!(terminal.screen().lines[cursor_row], cursor_text);
-                    assert!(terminal
+                    // The commit transports the live token through the exact
+                    // replacement, including a resident point becoming cold.
+                    let refresh = terminal
                         .screen()
-                        .resolve_selection_anchor(&selection, sequence)
-                        .is_none());
+                        .selection_anchor_read_ranges(&selection, sequence)
+                        .unwrap()
+                        .expect("seam must preserve the source identity");
+                    for range in refresh {
+                        let read = terminal
+                            .screen()
+                            .capture_line_read(range)
+                            .unwrap()
+                            .hydrate(|| false)
+                            .unwrap();
+                        assert!(terminal.screen().validates_line_read(&read));
+                        terminal
+                            .screen_mut()
+                            .install_line_read_layout(&read, sequence);
+                    }
+                    let reads: Vec<_> = terminal
+                        .screen()
+                        .selection_anchor_read_ranges(&selection, sequence)
+                        .unwrap()
+                        .unwrap()
+                        .into_iter()
+                        .map(|range| {
+                            terminal
+                                .screen()
+                                .capture_line_read(range)
+                                .unwrap()
+                                .hydrate(|| false)
+                                .unwrap()
+                        })
+                        .collect();
+                    let refs: Vec<_> = reads.iter().collect();
+                    let points = terminal
+                        .screen()
+                        .resolve_selection_anchor_with_reads(&selection, sequence, &refs)
+                        .unwrap()
+                        .unwrap();
+                    assert!(points.iter().all(|mapped| *mapped == points[0]));
+                    let mapped = points[0].unwrap();
+                    let read = terminal
+                        .screen()
+                        .capture_line_read(mapped.row..mapped.row + 1)
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap();
+                    let line = read.lines().next().unwrap();
+                    assert_eq!(
+                        line.visible_cells()
+                            .find(|cell| cell.cell_index() == mapped.column.unwrap())
+                            .unwrap()
+                            .str(),
+                        selected_cell
+                    );
                 }
             }
             let plan = terminal.screen().capture_line_read(0..8).unwrap();
@@ -14172,7 +15547,10 @@ pub(crate) mod tests {
             + 2 * std::mem::size_of::<usize>()
             + layout.groups.capacity()
                 * std::mem::size_of::<(Range<StableRowIndex>, Range<StableRowIndex>)>();
-        let mut exact = metadata_bytes;
+        // Two cold source rows retain coordinate lengths; the resident row
+        // needs no separate source-key mapping. The byte-below check still
+        // rejects the complete, exactly accounted representation.
+        let mut exact = metadata_bytes + 2 * std::mem::size_of::<(StableRowIndex, usize)>();
         for line in &mut expected {
             let _ = line.cells_mut_for_attr_changes_only();
             exact += serde_json::to_vec(line)
