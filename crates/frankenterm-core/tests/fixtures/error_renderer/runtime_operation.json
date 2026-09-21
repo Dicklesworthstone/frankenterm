@@ -7,7 +7,9 @@
     "hint": "Runtime operation 'config_reload' could not notify any active tasks because the watch channel is closed.",
     "ok": false,
     "remediation": {
-      "alternatives": ["If the runtime is shutting down, restart `ft watch` before retrying."],
+      "alternatives": [
+        "If the runtime is shutting down, restart `ft watch` before retrying."
+      ],
       "commands": [
         {
           "command": "ft status",

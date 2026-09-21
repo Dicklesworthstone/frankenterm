@@ -7780,26 +7780,6 @@ impl WaAwaitEventTool {
     }
 
     #[cfg(test)]
-    fn new_with_response_delivery_and_completion_handler(
-        db_path: Arc<PathBuf>,
-        response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
-        completion_handler: McpAwaitEventDeliveryCompletionHandler,
-    ) -> Self {
-        Self {
-            #[cfg(test)]
-            db_path,
-            response_delivery: Some(response_delivery),
-            request_service: None,
-            delivery_completion: Some(Arc::new(
-                McpAwaitEventDeliveryCompletionExecutor::new_with_handler(completion_handler)
-                    .expect("test completion lane must start"),
-            )),
-            blocked_retry_observer: None,
-            iteration_observer: None,
-        }
-    }
-
-    #[cfg(test)]
     fn with_blocked_retry_observer(
         mut self,
         observer: Arc<dyn Fn(usize) + Send + Sync + 'static>,
@@ -15875,7 +15855,12 @@ mod tests {
             false,
             false,
         );
-        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::new(super::FrameworkResponseDeliveryCoordinator::default()),
+        );
+        tool.wait_for_delivery_completion_ready_for_test();
+        let stats = tool.request_service.as_ref().unwrap().stats_for_test();
 
         let partial = parse_json_content(
             tool.call(
@@ -15922,6 +15907,13 @@ mod tests {
         assert_eq!(resumed["data"]["timed_out"], false);
         assert_eq!(resumed["data"]["events"][0]["id"], first_event_id);
         assert_eq!(resumed["data"]["events"][1]["id"], second_event_id);
+        let settled =
+            wait_for_completion_stats(&stats, "both shared replay requests", |snapshot| {
+                snapshot.request_jobs_finished == 2
+            });
+        assert_eq!(settled.runtime_initializations, 1);
+        assert_eq!(settled.storage_initializations, 1);
+        assert_eq!(settled.request_admissions, 2);
     }
 
     #[test]
@@ -16361,20 +16353,34 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
         let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
-        let (worker_started_tx, worker_started_rx) = crossbeam::channel::bounded(1);
-        let (release_worker_tx, release_worker_rx) = crossbeam::channel::bounded(1);
-        let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
-            Arc::new(move |job| {
-                worker_started_tx.send(()).unwrap();
-                let _ = release_worker_rx.recv_timeout(std::time::Duration::from_secs(5));
-                drop(job);
-            });
-        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
-        let tool = WaAwaitEventTool::new_with_response_delivery_and_completion_handler(
-            Arc::clone(&db_path),
-            Arc::clone(&response_delivery),
-            completion_handler,
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_completion_stall_for_test(
+                Arc::clone(&db_path),
+                Arc::clone(&stall),
+            )
+            .expect("shared await service with completion gate must start"),
         );
+        let stats = service.stats_for_test();
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool = WaAwaitEventTool {
+            db_path: Arc::clone(&db_path),
+            response_delivery: Some(Arc::clone(&response_delivery)),
+            request_service: Some(Arc::clone(&service)),
+            delivery_completion: Some(service),
+            blocked_retry_observer: None,
+            iteration_observer: None,
+        };
+        // Release before the service drops, including assertion unwinds, so
+        // this fixture cannot leave a runtime worker parked indefinitely.
+        struct CompletionGateGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CompletionGateGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let gate_guard = CompletionGateGuard(Arc::clone(&stall));
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let claimed = parse_json_content(
             tool.call(
@@ -16401,9 +16407,17 @@ mod tests {
             response_delivery_for_thread.fail_all();
             completion_returned_tx.send(()).unwrap();
         });
-        worker_started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("completion worker did not receive the queued job");
+        let gate_wait_started = std::time::Instant::now();
+        while stats.snapshot().completion_stalls != 1
+            && gate_wait_started.elapsed() < std::time::Duration::from_secs(1)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            stats.snapshot().completion_stalls,
+            1,
+            "shared completion did not reach its gate within one second"
+        );
         completion_returned_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("transport completion waited for the deliberately blocked completion handler");
@@ -16426,7 +16440,39 @@ mod tests {
             checkpoint["data"]["bootstrap_state"],
             "storage_tail_checkpoint"
         );
-        release_worker_tx.send(()).unwrap();
+        let blocked =
+            wait_for_completion_stats(&stats, "both shared requests completed", |snapshot| {
+                snapshot.request_jobs_finished == 2
+            });
+        assert!(stall.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(blocked.completion_attempts_finished, 0);
+        assert_eq!(blocked.runtime_initializations, 1);
+        assert_eq!(blocked.storage_initializations, 1);
+        assert_eq!(blocked.request_admissions, 2);
+
+        drop(gate_guard);
+        let finalized =
+            wait_for_completion_stats(&stats, "real failed-delivery lease release", |snapshot| {
+                snapshot.completion_attempts_finished == 1
+            });
+        assert_eq!(finalized.completion_attempts_storage_reusable, 1);
+        assert_eq!(finalized.completion_attempts_storage_unusable, 0);
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(probe_lease) = reservation
+            else {
+                panic!("real completion must release the claimed event, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]

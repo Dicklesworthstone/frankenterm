@@ -7,7 +7,9 @@
     "hint": "Validate the JSON input and retry.",
     "ok": false,
     "remediation": {
-      "alternatives": ["Check for trailing commas or invalid UTF-8."],
+      "alternatives": [
+        "Check for trailing commas or invalid UTF-8."
+      ],
       "commands": [
         {
           "command": "python -m json.tool < input.json",

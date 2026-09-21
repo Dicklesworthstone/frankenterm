@@ -7,7 +7,9 @@
     "hint": "Review policy configuration or request approval if needed.",
     "ok": false,
     "remediation": {
-      "alternatives": ["Check ft.toml policy settings for explicit allow rules."],
+      "alternatives": [
+        "Check ft.toml policy settings for explicit allow rules."
+      ],
       "commands": [
         {
           "command": "ft status",

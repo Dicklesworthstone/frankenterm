@@ -17,11 +17,15 @@
       "source": "resource_admission",
       "monotonic_ms": 10,
       "source_hash": "9436fd0a9f0da7102b7e441395503bb8d49b5855d141ebc90f11a2b89213eeeb",
-      "source_artifact_hashes": ["golden-healthy"],
+      "source_artifact_hashes": [
+        "golden-healthy"
+      ],
       "queue_utilization": 0.2,
       "pending_items": 2,
       "admission_action": "admit",
-      "reason_codes": ["healthy"],
+      "reason_codes": [
+        "healthy"
+      ],
       "raw_pressure_severity": 0,
       "effective_pressure_severity": 0,
       "fleet_pressure": "normal",
@@ -34,11 +38,16 @@
       "source": "resource_admission",
       "monotonic_ms": 20,
       "source_hash": "0e2e0a2a8a2efdcd398b1dd596e1fd2758b54040c2ab93ccf6924454b43550cf",
-      "source_artifact_hashes": ["golden-pressured"],
+      "source_artifact_hashes": [
+        "golden-pressured"
+      ],
       "queue_utilization": 0.84,
       "pending_items": 48,
       "admission_action": "defer",
-      "reason_codes": ["fleet_pressure", "queue_elevated"],
+      "reason_codes": [
+        "fleet_pressure",
+        "queue_elevated"
+      ],
       "raw_pressure_severity": 1,
       "effective_pressure_severity": 1,
       "fleet_pressure": "elevated",
@@ -51,11 +60,17 @@
       "source": "resource_admission",
       "monotonic_ms": 30,
       "source_hash": "aef69202934af450470b20b9c10bb760a21e01145e821d56987c3a7aa49d5002",
-      "source_artifact_hashes": ["golden-degraded"],
+      "source_artifact_hashes": [
+        "golden-degraded"
+      ],
       "queue_utilization": 0.94,
       "pending_items": 96,
       "admission_action": "degrade",
-      "reason_codes": ["latency_stage_over_budget", "memory_tier_pressure", "queue_saturated"],
+      "reason_codes": [
+        "latency_stage_over_budget",
+        "memory_tier_pressure",
+        "queue_saturated"
+      ],
       "raw_pressure_severity": 2,
       "effective_pressure_severity": 2,
       "fleet_pressure": "critical",

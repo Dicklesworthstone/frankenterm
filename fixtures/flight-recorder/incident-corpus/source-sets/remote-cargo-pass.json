@@ -10,12 +10,20 @@
       "issue_id": "ft-ogr3n.4",
       "status": "closed",
       "updated_at_ms": 1780696807000,
-      "dependency_ids": ["ft-ogr3n.3", "ft-ogr3n.5"],
+      "dependency_ids": [
+        "ft-ogr3n.3",
+        "ft-ogr3n.5"
+      ],
       "comment_count": 5,
       "dirty_tree_guard_comment_count": 0,
       "close_reason": "Remote RCH proof passed on attested worker",
-      "reason_codes": ["beads.closeout", "beads.rch_proof_cited"],
-      "artifact_paths": [".beads/issues.jsonl"],
+      "reason_codes": [
+        "beads.closeout",
+        "beads.rch_proof_cited"
+      ],
+      "artifact_paths": [
+        ".beads/issues.jsonl"
+      ],
       "payload": {
         "summary": "Closeout cited remote worker, target dir, command, exit code, and retained artifact path."
       }
@@ -32,8 +40,13 @@
       "branch_ahead": 0,
       "branch_behind": 0,
       "protected_deletion_warnings": [],
-      "artifact_paths": ["fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"],
-      "reason_codes": ["git.clean", "git.main_branch"],
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/summary.v1.json"
+      ],
+      "reason_codes": [
+        "git.clean",
+        "git.main_branch"
+      ],
       "payload": {
         "summary": "Clean worktree snapshot taken before closeout proof was cited."
       }
@@ -44,15 +57,26 @@
       "source_id": "rch-remote-cargo-pass",
       "build_id": "j-29871232832766549",
       "worker_id": "vmi1293453",
-      "command_argv": ["cargo", "check", "--workspace", "--all-targets"],
+      "command_argv": [
+        "cargo",
+        "check",
+        "--workspace",
+        "--all-targets"
+      ],
       "started_at_ms": 1780696809000,
       "completed_at_ms": 1780696817000,
       "location": "remote",
       "exit_code": 0,
       "cancellation_reason": null,
       "preflight_refusal_reason": null,
-      "artifact_paths": ["fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"],
-      "reason_codes": ["rch.remote_worker_reached", "rch.remote_cargo_reached", "rch.exit_zero"],
+      "artifact_paths": [
+        "fixtures/flight-recorder/incident-corpus/proof/proof-ledger.v1.jsonl"
+      ],
+      "reason_codes": [
+        "rch.remote_worker_reached",
+        "rch.remote_cargo_reached",
+        "rch.exit_zero"
+      ],
       "payload": {
         "duration_ms": 8000,
         "target_dir": "/tmp/ft-ogr3n4-workspace-check",

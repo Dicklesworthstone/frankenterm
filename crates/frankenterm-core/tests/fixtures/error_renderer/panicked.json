@@ -7,7 +7,9 @@
     "hint": "A task panicked. Check logs for the panic backtrace and retry.",
     "ok": false,
     "remediation": {
-      "alternatives": ["If the panic persists, report the issue with the backtrace."],
+      "alternatives": [
+        "If the panic persists, report the issue with the backtrace."
+      ],
       "commands": [
         {
           "command": "ft doctor",

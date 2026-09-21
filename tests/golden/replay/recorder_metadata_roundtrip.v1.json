@@ -13,9 +13,28 @@
     "operator_action",
     "recovery_flow"
   ],
-  "text_encodings": ["utf8"],
-  "redaction_levels": ["none", "partial", "full"],
-  "ingress_kinds": ["send_text", "paste", "workflow_action"],
-  "segment_kinds": ["delta", "gap", "snapshot"],
-  "control_marker_types": ["prompt_boundary", "resize", "policy_decision", "approval_checkpoint"]
+  "text_encodings": [
+    "utf8"
+  ],
+  "redaction_levels": [
+    "none",
+    "partial",
+    "full"
+  ],
+  "ingress_kinds": [
+    "send_text",
+    "paste",
+    "workflow_action"
+  ],
+  "segment_kinds": [
+    "delta",
+    "gap",
+    "snapshot"
+  ],
+  "control_marker_types": [
+    "prompt_boundary",
+    "resize",
+    "policy_decision",
+    "approval_checkpoint"
+  ]
 }

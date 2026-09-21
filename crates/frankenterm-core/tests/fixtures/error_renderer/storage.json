@@ -7,7 +7,9 @@
     "hint": "Database operation failed. Check workspace permissions and retry.",
     "ok": false,
     "remediation": {
-      "alternatives": ["Ensure the workspace directory is writable."],
+      "alternatives": [
+        "Ensure the workspace directory is writable."
+      ],
       "commands": [
         {
           "command": "ft doctor",

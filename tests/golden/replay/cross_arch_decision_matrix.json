@@ -1,6 +1,9 @@
 {
   "schema": "ft.replay.golden_matrix.v1",
-  "matrix_targets": ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"],
+  "matrix_targets": [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+  ],
   "canonical_output_sha256": "6d1485522bd7d15955efbffe3d0c71f8b7e83a06de1a6e92ff7599920b3ea909",
   "canonical_output": {
     "schema": "ft.replay.canonical_output.v1",
@@ -20,7 +23,11 @@
         "output_hash": "3023fea2ccafe28e0ba6e9687d5094e2994fc5283a1868f57bcfa7f2050e6578",
         "timestamp_ms": 10000,
         "causal_chain": [],
-        "effects": [1, 2, 4]
+        "effects": [
+          1,
+          2,
+          4
+        ]
       },
       {
         "node_id": 1,
@@ -31,8 +38,13 @@
         "input_hash": "1342495b10f88ab8dfc0478c747353a865ae2defc4bc5c643b6748251e132216",
         "output_hash": "1a16dc8d60103adc95657061c30f6790f26cb8682b7cd7d3cd36df070d334617",
         "timestamp_ms": 10050,
-        "causal_chain": [0],
-        "effects": [2, 4]
+        "causal_chain": [
+          0
+        ],
+        "effects": [
+          2,
+          4
+        ]
       },
       {
         "node_id": 2,
@@ -43,8 +55,13 @@
         "input_hash": "dad0c9722b1a786596332be1ccba08732d68e27174bb865738a1656752bbb103",
         "output_hash": "547721048fbe07a06162b4bd3a0519e852240992dc5b78972f8ae806bced97ef",
         "timestamp_ms": 10060,
-        "causal_chain": [0, 1],
-        "effects": [4]
+        "causal_chain": [
+          0,
+          1
+        ],
+        "effects": [
+          4
+        ]
       },
       {
         "node_id": 3,
@@ -67,10 +84,17 @@
         "input_hash": "29f813eab11675daf63f6ee848b7929d549d2a70db50b7f84d8676c100436488",
         "output_hash": "0f89a364e3591863aeda169d21300a7195c8bc537bda5c027a47a2737d355901",
         "timestamp_ms": 10100,
-        "causal_chain": [0, 1, 2],
+        "causal_chain": [
+          0,
+          1,
+          2
+        ],
         "effects": []
       }
     ],
-    "roots": [0, 3]
+    "roots": [
+      0,
+      3
+    ]
   }
 }

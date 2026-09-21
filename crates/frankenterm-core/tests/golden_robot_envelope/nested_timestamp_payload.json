@@ -5,7 +5,11 @@
     "timestamp": "[TIMESTAMP]",
     "source": "bridge.inner",
     "data": {
-      "pane_ids": [3, 5, 9],
+      "pane_ids": [
+        3,
+        5,
+        9
+      ],
       "status": "ok"
     },
     "degraded": true

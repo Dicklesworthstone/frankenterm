@@ -28,7 +28,9 @@
       "tx_contract_hash": null,
       "envelope_verdict": "envelope.requires_approval",
       "rehearsal_score": 400,
-      "required_approvals": ["approval:dirty_overlap"],
+      "required_approvals": [
+        "approval:dirty_overlap"
+      ],
       "created_at_ms": 1704000000000,
       "ttl_ms": null
     }
@@ -62,7 +64,10 @@
       "tx_contract_hash": null,
       "envelope_verdict": "envelope.requires_approval",
       "rehearsal_score": 600,
-      "required_approvals": ["approval:owner_handoff", "approval:policy.alt_screen_unknown"],
+      "required_approvals": [
+        "approval:owner_handoff",
+        "approval:policy.alt_screen_unknown"
+      ],
       "created_at_ms": 1704000000000,
       "ttl_ms": null
     }

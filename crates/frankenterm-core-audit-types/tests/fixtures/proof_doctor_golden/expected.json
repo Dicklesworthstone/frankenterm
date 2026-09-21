@@ -57,10 +57,14 @@
       "test_binary_started": true,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "complete",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/remote_pass.summary.json"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/remote_pass.summary.json"
+      ],
       "hardware_predicate": null,
       "redaction_status": "none_needed",
-      "claims_allowed": ["focused_remote_proof_passed"],
+      "claims_allowed": [
+        "focused_remote_proof_passed"
+      ],
       "next_action": "Attach the retained proof artifacts to the Beads closeout and close only claims supported by this record.",
       "proof_doctor": {
         "verdict_id": "proof-doctor:ft-782hw.6:proof.runnable",
@@ -139,7 +143,9 @@
       "test_binary_started": false,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "complete",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/source_compile_failure.summary.json"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/source_compile_failure.summary.json"
+      ],
       "hardware_predicate": null,
       "redaction_status": "redacted",
       "claims_allowed": [],
@@ -152,7 +158,9 @@
         "blocker_kind": "source_compile",
         "tool_version_state": "installed_current",
         "remote_cargo_reached": true,
-        "affected_paths": ["crates/frankenterm-core-audit-types/src/proof_lane.rs"],
+        "affected_paths": [
+          "crates/frankenterm-core-audit-types/src/proof_lane.rs"
+        ],
         "operator_summary": "missing field initializer in proof lane fixture",
         "next_action": "Handoff to the owner of the first-party source failure; do not claim this proof lane green."
       }
@@ -221,7 +229,9 @@
       "test_binary_started": true,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "complete",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/test_assertion_failure.summary.json"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/test_assertion_failure.summary.json"
+      ],
       "hardware_predicate": null,
       "redaction_status": "redacted",
       "claims_allowed": [],
@@ -234,7 +244,9 @@
         "blocker_kind": "test_assertion",
         "tool_version_state": "installed_current",
         "remote_cargo_reached": true,
-        "affected_paths": ["crates/frankenterm-core-audit-types/src/proof_handoff.rs"],
+        "affected_paths": [
+          "crates/frankenterm-core-audit-types/src/proof_handoff.rs"
+        ],
         "operator_summary": "assertion failed in proof handoff fixture",
         "next_action": "Fix the behavior or test harness before claiming this lane."
       }
@@ -303,7 +315,9 @@
       "test_binary_started": false,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "partial",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/pre-cargo-rch.log"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/pre-cargo-rch.log"
+      ],
       "hardware_predicate": null,
       "redaction_status": "unknown",
       "claims_allowed": [],
@@ -385,7 +399,9 @@
       "test_binary_started": false,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "partial",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/post-cargo-rch.log"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/post-cargo-rch.log"
+      ],
       "hardware_predicate": null,
       "redaction_status": "unknown",
       "claims_allowed": [],
@@ -430,7 +446,13 @@
       "finished_at_utc": "<timestamp>",
       "agent_name": "Codex",
       "cwd": "<repo>",
-      "command": ["cargo", "test", "-p", "frankenterm-core-audit-types", "proof_doctor_golden"],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "frankenterm-core-audit-types",
+        "proof_doctor_golden"
+      ],
       "declared_target_dir": null,
       "state": "LOCAL_INVALID",
       "reason_code": "proof.command.local_cargo_invalid",
@@ -493,7 +515,9 @@
       "safe_to_close": false,
       "beads_comment_prefix": "Proof-doctor handoff for ft-782hw.6: dirty_tree_blocked.",
       "agent_mail": {
-        "to": ["SageRobin"],
+        "to": [
+          "SageRobin"
+        ],
         "subject": "ft-782hw.6 proof-doctor dirty_tree_blocked: proof.dirty.active_owned_path_overlap",
         "importance": "high"
       }
@@ -557,7 +581,9 @@
         "blocker_kind": "dirty_tree",
         "tool_version_state": "installed_current",
         "remote_cargo_reached": false,
-        "affected_paths": ["crates/frankenterm-core-audit-types/src/proof_lane.rs"],
+        "affected_paths": [
+          "crates/frankenterm-core-audit-types/src/proof_lane.rs"
+        ],
         "operator_summary": "A dirty path overlaps the proof lane and is owned by active work.",
         "next_action": "Resolve ownership or wait for the owning Bead before claiming proof."
       }
@@ -626,7 +652,9 @@
       "test_binary_started": true,
       "local_cargo_detected": false,
       "artifact_retrieval_status": "complete",
-      "artifact_paths": ["tests/fixtures/proof_doctor_golden/skipped_not_proven.summary.json"],
+      "artifact_paths": [
+        "tests/fixtures/proof_doctor_golden/skipped_not_proven.summary.json"
+      ],
       "hardware_predicate": null,
       "redaction_status": "redacted",
       "claims_allowed": [],

@@ -7,7 +7,9 @@
     "hint": "Pane is locked by another workflow. Wait for it to complete.",
     "ok": false,
     "remediation": {
-      "alternatives": ["Avoid running multiple workflows on the same pane."],
+      "alternatives": [
+        "Avoid running multiple workflows on the same pane."
+      ],
       "commands": [
         {
           "command": "ft status",
