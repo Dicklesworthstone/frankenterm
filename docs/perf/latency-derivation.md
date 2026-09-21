@@ -282,9 +282,23 @@ It exercises the production grouped writer; it does not observe or certify
 the number of requests in each physical SQLite transaction.
 
 The producer freezes its model after 1,000 calibration requests, then records
-1,000 held-out requests. Service rates are minimum observed burst throughput;
-stage latencies are calibration maximums, despite the legacy telemetry field
-being named `p99_latency_ms`. The held-out p99 is computed independently.
+1,000 held-out requests. It fits aggregate arrival/departure envelopes over a
+predetermined common-rate grid: `2^(k/8)` events/ms for integer `k=-80..160`,
+restricted to rates above the declared arrival rate. For each rate it finds the
+least stage latency satisfying the finite calibration trace, adds a fixed 1 ns
+rounding margin, and selects the smallest composed bound. An independent
+convolution check must accept the fitted calibration envelopes before the model
+is frozen. This avoids counting batch waiting both as latency and as reduced
+service rate. Fitted rates are not measurements of saturated throughput.
+
+For a departure cut `t` with `q` completions, the least latency is the positive
+part of `t - q/R + min(i/R - a_i, 0 <= i <= q)` when more than `q` arrivals
+have occurred. Sorted arrival times `a_i` and prefix minima give a linear fit
+per stage and candidate rate after sorting. Stage latencies are these fitted
+finite-trace parameters, despite the legacy field being named `p99_latency_ms`.
+The held-out p99 is computed independently. Aggregate service conformance with
+reordered completions does not establish individual-request delay bounds, so
+the separate maximum-delay check remains necessary.
 Arrival-envelope, per-stage min-plus service, maximum-delay and 20% agreement
 checks are separate. An exceeded bound or failed agreement remains a failed
 measurement; do not refit the model using the held-out trace to make it pass.

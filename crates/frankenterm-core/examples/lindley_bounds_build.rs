@@ -508,8 +508,9 @@ mod live_measurement {
                 "observed_delay_bound_holds": observed_bound_holds,
                 "arrival_envelope_holds": arrival_holds,
                 "held_out_service_curves_hold": service_holds,
-                "calibration_method": "per-stage minimum burst throughput; maximum per-request latency, including batch wait; frozen before held-out requests",
-                "latency_field_semantics": "model p99_latency_ms fields contain calibration maximums, not quantile guarantees",
+                "calibration_method": "minimum composed bound over a predetermined common-rate grid, fitting stage arrival/departure envelopes and independently checking calibration conformance; frozen before held-out requests",
+                "calibration_rate_grid": "2^(k/8) events/ms for integer k=-80..160, restricted to rates strictly above declared arrival rate; fitted rates are not saturated throughput measurements",
+                "latency_field_semantics": "model p99_latency_ms fields contain fitted finite-trace service latencies with a fixed 1ns rounding margin, not quantile guarantees",
                 "capture_timing": "numeric stimulus dispatch through complete mux snapshot receipt; includes producer response and any bounded snapshot polling",
                 "trace_encoding": "serde-json-observations-v1",
                 "trace_json": trace_json,
@@ -707,45 +708,93 @@ mod live_measurement {
             rows: &[Observation],
             arrival_rate: f64,
         ) -> Result<LindleyTelemetryModel, String> {
-            let mut stages = Vec::new();
-            for (index, stage) in [
+            if rows.is_empty() || !arrival_rate.is_finite() || arrival_rate <= 0.0 {
+                return Err("invalid or empty calibration".into());
+            }
+            let mut traces = Vec::new();
+            for index in 0..3 {
+                if rows
+                    .iter()
+                    .any(|row| row.stages_ns[index][1] < row.stages_ns[index][0])
+                {
+                    return Err("calibration departure precedes arrival".into());
+                }
+                let mut arrivals: Vec<_> = rows.iter().map(|row| row.stages_ns[index][0]).collect();
+                let mut departures: Vec<_> =
+                    rows.iter().map(|row| row.stages_ns[index][1]).collect();
+                arrivals.sort_unstable();
+                departures.sort_unstable();
+                traces.push((arrivals, departures));
+            }
+            let stage_names = [
                 LatencyStage::PtyCapture,
                 LatencyStage::DeltaExtraction,
                 LatencyStage::StorageWrite,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let latency_ns = rows
-                    .iter()
-                    .map(|row| row.stages_ns[index][1] - row.stages_ns[index][0])
-                    .max()
-                    .ok_or("empty calibration")?;
-                let rate = rows
-                    .as_chunks::<BURST>()
-                    .0
-                    .iter()
-                    .map(|batch| {
-                        let first = batch
-                            .iter()
-                            .map(|row| row.stages_ns[index][0])
-                            .min()
-                            .unwrap();
-                        let last = batch
-                            .iter()
-                            .map(|row| row.stages_ns[index][1])
-                            .max()
-                            .unwrap();
-                        BURST as f64 * 1e6 / (last - first).max(1) as f64
-                    })
-                    .fold(f64::INFINITY, f64::min);
-                stages.push(LindleyStageTelemetry::try_new(
-                    stage,
-                    rate,
-                    latency_ns as f64 / 1e6,
-                )?);
+            ];
+            // A common rate suffices: lowering any faster stage to the pipeline
+            // bottleneck cannot increase its required latency or change B/R.
+            // This grid and rounding margin are fixed before any observations;
+            // neither held-out delays nor the agreement threshold enter fitting.
+            let mut best: Option<(f64, Vec<LindleyStageTelemetry>)> = None;
+            for step in -80..=160 {
+                let rate = 2.0_f64.powf(f64::from(step) / 8.0);
+                if rate <= arrival_rate {
+                    continue;
+                }
+                let mut stages = Vec::new();
+                let mut bound = BURST as f64 / rate;
+                for (index, (arrivals, departures)) in traces.iter().enumerate() {
+                    let latency = fit_service_latency(arrivals, departures, rate);
+                    bound += latency;
+                    stages.push(LindleyStageTelemetry::try_new(
+                        stage_names[index],
+                        rate,
+                        latency,
+                    )?);
+                }
+                if best.as_ref().is_none_or(|(previous, _)| bound < *previous) {
+                    best = Some((bound, stages));
+                }
+            }
+            let (_, stages) = best.ok_or("arrival rate exceeds calibration grid")?;
+            for (index, stage) in stages.iter().enumerate() {
+                if !service_conforms(rows, index, stage) {
+                    return Err(
+                        "fitted service envelope fails independent calibration check".into(),
+                    );
+                }
             }
             LindleyTelemetryModel::try_new(BURST as f64, arrival_rate, stages)
+        }
+
+        fn fit_service_latency(arrivals: &[u64], departures: &[u64], rate: f64) -> f64 {
+            let epoch = arrivals[0];
+            let mut minimum = f64::INFINITY;
+            let prefix: Vec<_> = arrivals
+                .iter()
+                .enumerate()
+                .map(|(index, arrival)| {
+                    minimum = minimum.min(index as f64 / rate - (arrival - epoch) as f64 / 1e6);
+                    minimum
+                })
+                .collect();
+            let mut completed = 0;
+            let mut latency = 0.0_f64;
+            for departure in departures {
+                let time = departure.saturating_sub(1);
+                while completed < departures.len() && departures[completed] <= time {
+                    completed += 1;
+                }
+                if completed < arrivals.len() && arrivals[completed] <= time {
+                    // At this cut q completions require some i<=q with
+                    // i + R max(t-a_i-T, 0) <= q. Solve for the least T,
+                    // then take the largest requirement over all cuts.
+                    latency = latency.max(
+                        (time - epoch) as f64 / 1e6 - completed as f64 / rate + prefix[completed],
+                    );
+                }
+            }
+            latency + 0.000_001
         }
 
         fn arrival_conforms(rows: &[Observation], rate: f64) -> bool {
@@ -928,6 +977,95 @@ mod live_measurement {
                 rows.push(row(10, 0, 100_000_000));
                 assert_eq!(model, calibrate(&rows[..10], 0.1).unwrap());
                 assert!(!service_conforms(&rows[10..], 0, &model.stages[0]));
+            }
+
+            #[test]
+            fn calibration_does_not_charge_batch_wait_twice() {
+                let rows: Vec<_> = (0..10)
+                    .map(|seq| {
+                        let mut observation = row(seq, 0, 20_000_000);
+                        observation.stages_ns[1] = [20_000_000, 20_000_001];
+                        observation.stages_ns[2] = [20_000_001, 20_000_002];
+                        observation
+                    })
+                    .collect();
+                let model = calibrate(&rows, 0.1).unwrap();
+                let (arrival, stages) = model.to_network_calculus_inputs().unwrap();
+                let bound = pipeline_delay_bound(arrival, &stages).unwrap();
+                assert!(
+                    (20.0..20.001).contains(&bound),
+                    "batch delay was charged twice: {bound}"
+                );
+                for (index, stage) in model.stages.iter().enumerate() {
+                    assert!(service_conforms(&rows, index, stage));
+                }
+                let delayed = [row(0, 0, 21_000_000)];
+                assert!(!service_conforms(&delayed, 0, &model.stages[0]));
+            }
+
+            #[test]
+            fn fitted_latency_matches_independent_convolution_with_reordered_completions() {
+                // Include idle gaps, simultaneous events and non-FIFO completion.
+                // The direct convolution checker shares no prefix-fit code.
+                for offset in [0, 9_000_000_000_000, u64::MAX - 104_000_000] {
+                    let rows = [
+                        row(0, offset, offset + 8_000_000),
+                        row(1, offset, offset + 2_000_000),
+                        row(2, offset + 1_000_000, offset + 4_000_000),
+                        row(3, offset + 100_000_000, offset + 103_000_000),
+                        row(4, offset + 100_000_000, offset + 103_000_000),
+                    ];
+                    let mut arrivals: Vec<_> = rows.iter().map(|row| row.stages_ns[0][0]).collect();
+                    let mut departures: Vec<_> =
+                        rows.iter().map(|row| row.stages_ns[0][1]).collect();
+                    arrivals.sort_unstable();
+                    departures.sort_unstable();
+                    for rate in [0.125, 0.5, 1.0, 4.0, 1024.0] {
+                        let latency = fit_service_latency(&arrivals, &departures, rate);
+                        let fitted =
+                            LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, rate, latency)
+                                .unwrap();
+                        assert!(
+                            service_conforms(&rows, 0, &fitted),
+                            "rate={rate} latency={latency}"
+                        );
+                        if latency > 0.000_01 {
+                            let too_small = LindleyStageTelemetry::try_new(
+                                LatencyStage::PtyCapture,
+                                rate,
+                                latency - 0.000_01,
+                            )
+                            .unwrap();
+                            assert!(
+                                !service_conforms(&rows, 0, &too_small),
+                                "fit must be tight at a departure cut"
+                            );
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn calibration_rejects_invalid_traces_and_arrival_rates() {
+                assert!(calibrate(&[], 0.1).is_err());
+                assert!(calibrate(&[row(0, 2, 1)], 0.1).is_err());
+                for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 2_000_000.0] {
+                    assert!(calibrate(&[row(0, 0, 1)], rate).is_err());
+                }
+            }
+
+            #[test]
+            fn calibration_accepts_simultaneous_zero_duration_events() {
+                for timestamp in [0, u64::MAX] {
+                    let rows: Vec<_> = (0..10)
+                        .map(|sequence| row(sequence, timestamp, timestamp))
+                        .collect();
+                    let model = calibrate(&rows, 0.1).unwrap();
+                    for (index, stage) in model.stages.iter().enumerate() {
+                        assert!(service_conforms(&rows, index, stage));
+                        assert_eq!(stage.p99_latency_ms, 0.000_001);
+                    }
+                }
             }
         }
     }
