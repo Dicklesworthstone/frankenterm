@@ -8,7 +8,7 @@ an attestation artifact. Fill every placeholder before closing.
 - Manifest slot category: `<category>`
 - Artifact path: `<path>` (sha256 `<hash>`)
 - Build smoke: `bash scripts/attestation-build.sh --version 0.0.0-dev --channel dev --sign unsigned` exit `<code>`
-- Strict-deferred build: `bash scripts/attestation-build.sh ... --strict-deferred` exit `<code>` (must be 0 if any previously-deferred slot now resolves)
+- Strict-deferred build: `bash scripts/attestation-build.sh ... --strict-deferred` exit `<code>` (must be 0 once every deferred slot resolves; otherwise list the remaining deferred producers and retain the nonzero result)
 - Verify round-trip: `bash scripts/attestation-verify.sh <bundle>` exit `<code>`
 - Hedge alignment: `cargo test -p frankenterm-core --test readme_hedge_alignment` exit `<code>` (per ft-e87u6.4)
 - Manifest completeness: `cargo test -p frankenterm-core --test attestation_manifest_completeness` exit `<code>` (per ft-e87u6.5)

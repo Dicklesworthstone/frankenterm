@@ -12,6 +12,10 @@ crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::dev(&rewrit
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&original_metadata)
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&replacement_metadata),
 crates/frankenterm-core/src/crash.rs	std::os::unix::fs::MetadataExt::ino(&rewritten_metadata),
+# ft-vpoab: rehearsal_manifest_rejects_outside_file_and_directory_symlinks is #[cfg(unix)];
+# both symlink calls occur beyond the guard's eight-line lookback.
+crates/frankenterm-core/src/mcp_tools.rs	std::os::unix::fs::symlink(
+crates/frankenterm-core/src/mcp_tools.rs	std::os::unix::fs::symlink(outside.path(), root.path().join("directory")).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
