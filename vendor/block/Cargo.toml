@@ -17,7 +17,3 @@ exclude = [
   "travis_test.sh",
   "tests-ios/**",
 ]
-
-[dev-dependencies.objc_test_utils]
-version = "0.0"
-path = "test_utils"

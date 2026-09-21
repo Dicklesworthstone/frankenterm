@@ -30,7 +30,10 @@ capture whose final disposal is counted. Execute it on macOS; a Linux build
 with the module excluded is not proof. Fresh native compile/future-incompatibility
 evidence and that test's terminal result are required before claiming resolution.
 The published crate's own historical tests reference an unbundled `test_utils`
-development dependency; this import does not fabricate that missing fixture.
+development dependency. Its unusable path declaration is removed from this
+local package so the source bundle is self-contained for RCH; this does not
+fabricate the missing fixture or qualify those historical tests. The native
+window regression above is the supported validation of this repair.
 
 For more information on the specifics of the block implementation, see
 Clang's documentation: http://clang.llvm.org/docs/Block-ABI-Apple.html
