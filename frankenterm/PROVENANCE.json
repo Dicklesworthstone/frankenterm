@@ -641,21 +641,21 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 275,
+        "fix": 276,
         "other": 54,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 108
+        "test": 109
       },
-      "fork_side_commit_count": 715,
+      "fork_side_commit_count": 717,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "test",
-        "committed_at": "2026-09-21T05:09:36-04:00",
-        "sha": "bbebc2028efc7f23a9b024da98fd966a95c58386",
-        "subject": "test(mux): distinguish alert rollback from pending output drain"
+        "committed_at": "2026-09-21T10:34:52-04:00",
+        "sha": "8f6e49f905ba729e0af4de9b40b4827b04ca61ef",
+        "subject": "test(mux): own the scheduler until pane-removal cleanup actually finishes"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -731,7 +731,7 @@
     {
       "authors_raw": "[\"Wez Furlong\"]",
       "classification_summary": {
-        "cosmetic": 4,
+        "cosmetic": 5,
         "feat": 7,
         "fix": 25,
         "other": 4,
@@ -739,13 +739,13 @@
         "runtime-swap": 1,
         "test": 16
       },
-      "fork_side_commit_count": 59,
+      "fork_side_commit_count": 60,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-20T22:57:56-04:00",
-        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
-        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
+        "classification": "cosmetic",
+        "committed_at": "2026-09-21T10:09:34-04:00",
+        "sha": "c913f623f500b32e387af3500d8266b5f3cae77f",
+        "subject": "style(json): reformat JSON fixtures and configs"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2888,
-  "generated_at": "2026-09-21T09:10:34.276400Z",
+  "fork_side_commit_total": 2891,
+  "generated_at": "2026-09-21T14:48:15.720504Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,

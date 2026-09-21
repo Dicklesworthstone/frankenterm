@@ -16944,6 +16944,27 @@ mod tests {
                         transitioning_pane_ids: Arc::new(HashSet::new()),
                         transitions: Arc::new(HashMap::new()),
                     });
+                // Discovery establishes an authoritative baseline before it
+                // publishes a capture generation. An empty cache deliberately
+                // remains uncertain after appends, even when they commit.
+                let checkpoints = Arc::new(StdMutex::new(LruCache::new(4)));
+                let checkpoint_cx = crate::cx::for_testing();
+                for pane_id in [501, 502] {
+                    let baseline = load_capture_checkpoint_from_storage(
+                        &checkpoint_cx,
+                        &storage,
+                        pane_id,
+                        revision,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(baseline.next_seq, 0);
+                    assert!(baseline.raw_tail.is_empty());
+                    checkpoints
+                        .lock()
+                        .unwrap()
+                        .put(pane_id, CachedCaptureCheckpoint::Certain(baseline));
+                }
                 let (entered, release) = storage.pause_writer_before_receive_for_test();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
@@ -16961,7 +16982,6 @@ mod tests {
                 }
                 let (retirement_tx, retirement_rx) = spsc_channel(1);
                 drop(retirement_tx);
-                let checkpoints = Arc::new(StdMutex::new(LruCache::new(4)));
                 let persistence = runtime.spawn_persistence_task(
                     ring_rx,
                     Arc::clone(&runtime.cursors),
@@ -17091,10 +17111,11 @@ mod tests {
                     HashSet::from([501, 502])
                 );
                 for pane_id in [501, 502] {
-                    assert!(matches!(
-                        checkpoints.lock().unwrap().get(&pane_id),
-                        Some(CachedCaptureCheckpoint::Certain(_))
-                    ));
+                    let checkpoint = certain_capture_checkpoint(&checkpoints, pane_id, revision)
+                        .expect("committed contiguous captures preserve the proven baseline");
+                    let count = if fail_ack && pane_id == 501 { 2 } else { 1 };
+                    assert_eq!(checkpoint.next_seq, count);
+                    assert_eq!(checkpoint.raw_tail, "test".repeat(count as usize));
                 }
                 storage.shutdown().await.unwrap();
             }
