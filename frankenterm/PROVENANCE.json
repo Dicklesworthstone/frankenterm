@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 54,
-        "fix": 106,
+        "fix": 107,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 37
       },
-      "fork_side_commit_count": 251,
+      "fork_side_commit_count": 252,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T22:57:56-04:00",
-        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
-        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
+        "committed_at": "2026-09-21T04:32:20-04:00",
+        "sha": "d824eeded272b2e21f4fd099e52c3c02bf268f33",
+        "subject": "fix(alerts): fund historical GUI delivery before pane mutation"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 274,
+        "fix": 275,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 107
       },
-      "fork_side_commit_count": 713,
+      "fork_side_commit_count": 714,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T23:15:31-04:00",
-        "sha": "302e23b8611e2e8ef6cb969286385b4fcad8c472",
-        "subject": "fix(selection): preserve cold history endpoints through spill and reflow"
+        "committed_at": "2026-09-21T04:32:20-04:00",
+        "sha": "d824eeded272b2e21f4fd099e52c3c02bf268f33",
+        "subject": "fix(alerts): fund historical GUI delivery before pane mutation"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -710,19 +710,19 @@
       "classification_summary": {
         "cosmetic": 5,
         "feat": 9,
-        "fix": 26,
+        "fix": 27,
         "other": 5,
         "refactor": 3,
         "runtime-swap": 4,
         "test": 8
       },
-      "fork_side_commit_count": 60,
+      "fork_side_commit_count": 61,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T17:33:50-04:00",
-        "sha": "297cd8aafc8dcaeac6ab10a6c4ce5db76fe18943",
-        "subject": "fix(recovery): honor cancellation at atomic topology publication"
+        "committed_at": "2026-09-21T04:32:20-04:00",
+        "sha": "d824eeded272b2e21f4fd099e52c3c02bf268f33",
+        "subject": "fix(alerts): fund historical GUI delivery before pane mutation"
       },
       "name": "promise",
       "path": "frankenterm/promise",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2883,
-  "generated_at": "2026-09-21T06:13:20.538065Z",
+  "fork_side_commit_total": 2886,
+  "generated_at": "2026-09-21T08:34:25.298324Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
