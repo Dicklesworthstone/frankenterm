@@ -30,6 +30,9 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+- Selection retains its drag origin and both range endpoints across cold-history reflow, spill admission and seam replacement. Bounded endpoint hydration runs outside the terminal lock; source and gesture checks reject stale completions.
+- Same-path GUI upgrades start the successor executable instead of delegating to the older running process. Unix discovery publishes atomically under a bounded lock; updated publishers check inode ownership before removing their discovery pointer.
+- Standalone Unix listeners no longer create dormant client domains that reject recovered topology. Guardian startup retries reconciliation of the same Genesis request within its existing bounded budget, retaining unresolved-birth and cancellation safeguards. Native acceptance of these changes remains pending.
 - Hyperlink hit testing uses the glyph spans from the displayed frame, including clipped and wide text, instead of rereading terminal state during mouse movement. Cached rendering retains those spans and rejects stale pane or layout identities.
 - Guardian recovery retries a busy, authenticated handshake before claiming ownership. The retry remains bounded and does not replay ownership claims or mutations. Snapshot publication also rechecks the captured domain policy and default domain before publishing.
 - A replay-safe render-read rejection uses a 1 ms first backoff, retaining the longer backoff for persistent contention, the original deadline and the attempt cap. Native latency qualification remains pending.

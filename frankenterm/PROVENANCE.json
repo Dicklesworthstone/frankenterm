@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 54,
-        "fix": 105,
+        "fix": 106,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 37
       },
-      "fork_side_commit_count": 250,
+      "fork_side_commit_count": 251,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-20T07:19:25-04:00",
-        "sha": "f908136bf6a45baac14537945bcd30d9e7b567ff",
-        "subject": "test(input): format scheduler failure diagnostics on Rust 2018"
+        "classification": "fix",
+        "committed_at": "2026-09-20T22:57:56-04:00",
+        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
+        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -184,7 +184,7 @@
         "cosmetic": 21,
         "docs": 2,
         "feat": 44,
-        "fix": 62,
+        "fix": 63,
         "other": 21,
         "refactor": 2,
         "rename": 2,
@@ -192,13 +192,13 @@
         "security-fix": 1,
         "test": 84
       },
-      "fork_side_commit_count": 246,
+      "fork_side_commit_count": 247,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-18T20:27:37-04:00",
-        "sha": "68d383ee22b2838c093cc472f1b4e1ff1942e665",
-        "subject": "fix(mux): preserve typed read contention and bound safe retries"
+        "committed_at": "2026-09-20T22:57:56-04:00",
+        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
+        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
       },
       "name": "codec",
       "path": "frankenterm/codec",
@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 273,
+        "fix": 274,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 107
       },
-      "fork_side_commit_count": 712,
+      "fork_side_commit_count": 713,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T19:23:43-04:00",
-        "sha": "fc12b2093ff27d59a51f183d44848664df1edca8",
-        "subject": "fix(recovery): reject unresolved domain state at snapshot cuts"
+        "committed_at": "2026-09-20T23:15:31-04:00",
+        "sha": "302e23b8611e2e8ef6cb969286385b4fcad8c472",
+        "subject": "fix(selection): preserve cold history endpoints through spill and reflow"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -733,19 +733,19 @@
       "classification_summary": {
         "cosmetic": 4,
         "feat": 7,
-        "fix": 24,
+        "fix": 25,
         "other": 4,
         "refactor": 2,
         "runtime-swap": 1,
         "test": 16
       },
-      "fork_side_commit_count": 58,
+      "fork_side_commit_count": 59,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-16T14:45:16-04:00",
-        "sha": "99213c76c1a3323df93636eb149ecf80d76cbccf",
-        "subject": "fix(parser): retain leading empty OSC fields and correct property oracles"
+        "committed_at": "2026-09-20T22:57:56-04:00",
+        "sha": "8cdc77907cd3d562927153c469156d3d15d2cfd0",
+        "subject": "fix: preserve GUI launch ownership and unblock guardian recovery startup"
       },
       "name": "portable-pty",
       "path": "frankenterm/pty",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 58,
-        "fix": 134,
+        "fix": 135,
         "other": 60,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 70
       },
-      "fork_side_commit_count": 356,
+      "fork_side_commit_count": 357,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T17:44:01-04:00",
-        "sha": "fc07fdb6e12e6dd5293402c97ae61fa35a31c78c",
-        "subject": "fix(render): refresh cold viewport geometry after live output"
+        "committed_at": "2026-09-20T23:15:31-04:00",
+        "sha": "302e23b8611e2e8ef6cb969286385b4fcad8c472",
+        "subject": "fix(selection): preserve cold history endpoints through spill and reflow"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2877,
-  "generated_at": "2026-09-21T00:55:27.865196Z",
+  "fork_side_commit_total": 2882,
+  "generated_at": "2026-09-21T03:19:28.224785Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
