@@ -1500,7 +1500,6 @@ fn parse_mcp_rehearsal_score_surface(surface: Option<&str>) -> Option<RehearsalS
 }
 
 fn resolve_mcp_rehearsal_manifest_path(
-    config: &Config,
     manifest_path: &str,
 ) -> std::result::Result<PathBuf, String> {
     let trimmed = manifest_path.trim();
@@ -1513,18 +1512,76 @@ fn resolve_mcp_rehearsal_manifest_path(
         return Err("manifest_path must be workspace-relative for MCP calls".to_string());
     }
     if path.components().any(|component| {
-        matches!(
+        !matches!(
             component,
-            std::path::Component::ParentDir | std::path::Component::RootDir
+            std::path::Component::Normal(_) | std::path::Component::CurDir
         )
     }) {
         return Err("manifest_path must not traverse outside the workspace".to_string());
     }
+    if !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("manifest_path must name a file".to_string());
+    }
 
-    let layout = config
-        .workspace_layout(None)
-        .map_err(|error| format!("resolve workspace layout: {error}"))?;
-    Ok(layout.root.join(path))
+    Ok(path.to_path_buf())
+}
+
+const MCP_REHEARSAL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+
+fn read_mcp_rehearsal_manifest(
+    root: &Path,
+    relative: &Path,
+) -> std::result::Result<DemoScenarioManifest, String> {
+    #[cfg(unix)]
+    use cap_fs_ext::OpenOptionsSyncExt;
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use std::io::Read;
+
+    let read = || -> std::io::Result<String> {
+        let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+        let mut components = relative
+            .components()
+            .filter(|part| *part != std::path::Component::CurDir)
+            .peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(std::io::Error::other(
+                    "manifest path must remain within workspace",
+                ));
+            };
+            if components.peek().is_some() {
+                directory = directory.open_dir_nofollow(name)?;
+                continue;
+            }
+            if !directory.symlink_metadata(name)?.is_file() {
+                return Err(std::io::Error::other("manifest must be a regular file"));
+            }
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            options.nonblock(true);
+            let file = directory.open_with(name, &options)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MCP_REHEARSAL_MANIFEST_MAX_BYTES {
+                return Err(std::io::Error::other(
+                    "manifest must be a regular file of at most 1 MiB",
+                ));
+            }
+            let mut raw = String::new();
+            file.take(MCP_REHEARSAL_MANIFEST_MAX_BYTES + 1)
+                .read_to_string(&mut raw)?;
+            if raw.len() as u64 > MCP_REHEARSAL_MANIFEST_MAX_BYTES {
+                return Err(std::io::Error::other("manifest exceeds 1 MiB"));
+            }
+            return Ok(raw);
+        }
+        Err(std::io::Error::other("manifest path must name a file"))
+    };
+    let raw = read().map_err(|error| format!("read workspace manifest: {error}"))?;
+    DemoScenarioManifest::from_json(&raw).map_err(|error| format!("parse manifest: {error}"))
 }
 
 fn load_mcp_rehearsal_manifest(
@@ -1538,11 +1595,11 @@ fn load_mcp_rehearsal_manifest(
         return Ok((manifest, "inline_manifest".to_string()));
     }
 
-    let path = resolve_mcp_rehearsal_manifest_path(config, &params.manifest_path)?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| format!("read manifest {}: {error}", path.display()))?;
-    let manifest = DemoScenarioManifest::from_json(&raw)
-        .map_err(|error| format!("parse manifest {}: {error}", path.display()))?;
+    let path = resolve_mcp_rehearsal_manifest_path(&params.manifest_path)?;
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|error| format!("resolve workspace layout: {error}"))?;
+    let manifest = read_mcp_rehearsal_manifest(&layout.root, &path)?;
     Ok((manifest, params.manifest_path.clone()))
 }
 
@@ -1652,7 +1709,7 @@ impl ToolHandler for WaRehearsalScoreTool {
                 "type": "object",
                 "properties": {
                     "surface": { "type": "string", "enum": ["score", "explain"], "default": "score" },
-                    "manifest_path": { "type": "string", "default": "fixtures/demo-lab/manifest.v1.json", "description": "Workspace-relative demo scenario manifest path" },
+                    "manifest_path": { "type": "string", "default": "fixtures/demo-lab/manifest.v1.json", "description": "Workspace-relative regular JSON file, at most 1 MiB; symlink path components are rejected" },
                     "manifest": { "type": "object", "description": "Inline DemoScenarioManifest object; overrides manifest_path when supplied" },
                     "rehearsal_id": { "type": "string", "default": "rehearsal-demo-manifest" },
                     "scenario_id": { "type": "string", "default": "demo_lab.manifest" }
@@ -20081,6 +20138,87 @@ mod tests {
             explain["data"]["selected_item"]["recommended_action"]["mutates"],
             false
         );
+    }
+
+    #[test]
+    fn rehearsal_manifest_file_read_is_bounded_and_validated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("manifests")).unwrap();
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/demo-lab/manifest.v1.json"
+        ));
+        let path = root.path().join("manifests/valid.json");
+        std::fs::write(&path, fixture).unwrap();
+        let relative = resolve_mcp_rehearsal_manifest_path("./manifests/valid.json").unwrap();
+        let loaded = read_mcp_rehearsal_manifest(root.path(), &relative).unwrap();
+        assert_eq!(loaded, DemoScenarioManifest::from_json(fixture).unwrap());
+        assert!(resolve_mcp_rehearsal_manifest_path("../outside.json").is_err());
+        for invalid in ["", "   ", ".", "./"] {
+            assert!(resolve_mcp_rehearsal_manifest_path(invalid).is_err());
+        }
+        assert!(resolve_mcp_rehearsal_manifest_path(&path.to_string_lossy()).is_err());
+        assert!(read_mcp_rehearsal_manifest(root.path(), Path::new("manifests")).is_err());
+        let oversized = root.path().join("oversized.json");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MCP_REHEARSAL_MANIFEST_MAX_BYTES + 1)
+            .unwrap();
+        assert!(
+            read_mcp_rehearsal_manifest(root.path(), Path::new("oversized.json"))
+                .unwrap_err()
+                .contains("at most 1 MiB")
+        );
+        std::fs::write(root.path().join("invalid.json"), "not JSON").unwrap();
+        assert!(read_mcp_rehearsal_manifest(root.path(), Path::new("invalid.json")).is_err());
+    }
+
+    // rustix 1.1.4 exposes mkfifoat on Linux, but not Apple targets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rehearsal_manifest_rejects_fifo_without_opening_a_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(root.path()).unwrap();
+        rustix::fs::mkfifoat(
+            &directory,
+            "manifest.json",
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let error =
+            read_mcp_rehearsal_manifest(root.path(), Path::new("manifest.json")).unwrap_err();
+        assert!(error.contains("manifest must be a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rehearsal_manifest_rejects_outside_file_and_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("manifest.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/demo-lab/manifest.v1.json"
+            )),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("manifest.json"),
+            root.path().join("file.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("directory")).unwrap();
+        for path in ["file.json", "directory/manifest.json"] {
+            let relative = resolve_mcp_rehearsal_manifest_path(path).unwrap();
+            assert!(
+                read_mcp_rehearsal_manifest(root.path(), &relative).is_err(),
+                "symlink escaped capability: {path}"
+            );
+        }
+        // The outside payload itself is valid; refusal is a filesystem
+        // authority decision rather than a JSON parsing failure.
+        assert!(read_mcp_rehearsal_manifest(outside.path(), Path::new("manifest.json")).is_ok());
     }
 
     #[test]
