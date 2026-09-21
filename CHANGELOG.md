@@ -30,6 +30,10 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+- Hyperlink hit testing uses the glyph spans from the displayed frame, including clipped and wide text, instead of rereading terminal state during mouse movement. Cached rendering retains those spans and rejects stale pane or layout identities.
+- Guardian recovery retries a busy, authenticated handshake before claiming ownership. The retry remains bounded and does not replay ownership claims or mutations. Snapshot publication also rechecks the captured domain policy and default domain before publishing.
+- A replay-safe render-read rejection uses a 1 ms first backoff, retaining the longer backoff for persistent contention, the original deadline and the attempt cap. Native latency qualification remains pending.
+- The latency diagnostic fits finite arrival/departure service envelopes without counting batch waiting twice. It freezes calibration before checking held-out samples; fitted rates do not establish saturated throughput.
 - Guardian recovery preserves separate authenticated adoptions when successor muxes capture identical terminal content. Exact replay and resumed reads retain the selected capture generation; historical checkpoint files remain available. Subprocess tests cover mux death during durable ownership transfer while the original guardian-owned child remains alive. Recovery after guardian or host failure remains unfinished.
 - The mux server adds opt-in `--recovery-restore`: authenticate the saved image, reconcile its original guardian-owned processes, and publish the complete recovered topology before opening listeners. Cancellation or a failed preparation leaves the topology unpublished. Recovered tabs support subsequent window transactions; periodic snapshots continue the exact authenticated predecessor chain across repeated root-slot rotation. Focused remote tests cover these paths; native startup and release qualification remain pending.
 - Cold scrollback retains its logical viewport anchor across repeated reflow and refreshes stale geometry after ordinary output. Hydration stays off the terminal lock; a missing new-width paragraph defers painting instead of substituting an old numeric row. Native position and presentation checks remain pending.
@@ -101,7 +105,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Offline recovery selects the authenticated checkpoint adoption by its complete
   capture identity, including mux incarnation, generation, effect and sequence.
 
-The `0.15.6-rc.40` candidate is being prepared with these changes. The 50 ms resize target,
+The `0.15.6` changes remain under release qualification. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.

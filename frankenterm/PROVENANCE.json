@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 272,
+        "fix": 273,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 107
       },
-      "fork_side_commit_count": 711,
+      "fork_side_commit_count": 712,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-20T18:37:55-04:00",
-        "sha": "ba882b5b518702b39dfc8c95a224092abdacd158",
-        "subject": "fix(recovery): preserve window transactions and periodic root rotation"
+        "committed_at": "2026-09-20T19:23:43-04:00",
+        "sha": "fc12b2093ff27d59a51f183d44848664df1edca8",
+        "subject": "fix(recovery): reject unresolved domain state at snapshot cuts"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2876,
-  "generated_at": "2026-09-20T22:39:41.398928Z",
+  "fork_side_commit_total": 2877,
+  "generated_at": "2026-09-21T00:55:27.865196Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
