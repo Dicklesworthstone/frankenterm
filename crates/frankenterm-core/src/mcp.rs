@@ -2492,6 +2492,8 @@ mod tests {
     /// owned fields, so the Ok arm is the production path.
     #[test]
     fn mcp_audit_decision_context_happy_path_does_not_bump_counter() {
+        // The round-trip test mutates this same process-wide counter.
+        let _guard = audit_counter_test_lock();
         reset_mcp_audit_decision_context_serde_failure_count_for_test();
         let before = mcp_audit_decision_context_serde_failure_count();
         let json = mcp_audit_decision_context(
@@ -2519,6 +2521,7 @@ mod tests {
     /// shape of mcp_audit_failure_count + reset_mcp_audit_failure_count_for_test.
     #[test]
     fn mcp_audit_decision_context_serde_failure_counter_round_trip() {
+        let _guard = audit_counter_test_lock();
         reset_mcp_audit_decision_context_serde_failure_count_for_test();
         assert_eq!(mcp_audit_decision_context_serde_failure_count(), 0);
         record_mcp_audit_decision_context_serde_failure();
