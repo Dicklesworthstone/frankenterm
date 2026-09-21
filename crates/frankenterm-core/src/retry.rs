@@ -451,14 +451,9 @@ where
                     "Retrying operation after failure"
                 );
 
-                // Tick 208 (ft-xbnl0.2.3): honor the sleep_with_cx
-                // result. Previously `let _ = ...` discarded the Err
-                // so cancel during backoff was swallowed and the next
-                // operation fired anyway. Now cancel during backoff
-                // returns the original operation Err plus a cancelled
-                // marker via the attempts count (the caller can
-                // inspect elapsed vs. policy.delay_for_attempt to tell
-                // cancel from natural timeout).
+                // A budget failure ends the backoff here. Direct cancellation
+                // may wake sleep successfully; the next iteration checks the
+                // context before invoking the operation again.
                 if crate::runtime_async::sleep_with_cx(cx, delay)
                     .await
                     .is_err()
@@ -769,11 +764,12 @@ mod tests {
         let region = runtime
             .state
             .create_root_region(asupersync::Budget::INFINITE);
-        let (task_id, _handle) = runtime
+        let (task_id, mut handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 // Reuse the root region's Cx so sleeps bind to lab virtual time.
-                let cx = crate::cx::for_request();
+                let cx = crate::cx::Cx::current().expect("lab task context");
+                let started = cx.now();
                 let policy = RetryPolicy {
                     initial_delay: Duration::from_millis(10),
                     max_delay: Duration::from_millis(50),
@@ -794,11 +790,20 @@ mod tests {
                 .await;
                 final_attempts_task.store(outcome.attempts, Ordering::SeqCst);
                 assert!(outcome.result.is_ok(), "expected success on attempt 4");
+                assert_eq!(cx.now(), started + Duration::from_millis(70));
             })
             .expect("spawn retry task");
         runtime.scheduler.lock().schedule(task_id, 0);
         runtime.step_for_test();
-        let _ = runtime.run_with_auto_advance();
+        assert_eq!(
+            runtime.run_with_auto_advance().termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        let outcome = handle.try_join();
+        assert!(
+            matches!(outcome, Ok(Some(()))),
+            "LabRuntime root task did not complete successfully: {outcome:?}"
+        );
         let report = runtime.run_until_quiescent_with_report();
 
         assert_eq!(
@@ -820,8 +825,8 @@ mod tests {
         // catch is a real-time wait that never returns or a step explosion.
         // A 1 s bound tripped at 5.4 s on a loaded RCH worker (2026-09-02,
         // lane 8) while the same test ran in 0.19 s on an idle host, so the
-        // guard is generous. Determinism itself is proven by the attempt
-        // counts and the LabRuntime oracles above.
+        // guard is generous. The exact virtual elapsed time is checked inside
+        // the task, whose successful completion is checked above.
         assert!(
             wall_start.elapsed() < Duration::from_secs(30),
             "virtual-time retry run appears to be hanging on real time; elapsed {:?}",
@@ -2410,7 +2415,7 @@ mod tests {
         let region = runtime
             .state
             .create_root_region(asupersync::Budget::INFINITE);
-        let (task_id, _handle) = runtime
+        let (task_id, mut handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 f().await;
@@ -2418,7 +2423,16 @@ mod tests {
             .expect("spawn lab task");
         runtime.scheduler.lock().schedule(task_id, 0);
         runtime.step_for_test();
-        let _ = runtime.run_with_auto_advance();
+        let termination = runtime.run_with_auto_advance().termination;
+        assert_eq!(
+            termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        let outcome = handle.try_join();
+        assert!(
+            matches!(outcome, Ok(Some(()))),
+            "LabRuntime root task did not complete successfully: {outcome:?}"
+        );
         let report = runtime.run_until_quiescent_with_report();
         assert!(
             report.oracle_report.all_passed(),
@@ -2672,7 +2686,10 @@ mod tests {
         let attempts_task = Arc::clone(&attempts);
 
         run_lab(0xE00A_0001, move || async move {
-            let cx = crate::cx::for_request();
+            // Fresh for_request contexts have no lab timer driver. Use the
+            // scheduled task's context so both backoffs advance virtual time.
+            let cx = crate::cx::Cx::current().expect("lab task context");
+            let started = cx.now();
             let policy = RetryPolicy {
                 initial_delay: Duration::from_millis(5),
                 max_delay: Duration::from_millis(20),
@@ -2685,8 +2702,12 @@ mod tests {
                 async { Err::<u32, _>(retry_runtime_error("always fail")) }
             })
             .await;
-            assert!(outcome.result.is_err());
+            assert!(matches!(
+                outcome.result,
+                Err(Error::RuntimeOperation { .. })
+            ));
             assert_eq!(outcome.attempts, 3, "must exhaust all 3 attempts");
+            assert_eq!(cx.now(), started + Duration::from_millis(15));
         });
         assert_eq!(
             attempts.load(Ordering::SeqCst),

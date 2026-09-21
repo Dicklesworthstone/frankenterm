@@ -84,19 +84,24 @@ where
             .max_steps(1_000_000),
     );
     let region = runtime.state.create_root_region(Budget::INFINITE);
-    let (task_id, _handle) = runtime
+    let (task_id, mut handle) = runtime
         .state
         .create_task(region, Budget::INFINITE, body)
         .expect("spawn bench task");
     runtime.scheduler.lock().schedule(task_id, 0);
     let report = runtime.run_with_auto_advance();
     assert!(
-        !matches!(
+        matches!(
             report.termination,
-            asupersync::lab::AutoAdvanceTermination::StuckBailout
+            asupersync::lab::AutoAdvanceTermination::Quiescent
         ),
-        "bench LabRuntime got stuck; termination: {:?}",
+        "bench LabRuntime did not finish; termination: {:?}",
         report.termination,
+    );
+    let outcome = handle.try_join();
+    assert!(
+        matches!(outcome, Ok(Some(()))),
+        "LabRuntime benchmark task did not complete successfully: {outcome:?}"
     );
 }
 

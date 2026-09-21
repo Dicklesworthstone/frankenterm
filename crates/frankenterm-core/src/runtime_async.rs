@@ -17534,7 +17534,7 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (task_id, _handle) = runtime
+            let (task_id, mut handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
@@ -17544,13 +17544,26 @@ mod tests {
 
             let report = runtime.run_with_auto_advance();
             assert!(
-                !matches!(
+                matches!(
                     report.termination,
-                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                    asupersync::lab::AutoAdvanceTermination::Quiescent
                 ),
-                "LabRuntime got stuck; termination: {:?}",
+                "LabRuntime did not finish; termination: {:?}",
                 report.termination,
             );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "LabRuntime root task did not complete successfully")]
+        fn run_lab_rejects_panicked_root_task() {
+            run_lab(0x10C5_F411, || async {
+                panic!("planted runtime primitive assertion");
+            });
         }
 
         /// `Mutex::lock_with_cx` acquires the guard and the caller observes
@@ -17834,36 +17847,52 @@ mod tests {
         fn ambient_locks_do_not_escape_cancelled_installed_cx() {
             run_lab(0x10C5_10C5_C410_4014, || async move {
                 use futures::FutureExt as _;
+                use std::future::Future as _;
 
-                let installed = crate::cx::Cx::current().expect("lab task installs a Cx");
+                let root = crate::cx::Cx::current().expect("lab task installs a Cx");
+                let installed = crate::cx::for_testing();
                 installed.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("cancel installed context before ambient locks"),
                 );
 
-                let mutex = Mutex::new(11u32);
-                assert!(
-                    std::panic::AssertUnwindSafe(mutex.lock())
-                        .catch_unwind()
-                        .await
-                        .is_err(),
-                    "ambient mutex must inherit the cancelled task context"
-                );
+                let checks = async {
+                    let mutex = Mutex::new(11u32);
+                    assert!(
+                        std::panic::AssertUnwindSafe(mutex.lock())
+                            .catch_unwind()
+                            .await
+                            .is_err(),
+                        "ambient mutex must inherit the cancelled task context"
+                    );
 
-                let rwlock = RwLock::new(12u32);
+                    let rwlock = RwLock::new(12u32);
+                    assert!(
+                        std::panic::AssertUnwindSafe(rwlock.read())
+                            .catch_unwind()
+                            .await
+                            .is_err(),
+                        "ambient rwlock read must inherit the cancelled task context"
+                    );
+                    assert!(
+                        std::panic::AssertUnwindSafe(rwlock.write())
+                            .catch_unwind()
+                            .await
+                            .is_err(),
+                        "ambient rwlock write must inherit the cancelled task context"
+                    );
+                };
+                futures::pin_mut!(checks);
+                // Scope ambient authority to each poll, without cancelling
+                // the LabRuntime root or carrying a TLS guard across await.
+                std::future::poll_fn(|task_cx| {
+                    let _guard = crate::cx::Cx::set_current(Some(installed.clone()));
+                    checks.as_mut().poll(task_cx)
+                })
+                .await;
                 assert!(
-                    std::panic::AssertUnwindSafe(rwlock.read())
-                        .catch_unwind()
-                        .await
-                        .is_err(),
-                    "ambient rwlock read must inherit the cancelled task context"
-                );
-                assert!(
-                    std::panic::AssertUnwindSafe(rwlock.write())
-                        .catch_unwind()
-                        .await
-                        .is_err(),
-                    "ambient rwlock write must inherit the cancelled task context"
+                    !root.is_cancel_requested(),
+                    "ambient cancellation checks must leave the lab root uncancelled"
                 );
             });
         }

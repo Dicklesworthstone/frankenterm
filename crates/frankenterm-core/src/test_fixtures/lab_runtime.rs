@@ -123,11 +123,9 @@ pub const DEFAULT_MAX_STEPS: u64 = 50_000;
 pub struct LabReport {
     pub termination: AutoAdvanceTermination,
     pub steps: u64,
-    /// Whether all asupersync invariant oracles passed at quiescence.
-    /// `true` for the manual-time harness (oracles are not run there
-    /// — `into_report()` does not drive `run_until_quiescent_with_report`).
-    /// For the function-style fixture, populated from
-    /// `LabRunReport::oracle_report::all_passed()` after auto-advance.
+    /// Whether all asupersync invariant oracles passed for the reported state.
+    /// Manual time evaluates the oracles without driving tasks or advancing
+    /// time; the termination field separately establishes completion.
     pub oracles_passed: bool,
     /// Final virtual time after the run, in nanoseconds since
     /// `Time::ZERO`. Lets post-run assertions like
@@ -142,8 +140,9 @@ pub struct LabReport {
 /// Run an async closure under LabRuntime virtual time with a
 /// freshly-constructed `Cx` installed.
 ///
-/// Uses [`DEFAULT_SEED`] and [`DEFAULT_MAX_STEPS`]. Panics on
-/// `StuckBailout` with a diagnostic that names the seed.
+/// Uses [`DEFAULT_SEED`] and [`DEFAULT_MAX_STEPS`]. Requires quiescence
+/// and a successful root-task result; scheduler termination alone cannot
+/// prove that assertions in the async body completed successfully.
 ///
 /// # Examples
 ///
@@ -201,7 +200,7 @@ where
 {
     let mut runtime = LabRuntime::new(config);
     let region = runtime.state.create_root_region(Budget::INFINITE);
-    let (task_id, _handle) = runtime
+    let (task_id, mut handle) = runtime
         .state
         .create_task(region, Budget::INFINITE, async move {
             let cx = Cx::current().unwrap_or_else(Cx::for_testing);
@@ -226,6 +225,12 @@ where
             report.steps
         );
     }
+    assert_eq!(
+        report.termination,
+        AutoAdvanceTermination::Quiescent,
+        "LabRuntime did not finish within its step budget"
+    );
+    assert_task_succeeded(&mut handle);
 
     // br-ft-c8x87: drive an extra `run_until_quiescent_with_report`
     // pass after auto-advance so callers that need oracle assertions
@@ -240,6 +245,14 @@ where
         oracles_passed: lab_run_report.oracle_report.all_passed(),
         now_nanos: runtime.now().as_nanos(),
     }
+}
+
+fn assert_task_succeeded(handle: &mut asupersync::runtime::TaskHandle<()>) {
+    let outcome = handle.try_join();
+    assert!(
+        matches!(outcome, Ok(Some(()))),
+        "LabRuntime root task did not complete successfully: {outcome:?}"
+    );
 }
 
 // ============================================================================
@@ -273,6 +286,7 @@ where
 /// [`run`]: Self::run
 pub struct LabRuntimeMultiTask {
     runtime: LabRuntime,
+    handles: Vec<asupersync::runtime::TaskHandle<()>>,
     /// Single shared root region for every spawned task.
     /// `LabRuntime::create_root_region` panics on a second call —
     /// the harness creates the region eagerly in [`with_config`]
@@ -328,6 +342,7 @@ impl LabRuntimeMultiTask {
         Self {
             runtime,
             root_region,
+            handles: Vec::new(),
         }
     }
 
@@ -346,7 +361,7 @@ impl LabRuntimeMultiTask {
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (task_id, _handle) = self
+        let (task_id, handle) = self
             .runtime
             .state
             .create_task(self.root_region, Budget::INFINITE, async move {
@@ -355,6 +370,7 @@ impl LabRuntimeMultiTask {
             })
             .expect("LabRuntime root task spawn must succeed");
         self.runtime.scheduler.lock().schedule(task_id, 0);
+        self.handles.push(handle);
         self
     }
 
@@ -375,6 +391,14 @@ impl LabRuntimeMultiTask {
                  oneshot resolutions across the spawned task set.",
                 report.steps
             );
+        }
+        assert_eq!(
+            report.termination,
+            AutoAdvanceTermination::Quiescent,
+            "LabRuntime did not finish within its step budget"
+        );
+        for mut handle in self.handles.drain(..) {
+            assert_task_succeeded(&mut handle);
         }
 
         let lab_run_report = self.runtime.run_until_quiescent_with_report();
@@ -433,6 +457,8 @@ impl LabRuntimeMultiTask {
 /// expresses that interleaving naturally.
 pub struct ManualTimeHarness {
     runtime: LabRuntime,
+    handles: Vec<asupersync::runtime::TaskHandle<()>>,
+    root_region: Option<RegionId>,
 }
 
 impl Default for ManualTimeHarness {
@@ -470,6 +496,8 @@ impl ManualTimeHarness {
         config.auto_advance_time = false;
         Self {
             runtime: LabRuntime::new(config),
+            handles: Vec::new(),
+            root_region: None,
         }
     }
 
@@ -481,8 +509,10 @@ impl ManualTimeHarness {
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let region = self.runtime.state.create_root_region(Budget::INFINITE);
-        let (task_id, _handle) = self
+        let region = *self
+            .root_region
+            .get_or_insert_with(|| self.runtime.state.create_root_region(Budget::INFINITE));
+        let (task_id, handle) = self
             .runtime
             .state
             .create_task(region, Budget::INFINITE, async move {
@@ -491,6 +521,7 @@ impl ManualTimeHarness {
             })
             .expect("LabRuntime root task spawn must succeed");
         self.runtime.scheduler.lock().schedule(task_id, 0);
+        self.handles.push(handle);
     }
 
     /// Advance virtual time by `duration` and process timers that are
@@ -526,7 +557,9 @@ impl ManualTimeHarness {
     /// [`advance`]: Self::advance
     /// [`advance_to_next_timer`]: Self::advance_to_next_timer
     pub fn run_until_idle(&mut self) -> u64 {
-        self.runtime.run_until_idle()
+        let steps = self.runtime.run_until_idle();
+        self.check_task_outcomes();
+        steps
     }
 
     /// Drive the runtime until quiescent or `max_steps` is reached.
@@ -536,13 +569,23 @@ impl ManualTimeHarness {
     /// caller has manually advanced past every pending timer the
     /// task graph waits on.
     pub fn run_until_quiescent(&mut self) -> u64 {
-        self.runtime.run_until_quiescent()
+        let steps = self.runtime.run_until_quiescent();
+        self.check_task_outcomes();
+        steps
     }
 
-    /// True iff scheduler is empty + all obligations resolved.
+    fn check_task_outcomes(&mut self) {
+        self.handles.retain_mut(|handle| match handle.try_join() {
+            Ok(Some(())) => false,
+            Ok(None) => true, // Pending timers are legitimate under manual time.
+            Err(error) => panic!("LabRuntime root task did not complete successfully: {error:?}"),
+        });
+    }
+
+    /// True iff the runtime is quiescent and every owned task succeeded.
     #[must_use]
     pub fn is_quiescent(&self) -> bool {
-        self.runtime.is_quiescent()
+        self.runtime.is_quiescent() && self.handles.is_empty()
     }
 
     /// Current virtual time, as nanoseconds since epoch (Time::ZERO).
@@ -572,23 +615,21 @@ impl ManualTimeHarness {
     /// (auto-advance is disabled, so the bailout heuristic does
     /// not apply).
     #[must_use]
-    pub fn into_report(self) -> LabReport {
-        let termination = if self.runtime.is_quiescent() {
+    pub fn into_report(mut self) -> LabReport {
+        self.check_task_outcomes();
+        let termination = if self.runtime.is_quiescent() && self.handles.is_empty() {
             AutoAdvanceTermination::Quiescent
         } else {
             AutoAdvanceTermination::StepLimitReached
         };
+        // `report` hydrates/evaluates the actual invariant oracles without
+        // polling tasks or advancing virtual time. A pending manual timer
+        // must remain pending merely because the caller requests a report.
+        let oracle_report = self.runtime.report().oracle_report;
         LabReport {
             termination,
             steps: self.runtime.steps(),
-            // The manual-time harness does not drive
-            // `run_until_quiescent_with_report` — oracle status is
-            // not produced for these tests. `true` is the safer
-            // default than `false` because callers that don't
-            // assert on oracles_passed continue to behave as
-            // before; callers that *do* must use the function-style
-            // fixture, which populates the field.
-            oracles_passed: true,
+            oracles_passed: oracle_report.all_passed(),
             now_nanos: self.runtime.now().as_nanos(),
         }
     }
@@ -723,6 +764,120 @@ mod tests {
             // Trivial body — the budget shouldn't matter.
         });
         assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    #[should_panic(expected = "LabRuntime root task did not complete successfully")]
+    fn lab_runtime_test_rejects_panicked_root_task() {
+        lab_runtime_test(|_cx| async {
+            panic!("planted root task assertion");
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "LabRuntime did not finish within its step budget")]
+    fn lab_runtime_test_rejects_incomplete_root_task() {
+        let config = LabConfig::new(0).with_auto_advance().max_steps(1);
+        lab_runtime_test_with_config(config, |_cx| async {
+            std::future::poll_fn(|cx| {
+                cx.waker().wake_by_ref();
+                std::task::Poll::<()>::Pending
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "LabRuntime root task did not complete successfully")]
+    fn lab_runtime_multi_task_rejects_panicked_root_task() {
+        let mut harness = LabRuntimeMultiTask::new();
+        harness.spawn(|_cx| async {});
+        harness.spawn(|_cx| async {
+            panic!("planted second root task assertion");
+        });
+        let _ = harness.run();
+    }
+
+    #[test]
+    #[should_panic(expected = "LabRuntime root task did not complete successfully")]
+    fn manual_time_harness_rejects_panicked_root_task_at_idle() {
+        let mut harness = ManualTimeHarness::new();
+        harness.spawn(|_cx| async {
+            panic!("planted manual task assertion");
+        });
+        harness.run_until_idle();
+    }
+
+    #[test]
+    fn manual_time_harness_pending_timer_is_not_a_failed_task() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_done = std::sync::Arc::clone(&done);
+        let fast_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fast_task_done = std::sync::Arc::clone(&fast_done);
+        let mut harness = ManualTimeHarness::new();
+        harness.spawn(move |cx| async move {
+            crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_millis(5))
+                .await
+                .unwrap();
+            task_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        harness.spawn(move |_cx| async move {
+            fast_task_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        harness.run_until_idle();
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(fast_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(harness.handles.len(), 1);
+        assert!(!harness.is_quiescent());
+        harness.advance(std::time::Duration::from_millis(5));
+        harness.run_until_idle();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(harness.handles.is_empty());
+        assert!(harness.is_quiescent());
+        // Repeated driver calls cannot re-poll a consumed terminal result.
+        harness.run_until_idle();
+        assert_ran_to_completion(&harness.into_report());
+    }
+
+    #[test]
+    fn manual_time_report_evaluates_oracle_failure_without_advancing_pending_timer() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = std::sync::Arc::clone(&completed);
+        // This negative control needs the violation in the returned report.
+        // Ordinary harnesses retain the default panic-on-violation policy.
+        let mut harness = ManualTimeHarness::with_config(
+            LabConfig::new(0).panic_on_cancellation_violation(false),
+        );
+        harness.spawn(move |cx| async move {
+            crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_millis(10))
+                .await
+                .unwrap();
+            task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let task_id = harness.handles[0].task_id();
+        harness.run_until_idle();
+        let steps = harness.steps();
+        let now = harness.now_nanos();
+        // Feed an actual cancellation-protocol violation to the real oracle:
+        // an exit with no preceding mask entry must not become a green report.
+        harness
+            .runtime
+            .notify_cancellation_oracle_mask_exit(task_id);
+        let report = harness.into_report();
+        assert!(
+            !report.oracles_passed,
+            "an unmatched mask exit must reach the caller"
+        );
+        assert_eq!(report.termination, AutoAdvanceTermination::StepLimitReached);
+        assert_eq!(
+            report.steps, steps,
+            "reporting must not poll the pending task"
+        );
+        assert_eq!(
+            report.now_nanos, now,
+            "reporting must not advance virtual time"
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

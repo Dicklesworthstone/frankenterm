@@ -921,7 +921,7 @@ mod tests {
         let region = runtime
             .state
             .create_root_region(asupersync::Budget::INFINITE);
-        let (task_id, _handle) = runtime
+        let (task_id, mut handle) = runtime
             .state
             .create_task(region, asupersync::Budget::INFINITE, async move {
                 f().await;
@@ -929,7 +929,16 @@ mod tests {
             .expect("spawn lab task");
         runtime.scheduler.lock().schedule(task_id, 0);
         runtime.step_for_test();
-        let _ = runtime.run_with_auto_advance();
+        let termination = runtime.run_with_auto_advance().termination;
+        assert_eq!(
+            termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        let outcome = handle.try_join();
+        assert!(
+            matches!(outcome, Ok(Some(()))),
+            "LabRuntime root task did not complete successfully: {outcome:?}"
+        );
         let report = runtime.run_until_quiescent_with_report();
         assert!(
             report.oracle_report.all_passed(),
