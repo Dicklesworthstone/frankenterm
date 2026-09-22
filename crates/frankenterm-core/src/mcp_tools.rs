@@ -5468,6 +5468,10 @@ impl McpAwaitEventDeliveryCompletionExecutor {
         Arc::clone(&self.stats)
     }
 
+    /// Poll until the service's storage epoch is ready or `timeout` elapses.
+    /// Initial-readiness waits should use
+    /// [`AWAIT_EVENT_STORAGE_READY_HANG_GUARD`]; short explicit bounds are only
+    /// for asserting that an already-ready service stays ready.
     #[cfg(test)]
     fn wait_until_ready_for_test(&self, timeout: std::time::Duration) -> bool {
         let started = Instant::now();
@@ -7868,7 +7872,7 @@ impl WaAwaitEventTool {
             .as_ref()
             .expect("test claim-completion executor must exist");
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(15)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "test claim-completion storage did not become ready"
         );
     }
@@ -14364,6 +14368,15 @@ impl ToolHandler for WaEventsLabelTool {
     }
 }
 
+/// Hang guard for a test waiting on an await-event service's first storage
+/// readiness. Opening the storage epoch runs full SQLite schema
+/// initialization, which can take well over 5 s on a loaded remote worker
+/// during a full parallel lib run; this bound only has to catch a hang, it is
+/// not a latency assertion.
+#[cfg(test)]
+const AWAIT_EVENT_STORAGE_READY_HANG_GUARD: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
 #[cfg(test)]
 mod tests {
     // Test-only fixture/bootstrap helpers below intentionally use unwrap/expect for
@@ -17177,7 +17190,7 @@ mod tests {
             .expect("pre-cancellation await service must start");
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "pre-cancellation storage did not become ready"
         );
         let operation_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -17228,7 +17241,7 @@ mod tests {
         );
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "shared await storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -17341,7 +17354,7 @@ mod tests {
         );
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "fairness-test shared storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -17425,7 +17438,7 @@ mod tests {
         );
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "cancellation-isolation storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -17521,7 +17534,7 @@ mod tests {
         );
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "queued-cancellation storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -17636,7 +17649,7 @@ mod tests {
         );
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "shutdown-isolation storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -17755,7 +17768,7 @@ mod tests {
             .expect("request-local-error await service must start");
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "request-local-error storage did not become ready"
         );
 
@@ -17909,7 +17922,7 @@ mod tests {
             .expect("panic-contained await service must start");
         let stats = service.stats_for_test();
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "panic-containment storage did not become ready"
         );
         let operation: super::McpAwaitEventRequestOperation = Box::new(|_storage| {
@@ -17946,7 +17959,7 @@ mod tests {
         assert_eq!(recovered.request_jobs_finished, 1);
         assert_eq!(recovered.storage_shutdowns, 1);
         assert!(
-            service.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            service.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "shared service must be ready on its replacement epoch"
         );
         drop(service);
@@ -17989,7 +18002,7 @@ mod tests {
             .expect("long-lived completion worker must start");
         let stats = executor.stats_for_test();
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "long-lived completion storage did not become ready"
         );
 
@@ -18131,7 +18144,7 @@ mod tests {
             .expect("completion worker with synthetic init failures must start");
         let stats = executor.stats_for_test();
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "completion storage did not recover from bounded synthetic init failures"
         );
         let recovered = stats.snapshot();
@@ -18257,7 +18270,7 @@ mod tests {
             .expect("completion worker with synthetic completion stall must start");
         let stats = executor.stats_for_test();
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "completion storage did not become ready"
         );
         assert!(executor.try_submit(
@@ -18358,7 +18371,7 @@ mod tests {
         );
         let stats = executor.stats_for_test();
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "initial completion storage did not become ready"
         );
         let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -18401,7 +18414,7 @@ mod tests {
             snapshot.storage_reconnects == 1 && snapshot.storage_initializations == 2
         });
         assert!(
-            executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)),
+            executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD),
             "replacement completion storage epoch did not become ready"
         );
         let mut cancelled_requests = 0_usize;
@@ -19198,7 +19211,7 @@ mod tests {
         let executor = super::McpAwaitEventDeliveryCompletionExecutor::new(Arc::clone(&db_path))
             .expect("contradictory-token completion service must start");
         let stats = executor.stats_for_test();
-        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)));
+        assert!(executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD));
         assert!(executor.try_submit(
             vec![stale_lease.clone(), successor_lease.clone()],
             super::FrameworkResponseDeliveryOutcome::DeliveryAcknowledged,
@@ -19261,7 +19274,7 @@ mod tests {
         let executor = super::McpAwaitEventDeliveryCompletionExecutor::new(db_path)
             .expect("invalid-lease completion service must start");
         let stats = executor.stats_for_test();
-        assert!(executor.wait_until_ready_for_test(std::time::Duration::from_secs(5)));
+        assert!(executor.wait_until_ready_for_test(AWAIT_EVENT_STORAGE_READY_HANG_GUARD));
         assert!(executor.try_submit(
             vec![crate::storage::EventDeliveryLease::new(
                 0,
