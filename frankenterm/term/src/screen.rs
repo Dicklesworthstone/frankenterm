@@ -342,6 +342,7 @@ pub struct ScreenLineRead {
     attempted_index: bool,
     fragments: Option<Arc<ColdRowFragments>>,
     geometry: Option<ColdGeometrySnapshot>,
+    requested_physical_rows_only: bool,
 }
 
 /// A logical position in an immutable, complete backing-store group. Visual
@@ -1633,6 +1634,15 @@ impl ScreenLineRead {
         self.payload_bytes
     }
 
+    /// Copying explicit rows needs no surrounding logical paragraph when the
+    /// stored rows already have the captured geometry. Reflowed layouts still
+    /// hydrate their complete source groups. Anchor and logical-line readers
+    /// retain the default complete-context behavior.
+    pub fn with_requested_physical_rows_only(mut self) -> Self {
+        self.requested_physical_rows_only = true;
+        self
+    }
+
     /// A cache may serve a subset of the complete logical context hydrated by
     /// its worker. Borrowed cells stay owned by this read's retirement guard.
     pub fn cached_lines(
@@ -1876,8 +1886,21 @@ impl ScreenLineRead {
                 .groups
                 .partition_point(|(_, visual)| visual.start < self.resident_first);
             let groups = &layout.groups[first_group..end_group.max(first_group)];
-            let source_end = groups.last().map_or(0, |(source, _)| source.end);
-            let mut next_source_row = groups.first().map_or(0, |(source, _)| source.start);
+            let rows_only = layout.stored_physical() && self.requested_physical_rows_only;
+            let source_end = groups.last().map_or(0, |(source, _)| {
+                if rows_only {
+                    source.end.min(self.resident_first)
+                } else {
+                    source.end
+                }
+            });
+            let mut next_source_row = groups.first().map_or(0, |(source, _)| {
+                if rows_only {
+                    source.start.max(self.first)
+                } else {
+                    source.start
+                }
+            });
             let context_source_start = next_source_row;
             if layout.stored_physical() {
                 anyhow::ensure!(self.fragments.is_none(), ColdReadGeometryUnavailable);
@@ -1896,6 +1919,19 @@ impl ScreenLineRead {
             let mut prefetched = Vec::new().into_iter();
             for (source, visual) in groups {
                 anyhow::ensure!(!cancelled(), "cold read cancelled");
+                if layout.stored_physical() {
+                    anyhow::ensure!(source == visual, "cold physical index coordinates changed");
+                }
+                let source = if rows_only {
+                    source.start.max(self.first)..source.end.min(self.resident_first)
+                } else {
+                    source.clone()
+                };
+                let visual = if rows_only {
+                    source.clone()
+                } else {
+                    visual.clone()
+                };
                 anyhow::ensure!(
                     source.start == next_source_row && source.start < source.end,
                     "cold visual index source discontinuity"
@@ -4457,6 +4493,7 @@ impl Screen {
                 .load(std::sync::atomic::Ordering::Acquire),
             fragments: self.cold_row_fragments.clone(),
             geometry,
+            requested_physical_rows_only: false,
         })
     }
 
@@ -13804,6 +13841,76 @@ pub(crate) mod tests {
         screen.install_line_read_layout(&ready, 2);
         assert_eq!(screen.lines_in_stable_range(requested).1, expected);
         assert!(screen.validates_line_read(&ready));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn stored_physical_row_copy_does_not_reload_the_surrounding_paragraph() {
+        let (mut screen, sink) = stored_physical_fixture(0, 2048);
+        for row in 0..1024 {
+            let mut line = Line::from_text("界e\u{301} tail  ", &CellAttributes::blank(), 1, None);
+            line.set_last_cell_was_wrapped(row != 1023, 1);
+            assert!(screen.record_scrollback_spill(row, &line, 1));
+            screen.advance_stable_row_index_offset(1);
+        }
+        let requested = 128..192;
+        let full = screen
+            .capture_line_read(requested.clone())
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(full.cached_lines(0..1024).is_some());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 512);
+        // Establish the mapping before checking that a subsequent scoped
+        // payload read preserves it; the fixture starts without one installed.
+        screen.install_line_read_layout(&full, 2);
+        assert!(screen.validates_line_read(&full));
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        let ready = screen
+            .capture_line_read(requested.clone())
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| false)
+            .unwrap();
+        // The sink returns at most two rows per call: exactly 64 rows, rather
+        // than the 1,024-row paragraph, must cross the payload read boundary.
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 32);
+        assert_eq!(ready.cold_context, Some(requested.clone()));
+        assert!(ready.cached_lines(0..1024).is_none());
+        assert_eq!(
+            ready.lines().cloned().collect::<Vec<_>>(),
+            full.lines().cloned().collect::<Vec<_>>()
+        );
+        assert!(ready.lines().all(Line::last_cell_was_wrapped));
+        assert!(ready.payload_bytes() < full.payload_bytes());
+        assert!(screen.validates_line_read(&ready));
+        assert!(!screen.line_read_changes_layout(&ready));
+
+        let seam = screen
+            .capture_line_read(1023..1025)
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| false)
+            .unwrap();
+        assert_eq!(seam.row_count(), 2);
+        assert_eq!(seam.lines().last().unwrap(), &screen.lines[0]);
+        assert!(screen.validates_line_read(&seam));
+        assert!(screen
+            .capture_line_read(requested.clone())
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate_with_payload_limit(1, || false)
+            .is_err());
+        sink.batch_reads.store(0, Ordering::Relaxed);
+        assert!(screen
+            .capture_line_read(requested)
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| true)
+            .is_err());
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 0);
+        sink.rows.lock().unwrap().retain(|row, _| *row > 128);
+        assert!(!screen.validates_line_read(&ready));
     }
 
     #[cfg(feature = "use_serde")]

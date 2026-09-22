@@ -140,7 +140,7 @@ impl LocalSelectionRead {
             ready: None,
             cancelled,
         };
-        worker.submit(vec![plan]);
+        worker.submit(vec![plan.with_requested_physical_rows_only()]);
         Ok(Some(read))
     }
 }
@@ -2302,6 +2302,13 @@ mod tests {
     fn local_selection_copy_reads_large_cold_wrapped_span_from_encrypted_store() {
         use wezterm_term::config::{ScrollbackSpillSink, ScrollbackTierConfig};
 
+        let profile_logger_installed = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .filter_module("mux::cold_read_profile", log::LevelFilter::Debug)
+            .is_test(true)
+            .try_init()
+            .is_ok();
+        let fixture_started = std::time::Instant::now();
         #[derive(Debug)]
         struct ColdConfig(Arc<dyn ScrollbackSpillSink>);
         impl wezterm_term::TerminalConfiguration for ColdConfig {
@@ -2370,9 +2377,18 @@ mod tests {
         });
         let mut copy = SelectionCopy::new(&selection, sequence).unwrap();
         copy.local = true;
+        eprintln!(
+            "encrypted_copy_fixture_ready setup_ms={} profile_logger_installed={} copy_budget_ms={}",
+            fixture_started.elapsed().as_millis(),
+            profile_logger_installed,
+            copy.deadline()
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis(),
+        );
         let mut chunks = 0;
         while copy.next_row < copy.end_row {
             let requested = copy.next_row..(copy.next_row + 64).min(copy.end_row);
+            let capture_started = std::time::Instant::now();
             let read = loop {
                 if let Some(read) = LocalSelectionRead::start(
                     || {
@@ -2400,10 +2416,38 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             };
-            let ready = read
+            eprintln!(
+                "encrypted_copy_submitted chunk={} first={} end={} capture_admission_ms={} remaining_ms={}",
+                chunks,
+                requested.start,
+                requested.end,
+                capture_started.elapsed().as_millis(),
+                copy.deadline()
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            );
+            let receive_started = std::time::Instant::now();
+            let received = read
                 .receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap();
+                .recv_timeout(std::time::Duration::from_secs(10));
+            let outcome = match &received {
+                Ok(ready) if ready.plans.as_ref().is_some_and(|plans| plans.is_ok()) => "ready",
+                Ok(_) => "read_error",
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "timeout",
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
+            };
+            eprintln!(
+                "encrypted_copy_received chunk={} first={} end={} receive_ms={} remaining_ms={} outcome={}",
+                chunks,
+                requested.start,
+                requested.end,
+                receive_started.elapsed().as_millis(),
+                copy.deadline()
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+                outcome,
+            );
+            let ready = received.unwrap();
             let plans = ready.plans.as_ref().unwrap().as_ref().unwrap();
             assert_eq!(plans.len(), 1);
             assert!(terminal.lock().screen().validates_line_read(&plans[0]));
