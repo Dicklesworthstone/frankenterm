@@ -587,12 +587,35 @@ impl RunConformanceCase {
 }
 
 async fn assert_run_case(case: RunConformanceCase) {
-    let (runner, _storage, lock_manager) = build_runner(
+    let (mut runner, storage, lock_manager) = build_runner(
         case.name,
         case.config.clone(),
         case.mock_contains_target_pane,
     )
     .await;
+    if !case.mock_contains_target_pane {
+        // The intended failure is transport dispatch to a missing mux pane,
+        // not missing shell authority. Use the same real registry source as
+        // in-process watch on every platform, plus persisted OSC evidence.
+        storage
+            .append_segment(PANE_ID, "\x1b]133;A\x07", None)
+            .await
+            .expect("persist verified prompt marker");
+        let mut registry = frankenterm_core::ingest::PaneRegistry::new();
+        registry.discovery_tick(vec![
+            serde_json::from_value(serde_json::json!({
+                "pane_id": PANE_ID,
+                "tab_id": 1,
+                "window_id": 1,
+                "domain_name": "local",
+                "is_active": true,
+            }))
+            .expect("valid watcher pane"),
+        ]);
+        runner = runner.with_watcher_registry(Arc::new(
+            frankenterm_core::runtime_async::RwLock::new(registry),
+        ));
+    }
     let workflow = Arc::new(case.workflow);
     let (execution_id, _start) = start_workflow(&runner, Arc::clone(&workflow)).await;
     assert!(

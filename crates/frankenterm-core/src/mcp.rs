@@ -415,6 +415,13 @@ impl McpWorkflowAssembly {
             injector,
             WorkflowRunnerConfig::default(),
         );
+        let runner = match self.config.workspace_layout(None) {
+            Ok(layout) => runner.with_watcher_socket(layout.ipc_socket_path),
+            Err(_) => {
+                tracing::warn!("Workflow watcher layout unavailable; shell authority unknown");
+                runner
+            }
+        };
         register_builtin_workflows(&runner, &self.config);
         runner
     }

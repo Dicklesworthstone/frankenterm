@@ -785,12 +785,35 @@ impl WorkflowRunner {
             workflows: std::sync::RwLock::new(Vec::new()),
             engine,
             lock_manager,
+            injector: injector.with_capability_source(Arc::clone(&storage), None),
             storage,
-            injector,
             replay_capture: None,
             external_signals: None,
             config,
         }
+    }
+
+    /// Use the workspace watcher for live shell and capture-continuity evidence.
+    #[must_use]
+    pub fn with_watcher_socket(mut self, socket: std::path::PathBuf) -> Self {
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(crate::pane_capability_resolution::WatcherCapabilitySource::Ipc(socket)),
+        );
+        self
+    }
+
+    /// Share the actual observation runtime's registry on every platform.
+    #[must_use]
+    pub fn with_watcher_registry(
+        mut self,
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+    ) -> Self {
+        self.injector = self.injector.with_capability_source(
+            Arc::clone(&self.storage),
+            Some(crate::pane_capability_resolution::WatcherCapabilitySource::Registry(registry)),
+        );
+        self
     }
 
     /// Attach a replay capture adapter for workflow step decision provenance.
@@ -1343,34 +1366,15 @@ impl WorkflowRunner {
         }
 
         // Create workflow context with injector for policy-gated actions.
-        // Use prompt() capabilities (alt_screen: Some(false)) as the baseline —
-        // workflows are triggered by detections on active panes where normal-screen
-        // is the expected state. PaneCapabilities::default() leaves alt_screen as
-        // None which causes the policy engine to require approval for SendText.
-        let mut capabilities = PaneCapabilities::prompt();
-        match self
-            .storage
-            .get_active_reservation_with_cx(cx, pane_id)
-            .await
-        {
-            Ok(Some(reservation)) => {
-                capabilities.is_reserved = Some(true);
-                capabilities.reserved_by = Some(reservation.owner_id);
-            }
-            Ok(None) => capabilities.is_reserved = Some(false),
-            Err(_) => {
-                tracing::warn!(pane_id, "Workflow reservation authority unavailable");
-            }
-        }
-        // Preconditions need initial ownership evidence too. The injector
-        // refreshes it again for each action, since this snapshot can go stale.
-        let mut ctx = WorkflowContext::new(
-            self.storage.clone(),
-            pane_id,
-            capabilities,
-            execution_id,
-        )
-        .with_injector(self.injector.clone());
+        // Detection is not proof of prompt, normal screen, or continuity.
+        // Preconditions get a live snapshot; each send independently refreshes.
+        let capabilities = self
+            .injector
+            .resolve_capabilities(cx, pane_id, &PaneCapabilities::unknown())
+            .await;
+        let mut ctx =
+            WorkflowContext::new(self.storage.clone(), pane_id, capabilities, execution_id)
+                .with_injector(self.injector.clone());
 
         // Attach the already-validated execution's optional trigger context.
         if let Some(trigger) = execution_record.context {
@@ -1664,6 +1668,11 @@ impl WorkflowRunner {
             } else if idempotency_skip.is_some() {
                 StepResult::Continue
             } else {
+                ctx.update_capabilities(
+                    self.injector
+                        .resolve_capabilities(cx, pane_id, &PaneCapabilities::unknown())
+                        .await,
+                );
                 workflow.execute_step_cx(cx, &mut ctx, current_step).await
             };
 

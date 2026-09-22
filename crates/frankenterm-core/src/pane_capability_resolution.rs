@@ -3,7 +3,7 @@
 //! Every surface that evaluates a policy decision for pane input (the robot
 //! and human CLI, the MCP server, tx prepare gates) must see the same
 //! evidence: OSC 133 prompt state reconstructed from captured segments,
-//! alt-screen and capture-gap state from the watcher over IPC, and the
+//! alt-screen and capture-gap state from the live watcher registry or IPC, and the
 //! pane's active reservation. This module is the single implementation
 //! (ft-zhwa6); surfaces must not carry private copies, because a copy that
 //! drops one input silently weakens its policy gate.
@@ -49,6 +49,46 @@ pub struct CapabilityResolution {
     /// Bounded, unsanitized diagnostics; callers that print them must apply
     /// their own terminal sanitization.
     pub warnings: Vec<String>,
+}
+
+/// Concrete watcher authority, either remote IPC or the observation runtime's
+/// live registry. Both feed the same policy evidence normalization below.
+#[derive(Clone)]
+pub enum WatcherCapabilitySource {
+    Ipc(std::path::PathBuf),
+    Registry(std::sync::Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>),
+}
+
+impl WatcherCapabilitySource {
+    async fn pane_state(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<IpcPaneState>, String> {
+        match self {
+            Self::Ipc(path) => fetch_pane_state_from_ipc(cx, path, pane_id).await,
+            Self::Registry(registry) => {
+                let registry = registry
+                    .read_with_cx(cx)
+                    .await
+                    .map_err(|error| bounded_detail("watcher registry unavailable: ", &error))?;
+                let Some(entry) = registry.get_entry(pane_id) else {
+                    return Ok(None);
+                };
+                let cursor = registry.get_cursor(pane_id);
+                Ok(Some(IpcPaneState {
+                    pane_id,
+                    known: true,
+                    observed: Some(entry.should_observe()),
+                    alt_screen: None,
+                    last_status_at: None,
+                    in_gap: cursor.map(|cursor| cursor.in_gap),
+                    cursor_alt_screen: cursor.map(|cursor| cursor.in_alt_screen),
+                    reason: None,
+                }))
+            }
+        }
+    }
 }
 
 struct BoundedWarning {
@@ -205,6 +245,18 @@ pub async fn resolve_pane_capabilities(
     storage: Option<&StorageHandle>,
     ipc_socket_path: Option<&Path>,
 ) -> CapabilityResolution {
+    let source = ipc_socket_path.map(|path| WatcherCapabilitySource::Ipc(path.to_path_buf()));
+    resolve_pane_capabilities_with_source(cx, pane_id, storage, source.as_ref()).await
+}
+
+/// Resolve capabilities from the actual watcher source without assuming shell
+/// state when that source is absent, unavailable, or does not know this pane.
+pub async fn resolve_pane_capabilities_with_source(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    storage: Option<&StorageHandle>,
+    source: Option<&WatcherCapabilitySource>,
+) -> CapabilityResolution {
     let mut warnings = Vec::new();
     let mut osc_state = None;
 
@@ -221,8 +273,8 @@ pub async fn resolve_pane_capabilities(
     let mut in_gap = true;
     let mut gap_known = false;
 
-    if let Some(socket_path) = ipc_socket_path {
-        match fetch_pane_state_from_ipc(cx, socket_path, pane_id).await {
+    if let Some(source) = source {
+        match source.pane_state(cx, pane_id).await {
             Ok(Some(state)) => {
                 if state.pane_id != pane_id {
                     warnings.push(format!(
@@ -265,14 +317,14 @@ pub async fn resolve_pane_capabilities(
                 }
             }
             Ok(None) => {
-                warnings.push("Watcher IPC returned no pane state.".to_string());
+                warnings.push("Watcher returned no pane state.".to_string());
             }
             Err(error) => {
-                warnings.push(bounded_detail("Watcher IPC unavailable: ", &error));
+                warnings.push(bounded_detail("Watcher unavailable: ", &error));
             }
         }
     } else {
-        warnings.push("IPC socket unavailable; alt-screen/gap unknown.".to_string());
+        warnings.push("Watcher source unavailable; alt-screen/gap unknown.".to_string());
     }
 
     let mut capabilities =

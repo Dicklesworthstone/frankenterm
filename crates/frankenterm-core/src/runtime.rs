@@ -4926,6 +4926,14 @@ impl ObservationRuntime {
         self
     }
 
+    /// Share the live registry before startup without replacing its configured
+    /// filtering or copying a snapshot. Discovery and capture publish into this
+    /// same registry throughout the runtime's lifetime.
+    #[must_use]
+    pub fn pane_registry(&self) -> Arc<RwLock<PaneRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
     /// Configure the runtime-owned inbound connector bridge.
     ///
     /// This is how operator `[safety.data_classifier]` settings and

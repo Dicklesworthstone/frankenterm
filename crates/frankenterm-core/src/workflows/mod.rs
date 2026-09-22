@@ -173,6 +173,10 @@ type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::Wezterm
 #[derive(Clone)]
 pub struct CxPolicyInjector {
     inner: Arc<crate::runtime_async::Mutex<PolicyInjector>>,
+    capability_source: Option<(
+        Arc<crate::storage::StorageHandle>,
+        Option<crate::pane_capability_resolution::WatcherCapabilitySource>,
+    )>,
 }
 
 fn injector_lock_error(operation: &'static str, error: LockAcquireError) -> crate::Error {
@@ -200,6 +204,39 @@ impl CxPolicyInjector {
     pub fn new(injector: PolicyInjector) -> Self {
         Self {
             inner: Arc::new(crate::runtime_async::Mutex::new(injector)),
+            capability_source: None,
+        }
+    }
+
+    fn with_capability_source(
+        mut self,
+        storage: Arc<crate::storage::StorageHandle>,
+        source: Option<crate::pane_capability_resolution::WatcherCapabilitySource>,
+    ) -> Self {
+        self.capability_source = Some((storage, source));
+        self
+    }
+
+    async fn resolve_capabilities(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        supplied: &PaneCapabilities,
+    ) -> PaneCapabilities {
+        match &self.capability_source {
+            Some((storage, source)) => {
+                crate::pane_capability_resolution::resolve_pane_capabilities_with_source(
+                    cx,
+                    pane_id,
+                    Some(storage.as_ref()),
+                    source.as_ref(),
+                )
+                .await
+                .capabilities
+            }
+            // Standalone adapters may receive explicit caller evidence. Every
+            // WorkflowRunner binds its storage, including when IPC is absent.
+            None => supplied.clone(),
         }
     }
 
@@ -226,6 +263,7 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
+        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
         let fut = {
             let mut injector = self
                 .inner
@@ -238,7 +276,7 @@ impl CxPolicyInjector {
                 text,
                 crate::policy::ActionKind::SendText,
                 actor,
-                capabilities,
+                &resolved_capabilities,
                 workflow_id,
             )
         };
@@ -253,6 +291,7 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
+        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
         let fut = {
             let mut injector = self
                 .inner
@@ -265,7 +304,7 @@ impl CxPolicyInjector {
                 crate::wezterm::control::CTRL_C,
                 crate::policy::ActionKind::SendCtrlC,
                 actor,
-                capabilities,
+                &resolved_capabilities,
                 workflow_id,
             )
         };
@@ -280,6 +319,7 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
+        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
         let fut = {
             let mut injector = self
                 .inner
@@ -292,7 +332,7 @@ impl CxPolicyInjector {
                 crate::wezterm::control::CTRL_D,
                 crate::policy::ActionKind::SendCtrlD,
                 actor,
-                capabilities,
+                &resolved_capabilities,
                 workflow_id,
             )
         };
@@ -307,6 +347,7 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> crate::Result<InjectionResult> {
+        let resolved_capabilities = self.resolve_capabilities(cx, pane_id, capabilities).await;
         let fut = {
             let mut injector = self
                 .inner
@@ -319,7 +360,7 @@ impl CxPolicyInjector {
                 crate::wezterm::control::CTRL_Z,
                 crate::policy::ActionKind::SendCtrlZ,
                 actor,
-                capabilities,
+                &resolved_capabilities,
                 workflow_id,
             )
         };
@@ -6024,6 +6065,463 @@ steps:
         }
     }
 
+    #[cfg(unix)]
+    struct WorkflowWatcherFixture {
+        socket: std::path::PathBuf,
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+        shutdown: crate::runtime_async::mpsc::Sender<()>,
+        task: crate::runtime_async::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl WorkflowWatcherFixture {
+        async fn start(storage: &StorageHandle, pane_id: u64) -> Self {
+            let cx = crate::cx::for_testing();
+            create_test_pane(storage, pane_id).await;
+            storage
+                .append_segment_with_cx(&cx, pane_id, "\x1b]133;A\x07", None)
+                .await
+                .unwrap();
+            let mut registry = crate::ingest::PaneRegistry::new();
+            registry.discovery_tick(vec![
+                serde_json::from_value(serde_json::json!({
+                    "pane_id": pane_id, "tab_id": 1, "window_id": 1,
+                    "domain_name": "local", "is_active": true,
+                }))
+                .unwrap(),
+            ]);
+            let registry = Arc::new(crate::runtime_async::RwLock::new(registry));
+            let directory = tempfile::Builder::new()
+                .prefix("ft-wf-")
+                .tempdir_in("/tmp")
+                .unwrap()
+                .keep();
+            let socket = directory.join("watch.sock");
+            let server = crate::ipc::IpcServer::bind(&socket).await.unwrap();
+            let (shutdown, receiver) = crate::runtime_async::mpsc::channel(1);
+            let server_registry = Arc::clone(&registry);
+            let task = crate::runtime_async::task::spawn(async move {
+                server
+                    .run_with_registry_with_cx(
+                        &cx,
+                        Arc::new(crate::events::EventBus::new(16)),
+                        server_registry,
+                        receiver,
+                    )
+                    .await;
+            });
+            Self {
+                socket,
+                registry,
+                shutdown,
+                task,
+            }
+        }
+
+        async fn stop(self) {
+            let cx = crate::cx::for_testing();
+            self.shutdown.send(&cx, ()).await.unwrap();
+            crate::runtime_async::timeout_with_cx(
+                &cx,
+                std::time::Duration::from_secs(5),
+                self.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
+
+    /// Real SQLite and watcher IPC; the recording transport is only the
+    /// dispatch oracle, not proof of an external mux or native terminal.
+    #[cfg(unix)]
+    #[test]
+    fn workflow_context_refreshes_watcher_evidence_before_each_send() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let cx = crate::cx::for_testing();
+            let storage = Arc::new(
+                StorageHandle::new_with_cx(&cx, directory.join("workflow.db").to_str().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            let pane_id = 901;
+            let watcher = WorkflowWatcherFixture::start(&storage, pane_id).await;
+            let recording = Arc::new(crate::wezterm::MockWezterm::new());
+            recording
+                .add_default_pane_with_cx(&cx, pane_id)
+                .await
+                .unwrap();
+            let transport: crate::wezterm::WeztermHandle = recording.clone();
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::with_storage(
+                crate::policy::PolicyEngine::new(100, 100, true),
+                transport,
+                storage.as_ref().clone(),
+            ))
+            .with_capability_source(
+                Arc::clone(&storage),
+                Some(
+                    crate::pane_capability_resolution::WatcherCapabilitySource::Ipc(
+                        watcher.socket.clone(),
+                    ),
+                ),
+            );
+            // An intentionally stale supplied prompt must never override IPC.
+            let mut context = WorkflowContext::new(
+                Arc::clone(&storage),
+                pane_id,
+                PaneCapabilities::prompt(),
+                "live-shell-test",
+            )
+            .with_injector(injector);
+            assert!(
+                context
+                    .send_text_with_cx(&cx, "first")
+                    .await
+                    .unwrap()
+                    .is_allowed()
+            );
+            let first = recording
+                .pane_state_with_cx(&cx, pane_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content;
+            assert_eq!(first, "first");
+            for (alt, gap, rule) in [
+                (true, false, "policy.alt_screen"),
+                (false, true, "policy.recent_gap"),
+            ] {
+                {
+                    let mut registry = watcher.registry.write_with_cx(&cx).await.unwrap();
+                    let cursor = registry.get_cursor_mut(pane_id).unwrap();
+                    cursor.in_alt_screen = alt;
+                    cursor.in_gap = gap;
+                }
+                let result = context.send_text_with_cx(&cx, "forbidden").await.unwrap();
+                assert!(!result.is_allowed());
+                let decision = match &result {
+                    InjectionResult::Denied { decision, .. }
+                    | InjectionResult::RequiresApproval { decision, .. } => decision,
+                    other => panic!("expected policy refusal, got {other:?}"),
+                };
+                assert_eq!(decision.rule_id(), Some(rule));
+                assert_eq!(
+                    recording
+                        .pane_state_with_cx(&cx, pane_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    first
+                );
+            }
+            {
+                let mut registry = watcher.registry.write_with_cx(&cx).await.unwrap();
+                let cursor = registry.get_cursor_mut(pane_id).unwrap();
+                cursor.in_alt_screen = false;
+                cursor.in_gap = false;
+            }
+            assert!(
+                context
+                    .send_text_with_cx(&cx, "recovered")
+                    .await
+                    .unwrap()
+                    .is_allowed()
+            );
+            let first = "firstrecovered";
+            assert_eq!(
+                recording
+                    .pane_state_with_cx(&cx, pane_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                first
+            );
+            watcher
+                .registry
+                .write_with_cx(&cx)
+                .await
+                .unwrap()
+                .discovery_tick(vec![]);
+            let unknown = context.send_text_with_cx(&cx, "unknown").await.unwrap();
+            match unknown {
+                InjectionResult::RequiresApproval { decision, .. } => {
+                    assert_eq!(decision.rule_id(), Some("policy.alt_screen_unknown"));
+                }
+                other => panic!("unknown watcher must require approval: {other:?}"),
+            }
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("workflow fixture cancellation"),
+            );
+            let error = context
+                .send_text_with_cx(&cancelled, "cancelled")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::RuntimeOperation {
+                    source: crate::error::RuntimeOperationSource::Cancelled(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                recording
+                    .pane_state_with_cx(&cx, pane_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                first
+            );
+            watcher.stop().await;
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    /// Cross-platform live registry and SQLite evidence, with a recording
+    /// transport only; this does not claim an external mux dispatch.
+    #[test]
+    fn workflow_context_refreshes_in_process_registry_before_each_send() {
+        run_async_test(async {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let cx = crate::cx::for_testing();
+            let storage = Arc::new(
+                StorageHandle::new_with_cx(&cx, directory.join("workflow.db").to_str().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            let pane_id = 904;
+            create_test_pane(&storage, pane_id).await;
+            storage
+                .append_segment_with_cx(&cx, pane_id, "\x1b]133;A\x07", None)
+                .await
+                .unwrap();
+            let mut registry = crate::ingest::PaneRegistry::new();
+            registry.discovery_tick(vec![
+                serde_json::from_value(serde_json::json!({
+                    "pane_id": pane_id, "tab_id": 1, "window_id": 1,
+                    "domain_name": "local", "is_active": true,
+                }))
+                .unwrap(),
+            ]);
+            let registry = Arc::new(crate::runtime_async::RwLock::new(registry));
+            let recording = Arc::new(crate::wezterm::MockWezterm::new());
+            recording
+                .add_default_pane_with_cx(&cx, pane_id)
+                .await
+                .unwrap();
+            let transport: crate::wezterm::WeztermHandle = recording.clone();
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::with_storage(
+                crate::policy::PolicyEngine::new(100, 100, true),
+                transport,
+                storage.as_ref().clone(),
+            ))
+            .with_capability_source(
+                Arc::clone(&storage),
+                Some(
+                    crate::pane_capability_resolution::WatcherCapabilitySource::Registry(
+                        Arc::clone(&registry),
+                    ),
+                ),
+            );
+            let mut context = WorkflowContext::new(
+                Arc::clone(&storage),
+                pane_id,
+                PaneCapabilities::unknown(),
+                "registry-shell-test",
+            )
+            .with_injector(injector);
+            assert!(
+                context
+                    .send_text_with_cx(&cx, "first")
+                    .await
+                    .unwrap()
+                    .is_allowed()
+            );
+            for (alt, gap, rule) in [
+                (true, false, "policy.alt_screen"),
+                (false, true, "policy.recent_gap"),
+            ] {
+                {
+                    let mut registry = registry.write_with_cx(&cx).await.unwrap();
+                    let cursor = registry.get_cursor_mut(pane_id).unwrap();
+                    cursor.in_alt_screen = alt;
+                    cursor.in_gap = gap;
+                }
+                let result = context.send_text_with_cx(&cx, "forbidden").await.unwrap();
+                let decision = match &result {
+                    InjectionResult::Denied { decision, .. }
+                    | InjectionResult::RequiresApproval { decision, .. } => decision,
+                    other => panic!("unexpected dispatch result: {other:?}"),
+                };
+                assert_eq!(decision.rule_id(), Some(rule));
+                assert_eq!(
+                    recording
+                        .pane_state_with_cx(&cx, pane_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    "first"
+                );
+            }
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    struct WatcherTransitionWorkflow {
+        registry: Arc<crate::runtime_async::RwLock<crate::ingest::PaneRegistry>>,
+        gap: bool,
+    }
+
+    #[cfg(unix)]
+    impl Workflow for WatcherTransitionWorkflow {
+        fn name(&self) -> &'static str {
+            "watcher_transition"
+        }
+
+        fn description(&self) -> &'static str {
+            "Exercise live watcher changes between workflow steps"
+        }
+
+        fn handles(&self, _: &Detection) -> bool {
+            true
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("first", "Send while normal"),
+                WorkflowStep::new("transition", "Change watcher evidence"),
+                WorkflowStep::new("second", "Refuse changed state"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let pane_id = ctx.pane_id();
+            if step_idx == 0 {
+                assert!(ctx.capabilities().prompt_active);
+                assert_eq!(ctx.capabilities().alt_screen, Some(false));
+                assert!(!ctx.capabilities().has_recent_gap);
+            } else if step_idx == 2 {
+                assert_eq!(ctx.capabilities().alt_screen, Some(!self.gap));
+                assert_eq!(ctx.capabilities().has_recent_gap, self.gap);
+            }
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::send_text("first"),
+                    1 => {
+                        let cx = crate::cx::for_testing();
+                        let mut registry = self.registry.write_with_cx(&cx).await.unwrap();
+                        let cursor = registry.get_cursor_mut(pane_id).unwrap();
+                        cursor.in_alt_screen = !self.gap;
+                        cursor.in_gap = self.gap;
+                        StepResult::Continue
+                    }
+                    2 => StepResult::send_text("forbidden"),
+                    _ => panic!("unexpected workflow step"),
+                }
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_runner_refreshes_watcher_between_steps() {
+        run_async_test(async {
+            for gap in [false, true] {
+                let directory = tempfile::tempdir().unwrap().keep();
+                let cx = crate::cx::for_testing();
+                let storage = Arc::new(
+                    StorageHandle::new_with_cx(&cx, directory.join("runner.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                );
+                let pane_id = 902;
+                let watcher = WorkflowWatcherFixture::start(&storage, pane_id).await;
+                let recording = Arc::new(crate::wezterm::MockWezterm::new());
+                recording
+                    .add_default_pane_with_cx(&cx, pane_id)
+                    .await
+                    .unwrap();
+                let transport: crate::wezterm::WeztermHandle = recording.clone();
+                let injector =
+                    CxPolicyInjector::new(crate::policy::PolicyGatedInjector::with_storage(
+                        crate::policy::PolicyEngine::new(100, 100, true),
+                        transport,
+                        storage.as_ref().clone(),
+                    ));
+                let runner = WorkflowRunner::new(
+                    WorkflowEngine::default(),
+                    Arc::new(PaneWorkflowLockManager::new()),
+                    Arc::clone(&storage),
+                    injector,
+                    WorkflowRunnerConfig::default(),
+                )
+                .with_watcher_socket(watcher.socket.clone());
+                runner.register_workflow(Arc::new(WatcherTransitionWorkflow {
+                    registry: Arc::clone(&watcher.registry),
+                    gap,
+                }));
+                let start = runner
+                    .handle_detection(pane_id, &make_test_detection("watcher"), None)
+                    .await;
+                assert!(start.is_started());
+                let result = runner
+                    .run_workflow(
+                        pane_id,
+                        runner.find_workflow_by_name("watcher_transition").unwrap(),
+                        start.execution_id().unwrap(),
+                        0,
+                    )
+                    .await;
+                assert!(
+                    !result.is_completed(),
+                    "changed watcher state must stop second send: {result:?}"
+                );
+                assert_eq!(
+                    recording
+                        .pane_state_with_cx(&cx, pane_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    "first"
+                );
+                let logs = storage
+                    .get_step_logs(start.execution_id().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    logs.iter()
+                        .any(|log| log.step_name == "first" && log.audit_action_id.is_some())
+                );
+                let second = logs.iter().find(|log| log.step_name == "second").unwrap();
+                let summary: WorkflowStepPolicySummary =
+                    serde_json::from_str(second.policy_summary.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    summary.rule_id.as_deref(),
+                    Some(if gap {
+                        "policy.recent_gap"
+                    } else {
+                        "policy.alt_screen"
+                    })
+                );
+                assert!(summary.error.is_none());
+                watcher.stop().await;
+                storage.shutdown_with_cx(&cx).await.unwrap();
+            }
+        });
+    }
+
     /// Workflow that sets prompt capabilities before sending text.
     struct PromptSendWorkflow;
 
@@ -6694,6 +7192,22 @@ steps:
     #[test]
     fn send_text_step_logs_audit_action_id() {
         run_async_test(async {
+            // This cross-platform audit unit test supplies scoped watcher
+            // authority explicitly; real Unix IPC is exercised separately.
+            let pane_id = 60u64;
+            let _watcher_authority =
+                crate::pane_capability_resolution::set_test_pane_state_override(
+                    crate::pane_capability_resolution::IpcPaneState {
+                        pane_id,
+                        known: true,
+                        observed: Some(true),
+                        alt_screen: None,
+                        last_status_at: None,
+                        in_gap: Some(false),
+                        cursor_alt_screen: Some(false),
+                        reason: None,
+                    },
+                );
             let temp_dir = tempfile::TempDir::new().unwrap();
             let db_path = temp_dir
                 .path()
@@ -6719,8 +7233,12 @@ steps:
                 WorkflowRunnerConfig::default(),
             );
 
-            let pane_id = 60u64;
+            let runner = runner.with_watcher_socket(std::path::PathBuf::from("audit-fixture.sock"));
             create_test_pane(&storage, pane_id).await;
+            storage
+                .append_segment(pane_id, "\x1b]133;A\x07", None)
+                .await
+                .unwrap();
             runner.register_workflow(Arc::new(PromptSendWorkflow));
 
             let detection = make_test_detection("prompt_send.audit");

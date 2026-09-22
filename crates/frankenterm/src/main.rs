@@ -47054,6 +47054,78 @@ async fn run_watcher(
     // spawning `wezterm cli` subprocesses on hot paths.
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(&config);
 
+    // Construct the runtime before subscribing workflows so both retain the
+    // same configured registry. Start remains after workflow subscription.
+    let native_event_socket = frankenterm_core::config::resolve_native_events_socket_path(
+        config.native.enabled,
+        std::env::var("WEZTERM_FT_SOCKET").ok().as_deref(),
+        &config.native.socket_path,
+    );
+    let vendored_mux_socket_paths =
+        if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
+            config
+                .vendored
+                .sharding
+                .socket_paths
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            std::env::var("WEZTERM_UNIX_SOCKET")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .or_else(|| {
+                    config
+                        .vendored
+                        .mux_socket_path
+                        .clone()
+                        .filter(|path| !path.trim().is_empty())
+                })
+                .map(|path| vec![PathBuf::from(path)])
+                .unwrap_or_default()
+        };
+    let runtime_config = RuntimeConfig {
+        discovery_interval: Duration::from_millis(poll_interval),
+        capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
+        min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
+        // ft-li2hc: see the sibling watch path — a fixed 4 KiB cap cannot reach
+        // back far enough to match a scrolled snapshot.
+        overlap_size: RuntimeConfig::default().overlap_size,
+        pane_filter: config.ingest.panes.clone(),
+        pane_priorities: config.ingest.priorities.clone(),
+        capture_budgets: config.ingest.budgets.clone(),
+        fleet_scrollback: config.fleet_scrollback.clone(),
+        patterns: config.patterns.clone(),
+        patterns_root: patterns_root.clone(),
+        channel_buffer: 1024,
+        max_concurrent_captures: config.ingest.max_concurrent_captures,
+        retention_days: config.storage.retention_days,
+        retention_policy: config
+            .storage
+            .compile_retention_policy()
+            .map_err(|error| anyhow::anyhow!("invalid startup retention policy: {error}"))?,
+        retention_max_mb: config.storage.retention_max_mb,
+        checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+        gc: config.gc,
+        vendored_mux_socket_paths,
+        vendored_mux_compression: config.vendored.mux_pool.compression,
+        native_event_socket,
+        trauma_guard: config.safety.trauma_guard.clone(),
+    };
+    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
+        .with_tuning(config.tuning.clone())
+        .with_recorder_storage(Arc::clone(&recorder_storage))?
+        .with_connector_transport(&config.safety)?
+        .with_connector_inbound_bridge_config(
+            frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
+                classifier: config.safety.data_classifier.clone(),
+                ..Default::default()
+            },
+        )
+        .with_event_bus(Arc::clone(&event_bus))
+        .with_snapshot_config(config.snapshots.clone())
+        .with_wezterm_handle(wezterm_handle.clone());
+
     // Set up workflow runner if auto_handle is enabled
     let workflow_runner_handle = if auto_handle {
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
@@ -47094,7 +47166,8 @@ async fn run_watcher(
             storage_for_workflows,
             injector,
             runner_config,
-        );
+        )
+        .with_watcher_registry(runtime.pane_registry());
 
         register_builtin_workflows(&workflow_runner, &config.workflows);
         let enabled_names = enabled_builtin_workflows(&config.workflows)
@@ -47146,80 +47219,6 @@ async fn run_watcher(
         None
     };
 
-    // Native push events are opt-in. When enabled, an explicit environment
-    // override wins over the already-canonicalized configured path.
-    let native_event_socket = frankenterm_core::config::resolve_native_events_socket_path(
-        config.native.enabled,
-        std::env::var("WEZTERM_FT_SOCKET").ok().as_deref(),
-        &config.native.socket_path,
-    );
-    let vendored_mux_socket_paths =
-        if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
-            config
-                .vendored
-                .sharding
-                .socket_paths
-                .iter()
-                .map(PathBuf::from)
-                .collect()
-        } else {
-            std::env::var("WEZTERM_UNIX_SOCKET")
-                .ok()
-                .filter(|path| !path.trim().is_empty())
-                .or_else(|| {
-                    config
-                        .vendored
-                        .mux_socket_path
-                        .clone()
-                        .filter(|path| !path.trim().is_empty())
-                })
-                .map(|path| vec![PathBuf::from(path)])
-                .unwrap_or_default()
-        };
-
-    let runtime_config = RuntimeConfig {
-        discovery_interval: Duration::from_millis(poll_interval),
-        capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
-        min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
-        // ft-li2hc: see the sibling watch path — a fixed 4 KiB cap cannot reach
-        // back far enough to match a scrolled snapshot.
-        overlap_size: RuntimeConfig::default().overlap_size,
-        pane_filter: config.ingest.panes.clone(),
-        pane_priorities: config.ingest.priorities.clone(),
-        capture_budgets: config.ingest.budgets.clone(),
-        fleet_scrollback: config.fleet_scrollback.clone(),
-        patterns: config.patterns.clone(),
-        patterns_root: patterns_root.clone(),
-        channel_buffer: 1024,
-        max_concurrent_captures: config.ingest.max_concurrent_captures,
-        retention_days: config.storage.retention_days,
-        retention_policy: config
-            .storage
-            .compile_retention_policy()
-            .map_err(|error| anyhow::anyhow!("invalid startup retention policy: {error}"))?,
-        retention_max_mb: config.storage.retention_max_mb,
-        checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
-        gc: config.gc,
-        vendored_mux_socket_paths,
-        vendored_mux_compression: config.vendored.mux_pool.compression,
-        native_event_socket,
-        trauma_guard: config.safety.trauma_guard.clone(),
-    };
-
-    // Create and start the observation runtime (with event bus for workflow integration)
-    let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
-        .with_tuning(config.tuning.clone())
-        .with_recorder_storage(Arc::clone(&recorder_storage))?
-        .with_connector_transport(&config.safety)?
-        .with_connector_inbound_bridge_config(
-            frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
-                classifier: config.safety.data_classifier.clone(),
-                ..Default::default()
-            },
-        )
-        .with_event_bus(Arc::clone(&event_bus))
-        .with_snapshot_config(config.snapshots.clone())
-        .with_wezterm_handle(wezterm_handle.clone());
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
     let shared_storage = Arc::new(frankenterm_core::runtime_async::Mutex::new(
@@ -55095,7 +55094,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         Arc::clone(&storage),
                                         injector,
                                         runner_config,
-                                    );
+                                    )
+                                    .with_watcher_socket(layout.ipc_socket_path.clone());
                                     register_builtin_workflows(&runner, &config.workflows);
 
                                     // Look up workflow by name
@@ -55825,7 +55825,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                         Arc::clone(&storage),
                                         injector,
                                         runner_config,
-                                    );
+                                    )
+                                    .with_watcher_socket(layout.ipc_socket_path.clone());
 
                                     // Execute the abort (ft-xbnl0.2.3 tick 226:
                                     // cross-crate cx-first migration).
@@ -61814,7 +61815,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             Arc::clone(&storage),
                             injector,
                             runner_config,
-                        );
+                        )
+                        .with_watcher_socket(layout.ipc_socket_path.clone());
 
                         register_builtin_workflows(&runner, &config.workflows);
 
@@ -65421,7 +65423,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         std::sync::Arc::clone(&storage),
                         injector,
                         runner_config,
-                    );
+                    )
+                    .with_watcher_socket(layout.ipc_socket_path.clone());
 
                     register_builtin_workflows(&runner, &config.workflows);
 
