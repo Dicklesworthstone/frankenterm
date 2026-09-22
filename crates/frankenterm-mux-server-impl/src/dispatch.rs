@@ -1313,6 +1313,128 @@ enum Item {
     Readable,
 }
 
+/// Keep startup pushes lossless without allowing them to precede codec discovery.
+/// Every retained item still owns its original connection budget reservation;
+/// moving it out of the channel does not make another outbound slot available.
+#[derive(Default)]
+struct CodecBootstrapGate {
+    request_serial: Option<u64>,
+    response_writing: bool,
+    ready: bool,
+    retained: VecDeque<Item>,
+}
+
+impl CodecBootstrapGate {
+    fn observe_request(&mut self, decoded: &DecodedPdu) {
+        if !self.ready
+            && self.request_serial.is_none()
+            && decoded.serial != 0
+            && matches!(decoded.pdu, Pdu::GetCodecVersion(_))
+        {
+            self.request_serial = Some(decoded.serial);
+        }
+    }
+
+    fn admit_item(
+        &mut self,
+        item: Item,
+        terminal: &DispatchTerminal,
+    ) -> anyhow::Result<Option<Item>> {
+        let unilateral = match &item {
+            Item::Notif(queued) => match &queued.notification {
+                // These branches do not write a frame. In particular, output
+                // is a coalesced wake for already-tracked panes, not payload
+                // history to accumulate during discovery. Any resulting push
+                // is still gated below as a serial-zero WritePdu.
+                MuxNotification::PaneOutput(_)
+                | MuxNotification::PaneAdded(_)
+                | MuxNotification::SaveToDownloads { .. }
+                | MuxNotification::WindowRemoved(_)
+                | MuxNotification::WindowCreated(_)
+                | MuxNotification::WindowInvalidated(_)
+                | MuxNotification::SynchronizedOutput { .. }
+                | MuxNotification::ActiveWorkspaceChanged(_)
+                | MuxNotification::Empty => false,
+                // Alerts retain exact payload obligations and must not pass
+                // an older PaneRemoved while its cleanup is still deferred.
+                MuxNotification::Alert { .. }
+                | MuxNotification::FloatingPaneSpawnCommitted(_)
+                | MuxNotification::PaneRemoved(_)
+                | MuxNotification::AssignClipboard { .. }
+                | MuxNotification::TabAddedToWindow { .. }
+                | MuxNotification::WindowOrderChanged { .. }
+                | MuxNotification::WindowTopologyChanged(_)
+                | MuxNotification::WindowWorkspaceChanged { .. }
+                | MuxNotification::PaneFocused(_)
+                | MuxNotification::TabResized(_)
+                | MuxNotification::TabTitleChanged { .. }
+                | MuxNotification::WindowTitleChanged { .. }
+                | MuxNotification::WorkspaceRenamed { .. } => true,
+            },
+            Item::WritePdu(WritePayload::Typed(typed)) => typed.decoded.serial == 0,
+            Item::WritePdu(WritePayload::Encoded(frame)) => frame.authority.serial == 0,
+            Item::Readable => false,
+        };
+        if !self.ready && unilateral {
+            if self.retained.len() >= DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY {
+                terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+                anyhow::bail!("mux codec bootstrap exceeded its retained item bound");
+            }
+            if let Err(error) = self.retained.try_reserve(1) {
+                terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+                return Err(error).context("retaining mux codec bootstrap notification");
+            }
+            self.retained.push_back(item);
+            return Ok(None);
+        }
+        if !self.ready
+            && !self.response_writing
+            && let Item::WritePdu(payload) = &item
+        {
+            let (serial, is_codec_response) = match payload {
+                WritePayload::Typed(typed) => (
+                    typed.decoded.serial,
+                    matches!(typed.decoded.pdu, Pdu::GetCodecVersionResponse(_)),
+                ),
+                WritePayload::Encoded(frame) => (
+                    frame.authority.serial,
+                    frame.authority.wire_spec.is_some_and(|spec| {
+                        spec.ident == <codec::GetCodecVersionResponse as codec::PduWireIdent>::IDENT
+                    }),
+                ),
+            };
+            if self.request_serial == Some(serial) {
+                self.response_writing = is_codec_response;
+                if !is_codec_response {
+                    // A correlated error is not negotiation success. Permit
+                    // a subsequent codec request while retaining the pushes.
+                    self.request_serial = None;
+                }
+            }
+        }
+        Ok(Some(item))
+    }
+
+    fn write_completed(&mut self) {
+        if self.response_writing {
+            self.ready = true;
+            self.response_writing = false;
+        }
+    }
+
+    fn next_retained(&mut self) -> Option<Item> {
+        if self.ready {
+            self.retained.pop_front()
+        } else {
+            None
+        }
+    }
+
+    fn permits_batching(&self) -> bool {
+        self.ready && self.retained.is_empty()
+    }
+}
+
 struct MuxSubscriptionGuard {
     mux: Arc<Mux>,
     sub_id: usize,
@@ -6738,6 +6860,12 @@ where
     let mut deferred_item = None;
     let mut pending_outbound = None;
     let mut prefer_read = true;
+    let mut bootstrap = CodecBootstrapGate::default();
+    // A closed receiver lets the existing encoder prepare exactly one frame.
+    // While bootstrapping (or draining older retained items), batching from the
+    // live queue would bypass the gate or overtake a retained notification.
+    let (single_frame_tx, single_frame_rx) = bounded::<Item>(1);
+    drop(single_frame_tx);
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     let io_uring_runtime = DispatchIoUringRuntime::maybe_new(reactor, stream.io_uring_fd());
     #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
@@ -6800,6 +6928,7 @@ where
                     Ok(OutboundService::Progress) => continue,
                     Ok(OutboundService::Complete) => {
                         pending_outbound = None;
+                        bootstrap.write_completed();
                         continue;
                     }
                     Ok(OutboundService::Terminal) => {
@@ -6811,6 +6940,8 @@ where
                     }
                     Err(err) => Err(err),
                 }
+            } else if let Some(item) = bootstrap.next_retained() {
+                Ok(item)
             } else {
                 let terminal_event = terminal_rx.recv();
                 let dispatch_item = next_dispatch_item(
@@ -6835,6 +6966,18 @@ where
                 }
             };
 
+            let next_item = match next_item {
+                Ok(item) => match bootstrap.admit_item(item, &terminal)? {
+                    Some(item) => Ok(item),
+                    None => continue,
+                },
+                Err(error) => Err(error),
+            };
+            let batch_rx = if bootstrap.permits_batching() {
+                &item_rx
+            } else {
+                &single_frame_rx
+            };
             match next_item {
                 Ok(Item::Readable) => {
                     let decode_started_at = std::time::Instant::now();
@@ -6866,6 +7009,7 @@ where
                         }
                         Ok(data) => data,
                     };
+                    bootstrap.observe_request(&decoded);
                     let decode_interval = ServerDecodeInterval {
                         started_at: decode_started_at,
                         completed_at: std::time::Instant::now(),
@@ -6893,7 +7037,7 @@ where
                 Ok(Item::WritePdu(decoded)) => {
                     match prepare_pending_outbound_batch(
                         decoded,
-                        &item_rx,
+                        batch_rx,
                         &mut deferred_item,
                         codec::CompressionMode::Auto,
                         &terminal,
@@ -6923,7 +7067,7 @@ where
                                     tab_id: spawn.tab_id(),
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -6933,7 +7077,7 @@ where
                             pending_outbound = Some(prepare_unilateral_pdu(
                                 Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -6960,7 +7104,7 @@ where
                                     selection,
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -6972,7 +7116,7 @@ where
                                     window_id,
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -6989,7 +7133,7 @@ where
                                     tab_id: window.active_tab_id().unwrap_or(0),
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7000,7 +7144,7 @@ where
                                     tab_id: change.legacy_resync_tab_id(),
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7015,7 +7159,7 @@ where
                                     workspace,
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7024,7 +7168,7 @@ where
                             pending_outbound = Some(prepare_unilateral_pdu(
                                 Pdu::PaneFocused(codec::PaneFocused { pane_id }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7033,7 +7177,7 @@ where
                             pending_outbound = Some(prepare_unilateral_pdu(
                                 Pdu::TabResized(codec::TabResized { tab_id }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7042,7 +7186,7 @@ where
                             pending_outbound = Some(prepare_unilateral_pdu(
                                 Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7054,7 +7198,7 @@ where
                                     title,
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -7069,7 +7213,7 @@ where
                                     new_workspace,
                                 }),
                                 reservation,
-                                &item_rx,
+                                batch_rx,
                                 &mut deferred_item,
                                 &terminal,
                             )?);
@@ -13778,6 +13922,376 @@ mod tests {
             pdu: Pdu::Pong(Pong {}),
             serial,
         })
+    }
+
+    fn bootstrap_codec_response() -> Pdu {
+        Pdu::GetCodecVersionResponse(codec::GetCodecVersionResponse {
+            codec_vers: codec::CODEC_VERSION,
+            version_string: "bootstrap-wire-test".to_owned(),
+            executable_path: std::path::PathBuf::from("mux-server"),
+            config_file_path: None,
+            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+        })
+    }
+
+    #[test]
+    fn codec_bootstrap_real_wire_response_precedes_retained_and_later_pushes() {
+        assert_codec_bootstrap_wire_order_after_output(0);
+    }
+
+    #[test]
+    fn codec_bootstrap_high_output_releases_wakes_then_delivers_retained_wire_pushes() {
+        assert_codec_bootstrap_wire_order_after_output(DISPATCH_ITEM_QUEUE_CAPACITY * 2);
+    }
+
+    fn assert_codec_bootstrap_wire_order_after_output(output_wakes: usize) {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let (tx, rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let stream_id = TopologyStreamId::from_bytes([0x72; 16]);
+        let topology = Arc::new(TopologyStreamCoordinator::new(
+            tx.clone(),
+            terminal.clone(),
+            stream_id,
+        ));
+        let budget = Arc::clone(&topology.outbound_budget);
+        let handler = SessionHandler::new_for_session_with_topology_stream(
+            pdu_sender_for_topology(&topology),
+            SessionOwner::new(Arc::new(Mux::new(None))),
+            stream_id,
+        )
+        .unwrap();
+        let (single_tx, single_rx) = bounded(1);
+        drop(single_tx);
+        let mut gate = CodecBootstrapGate::default();
+
+        // Real notification admission occurs before the client sends discovery.
+        assert!(queue_notification(
+            &tx,
+            &terminal,
+            &budget,
+            MuxNotification::PaneRemoved(11)
+        ));
+        assert!(
+            gate.admit_item(rx.try_recv().unwrap(), &terminal)
+                .unwrap()
+                .is_none()
+        );
+        queue_response_pdu(
+            &tx,
+            &terminal,
+            &budget,
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 12 }),
+            0,
+            PduDeliveryClass::Bulk,
+        )
+        .unwrap();
+        let Item::WritePdu(push) = rx.try_recv().unwrap() else {
+            panic!("expected queued push")
+        };
+        let push = encode_write_payload(push, CompressionMode::Never, &terminal).unwrap();
+        assert!(
+            gate.admit_item(Item::WritePdu(WritePayload::Encoded(push)), &terminal)
+                .unwrap()
+                .is_none(),
+            "pre-encoded serial-zero pushes cannot bypass bootstrap"
+        );
+        let retained_budget = budget.snapshot();
+        for pane_id in 0..output_wakes {
+            // Drain between arrivals: this is sustained output pressure, not
+            // an intentional overflow of the ordinary bounded input channel.
+            for notification in [
+                MuxNotification::PaneOutput(pane_id),
+                MuxNotification::PaneAdded(pane_id),
+                MuxNotification::Empty,
+            ] {
+                assert!(queue_notification(&tx, &terminal, &budget, notification));
+                let item = gate
+                    .admit_item(rx.try_recv().unwrap(), &terminal)
+                    .unwrap()
+                    .expect("non-wire wake must remain dispatchable");
+                let Item::Notif(ReservedNotification {
+                    notification,
+                    reservation,
+                }) = item
+                else {
+                    panic!("expected admitted notification")
+                };
+                match notification {
+                    MuxNotification::PaneOutput(id) => handler.schedule_tracked_pane_push(id),
+                    MuxNotification::PaneAdded(_) | MuxNotification::Empty => {}
+                    _ => panic!("unexpected output-pressure notification"),
+                }
+                drop(reservation);
+                assert_eq!(gate.retained.len(), 2);
+                assert_eq!(budget.snapshot().total_slots, retained_budget.total_slots);
+                assert_eq!(
+                    budget.snapshot().retained_bytes,
+                    retained_budget.retained_bytes
+                );
+                assert!(handler.per_pane_if_present(pane_id).is_none());
+                assert!(
+                    rx.is_empty(),
+                    "untracked output must not create a wire push"
+                );
+                assert!(terminal_rx.is_empty());
+            }
+        }
+        gate.observe_request(&DecodedPdu {
+            pdu: Pdu::GetCodecVersion(codec::GetCodecVersion {}),
+            serial: 7,
+        });
+        queue_response_pdu(
+            &tx,
+            &terminal,
+            &budget,
+            bootstrap_codec_response(),
+            7,
+            PduDeliveryClass::Control,
+        )
+        .unwrap();
+        // A queued serial-zero frame must not be batched behind the response
+        // ahead of the older retained notification.
+        queue_response_pdu(
+            &tx,
+            &terminal,
+            &budget,
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 22 }),
+            0,
+            PduDeliveryClass::Bulk,
+        )
+        .unwrap();
+        let Item::WritePdu(response) = gate
+            .admit_item(rx.try_recv().unwrap(), &terminal)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected codec response")
+        };
+        assert!(!gate.permits_batching());
+        let mut deferred = None;
+        let mut pending = prepare_pending_outbound_batch(
+            response,
+            &single_rx,
+            &mut deferred,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .unwrap();
+        assert_eq!(rx.len(), 1, "codec response must be encoded alone");
+        assert!(gate.next_retained().is_none());
+
+        let (mut server, mut client) = UnixStream::pair().expect("owned socket pair");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        for expected in [7_usize, 11, 12, 22] {
+            loop {
+                match promise::spawn::block_on(service_pending_outbound(
+                    &mut server,
+                    &mut pending,
+                    None,
+                    &terminal,
+                ))
+                .unwrap()
+                {
+                    OutboundService::Progress => {
+                        if expected == 7 {
+                            assert!(!gate.ready, "writing bytes alone does not open bootstrap");
+                        }
+                    }
+                    OutboundService::Complete => {
+                        gate.write_completed();
+                        break;
+                    }
+                    _ => panic!("owned peer sends no requests during this write"),
+                }
+            }
+            drop(pending);
+            let decoded = Pdu::decode(&mut client).expect("decode real socket frame");
+            if expected == 7 {
+                assert_eq!(decoded.serial, 7);
+                assert!(matches!(decoded.pdu, Pdu::GetCodecVersionResponse(_)));
+            } else {
+                assert_eq!(decoded.serial, 0);
+                assert!(matches!(decoded.pdu, Pdu::PaneRemoved(ref p) if p.pane_id == expected));
+            }
+            if expected == 22 {
+                break;
+            }
+            let item = gate
+                .next_retained()
+                .unwrap_or_else(|| rx.try_recv().unwrap());
+            let item = gate.admit_item(item, &terminal).unwrap().unwrap();
+            pending = match item {
+                Item::Notif(ReservedNotification {
+                    notification: MuxNotification::PaneRemoved(pane_id),
+                    reservation,
+                }) => prepare_unilateral_pdu(
+                    Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
+                    reservation,
+                    &single_rx,
+                    &mut deferred,
+                    &terminal,
+                )
+                .unwrap(),
+                Item::WritePdu(payload) => prepare_pending_outbound_batch(
+                    payload,
+                    &single_rx,
+                    &mut deferred,
+                    CompressionMode::Never,
+                    &terminal,
+                )
+                .unwrap(),
+                _ => panic!("expected retained or later pane removal"),
+            };
+        }
+        assert!(gate.retained.is_empty());
+        assert!(rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_budget_live_counters_zero(&budget);
+    }
+
+    #[test]
+    fn codec_bootstrap_rejects_wrong_serial_error_and_failed_flush() {
+        let (terminal, _) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
+        let (tx, rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (single_tx, single_rx) = bounded(1);
+        drop(single_tx);
+        let mut gate = CodecBootstrapGate::default();
+        assert!(queue_notification(
+            &tx,
+            &terminal,
+            &budget,
+            MuxNotification::PaneRemoved(11)
+        ));
+        assert!(
+            gate.admit_item(rx.try_recv().unwrap(), &terminal)
+                .unwrap()
+                .is_none()
+        );
+        gate.observe_request(&DecodedPdu {
+            pdu: Pdu::GetCodecVersion(codec::GetCodecVersion {}),
+            serial: 7,
+        });
+        for (serial, response) in [
+            (8, bootstrap_codec_response()),
+            (
+                7,
+                Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                    <codec::GetCodecVersion as codec::PduWireIdent>::IDENT,
+                )),
+            ),
+        ] {
+            queue_response_pdu(
+                &tx,
+                &terminal,
+                &budget,
+                response,
+                serial,
+                PduDeliveryClass::Control,
+            )
+            .unwrap();
+            drop(gate.admit_item(rx.try_recv().unwrap(), &terminal).unwrap());
+            gate.write_completed();
+            assert!(!gate.ready);
+            assert!(gate.next_retained().is_none());
+        }
+        gate.observe_request(&DecodedPdu {
+            pdu: Pdu::GetCodecVersion(codec::GetCodecVersion {}),
+            serial: 9,
+        });
+        queue_response_pdu(
+            &tx,
+            &terminal,
+            &budget,
+            bootstrap_codec_response(),
+            9,
+            PduDeliveryClass::Control,
+        )
+        .unwrap();
+        let Item::WritePdu(response) = gate
+            .admit_item(rx.try_recv().unwrap(), &terminal)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected codec response")
+        };
+        let mut pending = prepare_pending_outbound_batch(
+            response,
+            &single_rx,
+            &mut None,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .unwrap();
+        let mut stream = ChunkedDispatchStream {
+            max_write_size: Some(3),
+            fail_flush: true,
+            ..Default::default()
+        };
+        loop {
+            match promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &terminal,
+            )) {
+                Ok(OutboundService::Progress) => assert!(!gate.ready),
+                Err(_) => break,
+                _ => panic!("failed flush must not complete codec bootstrap"),
+            }
+        }
+        assert!(!gate.ready);
+        assert!(gate.next_retained().is_none());
+        drop(pending);
+        drop(gate);
+        assert_outbound_budget_live_counters_zero(&budget);
+    }
+
+    #[test]
+    fn codec_bootstrap_retained_notifications_keep_budget_and_release_on_terminal() {
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let budget = Arc::new(OutboundBudget::default());
+        let (tx, rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let mut gate = CodecBootstrapGate::default();
+        for pane_id in 0..DISPATCH_ITEM_QUEUE_CAPACITY {
+            assert!(queue_notification(
+                &tx,
+                &terminal,
+                &budget,
+                MuxNotification::PaneRemoved(pane_id)
+            ));
+            assert!(
+                gate.admit_item(rx.try_recv().unwrap(), &terminal)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(rx.is_empty());
+        assert_eq!(budget.snapshot().bulk_slots, DISPATCH_ITEM_QUEUE_CAPACITY);
+        queue_response_pdu(
+            &tx,
+            &terminal,
+            &budget,
+            bootstrap_codec_response(),
+            7,
+            PduDeliveryClass::Control,
+        )
+        .expect("codec response retains control headroom");
+        assert!(!queue_notification(
+            &tx,
+            &terminal,
+            &budget,
+            MuxNotification::PaneRemoved(0)
+        ));
+        assert_eq!(terminal_rx.try_recv().unwrap(), OUTBOUND_BUDGET_OVERFLOW);
+        drop(gate);
+        drop(rx);
+        drop(tx);
+        assert_outbound_budget_live_counters_zero(&budget);
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]

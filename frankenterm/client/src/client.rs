@@ -1543,20 +1543,20 @@ impl RpcProtocolAuthority {
         let codec_response = spec.ident == <GetCodecVersionResponse as PduWireIdent>::IDENT;
         let unit_response = spec.ident == <UnitResponse as PduWireIdent>::IDENT;
         let error_response = spec.ident == <ErrorResponse as PduWireIdent>::IDENT;
-        // Codec 46 servers can push notifications between the version reply
-        // and SetClientId. Admit only the negotiated legacy unilateral surface;
+        // Servers can push notifications between the version reply and
+        // SetClientId, including current peers. Admit the negotiated unilateral
+        // surface;
         // the reader's bounded pre-ready queue retains it until registration
-        // and topology publication finish. Current peers keep the stricter
-        // registration contract, and no correlated reply gains authority here.
-        let legacy_notification = role == PduWireRole::Unilateral
-            && self.codec.is_some_and(|codec| codec.dialect.is_legacy46());
+        // and topology publication finish. Descriptor, dialect and capability
+        // checks above still apply; no correlated reply gains authority here.
+        let negotiated_notification = role == PduWireRole::Unilateral && self.codec.is_some();
         let phase_authorized = match self.phase {
             RpcProtocolPhase::AwaitingCodecResponse => codec_response || error_response,
             RpcProtocolPhase::AwaitingRegistrationResponse => {
-                unit_response || error_response || legacy_notification
+                unit_response || error_response || negotiated_notification
             }
             RpcProtocolPhase::Established => !codec_response,
-            RpcProtocolPhase::AwaitingRegistrationRequest => legacy_notification,
+            RpcProtocolPhase::AwaitingRegistrationRequest => negotiated_notification,
             RpcProtocolPhase::AwaitingCodecRequest => false,
         };
         if !phase_authorized {
@@ -13005,15 +13005,25 @@ mod tests {
         protocol
             .install_codec(codec)
             .expect("caller-side retention of the same authority is idempotent");
-        assert!(matches!(
-            protocol.validate_inbound(
+        protocol
+            .validate_inbound(
                 &<NotifyAlert as PduWireIdent>::WIRE_SPEC,
                 PduWireRole::Unilateral,
-            ),
+            )
+            .expect("negotiated notification may enter the bounded quarantine");
+        assert!(matches!(
+            protocol.validate_outbound_pdu(&ping, RpcOutboundAdmissionPoint::Preflight),
             Err(OrdinaryMuxProtocolError::PhaseViolation {
                 phase: RpcProtocolPhase::AwaitingRegistrationRequest,
                 ..
             })
+        ));
+        assert!(matches!(
+            protocol.validate_inbound(
+                &<Pong as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::CorrelatedReply,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
         ));
         assert_eq!(
             protocol
@@ -13024,15 +13034,25 @@ mod tests {
                 .expect("registration is the only second request"),
             RpcProtocolTransition::RegistrationRequest
         );
-        assert!(matches!(
-            protocol.validate_inbound(
+        protocol
+            .validate_inbound(
                 &<NotifyAlert as PduWireIdent>::WIRE_SPEC,
                 PduWireRole::Unilateral,
-            ),
+            )
+            .expect("notification remains quarantined while registration is outstanding");
+        assert!(matches!(
+            protocol.validate_outbound_pdu(&ping, RpcOutboundAdmissionPoint::Preflight),
             Err(OrdinaryMuxProtocolError::PhaseViolation {
                 phase: RpcProtocolPhase::AwaitingRegistrationResponse,
                 ..
             })
+        ));
+        assert!(matches!(
+            protocol.validate_inbound(
+                &<Pong as PduWireIdent>::WIRE_SPEC,
+                PduWireRole::CorrelatedReply,
+            ),
+            Err(OrdinaryMuxProtocolError::PhaseViolation { .. })
         ));
         protocol
             .validate_inbound(
@@ -16254,61 +16274,143 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bootstrap_admits_notifications_to_bounded_pre_ready_queue() {
-        let rpc_transport = RpcTransportState::new();
-        let generation = rpc_transport.active_generation().unwrap();
-        let title = WindowTitleChanged {
-            window_id: 42,
-            title: "legacy startup".to_string(),
-        };
-        let wire = Pdu::WindowTitleChanged(title.clone())
-            .prepare_outbound_for_dialect(
-                MuxWireDialect::LEGACY46,
-                PduProducer::Server,
-                PduWireRole::Unilateral,
-                None,
-                CompressionMode::Never,
-            )
-            .unwrap()
-            .encode_frame(0)
-            .unwrap();
-        for phase in [
-            RpcProtocolPhase::AwaitingRegistrationRequest,
-            RpcProtocolPhase::AwaitingRegistrationResponse,
-        ] {
-            let mut protocol =
-                RpcProtocolAuthority::established_for_test(generation, LEGACY46_CODEC_VERSION);
-            protocol.phase = phase;
-            rpc_transport.lifecycle.lock().protocol = Some(protocol);
-            let mut reader = std::io::Cursor::new(&wire);
-            let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
-                &mut reader,
-                None,
-                |header| {
-                    validate_ordinary_mux_inbound_header(&rpc_transport, generation, header, 1)?;
-                    Ok(PduBodyDisposition::Materialize)
-                },
-            ))
-            .expect("negotiated legacy notification must pass header admission");
-            let AsyncPduDecode::Decoded(decoded) = decoded else {
-                panic!("legacy title must be materialized");
+    fn negotiated_bootstrap_quarantines_notifications_until_exact_replay() {
+        for version in [LEGACY46_CODEC_VERSION, 61, CODEC_VERSION] {
+            let dialect = if version == LEGACY46_CODEC_VERSION {
+                MuxWireDialect::LEGACY46
+            } else {
+                MuxWireDialect::current(version).unwrap()
             };
-            assert_eq!(decoded.pdu, Pdu::WindowTitleChanged(title.clone()));
-            let mut queue = PreReadyUnilateralQueue::default();
-            queue
-                .enqueue(decoded, 0, 0)
-                .expect("retain until readiness");
-            assert_eq!(queue.waiting.len(), 1);
-            assert!(queue.waiting_bytes > 0);
-            assert_eq!(
-                rpc_transport.ready_generation.load(AtomicOrdering::Acquire),
-                0
-            );
+            let rpc_transport = RpcTransportState::new();
+            let generation = rpc_transport.active_generation().unwrap();
+            let title = WindowTitleChanged {
+                window_id: 42,
+                title: "pre-registration startup".to_string(),
+            };
+            let wire = Pdu::WindowTitleChanged(title.clone())
+                .prepare_outbound_for_dialect(
+                    dialect,
+                    PduProducer::Server,
+                    PduWireRole::Unilateral,
+                    None,
+                    CompressionMode::Never,
+                )
+                .unwrap()
+                .encode_frame(0)
+                .unwrap();
+            for phase in [
+                RpcProtocolPhase::AwaitingRegistrationRequest,
+                RpcProtocolPhase::AwaitingRegistrationResponse,
+            ] {
+                let mut protocol = RpcProtocolAuthority::new(generation);
+                protocol
+                    .admit_outbound(&Pdu::GetCodecVersion(GetCodecVersion {}))
+                    .unwrap();
+                protocol
+                    .complete_correlated_response(
+                        "GetCodecVersion",
+                        &Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                            codec_vers: version,
+                            min_supported: version,
+                            version_string: "bootstrap-notification-test".to_string(),
+                            executable_path: PathBuf::from("/test/ft"),
+                            config_file_path: None,
+                        }),
+                    )
+                    .unwrap();
+                if phase == RpcProtocolPhase::AwaitingRegistrationResponse {
+                    protocol
+                        .admit_outbound(&Pdu::SetClientId(SetClientId {
+                            client_id: ClientId::new(),
+                            is_proxy: false,
+                        }))
+                        .unwrap();
+                }
+                assert_eq!(protocol.phase, phase);
+                rpc_transport.lifecycle.lock().protocol = Some(protocol);
+                let mut reader = std::io::Cursor::new(&wire);
+                let decoded = asupersync_block_on(Pdu::decode_async_with_selector(
+                    &mut reader,
+                    None,
+                    |header| {
+                        validate_ordinary_mux_inbound_header(
+                            &rpc_transport,
+                            generation,
+                            header,
+                            1,
+                        )?;
+                        Ok(PduBodyDisposition::Materialize)
+                    },
+                ))
+                .expect("negotiated notification must pass header admission");
+                let AsyncPduDecode::Decoded(decoded) = decoded else {
+                    panic!("negotiated title must be materialized");
+                };
+                assert_eq!(decoded.pdu, Pdu::WindowTitleChanged(title.clone()));
+                let mut queue = PreReadyUnilateralQueue::default();
+                queue
+                    .enqueue(decoded, 0, 0)
+                    .expect("retain until readiness");
+                assert_eq!(queue.waiting.len(), 1);
+                assert!(queue.waiting_bytes > 0);
+                assert_eq!(
+                    rpc_transport.ready_generation.load(AtomicOrdering::Acquire),
+                    0
+                );
+                let mut readiness = RpcReadinessCoordinator::default();
+                let RpcReadinessNextAction::StartReplay {
+                    batch,
+                    replayed_bytes,
+                } = readiness
+                    .next_action(generation, &mut queue)
+                    .expect("queued notification must become a replay obligation")
+                else {
+                    panic!("readiness must not precede notification replay");
+                };
+                assert_eq!(batch.len(), 1);
+                let replayed = Pdu::decode_retained_frame(batch[0].frame.as_slice())
+                    .expect("replay preserves the received frame");
+                assert_eq!(replayed.pdu, Pdu::WindowTitleChanged(title.clone()));
+                assert!(matches!(
+                    readiness.next_action(generation, &mut queue).unwrap(),
+                    RpcReadinessNextAction::AwaitInFlightReplay
+                ));
+                let successor = NonZeroU64::new(generation.get() + 1).unwrap();
+                assert_eq!(
+                    readiness
+                        .finish_replay(successor, generation, batch.len(), replayed_bytes)
+                        .unwrap(),
+                    RpcReadinessReplayCompletion::RetiredGeneration
+                );
+                assert!(matches!(
+                    readiness.next_action(generation, &mut queue).unwrap(),
+                    RpcReadinessNextAction::AwaitInFlightReplay
+                ));
+                assert_eq!(
+                    rpc_transport.ready_generation.load(AtomicOrdering::Acquire),
+                    0
+                );
+                assert_eq!(
+                    readiness
+                        .finish_replay(generation, generation, batch.len(), replayed_bytes)
+                        .unwrap(),
+                    RpcReadinessReplayCompletion::CurrentGeneration
+                );
+                assert!(matches!(
+                    readiness.next_action(generation, &mut queue).unwrap(),
+                    RpcReadinessNextAction::CommitReady
+                ));
+                assert_eq!(
+                    rpc_transport.ready_generation.load(AtomicOrdering::Acquire),
+                    0,
+                    "replay completion alone must not publish transport readiness"
+                );
+            }
         }
     }
 
     #[test]
-    fn bootstrap_rejects_unilateral_headers_before_registration_and_body_admission() {
+    fn bootstrap_rejects_unilateral_headers_before_codec_and_body_admission() {
         let rpc_transport = RpcTransportState::new();
         let generation = rpc_transport
             .active_generation()
@@ -16316,8 +16418,8 @@ mod tests {
         let payload = [0x3b; 257];
 
         for phase in [
-            RpcProtocolPhase::AwaitingRegistrationRequest,
-            RpcProtocolPhase::AwaitingRegistrationResponse,
+            RpcProtocolPhase::AwaitingCodecRequest,
+            RpcProtocolPhase::AwaitingCodecResponse,
         ] {
             let mut protocol =
                 RpcProtocolAuthority::established_for_test(generation, CODEC_VERSION);
@@ -16347,7 +16449,7 @@ mod tests {
                         Ok(PduBodyDisposition::Materialize)
                     },
                 ))
-                .expect_err("pre-registration unilateral header must fail closed");
+                .expect_err("pre-codec unilateral header must fail closed");
 
                 assert!(!downstream_selector_reached);
                 assert!(matches!(
