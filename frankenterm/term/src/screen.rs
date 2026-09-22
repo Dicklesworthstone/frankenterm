@@ -342,6 +342,7 @@ pub struct ScreenLineRead {
     attempted_index: bool,
     fragments: Option<Arc<ColdRowFragments>>,
     geometry: Option<ColdGeometrySnapshot>,
+    wait_for_shared_geometry: bool,
     requested_physical_rows_only: bool,
 }
 
@@ -422,6 +423,7 @@ struct ColdGeometryIndex {
     pages: VecDeque<Arc<ColdGeometryPage>>,
     head_skip: usize,
     geometry_bytes: usize,
+    calculation: Arc<std::sync::Mutex<Option<ColdGeometryReuse>>>,
 }
 
 #[cfg(feature = "use_serde")]
@@ -438,6 +440,20 @@ struct ColdGeometrySnapshot {
     pages: Vec<Arc<ColdGeometryPage>>,
     head_skip: usize,
     row_count: usize,
+    calculation: Arc<std::sync::Mutex<Option<ColdGeometryReuse>>>,
+}
+
+/// Calculation sharing is not publication authority. No completed index or
+/// historical payload is kept alive by this entry; every consumer must still
+/// validate its captured source before installing the result.
+#[cfg(feature = "use_serde")]
+#[derive(Debug)]
+struct ColdGeometryReuse {
+    source: Range<StableRowIndex>,
+    fragments: Option<Weak<ColdRowFragments>>,
+    policy: ResizeWrapPolicy,
+    layout: Weak<ColdVisualLayout>,
+    metadata_bytes: usize,
 }
 
 #[cfg(feature = "use_serde")]
@@ -456,6 +472,16 @@ impl ColdGeometryIndex {
     const PAGE_ROWS: usize = 256;
 
     fn append(&mut self, row: StableRowIndex, line: &Line) -> Option<()> {
+        // Captured workers must never share calculation state with mutated
+        // geometry, including a clone whose source later returns to old bounds.
+        // The common no-reader append reuses the small allocation in place.
+        if let Some(calculation) = Arc::get_mut(&mut self.calculation) {
+            *calculation
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        } else {
+            self.calculation = Arc::default();
+        }
         let retained = self.interval.rows()?;
         let end = row.checked_add(1)?;
         if row != self.source.end || retained.end != end || retained.start > row {
@@ -504,6 +530,15 @@ impl ColdGeometryIndex {
             .checked_mul(std::mem::size_of::<Arc<ColdGeometryPage>>())?
             .checked_add((self.pages.len() + 1).checked_mul(page_bytes)?)?
             .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<
+                std::sync::Mutex<Option<ColdGeometryReuse>>,
+            >())?
+            // Weak references release payloads but retain their Arc allocation
+            // headers, including space for the already-dropped value.
+            .checked_add(std::mem::size_of::<ColdVisualLayout>())?
+            .checked_add(std::mem::size_of::<ColdRowFragments>())?
+            .checked_add(4 * std::mem::size_of::<usize>())?
+            .checked_add(2 * std::mem::size_of::<usize>())?
             .checked_add(2 * std::mem::size_of::<usize>())?;
         let available = ScreenLineRead::MAX_INDEX_METADATA_BYTES
             .checked_sub(overhead)?
@@ -1213,6 +1248,75 @@ impl ScreenLineRead {
     /// An uncertified join or exhausted metadata budget keeps the payload
     /// planner available; it never publishes a partial geometry index.
     fn geometry_cold_layout(
+        &self,
+        limit: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> anyhow::Result<Option<(Arc<ColdVisualLayout>, usize)>> {
+        let Some(snapshot) = &self.geometry else {
+            return Ok(None);
+        };
+        // Owned hydration/preparation workers may wait without terminal/GUI
+        // locks. The legacy synchronous consumer explicitly disables waiting
+        // and retains its independent calculation if another owner is busy.
+        let mut calculation = loop {
+            anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+            match snapshot.calculation.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if !self.wait_for_shared_geometry {
+                        return self.compute_geometry_cold_layout(limit, cancelled);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        if let (Some(previous), Some((_, interval))) = (calculation.as_ref(), &self.cold) {
+            let same_fragments = match (&previous.fragments, &self.fragments) {
+                (None, None) => true,
+                (Some(before), Some(now)) => before.ptr_eq(&Arc::downgrade(now)),
+                _ => false,
+            };
+            if previous.source == snapshot.source
+                && previous.policy == self.wrap_policy
+                && same_fragments
+                && previous.metadata_bytes < limit.min(Self::MAX_INDEX_METADATA_BYTES)
+            {
+                if let Some(layout) = previous.layout.upgrade() {
+                    if Arc::ptr_eq(&layout.witness.identity, &self.witness.identity)
+                        && layout.witness.rows == self.witness.rows
+                        && layout.witness.cols == self.witness.cols
+                        && layout.witness.dpi == self.witness.dpi
+                        && layout.resident_frontier == self.hot_top
+                        && interval.retains(&layout.interval, snapshot.source.clone())
+                    {
+                        anyhow::ensure!(
+                            layout.source.end == self.hot_top || self.end <= layout.source.end,
+                            ColdReadGeometryUnavailable
+                        );
+                        anyhow::ensure!(!cancelled(), "cold geometry index cancelled");
+                        log::debug!(target: "frankenterm_term::screen::reflow_profile",
+                            "cold_geometry_shared cols={} source_rows={} groups={}",
+                            self.witness.cols, snapshot.row_count, layout.groups.len());
+                        return Ok(Some((layout, previous.metadata_bytes)));
+                    }
+                }
+            }
+        }
+        let result = self.compute_geometry_cold_layout(limit, cancelled)?;
+        if let Some((layout, metadata_bytes)) = &result {
+            *calculation = Some(ColdGeometryReuse {
+                source: snapshot.source.clone(),
+                fragments: self.fragments.as_ref().map(Arc::downgrade),
+                policy: self.wrap_policy,
+                layout: Arc::downgrade(layout),
+                metadata_bytes: *metadata_bytes,
+            });
+        }
+        Ok(result)
+    }
+
+    fn compute_geometry_cold_layout(
         &self,
         limit: usize,
         cancelled: &impl Fn() -> bool,
@@ -4493,6 +4597,7 @@ impl Screen {
                 .load(std::sync::atomic::Ordering::Acquire),
             fragments: self.cold_row_fragments.clone(),
             geometry,
+            wait_for_shared_geometry: true,
             requested_physical_rows_only: false,
         })
     }
@@ -4545,6 +4650,7 @@ impl Screen {
             pages,
             head_skip: absolute_skip % ColdGeometryIndex::PAGE_ROWS,
             row_count: count,
+            calculation: Arc::clone(&index.calculation),
         })
     }
 
@@ -6545,6 +6651,7 @@ impl Screen {
                 pages: VecDeque::new(),
                 head_skip: 0,
                 geometry_bytes: 0,
+                calculation: Arc::default(),
             });
         }
         let index = self.cold_geometry_index.as_mut().unwrap();
@@ -9627,7 +9734,10 @@ impl Screen {
             // Do not publish here: the caller owns layout sequence authority.
             let read = self
                 .capture_line_read(stable_range.clone())
-                .and_then(|read| read.hydrate(|| false));
+                .and_then(|mut read| {
+                    read.wait_for_shared_geometry = false;
+                    read.hydrate(|| false)
+                });
             return match read {
                 Ok(read) if self.validates_line_read(&read) => {
                     (read.first_row(), read.lines().cloned().collect())
@@ -15281,6 +15391,184 @@ pub(crate) mod tests {
             fast.lines().cloned().collect::<Vec<_>>(),
             reference.lines().cloned().collect::<Vec<_>>()
         );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_geometry_shared_workers_reuse_one_calculation() {
+        let (mut screen, _) = stored_physical_fixture(9, 32);
+        screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        let first = screen.capture_line_read(0..1).unwrap();
+        let second = screen.capture_line_read(0..1).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.geometry.as_ref().unwrap().calculation,
+            &second.geometry.as_ref().unwrap().calculation,
+        ));
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            let checks = std::cell::Cell::new(0);
+            first
+                .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| {
+                    let count = checks.get() + 1;
+                    checks.set(count);
+                    if count == 2 {
+                        // The real calculator has acquired ownership, before its
+                        // first row. A competing capture must share its result.
+                        entered.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    false
+                })
+                .unwrap()
+                .unwrap()
+                .0
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (waiting, saw_waiter) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let signalled = std::cell::Cell::new(false);
+            second
+                .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| {
+                    if !signalled.replace(true) {
+                        waiting.send(()).unwrap();
+                    }
+                    false
+                })
+                .unwrap()
+                .unwrap()
+                .0
+        });
+        saw_waiter.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        let first = owner.join().unwrap();
+        let second = waiter.join().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "duplicate geometry computation"
+        );
+        let reference = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .streamed_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .0;
+        assert_eq!(first.groups, reference.groups);
+        assert_eq!(first.visual, reference.visual);
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_geometry_shared_cancellation_budget_and_identity_fences() {
+        let (mut screen, _) = stored_physical_fixture(9, 32);
+        let cursor = screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let calculation = Arc::clone(&plan.geometry.as_ref().unwrap().calculation);
+        let held = calculation.lock().unwrap();
+        let (finished, observed) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let checks = std::cell::Cell::new(0);
+            let result = plan.geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            });
+            finished.send(result.is_err()).unwrap();
+        });
+        // Cancellation must settle while the owner is STILL holding the lock.
+        let cancelled = observed.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        waiter.join().unwrap();
+        assert!(cancelled.unwrap());
+
+        let mut synchronous = screen.capture_line_read(0..1).unwrap();
+        synchronous.wait_for_shared_geometry = false;
+        let held = calculation.lock().unwrap();
+        let (finished, observed) = std::sync::mpsc::sync_channel(1);
+        let synchronous = std::thread::spawn(move || {
+            finished
+                .send(
+                    synchronous
+                        .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+                        .unwrap()
+                        .is_some(),
+                )
+                .unwrap();
+        });
+        let completed_without_wait = observed.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        synchronous.join().unwrap();
+        assert!(
+            completed_without_wait.unwrap(),
+            "synchronous caller waited for index owner"
+        );
+
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = plan.geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| {
+                checks.set(checks.get() + 1);
+                assert!(checks.get() != 2, "injected calculator panic");
+                false
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(calculation.is_poisoned());
+        // Poison cannot permanently strand another reader after containment.
+        let (layout, bytes) = plan
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .unwrap();
+        assert!(plan
+            .geometry_cold_layout(bytes, &|| false)
+            .unwrap()
+            .is_none());
+        assert!(plan
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| true)
+            .is_err());
+        // A different policy cannot reuse even identical source coordinates.
+        let mut changed = screen.capture_line_read(0..1).unwrap();
+        changed.wrap_policy.scorecard_enabled = !changed.wrap_policy.scorecard_enabled;
+        let changed = changed
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(!Arc::ptr_eq(&layout, &changed));
+        screen.resize(test_size(4, 7, 96), cursor, 3, false);
+        let next = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .geometry_cold_layout(ScreenLineRead::MAX_PAYLOAD_BYTES, &|| false)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(!Arc::ptr_eq(&layout, &next));
+        assert_eq!(next.witness.cols, 7);
+        // The memo must not extend the lifetime of any finished index.
+        let weak = Arc::downgrade(&next);
+        drop(next);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn cold_geometry_shared_append_separates_captured_calculations() {
+        let (mut screen, _) = stored_physical_fixture(9, 32);
+        screen.resize(test_size(4, 11, 96), test_cursor(0, 0, 1), 2, false);
+        let plan = screen.capture_line_read(0..1).unwrap();
+        let captured = Arc::clone(&plan.geometry.as_ref().unwrap().calculation);
+        let index = screen.cold_geometry_index.as_mut().unwrap();
+        // Even a refused mutation cannot retain sharing with a captured
+        // revision; successful append/prune uses this same entry boundary.
+        assert!(index
+            .append(StableRowIndex::MAX, &Line::new(0))
+            .is_none());
+        assert!(!Arc::ptr_eq(&captured, &index.calculation));
+        let current = Arc::as_ptr(&index.calculation);
+        assert!(index
+            .append(StableRowIndex::MAX, &Line::new(0))
+            .is_none());
+        assert_eq!(current, Arc::as_ptr(&index.calculation));
     }
 
     #[cfg(feature = "use_serde")]
