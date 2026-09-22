@@ -2026,6 +2026,92 @@ mod tests {
     }
 
     #[test]
+    fn native_selection_rebase_rejects_obsolete_frame_damage_but_not_later_edits() {
+        let (mut term, mut selection, expected) = native_anchor_fixture();
+        let before_resize = selection.seqno;
+        let token = selection.native_anchor().unwrap().clone();
+        term.resize(wezterm_term::TerminalSize {
+            rows: 24,
+            cols: 37,
+            dpi: 96,
+            pixel_width: 296,
+            pixel_height: 384,
+        });
+        let frame_sequence = term.current_seqno();
+        assert!(frame_sequence > before_resize);
+        let damage = term.screen().get_changed_stable_rows(0..24, before_resize);
+        assert!(
+            !damage.is_empty(),
+            "the captured frame must carry real reflow damage"
+        );
+        let mut authority = selection.authority.unwrap();
+        authority.sequence = frame_sequence;
+        authority.geometry = (37, 24, 96, 296, 384);
+
+        // The terminal lock is released after capturing a frame. Output outside
+        // the selected rows can arrive before the GUI resolves its native token.
+        term.advance_bytes(b"\x1b[20;1HUNRELATED OUTPUT");
+        let resolved_sequence = term.current_seqno();
+        assert!(resolved_sequence > frame_sequence);
+        let points = term
+            .screen()
+            .resolve_selection_anchor(&token, resolved_sequence)
+            .unwrap();
+        assert!(selection.rebase_native_anchor(points, authority, resolved_sequence));
+        assert_eq!(live_native_selection_text(&term, &selection), expected);
+        assert!(
+            damage
+                .iter()
+                .any(|row| selection.range.unwrap().rows().contains(row))
+        );
+        assert!(crate::termwindow::native_selection_covers_frame(
+            selection.seqno,
+            frame_sequence,
+            before_resize,
+        ));
+
+        // A real edit after the validated rebase invalidates the same token and
+        // must still clear the selection when that newer frame is processed.
+        let edited_row = selection.range.unwrap().normalize().start.y;
+        term.advance_bytes(format!("\x1b[{};1HCHANGED", edited_row + 1).as_bytes());
+        let edited_sequence = term.current_seqno();
+        assert!(edited_sequence > resolved_sequence);
+        assert!(
+            term.screen()
+                .resolve_selection_anchor(&token, edited_sequence)
+                .is_none()
+        );
+        assert!(
+            term.screen()
+                .get_changed_stable_rows(0..24, resolved_sequence)
+                .contains(&edited_row)
+        );
+        assert!(!crate::termwindow::native_selection_covers_frame(
+            selection.seqno,
+            edited_sequence,
+            selection.seqno,
+        ));
+        assert!(
+            !crate::termwindow::native_selection_covers_frame(
+                selection.seqno,
+                frame_sequence,
+                selection.seqno,
+            ),
+            "an unexplained source regression must not be treated as a successful rebase"
+        );
+        for (selected, frame) in [
+            (termwiz::surface::SequenceNo::MAX, frame_sequence),
+            (selection.seqno, termwiz::surface::SequenceNo::MAX),
+        ] {
+            assert!(!crate::termwindow::native_selection_covers_frame(
+                selected,
+                frame,
+                before_resize
+            ));
+        }
+    }
+
+    #[test]
     fn native_selection_commit_retains_released_intent_through_capture_contention() {
         let (mut term, mut committed, _) = native_anchor_fixture();
         let previous = committed.clone();

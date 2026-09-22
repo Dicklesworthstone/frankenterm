@@ -2432,6 +2432,21 @@ pub(crate) fn is_clean_line_for_cache_hit_accounting(
     !bm.contains(line_idx)
 }
 
+/// Called only after matching the selection and frame layout authorities.
+/// A newer sequence covers an older frame only when this check advanced the
+/// selection through a validated native rebase; a stale high baseline alone
+/// is not evidence against source regression or reset.
+pub(crate) fn native_selection_covers_frame(
+    selection_sequence: termwiz::surface::SequenceNo,
+    frame_sequence: termwiz::surface::SequenceNo,
+    before_rebase: termwiz::surface::SequenceNo,
+) -> bool {
+    selection_sequence != termwiz::surface::SequenceNo::MAX
+        && frame_sequence != termwiz::surface::SequenceNo::MAX
+        && (selection_sequence == frame_sequence
+            || (selection_sequence > frame_sequence && selection_sequence > before_rebase))
+}
+
 /// True only while the initiating button of a terminal selection drag is held.
 /// Dirty PTY output may redraw under that in-flight selection, but it must not
 /// clear the selection before the matching mouse-up can copy it.
@@ -7028,11 +7043,14 @@ impl TermWindow {
         {
             // Coordinate invalidation is independent of visible damage and
             // must also cancel an active drag anchored in the old layout.
-            let has_selection_anchor = {
+            let (has_selection_anchor, selection_sequence_before_rebase) = {
                 let selection = self
                     .selection(pane_id)
                     .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
-                selection.origin.is_some() || selection.range.is_some()
+                (
+                    selection.origin.is_some() || selection.range.is_some(),
+                    selection.seqno,
+                )
             };
             let selection_authority = frame.map_or_else(
                 || crate::selection::SelectionAuthority::capture(&**pane),
@@ -7111,9 +7129,15 @@ impl TermWindow {
                                 .1
                         },
                         |frame| {
-                            if frame.source_sequence == selection_seqno {
-                                // A successful native remap established this exact
-                                // frame as the selection's new damage baseline.
+                            if native_selection_covers_frame(
+                                selection_seqno,
+                                frame.source_sequence,
+                                selection_sequence_before_rebase,
+                            ) {
+                                // The frame's damage was computed before native
+                                // rebasing. A validated rebase may observe newer
+                                // unrelated output under this same layout, and
+                                // its baseline covers this older captured damage.
                                 rangeset::RangeSet::new()
                             } else {
                                 frame.selection_dirty.clone()
