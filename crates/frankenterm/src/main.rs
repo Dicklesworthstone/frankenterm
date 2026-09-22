@@ -16022,32 +16022,92 @@ fn validate_agent_config_acl_presence(
     }
 }
 
+/// Extended attributes the operating system stamps on files by itself and
+/// that therefore are not user metadata a replacement could silently drop.
+///
+/// macOS attaches `com.apple.provenance` to every file created by a
+/// provenance-tracked process, including the private candidate this writer
+/// has just created and most targets written by other apps. A replacement
+/// file receives its own provenance from the kernel, so refusing on this
+/// name would make agent-config application impossible on macOS while
+/// protecting nothing. Every other name remains fail-closed.
+#[cfg(target_os = "macos")]
+const AGENT_CONFIG_OS_MANAGED_XATTRS: &[&[u8]] = &[b"com.apple.provenance"];
+#[cfg(target_os = "linux")]
+const AGENT_CONFIG_OS_MANAGED_XATTRS: &[&[u8]] = &[];
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_agent_config_has_no_xattrs(
     file: &cap_std::fs::File,
     path: &Path,
 ) -> std::result::Result<(), String> {
+    let names = list_agent_config_xattr_names(file, path)?;
+    validate_agent_config_xattr_names(&names, path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn list_agent_config_xattr_names(
+    file: &cap_std::fs::File,
+    path: &Path,
+) -> std::result::Result<Vec<u8>, String> {
     use std::os::fd::AsFd as _;
 
-    let mut empty = [0_u8; 0];
-    match rustix::fs::flistxattr(file.as_fd(), &mut empty) {
-        Ok(0) => Ok(()),
-        Ok(count) => Err(format!(
-            "Agent config '{}' has extended attributes ({count} name bytes); refusing to replace metadata that cannot be preserved safely.",
-            path.display()
-        )),
-        Err(err) if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP => {
-            Ok(())
-        }
-        Err(err) if err == rustix::io::Errno::RANGE => Err(format!(
-            "Agent config '{}' has extended attributes; refusing to replace metadata that cannot be preserved safely.",
-            path.display()
-        )),
-        Err(err) => Err(format!(
+    // The name list can grow between the size probe and the read; retry a
+    // bounded number of times and fail closed if it never settles.
+    const MAX_ATTEMPTS: usize = 4;
+    let inspect_error = |err: rustix::io::Errno| {
+        format!(
             "Failed to inspect descriptor-bound extended attributes for '{}': {}",
             path.display(),
             std::io::Error::from(err)
-        )),
+        )
+    };
+    for _ in 0..MAX_ATTEMPTS {
+        let mut empty = [0_u8; 0];
+        let size = match rustix::fs::flistxattr(file.as_fd(), &mut empty[..]) {
+            Ok(0) => return Ok(Vec::new()),
+            Ok(size) => size,
+            Err(err)
+                if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(inspect_error(err)),
+        };
+        let mut names = vec![0_u8; size];
+        match rustix::fs::flistxattr(file.as_fd(), &mut names[..]) {
+            Ok(len) => {
+                names.truncate(len);
+                return Ok(names);
+            }
+            Err(err) if err == rustix::io::Errno::RANGE => {}
+            Err(err) => return Err(inspect_error(err)),
+        }
+    }
+    Err(format!(
+        "Agent config '{}' has extended attributes that kept changing while being inspected; refusing to replace metadata that cannot be preserved safely.",
+        path.display()
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_agent_config_xattr_names(
+    names: &[u8],
+    path: &Path,
+) -> std::result::Result<(), String> {
+    let unexpected: Vec<String> = names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty() && !AGENT_CONFIG_OS_MANAGED_XATTRS.contains(name))
+        .map(|name| String::from_utf8_lossy(name).escape_debug().to_string())
+        .collect();
+    if unexpected.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Agent config '{}' has extended attributes ({}); refusing to replace metadata that cannot be preserved safely.",
+            path.display(),
+            unexpected.join(", ")
+        ))
     }
 }
 
@@ -130255,6 +130315,36 @@ printf x > "$MINISIGN_MARKER"
                 .unwrap_err()
                 .contains("file flags")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_config_xattr_names_ignore_only_os_managed_provenance() {
+        let target = Path::new("/tmp/agent-config-xattr-names");
+        assert!(validate_agent_config_xattr_names(b"", target).is_ok());
+
+        let user_error = validate_agent_config_xattr_names(b"user.frankenterm-test\0", target)
+            .expect_err("user metadata must fail closed");
+        assert!(user_error.contains("extended attributes"));
+        assert!(user_error.contains("user.frankenterm-test"));
+
+        let provenance = validate_agent_config_xattr_names(b"com.apple.provenance\0", target);
+        #[cfg(target_os = "macos")]
+        assert!(
+            provenance.is_ok(),
+            "the kernel-stamped provenance attribute is not user metadata"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(provenance.is_err());
+
+        let mixed_error = validate_agent_config_xattr_names(
+            b"com.apple.provenance\0com.apple.quarantine\0",
+            target,
+        )
+        .expect_err("any other attribute next to provenance must still fail closed");
+        assert!(mixed_error.contains("com.apple.quarantine"));
+        #[cfg(target_os = "macos")]
+        assert!(!mixed_error.contains("com.apple.provenance"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
