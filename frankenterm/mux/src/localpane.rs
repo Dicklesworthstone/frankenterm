@@ -10162,6 +10162,194 @@ mod tests {
                 assert!(viewport.cold_anchor.is_some());
             }
         }
+        cold_ragged_paragraph_selection_endpoints(&executor);
+    }
+
+    fn cold_ragged_paragraph_selection_endpoints(executor: &promise::spawn::SimpleExecutor) {
+        use frankenterm_term::screen::SelectionAnchorCoordinate;
+        let (pane, _mux, registration, _sink, token) = cold_resize_fixture(false);
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut term = Terminal::new(
+            term_size(80, 4),
+            Arc::new(ColdResizeTestConfig(sink)),
+            "FrankenTerm",
+            "cold-ragged-selection",
+            Box::new(Vec::new()),
+        );
+        let paragraph = format!(
+            "RAGGED_04806 {}{} END_04806",
+            "ab 界 e\u{301} 🚀 xy\u{a0}z ".repeat(7),
+            "q".repeat(64)
+        );
+        assert_eq!(paragraph.len(), 241);
+        term.advance_bytes(paragraph.as_bytes());
+        term.advance_bytes(b"\r\n");
+        for _ in 0..12 {
+            term.advance_bytes(b"later unselected history\r\n");
+        }
+        *pane.terminal.lock() = term;
+        LocalPane::prepare_cold_layout_after_resize(
+            pane.pane_id(),
+            &pane.terminal,
+            &pane.line_layout_observation,
+            &pane.resize_queue,
+            token,
+            registration.clone(),
+        );
+        let dimensions = pane.get_dimensions();
+        let read = pane
+            .capture_line_read(
+                dimensions.scrollback_top..dimensions.physical_top,
+                &mut Default::default(),
+            )
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let rows: Vec<_> = read.lines().collect();
+        let first = rows
+            .iter()
+            .position(|line| line.as_str().starts_with("RAGGED_04806"))
+            .unwrap();
+        let last = rows
+            .iter()
+            .position(|line| line.as_str().contains("END_04806"))
+            .unwrap();
+        assert!(!rows[last].last_cell_was_wrapped());
+        let end_len = rows[last].len();
+        let start_row = read.first_row() + first as StableRowIndex;
+        let end_row = read.first_row() + last as StableRowIndex;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while executor.try_tick().unwrap() {}
+            if let Some(frame) = pane.try_capture_render_frame(
+                Some(NativeViewport::new(start_row)),
+                0,
+                0,
+                &[],
+                false,
+            ) {
+                assert!(frame.viewport.unwrap().cold_anchor.is_some());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ragged cold frame did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let mut anchors = Vec::new();
+        for end_column in [end_len - 1, end_len, end_len + 1] {
+            let origin = Some(SelectionAnchorCoordinate {
+                row: start_row,
+                column: Some(0),
+            });
+            let points = [
+                origin,
+                origin,
+                Some(SelectionAnchorCoordinate {
+                    row: end_row,
+                    column: Some(end_column),
+                }),
+            ];
+            COLD_VIEWPORT_CACHE.lock().clear();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                match pane.capture_selection_anchor(floor, sequence, dimensions, points) {
+                    Ok(Some(anchor)) => {
+                        anchors.push(anchor);
+                        break;
+                    }
+                    Err(SelectionAnchorCaptureError::Busy) => {}
+                    result => panic!(
+                        "ragged endpoint {} capture failed: {:?}",
+                        end_column, result
+                    ),
+                }
+                assert!(Instant::now() < deadline, "ragged capture did not settle");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for cols in [69, 106] {
+            let size = term_size(cols, 4);
+            let pty = pty_size(cols as u16, 4);
+            let pending = {
+                let mut queue = pane.resize_queue.lock();
+                queue.enqueue(size, pty, Instant::now());
+                queue.dequeue_for_worker().unwrap()
+            };
+            let token = ResizeCancellationToken::new(pending.seq);
+            LocalPane::apply_resize_sync(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                #[cfg(feature = "disruptor-pane-io")]
+                &pane.action_ring,
+                &pane.pty,
+                &pane.resize_queue,
+                pending.seq,
+                size,
+                pty,
+                token,
+            )
+            .unwrap();
+            LocalPane::prepare_cold_layout_after_resize(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                &pane.resize_queue,
+                token,
+                registration.clone(),
+            );
+            for (extra, anchor) in anchors.iter().enumerate() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let points = loop {
+                    while executor.try_tick().unwrap() {}
+                    if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(anchor) {
+                        break points.expect("ragged hard-ended selection survives resize");
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "ragged resolution did not settle"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let start = points[1].unwrap();
+                let end = points[2].unwrap();
+                let read = pane
+                    .capture_line_read(start.row..end.row + 1, &mut Default::default())
+                    .unwrap()
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap();
+                let mut selected = String::new();
+                let mut last_len = 0;
+                for (offset, line) in read.lines().enumerate() {
+                    let row = read.first_row() + offset as StableRowIndex;
+                    if row < start.row || row > end.row {
+                        continue;
+                    }
+                    for cell in line.visible_cells() {
+                        if (row != start.row || cell.cell_index() >= start.column.unwrap())
+                            && (row != end.row || cell.cell_index() <= end.column.unwrap())
+                        {
+                            selected.push_str(cell.str());
+                        }
+                    }
+                    if row == end.row {
+                        last_len = line.len();
+                    }
+                }
+                assert_eq!(
+                    selected.trim_end(),
+                    paragraph,
+                    "cols={cols} padding={extra}"
+                );
+                assert_eq!(end.column, Some(last_len - 1 + extra));
+            }
+        }
     }
 
     #[test]

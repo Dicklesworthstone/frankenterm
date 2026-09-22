@@ -1,0 +1,208 @@
+  [2m2026-09-21T06:41:15.850775Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2062 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:42:38.707239Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts1 at ubuntu@100.74.254.33 (0 slots remaining after reservation, speed 76.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2977 [2;3mon[0m ThreadId(1)
+
+[*] Job j-30023644042233666 submitted to ts1 (0 slots remaining, speed 76.4)
+  [2m2026-09-21T06:42:54.090451Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankenterm (hash: paired-c81fa6bc5def09d76929b19e765a995b)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:42:54.090496Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:744 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:42:54.754545Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker ts1...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:892 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:42:54.754708Z[0m [33m WARN[0m [1;33mrch::transfer[0m[33m: [33mProject hash contains non-hex characters, sanitizing: "paired-c81fa6bc5def09d76929b19e765a995b"[0m
+    [2;3mat[0m rch/src/transfer.rs:1378 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:43:19.625372Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 362567680 bytes in 20574ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1232 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:43:19.687013Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: env 'TMPDIR=/var/tmp' 'CARGO_HOME=/home/ubuntu/.cargo' 'RUSTUP_TOOLCHAIN=nightly-2026-08-31' 'CARGO_INCREMENTAL=0' cargo test --locked --profile test-recovery --target x86_64-unknown-linux-gnu -j1 -p frankenterm-core --features default,mcp,mcp-client,vendored --test proptest_ntm_parity --test operating_envelope_schema --config 'build.build-dir="/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-3907d68fde335c04cb6979c05955c516"' -- --nocapture '--test-threads=4'[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1309 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:43:19.687260Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/ft-rc53-parity-ts1 -> /var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-3907d68fde335c04cb6979c05955c516[0m
+    [2;3mat[0m rch/src/transfer.rs:1992 [2;3mon[0m ThreadId(1)
+
+   Compiling frankenterm-dynamic-derive v0.1.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/dynamic/derive)
+   Compiling frankenterm-dynamic v0.2.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/dynamic)
+   Compiling frankenterm-color-types v0.3.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/color-types)
+   Compiling frankenterm-input-types v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/input-types)
+   Compiling frankenterm-blob-leases v0.1.1 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/blob-leases)
+   Compiling vtparse v0.7.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/vtparse)
+   Compiling frankenterm-escape-parser v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/escape-parser)
+   Compiling frankenterm-char-props v0.1.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/char-props)
+   Compiling filedescriptor v0.8.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/filedescriptor)
+   Compiling libssh-rs-sys v0.2.8 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/vendor/libssh-rs-sys)
+   Compiling frankenterm-cell v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/cell)
+   Compiling frankenterm-bidi v0.2.3 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/bidi)
+   Compiling frankenterm-surface v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/surface)
+   Compiling portable-pty v0.9.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/pty)
+   Compiling termwiz v0.24.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/termwiz)
+   Compiling libssh-rs v0.3.8
+   Compiling frankenterm-uds v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/uds)
+   Compiling luahelper v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/luahelper)
+   Compiling async_ossl v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/async_ossl)
+   Compiling frankenterm-sigpipe v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-sigpipe)
+   Compiling promise v0.2.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/promise)
+   Compiling frankenterm-ssh v0.4.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/ssh)
+   Compiling frankenterm-term v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/term)
+   Compiling umask v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/umask)
+   Compiling frankenterm-config-derive v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/config/derive)
+   Compiling config v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/config)
+   Compiling procinfo v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/procinfo)
+   Compiling rangeset v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/rangeset)
+   Compiling frankenterm-build-identity v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-build-identity)
+   Compiling bintree v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/bintree)
+   Compiling mux v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/mux)
+   Compiling frankenterm-pty-guardian v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-pty-guardian)
+   Compiling frankenterm-core-replay-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-replay-types)
+   Compiling frankenterm-core-audit-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-audit-types)
+   Compiling frankenterm-core v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core)
+   Compiling codec v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/codec)
+   Compiling frankenterm-core-mcp v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-mcp)
+   Compiling frankenterm-core-cass-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-cass-types)
+   Compiling frankenterm-core-policy-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-policy-types)
+   Compiling frankenterm-core-telemetry-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-telemetry-types)
+   Compiling frankenterm-core-resource-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-resource-types)
+   Compiling frankenterm-core-error-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-error-types)
+   Compiling ft-perf-gate v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/ft-perf-gate)
+   Compiling frankenterm-core-caut-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-caut-types)
+   Compiling frankenterm-alloc v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-alloc)
+   Compiling frankenterm-core-connector-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-connector-types)
+   Compiling frankenterm-core-config-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-config-types)
+   Compiling frankenterm-core-x11-resize-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-x11-resize-types)
+   Compiling frankenterm-core-atlas-pack-types v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-atlas-pack-types)
+   Compiling lfucache v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/frankenterm/lfucache)
+   Compiling frankenterm-core-replay v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-replay)
+   Compiling frankenterm-core-tantivy v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-tantivy)
+   Compiling frankenterm-core-ars v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-ars)
+   Compiling frankenterm-core-fleet v0.15.6-rc.53 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-fleet)
+   Compiling frankenterm-core-test-macros v0.1.0 (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b/crates/frankenterm-core-test-macros)
+    Finished `test-recovery` profile [unoptimized] target(s) in 5m 32s
+     Running tests/operating_envelope_schema.rs (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-3907d68fde335c04cb6979c05955c516/x86_64-unknown-linux-gnu/test-recovery/build/frankenterm-core/4a437d98a4d65fe2/out/operating_envelope_schema-4a437d98a4d65fe2)
+
+running 3 tests
+test operating_envelope_degraded_cases_pin_reason_codes ... ok
+test operating_envelope_invalid_fixtures_are_rejected ... ok
+test operating_envelope_valid_fixtures_match_schema ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/proptest_ntm_parity.rs (/var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/.rch-target-ts1-pool-3907d68fde335c04cb6979c05955c516/x86_64-unknown-linux-gnu/test-recovery/build/frankenterm-core/4437652959ff6e1b/out/proptest_ntm_parity-4437652959ff6e1b)
+
+running 38 tests
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test all_gates_pass_when_everything_passes ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test assertion_op_as_str_covers_all_variants ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test artifacts_gate_fails_when_artifacts_empty ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test blocking_gate_fails_when_blocking_scenario_fails ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test divergence_report_captures_envelope_violations ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test divergence_report_counts_match_entries ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test contains_passes_when_substring_present ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test corpus_serde_roundtrip ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test empty_assertions_with_valid_envelope_passes ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test empty_results_produce_passing_summary ... ok
+test envelope_rejects_overwritten_ok_from_regression_seed ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test envelope_branch_matches_when_assertions_fail_but_json_envelope_is_valid ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test envelope_gate_fails_when_envelope_invalid ... ok
+test envelope_invalid_for_non_json_non_toon ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test envelope_valid_for_error_code_json ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test envelope_valid_for_ok_true_json ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test eq_assertion_passes_for_matching_value ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test eq_assertion_fails_for_mismatched_value ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test execution_error_produces_untested_status ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test evaluate_preserves_scenario_metadata ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test failure_branch_matches_when_success_fails_but_failure_passes ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test hp_gate_passes_when_pass_rate_met ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test hp_gate_fails_when_intentional_delta_budget_exceeded ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test has_any_passes_when_key_exists ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test in_assertion_fails_when_value_absent ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test intentional_delta_note_produces_intentional_delta_status ... ok
+test in_assertion_passes_when_value_in_array ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test is_array_fails_for_non_arrays ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test is_pass_only_true_for_pass ... ok
+test matrix_serde_roundtrip ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test is_array_passes_for_arrays ... ok
+test nested_path_resolves_deep_values ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test priority_as_str_is_stable ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test summary_counts_are_consistent ... ok
+proptest: FileFailurePersistence::SourceParallel set, but failed to find lib.rs or main.rs
+test stderr_path_captures_raw_stderr ... ok
+test stdout_path_captures_raw_stdout ... ok
+test scenario_result_serde_roundtrip ... ok
+test toon_envelope_passes_for_nonempty_stdout ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+  [2m2026-09-21T06:48:52.763781Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 333078ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1482 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:48:52.774802Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1573 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:48:52.774881Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /var/tmp/ft-rch-release-20260920-quality-v3/frankenterm/paired-c81fa6bc5def09d76929b19e765a995b on ts1[0m
+    [2;3mat[0m rch/src/transfer.rs:4648 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:48:52.987341Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifact retrieval budget from selected remote files, [1;32mselected_bytes[0m[32m: 0, [1;32mtotal_timeout_ms[0m[32m: 30000[0m
+    [2;3mat[0m rch/src/transfer.rs:1717 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:48:53.194082Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 419ms (0 files, 44 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:4705 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-21T06:48:53.194128Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 0 files, 44 bytes in 419ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1605 [2;3mon[0m ThreadId(1)
+
+[W] Worker: ts1 | Job: j-30023644042233666
+[T] Total: 354.1s (sync 20.6s, build 333.1s, artifacts 419ms)
+^ Sync: 345.8 MB in 20.6s (16.8 MB/s)
+[C] Compile: 333.1s
+v Artifacts: 44 B in 419ms (105 B/s)
+[T] Cache: MISS
++------------- [OK] Build Successful -------------+
+| Target: test-recovery                           |
+| Duration: 5.6m (v 56% faster vs previous 12.7m) |
+| Artifacts: 0 files (44 B)                       |
+| Worker: ts1                                     |
+| Cache: MISS (warming cache)                     |
+| Time: 2026-09-21 06:48:53                       |
++-------------------------------------------------+
+[RCH] remote ts1 (375.1s)
+[RCH] clean-overlay receipt: base=773f5898277ebb612717065386835359d163e9df overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195 tree=3541bbfad9109fa6a38e296f334fe5f143128715

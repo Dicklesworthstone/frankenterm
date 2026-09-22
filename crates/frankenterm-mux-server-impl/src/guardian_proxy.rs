@@ -173,6 +173,15 @@ impl Drop for GuardianDomainSpawnAdmission {
 }
 
 impl GuardianDomain {
+    #[cfg(test)]
+    pub(crate) fn with_held_recovery_admission_for_test(&self, action: impl FnOnce()) {
+        self.admission
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .expect("test must start with idle spawn admission");
+        let _admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
+        action();
+    }
+
     /// Construct a private domain from authenticated recovery metadata without
     /// allocating a new domain ID or consulting current command defaults.
     /// Endpoint authentication still occurs on the guardian connection; this
@@ -246,17 +255,14 @@ impl Domain for GuardianDomain {
         // that policy while a worker or an unpublished birth still owns the
         // original domain's fence. Share spawn admission across the complete
         // read so a new worker cannot start between these checks.
-        anyhow::ensure!(
-            self.admission
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "guardian domain spawn admission is busy during recovery capture"
-        );
+        self.admission
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| mux::domain::DomainRecoveryPolicyBusy)?;
         let _admission = GuardianDomainSpawnAdmission(Arc::clone(&self.admission));
         let state = self
             .state
             .try_lock()
-            .context("guardian domain birth state is busy during recovery capture")?;
+            .ok_or(mux::domain::DomainRecoveryPolicyBusy)?;
         anyhow::ensure!(
             state.unadopted_birth.is_none()
                 || state
@@ -610,6 +616,10 @@ pub enum GuardianProxyError {
     UnexpectedMutationReply,
     #[error("guardian checkpoint staging returned an inconsistent durable state")]
     CheckpointStageInvariant,
+    #[error(
+        "guardian checkpoint staging admission exhausted its bounded retry budget; exact publication remains pending"
+    )]
+    CheckpointStageAdmissionBusy,
     #[error("guardian checkpoint staging was quarantined")]
     CheckpointStageQuarantined,
     #[error("guardian checkpoint staging expired before durable acknowledgement")]
@@ -2005,7 +2015,17 @@ impl PendingGuardianCheckpointPublication {
             .checked_mul(2)
             .and_then(|steps| steps.checked_add(8))
             .ok_or(GuardianProxyError::CheckpointStageCapacity)?;
-        for _ in 0..max_steps {
+        for step in 0..=max_steps {
+            if step == max_steps
+                && matches!(
+                    status,
+                    GuardianCheckpointStageStatus::Absent
+                        | GuardianCheckpointStageStatus::Progress(_)
+                )
+            {
+                return Err(GuardianProxyError::CheckpointStageAdmissionBusy);
+            }
+            let previous = status;
             status = match status {
                 GuardianCheckpointStageStatus::Absent => self.send_begin(transport)?,
                 GuardianCheckpointStageStatus::Progress(next_index)
@@ -2049,6 +2069,13 @@ impl PendingGuardianCheckpointPublication {
                     return Err(GuardianProxyError::CheckpointStageInvariant);
                 }
             };
+            if let GuardianCheckpointStageStatus::Progress(previous_index) = previous {
+                if matches!(status, GuardianCheckpointStageStatus::Absent)
+                    || matches!(status, GuardianCheckpointStageStatus::Progress(next_index) if next_index < previous_index)
+                {
+                    return Err(GuardianProxyError::CheckpointStageInvariant);
+                }
+            }
         }
         Err(GuardianProxyError::CheckpointStageInvariant)
     }
@@ -2059,12 +2086,15 @@ impl PendingGuardianCheckpointPublication {
         completion_id: Uuid,
     ) -> Result<(), GuardianProxyError> {
         let mut status = self.send_ack(transport, completion_id)?;
-        for _ in 0..GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS {
+        for attempt in 0..=GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS {
             match status {
                 GuardianCheckpointStageStatus::Acked(observed) if observed == completion_id => {
                     return Ok(());
                 }
                 GuardianCheckpointStageStatus::Sealed(observed) if observed == completion_id => {
+                    if attempt == GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS {
+                        return Err(GuardianProxyError::CheckpointStageAdmissionBusy);
+                    }
                     status = self.send_ack(transport, completion_id)?;
                 }
                 GuardianCheckpointStageStatus::Expired => {
@@ -7525,7 +7555,7 @@ mod tests {
                 assert!(domain.recovery_policy(&config::configuration()).is_err());
                 assert!(matches!(
                     mux.capture_topology_coherent(Default::default()),
-                    Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+                    Err(mux::MuxTopologyCaptureError::DomainPolicyBusy)
                 ));
                 assert!(domain.admission.load(Ordering::Acquire));
                 drop(spawn);
@@ -7824,6 +7854,7 @@ mod tests {
 
     struct FakeCheckpointStageState {
         calls: Vec<(Uuid, GuardianCheckpointStageKindV1)>,
+        refuse_before_mutation: Option<GuardianCheckpointStageKindV1>,
         lose_reply_once: VecDeque<GuardianCheckpointStageKindV1>,
         scope: Option<GuardianCheckpointScopeV1>,
         upload_id: Option<Uuid>,
@@ -7840,6 +7871,7 @@ mod tests {
         fn new(lose_reply_once: impl IntoIterator<Item = GuardianCheckpointStageKindV1>) -> Self {
             Self {
                 calls: Vec::new(),
+                refuse_before_mutation: None,
                 lose_reply_once: lose_reply_once.into_iter().collect(),
                 scope: None,
                 upload_id: None,
@@ -7930,6 +7962,15 @@ mod tests {
             let completion_id = request.completion_id();
             let mut state = self.state.lock();
             state.calls.push((request_id, kind));
+
+            if state.refuse_before_mutation == Some(kind) {
+                return Err(GuardianProxyError::Client(GuardianClientError::Io(
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "injected busy guardian before mutation",
+                    ),
+                )));
+            }
 
             match kind {
                 GuardianCheckpointStageKindV1::Begin => {
@@ -11473,6 +11514,168 @@ mod tests {
             (1..=32).contains(&transport.calls),
             "persistent failure must exhaust its finite admission budget"
         );
+    }
+
+    #[test]
+    fn checkpoint_stage_contradictions_remain_terminal_not_busy() {
+        struct Replies(VecDeque<GuardianCheckpointStageReplyV1>);
+        impl GuardianCheckpointStageTransport for Replies {
+            fn checkpoint_stage(
+                &mut self,
+                _request_id: Uuid,
+                _request: GuardianCheckpointStageRequestV1,
+            ) -> Result<GuardianCheckpointStageReplyV1, GuardianProxyError> {
+                Ok(self
+                    .0
+                    .pop_front()
+                    .expect("contradiction must stop without another exchange"))
+            }
+        }
+        for fault in 0..4 {
+            let fixture = capture_record_checkpoint_fixture();
+            let mut pending = PendingGuardianCheckpointPublication::from_live_capture(
+                identity(),
+                fixture.capture,
+            )
+            .unwrap();
+            let upload_id = pending.upload_id;
+            let progress = GuardianCheckpointStageReplyV1::Progress {
+                upload_id,
+                next_index: 1,
+                committed_bytes: u64::from(pending.chunk_bytes)
+                    .min(pending.descriptor.total_bytes()),
+            };
+            let contradiction = match fault {
+                0 => GuardianCheckpointStageReplyV1::Absent { upload_id },
+                1 => GuardianCheckpointStageReplyV1::Ready {
+                    upload_id,
+                    next_index: 0,
+                    committed_bytes: 0,
+                },
+                2 => GuardianCheckpointStageReplyV1::Progress {
+                    upload_id,
+                    next_index: 1,
+                    committed_bytes: 0,
+                },
+                _ => {
+                    pending.completion_id = Some(id(0x3001));
+                    GuardianCheckpointStageReplyV1::Sealed {
+                        upload_id,
+                        completion_id: id(0x3002),
+                        checkpoint_id: pending.descriptor.checkpoint_id(),
+                        boundary_id: pending.descriptor.boundary_id(),
+                        total_bytes: pending.descriptor.total_bytes(),
+                    }
+                }
+            };
+            let mut transport = Replies(VecDeque::from([progress, contradiction]));
+            assert!(matches!(
+                pending.drive_to_sealed(&mut transport),
+                Err(GuardianProxyError::CheckpointStageInvariant)
+            ));
+            assert!(transport.0.is_empty());
+            assert!(pending.adoption_receipt.is_none());
+        }
+    }
+
+    #[test]
+    fn checkpoint_stage_busy_budget_preserves_exact_upload_for_retry() {
+        for blocked in [
+            GuardianCheckpointStageKindV1::Begin,
+            GuardianCheckpointStageKindV1::Chunk,
+            GuardianCheckpointStageKindV1::Ack,
+        ] {
+            let fixture = capture_record_checkpoint_fixture();
+            let expected_payload = fixture.checkpoint.clone();
+            let descriptor = fixture.descriptor;
+            let total_chunks = u32::try_from(
+                descriptor
+                    .total_bytes()
+                    .div_ceil(u64::from(GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES)),
+            )
+            .unwrap();
+            let mut pending = PendingGuardianCheckpointPublication {
+                scope: GuardianCheckpointScopeV1::Pane {
+                    pane_id: identity().pane_id(),
+                    generation: identity().generation(),
+                },
+                upload_id: id(0x2_000_001),
+                descriptor,
+                chunk_bytes: GUARDIAN_CHECKPOINT_STAGE_CHUNK_BYTES,
+                total_chunks,
+                capture: fixture.capture,
+                begin_request_id: id(0x2_000_002),
+                chunk_request_ids: (0..total_chunks)
+                    .map(|index| id(0x2_000 + u128::from(index)))
+                    .collect(),
+                query_request_id: id(0x2_000_003),
+                seal_request_id: id(0x2_000_004),
+                ack_request_id: id(0x2_000_005),
+                completion_id: None,
+                adoption_receipt: None,
+            };
+            let state = Arc::new(Mutex::new(FakeCheckpointStageState::new([])));
+            state.lock().refuse_before_mutation = Some(blocked);
+            let mut transport = FakeCheckpointStageTransport {
+                state: Arc::clone(&state),
+            };
+            let exhausted = if blocked == GuardianCheckpointStageKindV1::Ack {
+                let completion = pending.drive_to_sealed(&mut transport).unwrap();
+                pending.drive_ack(&mut transport, completion)
+            } else {
+                pending.drive_to_sealed(&mut transport).map(|_| ())
+            };
+            assert!(matches!(
+                exhausted,
+                Err(GuardianProxyError::CheckpointStageAdmissionBusy)
+            ));
+            assert_eq!(pending.upload_id, id(0x2_000_001));
+            assert_eq!(pending.descriptor, descriptor);
+            assert!(pending.adoption_receipt.is_none());
+            {
+                let state = state.lock();
+                let refused = state
+                    .calls
+                    .iter()
+                    .filter(|(_, kind)| *kind == blocked)
+                    .count();
+                let bound = if blocked == GuardianCheckpointStageKindV1::Ack {
+                    GUARDIAN_CHECKPOINT_QUERY_ATTEMPTS + 1
+                } else {
+                    usize::try_from(total_chunks).unwrap() * 2 + 8
+                        - usize::from(blocked == GuardianCheckpointStageKindV1::Chunk)
+                };
+                assert_eq!(refused, bound, "unchanged finite mutation admission bound");
+                assert!(!state.acked);
+            }
+            state.lock().refuse_before_mutation = None;
+            let completion = pending.drive_to_sealed(&mut transport).unwrap();
+            pending.drive_ack(&mut transport, completion).unwrap();
+            let state = state.lock();
+            assert!(state.acked);
+            assert_eq!(state.payload.as_slice(), expected_payload.as_slice());
+            assert_eq!(state.upload_id, Some(pending.upload_id));
+            assert_eq!(state.completion_id, Some(completion));
+            for (kind, request_id) in [
+                (
+                    GuardianCheckpointStageKindV1::Begin,
+                    pending.begin_request_id,
+                ),
+                (GuardianCheckpointStageKindV1::Ack, pending.ack_request_id),
+                (
+                    GuardianCheckpointStageKindV1::Query,
+                    pending.query_request_id,
+                ),
+            ] {
+                assert!(
+                    state
+                        .calls
+                        .iter()
+                        .filter(|(_, observed)| *observed == kind)
+                        .all(|(observed, _)| *observed == request_id)
+                );
+            }
+        }
     }
 
     #[test]

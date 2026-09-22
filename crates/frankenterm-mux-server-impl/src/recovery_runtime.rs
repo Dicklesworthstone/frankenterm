@@ -216,6 +216,7 @@ impl CaptureState {
                 // messages and topology errors carry live object identities.
                 let reason = match error {
                     mux::MuxTopologyCaptureError::UnsupportedDomainPolicy => "domain_policy",
+                    mux::MuxTopologyCaptureError::DomainPolicyBusy => "domain_policy_busy",
                     mux::MuxTopologyCaptureError::AuthorityExhausted => "authority_exhausted",
                     mux::MuxTopologyCaptureError::ConcurrentMutation { .. } => {
                         "concurrent_mutation"
@@ -539,12 +540,23 @@ impl PeriodicRecovery {
                 CaptureState::open(&options, &mux, custody, &cx, restored.as_ref())
             }) {
                 Ok(state) => state,
-                Err(_) => {
+                Err(error) => {
+                    let retryable = matches!(
+                        error.downcast_ref::<mux::MuxTopologyCaptureError>(),
+                        Some(
+                            mux::MuxTopologyCaptureError::DomainPolicyBusy
+                                | mux::MuxTopologyCaptureError::ConcurrentMutation { .. }
+                        )
+                    );
                     return AttemptResult {
                         state: None,
                         published_generation: None,
-                        error: Some("authority_rejected"),
-                        terminal: true,
+                        error: Some(if retryable {
+                            "capture_busy"
+                        } else {
+                            "authority_rejected"
+                        }),
+                        terminal: !retryable,
                     };
                 }
             };
@@ -1046,6 +1058,87 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn periodic_recovery_busy_domain_retries_then_publishes_without_restart() {
+        let _serial = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (directory, options) = prepared();
+        let mux = Arc::new(mux::Mux::new(None));
+        let commands = LocalDomain::new("recovery-command-policy")
+            .unwrap()
+            .capture_recovery_policy(&config::ConfigHandle::default_config())
+            .unwrap();
+        let domain = Arc::new(
+            crate::guardian_proxy::GuardianDomain::from_recovery_policy(
+                &mux,
+                mux::domain::alloc_domain_id(),
+                "busy-guardian".into(),
+                mux::domain::DomainRecoveryPolicy::GuardianLocal {
+                    commands,
+                    socket_path: directory.path().join("unused-guardian.sock"),
+                    token_path: directory.path().join("unused-guardian.token"),
+                },
+            )
+            .unwrap(),
+        );
+        let registered: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered).unwrap();
+        mux.set_default_domain(&registered).unwrap();
+        let mut controller = PeriodicRecovery::new(options.clone(), Arc::clone(&mux), None)
+            .unwrap()
+            .unwrap();
+        let before = files(directory.path());
+        domain.with_held_recovery_admission_for_test(|| {
+            controller.poll(true);
+            assert!(!controller.is_settled());
+            pump_until(&mut controller, &executor, PeriodicRecovery::is_settled);
+            assert!(!controller.failed);
+            assert!(controller.state.is_none());
+            assert!(controller.last_success.is_none());
+            assert_eq!(files(directory.path()), before);
+        });
+        // The same controller retries on its configured interval after the
+        // actual spawn-admission owner releases its guard. No guardian child
+        // exists here: this proves publication of a retained empty domain.
+        pump_until(&mut controller, &executor, |c| c.last_success.is_some());
+        let published = selected(&options);
+        assert_eq!(published.generation(), 1);
+        assert_eq!(published.image().topology.domains.len(), 1);
+        assert_eq!(
+            published.image().topology.domains[0].domain_name,
+            "busy-guardian"
+        );
+        controller.request_shutdown();
+        pump_until(&mut controller, &executor, PeriodicRecovery::is_settled);
+    }
+
+    #[test]
+    fn periodic_recovery_unsupported_domain_is_terminal_without_publication() {
+        let _serial = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let (directory, options) = prepared();
+        let domain = LocalDomain::new_exec_domain(config::ExecDomain {
+            name: "unsupported-callback".into(),
+            fixup_command: "not-a-restorable-command".into(),
+            label: None,
+        })
+        .unwrap();
+        let mux = Arc::new(mux::Mux::new(Some(Arc::new(domain))));
+        assert!(matches!(
+            mux.capture_topology_coherent(Default::default()),
+            Err(mux::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+        ));
+        let before = files(directory.path());
+        let mut controller = PeriodicRecovery::new(options, mux, None).unwrap().unwrap();
+        pump_until(&mut controller, &executor, |c| c.failed && c.is_settled());
+        assert!(controller.last_success.is_none());
+        assert_eq!(files(directory.path()), before);
+        controller.next_due = Instant::now();
+        controller.poll(true);
+        assert!(controller.failed && controller.is_settled());
+        assert_eq!(files(directory.path()), before);
     }
 
     #[test]

@@ -629,11 +629,9 @@ fn vertex_from_glyph_quad_staging(vertex: GlyphQuadStagingVertex) -> Vertex {
     }
 }
 
-/// We prefer to allocate a quad at a time for HeapQuadAllocator
-/// because we tend to end up with fairly large arrays of Vertex
-/// and the total amount of contiguous memory is in the MB range,
-/// which is a bit gnarly to reallocate, and can waste several MB
-/// in unused capacity
+/// Compact cached quad, expanded to vertices only when applying a layer.
+/// Keeping these compact records contiguous avoids an allocation per glyph
+/// without retaining a full four-vertex array for ordinary rectangular quads.
 #[derive(Default)]
 pub struct BoxedQuad {
     position: (f32, f32, f32, f32),
@@ -773,9 +771,9 @@ impl BoxedQuad {
 
 #[derive(Default)]
 pub struct HeapQuadAllocator {
-    layer0: Vec<Box<BoxedQuad>>,
-    layer1: Vec<Box<BoxedQuad>>,
-    layer2: Vec<Box<BoxedQuad>>,
+    layer0: Vec<BoxedQuad>,
+    layer1: Vec<BoxedQuad>,
+    layer2: Vec<BoxedQuad>,
 }
 
 impl std::fmt::Debug for HeapQuadAllocator {
@@ -806,7 +804,9 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             _ => unreachable!(),
         };
 
-        quads.push(Box::new(BoxedQuad::default()));
+        // The returned borrow prevents another allocation until it is released;
+        // vector growth therefore cannot invalidate an outstanding quad handle.
+        quads.push(BoxedQuad::default());
 
         let quad = quads.last_mut().unwrap();
         Ok(QuadImpl::Boxed(quad))
@@ -832,7 +832,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
             unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), vertices.len() / 4) };
 
         for quad in src_quads {
-            dest_quads.push(Box::new(BoxedQuad::from_vertices(quad)));
+            dest_quads.push(BoxedQuad::from_vertices(quad));
         }
     }
 }
@@ -1536,6 +1536,51 @@ mod tests {
         assert_eq!(allocator.layer2.len(), 2);
         assert_vertices_match(&allocator.layer2[0].to_vertices(), &first);
         assert_vertices_match(&allocator.layer2[1].to_vertices(), &second);
+    }
+
+    #[test]
+    fn heap_quad_growth_preserves_allocated_and_imported_vertices() {
+        let mut allocator = HeapQuadAllocator::default();
+        let mut expected = [Vec::new(), Vec::new(), Vec::new()];
+        for index in 0..1025 {
+            let layer = index % 3;
+            let mut vertices = configured_quad();
+            for vertex in &mut vertices {
+                vertex.position[0] += index as f32;
+            }
+            if index % 2 == 0 {
+                allocator.extend_with(layer, &vertices);
+            } else {
+                let mut quad = allocator.allocate(layer).unwrap();
+                quad.set_position(index as f32, 2.0, index as f32 + 3.0, 4.0);
+                quad.set_fg_color(LinearRgba::with_components(0.1, 0.2, 0.3, 0.4));
+                let mut reference = BoxedQuad::default();
+                reference.set_position(index as f32, 2.0, index as f32 + 3.0, 4.0);
+                reference.set_fg_color(LinearRgba::with_components(0.1, 0.2, 0.3, 0.4));
+                vertices = reference.to_vertices();
+            }
+            expected[layer].push(vertices);
+        }
+        let mut destination = HeapQuadAllocator::default();
+        allocator
+            .apply_to(&mut TripleLayerQuadAllocator::Heap(&mut destination))
+            .unwrap();
+        for (actual, expected) in [
+            &destination.layer0,
+            &destination.layer1,
+            &destination.layer2,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(actual.len(), expected.len());
+            for (quad, vertices) in actual.iter().zip(expected) {
+                assert_eq!(
+                    bytemuck::bytes_of(&quad.to_vertices()),
+                    bytemuck::bytes_of(&vertices)
+                );
+            }
+        }
     }
 
     #[test]

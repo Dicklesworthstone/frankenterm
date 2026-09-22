@@ -5322,7 +5322,10 @@ impl Screen {
             .0
             .retain(|entry| entry.owner.strong_count() != 0);
         if self.selection_anchors.0.len() >= 16 {
-            return Ok(None);
+            // Live viewport/selection tokens temporarily occupy this bounded
+            // registry. This does not make supported coordinates unremappable:
+            // callers must retain the gesture and retry after a token retires.
+            return Err(ColdReadMetadataBusy);
         }
         let token = ScreenSelectionAnchor(Arc::new(()));
         self.selection_anchors.0.push(SelectionAnchorEntry {
@@ -10449,6 +10452,35 @@ pub(crate) mod tests {
             .collect();
         assert!(screen.capture_selection_anchor(1, points).is_none());
         assert_eq!(screen.selection_anchors.0.len(), 16);
+        #[cfg(feature = "use_serde")]
+        let mut tokens = tokens;
+        #[cfg(feature = "use_serde")]
+        {
+            assert_eq!(
+                screen.capture_selection_anchor_with_reads(1, points, &[]),
+                Err(ColdReadMetadataBusy),
+                "temporary token capacity must not downgrade a valid selection to unremappable"
+            );
+            // Invalid coordinates remain terminal even while the registry is
+            // full; capacity must not authorize a stale or malformed gesture.
+            for invalid in [[anchor_point(0, -1); 3], [points[0], points[1], None]] {
+                assert_eq!(
+                    screen.capture_selection_anchor_with_reads(1, invalid, &[]),
+                    Ok(None)
+                );
+            }
+            drop(tokens.pop().unwrap());
+            let recovered = screen
+                .capture_selection_anchor_with_reads(1, points, &[])
+                .unwrap()
+                .expect("one retired token makes the same supported gesture admissible");
+            assert_eq!(screen.selection_anchors.0.len(), 16);
+            screen.resize(test_size(1, 10, 96), test_cursor(0, 0, 1), 2, false);
+            assert_eq!(
+                screen.resolve_selection_anchor_with_reads(&recovered, 2, &[]),
+                Ok(Some(points))
+            );
+        }
         drop(tokens);
         assert!(screen.capture_selection_anchor(1, points).is_some());
         assert_eq!(screen.selection_anchors.0.len(), 1);

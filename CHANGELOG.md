@@ -26,11 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.6`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.7`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.6` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.7` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Mux connections flush the codec-discovery response before sending startup notifications. Clients retain negotiated notifications in their bounded quarantine while registration completes, preventing valid startup events from retiring the connection. Native qualification of this candidate remains pending.
 
 - Bell and user-variable notifications reserve GUI delivery capacity before local or remote pane mutation. Callback completion orders successive historical events without blocking the RPC reader. A fatal admission refusal revokes the exact connection even after readiness completes, while stale scopes cannot revoke a successor. Native qualification remains pending.
 - The legacy macOS Blocks declarations explicitly name the C ABI. The next native copy/invoke/dispose test must qualify these final declarations.

@@ -359,6 +359,8 @@ impl Default for MuxTopologyCaptureConfig {
 pub enum MuxTopologyCaptureError {
     #[error("domain directory or durable recovery policy is unsupported")]
     UnsupportedDomainPolicy,
+    #[error("domain recovery policy is temporarily busy")]
+    DomainPolicyBusy,
     #[error("mux topology authority exhausted")]
     AuthorityExhausted,
     #[error(
@@ -19613,9 +19615,13 @@ impl Mux {
                 if domain.domain_id() != *domain_id || domain.domain_name().len() > 65536 {
                     return Err(MuxTopologyCaptureError::UnsupportedDomainPolicy);
                 }
-                let policy = domain
-                    .recovery_policy(&captured_config)
-                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                let policy = domain.recovery_policy(&captured_config).map_err(|error| {
+                    if error.is::<domain::DomainRecoveryPolicyBusy>() {
+                        MuxTopologyCaptureError::DomainPolicyBusy
+                    } else {
+                        MuxTopologyCaptureError::UnsupportedDomainPolicy
+                    }
+                })?;
                 policy
                     .validate()
                     .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
@@ -20035,9 +20041,13 @@ impl Mux {
                 let expected = &captured_domains[captured_domains
                     .binary_search_by_key(domain_id, |domain| domain.domain_id)
                     .expect("captured domain census preserves every candidate")];
-                let policy = domain
-                    .recovery_policy(&captured_config)
-                    .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;
+                let policy = domain.recovery_policy(&captured_config).map_err(|error| {
+                    if error.is::<domain::DomainRecoveryPolicyBusy>() {
+                        MuxTopologyCaptureError::DomainPolicyBusy
+                    } else {
+                        MuxTopologyCaptureError::UnsupportedDomainPolicy
+                    }
+                })?;
                 policy
                     .validate()
                     .map_err(|_| MuxTopologyCaptureError::UnsupportedDomainPolicy)?;

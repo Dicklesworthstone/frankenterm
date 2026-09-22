@@ -7048,6 +7048,13 @@ impl TermWindow {
                 .is_some_and(|selection| selection.is_invalidated_by(selection_authority));
             if has_selection_anchor && authority_changed {
                 if let Some(mut selection) = self.selection(pane_id) {
+                    log::debug!(
+                        target: "frankenterm_gui::selection_anchor",
+                        "clear_layout pane={} native_anchor={} points={:?}",
+                        pane_id,
+                        selection.native_anchor().is_some(),
+                        selection.native_points()
+                    );
                     selection.clear();
                 }
                 if self.active_selection_drag_pane == Some(pane_id) {
@@ -7140,6 +7147,15 @@ impl TermWindow {
             {
                 self.clear_selection_drag();
                 if let Some(mut selection) = self.selection(pane.pane_id()) {
+                    log::debug!(
+                        target: "frankenterm_gui::selection_anchor",
+                        "clear_damage pane={} native_anchor={} selection_sequence={} frame_sequence={:?} points={:?}",
+                        pane_id,
+                        selection.native_anchor().is_some(),
+                        selection.seqno,
+                        frame.map(|frame| frame.source_sequence),
+                        selection.native_points()
+                    );
                     selection.clear();
                     selection.seqno = frame
                         .map_or_else(|| pane.get_current_seqno(), |frame| frame.source_sequence);

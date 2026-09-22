@@ -2585,8 +2585,8 @@ impl LineWrapGeometry {
             }
         };
         #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
-        if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
-            return cached.scorecard.line_count;
+        if let Some(count) = memoized_wrap_point_cache_row_count(cache_key) {
+            return count;
         }
         scratch.rebuild_metadata(
             widths
@@ -3022,8 +3022,12 @@ struct MemoizedWrapPointCache {
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
 impl MemoizedWrapPointCache {
-    fn get(&mut self, key: MemoizedWrapPointCacheKey) -> Option<MemoizedWrapPointCacheEntry> {
-        let entry = self.entries.get(&key).cloned();
+    fn get<R>(
+        &mut self,
+        key: MemoizedWrapPointCacheKey,
+        project: impl FnOnce(&MemoizedWrapPointCacheEntry) -> R,
+    ) -> Option<R> {
+        let entry = self.entries.get(&key).map(project);
         #[cfg(test)]
         if entry.is_some() {
             self.key_hits
@@ -3085,7 +3089,18 @@ fn memoized_wrap_point_cache_get(
     memoized_wrap_point_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(key)
+        .get(key, Clone::clone)
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_row_count(key: MemoizedWrapPointCacheKey) -> Option<usize> {
+    // Cold layout needs only the scalar count. Borrow the cached entry under
+    // the same lock and hit accounting instead of allocating and copying its
+    // break-offset vector for every historical paragraph.
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key, |entry| entry.scorecard.line_count)
 }
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]

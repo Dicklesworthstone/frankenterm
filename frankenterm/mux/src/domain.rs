@@ -37,6 +37,12 @@ pub(crate) fn reserve_recovered_domain_ids(maximum: usize) -> anyhow::Result<()>
 }
 pub type DomainId = usize;
 
+/// A supported policy cannot be read while its live admission or lock is held.
+/// This marker must not be used for unsupported policy or unresolved custody.
+#[derive(Debug, thiserror::Error)]
+#[error("domain recovery policy is temporarily busy")]
+pub struct DomainRecoveryPolicyBusy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainState {
     Detached,
@@ -922,10 +928,7 @@ impl LocalDomain {
     ) -> anyhow::Result<LocalDomainRecoveryPolicy> {
         #[cfg(unix)]
         let native_pty = {
-            let backend = self
-                .pty_system
-                .try_lock()
-                .context("domain PTY construction policy is busy")?;
+            let backend = self.pty_system.try_lock().ok_or(DomainRecoveryPolicyBusy)?;
             let backend: &dyn PtySystem = &**backend;
             backend
                 .downcast_ref::<portable_pty::unix::UnixPtySystem>()
@@ -1929,11 +1932,19 @@ mod tests {
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
         #[cfg(unix)]
         {
-            let native = LocalDomain::new("busy-backend")?;
-            let _held = native.pty_system.lock();
+            let native = Arc::new(LocalDomain::new("busy-backend")?);
+            let mux = Mux::new(Some(native.clone()));
+            let held = native.pty_system.lock();
             assert!(native
                 .capture_recovery_policy(&config::ConfigHandle::default_config())
-                .is_err());
+                .unwrap_err()
+                .is::<DomainRecoveryPolicyBusy>());
+            assert!(matches!(
+                mux.capture_topology_coherent(Default::default()),
+                Err(crate::MuxTopologyCaptureError::DomainPolicyBusy)
+            ));
+            drop(held);
+            assert!(mux.capture_topology_coherent(Default::default()).is_ok());
         }
         let domain = LocalDomain::new_exec_domain(ExecDomain {
             name: "callback-domain".into(),
@@ -1942,7 +1953,14 @@ mod tests {
         })?;
         assert!(domain
             .capture_recovery_policy(&config::ConfigHandle::default_config())
-            .is_err());
+            .unwrap_err()
+            .downcast_ref::<DomainRecoveryPolicyBusy>()
+            .is_none());
+        let mux = Mux::new(Some(Arc::new(domain)));
+        assert!(matches!(
+            mux.capture_topology_coherent(Default::default()),
+            Err(crate::MuxTopologyCaptureError::UnsupportedDomainPolicy)
+        ));
         let policy = LocalDomainRecoveryPolicy {
             default_prog: None,
             default_cwd: None,

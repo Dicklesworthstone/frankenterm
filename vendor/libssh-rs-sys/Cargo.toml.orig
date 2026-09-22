@@ -1,0 +1,23 @@
+[package]
+name = "libssh-rs-sys"
+version = "0.2.8"
+authors = ["Wez Furlong"]
+edition = "2018"
+links = "libssh"
+repository = "https://github.com/wez/libssh-rs"
+description = "Native bindings to the libssh library"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1.0"
+
+[dependencies]
+libz-sys = { optional=true, version = "1.1", default-features = false, features = ["libc"] }
+openssl-sys = "0.9.105"
+
+[features]
+vendored = ["libz-sys", "libz-sys/static"]
+vendored-openssl = ["openssl-sys/vendored"]
