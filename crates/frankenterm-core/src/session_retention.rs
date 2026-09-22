@@ -2337,12 +2337,14 @@ fn read_session_cleanup_attempt(conn: &Connection) -> Result<Option<String>, rus
     }
     // Reject oversized and non-text values before copying them into Rust.
     // An empty string is deliberately malformed, preserving the cleanup fence.
+    let max_bytes = i64::try_from(SESSION_CLEANUP_ATTEMPT_MAX_BYTES)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     conn.query_row(
         "SELECT CASE
              WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?2
              THEN value ELSE '' END
          FROM config WHERE key = ?1",
-        rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, SESSION_CLEANUP_ATTEMPT_MAX_BYTES],
+        rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, max_bytes],
         |row| row.get::<_, String>(0),
     )
     .optional()
