@@ -152,11 +152,11 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 2,
+        "chore": 3,
         "cleanup": 2,
         "cosmetic": 20,
-        "feat": 54,
-        "fix": 109,
+        "feat": 55,
+        "fix": 110,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 37
       },
-      "fork_side_commit_count": 254,
+      "fork_side_commit_count": 257,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-21T21:01:06-04:00",
-        "sha": "7827bc4ded361999ef9299461b93d4261fd07e78",
-        "subject": "fix(protocol): preserve startup notifications through codec and registration handshake"
+        "classification": "chore",
+        "committed_at": "2026-09-22T02:24:58-04:00",
+        "sha": "77905cf3d44d6dfadf43ced1a67c09c4954a1dd6",
+        "subject": "chore(beads): sync beads issues"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -636,12 +636,12 @@
     {
       "authors_raw": "[\"Wez Furlong <wez@wezfurlong.org>\"]",
       "classification_summary": {
-        "chore": 9,
+        "chore": 10,
         "cleanup": 3,
         "cosmetic": 30,
         "docs": 6,
-        "feat": 206,
-        "fix": 279,
+        "feat": 207,
+        "fix": 283,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 110
       },
-      "fork_side_commit_count": 721,
+      "fork_side_commit_count": 727,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-21T22:37:54-04:00",
-        "sha": "8483eafdd6a694630c3da889b900593ea52e0e78",
-        "subject": "test(mux): verify selection capture retries after registry exhaustion"
+        "classification": "chore",
+        "committed_at": "2026-09-22T02:24:58-04:00",
+        "sha": "77905cf3d44d6dfadf43ced1a67c09c4954a1dd6",
+        "subject": "chore(beads): sync beads issues"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 58,
-        "fix": 136,
+        "fix": 137,
         "other": 60,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
         "test": 71
       },
-      "fork_side_commit_count": 359,
+      "fork_side_commit_count": 360,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-21T23:09:32-04:00",
-        "sha": "6bf1a07134f6f03f25ebf928004f479704021777",
-        "subject": "test(term): preserve full cold-history selections through reflow"
+        "classification": "fix",
+        "committed_at": "2026-09-22T01:28:08-04:00",
+        "sha": "b3132cd43f9f7df79d07e5276a1794243d3d2024",
+        "subject": "fix(selection): preserve cold anchors while layout projection catches up"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2902,
-  "generated_at": "2026-09-22T03:11:21.642351Z",
+  "fork_side_commit_total": 2912,
+  "generated_at": "2026-09-22T06:26:23.730337Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
