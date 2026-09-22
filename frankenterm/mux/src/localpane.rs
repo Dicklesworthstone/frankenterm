@@ -4586,6 +4586,82 @@ impl LocalPane {
         Some((floor, term.current_seqno(), dimensions))
     }
 
+    /// Publish a native coordinate action without accepting a reflow transition.
+    /// Unlike the remote layout protocol, an initial identity mapping can be
+    /// installed here: the callback receives its new authority atomically.
+    /// The callback must not call pane methods that acquire the terminal lock.
+    pub fn publish_line_reads_at_unchanged_coordinates(
+        &self,
+        reads: &[frankenterm_term::screen::ScreenLineRead],
+        expected_floor: SequenceNo,
+        expected_sequence: SequenceNo,
+        expected_dimensions: RenderableDimensions,
+        publish: &mut dyn FnMut(SequenceNo, SequenceNo, RenderableDimensions),
+    ) -> Result<bool, frankenterm_term::screen::ColdReadMetadataBusy> {
+        let _diagnostic = MetadataRefusalDiagnostic::new();
+        let mut term = self
+            .terminal
+            .try_lock()
+            .ok_or_else(|| metadata_busy(MetadataRefusalStage::PublishLayoutTerminal))?;
+        let Some(floor) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)?
+        else {
+            return Ok(false);
+        };
+        let Some(dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(false);
+        };
+        if expected_sequence == SequenceNo::MAX
+            || floor != expected_floor
+            || term.current_seqno() != expected_sequence
+            || dimensions != expected_dimensions
+        {
+            record_metadata_refusal(MetadataRefusalStage::PublicationGeometry);
+            return Ok(false);
+        }
+        for read in reads {
+            if !term.screen().try_validate_line_read(read)?
+                || !term.screen().line_read_preserves_coordinates(read)
+            {
+                return Ok(false);
+            }
+        }
+        let changed = reads
+            .iter()
+            .any(|read| term.screen().line_read_changes_layout(read));
+        let Some(published_sequence) = expected_sequence
+            .checked_add(usize::from(changed))
+            .filter(|sequence| *sequence != SequenceNo::MAX)
+        else {
+            return Ok(false);
+        };
+        if changed {
+            term.increment_seqno();
+        }
+        for read in reads {
+            term.screen_mut()
+                .install_line_read_layout(read, published_sequence);
+        }
+        // A storage observation can advance independently of the terminal.
+        // Do not authorize an unrelated prune/replacement as our own install.
+        // Once installation happened, unavailable authority is a refusal, not
+        // permission to retry the old numeric request with a newer sequence.
+        let Ok(Some(published_floor)) =
+            Self::refresh_line_layout_floor(&self.line_layout_observation, &mut term)
+        else {
+            return Ok(false);
+        };
+        let Some(published_dimensions) = terminal_try_get_dimensions(&mut term) else {
+            return Ok(false);
+        };
+        if term.current_seqno() != published_sequence || published_dimensions != expected_dimensions
+        {
+            return Ok(false);
+        }
+        publish(published_floor, published_sequence, published_dimensions);
+        Ok(true)
+    }
+
     /// The source/layout checks and coordinate registration share one
     /// nonblocking terminal acquisition. A busy capture never fabricates a
     /// token from independently sampled metadata.
@@ -10475,6 +10551,134 @@ mod tests {
         let (_, lines) = pane.get_lines(0..1);
         assert!(lines[0].get_appdata().is_none());
         assert!(lines[0].as_str().starts_with("original"));
+    }
+
+    #[test]
+    fn native_identity_publication_returns_fresh_authority_and_rejects_stale_intent() {
+        let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission.store(true, Ordering::Relaxed);
+        let mut terminal = Terminal::new(
+            term_size(20, 2),
+            Arc::new(ColdResizeTestConfig(sink.clone())),
+            "FrankenTerm",
+            "native-identity-publication",
+            Box::new(Vec::new()),
+        );
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\n");
+        let pane = LocalPane::new(
+            721,
+            terminal,
+            Box::new(KillCountingChild {
+                kills: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(GuardianLifetimeTestMasterPty),
+            Box::new(Vec::<u8>::new()),
+            1,
+            [0x81; 16],
+            "native-identity-publication".to_string(),
+        );
+        let first = *sink.rows.lock().1.first_key_value().unwrap().0;
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let read = pane
+            .capture_line_read(first..first + 1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(pane
+            .terminal
+            .lock()
+            .screen()
+            .line_read_changes_layout(&read));
+        let reads = std::slice::from_ref(&read);
+        {
+            let _busy = pane.terminal.lock();
+            assert_eq!(
+                pane.publish_line_reads_at_unchanged_coordinates(
+                    reads,
+                    floor,
+                    sequence,
+                    dimensions,
+                    &mut |_, _, _| { panic!("busy identity publication") }
+                ),
+                Err(frankenterm_term::screen::ColdReadMetadataBusy)
+            );
+        }
+        let mut wrong_retention = dimensions;
+        wrong_retention.scrollback_top += 1;
+        assert!(!pane
+            .publish_line_reads_at_unchanged_coordinates(
+                reads,
+                floor,
+                sequence,
+                wrong_retention,
+                &mut |_, _, _| { panic!("wrong retention accepted") }
+            )
+            .unwrap());
+        let mut published = None;
+        assert!(pane
+            .publish_line_reads_at_unchanged_coordinates(
+                reads,
+                floor,
+                sequence,
+                dimensions,
+                &mut |floor, sequence, dimensions| {
+                    assert!(pane.terminal.try_lock().is_none());
+                    published = Some((floor, sequence, dimensions));
+                }
+            )
+            .unwrap());
+        let published = published.unwrap();
+        assert_eq!(published.1, sequence + 1);
+        assert_eq!(published.2, dimensions);
+        assert_eq!(pane.selection_source_snapshot(), Some(published));
+        assert!(!pane
+            .publish_line_reads_at_unchanged_coordinates(
+                reads,
+                floor,
+                sequence,
+                dimensions,
+                &mut |_, _, _| { panic!("previous authority accepted after publication") }
+            )
+            .unwrap());
+        assert!(pane
+            .publish_line_reads_at_unchanged_coordinates(
+                reads,
+                published.0,
+                published.1,
+                published.2,
+                &mut |f, s, d| {
+                    assert_eq!((f, s, d), published);
+                }
+            )
+            .unwrap());
+        pane.terminal.lock().resize(term_size(7, 2));
+        let (floor, sequence, dimensions) = pane.selection_source_snapshot().unwrap();
+        let reflow = pane
+            .capture_line_read(first..first + 1, &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(pane
+            .terminal
+            .lock()
+            .screen()
+            .line_read_changes_layout(&reflow));
+        assert!(!pane
+            .publish_line_reads_at_unchanged_coordinates(
+                std::slice::from_ref(&reflow),
+                floor,
+                sequence,
+                dimensions,
+                &mut |_, _, _| panic!("reflow reinterpreted a numeric action")
+            )
+            .unwrap());
+        assert_eq!(
+            pane.selection_source_snapshot(),
+            Some((floor, sequence, dimensions))
+        );
     }
 
     #[test]

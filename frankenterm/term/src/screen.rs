@@ -4976,6 +4976,24 @@ impl Screen {
         })
     }
 
+    /// A native numeric-coordinate action may initialize an identity mapping,
+    /// but may not reinterpret its coordinates through a new wrapped layout.
+    /// This is a mapping check only: callers must separately validate the read,
+    /// source sequence, dimensions and retained interval under publication lock.
+    #[cfg(feature = "use_serde")]
+    pub fn line_read_preserves_coordinates(&self, read: &ScreenLineRead) -> bool {
+        if !self.line_read_changes_layout(read) {
+            return true;
+        }
+        read.layout.as_ref().is_some_and(|next| {
+            self.cold_visual_layout_at_current_coordinates().is_none()
+                && next.stored_physical()
+                && next.source == next.visual
+                && next.resident_frontier == self.phys_to_stable_row_index(0)
+                && read.fragments.is_none()
+        })
+    }
+
     #[cfg(feature = "use_serde")]
     pub fn validates_prepared_cold_layout(
         &self,
@@ -13927,6 +13945,35 @@ pub(crate) mod tests {
 
     #[cfg(feature = "use_serde")]
     #[test]
+    fn cold_identity_publication_preserves_rows_and_rejects_reflow() {
+        let (mut screen, _) = stored_physical_fixture(9, 32);
+        let read = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .with_requested_physical_rows_only()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&read));
+        assert!(screen.line_read_changes_layout(&read));
+        assert!(screen.line_read_preserves_coordinates(&read));
+        screen.install_line_read_layout(&read, 2);
+        assert!(!screen.line_read_changes_layout(&read));
+        assert!(screen.line_read_preserves_coordinates(&read));
+
+        screen.resize(test_size(4, 7, 96), test_cursor(0, 0, 1), 3, false);
+        assert!(!screen.validates_line_read(&read));
+        let reflow = screen
+            .capture_line_read(0..1)
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(screen.validates_line_read(&reflow));
+        assert!(screen.line_read_changes_layout(&reflow));
+        assert!(!screen.line_read_preserves_coordinates(&reflow));
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
     fn stored_physical_first_large_prefix_read_decodes_only_requested_groups() {
         let (mut screen, sink) = stored_physical_fixture(20_001, 30_000);
         let requested = 19_969..19_997;
@@ -15560,14 +15607,10 @@ pub(crate) mod tests {
         let index = screen.cold_geometry_index.as_mut().unwrap();
         // Even a refused mutation cannot retain sharing with a captured
         // revision; successful append/prune uses this same entry boundary.
-        assert!(index
-            .append(StableRowIndex::MAX, &Line::new(0))
-            .is_none());
+        assert!(index.append(StableRowIndex::MAX, &Line::new(0)).is_none());
         assert!(!Arc::ptr_eq(&captured, &index.calculation));
         let current = Arc::as_ptr(&index.calculation);
-        assert!(index
-            .append(StableRowIndex::MAX, &Line::new(0))
-            .is_none());
+        assert!(index.append(StableRowIndex::MAX, &Line::new(0)).is_none());
         assert_eq!(current, Arc::as_ptr(&index.calculation));
     }
 

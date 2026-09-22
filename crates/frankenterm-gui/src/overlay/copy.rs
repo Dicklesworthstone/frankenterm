@@ -122,6 +122,270 @@ struct Jump {
     target: char,
 }
 
+type ContentPlans = anyhow::Result<Vec<wezterm_term::screen::ScreenLineRead>>;
+type ContentEffect = Box<dyn FnOnce(&mut TermWindow) -> Result<bool, &'static str>>;
+
+struct ContentReadReady {
+    plans: Option<ContentPlans>,
+    endpoint: Option<usize>,
+    retire: std::sync::mpsc::SyncSender<ContentPlans>,
+}
+
+impl Drop for ContentReadReady {
+    fn drop(&mut self) {
+        if let Some(plans) = self.plans.take() {
+            let _ = self.retire.send(plans);
+        }
+    }
+}
+
+/// Dimensions are reusable only during a synchronous, validated publication.
+#[derive(Default)]
+struct ContentViewportPublication {
+    dimensions: Mutex<Option<RenderableDimensions>>,
+}
+
+impl ContentViewportPublication {
+    fn with_dimensions(&self, dims: RenderableDimensions, publish: impl FnOnce()) {
+        struct Clear<'a>(&'a ContentViewportPublication);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                *self.0.dimensions.lock() = None;
+            }
+        }
+        *self.dimensions.lock() = Some(dims);
+        let _clear = Clear(self);
+        publish();
+    }
+
+    fn update_dirty(
+        &self,
+        viewport: Option<StableRowIndex>,
+        dirty: &mut RangeSet<StableRowIndex>,
+    ) -> bool {
+        let Some(dims) = *self.dimensions.lock() else {
+            return false;
+        };
+        dirty.add(compute_search_row_from_viewport(viewport, dims));
+        prune_dirty_results(dirty, retained_row_range(dims));
+        true
+    }
+}
+
+/// One accepted native navigation action. Hydrated storage remains charged to
+/// its existing line-reader permit until the worker retires it.
+struct ContentNavigation {
+    token: Arc<()>,
+    cancelled: Arc<AtomicBool>,
+    deadline: std::time::Instant,
+    cursor: (usize, StableRowIndex),
+    start: Option<SelectionCoordinate>,
+    mode: SelectionMode,
+    end: bool,
+    source: Option<(
+        crate::selection::SelectionAuthority,
+        SequenceNo,
+        RenderableDimensions,
+    )>,
+    receiver: Option<std::sync::mpsc::Receiver<ContentReadReady>>,
+    ready: Option<ContentReadReady>,
+}
+
+impl Drop for ContentNavigation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl ContentNavigation {
+    fn new(
+        cursor: (usize, StableRowIndex),
+        start: Option<SelectionCoordinate>,
+        mode: SelectionMode,
+        end: bool,
+    ) -> Self {
+        Self {
+            token: Arc::new(()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            cursor,
+            start,
+            mode,
+            end,
+            source: None,
+            receiver: None,
+            ready: None,
+        }
+    }
+
+    fn matches(
+        &self,
+        cursor: (usize, StableRowIndex),
+        start: Option<SelectionCoordinate>,
+        mode: SelectionMode,
+    ) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && self.cursor == cursor
+            && self.start == start
+            && self.mode == mode
+    }
+
+    fn poll(
+        &mut self,
+        pane: &dyn Pane,
+        cursor: (usize, StableRowIndex),
+        start: Option<SelectionCoordinate>,
+        mode: SelectionMode,
+        publish: &mut dyn FnMut(usize, crate::selection::SelectionAuthority, RenderableDimensions),
+    ) -> Result<bool, &'static str> {
+        if !self.matches(cursor, start, mode) {
+            return Err("copy content action superseded");
+        }
+        if self.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= self.deadline {
+            return Err("copy content navigation cancelled or timed out");
+        }
+        let Some(range) = one_line_range(self.cursor.1) else {
+            return Err("copy content row overflow");
+        };
+        if self.source.is_none() {
+            // Only called for LocalPane: this is an atomic try-lock observation.
+            self.source = crate::selection::SelectionAuthority::capture_source(pane);
+        }
+        let Some((authority, sequence, dimensions)) = self.source else {
+            return Ok(false);
+        };
+        let Some((_, current_sequence, _)) =
+            crate::selection::SelectionAuthority::capture_source(pane)
+        else {
+            return Ok(false);
+        };
+        if current_sequence != sequence {
+            return Err("copy content source changed");
+        }
+        if self.receiver.is_none() {
+            let Some(permit) = mux::pane::LineReadPermit::try_acquire() else {
+                return Ok(false);
+            };
+            let cancel = Arc::clone(&self.cancelled);
+            let deadline = self.deadline;
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let requested = range.clone();
+            let end = self.end;
+            let worker = permit
+                .start(
+                    move || cancel.load(Ordering::Acquire) || std::time::Instant::now() >= deadline,
+                    move |plans, permit| {
+                        let endpoint = plans.as_ref().ok().and_then(|plans| {
+                            if plans.len() != 1 {
+                                return None;
+                            }
+                            let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                            let mut work = 65_536;
+                            let (top, rows) = plans[0].try_clone_viewport_for_snapshot(
+                                requested.clone(),
+                                &mut bytes,
+                                &mut work,
+                            )?;
+                            if top != requested.start || rows.len() != 1 {
+                                return None;
+                            }
+                            let mut x = 0;
+                            for cell in rows[0].visible_cells() {
+                                if cell.str() != " " {
+                                    x = cell.cell_index();
+                                    if !end {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(x)
+                        });
+                        let (retire, retired) = std::sync::mpsc::sync_channel(1);
+                        if sender
+                            .send(ContentReadReady {
+                                plans: Some(plans),
+                                endpoint,
+                                retire,
+                            })
+                            .is_ok()
+                        {
+                            drop(retired.recv());
+                        }
+                        drop(permit);
+                    },
+                )
+                .map_err(|_| "copy content worker admission failed")?;
+            match pane.capture_line_read(range.clone(), &mut Default::default()) {
+                Some(Ok(plan)) => {
+                    self.receiver = Some(receiver);
+                    worker.submit(vec![plan.with_requested_physical_rows_only()]);
+                    if crate::selection::SelectionAuthority::capture_source(pane)
+                        .is_some_and(|(_, current, _)| current != sequence)
+                    {
+                        return Err("copy content changed during capture");
+                    }
+                }
+                Some(Err(error)) if error.is::<wezterm_term::screen::ColdReadMetadataBusy>() => {
+                    return Ok(false);
+                }
+                _ => return Err("copy content row could not be captured"),
+            }
+            return Ok(false);
+        }
+        if self.ready.is_none() {
+            match self.receiver.as_ref().unwrap().try_recv() {
+                Ok(ready) => self.ready = Some(ready),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(_) => return Err("copy content worker stopped"),
+            }
+        }
+        let plans = self
+            .ready
+            .as_ref()
+            .unwrap()
+            .plans
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .map_err(|_| "copy content hydration failed")?;
+        if plans.len() != 1 {
+            return Err("copy content read was incomplete");
+        }
+        let x = self
+            .ready
+            .as_ref()
+            .unwrap()
+            .endpoint
+            .ok_or("copy content endpoint was incomplete")?;
+        let local = pane
+            .downcast_ref::<mux::localpane::LocalPane>()
+            .ok_or("copy content navigation requires a native pane")?;
+        let mut published_source = None;
+        let valid = local.publish_line_reads_at_unchanged_coordinates(
+            plans,
+            authority.layout_floor(),
+            sequence,
+            dimensions,
+            &mut |floor, sequence, dimensions| {
+                if let Some(authority) = crate::selection::SelectionAuthority::from_native_snapshot(
+                    pane, floor, dimensions,
+                ) {
+                    publish(x, authority, dimensions);
+                    published_source = Some((authority, sequence, dimensions));
+                }
+            },
+        );
+        match valid {
+            Err(_) => Ok(false),
+            Ok(true) if published_source.is_some() => {
+                self.source = published_source;
+                Ok(true)
+            }
+            _ => Err("copy content source or layout changed"),
+        }
+    }
+}
+
 struct CopyRenderable {
     /// Exact, allocation-backed identity for this overlay instance. Numeric
     /// pane ids and per-instance run counters can both be reused; pointer
@@ -173,6 +437,9 @@ struct CopyRenderable {
     desired_result_ordinal: Option<usize>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
+    content_navigation: Option<ContentNavigation>,
+    content_action: Arc<()>,
+    content_viewport_publication: Arc<ContentViewportPublication>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -688,6 +955,267 @@ fn previous_row_within_scrollback(
 mod dirty_tracking_tests {
     use super::*;
 
+    #[test]
+    fn content_viewport_dimensions_only_apply_during_validated_publication() {
+        let publication = ContentViewportPublication::default();
+        let mut dirty = RangeSet::default();
+        dirty.add(150);
+        // An outstanding command, including one with stale captured dimensions,
+        // cannot supply the ordinary viewport callback's pruning authority.
+        assert!(!publication.update_dirty(Some(0), &mut dirty));
+        assert_eq!(collect_ranges(&dirty), vec![150..151]);
+        publication.with_dimensions(dimensions(90, 10), || {
+            assert!(publication.update_dirty(Some(90), &mut dirty));
+            assert_eq!(collect_ranges(&dirty), vec![99..100]);
+        });
+        dirty.add(150);
+        assert!(!publication.update_dirty(Some(140), &mut dirty));
+        assert_eq!(collect_ranges(&dirty), vec![99..100, 150..151]);
+
+        // Unwinding a synchronous viewport callback must not leak its old
+        // dimensions into a later ordinary viewport notification.
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publication.with_dimensions(dimensions(90, 10), || {
+                panic!("test viewport publication unwind");
+            });
+        }));
+        assert!(failed.is_err());
+        assert!(!publication.update_dirty(Some(140), &mut dirty));
+        assert_eq!(collect_ranges(&dirty), vec![99..100, 150..151]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_content_navigation_cold_unicode_busy_and_stale_actions() {
+        use wezterm_term::config::{ScrollbackSpillSink, ScrollbackTierConfig};
+        #[derive(Debug)]
+        struct ColdConfig(Arc<dyn ScrollbackSpillSink>);
+        impl wezterm_term::TerminalConfiguration for ColdConfig {
+            fn color_palette(&self) -> ColorPalette {
+                Default::default()
+            }
+            fn scrollback_size(&self) -> usize {
+                4096
+            }
+            fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+                ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                }
+            }
+            fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        let sink = frankenterm_mux_server_impl::open_scrollback_spill_sink(
+            root.path().to_path_buf(),
+            &config::ScrollbackSpillSinkContext {
+                pane_id: 998_731,
+                domain_id: 998_731,
+                durable_pane_id: *uuid::Uuid::new_v4().as_bytes(),
+                command_description: "owned content navigation regression".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut terminal = wezterm_term::Terminal::new(
+            TerminalSize {
+                rows: 3,
+                cols: 16,
+                dpi: 96,
+                pixel_width: 128,
+                pixel_height: 48,
+            },
+            Arc::new(ColdConfig(Arc::clone(&sink))),
+            "content-navigation",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes("  界e\u{301}  Z \r\n".as_bytes());
+        for _ in 0..1024 {
+            terminal.advance_bytes(b"filler\r\n");
+        }
+        sink.flush_scrollback().unwrap();
+        assert!(sink.retained_scrollback_rows() > 256);
+        assert!(terminal.screen().in_memory_scrollback_rows() < 8);
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_731,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_731,
+            [0x73; 16],
+            "owned navigation".to_owned(),
+        ));
+        struct ChildGuard(Arc<dyn Pane>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                self.0.kill();
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while !self.0.is_dead() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(self.0.is_dead(), "owned navigation child must be reaped");
+            }
+        }
+        let _child = ChildGuard(Arc::clone(&pane));
+        // Check the cold bytes with the synchronous oracle. This does not
+        // publish an owned layout: the first action must handle that itself.
+        let (top, rows) = pane.get_lines(0..1);
+        assert_eq!(top, 0);
+        assert_eq!(rows[0].as_str().trim_end(), "  界e\u{301}  Z");
+        let bottom = pane.get_dimensions().physical_top;
+        struct Hold {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl WithPaneLines for Hold {
+            fn with_lines_mut(&mut self, _: StableRowIndex, _: &mut [&mut Line]) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+        }
+        for (end, expected) in [(false, 2), (true, 7)] {
+            let mut action = ContentNavigation::new((0, 0), None, SelectionMode::Cell, end);
+            let (entered, held) = std::sync::mpsc::sync_channel(1);
+            let (release, wait) = std::sync::mpsc::sync_channel(1);
+            let owned = Arc::clone(&pane);
+            let holder = std::thread::spawn(move || {
+                owned.with_lines_mut(
+                    bottom..bottom + 1,
+                    &mut Hold {
+                        entered,
+                        release: wait,
+                    },
+                )
+            });
+            held.recv_timeout(Duration::from_secs(3)).unwrap();
+            let began = std::time::Instant::now();
+            let mut result = None;
+            assert!(
+                !action
+                    .poll(&*pane, (0, 0), None, SelectionMode::Cell, &mut |x, _, _| {
+                        result = Some(x)
+                    })
+                    .unwrap()
+            );
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "accepted action blocked on held terminal"
+            );
+            assert_eq!(result, None);
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            loop {
+                if action
+                    .poll(&*pane, (0, 0), None, SelectionMode::Cell, &mut |x, _, _| {
+                        result = Some(x)
+                    })
+                    .unwrap()
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < action.deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(result, Some(expected), "exact wide/combining-cell endpoint");
+        }
+        for stale in ["cursor", "selection", "close", "source", "geometry"] {
+            let mut action = ContentNavigation::new((0, 0), None, SelectionMode::Cell, true);
+            while action.receiver.is_none() {
+                assert!(
+                    !action
+                        .poll(
+                            &*pane,
+                            (0, 0),
+                            None,
+                            SelectionMode::Cell,
+                            &mut |_, _, _| panic!("first capture must not publish")
+                        )
+                        .unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            action.ready = Some(
+                action
+                    .receiver
+                    .as_ref()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap(),
+            );
+            let mut cursor = (0, 0);
+            let mut start = None;
+            match stale {
+                "cursor" => cursor.0 = 1,
+                "selection" => start = Some(SelectionCoordinate::x_y(1, 0)),
+                "close" => action.cancelled.store(true, Ordering::Release),
+                "source" => pane
+                    .perform_actions(vec![termwiz::escape::Action::PrintString(
+                        "changed".to_owned(),
+                    )])
+                    .unwrap(),
+                "geometry" => {
+                    pane.resize(TerminalSize {
+                        rows: 3,
+                        cols: 8,
+                        dpi: 96,
+                        pixel_width: 64,
+                        pixel_height: 48,
+                    })
+                    .unwrap();
+                    // resize() admits an asynchronous worker. Fence its real
+                    // geometry publication before testing the stale read;
+                    // admission alone still permits the old source.
+                    loop {
+                        assert!(
+                            std::time::Instant::now() < action.deadline,
+                            "owned resize must complete within the original action deadline"
+                        );
+                        if crate::selection::SelectionAuthority::capture_source(&*pane).is_some_and(
+                            |(_, _, dims)| {
+                                dims.cols == 8
+                                    && dims.viewport_rows == 3
+                                    && dims.dpi == 96
+                                    && dims.pixel_width == 64
+                                    && dims.pixel_height == 48
+                            },
+                        ) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let mut published = false;
+            assert!(
+                action
+                    .poll(
+                        &*pane,
+                        cursor,
+                        start,
+                        SelectionMode::Cell,
+                        &mut |_, _, _| published = true
+                    )
+                    .is_err(),
+                "{stale}"
+            );
+            assert!(!published, "stale {stale} must not move the cursor");
+        }
+    }
+
     fn make_dirty_ranges(
         ranges: impl IntoIterator<Item = Range<StableRowIndex>>,
     ) -> RangeSet<StableRowIndex> {
@@ -1145,6 +1673,9 @@ impl CopyOverlay {
             desired_result_ordinal: None,
             pending_jump: None,
             last_jump: None,
+            content_navigation: None,
+            content_action: Arc::new(()),
+            content_viewport_publication: Arc::new(ContentViewportPublication::default()),
         };
 
         let search_row = render.compute_search_row();
@@ -1191,7 +1722,14 @@ impl CopyOverlay {
                 render.dirty_results.add(last);
             }
             render.viewport = viewport;
-            render.mark_search_ui_dirty();
+            let publication = Arc::clone(&render.content_viewport_publication);
+            if publication.update_dirty(viewport, &mut render.dirty_results) {
+                // Only the synchronous, source-validated set_viewport call may
+                // reuse dimensions without relocking the terminal.
+                render.window.invalidate();
+            } else {
+                render.mark_search_ui_dirty();
+            }
         }
     }
 }
@@ -1879,6 +2417,8 @@ impl CopyRenderable {
     }
 
     fn select_to_cursor_pos(&mut self) {
+        self.content_navigation.take();
+        self.content_action = Arc::new(());
         self.clamp_cursor_to_scrollback();
         if let Some(sel_start) = self.start {
             let cursor = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
@@ -1998,6 +2538,9 @@ impl CopyRenderable {
     }
 
     fn close(&self) {
+        if let Some(pending) = &self.content_navigation {
+            pending.cancelled.store(true, Ordering::Release);
+        }
         let pane_id = self.delegate.pane_id();
         let instance_token = Arc::clone(&self.instance_token);
         self.window
@@ -2226,7 +2769,231 @@ impl CopyRenderable {
         self.select_to_cursor_pos();
     }
 
+    fn start_content_navigation(&mut self, end: bool) -> bool {
+        // Remote panes and semantic-zone expansion retain their existing path;
+        // neither has the bounded native row/metadata contract used here.
+        if self
+            .delegate
+            .downcast_ref::<mux::localpane::LocalPane>()
+            .is_none()
+            || self.selection_mode == SelectionMode::SemanticZone
+        {
+            return false;
+        }
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "copy content navigation",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.content_navigation.take();
+                log::error!("{error:#}; copy content navigation was not accepted");
+                return true;
+            }
+        };
+        self.content_navigation = Some(ContentNavigation::new(
+            (self.cursor.x, self.cursor.y),
+            self.start,
+            self.selection_mode,
+            end,
+        ));
+        self.content_action = Arc::clone(&self.content_navigation.as_ref().unwrap().token);
+        let token = Arc::clone(&self.content_action);
+        let instance = Arc::clone(&self.instance_token);
+        let pane_id = self.delegate.pane_id();
+        let window = self.window.clone();
+        reservation
+            .spawn_local(async move {
+                loop {
+                    let (send, recv) = oneshot::channel();
+                    let token = Arc::clone(&token);
+                    let instance = Arc::clone(&instance);
+                    window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                        let render = {
+                            let Some(state) = tw.pane_state(pane_id) else {
+                                return;
+                            };
+                            let Some(copy) = state
+                                .overlay
+                                .as_ref()
+                                .and_then(|overlay| overlay.pane.downcast_ref::<CopyOverlay>())
+                            else {
+                                return;
+                            };
+                            Arc::clone(&copy.render)
+                        };
+                        let (retry, effect) = {
+                            let mut r = render.lock();
+                            if !Arc::ptr_eq(&r.instance_token, &instance)
+                                || !Arc::ptr_eq(&r.content_action, &token)
+                            {
+                                return;
+                            }
+                            r.drive_content_navigation()
+                        };
+                        let retry = if let Some(effect) = effect {
+                            match effect(tw) {
+                                Ok(false) => true,
+                                outcome => {
+                                    render.lock().content_navigation.take();
+                                    if let Err(reason) = outcome {
+                                        log::warn!("{reason}");
+                                    }
+                                    false
+                                }
+                            }
+                        } else {
+                            retry
+                        };
+                        let _ = send.send(retry);
+                    })));
+                    if !matches!(recv.await, Ok(true)) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .detach();
+        true
+    }
+
+    fn drive_content_navigation(&mut self) -> (bool, Option<ContentEffect>) {
+        let Some(mut pending) = self.content_navigation.take() else {
+            return (false, None);
+        };
+        if !pending.matches(
+            (self.cursor.x, self.cursor.y),
+            self.start,
+            self.selection_mode,
+        ) {
+            return (false, None);
+        }
+        let pane = Arc::clone(&self.delegate);
+        let mut metadata = None;
+        let result = pending.poll(
+            &*pane,
+            (self.cursor.x, self.cursor.y),
+            self.start,
+            self.selection_mode,
+            &mut |x, authority, dimensions| {
+                // Publication holds the pane's source/layout fence. Never call a
+                // pane getter or selection helper that relocks the terminal here.
+                self.cursor.x = x;
+                metadata = Some((authority, dimensions));
+            },
+        );
+        if let Some((authority, dims)) = metadata {
+            let sequence = pending.source.unwrap().1;
+            pending.cursor = (self.cursor.x, self.cursor.y);
+            self.content_navigation = Some(pending);
+            return (
+                true,
+                Some(self.finish_content_navigation(authority, sequence, dims)),
+            );
+        }
+        if let Err(reason) = result {
+            log::warn!("{reason}");
+            self.window.invalidate();
+            return (false, None);
+        }
+        self.content_navigation = Some(pending);
+        (true, None)
+    }
+
+    fn finish_content_navigation(
+        &self,
+        authority: crate::selection::SelectionAuthority,
+        sequence: SequenceNo,
+        dims: RenderableDimensions,
+    ) -> ContentEffect {
+        let pane = Arc::clone(&self.delegate);
+        let pane_id = pane.pane_id();
+        let cursor = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
+        let mode = self.selection_mode;
+        let range = self.start.map(|start| {
+            if mode == SelectionMode::Line {
+                let above = cursor.y < start.y;
+                SelectionRange {
+                    start: SelectionCoordinate::x_y(if above { usize::MAX } else { 0 }, start.y),
+                    end: SelectionCoordinate::x_y(if above { 0 } else { usize::MAX }, cursor.y),
+                }
+            } else {
+                SelectionRange { start, end: cursor }
+            }
+        });
+        let top = self.viewport.unwrap_or(dims.physical_top);
+        let gap: StableRowIndex = if dims.physical_top <= 5 { 1 } else { 5 };
+        let viewport = if top > cursor.y || cursor.y.saturating_sub(top) < gap {
+            Some(cursor.y.saturating_sub(gap))
+        } else if StableRowIndex::try_from(dims.viewport_rows)
+            .unwrap_or(StableRowIndex::MAX)
+            .saturating_sub(cursor.y.saturating_sub(top))
+            < gap
+        {
+            Some(cursor.y.saturating_add(gap).saturating_sub(
+                StableRowIndex::try_from(dims.viewport_rows).unwrap_or(StableRowIndex::MAX),
+            ))
+        } else {
+            None
+        };
+        let instance = Arc::clone(&self.instance_token);
+        let action = Arc::clone(&self.content_action);
+        let cursor_x = self.cursor.x;
+        let selected_start = self.start;
+        let publication = Arc::clone(&self.content_viewport_publication);
+        self.window.invalidate();
+        Box::new(move |tw| {
+            // A queued completion cannot change a replacement overlay.
+            let current = tw.pane_state(pane_id).and_then(|state| {
+                state
+                    .overlay
+                    .as_ref()
+                    .and_then(|overlay| overlay.pane.downcast_ref::<CopyOverlay>())
+                    .map(|copy| {
+                        let render = copy.render.lock();
+                        Arc::ptr_eq(&render.instance_token, &instance)
+                            && Arc::ptr_eq(&render.content_action, &action)
+                            && render.cursor.x == cursor_x
+                            && render.cursor.y == cursor.y
+                            && render.start == selected_start
+                            && render.selection_mode == mode
+                    })
+            });
+            if current != Some(true) {
+                return Err("copy content action superseded");
+            }
+            let Some((current_authority, current_sequence, current_dims)) =
+                crate::selection::SelectionAuthority::capture_source(&*pane)
+            else {
+                return Ok(false);
+            };
+            if current_authority != authority
+                || current_sequence != sequence
+                || current_dims != dims
+            {
+                return Err("copy content source changed before selection/viewport publication");
+            }
+            if let Some(range) = range {
+                tw.update_selection_with_seqno(&pane, Some(authority), sequence, |selection| {
+                    selection.origin = Some(range.start);
+                    selection.range = Some(range);
+                    selection.rectangular = mode == SelectionMode::Block;
+                });
+            }
+            if let Some(viewport) = viewport {
+                publication.with_dimensions(dims, || {
+                    tw.set_viewport(pane_id, Some(viewport), dims);
+                });
+            }
+            Ok(true)
+        })
+    }
+
     fn move_to_end_of_line_content(&mut self) {
+        if self.start_content_navigation(true) {
+            return;
+        }
         let y = self.cursor.y;
         let Some(line_range) = one_line_range(y) else {
             self.select_to_cursor_pos();
@@ -2246,6 +3013,9 @@ impl CopyRenderable {
     }
 
     fn move_to_start_of_line_content(&mut self) {
+        if self.start_content_navigation(false) {
+            return;
+        }
         let y = self.cursor.y;
         let Some(line_range) = one_line_range(y) else {
             self.select_to_cursor_pos();
@@ -2907,6 +3677,8 @@ impl Pane for CopyOverlay {
     fn perform_assignment(&self, assignment: &KeyAssignment) -> PerformAssignmentResult {
         use CopyModeAssignment::*;
         let mut render = self.render.lock();
+        render.content_navigation.take();
+        render.content_action = Arc::new(());
         if render.pending_jump.is_some() {
             // Block key assignments until key_down is called
             // and resolves the next state
