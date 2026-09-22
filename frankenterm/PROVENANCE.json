@@ -641,21 +641,21 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 277,
+        "fix": 279,
         "other": 54,
         "refactor": 12,
         "rename": 2,
         "runtime-swap": 3,
         "security-fix": 7,
-        "test": 109
+        "test": 110
       },
-      "fork_side_commit_count": 718,
+      "fork_side_commit_count": 721,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-21T21:16:22-04:00",
-        "sha": "d3c53f1c1aa6b8726c65eebee945247e61e7f87c",
-        "subject": "fix(mux): retry a busy guardian checkpoint instead of failing the domain"
+        "classification": "test",
+        "committed_at": "2026-09-21T22:37:54-04:00",
+        "sha": "8483eafdd6a694630c3da889b900593ea52e0e78",
+        "subject": "test(mux): verify selection capture retries after registry exhaustion"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -850,20 +850,20 @@
         "cleanup": 1,
         "cosmetic": 7,
         "feat": 14,
-        "fix": 46,
+        "fix": 47,
         "other": 31,
         "refactor": 3,
         "rename": 1,
         "security-fix": 2,
         "test": 22
       },
-      "fork_side_commit_count": 130,
+      "fork_side_commit_count": 131,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "other",
-        "committed_at": "2026-09-20T08:14:25-04:00",
-        "sha": "92980feedb0a7748ade16f1b056b9b6a214ff86d",
-        "subject": "perf(scrollback): canonicalize compact rows without cell vectors"
+        "classification": "fix",
+        "committed_at": "2026-09-21T21:56:39-04:00",
+        "sha": "a385a71431c3a51111c0b09b19efb562d582e390",
+        "subject": "fix(surface): read memoized wrap counts without copying break offsets"
       },
       "name": "frankenterm-surface",
       "path": "frankenterm/surface",
@@ -897,20 +897,20 @@
         "cosmetic": 15,
         "docs": 2,
         "feat": 58,
-        "fix": 135,
+        "fix": 136,
         "other": 60,
         "refactor": 5,
         "rename": 2,
         "security-fix": 6,
-        "test": 70
+        "test": 71
       },
-      "fork_side_commit_count": 357,
+      "fork_side_commit_count": 359,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "fix",
-        "committed_at": "2026-09-20T23:15:31-04:00",
-        "sha": "302e23b8611e2e8ef6cb969286385b4fcad8c472",
-        "subject": "fix(selection): preserve cold history endpoints through spill and reflow"
+        "classification": "test",
+        "committed_at": "2026-09-21T23:09:32-04:00",
+        "sha": "6bf1a07134f6f03f25ebf928004f479704021777",
+        "subject": "test(term): preserve full cold-history selections through reflow"
       },
       "name": "frankenterm-term",
       "path": "frankenterm/term",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2896,
-  "generated_at": "2026-09-22T01:22:06.804304Z",
+  "fork_side_commit_total": 2902,
+  "generated_at": "2026-09-22T03:11:21.642351Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
