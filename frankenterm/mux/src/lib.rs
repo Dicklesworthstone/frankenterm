@@ -17503,6 +17503,7 @@ impl Mux {
         &self,
         tab_id: TabId,
         expected: Option<&Arc<Tab>>,
+        expected_generation: Option<u64>,
     ) -> Option<(Arc<Tab>, Vec<RemovedPaneRegistration>)> {
         let tab = self.tabs.read().get(&tab_id).map(Arc::clone)?;
         if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &tab)) {
@@ -17517,6 +17518,11 @@ impl Mux {
             if !tabs
                 .get(&tab_id)
                 .is_some_and(|registered| Arc::ptr_eq(registered, &tab))
+            {
+                return None;
+            }
+            if expected_generation
+                .is_some_and(|generation| tab.active_mux_owner_generation() != Some(generation))
             {
                 return None;
             }
@@ -18168,7 +18174,7 @@ impl Mux {
     fn remove_tab_internal(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         log::debug!("remove_tab_internal tab {}", tab_id);
 
-        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
+        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None, None)?;
 
         self.flush_window_notifications();
 
@@ -18192,7 +18198,8 @@ impl Mux {
         let tab_id = expected.tab_id();
         log::debug!("remove exact tab instance {}", tab_id);
 
-        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, Some(expected))?;
+        let (tab, removed_panes) =
+            self.take_tab_and_panes_for_removal(tab_id, Some(expected), None)?;
 
         self.flush_window_notifications();
 
@@ -18824,6 +18831,29 @@ impl Mux {
         true
     }
 
+    /// Retire an owned applet tab's exact publication. The tab generation
+    /// is checked under the same registry locks as structural removal, so an
+    /// old cleanup cannot remove a later publication of the same `Arc<Tab>`.
+    /// Structural ownership disappears before deferred pane kill callbacks.
+    pub(crate) fn remove_tab_if_same_generation(
+        &self,
+        expected: &Arc<Tab>,
+        generation: u64,
+    ) -> bool {
+        let Some((_, removed_panes)) = self.take_tab_and_panes_for_removal(
+            expected.tab_id(),
+            Some(expected),
+            Some(generation),
+        ) else {
+            return false;
+        };
+        self.flush_window_notifications();
+        for removed in removed_panes {
+            self.finish_pane_removal(removed, true);
+        }
+        true
+    }
+
     /// Drop the LOCAL mirror of a tab without disturbing the remote session.
     ///
     /// Mirrors [`Mux::remove_tab`] (registry removal, detach from every window,
@@ -18836,7 +18866,7 @@ impl Mux {
     pub fn remove_tab_local_only(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         log::debug!("remove_tab_local_only tab {}", tab_id);
 
-        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
+        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None, None)?;
 
         self.flush_window_notifications();
 
@@ -29704,6 +29734,28 @@ mod tests {
             .to_string()
             .contains("already has an active mux-owner generation"));
         assert_eq!(stale_active.mux_owner_generation_for_test(), 1);
+    }
+
+    #[test]
+    fn owned_tab_cleanup_rejects_republished_generation() {
+        let origin = Arc::new(Mux::new(None));
+        let foreign = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        origin.add_tab_no_panes(&tab).unwrap();
+        let original_generation = tab.active_mux_owner_generation().unwrap();
+        assert!(!foreign.remove_tab_if_same_generation(&tab, original_generation));
+        assert!(origin.remove_tab_if_same_generation(&tab, original_generation));
+        assert!(origin.get_tab(tab.tab_id()).is_none());
+
+        origin.add_tab_no_panes(&tab).unwrap();
+        let successor_generation = tab.active_mux_owner_generation().unwrap();
+        assert_ne!(original_generation, successor_generation);
+        assert!(!origin.remove_tab_if_same_generation(&tab, original_generation));
+        assert!(origin
+            .get_tab(tab.tab_id())
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(origin.remove_tab_if_same_generation(&tab, successor_generation));
+        assert!(origin.get_tab(tab.tab_id()).is_none());
     }
 
     #[test]

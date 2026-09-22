@@ -14,7 +14,7 @@ use crate::pane::{
 use crate::renderable::*;
 use crate::tab::Tab;
 use crate::window::WindowId;
-use crate::{Mux, PaneRegistrationHandle, PaneRegistrationSlot};
+use crate::{Mux, PaneRegistrationSlot};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
@@ -29,8 +29,8 @@ use portable_pty::*;
 use rangeset::RangeSet;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use termwiz::input::{InputEvent, KeyEvent, Modifiers, MouseEvent as TermWizMouseEvent};
 use termwiz::render::terminfo::TerminfoRenderer;
@@ -119,6 +119,7 @@ pub struct TermWizTerminalPane {
     writer: Mutex<Vec<u8>>,
     render_rx: FileDescriptor,
     mux_registration: Arc<PaneRegistrationSlot>,
+    tab_cleanup_owns_retirement: bool,
 }
 
 impl TermWizTerminalPane {
@@ -128,6 +129,7 @@ impl TermWizTerminalPane {
         input_tx: Sender<InputEvent>,
         render_rx: FileDescriptor,
         term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
+        tab_cleanup_owns_retirement: bool,
     ) -> Result<Self, crate::IdAllocationError> {
         let pane_id = alloc_pane_id()?;
 
@@ -148,11 +150,21 @@ impl TermWizTerminalPane {
             input_tx,
             dead: Mutex::new(false),
             mux_registration: Arc::new(PaneRegistrationSlot::default()),
+            tab_cleanup_owns_retirement,
         })
     }
 }
 
 impl Pane for TermWizTerminalPane {
+    fn exit_behavior(&self) -> Option<config::ExitBehavior> {
+        // A run-owned applet closes its render pipe before its cleanup task
+        // executes. EOF must not remove the pane registry entry independently
+        // of exact tab retirement. Standalone overlays retain the configured
+        // EOF policy.
+        self.tab_cleanup_owns_retirement
+            .then_some(config::ExitBehavior::Hold)
+    }
+
     fn pane_id(&self) -> PaneId {
         self.pane_id
     }
@@ -626,6 +638,7 @@ fn allocate_with_render_deadline(
         input_tx,
         render_pipe.read,
         Some(config),
+        false,
     )?;
 
     // Add the tab to the mux so that the output is processed
@@ -641,47 +654,53 @@ fn allocate_with_render_deadline(
 }
 
 struct TermWizCleanupDispatch {
-    registration: Option<PaneRegistrationHandle>,
+    cleanup: Option<(Weak<Mux>, Arc<Tab>, u64)>,
 }
 
 impl TermWizCleanupDispatch {
-    fn new(registration: PaneRegistrationHandle) -> Self {
+    fn new(owner: &Arc<Mux>, tab: Arc<Tab>, generation: u64) -> Self {
         Self {
-            registration: Some(registration),
+            cleanup: Some((Arc::downgrade(owner), tab, generation)),
         }
     }
 
     fn execute(mut self) {
-        if let Some(registration) = self.registration.take() {
-            let _ = registration.retire_and_prune_if_current();
+        self.retire();
+    }
+
+    fn retire(&mut self) {
+        if let Some((owner, tab, generation)) = self.cleanup.take() {
+            if let Some(owner) = owner.upgrade() {
+                // Detach structural ownership in the same transaction as pane
+                // retirement. A pending reader/operation can delay Pane::kill;
+                // it must not leave an unregistered pane in a published tab.
+                owner.remove_tab_if_same_generation(&tab, generation);
+            }
         }
     }
 }
 
 impl Drop for TermWizCleanupDispatch {
     fn drop(&mut self) {
-        if let Some(registration) = self.registration.take() {
-            let _ = registration.retire_and_prune_if_current();
-        }
+        self.retire();
     }
 }
 
 struct TermWizRunCleanup {
-    registration: Option<PaneRegistrationHandle>,
+    cleanup: Option<TermWizCleanupDispatch>,
 }
 
 impl TermWizRunCleanup {
-    fn new(registration: PaneRegistrationHandle) -> Self {
+    fn new(dispatch: TermWizCleanupDispatch) -> Self {
         Self {
-            registration: Some(registration),
+            cleanup: Some(dispatch),
         }
     }
 
     fn schedule(&mut self) {
-        let Some(registration) = self.registration.take() else {
+        let Some(dispatch) = self.cleanup.take() else {
             return;
         };
-        let dispatch = TermWizCleanupDispatch::new(registration);
         if promise::spawn::is_scheduler_configured() {
             match promise::spawn::try_reserve_main_thread(
                 promise::spawn::MainThreadServiceClass::Topology,
@@ -782,6 +801,7 @@ pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> any
                 input_tx,
                 render_rx,
                 term_config,
+                true,
             )?;
             let pane: Arc<dyn Pane> = Arc::new(pane);
 
@@ -790,10 +810,16 @@ pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> any
             let tab = Arc::new(Tab::new(&size));
             tab.assign_pane(&pane);
 
-            let registration = mux
-                .add_tab_and_active_pane(&tab)?
+            mux.add_tab_and_active_pane(&tab)?
                 .context("TermWiz pane publication did not retain exact registration authority")?;
-            let cleanup = TermWizRunCleanup::new(registration);
+            let generation = tab
+                .active_mux_owner_generation()
+                .context("TermWiz tab publication did not retain exact owner generation")?;
+            let cleanup = TermWizRunCleanup::new(TermWizCleanupDispatch::new(
+                &mux,
+                Arc::clone(&tab),
+                generation,
+            ));
 
             // Delay allocating a new window until after pane publication, so a
             // publication failure cannot leave a provisional empty window. If
@@ -1031,6 +1057,10 @@ mod tests {
 
         let (_terminal, pane) = allocate(size, config).expect("allocate TermWiz test pane");
         let pane_domain = pane.domain_id();
+        assert!(
+            pane.exit_behavior().is_none(),
+            "overlay EOF policy is unchanged"
+        );
 
         assert_eq!(pane_domain, termwiz_terminal_domain().domain_id());
         assert_eq!(
@@ -1049,6 +1079,82 @@ mod tests {
             slot_registration.same_registration(&registry_registration),
             "TermWiz slot and mux registry must expose one exact generation"
         );
+    }
+
+    #[test]
+    fn termwiz_cleanup_detaches_topology_before_pending_operation_finishes() {
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("termwiz-cleanup-census").unwrap());
+        let foreign_domain_id = default_domain.domain_id();
+        let mux = Arc::new(Mux::new(Some(default_domain)));
+        let _mux = ScopedMux::install(Arc::clone(&mux));
+        let size = TerminalSize {
+            rows: 3,
+            cols: 7,
+            pixel_width: 70,
+            pixel_height: 30,
+            dpi: 96,
+        };
+
+        for drop_unpolled in [false, true] {
+            let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+                Arc::new(config::TermConfig::new());
+            let domain = termwiz_terminal_domain();
+            mux.add_domain(&domain).unwrap();
+            let (input_tx, _input_rx) = channel();
+            let pipe = Pipe::new().unwrap();
+            let pane: Arc<dyn Pane> = Arc::new(
+                TermWizTerminalPane::new(
+                    domain.domain_id(),
+                    size,
+                    input_tx,
+                    pipe.read,
+                    Some(config),
+                    true,
+                )
+                .unwrap(),
+            );
+            let tab = Arc::new(Tab::new(&size));
+            tab.assign_pane(&pane);
+            let registration = mux.add_tab_and_active_pane(&tab).unwrap().unwrap();
+            let window = mux.new_empty_window(None, None);
+            mux.add_tab_to_window(&tab, *window).unwrap();
+            drop(window);
+            mux.reconcile_domain_floating_panes(foreign_domain_id, Vec::new(), Vec::new())
+                .expect("published progress pane must satisfy the foreign ownership census");
+            // Exercise the real EOF handler before cleanup, without depending
+            // on reader thread scheduling to hit the original publication gap.
+            crate::finish_pane_reader_eof(
+                &Arc::downgrade(&pane),
+                &registration.live_parser_test_generation(),
+                pane.pane_id(),
+                pane.exit_behavior().unwrap_or(config::ExitBehavior::Close),
+            );
+            assert!(mux.get_pane(pane.pane_id()).is_some());
+            mux.reconcile_domain_floating_panes(foreign_domain_id, Vec::new(), Vec::new())
+                .expect("render EOF must preserve coherent ownership until applet cleanup");
+            let operation = registration.operation_guard(&mux).unwrap();
+            let dispatch = TermWizCleanupDispatch::new(
+                &mux,
+                Arc::clone(&tab),
+                tab.active_mux_owner_generation().unwrap(),
+            );
+            if drop_unpolled {
+                drop(async move { dispatch.execute() });
+            } else {
+                dispatch.execute();
+            }
+
+            assert!(mux.get_pane(pane.pane_id()).is_none());
+            assert!(mux.get_tab(tab.tab_id()).is_none());
+            assert!(!pane.is_dead(), "the held operation must defer Pane::kill");
+            mux.reconcile_domain_floating_panes(foreign_domain_id, Vec::new(), Vec::new())
+                .expect("cleanup must leave no structurally owned unregistered progress pane");
+            drop(operation);
+        }
     }
 
     #[test]
@@ -1072,10 +1178,14 @@ mod tests {
 
         let (_terminal, pane) = allocate(size, config).expect("allocate TermWiz test pane");
         let pane_id = pane.pane_id();
-        let registration = mux
-            .capture_pane_registration(&pane)
-            .expect("TermWiz pane should be registered");
-        let dispatch = TermWizCleanupDispatch::new(registration);
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab).unwrap();
+        let dispatch = TermWizCleanupDispatch::new(
+            &mux,
+            Arc::clone(&tab),
+            tab.active_mux_owner_generation().unwrap(),
+        );
         let unpolled = async move {
             dispatch.execute();
         };
