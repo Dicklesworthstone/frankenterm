@@ -18,10 +18,7 @@
       "reopen_dirty_overlap_without_owner_clear"
     ],
     "inbox_checked": false,
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ],
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"],
     "registered": false,
     "retry_limit": 1,
     "status": "unavailable"
@@ -198,33 +195,25 @@
       {
         "category": "janitor_untracked",
         "count": 1,
-        "paths": [
-          ".stash_janitor_workspace/handoff_report.md"
-        ],
+        "paths": [".stash_janitor_workspace/handoff_report.md"],
         "severity": "low"
       },
       {
         "category": "shared_tracker",
         "count": 1,
-        "paths": [
-          ".beads/issues.jsonl"
-        ],
+        "paths": [".beads/issues.jsonl"],
         "severity": "high"
       },
       {
         "category": "tracked_overlap_risk",
         "count": 1,
-        "paths": [
-          "crates/frankenterm-core/src/storage.rs"
-        ],
+        "paths": ["crates/frankenterm-core/src/storage.rs"],
         "severity": "high"
       },
       {
         "category": "untracked_review_required",
         "count": 1,
-        "paths": [
-          "docs/robot-contracts/policy-recommendations.md"
-        ],
+        "paths": ["docs/robot-contracts/policy-recommendations.md"],
         "severity": "medium"
       }
     ],

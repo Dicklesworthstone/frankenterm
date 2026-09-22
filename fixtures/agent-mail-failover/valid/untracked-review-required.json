@@ -12,10 +12,7 @@
     "registered": false,
     "inbox_checked": false,
     "failure_class": "unknown",
-    "reason_codes": [
-      "agent_mail.unavailable_after_retry",
-      "fallback.beads_only"
-    ],
+    "reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"],
     "forbidden_actions": [
       "am_service_restart",
       "am_service_stop",
@@ -81,7 +78,5 @@
     "Avoid the untracked path unless it is reserved or clearly owned.",
     "Continue with a non-overlapping ready bead."
   ],
-  "artifact_paths": [
-    "fixtures/agent-mail-failover/valid/untracked-review-required.json"
-  ]
+  "artifact_paths": ["fixtures/agent-mail-failover/valid/untracked-review-required.json"]
 }

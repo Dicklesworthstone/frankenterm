@@ -13,9 +13,7 @@
     {
       "case_id": "unsupported-schema-version",
       "expected_failure": "unsupported_schema_version",
-      "reason_codes": [
-        "demo.unsupported_schema_version"
-      ],
+      "reason_codes": ["demo.unsupported_schema_version"],
       "invalid_fragment": {
         "schema_version": "ft.demo.scenario-manifest.v2"
       }
@@ -23,9 +21,7 @@
     {
       "case_id": "absolute-scenario-path",
       "expected_failure": "scenario_path_must_be_repo_relative",
-      "reason_codes": [
-        "demo.absolute_path_forbidden"
-      ],
+      "reason_codes": ["demo.absolute_path_forbidden"],
       "invalid_fragment": {
         "scenario": {
           "id": "absolute-path",
@@ -36,9 +32,7 @@
     {
       "case_id": "parent-relative-artifact-path",
       "expected_failure": "artifact_path_must_not_escape_repo",
-      "reason_codes": [
-        "demo.parent_relative_path_forbidden"
-      ],
+      "reason_codes": ["demo.parent_relative_path_forbidden"],
       "invalid_fragment": {
         "expected_artifacts": [
           {
@@ -52,9 +46,7 @@
     {
       "case_id": "missing-degradation-reason",
       "expected_failure": "required_degradation_reason_missing",
-      "reason_codes": [
-        "demo.required_degradation_missing"
-      ],
+      "reason_codes": ["demo.required_degradation_missing"],
       "invalid_fragment": {
         "missing_reason": "rch_proof_unavailable",
         "scenario": {
@@ -76,9 +68,7 @@
     {
       "case_id": "duplicate-scenario-id",
       "expected_failure": "scenario_ids_must_be_unique",
-      "reason_codes": [
-        "demo.duplicate_scenario_id"
-      ],
+      "reason_codes": ["demo.duplicate_scenario_id"],
       "invalid_fragment": {
         "scenarios": [
           {
@@ -93,9 +83,7 @@
     {
       "case_id": "target-class-proof-overclaim",
       "expected_failure": "proof_boundary_must_not_claim_target_class_capacity",
-      "reason_codes": [
-        "demo.target_class_overclaim_forbidden"
-      ],
+      "reason_codes": ["demo.target_class_overclaim_forbidden"],
       "invalid_fragment": {
         "proof_boundary": "Demo fixtures prove target-class 200+ panes on 64-core / 256 GiB operators."
       }

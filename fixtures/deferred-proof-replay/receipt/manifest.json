@@ -9,10 +9,7 @@
   "golden_summary": {
     "valid_case_count": 9,
     "invalid_case_count": 19,
-    "command_shape_versions": [
-      "rch-no-self-healing-v1",
-      "static-verifier-v1"
-    ],
+    "command_shape_versions": ["rch-no-self-healing-v1", "static-verifier-v1"],
     "eligibility_states": [
       "dirty_overlap",
       "eligible",

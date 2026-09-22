@@ -34,10 +34,7 @@
       "title": "Clean worktree source collection",
       "source_name": "git_dirty_tree",
       "source_surface": "git status --short --branch",
-      "allowed_source_commands": [
-        "git status --short --branch",
-        "git diff --stat --"
-      ],
+      "allowed_source_commands": ["git status --short --branch", "git diff --stat --"],
       "bundle_entry": {
         "status": "collected",
         "evidence_state": "measured",
@@ -80,10 +77,7 @@
       "title": "Tracked dirty files require ownership caution",
       "source_name": "git_dirty_tree",
       "source_surface": "git status --short --branch",
-      "allowed_source_commands": [
-        "git status --short --branch",
-        "git diff --stat --"
-      ],
+      "allowed_source_commands": ["git status --short --branch", "git diff --stat --"],
       "bundle_entry": {
         "status": "collected",
         "evidence_state": "measured",
@@ -91,9 +85,7 @@
         "redaction": "partial",
         "privacy_tier": "metadata_only",
         "size_bytes": 640,
-        "warning_ids": [
-          "git-dirty-tree.tracked-overlap"
-        ]
+        "warning_ids": ["git-dirty-tree.tracked-overlap"]
       },
       "branch": {
         "name": "[BRANCH]",
@@ -154,10 +146,7 @@
       "title": "Untracked files are evidence but not proof of harmlessness",
       "source_name": "git_dirty_tree",
       "source_surface": "git status --short --branch",
-      "allowed_source_commands": [
-        "git status --short --branch",
-        "git diff --stat --"
-      ],
+      "allowed_source_commands": ["git status --short --branch", "git diff --stat --"],
       "bundle_entry": {
         "status": "collected",
         "evidence_state": "measured",
@@ -165,9 +154,7 @@
         "redaction": "partial",
         "privacy_tier": "metadata_only",
         "size_bytes": 384,
-        "warning_ids": [
-          "git-dirty-tree.untracked-review"
-        ]
+        "warning_ids": ["git-dirty-tree.untracked-review"]
       },
       "branch": {
         "name": "[BRANCH]",
@@ -222,9 +209,7 @@
       "title": "Git metadata unavailable fails closed",
       "source_name": "git_dirty_tree",
       "source_surface": "git status --short --branch",
-      "allowed_source_commands": [
-        "git status --short --branch"
-      ],
+      "allowed_source_commands": ["git status --short --branch"],
       "bundle_entry": {
         "status": "unavailable",
         "evidence_state": "unavailable",
@@ -232,9 +217,7 @@
         "redaction": "not_applicable",
         "privacy_tier": "metadata_only",
         "size_bytes": 0,
-        "warning_ids": [
-          "git-dirty-tree.unavailable"
-        ]
+        "warning_ids": ["git-dirty-tree.unavailable"]
       },
       "branch": {
         "name": null,

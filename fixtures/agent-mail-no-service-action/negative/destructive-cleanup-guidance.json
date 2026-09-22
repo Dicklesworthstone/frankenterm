@@ -4,9 +4,7 @@
   "case_kind": "negative",
   "expected_verdict": "reject",
   "expected_pattern": "git reset --hard",
-  "generated_guidance": [
-    "Clean the checkout with git reset --hard before taking the stale bead."
-  ],
+  "generated_guidance": ["Clean the checkout with git reset --hard before taking the stale bead."],
   "side_effects": {
     "agent_mail_repair_attempted": false,
     "agent_mail_restart_attempted": false,

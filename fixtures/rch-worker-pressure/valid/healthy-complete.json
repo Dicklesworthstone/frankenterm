@@ -14,12 +14,7 @@
       "timeout 15s find /tmp -maxdepth 2 -type d -name 'ft-*' -prune -print",
       "timeout 20s du -B1 -d 1 /data/projects/frankenterm/target"
     ],
-    "paths": [
-      "/",
-      "/tmp",
-      "/data/projects/frankenterm",
-      "/data/projects/frankenterm/target"
-    ],
+    "paths": ["/", "/tmp", "/data/projects/frankenterm", "/data/projects/frankenterm/target"],
     "timeout_ms": 30000,
     "partial_allowed": true,
     "side_effect_policy": {
@@ -36,16 +31,11 @@
   "summary": {
     "workers_total": 2,
     "workers_sampled": 2,
-    "worker_ids": [
-      "vmi1227854",
-      "vmi1227855"
-    ],
+    "worker_ids": ["vmi1227854", "vmi1227855"],
     "workers_with_critical_pressure": 0,
     "workers_with_telemetry_gap": 0,
     "workers_with_partial_output": 0,
-    "pressure_reasons": [
-      "none"
-    ]
+    "pressure_reasons": ["none"]
   },
   "worker_inventories": [
     {
@@ -66,9 +56,7 @@
           "used_percent": 58.3,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-df.json",
-          "notes": [
-            "Root filesystem had sufficient retained headroom."
-          ]
+          "notes": ["Root filesystem had sufficient retained headroom."]
         }
       ],
       "shallow_scans": [
@@ -87,9 +75,7 @@
           "entry_count": 7,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-tmp-shallow.json",
-          "notes": [
-            "Shallow temp scan completed before timeout."
-          ]
+          "notes": ["Shallow temp scan completed before timeout."]
         },
         {
           "path": "/data/projects/frankenterm/target",
@@ -106,9 +92,7 @@
           "entry_count": 5,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-target-shallow.json",
-          "notes": [
-            "Target scan remained bounded to two directory levels."
-          ]
+          "notes": ["Target scan remained bounded to two directory levels."]
         }
       ],
       "project_du_samples": [
@@ -127,9 +111,7 @@
           "entry_count": 5,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-project-du.json",
-          "notes": [
-            "Bounded project du sample completed with no cleanup action."
-          ]
+          "notes": ["Bounded project du sample completed with no cleanup action."]
         }
       ],
       "artifact_paths": [
@@ -138,9 +120,7 @@
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-target-shallow.json",
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227854-project-du.json"
       ],
-      "notes": [
-        "Fixture covers a complete healthy retained inventory."
-      ]
+      "notes": ["Fixture covers a complete healthy retained inventory."]
     },
     {
       "worker_id": "vmi1227855",
@@ -160,9 +140,7 @@
           "used_percent": 66.7,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-df.json",
-          "notes": [
-            "Root filesystem stayed below critical pressure."
-          ]
+          "notes": ["Root filesystem stayed below critical pressure."]
         }
       ],
       "shallow_scans": [
@@ -181,9 +159,7 @@
           "entry_count": 4,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-tmp-shallow.json",
-          "notes": [
-            "No temp pressure was retained."
-          ]
+          "notes": ["No temp pressure was retained."]
         }
       ],
       "project_du_samples": [
@@ -202,9 +178,7 @@
           "entry_count": 4,
           "pressure_reason": "none",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-project-du.json",
-          "notes": [
-            "Project du stayed within retained target size expectations."
-          ]
+          "notes": ["Project du stayed within retained target size expectations."]
         }
       ],
       "artifact_paths": [
@@ -212,9 +186,7 @@
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-tmp-shallow.json",
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/healthy-complete/vmi1227855-project-du.json"
       ],
-      "notes": [
-        "Second worker verifies multi-worker complete inventory shape."
-      ]
+      "notes": ["Second worker verifies multi-worker complete inventory shape."]
     }
   ],
   "artifact_paths": [

@@ -99,9 +99,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "proof-rch.no-admissible-workers"
-        ]
+        "warning_ids": ["proof-rch.no-admissible-workers"]
       },
       "proof": {
         "verdict": "blocked",
@@ -116,9 +114,7 @@
         "setup_chatter_only": false,
         "launches_new_proof": false,
         "artifact_posture": "attempt_metadata_only",
-        "artifact_paths": [
-          "tests/e2e/artifacts/[RUN]/rch-preflight.json"
-        ],
+        "artifact_paths": ["tests/e2e/artifacts/[RUN]/rch-preflight.json"],
         "reason_codes": [
           "rch.no_admissible_workers",
           "rch.remote_cargo_reached_false",
@@ -160,9 +156,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "proof-rch.local-fallback-rejected"
-        ]
+        "warning_ids": ["proof-rch.local-fallback-rejected"]
       },
       "proof": {
         "verdict": "blocked",
@@ -177,9 +171,7 @@
         "setup_chatter_only": false,
         "launches_new_proof": false,
         "artifact_posture": "attempt_metadata_only",
-        "artifact_paths": [
-          "tests/e2e/artifacts/[RUN]/rch-local-fallback-refused.log"
-        ],
+        "artifact_paths": ["tests/e2e/artifacts/[RUN]/rch-local-fallback-refused.log"],
         "reason_codes": [
           "rch.remote_required",
           "rch.local_fallback_refused",
@@ -221,9 +213,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "proof-rch.transport-failure"
-        ]
+        "warning_ids": ["proof-rch.transport-failure"]
       },
       "proof": {
         "verdict": "blocked",
@@ -238,9 +228,7 @@
         "setup_chatter_only": true,
         "launches_new_proof": false,
         "artifact_posture": "partial_attempt_metadata",
-        "artifact_paths": [
-          "tests/e2e/artifacts/[RUN]/rch-transport.log"
-        ],
+        "artifact_paths": ["tests/e2e/artifacts/[RUN]/rch-transport.log"],
         "reason_codes": [
           "rch.transport_failed",
           "rch.setup_chatter_not_proof",
@@ -282,9 +270,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "proof-rch.missing-artifact"
-        ]
+        "warning_ids": ["proof-rch.missing-artifact"]
       },
       "proof": {
         "verdict": "blocked",

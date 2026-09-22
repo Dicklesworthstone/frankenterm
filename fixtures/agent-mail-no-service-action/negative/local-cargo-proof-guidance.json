@@ -4,9 +4,7 @@
   "case_kind": "negative",
   "expected_verdict": "reject",
   "expected_pattern": "local cargo proof",
-  "generated_guidance": [
-    "Use local Cargo proof for this fallback verifier."
-  ],
+  "generated_guidance": ["Use local Cargo proof for this fallback verifier."],
   "side_effects": {
     "agent_mail_repair_attempted": false,
     "agent_mail_restart_attempted": false,

@@ -4,9 +4,7 @@
   "case_kind": "negative",
   "expected_verdict": "reject",
   "expected_pattern": "am service restart",
-  "generated_guidance": [
-    "Run am service restart and retry the mailbox."
-  ],
+  "generated_guidance": ["Run am service restart and retry the mailbox."],
   "side_effects": {
     "agent_mail_repair_attempted": false,
     "agent_mail_restart_attempted": false,

@@ -45,9 +45,7 @@
         "decision": {
           "state": "allow",
           "replay_allowed": true,
-          "reason_codes": [
-            "gate.clean_ownership"
-          ],
+          "reason_codes": ["gate.clean_ownership"],
           "explanation": "Static verifier receipt owns no currently dirty paths and has no active owner or prerequisite conflicts."
         },
         "forbidden_actions": [
@@ -74,9 +72,7 @@
         "bead_id": "ft-ssy4x",
         "evaluated_at": "2026-05-19T02:42:01Z",
         "receipt": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/recorder_storage.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/recorder_storage.rs"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": false
@@ -100,10 +96,7 @@
         "decision": {
           "state": "wait",
           "replay_allowed": false,
-          "reason_codes": [
-            "rch.critical_pressure",
-            "agent_mail.fallback_active"
-          ],
+          "reason_codes": ["rch.critical_pressure", "agent_mail.fallback_active"],
           "explanation": "Ownership is clean, but material remote proof must wait because RCH admission has no safe worker."
         },
         "forbidden_actions": [
@@ -163,9 +156,7 @@
         "decision": {
           "state": "dirty_overlap",
           "replay_allowed": false,
-          "reason_codes": [
-            "git.dirty_overlap"
-          ],
+          "reason_codes": ["git.dirty_overlap"],
           "explanation": "A currently dirty path overlaps the receipt ownership slice, so replay would prove unowned work."
         },
         "forbidden_actions": [
@@ -192,9 +183,7 @@
         "bead_id": "ft-j4fnv",
         "evaluated_at": "2026-05-19T02:42:03Z",
         "receipt": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/disk_pressure.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/disk_pressure.rs"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -219,9 +208,7 @@
               "assignee": "jemanuel",
               "updated_at": "2026-05-19T02:36:19Z",
               "stale_over_2h": false,
-              "owned_paths": [
-                "crates/frankenterm-core/src/disk_pressure.rs"
-              ]
+              "owned_paths": ["crates/frankenterm-core/src/disk_pressure.rs"]
             }
           ],
           "queued_receipt_owners": [],
@@ -234,10 +221,7 @@
         "decision": {
           "state": "owner_handoff_required",
           "replay_allowed": false,
-          "reason_codes": [
-            "owner.active_overlap",
-            "agent_mail.fallback_active"
-          ],
+          "reason_codes": ["owner.active_overlap", "agent_mail.fallback_active"],
           "explanation": "A non-stale in-progress owner overlaps the receipt paths; wait for explicit handoff instead of replaying."
         },
         "forbidden_actions": [
@@ -264,9 +248,7 @@
         "bead_id": "ft-zbnz4.4",
         "evaluated_at": "2026-05-19T02:42:04Z",
         "receipt": {
-          "owned_paths": [
-            "tests/e2e/test_deferred_proof_receipt_contract.sh"
-          ],
+          "owned_paths": ["tests/e2e/test_deferred_proof_receipt_contract.sh"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -295,9 +277,7 @@
         "decision": {
           "state": "prerequisite_blocked",
           "replay_allowed": false,
-          "reason_codes": [
-            "beads.prerequisite_blocked"
-          ],
+          "reason_codes": ["beads.prerequisite_blocked"],
           "explanation": "A prerequisite bead remains blocked, so this receipt cannot be replayed yet."
         },
         "forbidden_actions": [
@@ -324,9 +304,7 @@
         "bead_id": "ft-abc12",
         "evaluated_at": "2026-05-19T02:42:05Z",
         "receipt": {
-          "owned_paths": [
-            "tests/e2e/test_deferred_proof_receipt_contract.sh"
-          ],
+          "owned_paths": ["tests/e2e/test_deferred_proof_receipt_contract.sh"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -350,9 +328,7 @@
         "decision": {
           "state": "mail_state_unknown",
           "replay_allowed": false,
-          "reason_codes": [
-            "agent_mail.state_unknown"
-          ],
+          "reason_codes": ["agent_mail.state_unknown"],
           "explanation": "The gate has neither Agent Mail state nor the documented fallback snapshot, so ownership cannot be proven."
         },
         "forbidden_actions": [
@@ -379,9 +355,7 @@
         "bead_id": "ft-old99",
         "evaluated_at": "2026-05-19T02:42:06Z",
         "receipt": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/recorder_storage.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/recorder_storage.rs"],
           "dirty_paths_at_capture": [],
           "freshness_state": "stale",
           "replay_allowed_before_gate": true
@@ -405,9 +379,7 @@
         "decision": {
           "state": "stale",
           "replay_allowed": false,
-          "reason_codes": [
-            "receipt.stale"
-          ],
+          "reason_codes": ["receipt.stale"],
           "explanation": "The receipt freshness window has expired; regenerate ownership evidence before replay."
         },
         "forbidden_actions": [
@@ -434,9 +406,7 @@
         "bead_id": "ft-old77",
         "evaluated_at": "2026-05-19T02:42:07Z",
         "receipt": {
-          "owned_paths": [
-            "crates/frankenterm-core/src/recorder_storage.rs"
-          ],
+          "owned_paths": ["crates/frankenterm-core/src/recorder_storage.rs"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -455,9 +425,7 @@
               "assignee": "DormantAgent",
               "updated_at": "2026-05-18T22:30:00Z",
               "stale_over_2h": true,
-              "owned_paths": [
-                "crates/frankenterm-core/src/recorder_storage.rs"
-              ]
+              "owned_paths": ["crates/frankenterm-core/src/recorder_storage.rs"]
             }
           ],
           "queued_receipt_owners": [],
@@ -470,10 +438,7 @@
         "decision": {
           "state": "stale",
           "replay_allowed": false,
-          "reason_codes": [
-            "owner.stale_overlap",
-            "agent_mail.fallback_active"
-          ],
+          "reason_codes": ["owner.stale_overlap", "agent_mail.fallback_active"],
           "explanation": "A stale in-progress owner still overlaps the receipt paths; clean up or reassign the tracker state before replay."
         },
         "forbidden_actions": [
@@ -500,9 +465,7 @@
         "bead_id": "ft-dupe1",
         "evaluated_at": "2026-05-19T02:42:08Z",
         "receipt": {
-          "owned_paths": [
-            "tests/e2e/test_deferred_proof_receipt_contract.sh"
-          ],
+          "owned_paths": ["tests/e2e/test_deferred_proof_receipt_contract.sh"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -520,9 +483,7 @@
             {
               "receipt_id": "ft-dupe2:receipt-b",
               "bead_id": "ft-dupe2",
-              "owned_paths": [
-                "tests/e2e/test_deferred_proof_receipt_contract.sh"
-              ]
+              "owned_paths": ["tests/e2e/test_deferred_proof_receipt_contract.sh"]
             }
           ],
           "prerequisite_beads": []
@@ -534,9 +495,7 @@
         "decision": {
           "state": "owner_handoff_required",
           "replay_allowed": false,
-          "reason_codes": [
-            "receipt.multiple_owner_overlap"
-          ],
+          "reason_codes": ["receipt.multiple_owner_overlap"],
           "explanation": "Another queued receipt owns the same path, so one receipt must be explicitly selected before replay."
         },
         "forbidden_actions": [
@@ -563,9 +522,7 @@
         "bead_id": "ft-trk77",
         "evaluated_at": "2026-05-19T02:42:09Z",
         "receipt": {
-          "owned_paths": [
-            "tests/e2e/test_deferred_proof_receipt_contract.sh"
-          ],
+          "owned_paths": ["tests/e2e/test_deferred_proof_receipt_contract.sh"],
           "dirty_paths_at_capture": [],
           "freshness_state": "fresh",
           "replay_allowed_before_gate": true
@@ -595,10 +552,7 @@
         "decision": {
           "state": "wait",
           "replay_allowed": false,
-          "reason_codes": [
-            "git.shared_tracker_dirty",
-            "agent_mail.fallback_active"
-          ],
+          "reason_codes": ["git.shared_tracker_dirty", "agent_mail.fallback_active"],
           "explanation": "The shared Beads JSONL is dirty while Agent Mail is unavailable; wait for a clean tracker window before replay."
         },
         "forbidden_actions": [

@@ -31,9 +31,7 @@
       "inventory_evidence_sha256": null,
       "approval_match": "exact",
       "protected_reason": "missing_evidence",
-      "notes": [
-        "The path may be inactive, but the retained evidence hash is missing."
-      ]
+      "notes": ["The path may be inactive, but the retained evidence hash is missing."]
     }
   ],
   "allowed_operations": [],
@@ -95,12 +93,7 @@
       "fresh exact-path approval",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
-  "review_notes": [
-    "A missing hash turns otherwise complete evidence into a denial."
-  ]
+  "review_notes": ["A missing hash turns otherwise complete evidence into a denial."]
 }

@@ -82,7 +82,13 @@
     "account_pick_preview": {
       "type": "object",
       "description": "Preview of automatic account selection",
-      "required": ["selection_reason", "threshold_percent", "candidates_count", "filtered_count", "quota_advisory"],
+      "required": [
+        "selection_reason",
+        "threshold_percent",
+        "candidates_count",
+        "filtered_count",
+        "quota_advisory"
+      ],
       "properties": {
         "selected_account_id": {
           "type": "string",

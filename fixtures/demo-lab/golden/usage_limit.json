@@ -27,11 +27,7 @@
             "redacted": true
           }
         ],
-        "guidance": [
-          "pause_automation",
-          "preserve_state",
-          "notify_operator"
-        ],
+        "guidance": ["pause_automation", "preserve_state", "notify_operator"],
         "external_provider_called": false,
         "artifacts": [
           "fixtures/demo-lab/scenarios/usage_limit.yaml",

@@ -11,9 +11,7 @@
     "requested_cpu_cores": 64,
     "requested_memory_gib": 256,
     "proof_state": "unavailable",
-    "reason_codes": [
-      "target_hardware.proof_unavailable"
-    ]
+    "reason_codes": ["target_hardware.proof_unavailable"]
   },
   "input_domains": {
     "capacity_resource": {
@@ -29,15 +27,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Stale capacity lowers the envelope."
-        ]
+        "notes": ["Stale capacity lowers the envelope."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "capacity.stale",
-        "fail_closed.lower_stale"
-      ],
+      "reason_codes": ["capacity.stale", "fail_closed.lower_stale"],
       "unavailable_reason": null,
       "degraded_reason": "Capacity snapshot is outside the freshness budget.",
       "evidence": [
@@ -46,17 +39,11 @@
           "category": "capacity_pressure",
           "state": "stale",
           "subject": "resource cockpit",
-          "reason_codes": [
-            "capacity.stale"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/rch-topology-failure.json"
-          ]
+          "reason_codes": ["capacity.stale"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/rch-topology-failure.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
     },
     "rch": {
       "source_id": "rch-topology-failure",
@@ -71,9 +58,7 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "Topology failure is retained without build logs."
-        ]
+        "notes": ["Topology failure is retained without build logs."]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
@@ -89,17 +74,11 @@
           "category": "rch_topology_preflight",
           "state": "fail",
           "subject": "topology preflight",
-          "reason_codes": [
-            "rch.topology_preflight_failed"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/rch-topology-failure.json"
-          ]
+          "reason_codes": ["rch.topology_preflight_failed"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/rch-topology-failure.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
     },
     "beads": {
       "source_id": "beads-ready-but-proof-blocked",
@@ -114,15 +93,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Ready work exists but proof substrate is blocked."
-        ]
+        "notes": ["Ready work exists but proof substrate is blocked."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.ready_available",
-        "beads.do_not_claim_until_proof_available"
-      ],
+      "reason_codes": ["beads.ready_available", "beads.do_not_claim_until_proof_available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -131,17 +105,11 @@
           "category": "beads_ready_queue",
           "state": "warn",
           "subject": "ready queue",
-          "reason_codes": [
-            "beads.do_not_claim_until_proof_available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/rch-topology-failure.json"
-          ]
+          "reason_codes": ["beads.do_not_claim_until_proof_available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/rch-topology-failure.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
     },
     "agent_mail": {
       "source_id": "agent-mail-healthy",
@@ -156,14 +124,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "Mailbox summary only."
-        ]
+        "notes": ["Mailbox summary only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "agent_mail.available"
-      ],
+      "reason_codes": ["agent_mail.available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -172,17 +136,11 @@
           "category": "agent_mail_availability",
           "state": "pass",
           "subject": "fetch_inbox",
-          "reason_codes": [
-            "agent_mail.available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/rch-topology-failure.json"
-          ]
+          "reason_codes": ["agent_mail.available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/rch-topology-failure.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
     },
     "git": {
       "source_id": "git-clean-for-proof",
@@ -197,15 +155,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "No dirty overlap."
-        ]
+        "notes": ["No dirty overlap."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.clean_for_scope",
-        "dirty_overlap.none"
-      ],
+      "reason_codes": ["git.clean_for_scope", "dirty_overlap.none"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -214,17 +167,11 @@
           "category": "dirty_path_overlap",
           "state": "pass",
           "subject": "proof lane paths",
-          "reason_codes": [
-            "dirty_overlap.none"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/rch-topology-failure.json"
-          ]
+          "reason_codes": ["dirty_overlap.none"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/rch-topology-failure.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/rch-topology-failure.json"]
     }
   },
   "decision": {
@@ -252,11 +199,7 @@
       "expires_at_ms": null,
       "max_parallel_agents": 0,
       "max_parallel_proofs": 0,
-      "permitted_action_classes": [
-        "read_status",
-        "add_beads_comment",
-        "wait"
-      ],
+      "permitted_action_classes": ["read_status", "add_beads_comment", "wait"],
       "forbidden_action_classes": [
         "claim_bead",
         "edit_files",
@@ -274,14 +217,8 @@
         "worker_drain",
         "raw_pane_content_capture"
       ],
-      "source_ids": [
-        "rch-topology-failure",
-        "capacity-stale"
-      ],
-      "reason_codes": [
-        "envelope.block",
-        "rch.topology_preflight_failed"
-      ]
+      "source_ids": ["rch-topology-failure", "capacity-stale"],
+      "reason_codes": ["envelope.block", "rch.topology_preflight_failed"]
     }
   ],
   "fail_closed_policy": {
@@ -290,10 +227,7 @@
     "contradictory_signal_behavior": "block",
     "privacy_redaction_behavior": "lower_envelope",
     "target_hardware_gap_behavior": "defer_target_class_claim",
-    "reason_codes": [
-      "fail_closed.block_contradiction",
-      "proof.no_local_cargo_fallback"
-    ]
+    "reason_codes": ["fail_closed.block_contradiction", "proof.no_local_cargo_fallback"]
   },
   "side_effect_policy": {
     "dry_run_only": true,
@@ -307,15 +241,10 @@
     "policy_id": "ft.redaction.operating_envelope.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Topology diagnostics are reason-coded only."
-    ]
+    "notes": ["Topology diagnostics are reason-coded only."]
   },
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "envelope.block",
-    "rch.topology_preflight_failed"
-  ],
+  "reason_codes": ["envelope.block", "rch.topology_preflight_failed"],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
     "fixtures/operating-envelope/valid/rch-topology-failure.json"

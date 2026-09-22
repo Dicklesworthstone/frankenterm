@@ -3,12 +3,7 @@
   "$id": "ft.rch.proof-ledger.evidence.schema.v3",
   "title": "FrankenTerm RCH Proof Ledger Evidence Schema",
   "type": "object",
-  "required": [
-    "schema_version",
-    "bead_id",
-    "policy_version",
-    "runs"
-  ],
+  "required": ["schema_version", "bead_id", "policy_version", "runs"],
   "properties": {
     "schema_version": {
       "type": "integer",
@@ -63,10 +58,7 @@
           },
           "command_class": {
             "type": "string",
-            "enum": [
-              "heavy",
-              "light"
-            ]
+            "enum": ["heavy", "light"]
           },
           "is_heavy": {
             "type": "boolean"
@@ -83,10 +75,7 @@
             "pattern": "^sha256:[a-f0-9]{64}$"
           },
           "worker_evidence_confidence": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": ["string", "null"],
             "enum": [
               "target_worker_remote_proof",
               "target_worker_mirror_attestation",
@@ -99,22 +88,13 @@
             ]
           },
           "intended_worker_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "selected_worker_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "worker_queue_state": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": ["string", "null"],
             "enum": [
               "ready",
               "busy_wait",
@@ -127,17 +107,11 @@
             ]
           },
           "repo_snapshot_head": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": ["string", "null"],
             "pattern": "^([a-f0-9]{40}|unknown|not_applicable)$"
           },
           "source_mirror_status": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": ["string", "null"],
             "enum": [
               "present",
               "missing",
@@ -150,28 +124,16 @@
             ]
           },
           "source_mirror_reason_code": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "remote_cargo_reached": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": ["boolean", "null"]
           },
           "remote_rustc_reached": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": ["boolean", "null"]
           },
           "test_binary_reached": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": ["boolean", "null"]
           },
           "execution_mode": {
             "type": "string",
@@ -193,12 +155,7 @@
           },
           "target_dir_lifecycle": {
             "type": "string",
-            "enum": [
-              "not_applicable",
-              "retained",
-              "inventory_only",
-              "cleanup_approved"
-            ]
+            "enum": ["not_applicable", "retained", "inventory_only", "cleanup_approved"]
           },
           "artifact_paths": {
             "type": "array",
@@ -238,16 +195,10 @@
             ]
           },
           "fallback_reason_code": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "fallback_approved_by": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           }
         }
       }

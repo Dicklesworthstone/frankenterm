@@ -1,1 +1,81 @@
-{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"allOf": [{"type": "object"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}
+{
+  "allOf": [
+    {
+      "allOf": [
+        {
+          "allOf": [
+            {
+              "allOf": [
+                {
+                  "allOf": [
+                    {
+                      "allOf": [
+                        {
+                          "allOf": [
+                            {
+                              "allOf": [
+                                {
+                                  "allOf": [
+                                    {
+                                      "allOf": [
+                                        {
+                                          "allOf": [
+                                            {
+                                              "allOf": [
+                                                {
+                                                  "allOf": [
+                                                    {
+                                                      "allOf": [
+                                                        {
+                                                          "allOf": [
+                                                            {
+                                                              "allOf": [
+                                                                {
+                                                                  "allOf": [
+                                                                    {
+                                                                      "allOf": [
+                                                                        {
+                                                                          "allOf": [
+                                                                            {
+                                                                              "allOf": [
+                                                                                { "type": "object" }
+                                                                              ]
+                                                                            }
+                                                                          ]
+                                                                        }
+                                                                      ]
+                                                                    }
+                                                                  ]
+                                                                }
+                                                              ]
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

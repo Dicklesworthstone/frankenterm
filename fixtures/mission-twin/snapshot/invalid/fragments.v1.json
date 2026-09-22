@@ -14,9 +14,7 @@
     {
       "case_id": "raw-pane-content-stored",
       "expected_failure": "raw_pane_content_must_not_be_retained",
-      "reason_codes": [
-        "mission_twin.raw_pane_content_forbidden"
-      ],
+      "reason_codes": ["mission_twin.raw_pane_content_forbidden"],
       "invalid_fragment": {
         "raw_pane_content_stored": true,
         "sources": {
@@ -29,9 +27,7 @@
     {
       "case_id": "unsafe-artifact-path",
       "expected_failure": "artifact_paths_must_be_safe_repo_relative",
-      "reason_codes": [
-        "mission_twin.artifact_path_unsafe"
-      ],
+      "reason_codes": ["mission_twin.artifact_path_unsafe"],
       "invalid_fragment": {
         "artifact_paths": [
           "../outside.json",
@@ -47,23 +43,17 @@
     {
       "case_id": "destructive-action-hint",
       "expected_failure": "simulator_must_not_suggest_destructive_actions",
-      "reason_codes": [
-        "mission_twin.forbidden_action_suggested"
-      ],
+      "reason_codes": ["mission_twin.forbidden_action_suggested"],
       "invalid_fragment": {
         "validation": {
-          "destructive_action_hints": [
-            "file_deletion"
-          ]
+          "destructive_action_hints": ["file_deletion"]
         }
       }
     },
     {
       "case_id": "ambiguous-timestamp",
       "expected_failure": "timestamps_must_be_epoch_ms",
-      "reason_codes": [
-        "mission_twin.ambiguous_timestamp"
-      ],
+      "reason_codes": ["mission_twin.ambiguous_timestamp"],
       "invalid_fragment": {
         "generated_at": "2026-05-19T01:00:00Z",
         "validation": {
@@ -79,9 +69,7 @@
     {
       "case_id": "missing-forbidden-action",
       "expected_failure": "every_output_must_carry_full_forbidden_action_set",
-      "reason_codes": [
-        "mission_twin.forbidden_action_set_incomplete"
-      ],
+      "reason_codes": ["mission_twin.forbidden_action_set_incomplete"],
       "invalid_fragment": {
         "omitted_forbidden_action": "local_cargo_proof",
         "forbidden_actions": [
@@ -100,9 +88,7 @@
     {
       "case_id": "unredacted-source",
       "expected_failure": "source_facts_must_be_redacted",
-      "reason_codes": [
-        "mission_twin.source_unredacted"
-      ],
+      "reason_codes": ["mission_twin.source_unredacted"],
       "invalid_fragment": {
         "sources": {
           "git": {

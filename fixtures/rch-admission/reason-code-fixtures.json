@@ -56,9 +56,7 @@
         "worker_rejections": [],
         "cargo_jobs": 1,
         "estimated_slots": 1,
-        "reason_codes": [
-          "local_eno_space"
-        ],
+        "reason_codes": ["local_eno_space"],
         "recommendations": [
           {
             "action": "Stop proof work and request operator-approved cleanup evidence.",
@@ -120,9 +118,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-wjjkp.1",
-          "blocking_beads": [
-            "ft-4tp7g"
-          ]
+          "blocking_beads": ["ft-4tp7g"]
         },
         "agent_mail": {
           "db_open": true,
@@ -147,9 +143,7 @@
         ],
         "cargo_jobs": 1,
         "estimated_slots": 4,
-        "reason_codes": [
-          "no_admissible_workers"
-        ],
+        "reason_codes": ["no_admissible_workers"],
         "recommendations": [
           {
             "action": "Block the proof bead on RCH admission and retain dry-run output.",
@@ -211,9 +205,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-wjjkp.1",
-          "blocking_beads": [
-            "ft-4tp7g"
-          ]
+          "blocking_beads": ["ft-4tp7g"]
         },
         "agent_mail": {
           "db_open": true,
@@ -238,10 +230,7 @@
         ],
         "cargo_jobs": 1,
         "estimated_slots": 4,
-        "reason_codes": [
-          "critical_pressure",
-          "no_admissible_workers"
-        ],
+        "reason_codes": ["critical_pressure", "no_admissible_workers"],
         "recommendations": [
           {
             "action": "Wait for worker disk recovery or operator-approved cleanup.",
@@ -328,9 +317,7 @@
         ],
         "cargo_jobs": null,
         "estimated_slots": null,
-        "reason_codes": [
-          "telemetry_gap"
-        ],
+        "reason_codes": ["telemetry_gap"],
         "recommendations": [
           {
             "action": "Refresh read-only worker status and do not mutate workers.",
@@ -392,9 +379,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-4tp7g.6",
-          "blocking_beads": [
-            "ft-4tp7g"
-          ]
+          "blocking_beads": ["ft-4tp7g"]
         },
         "agent_mail": {
           "db_open": true,
@@ -419,9 +404,7 @@
         ],
         "cargo_jobs": 1,
         "estimated_slots": 4,
-        "reason_codes": [
-          "insufficient_slots"
-        ],
+        "reason_codes": ["insufficient_slots"],
         "recommendations": [
           {
             "action": "Wait for free slots or fix slot estimation before retrying.",
@@ -483,9 +466,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-4tp7g",
-          "blocking_beads": [
-            "ft-4tp7g"
-          ]
+          "blocking_beads": ["ft-4tp7g"]
         },
         "agent_mail": {
           "db_open": true,
@@ -510,9 +491,7 @@
         ],
         "cargo_jobs": 1,
         "estimated_slots": 4,
-        "reason_codes": [
-          "active_project_exclusion"
-        ],
+        "reason_codes": ["active_project_exclusion"],
         "recommendations": [
           {
             "action": "Wait for the same-project build or coordinate with the owner.",
@@ -592,9 +571,7 @@
         "worker_rejections": [],
         "cargo_jobs": null,
         "estimated_slots": null,
-        "reason_codes": [
-          "speedscore_response_shape"
-        ],
+        "reason_codes": ["speedscore_response_shape"],
         "recommendations": [
           {
             "action": "Ignore ranking data for admission and preserve the parse artifact.",
@@ -656,9 +633,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-4tp7g",
-          "blocking_beads": [
-            "ft-4tp7g"
-          ]
+          "blocking_beads": ["ft-4tp7g"]
         },
         "agent_mail": {
           "db_open": true,
@@ -683,9 +658,7 @@
         ],
         "cargo_jobs": null,
         "estimated_slots": 4,
-        "reason_codes": [
-          "dry_run_inconsistent_worker"
-        ],
+        "reason_codes": ["dry_run_inconsistent_worker"],
         "recommendations": [
           {
             "action": "Report both fields and classify the diagnostic as advisory only.",
@@ -747,9 +720,7 @@
           "db_writeable": true,
           "jsonl_writeable": true,
           "active_bead": "ft-iubh9",
-          "blocking_beads": [
-            "ft-iubh9"
-          ]
+          "blocking_beads": ["ft-iubh9"]
         },
         "agent_mail": {
           "db_open": true,
@@ -776,9 +747,7 @@
         ],
         "cargo_jobs": null,
         "estimated_slots": 1,
-        "reason_codes": [
-          "worker_toolchain_missing_target"
-        ],
+        "reason_codes": ["worker_toolchain_missing_target"],
         "recommendations": [
           {
             "action": "Keep the proof bead blocked until the selected worker has the requested Rust target or is quarantined for that target.",
@@ -865,9 +834,7 @@
         ],
         "cargo_jobs": null,
         "estimated_slots": null,
-        "reason_codes": [
-          "unknown"
-        ],
+        "reason_codes": ["unknown"],
         "recommendations": [
           {
             "action": "File or update a bead with retained evidence and propose a stable reason code.",

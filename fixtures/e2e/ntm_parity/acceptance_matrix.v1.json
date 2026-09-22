@@ -41,11 +41,7 @@
     "notes": "string"
   },
   "artifacts_contract": {
-    "required_files": [
-      "summary.json",
-      "raw_command_outputs.jsonl",
-      "assertion_results.json"
-    ],
+    "required_files": ["summary.json", "raw_command_outputs.jsonl", "assertion_results.json"],
     "artifact_root": "artifacts/e2e/ntm_parity/<run_id>/"
   }
 }

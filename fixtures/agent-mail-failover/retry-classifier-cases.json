@@ -12,9 +12,7 @@
       "expected_failure_class": null,
       "expected_registered": true,
       "expected_inbox_checked": true,
-      "required_reason_codes": [
-        "agent_mail.available"
-      ]
+      "required_reason_codes": ["agent_mail.available"]
     },
     {
       "id": "transient-database-recovery",
@@ -38,10 +36,7 @@
       "expected_failure_class": "api_unreachable",
       "expected_registered": false,
       "expected_inbox_checked": false,
-      "required_reason_codes": [
-        "agent_mail.unavailable_after_retry",
-        "fallback.beads_only"
-      ]
+      "required_reason_codes": ["agent_mail.unavailable_after_retry", "fallback.beads_only"]
     },
     {
       "id": "timeout-or-hang",

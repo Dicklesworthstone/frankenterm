@@ -31,11 +31,11 @@
     }
   ],
   "transitions": [
-    {"from": "paused", "to": "efficiency", "trigger": "window_unminimized"},
-    {"from": "efficiency", "to": "balanced", "trigger": "window_focused"},
-    {"from": "balanced", "to": "latency", "trigger": "keypress_detected"},
-    {"from": "latency", "to": "balanced", "trigger": "idle_timeout_500ms"},
-    {"from": "balanced", "to": "efficiency", "trigger": "window_unfocused"},
-    {"from": "efficiency", "to": "paused", "trigger": "window_minimized"}
+    { "from": "paused", "to": "efficiency", "trigger": "window_unminimized" },
+    { "from": "efficiency", "to": "balanced", "trigger": "window_focused" },
+    { "from": "balanced", "to": "latency", "trigger": "keypress_detected" },
+    { "from": "latency", "to": "balanced", "trigger": "idle_timeout_500ms" },
+    { "from": "balanced", "to": "efficiency", "trigger": "window_unfocused" },
+    { "from": "efficiency", "to": "paused", "trigger": "window_minimized" }
   ]
 }

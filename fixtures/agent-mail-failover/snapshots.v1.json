@@ -7,9 +7,7 @@
   "fixtures": [
     {
       "id": "healthy-agent-mail",
-      "covers": [
-        "healthy_agent_mail"
-      ],
+      "covers": ["healthy_agent_mail"],
       "snapshot": {
         "ts": "2026-05-18T04:30:00Z",
         "session": "frankenterm",
@@ -122,9 +120,7 @@
     },
     {
       "id": "unavailable-after-retry",
-      "covers": [
-        "unavailable_after_retry"
-      ],
+      "covers": ["unavailable_after_retry"],
       "snapshot": {
         "ts": "2026-05-18T04:31:00Z",
         "session": "frankenterm",
@@ -191,9 +187,7 @@
     },
     {
       "id": "transient-database-recovery",
-      "covers": [
-        "transient_database_recovery_message"
-      ],
+      "covers": ["transient_database_recovery_message"],
       "snapshot": {
         "ts": "2026-05-18T04:32:00Z",
         "session": "frankenterm",
@@ -268,9 +262,7 @@
     },
     {
       "id": "no-in-progress-beads",
-      "covers": [
-        "no_in_progress_beads"
-      ],
+      "covers": ["no_in_progress_beads"],
       "snapshot": {
         "ts": "2026-05-18T04:33:00Z",
         "session": "frankenterm",
@@ -352,9 +344,7 @@
     },
     {
       "id": "stale-candidates-present",
-      "covers": [
-        "stale_candidates_present"
-      ],
+      "covers": ["stale_candidates_present"],
       "snapshot": {
         "ts": "2026-05-18T04:34:00Z",
         "session": "frankenterm",
@@ -465,9 +455,7 @@
     },
     {
       "id": "dirty-tracked-overlap",
-      "covers": [
-        "dirty_tracked_overlap"
-      ],
+      "covers": ["dirty_tracked_overlap"],
       "snapshot": {
         "ts": "2026-05-18T04:35:00Z",
         "session": "frankenterm",
@@ -555,9 +543,7 @@
               "category": "tracked_overlap_risk",
               "severity": "high",
               "count": 1,
-              "paths": [
-                "crates/frankenterm-core/src/runtime.rs"
-              ]
+              "paths": ["crates/frankenterm-core/src/runtime.rs"]
             }
           ],
           "dirty_paths": [
@@ -588,9 +574,7 @@
     },
     {
       "id": "untracked-review-required",
-      "covers": [
-        "untracked_review_required"
-      ],
+      "covers": ["untracked_review_required"],
       "snapshot": {
         "ts": "2026-05-18T04:36:00Z",
         "session": "frankenterm",
@@ -665,9 +649,7 @@
               "category": "untracked_review_required",
               "severity": "medium",
               "count": 1,
-              "paths": [
-                "docs/draft-handoff.md"
-              ]
+              "paths": ["docs/draft-handoff.md"]
             }
           ],
           "dirty_paths": [

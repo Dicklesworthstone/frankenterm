@@ -6,10 +6,7 @@
   "source_bead": "ft-5xwsu.1",
   "source_context": {
     "parent_bead": "ft-5xwsu",
-    "seed_evidence": [
-      "ft-4tp7g#6014",
-      "agent-mail://frankenterm/2243"
-    ]
+    "seed_evidence": ["ft-4tp7g#6014", "agent-mail://frankenterm/2243"]
   },
   "side_effect_policy": {
     "read_only": true,

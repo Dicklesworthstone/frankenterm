@@ -10,18 +10,12 @@
       "state": "unavailable",
       "freshness_state": "not_collected",
       "redaction_posture": "redacted",
-      "reason_codes": [
-        "agent_mail.database_error",
-        "agent_mail.unavailable_after_retry"
-      ],
+      "reason_codes": ["agent_mail.database_error", "agent_mail.unavailable_after_retry"],
       "evidence": [
         {
           "category": "agent_mail_availability",
           "summary": "macro_start_session failed twice with transient database error",
-          "reason_codes": [
-            "agent_mail.database_error",
-            "fallback.beads_only"
-          ]
+          "reason_codes": ["agent_mail.database_error", "fallback.beads_only"]
         }
       ]
     },
@@ -31,17 +25,12 @@
       "state": "available",
       "freshness_state": "fresh",
       "redaction_posture": "redacted",
-      "reason_codes": [
-        "beads.ready_available",
-        "fallback.beads_only"
-      ],
+      "reason_codes": ["beads.ready_available", "fallback.beads_only"],
       "evidence": [
         {
           "category": "beads_ready_queue",
           "summary": "swarm tick fallback found one ready bead",
-          "reason_codes": [
-            "beads.ready_available"
-          ]
+          "reason_codes": ["beads.ready_available"]
         }
       ]
     }
@@ -54,18 +43,14 @@
       "readiness": "ready_bead",
       "priority": 2,
       "target_bead_id": "ft-auy2g.5",
-      "owned_paths": [
-        "fixtures/mission-planner/objective-plan-corpus"
-      ],
+      "owned_paths": ["fixtures/mission-planner/objective-plan-corpus"],
       "active_assignee": null,
       "active_age_seconds": null,
       "stale_after_seconds": 7200,
       "dependency_ready": true,
       "proof_availability": "not_required",
       "capacity_posture": "admit",
-      "reason_codes": [
-        "fallback.beads_only"
-      ]
+      "reason_codes": ["fallback.beads_only"]
     }
   ]
 }

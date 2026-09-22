@@ -25,12 +25,7 @@
     "local_cargo_proof_allowed": false,
     "max_retries_allowed": 1
   },
-  "required_cases": [
-    "available",
-    "unavailable-after-retry",
-    "database-error",
-    "fallback-only"
-  ],
+  "required_cases": ["available", "unavailable-after-retry", "database-error", "fallback-only"],
   "cases": [
     {
       "case_id": "available",
@@ -86,10 +81,7 @@
           "source": "none",
           "counts_as_agent_mail_health": false
         },
-        "reason_codes": [
-          "agent_mail.available",
-          "agent_mail.metadata_only"
-        ]
+        "reason_codes": ["agent_mail.available", "agent_mail.metadata_only"]
       },
       "safe_next_action": "record_agent_mail_health_metadata",
       "forbidden_actions": [
@@ -118,9 +110,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "agent-mail.unavailable-after-retry"
-        ]
+        "warning_ids": ["agent-mail.unavailable-after-retry"]
       },
       "agent_mail": {
         "service_status": "unavailable",
@@ -158,10 +148,7 @@
           "source": "none",
           "counts_as_agent_mail_health": false
         },
-        "reason_codes": [
-          "agent_mail.unavailable_after_retry",
-          "agent_mail.api_unreachable"
-        ]
+        "reason_codes": ["agent_mail.unavailable_after_retry", "agent_mail.api_unreachable"]
       },
       "warnings": [
         {
@@ -198,9 +185,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "agent-mail.database-error"
-        ]
+        "warning_ids": ["agent-mail.database-error"]
       },
       "agent_mail": {
         "service_status": "unavailable",
@@ -238,10 +223,7 @@
           "source": "none",
           "counts_as_agent_mail_health": false
         },
-        "reason_codes": [
-          "agent_mail.database_error",
-          "agent_mail.unavailable_after_retry"
-        ]
+        "reason_codes": ["agent_mail.database_error", "agent_mail.unavailable_after_retry"]
       },
       "warnings": [
         {
@@ -277,9 +259,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "agent-mail.fallback-only"
-        ]
+        "warning_ids": ["agent-mail.fallback-only"]
       },
       "agent_mail": {
         "service_status": "unavailable",
@@ -317,10 +297,7 @@
           "source": "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
           "counts_as_agent_mail_health": false
         },
-        "reason_codes": [
-          "agent_mail.fallback_only",
-          "agent_mail.health_unavailable"
-        ]
+        "reason_codes": ["agent_mail.fallback_only", "agent_mail.health_unavailable"]
       },
       "warnings": [
         {

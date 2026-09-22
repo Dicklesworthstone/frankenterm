@@ -6,20 +6,13 @@
   "source_bead": "ft-5xwsu.1",
   "source_context": {
     "parent_bead": "ft-5xwsu",
-    "seed_evidence": [
-      "ft-4tp7g#6014",
-      "agent-mail://frankenterm/2244"
-    ]
+    "seed_evidence": ["ft-4tp7g#6014", "agent-mail://frankenterm/2244"]
   },
   "side_effect_policy": {
     "read_only": true,
     "operator_approval_required": true,
     "automatic_cleanup_allowed": false,
-    "performed_actions": [
-      "read_rch_status",
-      "read_worker_capabilities",
-      "read_retained_artifact"
-    ],
+    "performed_actions": ["read_rch_status", "read_worker_capabilities", "read_retained_artifact"],
     "forbidden_actions": [
       "delete_file",
       "delete_directory",
@@ -169,10 +162,7 @@
           "notes": "Missing disk metrics are preserved as a blocker, not treated as green."
         }
       ],
-      "reason_codes": [
-        "rch.worker_pressure.telemetry_gap",
-        "rch.inventory.telemetry_gap"
-      ],
+      "reason_codes": ["rch.worker_pressure.telemetry_gap", "rch.inventory.telemetry_gap"],
       "notes": "The inventory preserves a telemetry gap without fabricating filesystem sizes."
     }
   ],

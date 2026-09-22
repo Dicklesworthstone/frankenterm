@@ -6,14 +6,8 @@
     {
       "window_id": 1,
       "title": "left-monitor",
-      "position": [
-        0,
-        0
-      ],
-      "size": [
-        1728,
-        1117
-      ],
+      "position": [0, 0],
+      "size": [1728, 1117],
       "tabs": [
         {
           "tab_id": 11,
@@ -69,14 +63,8 @@
     {
       "window_id": 2,
       "title": "right-monitor",
-      "position": [
-        1728,
-        0
-      ],
-      "size": [
-        1728,
-        1117
-      ],
+      "position": [1728, 0],
+      "size": [1728, 1117],
       "tabs": [
         {
           "tab_id": 21,

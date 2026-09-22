@@ -21,11 +21,11 @@
   "swarm": {
     "panes_count": 5,
     "agents": [
-      {"idx": 0, "type": "user",   "pane": "%41"},
-      {"idx": 1, "type": "claude", "pane": "%42"},
-      {"idx": 2, "type": "claude", "pane": "%43"},
-      {"idx": 3, "type": "codex",  "pane": "%44"},
-      {"idx": 4, "type": "codex",  "pane": "%45"}
+      { "idx": 0, "type": "user", "pane": "%41" },
+      { "idx": 1, "type": "claude", "pane": "%42" },
+      { "idx": 2, "type": "claude", "pane": "%43" },
+      { "idx": 3, "type": "codex", "pane": "%44" },
+      { "idx": 4, "type": "codex", "pane": "%45" }
     ]
   },
   "coordinator": {

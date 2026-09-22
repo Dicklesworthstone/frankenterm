@@ -1,1 +1,1 @@
-{"type":"string","pattern":"(a+)+$"}
+{ "type": "string", "pattern": "(a+)+$" }

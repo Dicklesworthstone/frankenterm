@@ -13,9 +13,7 @@
     {
       "case_id": "local-cargo-fallback-allowed",
       "expected_failure": "local_cargo_fallback_allowed_must_be_false",
-      "reason_codes": [
-        "proof.local_cargo_fallback_forbidden"
-      ],
+      "reason_codes": ["proof.local_cargo_fallback_forbidden"],
       "invalid_fragment": {
         "proof_policy": {
           "local_cargo_fallback_allowed": true
@@ -25,9 +23,7 @@
     {
       "case_id": "raw-pane-content-allowed",
       "expected_failure": "raw_pane_content_must_not_be_stored_or_allowed",
-      "reason_codes": [
-        "redaction.raw_pane_content_forbidden"
-      ],
+      "reason_codes": ["redaction.raw_pane_content_forbidden"],
       "invalid_fragment": {
         "redaction_policy": {
           "raw_pane_content_allowed": true
@@ -43,21 +39,15 @@
     {
       "case_id": "absolute-artifact-path",
       "expected_failure": "artifact_paths_must_be_repo_relative",
-      "reason_codes": [
-        "artifact.absolute_path_forbidden"
-      ],
+      "reason_codes": ["artifact.absolute_path_forbidden"],
       "invalid_fragment": {
-        "artifact_paths": [
-          "/tmp/frankenterm-proof-calendar.json"
-        ]
+        "artifact_paths": ["/tmp/frankenterm-proof-calendar.json"]
       }
     },
     {
       "case_id": "missing-required-forbidden-action",
       "expected_failure": "all_required_forbidden_actions_must_be_retained",
-      "reason_codes": [
-        "policy.required_forbidden_action_missing"
-      ],
+      "reason_codes": ["policy.required_forbidden_action_missing"],
       "invalid_fragment": {
         "missing_forbidden_action": "worker_mutation",
         "forbidden_actions": [
@@ -77,27 +67,12 @@
     {
       "case_id": "toon-row-width-mismatch",
       "expected_failure": "toon_rows_must_match_declared_columns",
-      "reason_codes": [
-        "toon.row_width_mismatch"
-      ],
+      "reason_codes": ["toon.row_width_mismatch"],
       "invalid_fragment": {
         "toon_projection": {
-          "columns": [
-            "case_id",
-            "lane",
-            "work_class",
-            "recommendation",
-            "confidence",
-            "reason"
-          ],
+          "columns": ["case_id", "lane", "work_class", "recommendation", "confidence", "reason"],
           "rows": [
-            [
-              "toon-row-width-mismatch",
-              "now",
-              "static_docs_fixture_verifier",
-              "run_now",
-              "medium"
-            ]
+            ["toon-row-width-mismatch", "now", "static_docs_fixture_verifier", "run_now", "medium"]
           ]
         }
       }
@@ -105,9 +80,7 @@
     {
       "case_id": "service-mutation-permitted",
       "expected_failure": "service_mutation_allowed_must_be_false",
-      "reason_codes": [
-        "policy.service_mutation_forbidden"
-      ],
+      "reason_codes": ["policy.service_mutation_forbidden"],
       "invalid_fragment": {
         "side_effect_policy": {
           "service_mutation_allowed": true

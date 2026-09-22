@@ -31,9 +31,7 @@
       "inventory_evidence_sha256": "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc",
       "approval_match": "mismatch",
       "protected_reason": "none",
-      "notes": [
-        "Requested path hash differs from the approved path-set hash."
-      ]
+      "notes": ["Requested path hash differs from the approved path-set hash."]
     }
   ],
   "allowed_operations": [],
@@ -95,12 +93,7 @@
       "fresh retained inventory evidence",
       "br dep cycles --json"
     ],
-    "beads_to_update": [
-      "ft-5xwsu.3",
-      "ft-4tp7g"
-    ]
+    "beads_to_update": ["ft-5xwsu.3", "ft-4tp7g"]
   },
-  "review_notes": [
-    "A different path under the same parent is still denied."
-  ]
+  "review_notes": ["A different path under the same parent is still denied."]
 }

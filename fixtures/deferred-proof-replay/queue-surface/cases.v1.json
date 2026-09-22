@@ -34,9 +34,7 @@
   "next_candidate": {
     "bead_id": "ft-rdy1",
     "receipt_id": "ft-rdy1:comment-7001",
-    "reason_codes": [
-      "rch.admitted"
-    ],
+    "reason_codes": ["rch.admitted"],
     "target_dir": "/tmp/ft-rdy1-recorder",
     "command_preview": [
       "rch",
@@ -58,9 +56,7 @@
       "bead_id": "ft-am1",
       "receipt_id": "ft-am1:comment-7006",
       "status": "ambiguous",
-      "reason_codes": [
-        "ambiguous_comment"
-      ],
+      "reason_codes": ["ambiguous_comment"],
       "target_dir": null,
       "material_remote_required": false,
       "replay_allowed": false,
@@ -78,9 +74,7 @@
       "bead_id": "ft-cp1",
       "receipt_id": "ft-cp1:comment-7007",
       "status": "completed",
-      "reason_codes": [
-        "receipt_emitted"
-      ],
+      "reason_codes": ["receipt_emitted"],
       "target_dir": "/tmp/ft-cp1-policy",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -102,9 +96,7 @@
       "bead_id": "ft-do1",
       "receipt_id": "ft-do1:comment-7003",
       "status": "dirty_overlap",
-      "reason_codes": [
-        "dirty_overlap"
-      ],
+      "reason_codes": ["dirty_overlap"],
       "target_dir": "/tmp/ft-do1-redactor",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -122,9 +114,7 @@
       "bead_id": "ft-pq1",
       "receipt_id": "ft-pq1:comment-7004",
       "status": "prerequisite_blocked",
-      "reason_codes": [
-        "prerequisite_blocked"
-      ],
+      "reason_codes": ["prerequisite_blocked"],
       "target_dir": "/tmp/ft-pq1-mcp",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -142,9 +132,7 @@
       "bead_id": "ft-rdy1",
       "receipt_id": "ft-rdy1:comment-7001",
       "status": "runnable",
-      "reason_codes": [
-        "rch.admitted"
-      ],
+      "reason_codes": ["rch.admitted"],
       "target_dir": "/tmp/ft-rdy1-recorder",
       "material_remote_required": true,
       "replay_allowed": true,
@@ -166,9 +154,7 @@
       "bead_id": "ft-st1",
       "receipt_id": "ft-st1:comment-7005",
       "status": "stale_command",
-      "reason_codes": [
-        "stale_command_shape"
-      ],
+      "reason_codes": ["stale_command_shape"],
       "target_dir": "/tmp/ft-st1-policy",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -186,9 +172,7 @@
       "bead_id": "ft-wt1",
       "receipt_id": "ft-wt1:comment-7002",
       "status": "wait_rch",
-      "reason_codes": [
-        "rch.topology_preflight_failed"
-      ],
+      "reason_codes": ["rch.topology_preflight_failed"],
       "target_dir": "/tmp/ft-wt1-latency",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -210,9 +194,7 @@
       "bead_id": "ft-wt2",
       "receipt_id": "ft-wt2:comment-7008",
       "status": "wait_rch",
-      "reason_codes": [
-        "rch.active_project_exclusion"
-      ],
+      "reason_codes": ["rch.active_project_exclusion"],
       "target_dir": "/tmp/ft-wt2-replay-types",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -234,9 +216,7 @@
       "bead_id": "ft-wt3",
       "receipt_id": "ft-wt3:comment-7009",
       "status": "wait_rch",
-      "reason_codes": [
-        "rch.insufficient_slots"
-      ],
+      "reason_codes": ["rch.insufficient_slots"],
       "target_dir": "/tmp/ft-wt3-insufficient",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -258,9 +238,7 @@
       "bead_id": "ft-wt4",
       "receipt_id": "ft-wt4:comment-7010",
       "status": "wait_rch",
-      "reason_codes": [
-        "rch.telemetry_gap"
-      ],
+      "reason_codes": ["rch.telemetry_gap"],
       "target_dir": "/tmp/ft-wt4-telemetry",
       "material_remote_required": true,
       "replay_allowed": false,
@@ -284,72 +262,56 @@
       "bead_id": "ft-am1",
       "status": "ambiguous",
       "why": "Footer carried no structured command, only prose, so no replayable proof can be derived.",
-      "blocking_reason_codes": [
-        "ambiguous_comment"
-      ],
+      "blocking_reason_codes": ["ambiguous_comment"],
       "remediation": "request_human_triage"
     },
     {
       "bead_id": "ft-do1",
       "status": "dirty_overlap",
       "why": "Captured tree had dirty paths outside the owned set; replaying would bundle unrelated work.",
-      "blocking_reason_codes": [
-        "dirty_overlap"
-      ],
+      "blocking_reason_codes": ["dirty_overlap"],
       "remediation": "resolve_dirty_overlap"
     },
     {
       "bead_id": "ft-pq1",
       "status": "prerequisite_blocked",
       "why": "A prerequisite bead is still open; its proof must land before this receipt can replay.",
-      "blocking_reason_codes": [
-        "prerequisite_blocked"
-      ],
+      "blocking_reason_codes": ["prerequisite_blocked"],
       "remediation": "complete_prerequisite_bead"
     },
     {
       "bead_id": "ft-st1",
       "status": "stale_command",
       "why": "Material command is missing the required remote-only RCH flags or exec shape.",
-      "blocking_reason_codes": [
-        "stale_command_shape"
-      ],
+      "blocking_reason_codes": ["stale_command_shape"],
       "remediation": "refresh_command_shape"
     },
     {
       "bead_id": "ft-wt1",
       "status": "wait_rch",
       "why": "RCH selected a worker, but remote topology preflight failed before Cargo; the receipt waits for RCH admission/topology recovery.",
-      "blocking_reason_codes": [
-        "rch.topology_preflight_failed"
-      ],
+      "blocking_reason_codes": ["rch.topology_preflight_failed"],
       "remediation": "wait_for_rch_admission"
     },
     {
       "bead_id": "ft-wt2",
       "status": "wait_rch",
       "why": "RCH reported active-project exclusion because another FrankenTerm proof lane occupied the project admission window; the receipt waits for the active lane to clear.",
-      "blocking_reason_codes": [
-        "rch.active_project_exclusion"
-      ],
+      "blocking_reason_codes": ["rch.active_project_exclusion"],
       "remediation": "wait_for_rch_admission"
     },
     {
       "bead_id": "ft-wt3",
       "status": "wait_rch",
       "why": "RCH reported insufficient slots for a remote-required proof; the receipt waits for RCH admission capacity.",
-      "blocking_reason_codes": [
-        "rch.insufficient_slots"
-      ],
+      "blocking_reason_codes": ["rch.insufficient_slots"],
       "remediation": "wait_for_rch_admission"
     },
     {
       "bead_id": "ft-wt4",
       "status": "wait_rch",
       "why": "RCH reported a telemetry gap, so admission truth is incomplete and the receipt waits for RCH to recover telemetry.",
-      "blocking_reason_codes": [
-        "rch.telemetry_gap"
-      ],
+      "blocking_reason_codes": ["rch.telemetry_gap"],
       "remediation": "wait_for_rch_admission"
     }
   ],

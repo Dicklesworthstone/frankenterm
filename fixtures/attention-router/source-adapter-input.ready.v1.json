@@ -18,14 +18,10 @@
           "fact": "beads_ready",
           "summary": "docs-only ready static slice",
           "count": 1,
-          "bead_ids": [
-            "ft-docs"
-          ],
+          "bead_ids": ["ft-docs"],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "beads.ready_available"
-          ]
+          "reason_codes": ["beads.ready_available"]
         }
       ],
       "items_seen": 1
@@ -49,9 +45,7 @@
           "bead_ids": [],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "agent_mail.no_ack_required"
-          ]
+          "reason_codes": ["agent_mail.no_ack_required"]
         }
       ],
       "items_seen": 1
@@ -75,9 +69,7 @@
           "bead_ids": [],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "git.no_candidate_overlap"
-          ]
+          "reason_codes": ["git.no_candidate_overlap"]
         }
       ],
       "items_seen": 1
@@ -101,9 +93,7 @@
           "bead_ids": [],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "proof.static_only"
-          ]
+          "reason_codes": ["proof.static_only"]
         }
       ],
       "items_seen": 1
@@ -127,9 +117,7 @@
           "bead_ids": [],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "pane_state.no_stale_claim"
-          ]
+          "reason_codes": ["pane_state.no_stale_claim"]
         }
       ],
       "items_seen": 1
@@ -153,9 +141,7 @@
           "bead_ids": [],
           "agent_names": [],
           "affected_paths": [],
-          "reason_codes": [
-            "operating_envelope.static_slice_allowed"
-          ]
+          "reason_codes": ["operating_envelope.static_slice_allowed"]
         }
       ],
       "items_seen": 1

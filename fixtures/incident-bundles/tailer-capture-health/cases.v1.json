@@ -112,10 +112,7 @@
           "gap_events_total": 0,
           "scheduler_tick_age_ms": 260
         },
-        "reason_codes": [
-          "tailer_capture_health.ok",
-          "tailer_capture_health.fresh"
-        ]
+        "reason_codes": ["tailer_capture_health.ok", "tailer_capture_health.fresh"]
       },
       "safe_next_action": "record_tailer_capture_health_measured",
       "forbidden_actions": [
@@ -261,9 +258,7 @@
         "mutates_state": false,
         "redaction": "none",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "tailer-capture-health.stale-capture"
-        ]
+        "warning_ids": ["tailer-capture-health.stale-capture"]
       },
       "capture": {
         "status": "stale",
@@ -370,9 +365,7 @@
         "mutates_state": false,
         "redaction": "not_applicable",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "tailer-capture-health.snapshot-unavailable"
-        ]
+        "warning_ids": ["tailer-capture-health.snapshot-unavailable"]
       },
       "capture": {
         "status": "unavailable",
@@ -391,9 +384,7 @@
           "gap_events_total": null,
           "scheduler_tick_age_ms": null
         },
-        "reason_codes": [
-          "tailer_capture_health.snapshot_unavailable"
-        ]
+        "reason_codes": ["tailer_capture_health.snapshot_unavailable"]
       },
       "warnings": [
         {

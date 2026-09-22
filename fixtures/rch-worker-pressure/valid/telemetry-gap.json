@@ -12,11 +12,7 @@
       "RCH_NO_SELF_HEALING=1 rch --no-self-healing --json status --workers --jobs",
       "timeout 15s df -B1 / /tmp /data/projects/frankenterm"
     ],
-    "paths": [
-      "/",
-      "/tmp",
-      "/data/projects/frankenterm"
-    ],
+    "paths": ["/", "/tmp", "/data/projects/frankenterm"],
     "timeout_ms": 30000,
     "partial_allowed": true,
     "side_effect_policy": {
@@ -33,16 +29,11 @@
   "summary": {
     "workers_total": 2,
     "workers_sampled": 1,
-    "worker_ids": [
-      "vmi1227870"
-    ],
+    "worker_ids": ["vmi1227870"],
     "workers_with_critical_pressure": 1,
     "workers_with_telemetry_gap": 1,
     "workers_with_partial_output": 0,
-    "pressure_reasons": [
-      "telemetry_gap",
-      "disk_critical_without_fresh_telemetry"
-    ]
+    "pressure_reasons": ["telemetry_gap", "disk_critical_without_fresh_telemetry"]
   },
   "worker_inventories": [
     {
@@ -84,9 +75,7 @@
           "entry_count": null,
           "pressure_reason": "telemetry_gap",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-target-not-run.json",
-          "notes": [
-            "Target scan was not run because fresh worker telemetry was unavailable."
-          ]
+          "notes": ["Target scan was not run because fresh worker telemetry was unavailable."]
         }
       ],
       "project_du_samples": [
@@ -105,9 +94,7 @@
           "entry_count": null,
           "pressure_reason": "telemetry_gap",
           "artifact_path": "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-project-du-not-run.json",
-          "notes": [
-            "Bounded du was not run; stale telemetry is retained as the diagnosis."
-          ]
+          "notes": ["Bounded du was not run; stale telemetry is retained as the diagnosis."]
         }
       ],
       "artifact_paths": [
@@ -115,9 +102,7 @@
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-target-not-run.json",
         "tests/e2e/artifacts/retained/ft-5xwsu.1/rch-worker-pressure/telemetry-gap/vmi1227870-project-du-not-run.json"
       ],
-      "notes": [
-        "Telemetry gaps stay explicit and must not trigger service repair."
-      ]
+      "notes": ["Telemetry gaps stay explicit and must not trigger service repair."]
     }
   ],
   "artifact_paths": [

@@ -32,9 +32,7 @@
     "target_dir": "/tmp/ft-s6h49-silverharbor-target",
     "feature_flags": {
       "default_features": false,
-      "enabled": [
-        "no-default-features"
-      ],
+      "enabled": ["no-default-features"],
       "disabled": []
     }
   },
@@ -43,67 +41,49 @@
       "persona": "idle_agents",
       "pane_count": 1,
       "output_bytes_per_sec": 0.0,
-      "operations": [
-        "state_snapshot"
-      ]
+      "operations": ["state_snapshot"]
     },
     {
       "persona": "active_agents",
       "pane_count": 2,
       "output_bytes_per_sec": 256.0,
-      "operations": [
-        "capture_delta",
-        "detect_prompt"
-      ]
+      "operations": ["capture_delta", "detect_prompt"]
     },
     {
       "persona": "noisy_agents",
       "pane_count": 1,
       "output_bytes_per_sec": 4096.0,
-      "operations": [
-        "scan_pipeline"
-      ]
+      "operations": ["scan_pipeline"]
     },
     {
       "persona": "rate_limited_agents",
       "pane_count": 1,
       "output_bytes_per_sec": 128.0,
-      "operations": [
-        "pattern_detection"
-      ]
+      "operations": ["pattern_detection"]
     },
     {
       "persona": "tui_heavy",
       "pane_count": 1,
       "output_bytes_per_sec": 2048.0,
-      "operations": [
-        "ansi_density_scan"
-      ]
+      "operations": ["ansi_density_scan"]
     },
     {
       "persona": "search_heavy",
       "pane_count": 2,
       "output_bytes_per_sec": 512.0,
-      "operations": [
-        "fts_query",
-        "hybrid_query"
-      ]
+      "operations": ["fts_query", "hybrid_query"]
     },
     {
       "persona": "workflow_heavy",
       "pane_count": 1,
       "output_bytes_per_sec": 384.0,
-      "operations": [
-        "workflow_trigger"
-      ]
+      "operations": ["workflow_trigger"]
     },
     {
       "persona": "distributed_panes",
       "pane_count": 1,
       "output_bytes_per_sec": 256.0,
-      "operations": [
-        "stale_session_prune"
-      ]
+      "operations": ["stale_session_prune"]
     }
   ],
   "timings": {

@@ -20,10 +20,7 @@
           "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
           "frankenterm/ssh/Cargo.toml"
         ],
-        "tokio": [
-          "Cargo.toml",
-          "crates/frankenterm-core/Cargo.toml"
-        ]
+        "tokio": ["Cargo.toml", "crates/frankenterm-core/Cargo.toml"]
       },
       "status": "passed"
     },
@@ -123,10 +120,7 @@
         "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
         "frankenterm/ssh/Cargo.toml"
       ],
-      "tokio": [
-        "Cargo.toml",
-        "crates/frankenterm-core/Cargo.toml"
-      ]
+      "tokio": ["Cargo.toml", "crates/frankenterm-core/Cargo.toml"]
     },
     "forbidden_token_counts": {
       "async_io::": 9,

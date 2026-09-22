@@ -29,15 +29,21 @@
         "workflow": ".github/workflows/contract-families-matrix.yml",
         "job": "matrix",
         "fail_closed_steps": [
-          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
-          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
-          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+          {
+            "name": "Robot/MCP Contract Doctor static verdict",
+            "command": "bash scripts/check-contract-doctor-coverage.sh"
+          },
+          { "name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..." },
+          {
+            "name": "Robot/MCP Contract Doctor cargo verdict",
+            "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
+          }
         ]
       },
       "tracked_exceptions": [
-        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
-        {"gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception"},
-        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+        { "gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception" },
+        { "gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception" },
+        { "gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception" }
       ]
     }
   },
@@ -71,14 +77,20 @@
         "workflow": ".github/workflows/contract-families-matrix.yml",
         "job": "matrix",
         "fail_closed_steps": [
-          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
-          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
-          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+          {
+            "name": "Robot/MCP Contract Doctor static verdict",
+            "command": "bash scripts/check-contract-doctor-coverage.sh"
+          },
+          { "name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..." },
+          {
+            "name": "Robot/MCP Contract Doctor cargo verdict",
+            "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
+          }
         ]
       },
       "tracked_exceptions": [
-        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
-        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+        { "gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception" },
+        { "gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception" }
       ]
     }
   },
@@ -112,15 +124,21 @@
         "workflow": ".github/workflows/contract-families-matrix.yml",
         "job": "matrix",
         "fail_closed_steps": [
-          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
-          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
-          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+          {
+            "name": "Robot/MCP Contract Doctor static verdict",
+            "command": "bash scripts/check-contract-doctor-coverage.sh"
+          },
+          { "name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..." },
+          {
+            "name": "Robot/MCP Contract Doctor cargo verdict",
+            "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"
+          }
         ]
       },
       "tracked_exceptions": [
-        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
-        {"gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception"},
-        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+        { "gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception" },
+        { "gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception" },
+        { "gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception" }
       ]
     }
   }

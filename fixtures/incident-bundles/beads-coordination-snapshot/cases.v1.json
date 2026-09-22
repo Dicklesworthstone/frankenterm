@@ -111,9 +111,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "beads-coordination.agent-mail-unavailable"
-        ]
+        "warning_ids": ["beads-coordination.agent-mail-unavailable"]
       },
       "coordination": {
         "ready_count": 0,
@@ -173,9 +171,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "beads-coordination.dirty-overlap"
-        ]
+        "warning_ids": ["beads-coordination.dirty-overlap"]
       },
       "coordination": {
         "ready_count": 0,
@@ -246,9 +242,7 @@
         "mutates_state": false,
         "redaction": "partial",
         "privacy_tier": "metadata_only",
-        "warning_ids": [
-          "beads-coordination.stale-candidate"
-        ]
+        "warning_ids": ["beads-coordination.stale-candidate"]
       },
       "coordination": {
         "ready_count": 0,

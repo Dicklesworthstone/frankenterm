@@ -7,11 +7,7 @@
       "slug": "clean_bootstrap",
       "surface": "first_run",
       "claim": "A clean workspace exposes explicit bootstrap guidance and can be bootstrapped through the product path.",
-      "commands": [
-        "ft doctor --json",
-        "ft status --health -f json",
-        "ft watch --foreground"
-      ],
+      "commands": ["ft doctor --json", "ft status --health -f json", "ft watch --foreground"],
       "success_criteria": [
         "status --health classifies the workspace as bootstrap_required before any runtime state exists",
         "doctor remains machine-readable and points at the bootstrap path even if other backend checks are still degraded",
@@ -29,9 +25,7 @@
       "slug": "broken_environment_diagnosis",
       "surface": "doctor",
       "claim": "A broken backend environment is diagnosed through actionable doctor output rather than silent failure.",
-      "commands": [
-        "ft doctor --json"
-      ],
+      "commands": ["ft doctor --json"],
       "success_criteria": [
         "doctor exits non-zero",
         "the WezTerm CLI check is marked as an error",
@@ -48,11 +42,7 @@
       "slug": "incident_triage_entry",
       "surface": "doctor_status_session_doctor",
       "claim": "The standard incident entry path routes through the new diagnostic surfaces and points operators at recovery commands.",
-      "commands": [
-        "ft doctor --json",
-        "ft status --health -f json",
-        "ft session doctor -f json"
-      ],
+      "commands": ["ft doctor --json", "ft status --health -f json", "ft session doctor -f json"],
       "success_criteria": [
         "all three surfaces classify the seeded incident as recovery_required",
         "the next-step commands point at watch, session list, or snapshot inspection"
@@ -68,10 +58,7 @@
       "slug": "return_to_steady_state",
       "surface": "session_recovery",
       "claim": "After the incident state is repaired, session persistence returns to a healthy classification.",
-      "commands": [
-        "ft session doctor -f json",
-        "ft session list -f json"
-      ],
+      "commands": ["ft session doctor -f json", "ft session list -f json"],
       "success_criteria": [
         "session doctor reports healthy after the unclean marker is cleared",
         "session inventory remains queryable after the repair"

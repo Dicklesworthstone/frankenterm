@@ -3,19 +3,8 @@
   "generated_at": "2026-02-25T07:11:57Z",
   "workspace": "/Users/jemanuel/projects/frankenterm",
   "inventory_scope": {
-    "source_globs": [
-      "crates/**/*.rs",
-      "frankenterm/**/*.rs",
-      "**/Cargo.toml",
-      "Cargo.lock"
-    ],
-    "symbol_patterns": [
-      "asupersync::",
-      "tokio::",
-      "runtime_compat::",
-      "smol::",
-      "async_std::"
-    ],
+    "source_globs": ["crates/**/*.rs", "frankenterm/**/*.rs", "**/Cargo.toml", "Cargo.lock"],
+    "symbol_patterns": ["asupersync::", "tokio::", "runtime_compat::", "smol::", "async_std::"],
     "symbol_token_probes": [
       "tokio::spawn",
       "tokio::time::sleep",
@@ -486,9 +475,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 215,
-      "affected_user_workflows": [
-        "runtime-abstraction-and-scheduling"
-      ]
+      "affected_user_workflows": ["runtime-abstraction-and-scheduling"]
     },
     {
       "path": "crates/frankenterm/src/main.rs",
@@ -497,10 +484,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 171,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane",
-        "cli-command-execution"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane", "cli-command-execution"]
     },
     {
       "path": "crates/frankenterm-core/src/storage.rs",
@@ -521,9 +505,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 86,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/pool.rs",
@@ -532,9 +514,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 65,
-      "affected_user_workflows": [
-        "runtime-abstraction-and-scheduling"
-      ]
+      "affected_user_workflows": ["runtime-abstraction-and-scheduling"]
     },
     {
       "path": "crates/frankenterm-core/tests/proptest_runtime_compat.rs",
@@ -555,9 +535,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 54,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/tantivy_ingest.rs",
@@ -566,9 +544,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 46,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/wezterm.rs",
@@ -577,9 +553,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 46,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/tantivy_reindex.rs",
@@ -588,9 +562,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat sync/channel adapters",
       "reference_count": 45,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/simulation.rs",
@@ -599,9 +571,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 42,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/recorder_storage.rs",
@@ -622,9 +592,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 36,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/approval.rs",
@@ -633,9 +601,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 34,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/cleanup.rs",
@@ -644,9 +610,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 32,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/spsc_ring_buffer.rs",
@@ -655,9 +619,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 32,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "frankenterm/ssh/tests/e2e/sftp.rs",
@@ -666,9 +628,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "asupersync-native adapter over smol surface",
       "reference_count": 31,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/src/undo.rs",
@@ -677,9 +637,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 28,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/tests/frankensqlite_e2e_tests.rs",
@@ -700,9 +658,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 27,
-      "affected_user_workflows": [
-        "capture-persistence-and-replay"
-      ]
+      "affected_user_workflows": ["capture-persistence-and-replay"]
     },
     {
       "path": "crates/frankenterm-core/tests/frankensqlite_perf_tests.rs",
@@ -736,9 +692,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 24,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/runtime_compat_tests.rs",
@@ -759,9 +713,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 22,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/export.rs",
@@ -770,9 +722,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 21,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/tantivy_integration_tests.rs",
@@ -793,9 +743,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 19,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/distributed.rs",
@@ -804,9 +752,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 19,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/ipc_throughput.rs",
@@ -815,9 +761,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 18,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/tests/session_persistence_tests.rs",
@@ -826,9 +770,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 18,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/src/events.rs",
@@ -837,9 +779,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 17,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/protocol_recovery.rs",
@@ -848,9 +788,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 17,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/tailer.rs",
@@ -859,9 +797,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 16,
-      "affected_user_workflows": [
-        "runtime-abstraction-and-scheduling"
-      ]
+      "affected_user_workflows": ["runtime-abstraction-and-scheduling"]
     },
     {
       "path": "crates/frankenterm-core/tests/frankensqlite_contract_tests.rs",
@@ -882,9 +818,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 15,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/sharding.rs",
@@ -893,9 +827,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 15,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/watchdog.rs",
@@ -904,9 +836,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 15,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/web.rs",
@@ -915,9 +845,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 15,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/src/native_events.rs",
@@ -926,9 +854,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/replay.rs",
@@ -937,9 +863,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "capture-persistence-and-replay"
-      ]
+      "affected_user_workflows": ["capture-persistence-and-replay"]
     },
     {
       "path": "crates/frankenterm-core/src/restore_layout.rs",
@@ -948,9 +872,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/retry.rs",
@@ -959,9 +881,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/search_bridge.rs",
@@ -970,9 +890,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "search-and-retrieval"
-      ]
+      "affected_user_workflows": ["search-and-retrieval"]
     },
     {
       "path": "crates/frankenterm-core/tests/daemon_integration.rs",
@@ -981,9 +899,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 14,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/frankensqlite_logging_tests.rs",
@@ -1004,9 +920,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 13,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/webhook.rs",
@@ -1015,9 +929,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat sync/channel adapters",
       "reference_count": 12,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/mux_client_ops.rs",
@@ -1026,9 +938,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 11,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/cx.rs",
@@ -1037,9 +947,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 11,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/metrics.rs",
@@ -1048,9 +956,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 11,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/orphan_reaper.rs",
@@ -1059,9 +965,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 11,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/secrets.rs",
@@ -1070,9 +974,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 11,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/pdu_pipelining.rs",
@@ -1081,9 +983,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 10,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/reports.rs",
@@ -1092,9 +992,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 10,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/compression_bypass.rs",
@@ -1103,9 +1001,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 9,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/mux_pool_scaling.rs",
@@ -1114,9 +1010,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 9,
-      "affected_user_workflows": [
-        "runtime-abstraction-and-scheduling"
-      ]
+      "affected_user_workflows": ["runtime-abstraction-and-scheduling"]
     },
     {
       "path": "crates/frankenterm-core/src/restore_process.rs",
@@ -1125,9 +1019,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 9,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/restore_scrollback.rs",
@@ -1136,9 +1028,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 9,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/web.rs",
@@ -1147,9 +1037,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 9,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/vendored/mux_client.rs",
@@ -1158,9 +1046,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 8,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/distributed_security_e2e.rs",
@@ -1169,9 +1055,7 @@
       "migration_difficulty": "high",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 8,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/benches/socket_throughput.rs",
@@ -1180,9 +1064,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/tui/query.rs",
@@ -1191,9 +1073,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/vendored/mux_pool.rs",
@@ -1202,9 +1082,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "runtime-abstraction-and-scheduling"
-      ]
+      "affected_user_workflows": ["runtime-abstraction-and-scheduling"]
     },
     {
       "path": "crates/frankenterm-core/src/wait.rs",
@@ -1213,9 +1091,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/asupersync_spike.rs",
@@ -1224,9 +1100,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/asupersync_unix_socket.rs",
@@ -1235,9 +1109,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/common/fixtures.rs",
@@ -1246,9 +1118,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "frankenterm/ssh/tests/e2e/sftp/file.rs",
@@ -1257,9 +1127,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "asupersync-native adapter over smol surface",
       "reference_count": 7,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/benches/native_events_latency.rs",
@@ -1268,9 +1136,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 6,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/distributed_streaming_e2e.rs",
@@ -1291,9 +1157,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/diagnostic.rs",
@@ -1302,9 +1166,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/survival.rs",
@@ -1313,9 +1175,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/frankensqlite_fixture_tests.rs",
@@ -1336,9 +1196,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "frankenterm/pty/examples/whoami_async.rs",
@@ -1347,9 +1205,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "frankenterm/ssh/src/lib.rs",
@@ -1358,9 +1214,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "asupersync-native adapter over smol surface",
       "reference_count": 5,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/telemetry.rs",
@@ -1369,9 +1223,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 4,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/tests/asupersync_cx_infrastructure.rs",
@@ -1380,9 +1232,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 4,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/event_annotation_tests.rs",
@@ -1391,9 +1241,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 4,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/proptest_search_bridge.rs",
@@ -1402,10 +1250,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 4,
-      "affected_user_workflows": [
-        "search-and-retrieval",
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["search-and-retrieval", "validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/proptest_snapshot.rs",
@@ -1414,9 +1259,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 4,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/recorder_stack_integration.rs",
@@ -1450,9 +1293,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/shard_routing.rs",
@@ -1461,9 +1302,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/subscription_streaming.rs",
@@ -1472,9 +1311,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/ingest.rs",
@@ -1483,9 +1320,7 @@
       "migration_difficulty": "medium",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/src/policy.rs",
@@ -1494,9 +1329,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/src/runtime.rs",
@@ -1505,9 +1338,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "agent-orchestration-control-plane"
-      ]
+      "affected_user_workflows": ["agent-orchestration-control-plane"]
     },
     {
       "path": "crates/frankenterm-core/tests/common/lab.rs",
@@ -1516,9 +1347,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/labruntime_infrastructure.rs",
@@ -1527,9 +1356,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat::sleep/timeout",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/recorder_recovery_drills.rs",
@@ -1562,9 +1389,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "crates/frankenterm-core/tests/web_streaming_dpor.rs",
@@ -1573,9 +1398,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat sync/channel adapters",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "validation-and-test-infrastructure"
-      ]
+      "affected_user_workflows": ["validation-and-test-infrastructure"]
     },
     {
       "path": "frankenterm/config/src/lib.rs",
@@ -1584,9 +1407,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "cx::spawn_with_cx / scope-owned spawn",
       "reference_count": 3,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     },
     {
       "path": "crates/frankenterm-core/benches/fts_query.rs",
@@ -1595,9 +1416,7 @@
       "migration_difficulty": "low",
       "recommended_target_primitive": "runtime_compat boundary adapter",
       "reference_count": 2,
-      "affected_user_workflows": [
-        "internal-runtime-maintenance"
-      ]
+      "affected_user_workflows": ["internal-runtime-maintenance"]
     }
   ],
   "runtime_manifests": [

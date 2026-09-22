@@ -41,39 +41,25 @@
           {
             "row_id": "ft-4tp7g",
             "state": "blocked",
-            "reason_codes": [
-              "rch.no_workers_passed_health",
-              "rch.remote_cargo_reached_false"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/rch-degraded.json"
-            ]
+            "reason_codes": ["rch.no_workers_passed_health", "rch.remote_cargo_reached_false"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/rch-degraded.json"]
           },
           {
             "row_id": "rch-update-check",
             "state": "blocked",
-            "reason_codes": [
-              "rch.latest_release_is_installed",
-              "rch.source_fix_not_released"
-            ],
-            "artifact_paths": [
-              "fixtures/mission-planner/source-adapters/rch-degraded.json"
-            ]
+            "reason_codes": ["rch.latest_release_is_installed", "rch.source_fix_not_released"],
+            "artifact_paths": ["fixtures/mission-planner/source-adapters/rch-degraded.json"]
           }
         ]
       },
-      "artifact_paths": [
-        "fixtures/mission-planner/source-adapters/rch-degraded.json"
-      ]
+      "artifact_paths": ["fixtures/mission-planner/source-adapters/rch-degraded.json"]
     }
   ],
   "redaction_policy": {
     "policy_id": "ft.redaction.objective_sources.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "RCH adapter fixtures store worker counts and reason codes, not SSH logs."
-    ]
+    "notes": ["RCH adapter fixtures store worker counts and reason codes, not SSH logs."]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

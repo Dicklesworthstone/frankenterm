@@ -13,9 +13,7 @@
     {
       "case_id": "provider-api-call-permitted",
       "expected_failure": "provider_api_call_must_stay_forbidden",
-      "reason_codes": [
-        "planner.provider_api_call_forbidden"
-      ],
+      "reason_codes": ["planner.provider_api_call_forbidden"],
       "invalid_fragment": {
         "missing_forbidden_action": "provider_api_call",
         "forbidden_actions": [
@@ -31,9 +29,7 @@
     {
       "case_id": "credential-mutation-permitted",
       "expected_failure": "credential_mutation_must_stay_forbidden",
-      "reason_codes": [
-        "planner.credential_mutation_forbidden"
-      ],
+      "reason_codes": ["planner.credential_mutation_forbidden"],
       "invalid_fragment": {
         "missing_forbidden_action": "credential_mutation",
         "forbidden_actions": [
@@ -49,9 +45,7 @@
     {
       "case_id": "hidden-spend-decision-permitted",
       "expected_failure": "hidden_spend_decision_must_stay_forbidden",
-      "reason_codes": [
-        "planner.hidden_spend_decision_forbidden"
-      ],
+      "reason_codes": ["planner.hidden_spend_decision_forbidden"],
       "invalid_fragment": {
         "missing_forbidden_action": "hidden_spend_decision",
         "forbidden_actions": [
@@ -67,9 +61,7 @@
     {
       "case_id": "assign-with-stale-evidence",
       "expected_failure": "assign_requires_fresh_evidence",
-      "reason_codes": [
-        "quota.stale_evidence"
-      ],
+      "reason_codes": ["quota.stale_evidence"],
       "invalid_fragment": {
         "recommendation": {
           "action": "assign",
@@ -86,9 +78,7 @@
     {
       "case_id": "raw-secret-storage-permitted",
       "expected_failure": "raw_secret_storage_must_stay_forbidden",
-      "reason_codes": [
-        "planner.raw_secret_storage_forbidden"
-      ],
+      "reason_codes": ["planner.raw_secret_storage_forbidden"],
       "invalid_fragment": {
         "missing_forbidden_action": "raw_secret_storage",
         "forbidden_actions": [
@@ -104,19 +94,10 @@
     {
       "case_id": "toon-row-width-mismatch",
       "expected_failure": "toon_rows_must_match_declared_columns",
-      "reason_codes": [
-        "toon.row_width_mismatch"
-      ],
+      "reason_codes": ["toon.row_width_mismatch"],
       "invalid_fragment": {
         "toon_projection": {
-          "columns": [
-            "case_id",
-            "provider",
-            "recommendation",
-            "reason",
-            "approval",
-            "fallback"
-          ],
+          "columns": ["case_id", "provider", "recommendation", "reason", "approval", "fallback"],
           "rows": [
             [
               "toon-row-width-mismatch",

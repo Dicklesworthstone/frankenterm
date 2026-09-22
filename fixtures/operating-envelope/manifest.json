@@ -15,38 +15,23 @@
     },
     {
       "path": "fixtures/operating-envelope/valid/agent-mail-unavailable.json",
-      "coverage": [
-        "agent_mail.unavailable_after_retry",
-        "fallback.beads_only"
-      ]
+      "coverage": ["agent_mail.unavailable_after_retry", "fallback.beads_only"]
     },
     {
       "path": "fixtures/operating-envelope/valid/rch-no-worker.json",
-      "coverage": [
-        "rch.no_workers_passed_health",
-        "rch.remote_cargo_reached_false"
-      ]
+      "coverage": ["rch.no_workers_passed_health", "rch.remote_cargo_reached_false"]
     },
     {
       "path": "fixtures/operating-envelope/valid/rch-topology-failure.json",
-      "coverage": [
-        "rch.topology_preflight_failed",
-        "rch.remote_cargo_reached_false"
-      ]
+      "coverage": ["rch.topology_preflight_failed", "rch.remote_cargo_reached_false"]
     },
     {
       "path": "fixtures/operating-envelope/valid/dirty-overlap.json",
-      "coverage": [
-        "dirty_overlap.present",
-        "assignee_overlap.active"
-      ]
+      "coverage": ["dirty_overlap.present", "assignee_overlap.active"]
     },
     {
       "path": "fixtures/operating-envelope/valid/target-hardware-skipped.json",
-      "coverage": [
-        "target_hardware.skipped_not_proven",
-        "capacity.target_class_unproven"
-      ]
+      "coverage": ["target_hardware.skipped_not_proven", "capacity.target_class_unproven"]
     }
   ],
   "invalid_fixtures": [

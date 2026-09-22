@@ -67,10 +67,26 @@
     }
   ],
   "sync_only_crates": [
-    "base91", "bidi", "bintree", "blob-leases", "cell", "char-props",
-    "color-types", "dynamic", "escape-parser", "filedescriptor",
-    "input-types", "luahelper", "rangeset", "surface", "term",
-    "termwiz", "umask", "vtparse", "lua-api-crates", "procinfo"
+    "base91",
+    "bidi",
+    "bintree",
+    "blob-leases",
+    "cell",
+    "char-props",
+    "color-types",
+    "dynamic",
+    "escape-parser",
+    "filedescriptor",
+    "input-types",
+    "luahelper",
+    "rangeset",
+    "surface",
+    "term",
+    "termwiz",
+    "umask",
+    "vtparse",
+    "lua-api-crates",
+    "procinfo"
   ],
   "feature_gate_matrix": {
     "ssh": {

@@ -9,50 +9,35 @@
       "title": "Scope ownership is explicit",
       "statement": "Long-lived loops and workers must have explicit scope ownership; detached task lifetimes are forbidden unless explicitly audited.",
       "enforcement_level": "must",
-      "validation_hooks": [
-        "doctrine_pack_validation",
-        "shutdown_trace_validation"
-      ]
+      "validation_hooks": ["doctrine_pack_validation", "shutdown_trace_validation"]
     },
     {
       "id": "INV-002",
       "title": "Capability context propagation is explicit",
       "statement": "Runtime-effectful paths propagate Cx (or approved adapters). Cx::for_testing() remains test-only.",
       "enforcement_level": "must",
-      "validation_hooks": [
-        "doctrine_pack_validation",
-        "integration_reference_check"
-      ]
+      "validation_hooks": ["doctrine_pack_validation", "integration_reference_check"]
     },
     {
       "id": "INV-003",
       "title": "Outcome semantics are preserved",
       "statement": "Success, error, cancellation, and panic paths remain distinguishable in logs and contracts.",
       "enforcement_level": "must",
-      "validation_hooks": [
-        "mapping_coverage_check",
-        "structured_log_contract_check"
-      ]
+      "validation_hooks": ["mapping_coverage_check", "structured_log_contract_check"]
     },
     {
       "id": "INV-004",
       "title": "Cancellation boundaries are intentional",
       "statement": "Cancellation checkpoints are explicit and positioned to avoid irreversible side-effect loss windows.",
       "enforcement_level": "must",
-      "validation_hooks": [
-        "failure_injection_check",
-        "recovery_check"
-      ]
+      "validation_hooks": ["failure_injection_check", "recovery_check"]
     },
     {
       "id": "INV-005",
       "title": "Runtime API access is centralized",
       "statement": "Doctrine-compliant modules use runtime_compat/cx boundaries rather than ad hoc mixed runtime calls.",
       "enforcement_level": "must",
-      "validation_hooks": [
-        "baseline_reference_check",
-        "inventory_surface_check"
-      ]
+      "validation_hooks": ["baseline_reference_check", "inventory_surface_check"]
     }
   ],
   "legacy_to_target_map": [

@@ -12,12 +12,8 @@
   },
   "thread_id": "ft-dezx8.2",
   "recipients": {
-    "to": [
-      "SapphireCardinal"
-    ],
-    "cc": [
-      "YellowHorse"
-    ],
+    "to": ["SapphireCardinal"],
+    "cc": ["YellowHorse"],
     "bcc": []
   },
   "subject": "ft-dezx8.2 fallback coordination",
@@ -47,11 +43,7 @@
   "retention": {
     "retain_until": "2026-06-28T14:05:33Z",
     "automatic_discard": false,
-    "redaction": [
-      "body_digest_only",
-      "body_preview_redacted",
-      "attachment_refs_only"
-    ]
+    "redaction": ["body_digest_only", "body_preview_redacted", "attachment_refs_only"]
   },
   "reservation_intent": null,
   "beads_fallback": {

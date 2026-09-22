@@ -8,11 +8,7 @@
   "side_effect_policy": {
     "read_only": true,
     "cleanup_requires_operator_approval": true,
-    "performed_actions": [
-      "stat_filesystem",
-      "read_status",
-      "read_retained_artifact"
-    ],
+    "performed_actions": ["stat_filesystem", "read_status", "read_retained_artifact"],
     "forbidden_actions": [
       "delete_file",
       "delete_directory",
@@ -38,12 +34,8 @@
       "total_bytes": 1995218165760,
       "threshold_bytes": 1073741824,
       "probe_result": "below recovery helper floor",
-      "reason_codes": [
-        "disk.system_data_volume.below_floor"
-      ],
-      "artifact_paths": [
-        "/Volumes/USB_NVME/frankenterm-recovery-index-20260517.md"
-      ],
+      "reason_codes": ["disk.system_data_volume.below_floor"],
+      "artifact_paths": ["/Volumes/USB_NVME/frankenterm-recovery-index-20260517.md"],
       "next_safe_action": "Use external scratch artifacts or obtain explicit operator cleanup approval before applying repo patches."
     },
     {
@@ -57,12 +49,8 @@
       "total_bytes": 1995218165760,
       "threshold_bytes": 1073741824,
       "probe_result": "below recovery helper floor",
-      "reason_codes": [
-        "disk.private_tmp.below_floor"
-      ],
-      "artifact_paths": [
-        "/Volumes/USB_NVME/frankenterm-cleanup-options-matrix-20260517.md"
-      ],
+      "reason_codes": ["disk.private_tmp.below_floor"],
+      "artifact_paths": ["/Volumes/USB_NVME/frankenterm-cleanup-options-matrix-20260517.md"],
       "next_safe_action": "Do not launch write-heavy proof lanes; keep work to Beads or retained external artifacts."
     },
     {
@@ -73,12 +61,8 @@
       "severity": "yellow",
       "path": "/Users/jemanuel/projects/frankenterm",
       "probe_result": "small tracker/doc writes are possible but recovery helper remains gated",
-      "reason_codes": [
-        "write_probe.repo.partial"
-      ],
-      "artifact_paths": [
-        "/Volumes/USB_NVME/frankenterm-active-goal-audit-20260517.md"
-      ],
+      "reason_codes": ["write_probe.repo.partial"],
+      "artifact_paths": ["/Volumes/USB_NVME/frankenterm-active-goal-audit-20260517.md"],
       "next_safe_action": "Avoid broad patches and generated artifacts until the disk floor is restored."
     },
     {
@@ -88,9 +72,7 @@
       "state": "pass",
       "severity": "green",
       "probe_result": "Beads DB and JSONL are internally synchronized",
-      "reason_codes": [
-        "beads.sync.clean"
-      ],
+      "reason_codes": ["beads.sync.clean"],
       "next_safe_action": "Use Beads as the coordination surface while Agent Mail is degraded."
     },
     {
@@ -100,9 +82,7 @@
       "state": "pass",
       "severity": "green",
       "probe_result": "dirty_count=0 db_newer=false jsonl_newer=false",
-      "reason_codes": [
-        "beads.jsonl.export_clean"
-      ],
+      "reason_codes": ["beads.jsonl.export_clean"],
       "next_safe_action": "Continue normal br comments and updates; do not bundle unrelated dirty files."
     },
     {
@@ -113,10 +93,7 @@
       "severity": "red",
       "probe_result": "health responds but bootstrap reports automatic recovery retry loop",
       "error_category": "database_corruption_detected",
-      "reason_codes": [
-        "agent_mail.degraded_read_only",
-        "agent_mail.bootstrap_unavailable"
-      ],
+      "reason_codes": ["agent_mail.degraded_read_only", "agent_mail.bootstrap_unavailable"],
       "next_safe_action": "Do not repair or restart Agent Mail; use Beads-only fallback coordination."
     },
     {
@@ -126,10 +103,7 @@
       "state": "degraded",
       "severity": "red",
       "probe_result": "RCH reachable but workers remain under pressure policy",
-      "reason_codes": [
-        "rch.reachable_degraded",
-        "rch.worker_pressure"
-      ],
+      "reason_codes": ["rch.reachable_degraded", "rch.worker_pressure"],
       "next_safe_action": "Do not count RCH status as proof; run only dry-run admission checks until worker selection recovers."
     },
     {
@@ -142,12 +116,8 @@
       "free_bytes": 1023599978496,
       "total_bytes": 2000125296640,
       "probe_result": "external scratch volume available",
-      "reason_codes": [
-        "external_scratch.available"
-      ],
-      "artifact_paths": [
-        "/Volumes/USB_NVME/frankenterm-operator-recovery-handoff-20260517.md"
-      ],
+      "reason_codes": ["external_scratch.available"],
+      "artifact_paths": ["/Volumes/USB_NVME/frankenterm-operator-recovery-handoff-20260517.md"],
       "next_safe_action": "Retain recovery artifacts on the external volume until local disk cleanup is explicitly approved and completed."
     }
   ],

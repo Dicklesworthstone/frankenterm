@@ -13,9 +13,7 @@
     {
       "case_id": "human-subject-true",
       "expected_failure": "agent_identity_human_subject_must_be_false",
-      "reason_codes": [
-        "safety.human_subject_forbidden"
-      ],
+      "reason_codes": ["safety.human_subject_forbidden"],
       "invalid_fragment": {
         "agent_identity": {
           "agent_id": "agent.fixture-human-subject",
@@ -26,9 +24,7 @@
     {
       "case_id": "raw-pane-content-stored",
       "expected_failure": "evidence_must_not_store_raw_pane_content",
-      "reason_codes": [
-        "safety.raw_pane_content_forbidden"
-      ],
+      "reason_codes": ["safety.raw_pane_content_forbidden"],
       "invalid_fragment": {
         "evidence": [
           {
@@ -41,9 +37,7 @@
     {
       "case_id": "mail-body-stored",
       "expected_failure": "evidence_must_not_store_mail_bodies",
-      "reason_codes": [
-        "safety.mail_body_storage_forbidden"
-      ],
+      "reason_codes": ["safety.mail_body_storage_forbidden"],
       "invalid_fragment": {
         "evidence": [
           {
@@ -56,9 +50,7 @@
     {
       "case_id": "auto-reassignment-permitted",
       "expected_failure": "auto_reassignment_must_stay_forbidden",
-      "reason_codes": [
-        "safety.auto_reassignment_forbidden"
-      ],
+      "reason_codes": ["safety.auto_reassignment_forbidden"],
       "invalid_fragment": {
         "missing_forbidden_action": "auto_reassignment",
         "forbidden_actions": [
@@ -77,9 +69,7 @@
     {
       "case_id": "assign-with-stale-evidence",
       "expected_failure": "assign_requires_fresh_evidence",
-      "reason_codes": [
-        "fit.stale_evidence"
-      ],
+      "reason_codes": ["fit.stale_evidence"],
       "invalid_fragment": {
         "recommendation": {
           "action": "assign",
@@ -96,9 +86,7 @@
     {
       "case_id": "toon-row-width-mismatch",
       "expected_failure": "toon_rows_must_match_declared_columns",
-      "reason_codes": [
-        "toon.row_width_mismatch"
-      ],
+      "reason_codes": ["toon.row_width_mismatch"],
       "invalid_fragment": {
         "toon_projection": {
           "columns": [

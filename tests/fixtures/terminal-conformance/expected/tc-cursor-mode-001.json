@@ -5,16 +5,7 @@
     "CSI": 4,
     "Print": 1
   },
-  "required_debug_fragments": [
-    "AutoWrap",
-    "GraphemeClustering"
-  ],
-  "required_display_utf8": [
-    "Z"
-  ],
-  "required_display_hex": [
-    "1b5b362071",
-    "1b5b3f3230323768",
-    "1b5b3f323032376c"
-  ]
+  "required_debug_fragments": ["AutoWrap", "GraphemeClustering"],
+  "required_display_utf8": ["Z"],
+  "required_display_hex": ["1b5b362071", "1b5b3f3230323768", "1b5b3f323032376c"]
 }

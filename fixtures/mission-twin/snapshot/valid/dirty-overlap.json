@@ -36,9 +36,7 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "ready_count": 1,
       "blocked_count": 1,
       "in_progress_count": 1,
@@ -56,9 +54,7 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "admission_state": "ready",
       "healthy_workers": 8,
       "total_workers": 8,
@@ -76,9 +72,7 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "availability_state": "healthy",
       "active_agents": [],
       "fallback_reason_codes": []
@@ -92,12 +86,8 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "mission_twin.dirty_overlap"
-      ],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "reason_codes": ["mission_twin.dirty_overlap"],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "branch": "main",
       "head": "5555555555555555555555555555555555555555",
       "remote_heads": [],
@@ -108,9 +98,7 @@
           "overlaps_owned_path": true
         }
       ],
-      "overlap_paths": [
-        "crates/frankenterm-core/src/mission_twin_snapshot.rs"
-      ],
+      "overlap_paths": ["crates/frankenterm-core/src/mission_twin_snapshot.rs"],
       "deletion_paths_present": false
     },
     "reservations": {
@@ -123,9 +111,7 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "active_reservations": [
         {
           "holder": "PinkTrout",
@@ -144,16 +130,10 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "mission_twin.dirty_overlap"
-      ],
-      "artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ],
+      "reason_codes": ["mission_twin.dirty_overlap"],
+      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"],
       "verdict": "admit",
-      "source_snapshot_artifact_paths": [
-        "fixtures/mission-twin/snapshot/valid/dirty-overlap.json"
-      ]
+      "source_snapshot_artifact_paths": ["fixtures/mission-twin/snapshot/valid/dirty-overlap.json"]
     }
   },
   "validation": {

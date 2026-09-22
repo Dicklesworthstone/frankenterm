@@ -12,12 +12,8 @@
   },
   "thread_id": "ft-dezx8.1",
   "recipients": {
-    "to": [
-      "SapphireCardinal"
-    ],
-    "cc": [
-      "SilverTrout"
-    ],
+    "to": ["SapphireCardinal"],
+    "cc": ["SilverTrout"],
     "bcc": []
   },
   "subject": "ft-dezx8.1 ack-required replay notice",

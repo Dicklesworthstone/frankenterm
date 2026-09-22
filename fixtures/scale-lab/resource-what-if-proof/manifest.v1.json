@@ -44,12 +44,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "data_quality_apply_blocker"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["data_quality_apply_blocker"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/cpu-queue-saturated-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
@@ -72,13 +68,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "memory_oversubscription",
-          "data_quality_apply_blocker"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["memory_oversubscription", "data_quality_apply_blocker"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/memory-tier-pressured-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
@@ -101,12 +92,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "topology_churn"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["topology_churn"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml --format json",
@@ -129,13 +116,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "memory_oversubscription",
-          "data_quality_apply_blocker"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["memory_oversubscription", "data_quality_apply_blocker"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/mcp-search-stalled-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/queue-relief-candidate.v1.toml --format json",
@@ -158,12 +140,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "policy_audit_fail_open_risk"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["policy_audit_fail_open_risk"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml --format json",
@@ -186,12 +164,8 @@
         "proof_evidence_source": "live_hardware",
         "hardware_predicate": "proven_predicate_met",
         "high_scale_claim_allowed": true,
-        "required_risk_codes": [
-          "memory_oversubscription"
-        ],
-        "required_apply_reason_codes": [
-          "candidate_risk_fail_closed"
-        ]
+        "required_risk_codes": ["memory_oversubscription"],
+        "required_apply_reason_codes": ["candidate_risk_fail_closed"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/healthy-live-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/memory-oversubscription-candidate.v1.toml --format json",
@@ -214,12 +188,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "topology_churn"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["topology_churn"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/topology-degraded-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/topology-churn-candidate.v1.toml --format json",
@@ -242,12 +212,8 @@
         "proof_evidence_source": "replay_backed",
         "hardware_predicate": "skipped_not_proven",
         "high_scale_claim_allowed": false,
-        "required_risk_codes": [
-          "policy_audit_fail_open_risk"
-        ],
-        "required_apply_reason_codes": [
-          "proof_skipped_not_proven"
-        ]
+        "required_risk_codes": ["policy_audit_fail_open_risk"],
+        "required_apply_reason_codes": ["proof_skipped_not_proven"]
       },
       "command_transcript": {
         "human_json": "ft resource what-if --trace fixtures/scale-lab/resource-what-if-proof/policy-audit-unavailable-trace.v1.json --override-package fixtures/scale-lab/resource-what-if-proof/policy-fail-open-candidate.v1.toml --format json",

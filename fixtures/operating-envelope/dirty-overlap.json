@@ -11,9 +11,7 @@
     "requested_cpu_cores": 8,
     "requested_memory_gib": 32,
     "proof_state": "not_required",
-    "reason_codes": [
-      "target_hardware.not_required"
-    ]
+    "reason_codes": ["target_hardware.not_required"]
   },
   "input_domains": {
     "capacity_resource": {
@@ -29,14 +27,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Capacity is not the blocker."
-        ]
+        "notes": ["Capacity is not the blocker."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "capacity.green"
-      ],
+      "reason_codes": ["capacity.green"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -45,17 +39,11 @@
           "category": "capacity_pressure",
           "state": "pass",
           "subject": "resource cockpit",
-          "reason_codes": [
-            "capacity.green"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/dirty-overlap.json"
-          ]
+          "reason_codes": ["capacity.green"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
     },
     "rch": {
       "source_id": "rch-not-needed",
@@ -70,15 +58,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Proof lane is not consumed when dirty overlap is present."
-        ]
+        "notes": ["Proof lane is not consumed when dirty overlap is present."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "rch.not_collected",
-        "dirty_overlap.blocks_proof"
-      ],
+      "reason_codes": ["rch.not_collected", "dirty_overlap.blocks_proof"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -87,17 +70,11 @@
           "category": "rch_cargo_reached",
           "state": "not_applicable",
           "subject": "proof lane",
-          "reason_codes": [
-            "dirty_overlap.blocks_proof"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/dirty-overlap.json"
-          ]
+          "reason_codes": ["dirty_overlap.blocks_proof"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
     },
     "beads": {
       "source_id": "beads-active-owner",
@@ -112,15 +89,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Active owner metadata only."
-        ]
+        "notes": ["Active owner metadata only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "beads.in_progress_active",
-        "assignee_overlap.active"
-      ],
+      "reason_codes": ["beads.in_progress_active", "assignee_overlap.active"],
       "unavailable_reason": null,
       "degraded_reason": "Another assignee owns the overlapping slice.",
       "evidence": [
@@ -129,17 +101,11 @@
           "category": "beads_in_progress",
           "state": "blocked",
           "subject": "active owner",
-          "reason_codes": [
-            "assignee_overlap.active"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/dirty-overlap.json"
-          ]
+          "reason_codes": ["assignee_overlap.active"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
     },
     "agent_mail": {
       "source_id": "agent-mail-healthy",
@@ -154,14 +120,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": [
-          "Mailbox summary only."
-        ]
+        "notes": ["Mailbox summary only."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "agent_mail.available"
-      ],
+      "reason_codes": ["agent_mail.available"],
       "unavailable_reason": null,
       "degraded_reason": null,
       "evidence": [
@@ -170,17 +132,11 @@
           "category": "agent_mail_availability",
           "state": "pass",
           "subject": "fetch_inbox",
-          "reason_codes": [
-            "agent_mail.available"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/dirty-overlap.json"
-          ]
+          "reason_codes": ["agent_mail.available"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
     },
     "git": {
       "source_id": "git-dirty-overlap",
@@ -195,16 +151,10 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": [
-          "Dirty paths overlap active owner paths."
-        ]
+        "notes": ["Dirty paths overlap active owner paths."]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": [
-        "git.dirty_paths_present",
-        "dirty_overlap.present",
-        "deletion_risk.none"
-      ],
+      "reason_codes": ["git.dirty_paths_present", "dirty_overlap.present", "deletion_risk.none"],
       "unavailable_reason": null,
       "degraded_reason": "Dirty path overlaps active work.",
       "evidence": [
@@ -213,17 +163,11 @@
           "category": "dirty_path_overlap",
           "state": "blocked",
           "subject": "crates/frankenterm-core/tests/mission_objective_plan_golden_corpus.rs",
-          "reason_codes": [
-            "dirty_overlap.present"
-          ],
-          "artifact_paths": [
-            "fixtures/operating-envelope/valid/dirty-overlap.json"
-          ]
+          "reason_codes": ["dirty_overlap.present"],
+          "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
         }
       ],
-      "artifact_paths": [
-        "fixtures/operating-envelope/valid/dirty-overlap.json"
-      ]
+      "artifact_paths": ["fixtures/operating-envelope/valid/dirty-overlap.json"]
     }
   },
   "decision": {
@@ -237,11 +181,7 @@
     "dirty_tree_state": "dirty_overlap",
     "max_parallel_agents": 0,
     "max_parallel_proofs": 0,
-    "reason_codes": [
-      "dirty_overlap.present",
-      "assignee_overlap.active",
-      "envelope.wait"
-    ]
+    "reason_codes": ["dirty_overlap.present", "assignee_overlap.active", "envelope.wait"]
   },
   "admission_windows": [
     {
@@ -251,10 +191,7 @@
       "expires_at_ms": null,
       "max_parallel_agents": 0,
       "max_parallel_proofs": 0,
-      "permitted_action_classes": [
-        "read_status",
-        "wait"
-      ],
+      "permitted_action_classes": ["read_status", "wait"],
       "forbidden_action_classes": [
         "claim_bead",
         "edit_files",
@@ -272,14 +209,8 @@
         "worker_drain",
         "raw_pane_content_capture"
       ],
-      "source_ids": [
-        "git-dirty-overlap",
-        "beads-active-owner"
-      ],
-      "reason_codes": [
-        "envelope.wait",
-        "dirty_overlap.present"
-      ]
+      "source_ids": ["git-dirty-overlap", "beads-active-owner"],
+      "reason_codes": ["envelope.wait", "dirty_overlap.present"]
     }
   ],
   "fail_closed_policy": {
@@ -288,10 +219,7 @@
     "contradictory_signal_behavior": "block",
     "privacy_redaction_behavior": "lower_envelope",
     "target_hardware_gap_behavior": "not_applicable",
-    "reason_codes": [
-      "fail_closed.block_contradiction",
-      "coordination.do_not_touch_owned_paths"
-    ]
+    "reason_codes": ["fail_closed.block_contradiction", "coordination.do_not_touch_owned_paths"]
   },
   "side_effect_policy": {
     "dry_run_only": true,
@@ -305,15 +233,10 @@
     "policy_id": "ft.redaction.operating_envelope.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": [
-      "Dirty paths are retained as repo-relative metadata."
-    ]
+    "notes": ["Dirty paths are retained as repo-relative metadata."]
   },
   "raw_pane_content_stored": false,
-  "reason_codes": [
-    "envelope.wait",
-    "dirty_overlap.present"
-  ],
+  "reason_codes": ["envelope.wait", "dirty_overlap.present"],
   "artifact_paths": [
     "docs/json-schema/ft-operating-envelope.json",
     "fixtures/operating-envelope/valid/dirty-overlap.json"

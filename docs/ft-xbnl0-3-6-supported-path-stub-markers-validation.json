@@ -67,10 +67,7 @@
   "bead_id": "ft-g6lfc",
   "checked_at": "2026-09-12T00:50:30Z",
   "contract_id": "ft.xbnl0.3.6.supported_path_stub_markers.v1",
-  "scan_roots": [
-    "crates",
-    "frankenterm"
-  ],
+  "scan_roots": ["crates", "frankenterm"],
   "status": "passed",
   "totals": {
     "allowed_markers": 9,
@@ -78,8 +75,5 @@
     "unexpected_markers": 0
   },
   "unexpected_markers": [],
-  "upstream_contracts": [
-    "ft-xbnl0.3.6",
-    "ft-xbnl0.5.2"
-  ]
+  "upstream_contracts": ["ft-xbnl0.3.6", "ft-xbnl0.5.2"]
 }

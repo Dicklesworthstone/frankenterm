@@ -37,12 +37,8 @@
       "dirty_tree_contaminated",
       "bead_closeout_mirror"
     ],
-    "pre_cargo_block_scenarios": [
-      "rch_mirror_before_cargo"
-    ],
-    "agent_mail_fallback_scenarios": [
-      "agent_mail_outage_beads_fallback"
-    ],
+    "pre_cargo_block_scenarios": ["rch_mirror_before_cargo"],
+    "agent_mail_fallback_scenarios": ["agent_mail_outage_beads_fallback"],
     "local_cargo_counted": false,
     "live_services_called": false,
     "target_dir": "not_applicable_static_fixture_summary",

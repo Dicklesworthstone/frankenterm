@@ -4,28 +4,11 @@
   "bead_id": "ft-xbnl0.2.6",
   "last_updated": "2026-04-15",
   "description": "Strict per-file allowlist gate that prevents reintroduction of direct tokio, smol, or async-io usage in supported builds, tests, benches, and core docs. Each existing usage must be explicitly quarantined with a named owner and a removal bead. Any file that contains a forbidden token without an explicit allowlist entry fails the gate.",
-  "source_roots": [
-    "crates",
-    "frankenterm"
-  ],
-  "doc_roots": [
-    "docs",
-    "README.md",
-    "AGENTS.md"
-  ],
-  "manifest_roots": [
-    "Cargo.toml"
-  ],
-  "forbidden_tokens": [
-    "tokio::",
-    "smol::",
-    "async_io::"
-  ],
-  "forbidden_dependencies": [
-    "tokio",
-    "smol",
-    "async-io"
-  ],
+  "source_roots": ["crates", "frankenterm"],
+  "doc_roots": ["docs", "README.md", "AGENTS.md"],
+  "manifest_roots": ["Cargo.toml"],
+  "forbidden_tokens": ["tokio::", "smol::", "async_io::"],
+  "forbidden_dependencies": ["tokio", "smol", "async-io"],
   "manifest_dependency_allowlist": {
     "tokio": {
       "Cargo.toml": {
