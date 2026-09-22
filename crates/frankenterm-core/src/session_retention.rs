@@ -2276,7 +2276,9 @@ fn parse_session_cleanup_attempt(raw: &str) -> Option<SessionCleanupAttemptRecei
     let well_formed = receipt.schema == SESSION_CLEANUP_ATTEMPT_SCHEMA
         && !id.is_empty()
         && id.len() <= SESSION_CLEANUP_ATTEMPT_ID_MAX_BYTES
-        && id.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        && id
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
         && match receipt.state {
             SessionCleanupAttemptState::Open => receipt.finished_at_ms.is_none(),
             SessionCleanupAttemptState::Completed => {
@@ -2291,7 +2293,10 @@ fn parse_session_cleanup_attempt(raw: &str) -> Option<SessionCleanupAttemptRecei
 
 fn session_cleanup_attempt_status_from(
     raw: Option<&str>,
-) -> (SessionCleanupAttemptStatus, Option<SessionCleanupAttemptReceipt>) {
+) -> (
+    SessionCleanupAttemptStatus,
+    Option<SessionCleanupAttemptReceipt>,
+) {
     let Some(raw) = raw else {
         return (SessionCleanupAttemptStatus::None, None);
     };
@@ -2471,6 +2476,9 @@ fn finalize_session_cleanup_attempt(
 ///
 /// Only the exact selected attempt is acknowledged; a completed or already
 /// acknowledged receipt is left untouched.
+/// The caller must independently establish that the cleanup owner is no
+/// longer executing. Receipt status and its recorded PID do not establish
+/// process liveness; acknowledging a live owner permits another admission.
 ///
 /// # Errors
 /// Returns the underlying SQLite error if the receipt cannot be read or
@@ -2482,16 +2490,18 @@ pub fn acknowledge_session_cleanup_attempt(
 ) -> Result<SessionCleanupAcknowledgement, rusqlite::Error> {
     let tx = begin_retention_transaction(conn)?;
     let raw = read_session_cleanup_attempt(&tx)?;
-    let acknowledged = match (session_cleanup_attempt_status_from(raw.as_deref()), selector) {
-        ((SessionCleanupAttemptStatus::Open { attempt_id, .. }, Some(receipt)), SessionCleanupAttemptSelector::AttemptId(selected))
-            if attempt_id == *selected =>
-        {
-            SessionCleanupAttemptReceipt {
-                state: SessionCleanupAttemptState::Acknowledged,
-                finished_at_ms: Some(acknowledged_at_ms),
-                ..receipt
-            }
-        }
+    let acknowledged = match (
+        session_cleanup_attempt_status_from(raw.as_deref()),
+        selector,
+    ) {
+        (
+            (SessionCleanupAttemptStatus::Open { attempt_id, .. }, Some(receipt)),
+            SessionCleanupAttemptSelector::AttemptId(selected),
+        ) if attempt_id == *selected => SessionCleanupAttemptReceipt {
+            state: SessionCleanupAttemptState::Acknowledged,
+            finished_at_ms: Some(acknowledged_at_ms),
+            ..receipt
+        },
         ((SessionCleanupAttemptStatus::Malformed, _), SessionCleanupAttemptSelector::Malformed) => {
             SessionCleanupAttemptReceipt {
                 schema: SESSION_CLEANUP_ATTEMPT_SCHEMA.to_string(),
@@ -6608,49 +6618,168 @@ mod tests {
 
     #[test]
     fn crash_after_receipt_creation_fences_a_new_process_before_any_mutation() {
+        let (_before_file, before_path) = receipt_fixture();
+        run_retention_crash_child(&before_path, "before");
+        assert_eq!(
+            session_cleanup_attempt_status(&open_process(&before_path)).unwrap(),
+            SessionCleanupAttemptStatus::None
+        );
+        assert_eq!(
+            cleanup_sessions_from_path(&before_path, &age_only_config())
+                .unwrap()
+                .total_sessions_deleted(),
+            1
+        );
         let (_file, path) = receipt_fixture();
         let config = age_only_config();
-        {
-            // The owning process admits and then dies before any cleanup SQL.
-            let owner = open_process(&path);
-            admit_session_cleanup_attempt(&owner, &config, 42).unwrap();
-        }
+        let owner_pid = run_retention_crash_child(&path, "admitted");
 
         let error = cleanup_sessions_from_path(&path, &config)
             .expect_err("an open receipt must fence the next process");
         assert_eq!(error, SessionCleanupError::UnresolvedAttempt);
         assert!(!error.requires_reconciliation());
         let conn = open_process(&path);
-        assert_eq!(count_sessions(&conn), 2, "the refused attempt deleted nothing");
-        assert!(session_cleanup_attempt_status(&conn).unwrap().blocks_cleanup());
+        assert_eq!(
+            count_sessions(&conn),
+            2,
+            "the refused attempt deleted nothing"
+        );
+        assert!(matches!(session_cleanup_attempt_status(&conn).unwrap(),
+            SessionCleanupAttemptStatus::Open { owner_pid: recorded, .. } if recorded == owner_pid));
+    }
+
+    fn run_retention_crash_child(path: &str, phase: &str) -> u32 {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_retention::tests::crash_after_each_mutation_phase_keeps_the_fence_across_processes",
+                "--nocapture",
+            ])
+            .env("FT_RETENTION_CRASH_DB", path)
+            .env("FT_RETENTION_CRASH_PHASE", phase)
+            .spawn()
+            .expect("spawn owned retention child");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert_eq!(status.code(), Some(73), "{phase}: exact interruption exit");
+                    return pid;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    let termination = child.kill();
+                    let reaping = child.wait();
+                    panic!(
+                        "{phase}: child did not settle: {outcome:?}; termination={termination:?}; reaping={reaping:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn crash_after_each_mutation_phase_keeps_the_fence_across_processes() {
-        type Phase = fn(&Connection, &SessionRetentionConfig);
-        let phases: [(&str, Phase); 3] = [
-            ("age", |conn, config| {
-                delete_sessions_by_age(conn, config.max_age_days).unwrap();
-            }),
-            ("orphans", |conn, _| {
-                cleanup_orphaned_data(conn).unwrap();
-            }),
-            ("full pipeline", |conn, config| {
-                cleanup_sessions(conn, config).unwrap();
-            }),
-        ];
-        for (label, phase) in phases {
-            let (_file, path) = receipt_fixture();
-            let config = age_only_config();
-            let receipt_before;
-            {
-                let owner = open_process(&path);
+        let config_for = |phase: &str| SessionRetentionConfig {
+            max_age_days: if matches!(phase, "age" | "full" | "admitted") {
+                30
+            } else {
+                0
+            },
+            max_closed_sessions: usize::from(phase == "count"),
+            max_total_size_mb: u64::from(phase == "size"),
+            cleanup_interval_hours: 0,
+        };
+        if let Ok(path) = std::env::var("FT_RETENTION_CRASH_DB") {
+            let phase = std::env::var("FT_RETENTION_CRASH_PHASE").unwrap();
+            let owner = open_process(&path);
+            let config = config_for(&phase);
+            if phase != "before" {
                 admit_session_cleanup_attempt(&owner, &config, 7).unwrap();
-                receipt_before = read_session_cleanup_attempt(&owner).unwrap();
-                phase(&owner, &config);
-                // Process dies here, before terminal publication.
             }
-            let sessions_after_crash = count_sessions(&open_process(&path));
+            match phase.as_str() {
+                "before" | "admitted" => {}
+                "age" => assert_eq!(delete_sessions_by_age(&owner, 30).unwrap(), 1),
+                "count" => assert_eq!(delete_excess_closed_sessions(&owner, 1).unwrap(), 1),
+                "size" => assert_eq!(delete_sessions_by_size(&owner, 1).unwrap().deleted, 1),
+                "orphans" => assert_eq!(
+                    cleanup_orphaned_data(&owner)
+                        .unwrap()
+                        .orphaned_restore_lifecycle_rows,
+                    1
+                ),
+                "full" => {
+                    let result = cleanup_sessions(&owner, &config).unwrap();
+                    assert_eq!(result.total_sessions_deleted(), 1);
+                    assert_eq!(result.orphaned_restore_lifecycle_rows, 1);
+                }
+                _ => panic!("unknown interruption boundary"),
+            }
+            // Actual process termination before Connection destructors or finalization.
+            std::process::exit(73);
+        }
+        for label in ["age", "count", "size", "orphans", "full"] {
+            let (_file, path) = receipt_fixture();
+            let config = config_for(label);
+            {
+                let conn = open_process(&path);
+                if label == "size" {
+                    let now = i64::try_from(epoch_ms()).unwrap();
+                    insert_checkpoint(&conn, "old-closed", now - 2000, 700 * 1024);
+                    insert_checkpoint(&conn, "recent-closed", now - 1000, 700 * 1024);
+                }
+                if matches!(label, "orphans" | "full") {
+                    seed_legacy_orphan(
+                        &conn,
+                        LegacyOrphanInsertSurface::RestoreLifecycle,
+                        |conn| {
+                            conn.execute(
+                                "INSERT INTO restore_attempt_lifecycle (
+                                intent_checkpoint_id, session_id, source_checkpoint_id,
+                                status, created_at
+                             ) VALUES (999, 'missing-session', 998, 'intent', 1000)",
+                                [],
+                            )
+                            .unwrap();
+                        },
+                    );
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM restore_attempt_lifecycle",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        1
+                    );
+                }
+            }
+            let owner_pid = run_retention_crash_child(&path, label);
+            let conn = open_process(&path);
+            let sessions_after_crash = if label == "orphans" { 2 } else { 1 };
+            assert_eq!(count_sessions(&conn), sessions_after_crash, "{label}");
+            if label != "orphans" {
+                let retained: String = conn
+                    .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(retained, "recent-closed", "{label}: exact survivor");
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM restore_attempt_lifecycle",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0,
+                "{label}"
+            );
+            assert!(matches!(session_cleanup_attempt_status(&conn).unwrap(),
+                SessionCleanupAttemptStatus::Open { owner_pid: recorded, .. } if recorded == owner_pid));
+            let receipt_before = read_session_cleanup_attempt(&conn).unwrap();
 
             assert_eq!(
                 cleanup_sessions_from_path(&path, &config),
@@ -6684,7 +6813,11 @@ mod tests {
                 phase: SessionCleanupIndeterminatePhase::CleanupExecution,
             }
         );
-        assert!(session_cleanup_attempt_status(&conn).unwrap().blocks_cleanup());
+        assert!(
+            session_cleanup_attempt_status(&conn)
+                .unwrap()
+                .blocks_cleanup()
+        );
     }
 
     #[test]
