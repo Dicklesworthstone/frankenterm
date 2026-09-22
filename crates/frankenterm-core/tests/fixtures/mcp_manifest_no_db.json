@@ -667,7 +667,7 @@
           },
           "manifest_path": {
             "default": "fixtures/demo-lab/manifest.v1.json",
-            "description": "Workspace-relative regular JSON file, at most 1 MiB; symlink path components are rejected",
+            "description": "Workspace-relative demo scenario manifest path",
             "type": "string"
           },
           "rehearsal_id": {

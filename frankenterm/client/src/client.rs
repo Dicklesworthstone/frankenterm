@@ -4523,13 +4523,10 @@ async fn process_unilateral_inner_async(
                 let resync_result = client_domain
                     .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
-                // A rejected snapshot retires this generation before its
-                // error returns. Preserve that cause before fencing further
-                // mutations on the now-unavailable attachment.
-                let _ = resync_result?;
                 if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
+                let _ = resync_result?;
                 dispatch
                     .inner
                     .remote_to_local_pane_id(&dispatch.mux, pane_id)
@@ -4551,10 +4548,10 @@ async fn process_unilateral_inner_async(
                 let resync_result = client_domain
                     .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
-                let _ = resync_result?;
                 if !dispatch.rpc_generation_is_live() {
                     return Ok(());
                 }
+                let _ = resync_result?;
 
                 let local_pane_id = dispatch
                     .inner
@@ -4787,10 +4784,10 @@ async fn apply_unilateral_on_main_thread(
                 .client_domain()
                 .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                 .await;
-            let _ = result?;
             if !dispatch.rpc_generation_is_live() {
                 return Ok(());
             }
+            let _ = result?;
             return Ok(());
         }
         _ => {}

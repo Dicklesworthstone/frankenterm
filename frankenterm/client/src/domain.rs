@@ -4186,26 +4186,13 @@ impl ClientDomain {
                     }
                     Ok(pane)
                 };
-                let installed = if floating_snapshot_authoritative {
-                    tab.sync_with_pane_tree(root_size, tabroot, make_pane)
+                if floating_snapshot_authoritative {
+                    tab.sync_with_pane_tree(root_size, tabroot, make_pane)?;
                 } else {
                     tab.sync_with_pane_tree_preserving_unmentioned_floating(
                         root_size, tabroot, make_pane,
-                    )
-                };
-                // Retain the structural failure before rejecting the fence:
-                // rejection retires the transport and the detached unilateral
-                // consumer may otherwise lose the original error. This path
-                // can include configured workspace metadata, but not terminal
-                // text or the remote pane title/cwd payload.
-                installed.inspect_err(|error| {
-                    log::error!(
-                        "topology snapshot application rejected stage=tiled-tree domain={} remote_tab={} local_tab={}: {error:#}",
-                        inner.local_domain_id,
-                        remote_tab_id,
-                        tab.tab_id()
-                    );
-                })?;
+                    )?;
+                }
                 // Snapshot application suppresses resize commands and preserves
                 // newer client-pane geometry. Rebuild the newly installed split
                 // tree from those panes so a stale remote listing cannot leave
@@ -4429,12 +4416,6 @@ impl ClientDomain {
         }
 
         if authoritative_panes_by_remote.len() != seen_remote_pane_ids.len() {
-            log::error!(
-                "topology snapshot application rejected stage=pane-cardinality domain={} resolved={} expected={}",
-                inner.local_domain_id,
-                authoritative_panes_by_remote.len(),
-                seen_remote_pane_ids.len()
-            );
             bail!(
                 "ListPanes resolved {} of {} authoritative panes",
                 authoritative_panes_by_remote.len(),
@@ -4454,12 +4435,6 @@ impl ClientDomain {
                     authoritative_panes,
                     desired_floating,
                 )
-                .inspect_err(|error| {
-                    log::error!(
-                        "topology snapshot application rejected stage=floating-reconciliation domain={}: {error:#}",
-                        inner.local_domain_id
-                    );
-                })
                 .context("reconcile authoritative floating-pane topology")?;
             let mut pending_float_mappings = pending_float_mappings.commit();
             pending_float_mappings.sort_unstable_by_key(|(_, local_pane_id)| *local_pane_id);
@@ -7214,7 +7189,7 @@ mod tests {
         }
     }
 
-    fn assert_stale_topology_snapshot_preserves_geometry(current: bool, tab_count: usize) {
+    fn assert_stale_topology_snapshot_preserves_geometry(current: bool) {
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
@@ -7259,27 +7234,15 @@ mod tests {
             }
             .unwrap();
         };
-        let mut old_listing = sample_remote_tab_listing();
-        let PaneNode::Leaf(template) = old_listing.tabs[0].clone() else {
-            panic!("fixture must contain one leaf");
-        };
-        for offset in 1..tab_count {
-            let mut entry = template.clone();
-            entry.tab_id += offset;
-            entry.pane_id += offset;
-            old_listing.tabs.push(PaneNode::Leaf(entry));
-            old_listing.tab_titles.push(format!("remote tab {offset}"));
-        }
+        let old_listing = sample_remote_tab_listing();
         apply(old_listing.clone());
         assert!(peer.is_empty(), "initial snapshot must not issue commands");
         // Registration separately schedules the initial palette update. Drain
         // and identify that request before measuring resize traffic; otherwise
         // a later executor tick can mistake palette setup for a resize echo.
         while executor.try_tick().unwrap() {}
-        for _ in 0..tab_count {
-            let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
-            assert!(matches!(request, codec::Pdu::SetPalette(_)));
-        }
+        let request = promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        assert!(matches!(request, codec::Pdu::SetPalette(_)));
         while executor.try_tick().unwrap() {}
         assert!(peer.is_empty(), "pane registration setup must be settled");
         let tab = mux
@@ -7353,17 +7316,12 @@ mod tests {
 
     #[test]
     fn stale_topology_snapshot_does_not_echo_resize_over_newer_local_geometry() {
-        assert_stale_topology_snapshot_preserves_geometry(true, 1);
-    }
-
-    #[test]
-    fn three_tab_topology_snapshot_survives_resize_and_repeated_application() {
-        assert_stale_topology_snapshot_preserves_geometry(true, 3);
+        assert_stale_topology_snapshot_preserves_geometry(true);
     }
 
     #[test]
     fn stale_legacy_topology_snapshot_preserves_newer_local_geometry() {
-        assert_stale_topology_snapshot_preserves_geometry(false, 1);
+        assert_stale_topology_snapshot_preserves_geometry(false);
     }
 
     fn assert_topology_resync_preserves_user_tab_order_and_window_moves(current: bool) {

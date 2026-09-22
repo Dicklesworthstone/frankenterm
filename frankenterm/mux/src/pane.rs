@@ -233,12 +233,7 @@ impl LineReadPermit {
             ready: parking_lot::Condvar::new(),
         });
         let receiver = Arc::clone(&input);
-        // Opt-in timings stay outside model locks and never include terminal
-        // contents. With this target disabled, no clock reads are performed.
-        let profile_start = log::log_enabled!(target: "mux::cold_read_profile", log::Level::Debug)
-            .then(std::time::Instant::now);
         spawn(Box::new(move || {
-            let profile_dispatched = profile_start.map(|_| std::time::Instant::now());
             let plans = {
                 let mut slot = receiver.plans.lock();
                 while slot.is_none() {
@@ -249,7 +244,6 @@ impl LineReadPermit {
                     _ => return,
                 }
             };
-            let profile_ready = profile_start.map(|_| std::time::Instant::now());
             let result =
                 frankenterm_sigpipe::catch_recoverable(
                     frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
@@ -280,34 +274,12 @@ impl LineReadPermit {
                     }),
                 )
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("cold read worker failed")));
-            let profile_hydrated = profile_start.map(|_| std::time::Instant::now());
-            let read_ok = result.is_ok();
             // Completion owns the permit through queued publication, so a busy
             // UI cannot accumulate uncharged finished read payloads.
-            let completion = frankenterm_sigpipe::catch_recoverable(
+            let _ = frankenterm_sigpipe::catch_recoverable(
                 frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
                 std::panic::AssertUnwindSafe(|| complete(result, self)),
             );
-            if let (Some(start), Some(dispatched), Some(ready), Some(hydrated)) = (
-                profile_start,
-                profile_dispatched,
-                profile_ready,
-                profile_hydrated,
-            ) {
-                // Completion can include waiting for main-thread publication
-                // retirement; it is not itself a presentation timestamp.
-                let finished = std::time::Instant::now();
-                log::debug!(target: "mux::cold_read_profile",
-                    "cold_read_complete dispatch_us={} input_wait_us={} hydrate_us={} completion_us={} total_us={} read_ok={} completion_ok={}",
-                    dispatched.duration_since(start).as_micros(),
-                    ready.duration_since(dispatched).as_micros(),
-                    hydrated.duration_since(ready).as_micros(),
-                    finished.duration_since(hydrated).as_micros(),
-                    finished.duration_since(start).as_micros(),
-                    read_ok,
-                    completion.is_ok(),
-                );
-            }
         }))
         .map(|_| LineReadWorker { input })
     }
