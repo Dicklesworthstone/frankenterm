@@ -26,14 +26,30 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.6`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
+Version `0.15.6` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Bell and user-variable notifications reserve GUI delivery capacity before local or remote pane mutation. Callback completion orders successive historical events without blocking the RPC reader. A fatal admission refusal revokes the exact connection even after readiness completes, while stale scopes cannot revoke a successor. Native qualification remains pending.
+- The legacy macOS Blocks declarations explicitly name the C ABI. The next native copy/invoke/dispose test must qualify these final declarations.
+
+- NTM parity property generators prevent arbitrary extra fields from overwriting the reserved `ok` discriminator. Deterministic coverage retains the RC51 failing seed, and the empty-assertion property explicitly validates its envelope. The 38 parity tests and three schema tests passed remotely.
+- Authenticated root reconstruction can resolve envelope corruption without hiding filesystem, discovery or rejected-root authority failures. Authority checks survive diagnostic truncation. Remote startup/publication coverage and owned native RC53 intact, repairable-corruption and above-budget refusal scenarios passed. These scenarios preserve a surviving guardian-owned shell across mux replacement; they do not establish recovery after guardian death or power failure.
+- Vendored SSH linkage uses the OpenSSL and zlib dependency crates' static-library declarations. The macOS Blocks binding uses inhabited runtime storage and raw address acquisition, with a native copy/invoke/dispose regression. Cross-platform release qualification remains pending.
+- Optional transaction diagnostics correlate committed segments with verified transaction durations while preserving ordinary writer logging. Extraction timing is recorded before oracle validation; benchmark workloads and acceptance thresholds are unchanged.
+- Selection retains its drag origin and both range endpoints across cold-history reflow, spill admission and seam replacement. Bounded endpoint hydration runs outside the terminal lock; source and gesture checks reject stale completions.
+- Same-path GUI upgrades start the successor executable instead of delegating to the older running process. Unix discovery publishes atomically under a bounded lock; updated publishers check inode ownership before removing their discovery pointer.
+- Standalone Unix listeners no longer create dormant client domains that reject recovered topology. Guardian startup retries reconciliation of the same Genesis request within its existing bounded budget, retaining unresolved-birth and cancellation safeguards. Owned native RC53 recovery scenarios exercised this startup path.
+- Hyperlink hit testing uses the glyph spans from the displayed frame, including clipped and wide text, instead of rereading terminal state during mouse movement. Cached rendering retains those spans and rejects stale pane or layout identities.
+- Guardian recovery retries a busy, authenticated handshake before claiming ownership. The retry remains bounded and does not replay ownership claims or mutations. Snapshot publication also rechecks the captured domain policy and default domain before publishing.
+- A replay-safe render-read rejection uses a 1 ms first backoff, retaining the longer backoff for persistent contention, the original deadline and the attempt cap. Native latency qualification remains pending.
+- The latency diagnostic fits finite arrival/departure service envelopes without counting batch waiting twice. It freezes calibration before checking held-out samples and reports bounded samples of failed service cuts. The RC53 held-out run failed its capture and storage service-envelope checks; fitted rates do not establish saturated throughput or a passing performance gate.
 - Guardian recovery preserves separate authenticated adoptions when successor muxes capture identical terminal content. Exact replay and resumed reads retain the selected capture generation; historical checkpoint files remain available. Subprocess tests cover mux death during durable ownership transfer while the original guardian-owned child remains alive. Recovery after guardian or host failure remains unfinished.
 - The mux server adds opt-in `--recovery-restore`: authenticate the saved image, reconcile its original guardian-owned processes, and publish the complete recovered topology before opening listeners. Cancellation or a failed preparation leaves the topology unpublished. Recovered tabs support subsequent window transactions; periodic snapshots continue the exact authenticated predecessor chain across repeated root-slot rotation. Focused remote tests cover these paths; native startup and release qualification remain pending.
 - Cold scrollback retains its logical viewport anchor across repeated reflow and refreshes stale geometry after ordinary output. Hydration stays off the terminal lock; a missing new-width paragraph defers painting instead of substituting an old numeric row. Native position and presentation checks remain pending.
-- GUI redraw notifications survive retirement of a saturated payload subscription. Initial Lua window events retry when scheduler capacity returns, and accepted user-variable events reserve callback and completion capacity together and retain their original pane identity. This does not yet provide lossless admission for every historical mux notification.
+- GUI redraw notifications survive retirement of a saturated payload subscription. Initial Lua window events retry when scheduler capacity returns. Bell and user-variable events use the pre-admitted historical delivery path described above and retain their original pane identity.
 - Recovery images reject the reserved window-order revision sentinel while accepting the last valid revision.
 - Headless mux socket waits use the runtime reactor while session tasks remain on their owner thread. Existing restricted contexts and shutdown ordering are preserved.
 - Line reads reuse four bounded workers instead of creating a thread per request. Admission still precedes row capture, and requests retain their permits through reply retirement.
@@ -101,7 +117,7 @@ Compare against the latest public release: <https://github.com/Dicklesworthstone
 - Offline recovery selects the authenticated checkpoint adoption by its complete
   capture identity, including mux incarnation, generation, effect and sequence.
 
-The `0.15.6-rc.40` candidate is being prepared with these changes. The 50 ms resize target,
+The `0.15.6-rc.51` candidate remains under release qualification. The 50 ms resize target,
 100 ms ceiling on this Mac, exact tab-order restoration after a full GUI
 reopen, and live runtime recovery remain unqualified; this entry does not claim
 tests or runtime behavior are proven.

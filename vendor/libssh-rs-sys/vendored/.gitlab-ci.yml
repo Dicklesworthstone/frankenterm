@@ -1,0 +1,664 @@
+---
+variables:
+  BUILD_IMAGES_PROJECT: libssh/build-images
+  CENTOS8_BUILD: buildenv-c8s
+  CENTOS9_BUILD: buildenv-c9s
+  CENTOS10_BUILD: buildenv-c10s
+  FEDORA_BUILD: buildenv-fedora
+  MINGW_BUILD: buildenv-mingw
+  TUMBLEWEED_BUILD: buildenv-tumbleweed
+  UBUNTU_BUILD: buildenv-ubuntu
+  ALPINE_BUILD: buildenv-alpine
+
+stages:
+  - review
+  - build
+  - test
+  - analysis
+
+# This is some black magic to select between branch pipelines and
+# merge request pipelines to avoid running same pipelines in twice
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+.build:
+  stage: build
+  variables:
+    CMAKE_DEFAULT_OPTIONS: "-DCMAKE_BUILD_TYPE=RelWithDebInfo -DPICKY_DEVELOPER=ON"
+    CMAKE_BUILD_OPTIONS: "-DWITH_BLOWFISH_CIPHER=ON -DWITH_SFTP=ON -DWITH_SERVER=ON -DWITH_ZLIB=ON -DWITH_PCAP=ON -DWITH_DEBUG_CRYPTO=ON -DWITH_DEBUG_PACKET=ON -DWITH_DEBUG_CALLTRACE=ON"
+    CMAKE_TEST_OPTIONS: "-DUNIT_TESTING=ON -DCLIENT_TESTING=ON -DSERVER_TESTING=ON -DGSSAPI_TESTING=ON -DWITH_BENCHMARKS=ON -DFUZZ_TESTING=ON"
+    CMAKE_OPTIONS: $CMAKE_DEFAULT_OPTIONS $CMAKE_BUILD_OPTIONS $CMAKE_TEST_OPTIONS
+  before_script: &build
+    - uname -a
+    - cat /etc/os-release
+    - mount
+    - df -h
+    - cat /proc/swaps
+    - free -h
+    - mkdir -p obj && cd obj
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      make -j$(nproc) install
+  # Do not use after_script as it does not make the targets fail
+  tags:
+    - saas-linux-small-amd64
+  only:
+    - merge_requests
+    - branches
+
+  except:
+    - tags
+  artifacts:
+    expire_in: 1 week
+    when: on_failure
+    paths:
+      - obj/
+
+.tests:
+  extends: .build
+  stage: test
+  # This is needed to prevent passing artifacts from previous stages
+  dependencies: []
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+    # Do not use after_script as it does not make the targets fail
+
+.fedora:
+  extends: .tests
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+
+.tumbleweed:
+  extends: .tests
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$TUMBLEWEED_BUILD
+
+.fips:
+  extends: .tests
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON
+  before_script:
+    - *build
+    - echo "# userspace fips" > /etc/system-fips
+    # We do not need the kernel part, but in case we ever do:
+    # mkdir -p /var/tmp/userspace-fips
+    # echo 1 > /var/tmp/userspace-fips/fips_enabled
+    # mount --bind /var/tmp/userspace-fips/fips_enabled \
+    # /proc/sys/crypto/fips_enabled
+    - update-crypto-policies --show
+    - update-crypto-policies --set FIPS
+    - update-crypto-policies --show
+
+###############################################################################
+#                                   Review                                    #
+###############################################################################
+review:
+  variables:
+    GIT_DEPTH: 100
+  stage: review
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+  script:
+    - ERROR=0
+      codespell --ignore-words-list=keypair,sorce,ned,nd,ue,pendin || ERROR=1;
+      ./.gitlab-ci/clang-format-check.sh || ERROR=1;
+      ./.gitlab-ci/git-check-signoff-trailer.sh ${CI_MERGE_REQUEST_DIFF_BASE_SHA} || ERROR=1;
+      ./.gitlab-ci/shellcheck.sh || ERROR=1;
+      exit $ERROR
+  # the format is not always matching our intentions
+  allow_failure: true
+  tags:
+    - saas-linux-small-amd64
+  only:
+    - merge_requests
+
+###############################################################################
+#                               CentOS builds                                 #
+###############################################################################
+centos10s/openssl_3.5.x/x86_64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS10_BUILD
+  extends: .tests
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON -DWITH_PKCS11_PROVIDER=ON
+  script:
+    - export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+centos10s/openssl_3.5.x/x86_64/fips:
+  extends: .fips
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS10_BUILD
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON -DWITH_PKCS11_PROVIDER=ON
+  script:
+    - export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      OPENSSL_FORCE_FIPS_MODE=1 ctest --output-on-failure
+
+centos9s/openssl_3.5.x/x86_64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS9_BUILD
+  extends: .tests
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON -DWITH_PKCS11_PROVIDER=ON
+  script:
+    - export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+centos9s/mbedtls_2.x/x86_64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS9_BUILD
+  extends: .tests
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DWITH_MBEDTLS=ON -DWITH_DEBUG_CRYPTO=ON -DWITH_BLOWFISH_CIPHER=OFF"
+
+centos9s/openssl_3.5.x/x86_64/fips:
+  extends: .fips
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS9_BUILD
+  script:
+    - export OPENSSL_ENABLE_SHA1_SIGNATURES=1
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      OPENSSL_FORCE_FIPS_MODE=1 ctest --output-on-failure
+
+centos8s/openssl_1.1.1/x86_64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS8_BUILD
+  extends: .tests
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+centos8s/openssl_1.1.1/x86_64/fips:
+  extends: .fips
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS8_BUILD
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      OPENSSL_FORCE_FIPS_MODE=1 ctest --output-on-failure
+
+###############################################################################
+#                               Fedora builds                                 #
+###############################################################################
+fedora/build:
+  extends: .build
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+
+fedora/docs:
+  extends: .build
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+  script:
+    - cmake .. && make docs_coverage && make docs
+  coverage: '/^Documentation coverage is \d+.\d+%/'
+
+fedora/ninja:
+  extends: .fedora
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+  script:
+    - cmake -G Ninja $CMAKE_OPTIONS ../ && ninja && CTEST_OUTPUT_ON_FAILURE=1 ninja test
+
+fedora/coverage:
+  extends: .fedora
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DCMAKE_BUILD_TYPE=Debug -DWITH_COVERAGE=ON"
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      make coverage_xml
+  coverage: /^\s*lines:\s*\d+.\d+\%/
+  artifacts:
+    name: ${CI_JOB_NAME}-${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHA}
+    expire_in: 1 week
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: obj/coverage_xml.xml
+
+fedora/openssl_3.0.x/x86_64:
+  extends: .fedora
+
+fedora/openssl_3.0.x/x86_64/pkcs11-provider:
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=ON -DWITH_PKCS11_PROVIDER=ON
+  extends: .fedora
+
+fedora/openssl_3.0.x/x86_64/minimal:
+  extends: .fedora
+  variables:
+  script:
+    - cmake $CMAKE_DEFAULT_OPTIONS
+      -DWITH_EXEC=OFF
+      -DWITH_SFTP=OFF
+      -DWITH_SERVER=OFF
+      -DWITH_ZLIB=OFF
+      -DWITH_PCAP=OFF
+      -DUNIT_TESTING=ON
+      -DCLIENT_TESTING=ON
+      -DWITH_GEX=OFF .. &&
+      make -j$(nproc)
+
+.valgrind:
+  extends: .fedora
+  stage: analysis
+  script:
+    - cmake $CMAKE_OPTIONS $CMAKE_ADDITIONAL_OPTIONS .. &&
+      make -j$(nproc) &&
+      make test_memcheck
+    - cat Testing/Temporary/MemoryChecker.*.log | wc -l | grep "^0$"
+
+# The PKCS#11 support is turned off as it brings dozens of memory issues from
+# engine_pkcs11 or openssl itself
+fedora/valgrind/openssl:
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_PKCS11_URI=OFF
+  extends: .valgrind
+
+fedora/valgrind/mbedtls:
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_MBEDTLS=ON
+  extends: .valgrind
+
+fedora/valgrind/libgcrypt:
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: -DWITH_GCRYPT=ON
+  extends: .valgrind
+
+# Address sanitizer doesn't mix well with LD_PRELOAD used in the testsuite
+# so, this is only enabled for unit tests right now.
+# TODO: add -DCLIENT_TESTING=ON -DSERVER_TESTING=ON
+fedora/address-sanitizer:
+  extends: .fedora
+  stage: analysis
+  script:
+    - cmake
+      -DCMAKE_BUILD_TYPE=AddressSanitizer
+      -DCMAKE_C_COMPILER=clang
+      -DCMAKE_CXX_COMPILER=clang++
+      -DPICKY_DEVELOPER=ON
+      $CMAKE_BUILD_OPTIONS
+      -DUNIT_TESTING=ON
+      -DFUZZ_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+# This is disabled as it report OpenSSL issues
+# It also has the same issues with cwrap as AddressSanitizer
+.fedora/memory-sanitizer:
+  extends: .fedora
+  stage: analysis
+  script:
+    - cmake
+      -DCMAKE_BUILD_TYPE=MemorySanitizer
+      -DCMAKE_C_COMPILER=clang
+      -DCMAKE_CXX_COMPILER=clang++
+      -DPICKY_DEVELOPER=ON
+      $CMAKE_BUILD_OPTIONS
+      -DUNIT_TESTING=ON
+      -DFUZZ_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+fedora/undefined-sanitizer:
+  extends: .fedora
+  stage: analysis
+  script:
+    - cmake
+      -DCMAKE_BUILD_TYPE=UndefinedSanitizer
+      -DCMAKE_C_COMPILER=clang
+      -DCMAKE_CXX_COMPILER=clang++
+      -DPICKY_DEVELOPER=ON
+      $CMAKE_BUILD_OPTIONS
+      -DUNIT_TESTING=ON
+      -DFUZZ_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+fedora/libgcrypt/x86_64:
+  extends: .fedora
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DWITH_GCRYPT=ON -DWITH_DEBUG_CRYPTO=ON"
+
+fedora/mbedtls_2.x/x86_64:
+  extends: .fedora
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DWITH_MBEDTLS=ON -DWITH_DEBUG_CRYPTO=ON "
+
+# Unit testing only, no client and pkd testing, because cwrap is not available
+# for MinGW
+fedora/mingw64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$MINGW_BUILD
+  extends: .tests
+  script:
+    - export WINEPATH=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
+    - export WINEDEBUG=-all
+    - mingw64-cmake $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON
+      -DWITH_SERVER=ON
+      -DWITH_ZLIB=ON
+      -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure -E torture_rand
+
+# Unit testing only, no client and pkd testing, because cwrap is not available
+# for MinGW
+fedora/mingw32:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$MINGW_BUILD
+  extends: .tests
+  script:
+    - export WINEPATH=/usr/i686-w64-mingw32/sys-root/mingw/bin
+    - export WINEDEBUG=-all
+    - mingw32-cmake $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON
+      -DWITH_SERVER=ON
+      -DWITH_ZLIB=ON
+      -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure -E torture_rand
+
+
+###############################################################################
+#                               Fedora csbuild                                #
+###############################################################################
+.csbuild:
+  stage: analysis
+  variables:
+    GIT_DEPTH: "100"
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$FEDORA_BUILD
+  before_script:
+    - |
+      # for merge requests
+      if [[ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]]; then
+          export CI_COMMIT_BEFORE_SHA="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      fi
+      # for branches run
+      if [[ -z "$CI_COMMIT_BEFORE_SHA" ]]; then
+          export CI_COMMIT_BEFORE_SHA=$(git rev-parse "${CI_COMMIT_SHA}~20")
+      fi
+
+      # Check if the commit exists in this branch
+      # This is not the case for a force push
+      git branch --contains $CI_COMMIT_BEFORE_SHA 2>/dev/null || export CI_COMMIT_BEFORE_SHA=$(git rev-parse "${CI_COMMIT_SHA}~20")
+
+      export CI_COMMIT_RANGE="$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA"
+  tags:
+    - saas-linux-small-amd64
+  except:
+    - tags
+  only:
+    - merge_requests
+  artifacts:
+    expire_in: 1 week
+    when: on_failure
+    paths:
+      - obj-csbuild/
+
+fedora/csbuild/openssl_3.0.x:
+  extends: .csbuild
+  script:
+    - csbuild
+      --build-dir=obj-csbuild
+      --build-cmd "rm -rf CMakeFiles CMakeCache.txt && cmake -DCMAKE_BUILD_TYPE=Debug -DPICKY_DEVELOPER=ON -DUNIT_TESTING=ON -DCLIENT_TESTING=ON -DSERVER_TESTING=ON -DFUZZ_TESTING=ON @SRCDIR@ && make clean && make -j$(nproc)"
+      --git-commit-range $CI_COMMIT_RANGE
+      --color
+      --print-current --print-fixed
+
+fedora/csbuild/libgcrypt:
+  extends: .csbuild
+  script:
+    - csbuild
+      --build-dir=obj-csbuild
+      --build-cmd "rm -rf CMakeFiles CMakeCache.txt && cmake -DCMAKE_BUILD_TYPE=Debug -DPICKY_DEVELOPER=ON -DUNIT_TESTING=ON -DCLIENT_TESTING=ON -DSERVER_TESTING=ON -DFUZZ_TESTING=ON -DWITH_GCRYPT=ON @SRCDIR@ && make clean && make -j$(nproc)"
+      --git-commit-range $CI_COMMIT_RANGE
+      --color
+      --print-current --print-fixed
+
+fedora/csbuild/mbedtls:
+  extends: .csbuild
+  script:
+    - csbuild
+      --build-dir=obj-csbuild
+      --build-cmd "rm -rf CMakeFiles CMakeCache.txt && cmake -DCMAKE_BUILD_TYPE=Debug -DPICKY_DEVELOPER=ON -DUNIT_TESTING=ON -DCLIENT_TESTING=ON -DSERVER_TESTING=ON -DFUZZ_TESTING=ON -DWITH_MBEDTLS=ON @SRCDIR@ && make clean && make -j$(nproc)"
+      --git-commit-range $CI_COMMIT_RANGE
+      --color
+      --print-current --print-fixed
+
+
+###############################################################################
+#                               Ubuntu builds                                 #
+###############################################################################
+ubuntu/openssl_3.0.x/x86_64:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$UBUNTU_BUILD
+  extends: .tests
+
+
+###############################################################################
+#                               Alpine builds                                 #
+###############################################################################
+alpine/openssl_3.0.x/musl:
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$ALPINE_BUILD
+  extends: .tests
+  script:
+    - cmake $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON
+      -DWITH_SERVER=ON
+      -DWITH_ZLIB=ON
+      -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+
+###############################################################################
+#                             Tumbleweed builds                               #
+###############################################################################
+tumbleweed/openssl_3.0.x/x86_64/gcc:
+  extends: .tumbleweed
+
+tumbleweed/openssl_3.0.x/x86/gcc:
+  extends: .tumbleweed
+  script:
+    - cmake
+      -DCMAKE_TOOLCHAIN_FILE=../cmake/Toolchain-cross-m32.cmake
+      $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON
+      -DWITH_SERVER=ON
+      -DWITH_ZLIB=ON
+      -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make -j$(nproc)
+
+tumbleweed/openssl_3.0.x/x86_64/gcc7:
+  extends: .tumbleweed
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DCMAKE_C_COMPILER=gcc-7 -DCMAKE_CXX_COMPILER=g++-7"
+
+tumbleweed/openssl_3.0.x/x86/gcc7:
+  extends: .tumbleweed
+  script:
+    - cmake
+      -DCMAKE_TOOLCHAIN_FILE=../cmake/Toolchain-cross-m32.cmake
+      -DCMAKE_C_COMPILER=gcc-7 -DCMAKE_CXX_COMPILER=g++-7
+      $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON -DWITH_SERVER=ON -DWITH_ZLIB=ON -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make -j$(nproc) &&
+      ctest --output-on-failure
+
+tumbleweed/openssl_3.0.x/x86_64/clang:
+  extends: .tumbleweed
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++"
+
+tumbleweed/mbedtls-3.6.x/x86_64/gcc:
+  extends: .tumbleweed
+  variables:
+    CMAKE_ADDITIONAL_OPTIONS: "-DKRB5_CONFIG=/usr/lib/mit/bin/krb5-config -DWITH_MBEDTLS=ON -DWITH_DEBUG_CRYPTO=ON -DWITH_BLOWFISH_CIPHER=OFF "
+
+tumbleweed/static-analysis:
+  extends: .tests
+  stage: analysis
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$TUMBLEWEED_BUILD
+  script:
+    - export CCC_CC=clang
+    - export CCC_CXX=clang++
+    - scan-build cmake
+      -DCMAKE_BUILD_TYPE=Debug
+      -DCMAKE_C_COMPILER=clang
+      -DCMAKE_CXX_COMPILER=clang++
+      -DPICKY_DEVELOPER=ON
+      $CMAKE_BUILD_OPTIONS
+      $CMAKE_TEST_OPTIONS .. &&
+      scan-build --status-bugs -o scan make -j$(nproc)
+  artifacts:
+    expire_in: 1 week
+    when: on_failure
+    paths:
+      - obj/scan
+
+
+###############################################################################
+#                               FreeBSD builds                                #
+###############################################################################
+# That is a specific runner that we cannot enable universally.
+# We restrict it to builds under the $BUILD_IMAGES_PROJECT project.
+freebsd/openssl_1.1.1/x86_64:
+  image:
+  extends: .tests
+  before_script:
+    - mkdir -p obj && cd obj && cmake
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      -DPICKY_DEVELOPER=ON
+      -DWITH_SFTP=ON -DWITH_SERVER=ON -DWITH_ZLIB=ON -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON ..
+  script:
+    - cmake $CMAKE_DEFAULT_OPTIONS
+      -DWITH_SFTP=ON
+      -DWITH_SERVER=ON
+      -DWITH_ZLIB=ON
+      -DWITH_PCAP=ON
+      -DUNIT_TESTING=ON .. &&
+      make &&
+      ctest --output-on-failure
+  tags:
+    - private
+    - freebsd
+  only:
+    - branches@libssh/libssh-mirror
+    - branches@cryptomilk/libssh-mirror
+    - branches@jjelen/libssh-mirror
+    - branches@marco.fortina/libssh-mirror
+
+
+###############################################################################
+#                           Visual Studio builds                              #
+###############################################################################
+# 2024-05-13: These jobs run out of the stages as they take extremely long and
+# usually timeout with the update to Gitlab 17.0
+.vs:
+  stage: analysis
+  needs: []
+  allow_failure: true
+  cache:
+    key: vcpkg.${CI_JOB_NAME}
+    paths:
+      - .vcpkg
+  variables:
+    ErrorActionPreference: STOP
+  script:
+    - cmake --build .
+    - ctest --output-on-failure
+  tags:
+    - saas-windows-medium-amd64
+  only:
+    - merge_requests
+    - branches
+  except:
+    - tags
+  artifacts:
+    expire_in: 1 week
+    when: on_failure
+    paths:
+      - obj/
+  before_script:
+    - If (!(test-path .vcpkg\archives)) { mkdir -p .vcpkg\archives }
+    - $env:VCPKG_DEFAULT_BINARY_CACHE="$PWD\.vcpkg\archives"
+    - echo $env:VCPKG_DEFAULT_BINARY_CACHE
+    - $env:VCPKG_DEFAULT_TRIPLET="$TRIPLET-windows"
+    - vcpkg install cmocka
+    - vcpkg install openssl
+    - vcpkg install zlib
+    - vcpkg integrate install
+    - mkdir -p obj; if ($?) {cd obj}; if (! $?) {exit 1}
+    - cmake
+        -A $PLATFORM
+        -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+        -DPICKY_DEVELOPER=ON
+        -DWITH_SFTP=ON -DWITH_SERVER=ON -DWITH_ZLIB=ON -DWITH_PCAP=ON
+        -DUNIT_TESTING=ON ..
+
+visualstudio/x86_64:
+  extends: .vs
+  variables:
+    PLATFORM: "x64"
+    TRIPLET: "x64"
+
+visualstudio/x86:
+  extends: .vs
+  variables:
+    PLATFORM: "win32"
+    TRIPLET: "x86"
+
+###############################################################################
+#                                 Coverity                                    #
+###############################################################################
+#
+# git push -o ci.variable="COVERITY_SCAN_TOKEN=XXXXXX" \
+#          -o ci.variable="COVERITY_SCAN_PROJECT_NAME=XXXXXX" \
+#          -o ci.variable="COVERITY_SCAN_EMAIL=XXXXXX" \
+#          -f gitlab
+
+coverity:
+  stage: analysis
+  image: $CI_REGISTRY/$BUILD_IMAGES_PROJECT:$CENTOS9_BUILD
+  script:
+    - mkdir obj && cd obj
+    - wget https://scan.coverity.com/download/linux64 --post-data "token=$COVERITY_SCAN_TOKEN&project=$COVERITY_SCAN_PROJECT_NAME" -O /tmp/coverity_tool.tgz
+    - tar xf /tmp/coverity_tool.tgz
+    - cmake -DCMAKE_BUILD_TYPE=Debug $CMAKE_BUILD_OPTIONS $CMAKE_TEST_OPTIONS ..
+    - cov-analysis-linux64-*/bin/cov-build --dir cov-int make -j$(nproc)
+    - tar czf cov-int.tar.gz cov-int
+    - curl
+      --form token=$COVERITY_SCAN_TOKEN
+      --form email=$COVERITY_SCAN_EMAIL
+      --form file=@cov-int.tar.gz
+      --form version="`git describe --tags`"
+      --form description="CI build"
+      https://scan.coverity.com/builds?project=$COVERITY_SCAN_PROJECT_NAME
+  tags:
+    - saas-linux-small-amd64
+  only:
+    refs:
+      - master
+      - schedules
+    variables:
+      - $COVERITY_SCAN_TOKEN != null
+      - $COVERITY_SCAN_PROJECT_NAME != null
+      - $COVERITY_SCAN_EMAIL != null
+  artifacts:
+    expire_in: 1 week
+    when: on_failure
+    paths:
+      - obj/cov-int/*.txt

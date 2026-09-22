@@ -93,6 +93,8 @@ members = [
 exclude = [
     "frankenterm/char-props/codegen",
     "frankenterm/bidi/generate",
+    "vendor/libssh-rs-sys",
+    "vendor/block",
 ]
 
 # Limit default workspace operations (check/clippy/test) to the ft crates.
@@ -119,7 +121,7 @@ default-members = [
 # - optional frontends (mcp/web/tui/browser) are feature-gated
 
 [workspace.package]
-version = "0.15.6-rc.48"
+version = "0.15.6"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Dicklesworthstone"]
@@ -613,7 +615,7 @@ frankensearch = { version = "=0.6.0", git = "https://github.com/Dicklesworthston
 # Keep this isolated from the existing full-stack FrankenSearch git pin above.
 frankensearch-index-acl = { package = "frankensearch-index", version = "=0.3.0", default-features = false }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
-franken-agent-detection = "0.2.2"
+franken-agent-detection = "0.3.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }
@@ -688,8 +690,8 @@ strip = "none"
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 
-# [patch.crates-io] redirects crates.io-sourced deps to pinned upstream GitHub revs
-# so the graph single-sources and resolves on any machine (CI runners, cargo install,
+# [patch.crates-io] redirects crates.io-sourced deps to pinned upstream revisions
+# or committed relative vendor paths so the graph resolves on any machine (cargo install,
 # external contributors). Do NOT use absolute /dp/... path patches: they break every
 # build outside the dev fleet (and CI's --locked jobs), since /dp only exists there.
 #
@@ -697,6 +699,12 @@ debug = 1
 # [workspace.dependencies]. Git-pinned integrations resolve their own declared
 # versions; keep those aligned before passing runtime types across crate boundaries.
 [patch.crates-io]
+# Preserve dependency-owned static OpenSSL/zlib linkage in vendored libssh.
+# Published crate identity and local changes: vendor/libssh-rs-sys/README.md.
+libssh-rs-sys = { path = "vendor/libssh-rs-sys" }
+# Preserve Cocoa's block API while correcting its opaque runtime-class ABI.
+# Published archive identity and native proof boundary: vendor/block/README.md.
+block = { path = "vendor/block" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.

@@ -1,0 +1,12 @@
+*.a
+*.o
+*.swp
+*~$
+cscope.*
+compile_commands.json
+/.cache
+/.clangd
+tags
+/build
+/obj*
+doc/tags.xml
