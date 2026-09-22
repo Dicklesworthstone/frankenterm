@@ -8148,7 +8148,15 @@ mod tests {
                 );
                 term.advance_bytes(format!("{}{}", "a".repeat(prefix), tail).as_bytes());
                 if rows == 2 {
-                    assert!(sink.retained_scrollback_rows() > 0);
+                    // This fallback sink deliberately supplies no spill-admission
+                    // witness. Close the paragraph before moving BOTH endpoints
+                    // into cold storage; an open unwitnessed cold/resident seam
+                    // cannot authorize a coherent layout for this fixture.
+                    term.advance_bytes(b"\r\nnext\r\nnext\r\nnext\r\n");
+                    assert!(term.screen().phys_to_stable_row_index(0) > 256);
+                    let retained = sink.rows.lock();
+                    assert!(retained.1.contains_key(&255));
+                    assert!(retained.1.contains_key(&256));
                 }
                 *pane.terminal.lock() = term;
                 for pattern in [
