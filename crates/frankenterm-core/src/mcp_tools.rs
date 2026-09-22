@@ -25281,6 +25281,10 @@ exit 17",
                 })
                 .await
                 .expect("distributed pane should seed");
+            storage
+                .shutdown()
+                .await
+                .expect("distributed pane seed writer should settle before reuse");
         });
     }
 
@@ -26502,7 +26506,10 @@ exit 17",
                 .append_segment(pane_id, "distributed-pane-needle-marker-9ia4p", None)
                 .await
                 .expect("output segment should append");
-            let _ = storage.shutdown().await;
+            storage
+                .shutdown()
+                .await
+                .expect("distributed output seed writer should settle before search");
         });
 
         let tool = WaSearchTool::new(config(), Arc::clone(&db));
