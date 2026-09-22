@@ -53,7 +53,13 @@ fn workspace_root() -> PathBuf {
 fn cargo_metadata_no_deps(manifest_path: &Path) -> serde_json::Value {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--no-deps", "--offline"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
         .arg("--manifest-path")
         .arg(manifest_path)
         .output()
@@ -133,7 +139,10 @@ fn first_party_manifests_declare_no_direct_tokio_edges() {
     }
     // Non-vacuity: the main workspace alone has dozens of members and many
     // hundreds of declared edges.
-    assert!(packages >= 50, "only {packages} first-party packages scanned");
+    assert!(
+        packages >= 50,
+        "only {packages} first-party packages scanned"
+    );
     assert!(
         declared_edges >= 500,
         "only {declared_edges} declared edges scanned"

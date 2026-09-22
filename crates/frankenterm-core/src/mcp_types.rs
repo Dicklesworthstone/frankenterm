@@ -1252,8 +1252,8 @@ pub(super) struct McpEventMutationData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane_capability_resolution::IpcPaneState;
     use crate::config::PaneFilterRule;
+    use crate::pane_capability_resolution::IpcPaneState;
     use crate::storage::PaneRecord;
     use crate::wezterm::PaneInfo;
 
