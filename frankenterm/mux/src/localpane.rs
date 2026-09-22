@@ -10263,7 +10263,10 @@ mod tests {
                         break;
                     }
                     Err(SelectionAnchorCaptureError::Busy) => {}
-                    result => panic!("ragged endpoint {end_column} capture failed: {result:?}"),
+                    result => panic!(
+                        "ragged endpoint {} capture failed: {:?}",
+                        end_column, result
+                    ),
                 }
                 assert!(Instant::now() < deadline, "ragged capture did not settle");
                 std::thread::sleep(Duration::from_millis(1));

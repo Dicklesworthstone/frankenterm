@@ -644,14 +644,24 @@ impl super::TermWindow {
         if desired.authority != Some(authority) {
             return NativeSelectionCapture::Invalidated;
         }
-        local
-            .capture_selection_anchor(
+        let captured = local.capture_selection_anchor(
+            authority.layout_floor(),
+            desired.seqno,
+            dimensions,
+            desired.native_points(),
+        );
+        if matches!(captured, Ok(None)) {
+            log::debug!(
+                target: "frankenterm_gui::selection_anchor",
+                "capture_unremappable pane={} floor={} sequence={} cols={} points={:?}",
+                pane.pane_id(),
                 authority.layout_floor(),
                 desired.seqno,
-                dimensions,
-                desired.native_points(),
-            )
-            .into()
+                dimensions.cols,
+                desired.native_points()
+            );
+        }
+        captured.into()
     }
 
     fn commit_selection_candidate(&self, pane: &Arc<dyn Pane>, desired: Selection) {
@@ -1072,6 +1082,16 @@ impl super::TermWindow {
         let resolved = SelectionAuthority::from_native_snapshot(&**pane, floor, dimensions);
         if resolved != current {
             return true;
+        }
+        if points.is_none() {
+            log::debug!(
+                target: "frankenterm_gui::selection_anchor",
+                "resolve_invalid pane={} floor={} sequence={} cols={}",
+                pane.pane_id(),
+                floor,
+                sequence,
+                dimensions.cols
+            );
         }
         if let Some((points, authority)) = points.zip(resolved) {
             if let Some(mut selection) = self.selection(pane.pane_id()) {
