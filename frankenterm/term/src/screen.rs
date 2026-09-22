@@ -4622,17 +4622,17 @@ impl Screen {
         if let Some(layout) = self.cold_visual_layout_for_interval(&interval) {
             return Ok(layout.viewport_anchor_group(anchor));
         }
-        // Appending output can advance the resident frontier and invalidate a
-        // reflowed layout without scheduling a resize worker. The cold visual
-        // interval ends at this frontier at every width, so its last row is a
-        // bounded refresh request even while the visual origin is unknown.
+        // Appending output can invalidate a reflowed layout without scheduling
+        // a resize worker. Bootstrap from the oldest reachable row, as the
+        // resize worker does: the tail can belong to an unfinished cold/hot
+        // seam and cannot be hydrated from the closed-group index.
         let frontier = self.phys_to_stable_row_index(0);
         let rows = interval.rows().ok_or(ColdReadMetadataBusy)?;
         let last = frontier.checked_sub(1).ok_or(ColdReadMetadataBusy)?;
         if last < rows.start || frontier > rows.end {
             return Err(ColdReadMetadataBusy);
         }
-        Ok(Some(last..frontier))
+        Ok(Some(StableRowIndex::MIN..StableRowIndex::MIN + 1))
     }
 
     /// Plan only this endpoint's complete group, or the bounded geometry
@@ -4676,7 +4676,10 @@ impl Screen {
         if last < rows.start || frontier > rows.end {
             return Err(ColdReadMetadataBusy);
         }
-        Ok(Some(last..frontier))
+        // Capture clamps this one-row probe to the oldest reachable row. The
+        // tail may be an unfinished seam, so retrying it cannot bootstrap the
+        // closed-group layout needed by an otherwise retained selection.
+        Ok(Some(StableRowIndex::MIN..StableRowIndex::MIN + 1))
     }
 
     /// Publication callers that can retry must distinguish transient metadata
@@ -11499,8 +11502,7 @@ pub(crate) mod tests {
                 .cold_viewport_anchor_read_range(&anchor)
                 .unwrap()
                 .unwrap();
-            assert_eq!(refresh.end, screen.phys_to_stable_row_index(0));
-            assert_eq!(refresh.end - refresh.start, 1);
+            assert_eq!(refresh, StableRowIndex::MIN..StableRowIndex::MIN + 1);
             let layout = screen
                 .capture_line_read(refresh)
                 .unwrap()

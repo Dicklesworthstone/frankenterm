@@ -4246,6 +4246,10 @@ impl LocalPane {
         let capture_aborted = Arc::new(AtomicBool::new(false));
         let abort_for_worker = Arc::clone(&capture_aborted);
         let abort_for_completion = Arc::clone(&capture_aborted);
+        let captured_witnesses = Arc::new(Mutex::new(Vec::<
+            frankenterm_term::screen::LineReadFailureWitness,
+        >::with_capacity(ranges.len())));
+        let worker_witnesses = Arc::clone(&captured_witnesses);
         let worker = permit.start(
             move || {
                 worker_cancelled.load(Ordering::Acquire) || abort_for_worker.load(Ordering::Acquire)
@@ -4317,11 +4321,30 @@ impl LocalPane {
                                 Ok(reads) => reads,
                                 Err(error)
                                     if error
-                                        .is::<frankenterm_term::screen::ColdReadMetadataBusy>() =>
+                                        .is::<frankenterm_term::screen::ColdReadMetadataBusy>()
+                                        || error.is::<
+                                            frankenterm_term::screen::ColdReadGeometryUnavailable,
+                                        >() =>
                                 {
+                                    // Primary resize geometry can be visible before
+                                    // the cold index is published. Its temporary
+                                    // absence does not revoke the selected text.
                                     return false
                                 }
                                 Err(_) => {
+                                    // An off-thread read failed against its captured
+                                    // source, not necessarily the source now locked.
+                                    // Never stamp an obsolete failure with current
+                                    // authority and permanently clear its selection.
+                                    let witnesses = worker_witnesses.lock();
+                                    if witnesses.is_empty()
+                                        || witnesses
+                                            .iter()
+                                            .any(|witness| !witness.matches(term.screen()))
+                                    {
+                                        return false;
+                                    }
+                                    drop(witnesses);
                                     work.ready = Some(ColdSelectionReady {
                                         floor,
                                         sequence,
@@ -4383,8 +4406,13 @@ impl LocalPane {
                                             .screen()
                                             .selection_anchor_read_ranges(anchor, sequence)
                                         {
-                                            Ok(_) => {}
-                                            Err(_) => return false,
+                                            Ok(None) => {}
+                                            // A bounded payload fallback can be
+                                            // valid without a complete layout
+                                            // projection. Retained source is not
+                                            // permanently invalid just because
+                                            // this read cannot map its points.
+                                            Ok(Some(_)) | Err(_) => return false,
                                         }
                                     }
                                     ColdSelectionValue::Resolved(points)
@@ -4424,7 +4452,10 @@ impl LocalPane {
                 .screen()
                 .capture_line_read_with_budget(range, &mut budget)
             {
-                Ok(plan) => plans.push(plan),
+                Ok(plan) => {
+                    captured_witnesses.lock().push(plan.failure_witness());
+                    plans.push(plan);
+                }
                 Err(error) => {
                     capture_error = Some(error);
                     break;
@@ -4434,7 +4465,9 @@ impl LocalPane {
         match capture_error {
             None => worker.submit(plans),
             Some(error) => {
-                if !error.is::<frankenterm_term::screen::ColdReadMetadataBusy>() {
+                if !error.is::<frankenterm_term::screen::ColdReadMetadataBusy>()
+                    && !error.is::<frankenterm_term::screen::ColdReadGeometryUnavailable>()
+                {
                     if let Some(floor) =
                         Self::refresh_line_layout_floor(&self.line_layout_observation, term)
                             .ok()
@@ -10171,16 +10204,22 @@ mod tests {
                 assert!(viewport.cold_anchor.is_some());
             }
         }
-        cold_ragged_paragraph_selection_endpoints(&executor);
+        cold_ragged_paragraph_selection_endpoints(&executor, false);
+        cold_ragged_paragraph_selection_endpoints(&executor, true);
     }
 
-    fn cold_ragged_paragraph_selection_endpoints(executor: &promise::spawn::SimpleExecutor) {
+    fn cold_ragged_paragraph_selection_endpoints(
+        executor: &promise::spawn::SimpleExecutor,
+        selection_before_index: bool,
+    ) {
         use frankenterm_term::screen::SelectionAnchorCoordinate;
         let (pane, _mux, registration, _sink, token) = cold_resize_fixture(false);
         let sink = Arc::new(ColdResizeTestSink::default());
+        sink.witness_admission
+            .store(selection_before_index, Ordering::Release);
         let mut term = Terminal::new(
             term_size(80, 4),
-            Arc::new(ColdResizeTestConfig(sink)),
+            Arc::new(ColdResizeTestConfig(Arc::clone(&sink))),
             "FrankenTerm",
             "cold-ragged-selection",
             Box::new(Vec::new()),
@@ -10196,15 +10235,22 @@ mod tests {
         for _ in 0..12 {
             term.advance_bytes(b"later unselected history\r\n");
         }
+        if selection_before_index {
+            // Leave an unselected logical line crossing the cold/hot seam.
+            // Input then stays frozen throughout resize and selection work.
+            term.advance_bytes("unselected soft tail ".repeat(40).as_bytes());
+        }
         *pane.terminal.lock() = term;
-        LocalPane::prepare_cold_layout_after_resize(
-            pane.pane_id(),
-            &pane.terminal,
-            &pane.line_layout_observation,
-            &pane.resize_queue,
-            token,
-            registration.clone(),
-        );
+        if !selection_before_index {
+            LocalPane::prepare_cold_layout_after_resize(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                &pane.resize_queue,
+                token,
+                registration.clone(),
+            );
+        }
         let dimensions = pane.get_dimensions();
         let read = pane
             .capture_line_read(
@@ -10304,6 +10350,33 @@ mod tests {
                 token,
             )
             .unwrap();
+            if selection_before_index {
+                // Production publishes primary geometry before preparing the
+                // cold index. Deterministically run the actual selection read
+                // worker in that gap, rather than relying on scheduling luck.
+                COLD_VIEWPORT_CACHE.lock().clear();
+                assert!(pane.selection_anchor_snapshot(&anchors[0]).is_none());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    let settled = pane
+                        .cold_selection
+                        .lock()
+                        .as_ref()
+                        .is_none_or(|work| work.ready.is_some());
+                    if settled {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "selection worker did not settle");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&anchors[0]) {
+                    assert!(
+                        points.is_some(),
+                        "unpublished cold index must not permanently invalidate retained selection"
+                    );
+                }
+            }
             LocalPane::prepare_cold_layout_after_resize(
                 pane.pane_id(),
                 &pane.terminal,
@@ -10357,6 +10430,241 @@ mod tests {
                     "cols={cols} padding={extra}"
                 );
                 assert_eq!(end.column, Some(last_len - 1 + extra));
+            }
+        }
+        if selection_before_index {
+            let retained_selection: Vec<_> = sink
+                .rows
+                .lock()
+                .1
+                .range(..=end_row)
+                .map(|(&row, line)| (row, line.clone()))
+                .collect();
+            assert!(!retained_selection.is_empty());
+            // Advance the cold frontier without a resize or an index-preparation
+            // call. Retire completed caches so the original tokens must drive
+            // their own real-worker bootstrap against the new source.
+            if let Some(work) = pane.cold_selection.lock().take() {
+                assert!(work.ready.is_some());
+                work.cancelled.store(true, Ordering::Release);
+            }
+            COLD_VIEWPORT_CACHE.lock().clear();
+            pane.terminal
+                .lock()
+                .advance_bytes(b"\r\nunselected append one\r\nunselected append two");
+            assert_eq!(
+                sink.rows
+                    .lock()
+                    .1
+                    .range(..=end_row)
+                    .map(|(&row, line)| (row, line.clone()))
+                    .collect::<Vec<_>>(),
+                retained_selection,
+                "unselected output must retain the exact selected source"
+            );
+            {
+                let term = pane.terminal.lock();
+                assert_eq!(
+                    term.screen()
+                        .selection_anchor_read_ranges(&anchors[0], term.current_seqno())
+                        .unwrap(),
+                    Some(vec![StableRowIndex::MIN..StableRowIndex::MIN + 1]),
+                    "output must invalidate the index and require a one-row bootstrap"
+                );
+            }
+            for exhaust_optional_index in [false, true] {
+                if exhaust_optional_index {
+                    // A real optional index allocation refusal must not revoke
+                    // source identity. Return to the original physical width
+                    // so the bounded, unindexed payload fallback can succeed.
+                    let apply = |cols| {
+                        let size = term_size(cols, 4);
+                        let pty = pty_size(cols as u16, 4);
+                        let pending = {
+                            let mut queue = pane.resize_queue.lock();
+                            queue.enqueue(size, pty, Instant::now());
+                            queue.dequeue_for_worker().unwrap()
+                        };
+                        let token = ResizeCancellationToken::new(pending.seq);
+                        LocalPane::apply_resize_sync(
+                            pane.pane_id(),
+                            &pane.terminal,
+                            &pane.line_layout_observation,
+                            #[cfg(feature = "disruptor-pane-io")]
+                            &pane.action_ring,
+                            &pane.pty,
+                            &pane.resize_queue,
+                            pending.seq,
+                            size,
+                            pty,
+                            token,
+                        )
+                        .unwrap();
+                        token
+                    };
+                    apply(80);
+                    if let Some(work) = pane.cold_selection.lock().take() {
+                        assert!(work.ready.is_some());
+                        work.cancelled.store(true, Ordering::Release);
+                    }
+                    COLD_VIEWPORT_CACHE.lock().clear();
+                    let plan = pane
+                        .terminal
+                        .lock()
+                        .screen()
+                        .capture_line_read(StableRowIndex::MIN..StableRowIndex::MIN + 1)
+                        .unwrap();
+                    let failure = plan.failure_witness();
+                    assert!(plan.hydrate_with_payload_limit(128, || false).is_err());
+                    assert!(failure.retry_without_index());
+                    let fallback = pane
+                        .terminal
+                        .lock()
+                        .screen()
+                        .capture_line_read(StableRowIndex::MIN..StableRowIndex::MIN + 1)
+                        .unwrap();
+                    let fallback = fallback
+                        .hydrate_with_payload_limit(32 * 1024, || false)
+                        .unwrap();
+                    assert!(fallback
+                        .capture_viewport_anchor(fallback.first_row())
+                        .is_none());
+                    {
+                        let term = pane.terminal.lock();
+                        assert!(term.screen().validates_line_read(&fallback));
+                        assert!(!term.screen().line_read_changes_layout(&fallback));
+                        assert_eq!(
+                            term.screen()
+                                .selection_anchor_read_ranges(&anchors[0], term.current_seqno())
+                                .unwrap(),
+                            Some(vec![StableRowIndex::MIN..StableRowIndex::MIN + 1])
+                        );
+                        assert!(term
+                            .screen()
+                            .resolve_selection_anchor_with_reads(
+                                &anchors[0],
+                                term.current_seqno(),
+                                &[&fallback],
+                            )
+                            .unwrap()
+                            .is_none());
+                    }
+                    let reads_before = sink.payload_reads.load(Ordering::Acquire);
+                    let busy_before = sink.busy_observations.load(Ordering::Acquire);
+                    let (entered_tx, entered_rx) = sync_channel(1);
+                    let (release_tx, release_rx) = sync_channel(1);
+                    assert!(sink.read_gate.lock().is_none());
+                    *sink.read_gate.lock() = Some((entered_tx, release_rx));
+                    let pending = pane.selection_anchor_snapshot(&anchors[0]);
+                    // No terminal or selection lock is held while waiting for
+                    // the real worker. Release and retire the gate before any
+                    // assertion, including the timeout failure path.
+                    let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+                    let _ = release_tx.send(());
+                    sink.read_gate.lock().take();
+                    assert!(pending.is_none());
+                    entered.expect("selection worker must hydrate the bounded fallback");
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        while executor.try_tick().unwrap() {}
+                        if pane
+                            .cold_selection
+                            .lock()
+                            .as_ref()
+                            .is_none_or(|work| work.ready.is_some())
+                        {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "fallback worker did not settle");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(sink.payload_reads.load(Ordering::Acquire) > reads_before);
+                    assert_eq!(sink.busy_observations.load(Ordering::Acquire), busy_before);
+                    if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&anchors[0]) {
+                        assert!(
+                            points.is_some(),
+                            "missing projection must not revoke the token"
+                        );
+                    }
+                    // A new geometry generation resets the optional index
+                    // budget. Prove recovery with production preparation and
+                    // the same tokens, rather than accepting indefinite Busy.
+                    let token = apply(69);
+                    LocalPane::prepare_cold_layout_after_resize(
+                        pane.pane_id(),
+                        &pane.terminal,
+                        &pane.line_layout_observation,
+                        &pane.resize_queue,
+                        token,
+                        registration.clone(),
+                    );
+                }
+                for (extra, anchor) in anchors.iter().enumerate() {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let points = loop {
+                        while executor.try_tick().unwrap() {}
+                        if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(anchor) {
+                            break points
+                                .expect("unselected output must preserve the original token");
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "selection must rebuild its index without a resize worker"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
+                    let start = points[1].unwrap();
+                    let end = points[2].unwrap();
+                    assert_eq!(points[0], points[1]);
+                    let read = pane
+                        .capture_line_read(start.row..end.row + 1, &mut Default::default())
+                        .unwrap()
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap();
+                    let mut selected = String::new();
+                    let mut last_len = None;
+                    for (offset, line) in read.lines().enumerate() {
+                        let row = read.first_row() + offset as StableRowIndex;
+                        if row < start.row || row > end.row {
+                            continue;
+                        }
+                        for cell in line.visible_cells() {
+                            if (row != start.row || cell.cell_index() >= start.column.unwrap())
+                                && (row != end.row || cell.cell_index() <= end.column.unwrap())
+                            {
+                                selected.push_str(cell.str());
+                            }
+                        }
+                        if row == end.row {
+                            last_len = Some(line.len());
+                        }
+                    }
+                    assert_eq!(selected.trim_end(), paragraph);
+                    assert_eq!(end.column, Some(last_len.unwrap() - 1 + extra));
+                }
+            }
+            // Remove the actual captured source rows from the fixture store.
+            // A retryable layout failure must not make a genuinely pruned
+            // selection immortal, including the last cached resolution.
+            {
+                let mut rows = sink.rows.lock();
+                let before = rows.1.len();
+                rows.1.retain(|row, _| *row > end_row);
+                assert!(rows.1.len() < before);
+                assert!(rows.1.first_key_value().unwrap().0 > &end_row);
+            }
+            for anchor in &anchors {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(anchor) {
+                        assert!(points.is_none(), "pruned selection must be invalidated");
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "pruned selection did not settle");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     }
