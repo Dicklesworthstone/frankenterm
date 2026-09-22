@@ -20,6 +20,8 @@ use frankenterm_core::telemetry::{TelemetryCollector, TelemetryConfig};
 
 use proptest::prelude::*;
 use serde_json::{Value, json};
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 use std::time::Duration;
 
 const GOLDEN_MATRIX: &str = include_str!("fixtures/cx_error_propagation/golden_matrix.json");
@@ -46,6 +48,63 @@ fn assert_golden_case(name: &str, actual: Value) -> Result<(), String> {
     Err(format!(
         "golden case {name} drifted\nexpected: {expected:#}\nactual: {actual:#}"
     ))
+}
+
+async fn cancel_pending_tailer_join(
+    pane_id: u64,
+    bytes: u64,
+    cancel_ms: u64,
+    slack_ms: u64,
+) -> Result<Option<(u64, PollOutcome)>, String> {
+    let mut set = TailerPollTaskSet::new();
+    let (complete_tx, complete_rx) = runtime_async::oneshot::channel();
+    set.spawn_poll_task(async move {
+        runtime_async::oneshot_recv(complete_rx)
+            .await
+            .expect("completion sender must release the pending poll task");
+        (pane_id, PollOutcome::Changed { bytes })
+    });
+    let cx = for_testing();
+    let observed = {
+        let mut join = std::pin::pin!(set.join_next_with_cx(&cx));
+        // Enter the real join before cancellation. Relative timer deadlines do
+        // not establish this order: a busy executor may run the producer before
+        // it ever starts the separately spawned canceller's shorter timer.
+        let first_poll = poll_fn(|task_cx| Poll::Ready(join.as_mut().poll(task_cx))).await;
+        if !first_poll.is_pending() {
+            return Err(format!(
+                "unreleased producer must leave join pending: {first_poll:?}"
+            ));
+        }
+        runtime_async::sleep(Duration::from_millis(cancel_ms)).await;
+        cx.cancel_with(CancelKind::User, Some("ft-npkn6 tailer midflight cancel"));
+        runtime_async::sleep(Duration::from_millis(slack_ms)).await;
+        // Now the producer is ready, but the already-started cancelled join
+        // must check cancellation before consuming its outcome.
+        runtime_async::oneshot_send(complete_tx, ())?;
+        runtime_async::timeout_with_cx(&for_testing(), Duration::from_secs(2), join)
+            .await
+            .map_err(|err| format!("cancelled tailer join did not resolve: {err}"))?
+    };
+    if cx.checkpoint().is_ok() {
+        return Err(String::from("midflight cancellation must trip the Cx"));
+    }
+    if observed.is_none() {
+        let retained = runtime_async::timeout_with_cx(
+            &for_testing(),
+            Duration::from_secs(2),
+            set.join_next_with_cx(&for_testing()),
+        )
+        .await
+        .map_err(|err| format!("live join could not recover retained outcome: {err}"))?;
+        if !matches!(retained, Some((id, PollOutcome::Changed { bytes: count })) if id == pane_id && count == bytes)
+        {
+            return Err(format!(
+                "cancelled join lost or altered the outcome: {retained:?}"
+            ));
+        }
+    }
+    Ok(observed)
 }
 
 #[test]
@@ -86,40 +145,12 @@ fn telemetry_run_cx_precancel_records_cancelled_counter_golden() -> Result<(), S
 fn tailer_join_next_with_cx_midflight_cancel_drains_no_outcome_golden() -> Result<(), String> {
     let fixture = RuntimeFixture::current_thread();
     let actual = fixture.block_on(async {
-        let mut set = TailerPollTaskSet::new();
-        set.spawn_poll_task(async {
-            runtime_async::sleep(Duration::from_millis(30)).await;
-            (7, PollOutcome::Changed { bytes: 19 })
-        });
-
-        let cx = for_testing();
-        let cancel_cx = cx.clone();
-        let cancel_handle = runtime_async::task::spawn(async move {
-            runtime_async::sleep(Duration::from_millis(5)).await;
-            cancel_cx.cancel_with(
-                CancelKind::User,
-                Some("ft-npkn6 tailer golden midflight cancel"),
-            );
-        });
-
-        let guard = for_testing();
-        let outcome = runtime_async::timeout_with_cx(
-            &guard,
-            Duration::from_secs(2),
-            set.join_next_with_cx(&cx),
-        )
-        .await
-        .map_err(|err| {
-            format!("tailer midflight cancel did not resolve before safety timeout: {err}")
-        })?;
-        cancel_handle
-            .await
-            .map_err(|err| format!("tailer cancel task failed to join: {err}"))?;
+        let outcome = cancel_pending_tailer_join(7, 19, 5, 25).await?;
 
         Ok::<Value, String>(json!({
             "case": "tailer_midflight_cancel",
             "surface": "TailerPollTaskSet::join_next_with_cx",
-            "cancel_observed": cx.checkpoint().is_err(),
+            "cancel_observed": true,
             "outcome": if outcome.is_none() {
                 "none_with_cancelled_cx"
             } else {
@@ -130,6 +161,20 @@ fn tailer_join_next_with_cx_midflight_cancel_drains_no_outcome_golden() -> Resul
     })?;
 
     assert_golden_case("tailer_midflight_cancel", actual)
+}
+
+#[test]
+fn tailer_midflight_cancel_retains_dsr_regression_outcome() -> Result<(), String> {
+    let fixture = RuntimeFixture::current_thread();
+    fixture.block_on(async {
+        let observed = cancel_pending_tailer_join(12, 1718, 4, 23).await?;
+        if observed.is_some() {
+            return Err(format!(
+                "cancelled join drained the regression outcome: {observed:?}"
+            ));
+        }
+        Ok(())
+    })
 }
 
 #[test]
@@ -214,39 +259,9 @@ proptest! {
     ) {
         let fixture = RuntimeFixture::current_thread();
         let result: Result<(), TestCaseError> = fixture.block_on(async move {
-            let mut set = TailerPollTaskSet::new();
-            let complete_after = Duration::from_millis(cancel_ms + slack_ms);
-            set.spawn_poll_task(async move {
-                runtime_async::sleep(complete_after).await;
-                (pane_id, PollOutcome::Changed { bytes })
-            });
-
-            let cx = for_testing();
-            let cancel_cx = cx.clone();
-            let cancel_handle = runtime_async::task::spawn(async move {
-                runtime_async::sleep(Duration::from_millis(cancel_ms)).await;
-                cancel_cx.cancel_with(
-                    CancelKind::User,
-                    Some("ft-npkn6 tailer property midflight cancel"),
-                );
-            });
-
-            let guard = for_testing();
-            let observed = runtime_async::timeout_with_cx(
-                &guard,
-                Duration::from_secs(2),
-                set.join_next_with_cx(&cx),
-            )
-            .await
-            .map_err(|err| TestCaseError::fail(err.to_string()))?;
-            cancel_handle
+            let observed = cancel_pending_tailer_join(pane_id, bytes, cancel_ms, slack_ms)
                 .await
-                .map_err(|err| TestCaseError::fail(err.to_string()))?;
-
-            prop_assert!(
-                cx.checkpoint().is_err(),
-                "property canceller must trip the Cx"
-            );
+                .map_err(TestCaseError::fail)?;
             prop_assert!(
                 observed.is_none(),
                 "cancelled join must drain no later poll outcome: {observed:?}"
