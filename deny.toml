@@ -46,36 +46,30 @@ wildcards = "allow"
 highlight = "all"
 
 # Direct dependencies on `tokio` are forbidden in every first-party
-# crate. The vendored wezterm fork under `frankenterm/<crate>/` is
-# already tokio-free (verified by ft-i2eni.3 audit on 2026-05-01),
-# so no per-crate allow-list is required at this time.
+# crate. Tokio still reaches the graph transitively through reputable
+# third-party HTTP/embedding stacks (fastembed -> hf-hub -> reqwest ->
+# hyper/h2/tower), which is out of scope for the doctrine.
+#
+# `wrappers` makes the ban edge-sensitive: `tokio` is accepted only as a
+# direct dependency of the listed third-party crates, so any first-party
+# crate declaring `tokio` itself still fails even when it also depends on
+# one of these parents. (`skip-tree` cannot express this: it only affects
+# duplicate-version detection, never `deny` entries.) If a dependency
+# update adds another third-party direct parent, cargo-deny names it; add
+# it here only after confirming it is not first-party.
+# `crates/frankenterm-core/tests/no_direct_tokio_manifest_edges.rs` checks
+# the same rule on declared manifest edges at Cargo-test time (ft-xxfwy.70).
 deny = [
-    { name = "tokio", reason = "Direct `tokio` dependency forbidden in first-party crates; use `runtime_async` wrappers backed by asupersync. See AGENTS.md doctrine + ft-i2eni.3." },
-]
-
-# Skip the same banned crate when it appears as a transitive
-# dependency through unavoidable third-party leaves (e.g. fastembed,
-# reqwest, hyper, h2). The structural rule is "first-party crates may not
-# *directly* depend on tokio"; transitive pulls through reputable
-# third-party crates are out of scope for this bead.
-skip-tree = [
-    { name = "frankensearch" },
-    { name = "frankensearch-embed" },
-    { name = "frankensearch-fusion" },
-    { name = "fastembed" },
-    { name = "hf-hub" },
-    { name = "criterion" },
-    { name = "reqwest" },
-    { name = "hyper" },
-    { name = "hyper-util" },
-    { name = "hyper-rustls" },
-    { name = "hyper-tls" },
-    { name = "h2" },
-    { name = "tokio-rustls" },
-    { name = "tokio-native-tls" },
-    { name = "tokio-util" },
-    { name = "tower" },
-    { name = "tower-http" },
+    { name = "tokio", wrappers = [
+        "h2",
+        "hyper",
+        "hyper-tls",
+        "hyper-util",
+        "reqwest",
+        "tokio-native-tls",
+        "tokio-util",
+        "tower",
+    ], reason = "Direct `tokio` dependency forbidden in first-party crates; use `runtime_async` wrappers backed by asupersync. See AGENTS.md doctrine + ft-i2eni.3 + ft-xxfwy.70." },
 ]
 
 [advisories]

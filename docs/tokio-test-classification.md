@@ -124,7 +124,8 @@ test attributes.
 | `asupersync-test-only` shell lint | `scripts/check_asupersync_test_only.sh` | yes | Fast PR/push guard for active `#[tokio::test]` lines |
 | Rust supported-path guard | `crates/frankenterm-core/tests/wa_22x4r_no_tokio_test_in_supported_paths.rs` | yes, when Cargo tests run | Cargo-test-time mirror of the same invariant |
 | Macro substrate | `crates/frankenterm-core/tests/common/asupersync_test.rs` | yes, through test compilation | Ergonomic async-test runner without tokio attributes |
-| Dependency ban | `deny.toml` + CI cargo-deny step | yes | Reject direct first-party `tokio` dependencies |
+| Dependency ban | `deny.toml` + CI cargo-deny step | yes | Graph-level `tokio` ban; `wrappers` lists the only third-party crates allowed to depend on Tokio directly, so transitive Tokio passes and a first-party direct edge fails |
+| Manifest edge guard | `crates/frankenterm-core/tests/no_direct_tokio_manifest_edges.rs` | yes, when Cargo tests run | Reject every declared first-party `tokio` edge (normal/build/dev, target-specific, renamed, optional, workspace-inherited) from `cargo metadata --no-deps`, independent of the resolved graph |
 | Source-pattern guards | `dependency_eradication.rs` / `forbidden_dep_guards.rs` | yes, through tests that exercise them | Reject direct tokio imports and runtime patterns |
 
 This classification feeds the release-bundle artifact at

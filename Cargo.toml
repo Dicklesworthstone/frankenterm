@@ -284,7 +284,6 @@ serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 semver = "1.0.28"
 tantivy = "0.26.1"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
 anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
