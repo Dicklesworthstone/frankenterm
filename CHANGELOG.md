@@ -5,7 +5,7 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release verified on 2026-09-12 is `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Version `0.15.2` was installed locally, but its GitHub release and remote tag are absent; its changes below do not establish public artifact availability.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). The latest published release verified on 2026-09-22 is `v0.15.1`. The `v0.15.0` release was source-only and `v0.15.1` restored the platform matrix. Version `0.15.2` was installed locally, but its GitHub release and remote tag are absent; its changes below do not establish public artifact availability.
 
 Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through the local `0.15.2` build (2026-09-05) and subsequent development. The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
@@ -26,11 +26,15 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.9`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.10`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.9` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.10` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Concurrent cold-history workers share a geometry calculation when their source, coordinate mapping, width and wrap policy match. Cancelled waiters retire promptly, and synchronous readers never wait for that worker. The cache holds weak references and accounts for retained allocation headers; native timing qualification remains pending.
+- After hydrating a cold viewport anchor, the worker can continue directly to its visible context under the same bounded permit. This avoids another GUI capture round trip while retaining source, layout, cancellation and retirement checks.
+- Native copy-mode start/end-of-content navigation reads cold rows through bounded workers. First publication of an identity physical-row layout returns fresh coordinate authority; reflow, source changes and superseded actions cannot publish stale cursor movement. Native callback qualification remains pending.
 
 - Copying cold wrapped text hydrates only the requested physical rows when the stored layout permits it, avoiding repeated whole-paragraph reads for each clipboard chunk. Reflow and selection-anchor reads retain their full logical context, source validation, cancellation and byte limits.
 - Literal search streams across wrapped rows and worker chunks, including the former 1,024-cell segment boundary, while retaining bounded memory, cancellation and Unicode cell coordinates. Case-insensitive literals treat Greek sigma and final sigma as equivalent. Regular-expression search requires complete logical context and explicitly refuses an incomplete group instead of reporting a false empty result.
