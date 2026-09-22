@@ -4311,7 +4311,7 @@ pub const CODEC_VERSION_MIN_SUPPORTED: usize = 61;
 /// Exact historical mux dialect supported for reconnecting to v0.13 servers.
 ///
 /// This is deliberately not folded into [`CODEC_VERSION_MIN_SUPPORTED`].  The
-/// normal rolling-upgrade window remains 61..=64; codec 46 is an explicitly
+/// normal rolling-upgrade window remains 61..=65; codec 46 is an explicitly
 /// selected, schema-by-schema compatibility dialect whose changed wire IDs are
 /// handled below without heuristic fallback.
 pub const LEGACY46_CODEC_VERSION: usize = 46;

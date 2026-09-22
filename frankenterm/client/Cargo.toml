@@ -46,6 +46,9 @@ winapi = { workspace=true, features = [
     "winuser",
 ]}
 
+[target."cfg(unix)".dependencies]
+tempfile.workspace = true
+
 [dev-dependencies]
 promise = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

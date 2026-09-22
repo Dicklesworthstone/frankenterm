@@ -26,6 +26,10 @@
 # Every process gets a private workspace, config, home and socket. All evidence
 # is retained. FT_SMOKE_SOURCE_SHA binds an RCH invocation to its retained build
 # transcript; without it the receipt is explicitly only a development signal.
+# FT_SMOKE_DOCTOR_CAPTURE=1 retains RPC traces and, if the initial Doctor is
+# still running after two seconds on macOS, concurrent one-second samples of
+# that exact child and this script's owned mux. Deadlines and pass criteria do
+# not change; sampling failure is recorded, never interpreted as a clean stack.
 set -u
 umask 077
 
@@ -105,19 +109,76 @@ PY
 }
 CLI_SHA=$(file_sha "$FT") || exit 2
 MUX_SHA=$(file_sha "$MUX") || exit 2
+DOCTOR_CAPTURE="${FT_SMOKE_DOCTOR_CAPTURE:-0}"
+RPC_TRACE='info,codec=debug,frankenterm_client=trace,frankenterm_core::vendored=trace,frankenterm_mux_server_impl=trace'
+MUX_DIAGNOSTIC_ENV=()
+[ "$DOCTOR_CAPTURE" = 1 ] && MUX_DIAGNOSTIC_ENV+=("RUST_LOG=$RPC_TRACE")
 run_bounded() {
   # Drain both streams concurrently with finite byte/time budgets, preserving
   # actual bytes in the caller's retained files. Failure never retries an
   # ambiguous mutation; only this wrapper's own child is killed and reaped.
-  env -i "${HERMETIC_ENV[@]}" "$PYTHON" -c '
-import os, selectors, subprocess, sys, time
+  local diagnostic_env=()
+  if [ "${CAPTURE_THIS_DOCTOR:-0}" = 1 ] && [ "$DOCTOR_CAPTURE" = 1 ]; then
+    diagnostic_env=("FT_CAPTURE_ROOT=$D" "FT_CAPTURE_MUX_PID=$MUX_PID" "FT_CAPTURE_OWNER_PID=$$" "RUST_LOG=$RPC_TRACE")
+  fi
+  env -i "${HERMETIC_ENV[@]}" "${diagnostic_env[@]}" "$PYTHON" -c '
+import json, os, pathlib, selectors, signal, subprocess, sys, time
 child = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+started = time.monotonic()
+capture_root = os.environ.get("FT_CAPTURE_ROOT")
+samplers, capture_attempted = [], False
+def interrupted(signum, frame):
+    raise RuntimeError(f"wrapper interrupted by signal {signum}")
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, interrupted)
+def capture_slow_doctor():
+    global capture_record
+    # Both targets are owned by this invocation. The client remains unreaped
+    # while samples start, and the shell keeps the mux alive until we return.
+    root = pathlib.Path(capture_root)
+    record = {"elapsed_seconds": time.monotonic() - started,
+              "doctor_pid": child.pid, "mux_pid": int(os.environ["FT_CAPTURE_MUX_PID"]),
+              "status": "capture_attempted", "samples": []}
+    capture_record = record
+    for label, pid in (("doctor", child.pid), ("mux", record["mux_pid"])):
+        entry = {"target": label, "pid": pid, "status": "not_started"}
+        record["samples"].append(entry)
+        if sys.platform != "darwin" or not os.path.isfile("/usr/bin/sample"):
+            entry["status"] = "unavailable_non_macos_or_missing_sample"
+            continue
+        if label == "mux":
+            try:
+                owner = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "ppid="],
+                                       capture_output=True, text=True, timeout=0.25)
+                if owner.returncode != 0 or owner.stdout.strip() != os.environ["FT_CAPTURE_OWNER_PID"]:
+                    entry["status"] = "owned_mux_no_longer_present"
+                    continue
+            except (OSError, subprocess.TimeoutExpired) as error:
+                entry["status"] = f"ownership_check_failed: {error}"
+                continue
+        output = (root / f"doctor-slow-{label}.sample.err").open("wb")
+        try:
+            process = subprocess.Popen(
+                ["/usr/bin/sample", str(pid), "1", "10", "-file",
+                 str(root / f"doctor-slow-{label}.sample.txt")],
+                stdout=output, stderr=subprocess.STDOUT)
+            samplers.append((process, output, entry))
+            entry["sampler_pid"] = process.pid
+            entry["status"] = "started"
+        except OSError as error:
+            output.close()
+            entry["status"] = f"launch_failed: {error}"
+    return record
+capture_record = None
 selector = selectors.DefaultSelector()
 selector.register(child.stdout, selectors.EVENT_READ, 1)
 selector.register(child.stderr, selectors.EVENT_READ, 2)
 counts, deadline = {1: 0, 2: 0}, time.monotonic() + 25
 try:
     while selector.get_map():
+        if capture_root and not capture_attempted and time.monotonic() - started >= 2 and child.poll() is None:
+            capture_attempted = True
+            capture_record = capture_slow_doctor()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("25-second command deadline exceeded")
@@ -138,13 +199,42 @@ try:
         raise TimeoutError("25-second command deadline exceeded")
     result = child.wait(timeout=remaining)
 except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
+    if capture_attempted:
+        if capture_record is None:
+            capture_record = {"status": "capture_attempted", "doctor_pid": child.pid}
+        capture_record["status"] = "wrapper_failed_after_capture_attempt"
+        capture_record["wrapper_error"] = str(error)
     print(f"owned candidate command failed: {error}; effect not confirmed", file=sys.stderr)
     sys.exit(124)
 finally:
-    if child.poll() is None:
-        child.kill()
-    child.wait()
-    selector.close()
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, signal.SIG_IGN)
+    # Stop and reap only sample processes created above, before the shell can
+    # tear down its mux. Never attach a debugger or suspend either target.
+    try:
+        for process, output, entry in samplers:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    entry["status"] = "stopped_at_command_completion"
+                else:
+                    entry["status"] = "completed" if process.returncode == 0 else "failed"
+                entry["exit_code"] = process.wait()
+            except OSError as error:
+                entry["cleanup_error"] = str(error)
+            finally:
+                try:
+                    output.close()
+                except OSError as error:
+                    entry["output_close_error"] = str(error)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        selector.close()
+    if capture_root:
+        pathlib.Path(capture_root, "doctor-slow-capture.json").write_text(json.dumps(
+            capture_record or {"status": "threshold_not_reached", "doctor_pid": child.pid}, indent=2) + "\n")
 sys.exit(result if result >= 0 else 128 - result)
 ' "$@"
 }
@@ -276,11 +366,11 @@ while time.monotonic() < deadline:
 else:
     raise RuntimeError('owned pane fixture deadline exceeded')
 PY
-  env -i "${HERMETIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
+  env -i "${HERMETIC_ENV[@]}" "${MUX_DIAGNOSTIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
     --daemonize=false --cwd "$D" -- "$PYTHON" "$D/owned-pane.py" "$D" > "$D/mux.log" 2>&1 &
 else
   # Bare zsh: nothing rewrites the pane title after we set it.
-  env -i "${HERMETIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
+  env -i "${HERMETIC_ENV[@]}" "${MUX_DIAGNOSTIC_ENV[@]}" "$MUX" --config-file "$D/frankenterm.toml" \
     --daemonize=false --cwd "$D" -- /bin/zsh -f > "$D/mux.log" 2>&1 &
 fi
 MUX_PID=$!
@@ -292,7 +382,7 @@ step mux_start pass "pid $MUX_PID on $SOCK"
 
 ft() { run_bounded "$FT" -c "$D/ft.toml" "$@"; }
 
-ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err" \
+CAPTURE_THIS_DOCTOR=1 ft doctor --json > "$D/doctor.json" 2> "$D/doctor.err" \
   || fail doctor "candidate doctor command failed; see doctor.err"
 SOCK_ROW=$(jq -c '.checks[] | select(.name=="mux socket")' "$D/doctor.json" 2>/dev/null)
 CONN_ROW=$(jq -c '.checks[] | select(.name=="WezTerm connection")' "$D/doctor.json" 2>/dev/null)

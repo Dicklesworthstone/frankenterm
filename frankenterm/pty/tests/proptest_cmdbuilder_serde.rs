@@ -237,6 +237,23 @@ fn command_builder_json_roundtrip_repeated_env_assignment() {
 }
 
 #[test]
+fn default_prog_json_roundtrip_repeated_env_assignment() {
+    let mut cmd = CommandBuilder::new_default_prog();
+    cmd.env_clear();
+    // Retain the minimized default-program failure: the second assignment
+    // replaces the first even when the key is a control character.
+    cmd.env("\u{7f}", "¡");
+    cmd.env("\u{7f}", " ");
+    let back: CommandBuilder = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+    assert_eq!(back, cmd);
+    assert!(back.is_default_prog());
+    assert_eq!(
+        back.iter_extra_env_as_str().collect::<Vec<_>>(),
+        vec![("\u{7f}", " ")]
+    );
+}
+
+#[test]
 fn command_builder_json_roundtrip_env_key_case() {
     let mut cmd = CommandBuilder::new("ft");
     cmd.env_clear();
@@ -313,12 +330,18 @@ proptest! {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: CommandBuilder = serde_json::from_str(&json).unwrap();
 
+        prop_assert_eq!(&back, &cmd);
         prop_assert!(back.is_default_prog());
         prop_assert_eq!(back.get_argv(), &Vec::<OsString>::new());
         prop_assert_eq!(back.get_controlling_tty(), controlling_tty);
         prop_assert_eq!(back.get_cwd().cloned(), cwd.clone().map(OsString::from));
 
-        let mut expected_env = env_pairs.clone();
+        let mut assigned_env = std::collections::BTreeMap::new();
+        for (key, value) in &env_pairs {
+            let identity = if cfg!(windows) { key.to_lowercase() } else { key.clone() };
+            assigned_env.insert(identity, (key.clone(), value.clone()));
+        }
+        let mut expected_env: Vec<_> = assigned_env.into_values().collect();
         expected_env.sort();
         let mut actual_env: Vec<(String, String)> = back
             .iter_extra_env_as_str()

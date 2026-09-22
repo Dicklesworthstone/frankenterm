@@ -561,17 +561,156 @@ mod windows {
 #[cfg(unix)]
 mod unix {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, MetadataExt as _, OpenOptionsExt as _};
+
+    // Never unlink this lock: every cooperating generation must lock the same
+    // inode. Each attempt is nonblocking; retirement makes only one attempt.
+    fn publication_lock(name: &Path) -> anyhow::Result<std::fs::File> {
+        let parent = name.parent().context("GUI pointer has no parent")?;
+        let parent_metadata = parent.symlink_metadata()?;
+        // One fixed name per private directory also handles class names that
+        // already consume NAME_MAX; appending a suffix would reject those.
+        let lock_name = parent.join(".gui-publication.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_name)?;
+        let opened = file.metadata()?;
+        let named = lock_name.symlink_metadata()?;
+        anyhow::ensure!(
+            opened.is_file()
+                && named.is_file()
+                && opened.dev() == named.dev()
+                && opened.ino() == named.ino()
+                && opened.uid() == parent_metadata.uid()
+                && opened.nlink() == 1
+                && named.nlink() == 1
+                && opened.mode() & 0o077 == 0
+                && named.mode() & 0o077 == 0,
+            "GUI publication lock is not private stable authority"
+        );
+        fs2::FileExt::try_lock_exclusive(&file).context("GUI publication lock is busy")?;
+        let locked_name = lock_name.symlink_metadata()?;
+        anyhow::ensure!(
+            locked_name.dev() == opened.dev() && locked_name.ino() == opened.ino(),
+            "GUI publication lock changed during admission"
+        );
+        Ok(file)
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static PUBLICATION_BUSY_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    fn publication_lock_for_publish(name: &Path) -> anyhow::Result<std::fs::File> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let mut last_busy: Option<anyhow::Error> = None;
+        loop {
+            if let Some(error) = last_busy.take() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error.context("bounded GUI publication admission failed"));
+                }
+            }
+            match publication_lock(name) {
+                Ok(lock) => return Ok(lock),
+                Err(error) => {
+                    let busy = error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+                    if !busy || std::time::Instant::now() >= deadline {
+                        return Err(error.context("bounded GUI publication admission failed"));
+                    }
+                    #[cfg(test)]
+                    if let Some(observer) =
+                        PUBLICATION_BUSY_OBSERVER.with(|slot| slot.borrow_mut().take())
+                    {
+                        observer();
+                    }
+                    last_busy = Some(error);
+                    std::thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contended_publication_retries_after_actual_lock_release() {
+        let runtime = tempfile::tempdir().unwrap();
+        let name = runtime.path().join("published");
+        let first = runtime.path().join("first-socket");
+        let second = runtime.path().join("second-socket");
+        let predecessor = NameHolder::new_at(&first, name.clone()).unwrap();
+        let lock = publication_lock(&name).unwrap();
+        PUBLICATION_BUSY_OBSERVER.with(|slot| {
+            // Release only after the real publication path sees WouldBlock,
+            // without relying on another thread being scheduled within 500ms.
+            *slot.borrow_mut() = Some(Box::new(move || drop(lock)));
+        });
+        let successor = NameHolder::new_at(&second, name.clone())
+            .expect("released lock must allow publication");
+        PUBLICATION_BUSY_OBSERVER.with(|slot| assert!(slot.borrow().is_none()));
+        assert_eq!(std::fs::read_link(&name).unwrap(), second);
+        drop(predecessor);
+        assert_eq!(std::fs::read_link(&name).unwrap(), second);
+        drop(successor);
+        assert!(std::fs::symlink_metadata(&name).is_err());
+    }
+
+    #[test]
+    fn busy_publication_lock_preserves_pointer_and_refuses_new_publication() {
+        let runtime = tempfile::tempdir().unwrap();
+        let name = runtime.path().join("published");
+        let first = runtime.path().join("first-socket");
+        let second = runtime.path().join("second-socket");
+        let holder = NameHolder::new_at(&first, name.clone()).unwrap();
+        let lock = publication_lock(&name).unwrap();
+        let started = std::time::Instant::now();
+        assert!(NameHolder::new_at(&second, name.clone()).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert_eq!(std::fs::read_link(&name).unwrap(), first);
+        drop(holder); // Contended retirement must not wait or unlink.
+        assert_eq!(std::fs::read_link(&name).unwrap(), first);
+        drop(lock);
+        let successor = NameHolder::new_at(&second, name.clone()).unwrap();
+        assert_eq!(std::fs::read_link(&name).unwrap(), second);
+        drop(successor);
+        assert!(std::fs::symlink_metadata(&name).is_err());
+    }
 
     pub struct NameHolder {
-        published: PathBuf,
+        published: std::fs::Metadata,
         name: PathBuf,
+        // A retained hard link to the symlink pins its inode until retirement,
+        // preventing inode reuse from making a successor look like this owner.
+        _publication: tempfile::TempDir,
     }
 
     impl Drop for NameHolder {
         fn drop(&mut self) {
-            // If it still points to us, remove the symlink
-            if let Ok(target) = std::fs::read_link(&self.name) {
-                if target == self.published {
+            let _lock = match publication_lock(&self.name) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    log::debug!("retaining GUI discovery pointer during retirement: {error:#}");
+                    return;
+                }
+            };
+            // Compare publication identity, not its target: a successor may
+            // legitimately republish the same socket path.
+            if let Ok(named) = self.name.symlink_metadata() {
+                if named.file_type().is_symlink()
+                    && named.dev() == self.published.dev()
+                    && named.ino() == self.published.ino()
+                {
                     log::trace!("removing {}", self.name.display());
                     std::fs::remove_file(&self.name).ok();
                 }
@@ -604,12 +743,32 @@ mod unix {
             if let Some(parent) = name.parent() {
                 config::create_user_owned_dirs(parent)?;
             }
-            std::fs::remove_file(&name).ok();
-            std::os::unix::fs::symlink(path, &name)
+            let _lock = publication_lock_for_publish(&name)?;
+            let parent = name.parent().context("GUI pointer has no parent")?;
+            let publication = tempfile::Builder::new()
+                .prefix(".gui-publication-")
+                .tempdir_in(parent)?;
+            let retained = publication.path().join("owner");
+            let staged = publication.path().join("pointer");
+            symlink(path, &retained)
                 .with_context(|| format!("pointing {} -> {}", name.display(), path.display()))?;
+            std::fs::hard_link(&retained, &staged)?;
+            let published = retained.symlink_metadata()?;
+            let staged_metadata = staged.symlink_metadata()?;
+            anyhow::ensure!(
+                published.file_type().is_symlink()
+                    && staged_metadata.file_type().is_symlink()
+                    && published.dev() == staged_metadata.dev()
+                    && published.ino() == staged_metadata.ino(),
+                "staged GUI pointer does not retain publication identity"
+            );
+            // Same-filesystem rename replaces the pointer atomically; failed
+            // staging/publication leaves the previous pointer intact.
+            std::fs::rename(&staged, &name)?;
             Ok(Self {
-                published: path.to_path_buf(),
+                published,
                 name,
+                _publication: publication,
             })
         }
 
@@ -1058,6 +1217,39 @@ mod tests {
             ));
             assert!(socket.exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_same_path_publication_survives_predecessor_retirement() {
+        let runtime = tempfile::tempdir().unwrap();
+        let socket = runtime.path().join("frankenterm-gui-sock-42");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let class = "discovery.concurrent.same-path";
+        let predecessor = publish_gui_sock_path_in(runtime.path(), &socket, class).unwrap();
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (retired_tx, retired_rx) = std::sync::mpsc::sync_channel(1);
+        let successor_runtime = runtime.path().to_path_buf();
+        let successor_socket = socket.clone();
+        let successor = std::thread::spawn(move || {
+            let holder =
+                publish_gui_sock_path_in(&successor_runtime, &successor_socket, class).unwrap();
+            published_tx.send(()).unwrap();
+            retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let resolved = resolve_gui_sock_path_in(&successor_runtime, class);
+            drop(holder);
+            resolved
+        });
+        let published = published_rx.recv_timeout(Duration::from_secs(5));
+        // Force retirement after the successor republished the identical path.
+        // The old target-comparison Drop deterministically deletes that pointer.
+        drop(predecessor);
+        let released = retired_tx.send(());
+        let resolved = successor.join().expect("successor publisher panicked");
+        published.unwrap();
+        released.unwrap();
+        assert_eq!(resolved.unwrap(), socket);
+        assert!(resolve_gui_sock_path_in(runtime.path(), class).is_err());
     }
 
     #[cfg(unix)]
