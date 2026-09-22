@@ -10428,6 +10428,9 @@ pub(crate) mod tests {
     #[test]
     fn selection_anchor_registry_is_bounded_and_reclaims_retired_tokens() {
         let mut screen = test_screen(1, 12, 96);
+        // Use real retained text: reflow can discard an all-blank logical row,
+        // which is not a valid fixture for proving selection transport.
+        screen.lines[0] = Line::from_text("ABCDEFGHIJKL", &CellAttributes::blank(), 1, None);
         let points = [anchor_point(0, 0); 3];
         for malformed in [
             [points[0], points[1], None],
@@ -10475,7 +10478,9 @@ pub(crate) mod tests {
                 .unwrap()
                 .expect("one retired token makes the same supported gesture admissible");
             assert_eq!(screen.selection_anchors.0.len(), 16);
-            screen.resize(test_size(1, 10, 96), test_cursor(0, 0, 1), 2, false);
+            screen.resize(test_size(2, 10, 96), test_cursor(0, 0, 1), 2, false);
+            assert_eq!(screen.lines[0].as_str(), "ABCDEFGHIJ");
+            assert_eq!(screen.lines[1].as_str(), "KL");
             assert_eq!(
                 screen.resolve_selection_anchor_with_reads(&recovered, 2, &[]),
                 Ok(Some(points))
@@ -14107,6 +14112,76 @@ pub(crate) mod tests {
     #[cfg(feature = "use_serde")]
     #[test]
     fn admitted_geometry_ragged_native_history_matches_streamed_viewports() {
+        fn verify_selection(
+            screen: &mut Screen,
+            token: &ScreenSelectionAnchor,
+            sequence: SequenceNo,
+            expected: &str,
+            padding: usize,
+        ) {
+            // Match the resize worker: bootstrap the new-width index from the
+            // oldest retained row before querying the token's logical group.
+            // Without an index, selection refresh requests the cold tail,
+            // which may end inside the unfinished cold/hot seam group.
+            let mut prepared = screen
+                .capture_line_read(StableRowIndex::MIN..StableRowIndex::MIN + 1)
+                .unwrap()
+                .prepare_cold_layout(|| false)
+                .unwrap();
+            assert!(screen.validates_prepared_cold_layout(&prepared).unwrap());
+            assert!(screen
+                .install_prepared_cold_layout(&mut prepared, sequence)
+                .unwrap());
+            let ranges = screen
+                .selection_anchor_read_ranges(token, sequence)
+                .unwrap()
+                .unwrap();
+            let reads: Vec<_> = ranges
+                .into_iter()
+                .map(|range| {
+                    screen
+                        .capture_line_read(range)
+                        .unwrap()
+                        .hydrate(|| false)
+                        .unwrap()
+                })
+                .collect();
+            let refs: Vec<_> = reads.iter().collect();
+            let points = screen
+                .resolve_selection_anchor_with_reads(token, sequence, &refs)
+                .unwrap()
+                .expect("full-corpus cold selection must survive reflow");
+            let start = points[1].unwrap();
+            let end = points[2].unwrap();
+            assert_eq!(points[0], points[1]);
+            let read = screen
+                .capture_line_read(start.row..end.row + 1)
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(screen.validates_line_read(&read));
+            let mut text = String::new();
+            let mut last_len = None;
+            for (offset, line) in read.lines().enumerate() {
+                let row = read.first_row() + offset as StableRowIndex;
+                if row < start.row || row > end.row {
+                    continue;
+                }
+                for cell in line.visible_cells() {
+                    if (row != start.row || cell.cell_index() >= start.column.unwrap())
+                        && (row != end.row || cell.cell_index() <= end.column.unwrap())
+                    {
+                        text.push_str(cell.str());
+                    }
+                }
+                if row == end.row {
+                    last_len = Some(line.len());
+                }
+            }
+            assert_eq!(text.trim_end(), expected);
+            assert_eq!(end.column, Some(last_len.unwrap() - 1 + padding));
+        }
+
         let sink = Arc::new(TestColdScrollbackSink::default());
         let mut terminal = crate::Terminal::new(
             test_size(24, 80, 96),
@@ -14124,6 +14199,8 @@ pub(crate) mod tests {
             "ragged-cold-geometry-test",
             Box::new(std::io::sink()),
         );
+        let mut selected_source = None;
+        let mut expected_selection = String::new();
         for i in 0..10_000 {
             if i % 13 == 0 {
                 terminal.advance_bytes(b"\r\n");
@@ -14133,9 +14210,80 @@ pub(crate) mod tests {
                 "ab 界 e\u{301} 🚀 xy\u{a0}z ".repeat((i * 37) % 61),
                 "q".repeat((i * 19) % 73),
             );
+            let start = terminal
+                .screen()
+                .visible_row_to_stable_row(terminal.cursor_pos().y);
             terminal.advance_bytes(text.as_bytes());
+            if i == 4_806 {
+                selected_source = Some(
+                    start
+                        ..terminal
+                            .screen()
+                            .visible_row_to_stable_row(terminal.cursor_pos().y),
+                );
+                expected_selection = text.trim_end_matches("\r\n").to_owned();
+            }
         }
-        terminal.resize(test_size(24, 69, 96));
+        // No further parser input: reproduce the native frozen corpus at its
+        // actual middle paragraph, not a short history or a moving hot tail.
+        assert_eq!(expected_selection.len(), 241);
+        let selected_source = selected_source.unwrap();
+        let retained_source: Vec<_> = sink
+            .rows
+            .lock()
+            .unwrap()
+            .range(selected_source.clone())
+            .map(|(&row, line)| (row, line.clone()))
+            .collect();
+        assert_eq!(
+            retained_source.len(),
+            (selected_source.end - selected_source.start) as usize
+        );
+        let initial = terminal
+            .screen()
+            .capture_line_read(selected_source.clone())
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        let sequence = terminal.current_seqno();
+        assert!(terminal.screen().validates_line_read(&initial));
+        terminal
+            .screen_mut()
+            .install_line_read_layout(&initial, sequence);
+        let rows: Vec<_> = initial.lines().collect();
+        let first = rows
+            .iter()
+            .position(|line| line.as_str().starts_with("RAGGED_04806"))
+            .unwrap();
+        let last = rows
+            .iter()
+            .position(|line| line.as_str().contains("END_04806"))
+            .unwrap();
+        assert!(!rows[last].last_cell_was_wrapped());
+        let origin = anchor_point(0, initial.first_row() + first as StableRowIndex);
+        let tokens: Vec<_> = [0, 1, 2]
+            .iter()
+            .copied()
+            .map(|padding| {
+                terminal
+                    .screen_mut()
+                    .capture_selection_anchor_with_reads(
+                        sequence,
+                        [
+                            origin,
+                            origin,
+                            anchor_point(
+                                rows[last].len() - 1 + padding,
+                                initial.first_row() + last as StableRowIndex,
+                            ),
+                        ],
+                        &[&initial],
+                    )
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        terminal.resize(test_size(21, 69, 96));
         let screen = terminal.screen();
         let plan = screen.capture_line_read(0..24).unwrap();
         assert!(
@@ -14169,6 +14317,40 @@ pub(crate) mod tests {
                 "historical viewport at {top}"
             );
         }
+        let sequence = terminal.current_seqno();
+        for (padding, token) in tokens.iter().enumerate() {
+            verify_selection(
+                terminal.screen_mut(),
+                token,
+                sequence,
+                &expected_selection,
+                padding,
+            );
+        }
+        for (rows, cols) in [(24, 80), (30, 106)] {
+            terminal.resize(test_size(rows, cols, 96));
+            let sequence = terminal.current_seqno();
+            for (padding, token) in tokens.iter().enumerate() {
+                verify_selection(
+                    terminal.screen_mut(),
+                    token,
+                    sequence,
+                    &expected_selection,
+                    padding,
+                );
+            }
+        }
+        let after: Vec<_> = sink
+            .rows
+            .lock()
+            .unwrap()
+            .range(selected_source)
+            .map(|(&row, line)| (row, line.clone()))
+            .collect();
+        assert_eq!(
+            after, retained_source,
+            "resize must neither prune nor rewrite the selected cold source"
+        );
     }
 
     #[cfg(feature = "use_serde")]
