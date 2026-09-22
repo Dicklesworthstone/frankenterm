@@ -561,6 +561,63 @@ mod tests {
         });
     }
 
+    /// ft-zhwa6's original symptom: CLI tx prepare gates evaluated every pane
+    /// as `PaneCapabilities::unknown`, so a `PromptActive` precondition could
+    /// never pass. The captured OSC 133 prompt marker is that evidence.
+    #[test]
+    fn captured_prompt_marker_yields_prompt_active_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prompt-evidence.db");
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            for pane_id in [21, 22] {
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            storage
+                .append_segment(21, "\u{1b}]133;A\u{7}$ ", None)
+                .await
+                .unwrap();
+            storage
+                .append_segment(22, "plain output without shell integration\n", None)
+                .await
+                .unwrap();
+
+            let cx = crate::cx::for_testing();
+            let prompt = resolve_pane_capabilities(&cx, 21, Some(&storage), None).await;
+            assert!(prompt.capabilities.prompt_active);
+            assert!(!prompt.capabilities.command_running);
+
+            let unmarked = resolve_pane_capabilities(&cx, 22, Some(&storage), None).await;
+            assert!(
+                !unmarked.capabilities.prompt_active,
+                "output without OSC 133 markers is not prompt evidence"
+            );
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn missing_evidence_never_widens_capabilities() {
         let state = IpcPaneState {
