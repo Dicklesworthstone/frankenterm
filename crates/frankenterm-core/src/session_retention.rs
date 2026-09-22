@@ -6529,8 +6529,8 @@ mod tests {
     // ft-0yuxe.1: durable session-cleanup attempt receipt
     // ====================================================================
 
-    /// File-backed database with one deletable old closed session, so every
-    /// connection opened on `path` models a separate process.
+    /// File-backed database with one deletable old closed session. Separate
+    /// connections are not process death; crash tests below spawn children.
     fn receipt_fixture() -> (tempfile::NamedTempFile, String) {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_owned();
