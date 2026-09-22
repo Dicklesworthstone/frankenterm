@@ -1370,23 +1370,22 @@ impl Drop for TxOwnedMux {
                             std::fs::read_to_string(self.root.join("mux.stderr"))
                                 .unwrap_or_default()
                         );
-                        if !std::thread::panicking() {
-                            panic!("owned mux failed: {status}");
-                        }
+                        assert!(std::thread::panicking(), "owned mux failed: {status}");
                     }
                     return;
                 }
                 Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10))
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 _ => {
                     // Only the Child handle created above is eligible for
                     // forced cleanup, never a PID read from a fixture file.
                     let _ = self.child.kill();
                     let _ = self.child.wait();
-                    if !std::thread::panicking() {
-                        panic!("owned mux did not stop cooperatively");
-                    }
+                    assert!(
+                        std::thread::panicking(),
+                        "owned mux did not stop cooperatively"
+                    );
                     return;
                 }
             }
@@ -1642,10 +1641,11 @@ impl TxOwnedMux {
     }
 
     fn assert_effects(&self, expected: &[&str]) {
-        let expected: String = expected
-            .iter()
-            .map(|line| format!("{}\n", line.strip_prefix("0\t").expect("owned pane zero")))
-            .collect();
+        let expected = expected.iter().fold(String::new(), |mut text, line| {
+            text.push_str(line.strip_prefix("0\t").expect("owned pane zero"));
+            text.push('\n');
+            text
+        });
         if !self.target_removed {
             use frankenterm_core::runtime_async::CompatRuntime as _;
             use frankenterm_core::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
@@ -1679,8 +1679,11 @@ impl TxOwnedMux {
                             .filter(|line| {
                                 !line.is_empty() && !line.starts_with("tx-owned-barrier-")
                             })
-                            .map(|line| format!("{line}\n"))
-                            .collect();
+                            .fold(String::new(), |mut text, line| {
+                                text.push_str(line);
+                                text.push('\n');
+                                text
+                            });
                         assert_eq!(
                             effects, expected,
                             "actual mux pane output must match PTY effects"

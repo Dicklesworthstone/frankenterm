@@ -339,16 +339,19 @@ proptest! {
     fn gate_pass_ratio_uses_outcomes(mut snap in arb_telemetry_snapshot()) {
         let ratio = snap.gate_pass_ratio();
         prop_assert!((0.0..=1.0).contains(&ratio));
+        // These endpoints are exact: unsigned zero yields positive zero,
+        // and an all-pass distribution (including no outcomes) yields one.
         if snap.gate_conditional_passes == 0 && snap.gate_failures == 0 {
-            prop_assert_eq!(ratio, 1.0);
+            prop_assert_eq!(ratio.to_bits(), 1.0_f64.to_bits());
         } else if snap.gate_passes == 0 {
-            prop_assert_eq!(ratio, 0.0);
+            prop_assert_eq!(ratio.to_bits(), 0.0_f64.to_bits());
         }
         // Aggregate counters may lag or saturate independently of outcomes.
+        // Changing only an unused aggregate must preserve every result bit.
         snap.gate_evaluations = 0;
-        prop_assert_eq!(snap.gate_pass_ratio(), ratio);
+        prop_assert_eq!(snap.gate_pass_ratio().to_bits(), ratio.to_bits());
         snap.gate_evaluations = u64::MAX;
-        prop_assert_eq!(snap.gate_pass_ratio(), ratio);
+        prop_assert_eq!(snap.gate_pass_ratio().to_bits(), ratio.to_bits());
     }
 
     #[test]
@@ -361,12 +364,13 @@ proptest! {
         if snap.health_green_samples == 0 && snap.health_yellow_samples == 0
             && snap.health_red_samples == 0 && snap.health_black_samples == 0
         {
-            prop_assert_eq!(dist, [1.0, 0.0, 0.0, 0.0]);
+            prop_assert_eq!(dist.map(f64::to_bits), [1.0, 0.0, 0.0, 0.0].map(f64::to_bits));
         }
+        // The unchanged outcome buckets must produce a bit-identical snapshot.
         snap.health_samples = 0;
-        prop_assert_eq!(snap.health_distribution(), dist);
+        prop_assert_eq!(snap.health_distribution().map(f64::to_bits), dist.map(f64::to_bits));
         snap.health_samples = u64::MAX;
-        prop_assert_eq!(snap.health_distribution(), dist);
+        prop_assert_eq!(snap.health_distribution().map(f64::to_bits), dist.map(f64::to_bits));
     }
 
     #[test]
