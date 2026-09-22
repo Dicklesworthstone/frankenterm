@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use crate::attention_router::AttentionRouterSourceAdapterInput;
 use crate::config::PaneFilterConfig;
 use crate::demo_scenarios::DemoScenarioManifest;
-use crate::policy::{InjectionResult, PaneCapabilities};
+use crate::policy::InjectionResult;
 use crate::query_contract::UnifiedSearchMode;
 use crate::storage::PaneRecord;
 use crate::wezterm::PaneInfo;
@@ -1249,35 +1249,10 @@ pub(super) struct McpEventMutationData {
     pub annotations: crate::storage::EventAnnotations,
 }
 
-// ── IPC pane state (internal) ────────────────────────────────────────────
-
-#[derive(Clone, Debug, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
-pub struct IpcPaneState {
-    pub pane_id: u64,
-    pub known: bool,
-    #[serde(default)]
-    pub observed: Option<bool>,
-    #[serde(default)]
-    pub alt_screen: Option<bool>,
-    #[serde(default)]
-    pub last_status_at: Option<i64>,
-    #[serde(default)]
-    pub in_gap: Option<bool>,
-    #[serde(default)]
-    pub cursor_alt_screen: Option<bool>,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-pub(super) struct CapabilityResolution {
-    pub capabilities: PaneCapabilities,
-    pub _warnings: Vec<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane_capability_resolution::IpcPaneState;
     use crate::config::PaneFilterRule;
     use crate::storage::PaneRecord;
     use crate::wezterm::PaneInfo;

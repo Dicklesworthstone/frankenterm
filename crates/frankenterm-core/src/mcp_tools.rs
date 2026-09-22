@@ -14397,8 +14397,8 @@ mod tests {
         resolve_mcp_rehearsal_manifest_path, serialize_mcp_audit_decision_context,
         tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
     };
-    use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
-    use crate::mcp::set_mcp_test_pane_state_override;
+    use crate::mcp::mcp_types::{McpPaneState, StateParams};
+    use crate::pane_capability_resolution::{IpcPaneState, set_test_pane_state_override};
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_CONFIG, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY,
         MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WORKFLOW,
@@ -14907,7 +14907,7 @@ mod tests {
             }
         });
         (1..=3u64)
-            .map(|pane_id| set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id)))
+            .map(|pane_id| set_test_pane_state_override(safe_test_ipc_pane_state(pane_id)))
             .collect()
     }
 
@@ -20912,7 +20912,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             // ft-kccj8: the over-limit call attaches an approval token, and
             // approval_tokens.pane_id REFERENCES panes(pane_id) — the pane
             // row must exist in storage or the insert dies on the FK.
@@ -21154,7 +21154,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21220,7 +21220,7 @@ mod tests {
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
             let before = mock.pane_state(pane_id).await.unwrap().content;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::new(cfg),
                 Arc::clone(&path),
@@ -21259,7 +21259,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21303,7 +21303,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21354,7 +21354,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21447,7 +21447,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21545,7 +21545,7 @@ mod tests {
             let cfg = Arc::new(cfg);
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21615,7 +21615,7 @@ mod tests {
             let cfg = Arc::new(cfg);
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21681,7 +21681,7 @@ mod tests {
                 cx_cancellation_observed: Arc::clone(&cancellation_observed),
                 fail_dispatch_after_cancel: true,
             });
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21757,7 +21757,7 @@ mod tests {
                 cx_cancellation_observed: Arc::clone(&cancellation_observed),
                 fail_dispatch_after_cancel: false,
             });
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21826,7 +21826,7 @@ mod tests {
             let cfg = Arc::new(cfg);
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21901,7 +21901,7 @@ mod tests {
             let cfg = Arc::new(cfg);
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -21954,7 +21954,7 @@ mod tests {
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
-            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            let _pane_state = set_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),

@@ -145,8 +145,11 @@ use mcp_types::{
     RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
     TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
+use crate::pane_capability_resolution::{CapabilityResolution, resolve_alt_screen_state};
+#[cfg(test)]
+use crate::pane_capability_resolution::IpcPaneState;
 use mcp_types::{
-    CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
+    McpEnvelope, McpMissionAssignmentCounters,
     McpMissionAssignmentData, McpMissionFailureCatalogEntry, McpMissionTransitionInfo,
     McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
     now_ms,
@@ -345,7 +348,6 @@ fn reservation_to_mcp_info(r: &PaneReservation) -> McpReservationInfo {
     }
 }
 
-const SEND_OSC_SEGMENT_LIMIT: usize = 200;
 const MCP_REFRESH_COOLDOWN_MS: i64 = 30_000;
 
 fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEngine {
@@ -518,255 +520,26 @@ fn check_refresh_cooldown(
     }
 }
 
-#[cfg(test)]
-fn mcp_test_pane_state_override_slot()
--> &'static std::sync::Mutex<HashMap<u64, (IpcPaneState, usize)>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (IpcPaneState, usize)>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-pub(crate) struct McpTestPaneStateOverrideGuard {
-    pane_id: u64,
-}
-
-#[cfg(test)]
-impl Drop for McpTestPaneStateOverrideGuard {
-    fn drop(&mut self) {
-        let mut overrides = mcp_test_pane_state_override_slot()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Equal overlapping fixtures share custody. One test completing must
-        // not remove another test's still-live pane state.
-        if let Some((_, owners)) = overrides.get_mut(&self.pane_id) {
-            *owners = owners
-                .checked_sub(1)
-                .expect("fixture guard owns one reference");
-            if *owners == 0 {
-                overrides.remove(&self.pane_id);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_mcp_test_pane_state_override(
-    state: IpcPaneState,
-) -> McpTestPaneStateOverrideGuard {
-    let pane_id = state.pane_id;
-    let mut overrides = mcp_test_pane_state_override_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match overrides.get_mut(&pane_id) {
-        Some((existing, owners)) => {
-            assert_eq!(
-                existing, &state,
-                "conflicting concurrent MCP pane fixtures need distinct pane IDs"
-            );
-            *owners = owners
-                .checked_add(1)
-                .expect("fixture owner count cannot overflow");
-        }
-        None => {
-            overrides.insert(pane_id, (state, 1));
-        }
-    }
-    McpTestPaneStateOverrideGuard { pane_id }
-}
-
-#[cfg(test)]
-fn mcp_test_pane_state_override(pane_id: u64) -> Option<IpcPaneState> {
-    mcp_test_pane_state_override_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&pane_id)
-        .map(|(state, _)| state.clone())
-}
-
-async fn derive_osc_state_from_storage(
-    storage: &StorageHandle,
-    pane_id: u64,
-) -> std::result::Result<Option<Osc133State>, String> {
-    let segments = storage
-        .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
-        .await
-        .map_err(|e| format!("failed to read segments: {e}"))?;
-    if segments.is_empty() {
-        return Ok(None);
-    }
-
-    let mut state = Osc133State::new();
-    for segment in segments.iter().rev() {
-        crate::ingest::process_osc133_output(&mut state, &segment.content);
-    }
-
-    if state.markers_seen == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(state))
-}
-
-#[cfg(unix)]
-async fn fetch_pane_state_from_ipc(
-    socket_path: &std::path::Path,
-    pane_id: u64,
-) -> std::result::Result<Option<IpcPaneState>, String> {
-    #[cfg(test)]
-    if let Some(state) = mcp_test_pane_state_override(pane_id) {
-        return Ok(Some(state));
-    }
-
-    let client = crate::ipc::IpcClient::new(socket_path);
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    match client.pane_state_with_cx(&cx, pane_id).await {
-        Ok(response) => {
-            if !response.ok {
-                let detail = response
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string());
-                return Err(detail);
-            }
-            if let Some(data) = response.data {
-                serde_json::from_value::<IpcPaneState>(data)
-                    .map(Some)
-                    .map_err(|e| format!("invalid pane state payload: {e}"))
-            } else {
-                Ok(None)
-            }
-        }
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-#[cfg(not(unix))]
-async fn fetch_pane_state_from_ipc(
-    _socket_path: &std::path::Path,
-    _pane_id: u64,
-) -> std::result::Result<Option<IpcPaneState>, String> {
-    Err("IPC not supported on this platform".to_string())
-}
-
-fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
-    if !state.known {
-        return None;
-    }
-    if let Some(cursor_state) = state.cursor_alt_screen {
-        return Some(cursor_state);
-    }
-    if state.last_status_at.is_some() {
-        return state.alt_screen;
-    }
-    None
-}
-
+/// Resolve pane capabilities for an MCP action through the shared resolver,
+/// locating the watcher IPC socket from this server's workspace config.
 async fn resolve_pane_capabilities(
     config: &Config,
     storage: Option<&StorageHandle>,
     pane_id: u64,
 ) -> CapabilityResolution {
-    let mut warnings = Vec::new();
-    let mut osc_state = None;
-
-    if let Some(storage) = storage {
-        match derive_osc_state_from_storage(storage, pane_id).await {
-            Ok(state) => osc_state = state,
-            Err(err) => warnings.push(format!("OSC 133 state unavailable: {err}")),
-        }
-    } else {
-        warnings.push("Storage unavailable; prompt state unknown.".to_string());
-    }
-
-    let mut alt_screen = None;
-    let mut in_gap = true;
-    let mut gap_known = false;
-
-    let ipc_socket_path = match config.workspace_layout(None) {
-        Ok(layout) => Some(layout.ipc_socket_path),
-        Err(err) => {
-            warnings.push(format!("Workspace layout unavailable: {err}"));
-            None
-        }
+    let (ipc_socket_path, layout_warning) = match config.workspace_layout(None) {
+        Ok(layout) => (Some(layout.ipc_socket_path), None),
+        Err(err) => (None, Some(format!("Workspace layout unavailable: {err}"))),
     };
-
-    if let Some(socket_path) = ipc_socket_path.as_deref() {
-        match fetch_pane_state_from_ipc(socket_path, pane_id).await {
-            Ok(Some(state)) => {
-                if state.pane_id != pane_id {
-                    warnings.push(format!(
-                        "Watcher returned state for pane {} (expected {})",
-                        state.pane_id, pane_id
-                    ));
-                }
-                if !state.known {
-                    let reason = state.reason.as_deref().unwrap_or("unknown");
-                    warnings.push(format!("Watcher has no state for this pane ({reason})."));
-                } else if state.observed == Some(false) {
-                    warnings.push(
-                        "Pane is not observed by watcher; state may be incomplete.".to_string(),
-                    );
-                }
-                alt_screen = resolve_alt_screen_state(&state);
-                if state.in_gap.is_some() {
-                    gap_known = true;
-                    in_gap = state.in_gap.unwrap_or(true);
-                }
-                if alt_screen.is_none() {
-                    warnings
-                        .push("Alt-screen state unknown; approval may be required.".to_string());
-                }
-                if in_gap {
-                    if gap_known {
-                        warnings.push(
-                            "Recent capture gap detected; approval may be required.".to_string(),
-                        );
-                    } else {
-                        warnings.push(
-                            "Capture continuity unknown; treating as recent gap.".to_string(),
-                        );
-                    }
-                } else if !gap_known {
-                    warnings
-                        .push("Capture continuity unknown; treating as recent gap.".to_string());
-                }
-            }
-            Ok(None) => {
-                warnings.push("Watcher IPC returned no pane state.".to_string());
-            }
-            Err(err) => {
-                warnings.push(format!("Watcher IPC unavailable: {err}"));
-            }
-        }
-    } else {
-        warnings.push("IPC socket unavailable; alt-screen/gap unknown.".to_string());
-    }
-
-    let mut capabilities =
-        PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
-
-    if let Some(storage) = storage {
-        // ft-xbnl0.2.3 tick 253: cx-first reservation lookup.
-        let reservation_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        match storage
-            .get_active_reservation_with_cx(&reservation_cx, pane_id)
-            .await
-        {
-            Ok(Some(reservation)) => {
-                capabilities.is_reserved = true;
-                capabilities.reserved_by = Some(reservation.owner_id);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warnings.push(format!("Reservation lookup failed: {err}"));
-            }
-        }
-    }
-
-    CapabilityResolution {
-        capabilities,
-        _warnings: warnings,
-    }
+    let mut resolution =
+        crate::pane_capability_resolution::resolve_pane_capabilities(
+            pane_id,
+            storage,
+            ipc_socket_path.as_deref(),
+        )
+        .await;
+    resolution.warnings.extend(layout_warning);
+    resolution
 }
 
 fn register_builtin_workflows(runner: &WorkflowRunner, config: &Config) {
@@ -1333,37 +1106,6 @@ mod tests {
         );
         // Dropping this sole sender signals the isolated worker to exit.
         drop(queue);
-    }
-
-    #[test]
-    fn equal_mcp_pane_overrides_retain_each_live_owner_in_both_drop_orders() {
-        let pane_id = 4_299;
-        let state = IpcPaneState {
-            pane_id,
-            known: true,
-            observed: Some(true),
-            alt_screen: Some(false),
-            last_status_at: Some(1_700_000_000_000),
-            in_gap: Some(false),
-            cursor_alt_screen: Some(false),
-            reason: None,
-        };
-        for drop_older_first in [true, false] {
-            let older = set_mcp_test_pane_state_override(state.clone());
-            let newer = set_mcp_test_pane_state_override(state.clone());
-            let remaining = if drop_older_first {
-                drop(older);
-                newer
-            } else {
-                drop(newer);
-                older
-            };
-            let visible = mcp_test_pane_state_override(pane_id)
-                .expect("one completing request cannot retire its live peer's fixture");
-            assert_eq!(visible, state);
-            drop(remaining);
-            assert!(mcp_test_pane_state_override(pane_id).is_none());
-        }
     }
 
     // These tests inspect metadata only; transport tests keep the owning runtime alive.
@@ -3452,14 +3194,6 @@ mod tests {
     }
 
     // ── constants ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn send_osc_segment_limit_reasonable() {
-        const {
-            assert!(SEND_OSC_SEGMENT_LIMIT > 0);
-            assert!(SEND_OSC_SEGMENT_LIMIT <= 1000);
-        }
-    }
 
     #[test]
     fn mcp_refresh_cooldown_positive() {

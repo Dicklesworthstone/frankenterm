@@ -507,6 +507,7 @@ pub mod output;
 pub mod output_compression;
 pub mod p_squared_quantile;
 pub mod pairing_heap;
+pub mod pane_capability_resolution;
 pub mod pane_groups;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
