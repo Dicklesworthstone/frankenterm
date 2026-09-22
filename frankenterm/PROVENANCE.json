@@ -131,19 +131,19 @@
       "classification_summary": {
         "docs": 1,
         "feat": 2,
-        "fix": 5,
-        "other": 3,
+        "fix": 6,
+        "other": 4,
         "refactor": 2,
         "rename": 1,
         "test": 6
       },
-      "fork_side_commit_count": 20,
+      "fork_side_commit_count": 22,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-14T17:26:55-04:00",
-        "sha": "0aa9343d9cd156f453c7f3a895e78d424a10803a",
-        "subject": "fix(char-props): preserve generated emoji table hash contract"
+        "committed_at": "2026-09-21T15:55:14-04:00",
+        "sha": "f57e64ea25e1a09917fea7061dd695c1583d1d7d",
+        "subject": "fix(build): preserve generated emoji hashes and prove content freshness"
       },
       "name": "frankenterm-char-props",
       "path": "frankenterm/char-props",
@@ -156,7 +156,7 @@
         "cleanup": 2,
         "cosmetic": 20,
         "feat": 54,
-        "fix": 108,
+        "fix": 109,
         "other": 17,
         "refactor": 5,
         "rename": 2,
@@ -164,13 +164,13 @@
         "security-fix": 2,
         "test": 37
       },
-      "fork_side_commit_count": 253,
+      "fork_side_commit_count": 254,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-21T04:54:41-04:00",
-        "sha": "3d12d845472066baf6383dbc8ba55ecb3a59031a",
-        "subject": "fix(client): revoke ready RPC generation after fatal alert refusal"
+        "committed_at": "2026-09-21T21:01:06-04:00",
+        "sha": "7827bc4ded361999ef9299461b93d4261fd07e78",
+        "subject": "fix(protocol): preserve startup notifications through codec and registration handshake"
       },
       "name": "frankenterm-client",
       "path": "frankenterm/client",
@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 206,
-        "fix": 276,
+        "fix": 277,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 109
       },
-      "fork_side_commit_count": 717,
+      "fork_side_commit_count": 718,
       "last_modified": {
         "author": "Jeff Emanuel",
-        "classification": "test",
-        "committed_at": "2026-09-21T10:34:52-04:00",
-        "sha": "8f6e49f905ba729e0af4de9b40b4827b04ca61ef",
-        "subject": "test(mux): own the scheduler until pane-removal cleanup actually finishes"
+        "classification": "fix",
+        "committed_at": "2026-09-21T21:16:22-04:00",
+        "sha": "d3c53f1c1aa6b8726c65eebee945247e61e7f87c",
+        "subject": "fix(mux): retry a busy guardian checkpoint instead of failing the domain"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,8 +1065,8 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2892,
-  "generated_at": "2026-09-21T14:48:15.720504Z",
+  "fork_side_commit_total": 2896,
+  "generated_at": "2026-09-22T01:22:06.804304Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
