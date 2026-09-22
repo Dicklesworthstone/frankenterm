@@ -2743,13 +2743,25 @@ impl Pane for LocalPane {
             let limit = limit.map_or(MAX_RESULTS, |limit| (limit as usize).min(MAX_RESULTS));
             let mut results = Vec::new();
             let mut unique = SearchMatchSet::default();
+            let mut literal = StreamingLiteralSearch::new(&pattern, range.clone(), history.start)?;
             let mut source_witness = None;
             let mut first = range.start;
-            while first < range.end && results.len() < limit {
+            while results.len() < limit {
                 let end = first.saturating_add(CHUNK).min(range.end);
-                let captured = first.saturating_sub(CONTEXT).max(history.start)
-                    ..end.saturating_add(CONTEXT).min(history.end);
+                let captured = if let Some(literal) = &literal {
+                    match literal.capture_range(&history, CHUNK) {
+                        Some(range) => range,
+                        None => break,
+                    }
+                } else {
+                    if first >= range.end {
+                        break;
+                    }
+                    first.saturating_sub(CONTEXT).max(history.start)
+                        ..end.saturating_add(CONTEXT).min(history.end)
+                };
                 let captured_start = captured.start;
+                let captured_end = captured.end;
                 let permit = crate::pane::LineReadPermit::try_acquire()
                     .ok_or_else(|| anyhow::anyhow!("search read admission busy"))?;
                 let mut completion = promise::Promise::new();
@@ -2797,15 +2809,26 @@ impl Pane for LocalPane {
                             );
                             let lines: Vec<_> = read.lines().collect();
                             let mut unique = unique;
-                            let matches = search_owned_lines(
-                                worker_pattern,
-                                requested,
-                                remaining,
-                                (read.first_row(), &lines),
-                                &worker_history,
-                                &mut unique,
-                                &matcher_cancel,
-                            )?;
+                            let mut literal = literal;
+                            let matches = if let Some(literal) = &mut literal {
+                                literal.consume(
+                                    captured_start..captured_end,
+                                    &lines,
+                                    remaining,
+                                    &mut unique,
+                                    &matcher_cancel,
+                                )?
+                            } else {
+                                search_owned_lines(
+                                    worker_pattern,
+                                    requested,
+                                    remaining,
+                                    (read.first_row(), &lines),
+                                    &worker_history,
+                                    &mut unique,
+                                    &matcher_cancel,
+                                )?
+                            };
                             let term = terminal
                                 .try_lock()
                                 .ok_or_else(|| anyhow::anyhow!("search publication busy"))?;
@@ -2821,7 +2844,7 @@ impl Pane for LocalPane {
                                 !matcher_cancel.load(Ordering::Acquire),
                                 "search cancelled"
                             );
-                            Ok((matches, unique))
+                            Ok((matches, unique, literal))
                         })();
                         completion.result(outcome);
                     },
@@ -2837,13 +2860,19 @@ impl Pane for LocalPane {
                 if source_witness.is_none() && captured.start < resident_start {
                     source_witness = Some(plan.failure_witness());
                 }
+                let plan = if matches!(pattern, Pattern::Regex(_)) {
+                    plan
+                } else {
+                    plan.with_requested_physical_rows_only()
+                };
                 worker.submit(vec![plan]);
-                let (matches, next_unique) = match future.await {
+                let (matches, next_unique, next_literal) = match future.await {
                     Ok(value) => value,
                     Err(error) if error.is::<SearchLayoutRefreshed>() => continue 'restart,
                     Err(error) => return Err(error),
                 };
                 unique = next_unique;
+                literal = next_literal;
                 results.extend(matches);
                 first = end;
             }
@@ -2888,6 +2917,258 @@ impl SearchMatchSet {
         self.values.insert(text.to_owned(), id);
         self.retained_bytes = bytes;
         Ok(id)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LiteralByteCoordinate {
+    row: StableRowIndex,
+    column: usize,
+    end_row: StableRowIndex,
+    end_column: usize,
+}
+
+enum LiteralSearchPhase {
+    FindHead(StableRowIndex),
+    Forward(StableRowIndex),
+    Done,
+}
+
+/// KMP state survives payload retirement. Only query-sized byte coordinates
+/// are retained; logical paragraphs are never concatenated for literal search.
+struct StreamingLiteralSearch {
+    needle: String,
+    failure: Vec<usize>,
+    matched: usize,
+    coordinates: std::collections::VecDeque<LiteralByteCoordinate>,
+    folded: bool,
+    requested: Range<StableRowIndex>,
+    history_start: StableRowIndex,
+    phase: LiteralSearchPhase,
+}
+
+impl StreamingLiteralSearch {
+    fn fold(text: &str) -> String {
+        // Sigma's final form depends on following text. Normalize both forms
+        // in the comparison key so a capture boundary cannot change folding.
+        text.chars()
+            .flat_map(char::to_lowercase)
+            .map(|c| if c == '\u{3c2}' { '\u{3c3}' } else { c })
+            .collect()
+    }
+
+    fn new(
+        pattern: &Pattern,
+        requested: Range<StableRowIndex>,
+        history_start: StableRowIndex,
+    ) -> anyhow::Result<Option<Self>> {
+        let (text, folded) = match pattern {
+            Pattern::CaseSensitiveString(text) => (text, false),
+            Pattern::CaseInSensitiveString(text) => (text, true),
+            Pattern::Regex(_) => return Ok(None),
+        };
+        let bytes_per_query_byte =
+            2 * std::mem::size_of::<LiteralByteCoordinate>() + std::mem::size_of::<usize>() + 4;
+        let maximum_query_bytes =
+            frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES / bytes_per_query_byte;
+        anyhow::ensure!(
+            text.len() <= maximum_query_bytes / if folded { 3 } else { 1 },
+            "search literal exceeds streaming memory budget"
+        );
+        let needle = if folded {
+            Self::fold(text)
+        } else {
+            text.clone()
+        };
+        anyhow::ensure!(
+            needle.len() <= maximum_query_bytes,
+            "search folded literal exceeds streaming memory budget"
+        );
+        let mut failure = Vec::new();
+        failure.try_reserve_exact(needle.len())?;
+        failure.resize(needle.len(), 0);
+        let bytes = needle.as_bytes();
+        let mut matched = 0;
+        for index in 1..bytes.len() {
+            while matched > 0 && bytes[matched] != bytes[index] {
+                matched = failure[matched - 1];
+            }
+            if bytes[matched] == bytes[index] {
+                matched += 1;
+            }
+            failure[index] = matched;
+        }
+        let mut coordinates = std::collections::VecDeque::new();
+        coordinates.try_reserve_exact(needle.len())?;
+        let phase = if needle.is_empty() || requested.is_empty() {
+            LiteralSearchPhase::Done
+        } else if requested.start == history_start {
+            LiteralSearchPhase::Forward(history_start)
+        } else {
+            LiteralSearchPhase::FindHead(requested.start)
+        };
+        Ok(Some(Self {
+            needle,
+            failure,
+            matched: 0,
+            coordinates,
+            folded,
+            requested,
+            history_start,
+            phase,
+        }))
+    }
+
+    fn capture_range(
+        &self,
+        history: &Range<StableRowIndex>,
+        chunk: StableRowIndex,
+    ) -> Option<Range<StableRowIndex>> {
+        match self.phase {
+            LiteralSearchPhase::FindHead(end) => {
+                Some(end.saturating_sub(chunk).max(history.start)..end)
+            }
+            LiteralSearchPhase::Forward(first) if first < history.end => {
+                Some(first..first.saturating_add(chunk).min(history.end))
+            }
+            _ => None,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        captured: Range<StableRowIndex>,
+        lines: &[&Line],
+        limit: usize,
+        unique: &mut SearchMatchSet,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        anyhow::ensure!(
+            usize::try_from(
+                captured
+                    .end
+                    .checked_sub(captured.start)
+                    .ok_or_else(|| anyhow::anyhow!("search literal row range overflow"))?
+            )? == lines.len(),
+            "search literal capture has a row gap"
+        );
+        if let LiteralSearchPhase::FindHead(expected_end) = self.phase {
+            anyhow::ensure!(
+                captured.end == expected_end,
+                "search literal prefix discontinuity"
+            );
+            for (offset, line) in lines.iter().enumerate().rev() {
+                anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
+                if !line.last_cell_was_wrapped() {
+                    self.phase =
+                        LiteralSearchPhase::Forward(captured.start + offset as StableRowIndex + 1);
+                    return Ok(Vec::new());
+                }
+            }
+            self.phase = if captured.start == self.history_start {
+                LiteralSearchPhase::Forward(captured.start)
+            } else {
+                LiteralSearchPhase::FindHead(captured.start)
+            };
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            matches!(self.phase, LiteralSearchPhase::Forward(row) if row == captured.start),
+            "search literal payload discontinuity"
+        );
+        let mut results = Vec::new();
+        for (offset, line) in lines.iter().enumerate() {
+            anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
+            let row = captured.start + offset as StableRowIndex;
+            if row >= self.requested.end && self.matched == 0 {
+                self.phase = LiteralSearchPhase::Done;
+                return Ok(results);
+            }
+            let mut cells = line.visible_cells().peekable();
+            while let Some(cell) = cells.next() {
+                anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
+                let wrap_end = cells.peek().is_none() && line.last_cell_was_wrapped();
+                let coordinate = LiteralByteCoordinate {
+                    row,
+                    column: cell.cell_index(),
+                    end_row: if wrap_end { row + 1 } else { row },
+                    end_column: if wrap_end {
+                        0
+                    } else {
+                        cell.cell_index() + cell.width()
+                    },
+                };
+                for character in cell.str().chars() {
+                    // Lowercase expansion is at most three Unicode scalars.
+                    // Encode one scalar's comparison bytes at a time rather
+                    // than allocating a folded copy of a large grapheme.
+                    let mut encoded = [0u8; 12];
+                    let mut count = 0;
+                    if self.folded {
+                        for lowered in character.to_lowercase() {
+                            let lowered = if lowered == '\u{3c2}' {
+                                '\u{3c3}'
+                            } else {
+                                lowered
+                            };
+                            count += lowered.encode_utf8(&mut encoded[count..]).len();
+                        }
+                    } else {
+                        count = character.encode_utf8(&mut encoded).len();
+                    }
+                    for byte in encoded[..count].iter().copied() {
+                        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
+                        if self.coordinates.len() == self.needle.len() {
+                            self.coordinates.pop_front();
+                        }
+                        self.coordinates.push_back(coordinate);
+                        while self.matched > 0 && self.needle.as_bytes()[self.matched] != byte {
+                            self.matched = self.failure[self.matched - 1];
+                        }
+                        if self.needle.as_bytes()[self.matched] == byte {
+                            self.matched += 1;
+                        }
+                        if self.matched == self.needle.len() {
+                            let start = self
+                                .coordinates
+                                .front()
+                                .expect("complete literal has coordinates");
+                            if self.requested.contains(&start.row) {
+                                results.push(SearchResult {
+                                    start_x: start.column,
+                                    start_y: start.row,
+                                    end_x: coordinate.end_column,
+                                    end_y: coordinate.end_row,
+                                    match_id: unique.id_for(&self.needle)?,
+                                });
+                            }
+                            // Match the non-overlapping literal semantics of
+                            // str::match_indices, including across capture windows.
+                            self.matched = 0;
+                            if results.len() == limit {
+                                self.phase = LiteralSearchPhase::Done;
+                                return Ok(results);
+                            }
+                        }
+                        if row >= self.requested.end {
+                            let eligible_prefix = self.matched > 0
+                                && self.coordinates[self.coordinates.len() - self.matched].row
+                                    < self.requested.end;
+                            if !eligible_prefix {
+                                self.phase = LiteralSearchPhase::Done;
+                                return Ok(results);
+                            }
+                        }
+                    }
+                }
+            }
+            if !line.last_cell_was_wrapped() {
+                self.matched = 0;
+                self.coordinates.clear();
+            }
+        }
+        self.phase = LiteralSearchPhase::Forward(captured.end);
+        Ok(results)
     }
 }
 
@@ -8110,7 +8391,7 @@ mod tests {
             return;
         }
         #[derive(Debug)]
-        struct BoundaryConfig(ColdResizeTestConfig);
+        struct BoundaryConfig(ColdResizeTestConfig, usize);
         impl TerminalConfiguration for BoundaryConfig {
             fn color_palette(&self) -> ColorPalette {
                 self.0.color_palette()
@@ -8118,7 +8399,7 @@ mod tests {
             fn scrollback_size(&self) -> usize {
                 // The shared resize fixture retains only 32 rows. This corpus
                 // needs all 257 paragraph rows plus its closing control lines.
-                512
+                self.1
             }
             fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
                 self.0.scrollback_tier_config()
@@ -8161,7 +8442,7 @@ mod tests {
                 let sink = Arc::new(ColdResizeTestSink::default());
                 let mut term = Terminal::new(
                     term_size(4, rows),
-                    Arc::new(BoundaryConfig(ColdResizeTestConfig(Arc::clone(&sink)))),
+                    Arc::new(BoundaryConfig(ColdResizeTestConfig(Arc::clone(&sink)), 512)),
                     "FrankenTerm",
                     "search-logical-boundary",
                     Box::new(Vec::new()),
@@ -8230,6 +8511,17 @@ mod tests {
                 ((end / 4) as StableRowIndex, end % 4)
             );
         }
+        let subrange = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("aaa".into()),
+            1000..1100,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            subrange.len(),
+            0,
+            "the last global non-overlapping match starts before row1000"
+        );
         let anchored =
             promise::spawn::block_on(pane.search(Pattern::Regex("^aaa".into()), 0..1100, None))
                 .unwrap();
@@ -8239,9 +8531,76 @@ mod tests {
             "chunk overlap must not create a regex line start"
         );
         assert_eq!((anchored[0].start_y, anchored[0].start_x), (0, 0));
-        // An arbitrarily long wrapped group can exceed the bounded captured
-        // context. Both literal and regex search must refuse completeness,
-        // rather than silently return no match or reinterpret regex anchors.
+        for (prefix, tail, query, start_column) in
+            [(3999, "İY", "i\u{307}y", 3), (3998, "界Y", "界y", 2)]
+        {
+            let mut term = Terminal::new(
+                term_size(4, 1100),
+                Arc::new(ColdResizeTestConfig(
+                    Arc::new(ColdResizeTestSink::default()),
+                )),
+                "FrankenTerm",
+                "streaming-unicode-boundary",
+                Box::new(Vec::new()),
+            );
+            term.advance_bytes(format!("{}{}", "a".repeat(prefix), tail).as_bytes());
+            *pane.terminal.lock() = term;
+            let found = promise::spawn::block_on(pane.search(
+                Pattern::CaseInSensitiveString(query.into()),
+                0..1100,
+                Some(10),
+            ))
+            .unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!((found[0].start_y, found[0].start_x), (999, start_column));
+            assert_eq!((found[0].end_y, found[0].end_x), (1000, 1));
+            let suffix = promise::spawn::block_on(pane.search(
+                Pattern::CaseInSensitiveString(query.into()),
+                999..1000,
+                Some(10),
+            ))
+            .unwrap();
+            assert_eq!(
+                suffix, found,
+                "match starting in range must finish beyond its end"
+            );
+        }
+        let mut term = Terminal::new(
+            term_size(4, 1100),
+            Arc::new(ColdResizeTestConfig(
+                Arc::new(ColdResizeTestSink::default()),
+            )),
+            "FrankenTerm",
+            "streaming-sigma",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes(format!("{}ΟΣ οσ ος Σ", " ".repeat(3999)).as_bytes());
+        *pane.terminal.lock() = term;
+        // Greek sigma forms denote the same letter in a case-insensitive
+        // literal. Scalar lowercase plus explicit sigma equivalence makes
+        // this independent of a physical capture ending between Ο and Σ.
+        for query in ["ΟΣ", "οσ", "ος"] {
+            let found = promise::spawn::block_on(pane.search(
+                Pattern::CaseInSensitiveString(query.into()),
+                0..1100,
+                Some(10),
+            ))
+            .unwrap();
+            assert_eq!(found.len(), 3);
+            for (result, column) in found.iter().zip([3999usize, 4002, 4005]) {
+                assert_eq!(
+                    (result.start_y, result.start_x),
+                    ((column / 4) as StableRowIndex, column % 4)
+                );
+                assert_eq!(
+                    (result.end_y, result.end_x),
+                    (((column + 2) / 4) as StableRowIndex, (column + 2) % 4)
+                );
+            }
+        }
+        // Literals stream through a group larger than the captured context.
+        // Regex must still refuse incomplete context rather than reinterpret
+        // anchors or claim a complete empty result.
         let mut term = Terminal::new(
             term_size(4, 4100),
             Arc::new(ColdResizeTestConfig(
@@ -8266,16 +8625,71 @@ mod tests {
                 "a satisfied limit must stop before unrelated incomplete context"
             );
             assert_eq!((found[0].start_y, found[0].start_x), (0, 0));
-            assert!(promise::spawn::block_on(pane.search(pattern, 0..4100, Some(2))).is_err());
+            let more = promise::spawn::block_on(pane.search(pattern.clone(), 0..4100, Some(2)));
+            if matches!(pattern, Pattern::Regex(_)) {
+                assert!(more.is_err());
+            } else {
+                assert_eq!(more.unwrap().len(), 1);
+            }
         }
         for pattern in [
             Pattern::CaseSensitiveString("XY".into()),
-            Pattern::Regex("XY".into()),
+            Pattern::CaseInSensitiveString("xy".into()),
         ] {
-            let error = promise::spawn::block_on(pane.search(pattern, 0..4100, Some(10)))
-                .expect_err("truncated logical context must not claim complete search");
+            let found = promise::spawn::block_on(pane.search(pattern, 0..4100, Some(10))).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!((found[0].start_y, found[0].start_x), (3502, 0));
+            assert_eq!((found[0].end_y, found[0].end_x), (3502, 2));
+        }
+        {
+            let error = promise::spawn::block_on(pane.search(
+                Pattern::Regex("XY".into()),
+                0..4100,
+                Some(10),
+            ))
+            .expect_err("truncated logical context must not claim complete search");
             assert!(error.to_string().contains("captured suffix context"));
         }
+        // Both sides of a streaming capture boundary are genuinely spilled,
+        // inside one logical paragraph longer than the former context cap.
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut term = Terminal::new(
+            term_size(4, 2),
+            Arc::new(BoundaryConfig(
+                ColdResizeTestConfig(Arc::clone(&sink)),
+                4096,
+            )),
+            "FrankenTerm",
+            "streaming-cold-boundary",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes(
+            format!(
+                "{}İY{}\r\nnext\r\nnext\r\n",
+                "a".repeat(3999),
+                "b".repeat(10_000)
+            )
+            .as_bytes(),
+        );
+        assert!(term.screen().phys_to_stable_row_index(0) > 1000);
+        assert!(sink.rows.lock().1.contains_key(&999));
+        assert!(sink.rows.lock().1.contains_key(&1000));
+        *pane.terminal.lock() = term;
+        for pattern in [
+            Pattern::CaseSensitiveString("İY".into()),
+            Pattern::CaseInSensitiveString("i\u{307}y".into()),
+        ] {
+            let found = promise::spawn::block_on(pane.search(
+                pattern,
+                StableRowIndex::MIN..StableRowIndex::MAX,
+                Some(10),
+            ))
+            .unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!((found[0].start_y, found[0].start_x), (999, 3));
+            assert_eq!((found[0].end_y, found[0].end_x), (1000, 1));
+        }
+        assert!(sink.payload_reads.load(Ordering::Acquire) > 0);
         let mut term = Terminal::new(
             term_size(4, 2),
             Arc::new(ColdResizeTestConfig(
@@ -8331,6 +8745,70 @@ mod tests {
             assert_eq!((found[0].start_y, found[0].start_x), (0, 0));
             assert_eq!((found[0].end_y, found[0].end_x), (0, 1));
         }
+    }
+
+    #[test]
+    fn streaming_literal_rejects_gaps_cancellation_and_oversized_queries() {
+        let pattern = Pattern::CaseSensitiveString("AB".into());
+        let cancelled = AtomicBool::new(false);
+        let mut unique = SearchMatchSet::default();
+        let mut first = Line::from_text("A", &termwiz::cell::CellAttributes::blank(), 1, None);
+        first.set_last_cell_was_wrapped(true, 1);
+        let second = Line::from_text("B", &termwiz::cell::CellAttributes::blank(), 1, None);
+        let mut stream = StreamingLiteralSearch::new(&pattern, 0..2, 0)
+            .unwrap()
+            .unwrap();
+        assert!(stream
+            .consume(0..1, &[&first], 10, &mut unique, &cancelled)
+            .unwrap()
+            .is_empty());
+        assert!(stream
+            .consume(2..3, &[&second], 10, &mut unique, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("discontinuity"));
+        assert!(stream
+            .consume(1..3, &[&second], 10, &mut unique, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("row gap"));
+        cancelled.store(true, Ordering::Release);
+        assert!(stream
+            .consume(1..2, &[&second], 10, &mut unique, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        cancelled.store(false, Ordering::Release);
+        let found = stream
+            .consume(1..2, &[&second], 10, &mut unique, &cancelled)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (
+                found[0].start_y,
+                found[0].start_x,
+                found[0].end_y,
+                found[0].end_x
+            ),
+            (0, 0, 1, 1)
+        );
+        let mut prefix = StreamingLiteralSearch::new(&pattern, 1..2, 0)
+            .unwrap()
+            .unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert!(prefix
+            .consume(0..1, &[&first], 10, &mut unique, &cancelled)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        let maximum = frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES
+            / (2 * std::mem::size_of::<LiteralByteCoordinate>() + std::mem::size_of::<usize>() + 4);
+        assert!(StreamingLiteralSearch::new(
+            &Pattern::CaseSensitiveString("a".repeat(maximum + 1)),
+            0..2,
+            0
+        )
+        .is_err());
     }
 
     #[test]
