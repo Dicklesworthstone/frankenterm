@@ -186,6 +186,7 @@ enum ColdSelectionRequest {
 #[derive(Clone)]
 enum ColdSelectionValue {
     Busy,
+    RetryAt(Instant),
     Captured(
         Result<
             Option<frankenterm_term::screen::ScreenSelectionAnchor>,
@@ -361,9 +362,11 @@ struct ColdViewportPending {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 struct ColdViewportFailure {
     requested: Range<StableRowIndex>,
     witness: frankenterm_term::screen::LineReadFailureWitness,
+    retry_at: Instant,
 }
 
 struct ColdViewportCompletion {
@@ -4408,6 +4411,9 @@ impl LocalPane {
         {
             return None;
         }
+        if let ColdSelectionValue::RetryAt(retry_at) = &ready.value {
+            return (Instant::now() < *retry_at).then_some(ColdSelectionValue::Busy);
+        }
         let anchor = match (&ready.value, request) {
             (ColdSelectionValue::Captured(Ok(Some(anchor))), _) => Some(anchor),
             (ColdSelectionValue::Resolved(Some(_)), ColdSelectionRequest::Resolve(anchor)) => {
@@ -4588,11 +4594,19 @@ impl LocalPane {
                                         floor,
                                         sequence,
                                         dimensions,
-                                        value: invalid,
+                                        // Matching retained identity is not evidence
+                                        // of pruning: storage may refuse one read.
+                                        value: ColdSelectionValue::RetryAt(
+                                            Instant::now() + Duration::from_millis(100),
+                                        ),
                                     });
                                     drop(slot);
                                     drop(term);
                                     pane.notify_lines_ready();
+                                    retry_cold_viewport(
+                                        worker_registration.clone(),
+                                        Arc::clone(&worker_retry),
+                                    );
                                     return true;
                                 }
                             };
@@ -4718,21 +4732,13 @@ impl LocalPane {
                                     .as_mut()
                                     .filter(|work| Arc::ptr_eq(&work.cancelled, &cancelled))
                                 {
-                                    let value = match work.request {
-                                        ColdSelectionRequest::Capture { .. } => {
-                                            ColdSelectionValue::Captured(Err(
-                                                SelectionAnchorCaptureError::SourceChanged,
-                                            ))
-                                        }
-                                        ColdSelectionRequest::Resolve(_) => {
-                                            ColdSelectionValue::Resolved(None)
-                                        }
-                                    };
                                     work.ready = Some(ColdSelectionReady {
                                         floor,
                                         sequence: term.current_seqno(),
                                         dimensions,
-                                        value,
+                                        value: ColdSelectionValue::RetryAt(
+                                            Instant::now() + Duration::from_millis(100),
+                                        ),
                                     });
                                 }
                             }
@@ -4967,13 +4973,19 @@ impl LocalPane {
         let Some(registration) = self.mux_registration.load() else {
             return empty();
         };
-        if let Some(failure) = self.cold_viewport_failure.try_lock() {
-            if let Some(failure) = failure.as_ref() {
-                if failure.requested == requested {
-                    if let Some(term) = self.terminal.try_lock() {
-                        if failure.witness.matches(term.screen()) {
-                            return empty();
-                        }
+        let failure = self
+            .cold_viewport_failure
+            .try_lock()
+            .and_then(|failure| failure.clone());
+        if let Some(failure) = failure {
+            if failure.requested == requested && Instant::now() < failure.retry_at {
+                if let Some(term) = self.terminal.try_lock() {
+                    if failure.witness.matches(term.screen()) {
+                        retry_cold_viewport(
+                            registration.clone(),
+                            Arc::clone(&self.cold_viewport_retry),
+                        );
+                        return empty();
                     }
                 }
             }
@@ -5057,8 +5069,20 @@ impl LocalPane {
                             return;
                         }
                         let geometry = error.is::<frankenterm_term::screen::ColdReadGeometryUnavailable>();
-                        *failure_state.lock() = Some(ColdViewportFailure { requested: response_range.clone(), witness: failure_witness.clone() });
-                        schedule_local_pane_main_thread(
+                        // Validate outside the failure lock: publication takes
+                        // terminal authority separately. Retain one diagnostic
+                        // per unchanged source, while payload retries remain live.
+                        let previous = failure_state.lock().clone();
+                        let repeated = terminal_for_failure.upgrade().is_some_and(|terminal| {
+                            let Some(term) = terminal.try_lock() else { return false; };
+                            previous.as_ref().is_some_and(|previous| {
+                                previous.requested == response_range
+                                    && previous.witness.matches(term.screen())
+                            })
+                        });
+                        *failure_state.lock() = Some(ColdViewportFailure { requested: response_range.clone(), witness: failure_witness.clone(), retry_at: Instant::now() + Duration::from_millis(100) });
+                        retry_cold_viewport(registration.clone(), Arc::clone(&retry));
+                        if !repeated { schedule_local_pane_main_thread(
                             promise::spawn::MainThreadServiceClass::Interactive,
                             LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
                             "cold_viewport_failure",
@@ -5079,7 +5103,7 @@ impl LocalPane {
                                     }
                                 });
                             },
-                        );
+                        ); }
                     }
                     return;
                 }
@@ -5118,6 +5142,7 @@ impl LocalPane {
                                     });
                                     published = true;
                                 });
+                                if published { *failure_state.lock() = None; }
                                 drop(pending);
                                 if published { pane.notify_lines_ready(); }
                                 else { retry_cold_viewport(registration.clone(), Arc::clone(&retry)); }
@@ -7472,6 +7497,8 @@ mod tests {
         busy_observations: AtomicUsize,
         witness_admission: AtomicBool,
         payload_reads: AtomicUsize,
+        refuse_next_payload: AtomicBool,
+        payload_refusals: AtomicUsize,
         read_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, Receiver<()>)>>,
     }
 
@@ -7559,6 +7586,10 @@ mod tests {
 
         fn load_scrollback_line(&self, row: StableRowIndex) -> Option<Line> {
             self.payload_reads.fetch_add(1, Ordering::Relaxed);
+            if self.refuse_next_payload.swap(false, Ordering::AcqRel) {
+                self.payload_refusals.fetch_add(1, Ordering::Release);
+                return None;
+            }
             let gate = self.read_gate.lock().take();
             if let Some((entered, release)) = gate {
                 entered.send(()).unwrap();
@@ -11160,6 +11191,160 @@ mod tests {
                     assert_eq!(selected.trim_end(), paragraph);
                     assert_eq!(end.column, Some(last_len.unwrap() - 1 + extra));
                 }
+            }
+            // A one-shot storage/auth refusal does not prune any retained row.
+            // Exercise the real worker with frozen source and the ORIGINAL
+            // selection token, then require payload recovery without resize.
+            for viewport in [false, true] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let current_points = loop {
+                    while executor.try_tick().unwrap() {}
+                    if let Some((_, _, _, points)) = pane.selection_anchor_snapshot(&anchors[0]) {
+                        break points.expect("original token must still resolve before refusal");
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "pre-refusal resolution did not settle"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let viewport_row = current_points[1].unwrap().row;
+                let expected_row = pane
+                    .capture_line_read(viewport_row..viewport_row + 1, &mut Default::default())
+                    .unwrap()
+                    .unwrap()
+                    .hydrate(|| false)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .clone();
+                if let Some(work) = pane.cold_selection.lock().take() {
+                    assert!(work.ready.is_some());
+                    work.cancelled.store(true, Ordering::Release);
+                }
+                COLD_VIEWPORT_CACHE.lock().clear();
+                let before = sink.payload_refusals.load(Ordering::Acquire);
+                let source_before = pane.selection_source_snapshot().unwrap();
+                sink.refuse_next_payload.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut recovered = false;
+                let mut checked_backoff = false;
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    if !checked_backoff {
+                        // Freeze the actual worker's failure deadline far in
+                        // the future so admission assertions do not race a
+                        // wall-clock sleep. Then expire that same record and
+                        // require real payload recovery below.
+                        let future = Instant::now() + Duration::from_secs(60);
+                        let retained_failure = if viewport {
+                            pane.cold_viewport_failure
+                                .lock()
+                                .as_mut()
+                                .map(|failure| {
+                                    failure.retry_at = future;
+                                })
+                                .is_some()
+                        } else {
+                            pane.cold_selection
+                                .lock()
+                                .as_mut()
+                                .and_then(|work| work.ready.as_mut())
+                                .is_some_and(|ready| {
+                                    if let ColdSelectionValue::RetryAt(retry_at) = &mut ready.value
+                                    {
+                                        *retry_at = future;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                })
+                        };
+                        if retained_failure {
+                            let reads = sink.payload_reads.load(Ordering::Acquire);
+                            for _ in 0..32 {
+                                if viewport {
+                                    assert!(pane
+                                        .cold_viewport_lines(viewport_row..viewport_row + 1)
+                                        .1
+                                        .is_empty());
+                                } else {
+                                    assert!(pane.selection_anchor_snapshot(&anchors[0]).is_none());
+                                }
+                            }
+                            assert_eq!(sink.payload_reads.load(Ordering::Acquire), reads);
+                            let expired = Instant::now() - Duration::from_secs(1);
+                            if viewport {
+                                pane.cold_viewport_failure.lock().as_mut().unwrap().retry_at =
+                                    expired;
+                            } else {
+                                pane.cold_selection
+                                    .lock()
+                                    .as_mut()
+                                    .unwrap()
+                                    .ready
+                                    .as_mut()
+                                    .unwrap()
+                                    .value = ColdSelectionValue::RetryAt(expired);
+                            }
+                            checked_backoff = true;
+                        }
+                    }
+                    if viewport {
+                        let (first, lines) =
+                            pane.cold_viewport_lines(viewport_row..viewport_row + 1);
+                        if !lines.is_empty() {
+                            assert_eq!(first, viewport_row);
+                            assert_eq!(lines, vec![expected_row.clone()]);
+                            recovered = true;
+                        }
+                    } else if let Some((_, _, _, points)) =
+                        pane.selection_anchor_snapshot(&anchors[0])
+                    {
+                        let points = points.expect("transient read refusal revoked original token");
+                        assert_eq!(points, current_points);
+                        let start = points[1].unwrap();
+                        let end = points[2].unwrap();
+                        let read = pane
+                            .capture_line_read(start.row..end.row + 1, &mut Default::default())
+                            .unwrap()
+                            .unwrap()
+                            .hydrate(|| false)
+                            .unwrap();
+                        let mut selected = String::new();
+                        for (offset, line) in read.lines().enumerate() {
+                            let row = read.first_row() + offset as StableRowIndex;
+                            if row < start.row || row > end.row {
+                                continue;
+                            }
+                            for cell in line.visible_cells() {
+                                if (row != start.row || cell.cell_index() >= start.column.unwrap())
+                                    && (row != end.row || cell.cell_index() <= end.column.unwrap())
+                                {
+                                    selected.push_str(cell.str());
+                                }
+                            }
+                        }
+                        assert_eq!(selected.trim_end(), paragraph);
+                        recovered = true;
+                    }
+                    if recovered {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "retained cold source never recovered: viewport={}",
+                        viewport
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    checked_backoff,
+                    "worker refusal must retain bounded retry admission"
+                );
+                assert_eq!(sink.payload_refusals.load(Ordering::Acquire), before + 1);
+                assert_eq!(pane.selection_source_snapshot().unwrap(), source_before);
             }
             // Remove the actual captured source rows from the fixture store.
             // A retryable layout failure must not make a genuinely pruned
