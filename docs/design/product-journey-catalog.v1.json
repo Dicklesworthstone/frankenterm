@@ -135,8 +135,16 @@
       "topology": "local_only",
       "title": "Local Mac mux",
       "target_posture": {
-        "controller_modes": ["m4_pro_native", "m5_native", "m5_pro_max_native"],
-        "session_host_modes": ["m4_pro_native", "m5_native", "m5_pro_max_native"]
+        "controller_modes": [
+          "m4_pro_native",
+          "m5_native",
+          "m5_pro_max_native"
+        ],
+        "session_host_modes": [
+          "m4_pro_native",
+          "m5_native",
+          "m5_pro_max_native"
+        ]
       },
       "description": "The GUI, mux authority, panes, and primary applications execute on the same Mac; loopback IPC is allowed and unrelated remote build work does not change this topology.",
       "source_refs": [
@@ -149,8 +157,14 @@
       "topology": "mac_lan_remote",
       "title": "Mac client to LAN remote mux",
       "target_posture": {
-        "controller_modes": ["m4_pro_native", "m5_native", "m5_pro_max_native"],
-        "session_host_modes": ["threadripper_pro_5995wx_native"]
+        "controller_modes": [
+          "m4_pro_native",
+          "m5_native",
+          "m5_pro_max_native"
+        ],
+        "session_host_modes": [
+          "threadripper_pro_5995wx_native"
+        ]
       },
       "description": "The local Mac owns the interactive GUI and client while the authoritative mux and application path crosses the named LAN route to trj; route, transport, endpoint, mux generation, RTT, jitter, loss, disconnects, and reconnects are explicit evidence.",
       "source_refs": [
@@ -210,7 +224,9 @@
     {
       "actor_mode": "human_interactive",
       "title": "Native interactive human",
-      "personas": ["interactive_human"],
+      "personas": [
+        "interactive_human"
+      ],
       "description": "A person drives native AppKit input and judges presented frames, focus, text, policy feedback, and recovery.",
       "source_refs": [
         "docs/design/product-journey-contract.md",
@@ -220,14 +236,21 @@
     {
       "actor_mode": "meta_agent_supervised",
       "title": "Supervised meta-agent",
-      "personas": ["meta_agent_operator"],
+      "personas": [
+        "meta_agent_operator"
+      ],
       "description": "A machine operator supervises agents through bounded Robot, MCP, mission, transaction, approval, search, and fleet-state calls.",
-      "source_refs": ["docs/design/product-journey-contract.md", "crates/frankenterm/src/main.rs"]
+      "source_refs": [
+        "docs/design/product-journey-contract.md",
+        "crates/frankenterm/src/main.rs"
+      ]
     },
     {
       "actor_mode": "automation_unattended",
       "title": "Unattended automation",
-      "personas": ["automation_agent"],
+      "personas": [
+        "automation_agent"
+      ],
       "description": "An approved workflow acts and waits without human timing assumptions while preserving cancellation, policy, and replay safety.",
       "source_refs": [
         "docs/design/product-journey-contract.md",
@@ -237,7 +260,9 @@
     {
       "actor_mode": "incident_response",
       "title": "Privacy-safe incident response",
-      "personas": ["incident_responder"],
+      "personas": [
+        "incident_responder"
+      ],
       "description": "A human or automated responder gathers bounded diagnostics, forms falsifiable causal candidates, replays evidence, and selects a safe next action.",
       "source_refs": [
         "docs/design/product-journey-contract.md",
@@ -487,7 +512,11 @@
       "title": "Clean Mac first hour",
       "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.1",
       "release_requirement": "required",
-      "personas": ["interactive_human", "meta_agent_operator", "automation_agent"],
+      "personas": [
+        "interactive_human",
+        "meta_agent_operator",
+        "automation_agent"
+      ],
       "setup": [
         "Record package, app, CLI, mux, config, renderer, display, OS, target, and first-run authority identity.",
         "Begin from a declared clean compatible Mac and install the packaged, signed candidate."
@@ -541,7 +570,11 @@
       "title": "Two-agent everyday project for four hours",
       "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.2",
       "release_requirement": "required",
-      "personas": ["interactive_human", "meta_agent_operator", "automation_agent"],
+      "personas": [
+        "interactive_human",
+        "meta_agent_operator",
+        "automation_agent"
+      ],
       "setup": [
         "Record pane, mux, application, route, display, renderer, config, and target identities.",
         "Start the exact packaged candidate with two real project agents in the selected local or Mac-to-LAN topology."
@@ -1163,7 +1196,9 @@
       "title": "Keyboard-only, VoiceOver, reduced-motion, and low-vision operator day",
       "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.12",
       "release_requirement": "required",
-      "personas": ["interactive_human"],
+      "personas": [
+        "interactive_human"
+      ],
       "setup": [
         "Record assistive technology, OS, app, renderer, display, target, and scenario identity.",
         "Start the exact native candidate with the declared accessibility corpus, keyboard configuration, VoiceOver, reduced-motion, low-vision, IME, display, and zoom settings."
@@ -1284,7 +1319,11 @@
       "title": "Version-pinned Codex, Claude, Gemini, and supported-agent dogfood",
       "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.14",
       "release_requirement": "required",
-      "personas": ["interactive_human", "meta_agent_operator", "automation_agent"],
+      "personas": [
+        "interactive_human",
+        "meta_agent_operator",
+        "automation_agent"
+      ],
       "setup": [
         "Separate real-agent runs from simulated or replayed fixtures.",
         "Pin the exact FrankenTerm candidate, supported agent products and versions, model or profile identity, authentication posture, policy, project fixture, pane manifest, topology, and target."
@@ -1517,67 +1556,13 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.2",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q002",
-            "topology": "local_only"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "local_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.2","coverage":{"persona":"interactive_human","fleet_point":"q002","topology":"local_only"},"actor_mode":"human_interactive","transport":"local_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q002.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q002.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q002.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q002.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -1633,67 +1618,13 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q020",
-            "topology": "local_only"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "local_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.3","coverage":{"persona":"interactive_human","fleet_point":"q020","topology":"local_only"},"actor_mode":"human_interactive","transport":"local_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q020.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q020.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q020.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q020.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -1750,48 +1681,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q050.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q050.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q050.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q050.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -1848,48 +1740,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q200.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.local_only.q200.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q200.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.local_only.q200.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -1948,68 +1801,13 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.2",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q002",
-            "topology": "mac_lan_remote"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "remote_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["trj_5995wx"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md",
-            "frankenterm/client/src/pane/clientpane.rs"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.2","coverage":{"persona":"interactive_human","fleet_point":"q002","topology":"mac_lan_remote"},"actor_mode":"human_interactive","transport":"remote_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["trj_5995wx"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md","frankenterm/client/src/pane/clientpane.rs"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q002.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q002.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -2073,68 +1871,13 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q020",
-            "topology": "mac_lan_remote"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "remote_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["trj_5995wx"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md",
-            "frankenterm/client/src/pane/clientpane.rs"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.3","coverage":{"persona":"interactive_human","fleet_point":"q020","topology":"mac_lan_remote"},"actor_mode":"human_interactive","transport":"remote_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["trj_5995wx"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md","frankenterm/client/src/pane/clientpane.rs"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q020.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q020.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -2198,68 +1941,13 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.4",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q050",
-            "topology": "mac_lan_remote"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "remote_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["trj_5995wx"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md",
-            "docs/high-scale-operator-rehearsals.md"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.4","coverage":{"persona":"interactive_human","fleet_point":"q050","topology":"mac_lan_remote"},"actor_mode":"human_interactive","transport":"remote_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["trj_5995wx"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md","docs/high-scale-operator-rehearsals.md"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q050.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q050.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -2323,67 +2011,13 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [
-        {
-          "producer_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.5",
-          "coverage": {
-            "persona": "interactive_human",
-            "fleet_point": "q200",
-            "topology": "mac_lan_remote"
-          },
-          "actor_mode": "human_interactive",
-          "transport": "remote_mux",
-          "controller_target_class_ids": ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"],
-          "session_host_target_class_ids": ["trj_5995wx"],
-          "source_refs": [
-            "docs/design/product-journey-contract.md",
-            "docs/perf/mux-long-session-performance-campaign.md"
-          ]
-        }
+        {"producer_bead_id":"ft-interactive-swarm-product-convergence-7xqz4.11.5","coverage":{"persona":"interactive_human","fleet_point":"q200","topology":"mac_lan_remote"},"actor_mode":"human_interactive","transport":"remote_mux","controller_target_class_ids":["mac16_11_m4_pro","m5_native","m5_pro_max_native"],"session_host_target_class_ids":["trj_5995wx"],"source_refs":["docs/design/product-journey-contract.md","docs/perf/mux-long-session-performance-campaign.md"]}
       ],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q200.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.interactive_human.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q200.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.interactive_human.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "human_interactive",
       "support": {
@@ -2444,48 +2078,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q002.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q002.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q002.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q002.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -2544,57 +2139,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q020.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q020.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q020.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q020.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -2653,56 +2202,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q050.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q050.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q050.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q050.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -2763,48 +2267,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q200.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.local_only.q200.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q200.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.local_only.q200.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -2867,48 +2332,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q002.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q002.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -2972,60 +2398,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q020.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q020.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -3090,60 +2467,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.4",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.4","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q050.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q050.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -3210,48 +2538,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q200.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.meta_agent_operator.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q200.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.meta_agent_operator.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "meta_agent_supervised",
       "support": {
@@ -3314,48 +2603,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q002.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q002.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q002.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q002.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3414,57 +2664,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q020.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q020.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q020.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q020.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3523,56 +2727,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q050.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q050.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q050.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q050.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3633,48 +2792,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q200.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.local_only.q200.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q200.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.local_only.q200.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3737,48 +2857,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q002.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q002.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3842,60 +2923,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q020.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q020.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -3960,60 +2992,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.4",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.6",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.4","ft-interactive-swarm-product-convergence-7xqz4.11.6","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13","ft-interactive-swarm-product-convergence-7xqz4.11.14"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q050.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q050.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -4080,48 +3063,9 @@
       "exact_producer_bindings": [],
       "partial_producer_bead_ids": [],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q200.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.automation_agent.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q200.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.automation_agent.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "automation_unattended",
       "support": {
@@ -4180,55 +3124,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q002.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q002.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.local_only.q002.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q002.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q002.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4287,56 +3187,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q020.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q020.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.local_only.q020.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q020.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q020.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4394,55 +3249,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q050.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q050.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.local_only.q050.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q050.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q050.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4501,56 +3312,11 @@
       ],
       "transport": "local_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.5","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "mac16_11_m4_pro",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q200.m5_native.m5_native",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "m5_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.local_only.q200.m5_pro_max_native.m5_pro_max_native",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "m5_pro_max_native",
-          "transport": "local_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.local_only.q200.mac16_11_m4_pro.mac16_11_m4_pro","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"mac16_11_m4_pro","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q200.m5_native.m5_native","controller_target_class_id":"m5_native","session_host_target_class_id":"m5_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.local_only.q200.m5_pro_max_native.m5_pro_max_native","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"m5_pro_max_native","transport":"local_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4609,57 +3375,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q002.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q002.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q002.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q002.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4722,58 +3442,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.3",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.3","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q020.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q020.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q020.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q020.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4836,58 +3509,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.4",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.4","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q050.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q050.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q050.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q050.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -4951,58 +3577,11 @@
       ],
       "transport": "remote_mux",
       "exact_producer_bindings": [],
-      "partial_producer_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.11.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.10",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.11",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.13"
-      ],
+      "partial_producer_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.11.5","ft-interactive-swarm-product-convergence-7xqz4.11.7","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.11.10","ft-interactive-swarm-product-convergence-7xqz4.11.11","ft-interactive-swarm-product-convergence-7xqz4.11.13"],
       "target_qualifications": [
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx",
-          "controller_target_class_id": "mac16_11_m4_pro",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "available",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q200.m5_native.trj_5995wx",
-          "controller_target_class_id": "m5_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        },
-        {
-          "qualification_id": "qual.incident_responder.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx",
-          "controller_target_class_id": "m5_pro_max_native",
-          "session_host_target_class_id": "trj_5995wx",
-          "transport": "remote_mux",
-          "route_identity_ref": null,
-          "candidate_identity_ref": null,
-          "availability": "unknown",
-          "evidence_state": "missing",
-          "run_verdict": "not_run",
-          "freshness_state": "unknown",
-          "evidence_refs": [],
-          "blocker_refs": []
-        }
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q200.mac16_11_m4_pro.trj_5995wx","controller_target_class_id":"mac16_11_m4_pro","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"available","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q200.m5_native.trj_5995wx","controller_target_class_id":"m5_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]},
+        {"qualification_id":"qual.incident_responder.mac_lan_remote.q200.m5_pro_max_native.trj_5995wx","controller_target_class_id":"m5_pro_max_native","session_host_target_class_id":"trj_5995wx","transport":"remote_mux","route_identity_ref":null,"candidate_identity_ref":null,"availability":"unknown","evidence_state":"missing","run_verdict":"not_run","freshness_state":"unknown","evidence_refs":[],"blocker_refs":[]}
       ],
       "actor_mode": "incident_response",
       "support": {
@@ -5058,7 +3637,9 @@
         "journey.component_crash_recovery",
         "journey.accessible_operator_day"
       ],
-      "source_refs": ["docs/ft-xbnl0-5-4-operator-acceptance-scenarios.json"],
+      "source_refs": [
+        "docs/ft-xbnl0-5-4-operator-acceptance-scenarios.json"
+      ],
       "notes": "Legacy operator-acceptance scenarios are reusable substrates only. Their stale local fallback wording does not satisfy fail-closed remote proof and they do not bind the exact 32 product cells."
     },
     {
@@ -5070,7 +3651,9 @@
         "journey.attention_and_verified_submit",
         "journey.version_pinned_agent_dogfood"
       ],
-      "source_refs": ["docs/demo-scenarios.md"],
+      "source_refs": [
+        "docs/demo-scenarios.md"
+      ],
       "notes": "Demo scenarios provide onboarding and deterministic regression material; a demo pass is not an exact native journey or support verdict."
     },
     {
@@ -5117,7 +3700,9 @@
       "readme_ref": "README.md#whats-here",
       "claim_text": "fleets of 200+ concurrent AI coding agents",
       "claim_sha256": "f7ef64eb62770a8db572b016c8bec0b1a05838f2e2a252780a2978afd2c38bd0",
-      "journey_ids": ["journey.two_hundred_pane_mission"],
+      "journey_ids": [
+        "journey.two_hundred_pane_mission"
+      ],
       "notes": "The README 200-plus headline exceeds the catalog's exact q200 point. No open-ended above-200 support claim is permitted until a distinct producer and passing journey exist."
     },
     {
@@ -5137,7 +3722,10 @@
       "readme_ref": "README.md#deep-dive-capacity-planning",
       "claim_text": "| 51–200 panes | 300–500 | ~200 MB | **required** | optional |",
       "claim_sha256": "af3f4a9d62343ea747688199916eff19f0b88462611dbb3835f9f2da99873a11",
-      "journey_ids": ["journey.fifty_pane_mac_trj", "journey.two_hundred_pane_mission"],
+      "journey_ids": [
+        "journey.fifty_pane_mac_trj",
+        "journey.two_hundred_pane_mission"
+      ],
       "notes": "README capacity bands overlap at 200 and are not qualification points. This catalog uses exact q002, q020, q050, and q200 cells."
     },
     {
@@ -5145,7 +3733,9 @@
       "readme_ref": "README.md#10-minute-tour",
       "claim_text": "A guided walkthrough from \"I cloned this\" to \"I have an AI driving an AI.\"",
       "claim_sha256": "aea74e6e8dcbf153fa7e0011a9bf614b30b327dcfa194abe190accf56444ffa4",
-      "journey_ids": ["journey.clean_mac_first_hour"],
+      "journey_ids": [
+        "journey.clean_mac_first_hour"
+      ],
       "notes": "Current manual setup guidance is not proof of an atomic packaged first hour. The clean-Mac journey remains conditional until its complete setup and relaunch path passes."
     },
     {
@@ -5193,29 +3783,9 @@
       "title": "README 200-plus scope exceeds exact q200 qualification",
       "status": "open",
       "blocks_all_claims": false,
-      "affected_claim_ids": [
-        "claim.interactive_human.local_only.q200",
-        "claim.interactive_human.mac_lan_remote.q200",
-        "claim.meta_agent_operator.local_only.q200",
-        "claim.meta_agent_operator.mac_lan_remote.q200",
-        "claim.automation_agent.local_only.q200",
-        "claim.automation_agent.mac_lan_remote.q200",
-        "claim.incident_responder.local_only.q200",
-        "claim.incident_responder.mac_lan_remote.q200"
-      ],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.1.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.1.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.15",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.9"
-      ],
-      "source_refs": [
-        "README.md#whats-here",
-        "docs/design/product-journey-contract.md",
-        "docs/attestations/proofs/resource-cockpit-target-class.json"
-      ],
+      "affected_claim_ids": ["claim.interactive_human.local_only.q200","claim.interactive_human.mac_lan_remote.q200","claim.meta_agent_operator.local_only.q200","claim.meta_agent_operator.mac_lan_remote.q200","claim.automation_agent.local_only.q200","claim.automation_agent.mac_lan_remote.q200","claim.incident_responder.local_only.q200","claim.incident_responder.mac_lan_remote.q200"],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.1.5","ft-interactive-swarm-product-convergence-7xqz4.1.7","ft-interactive-swarm-product-convergence-7xqz4.11.5","ft-interactive-swarm-product-convergence-7xqz4.11.15","ft-interactive-swarm-product-convergence-7xqz4.12.7","ft-interactive-swarm-product-convergence-7xqz4.12.9"],
+      "source_refs": ["README.md#whats-here","docs/design/product-journey-contract.md","docs/attestations/proofs/resource-cockpit-target-class.json"],
       "resolution_refs": [],
       "notes": "Exact q200 does not authorize an open-ended above-200 claim; derived wording must narrow or a distinct above-200 journey must pass."
     },
@@ -5225,17 +3795,8 @@
       "status": "open",
       "blocks_all_claims": true,
       "affected_claim_ids": [],
-      "tracking_bead_ids": [
-        "ft-wtd5g",
-        "ft-interactive-systems-performance-4tenz.5.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.1.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.7"
-      ],
-      "source_refs": [
-        "README.md#tldr",
-        "docs/design/product-journey-contract.md",
-        "docs/perf-ledger/interactive-systems-negative-results.md"
-      ],
+      "tracking_bead_ids": ["ft-wtd5g","ft-interactive-systems-performance-4tenz.5.5","ft-interactive-swarm-product-convergence-7xqz4.1.5","ft-interactive-swarm-product-convergence-7xqz4.12.7"],
+      "source_refs": ["README.md#tldr","docs/design/product-journey-contract.md","docs/perf-ledger/interactive-systems-negative-results.md"],
       "resolution_refs": [],
       "notes": "The product must record explicit gaps whenever continuity is not guaranteed; the unconditional every-byte wording cannot govern any support claim."
     },
@@ -5244,25 +3805,9 @@
       "title": "README capacity bands overlap at 200 panes",
       "status": "open",
       "blocks_all_claims": false,
-      "affected_claim_ids": [
-        "claim.interactive_human.local_only.q200",
-        "claim.interactive_human.mac_lan_remote.q200",
-        "claim.meta_agent_operator.local_only.q200",
-        "claim.meta_agent_operator.mac_lan_remote.q200",
-        "claim.automation_agent.local_only.q200",
-        "claim.automation_agent.mac_lan_remote.q200",
-        "claim.incident_responder.local_only.q200",
-        "claim.incident_responder.mac_lan_remote.q200"
-      ],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.1.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.1.7",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.7"
-      ],
-      "source_refs": [
-        "README.md#deep-dive-capacity-planning",
-        "docs/design/product-journey-contract.md"
-      ],
+      "affected_claim_ids": ["claim.interactive_human.local_only.q200","claim.interactive_human.mac_lan_remote.q200","claim.meta_agent_operator.local_only.q200","claim.meta_agent_operator.mac_lan_remote.q200","claim.automation_agent.local_only.q200","claim.automation_agent.mac_lan_remote.q200","claim.incident_responder.local_only.q200","claim.incident_responder.mac_lan_remote.q200"],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.1.5","ft-interactive-swarm-product-convergence-7xqz4.1.7","ft-interactive-swarm-product-convergence-7xqz4.12.7"],
+      "source_refs": ["README.md#deep-dive-capacity-planning","docs/design/product-journey-contract.md"],
       "resolution_refs": [],
       "notes": "Sizing guidance must use non-overlapping bands distinct from exact product qualification points."
     },
@@ -5271,21 +3816,9 @@
       "title": "Atomic clean first-hour promise exceeds the current manual setup path",
       "status": "open",
       "blocks_all_claims": false,
-      "affected_claim_ids": [
-        "claim.interactive_human.local_only.q002",
-        "claim.meta_agent_operator.local_only.q002",
-        "claim.automation_agent.local_only.q002"
-      ],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.2.4",
-        "ft-interactive-swarm-product-convergence-7xqz4.2.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.1"
-      ],
-      "source_refs": [
-        "README.md#10-minute-tour",
-        "docs/frankenterm-gui-user-guide.md",
-        "docs/design/product-journey-contract.md"
-      ],
+      "affected_claim_ids": ["claim.interactive_human.local_only.q002","claim.meta_agent_operator.local_only.q002","claim.automation_agent.local_only.q002"],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.2.4","ft-interactive-swarm-product-convergence-7xqz4.2.9","ft-interactive-swarm-product-convergence-7xqz4.11.1"],
+      "source_refs": ["README.md#10-minute-tour","docs/frankenterm-gui-user-guide.md","docs/design/product-journey-contract.md"],
       "resolution_refs": [],
       "notes": "The clean-Mac first-hour journey remains conditional until packaged setup, useful work, exit, and relaunch pass without hidden prerequisites or undocumented intervention."
     },
@@ -5295,16 +3828,8 @@
       "status": "open",
       "blocks_all_claims": true,
       "affected_claim_ids": [],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.1.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.1",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.9"
-      ],
-      "source_refs": [
-        "AGENTS.md",
-        "docs/ft-xbnl0-5-4-operator-acceptance-scenarios.json",
-        "docs/design/product-journey-contract.md"
-      ],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.1.5","ft-interactive-swarm-product-convergence-7xqz4.12.1","ft-interactive-swarm-product-convergence-7xqz4.12.9"],
+      "source_refs": ["AGENTS.md","docs/ft-xbnl0-5-4-operator-acceptance-scenarios.json","docs/design/product-journey-contract.md"],
       "resolution_refs": [],
       "notes": "Local Cargo output cannot satisfy a remote proof lane; stale fallback wording must be corrected before any legacy evidence is imported."
     },
@@ -5313,26 +3838,9 @@
       "title": "Performance diagnostic q001 differs from product floor q002",
       "status": "open",
       "blocks_all_claims": false,
-      "affected_claim_ids": [
-        "claim.interactive_human.local_only.q002",
-        "claim.interactive_human.mac_lan_remote.q002",
-        "claim.meta_agent_operator.local_only.q002",
-        "claim.meta_agent_operator.mac_lan_remote.q002",
-        "claim.automation_agent.local_only.q002",
-        "claim.automation_agent.mac_lan_remote.q002",
-        "claim.incident_responder.local_only.q002",
-        "claim.incident_responder.mac_lan_remote.q002"
-      ],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.1.1",
-        "ft-interactive-swarm-product-convergence-7xqz4.3.1",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.2",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.15"
-      ],
-      "source_refs": [
-        "docs/perf/mux-long-session-performance-campaign.md",
-        "docs/design/product-journey-contract.md"
-      ],
+      "affected_claim_ids": ["claim.interactive_human.local_only.q002","claim.interactive_human.mac_lan_remote.q002","claim.meta_agent_operator.local_only.q002","claim.meta_agent_operator.mac_lan_remote.q002","claim.automation_agent.local_only.q002","claim.automation_agent.mac_lan_remote.q002","claim.incident_responder.local_only.q002","claim.incident_responder.mac_lan_remote.q002"],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.1.1","ft-interactive-swarm-product-convergence-7xqz4.3.1","ft-interactive-swarm-product-convergence-7xqz4.11.2","ft-interactive-swarm-product-convergence-7xqz4.11.15"],
+      "source_refs": ["docs/perf/mux-long-session-performance-campaign.md","docs/design/product-journey-contract.md"],
       "resolution_refs": [],
       "notes": "One pane remains a subsystem diagnostic only; exact two-pane runs are required for the smallest useful product fleet."
     },
@@ -5342,16 +3850,8 @@
       "status": "open",
       "blocks_all_claims": true,
       "affected_claim_ids": [],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.1.1",
-        "ft-interactive-swarm-product-convergence-7xqz4.1.5",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.14",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.7"
-      ],
-      "source_refs": [
-        "README.md#deep-dive-agent-profiles-personas-and-fleet-templates",
-        "docs/design/product-journey-contract.md"
-      ],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.1.1","ft-interactive-swarm-product-convergence-7xqz4.1.5","ft-interactive-swarm-product-convergence-7xqz4.11.14","ft-interactive-swarm-product-convergence-7xqz4.12.7"],
+      "source_refs": ["README.md#deep-dive-agent-profiles-personas-and-fleet-templates","docs/design/product-journey-contract.md"],
       "resolution_refs": [],
       "notes": "All claim joins must qualify product_persona, agent_profile_persona, and workload_class rather than infer identity from the bare word persona."
     },
@@ -5360,37 +3860,9 @@
       "title": "Distributed observation and authoritative remote-mux paths are conflated",
       "status": "open",
       "blocks_all_claims": false,
-      "affected_claim_ids": [
-        "claim.interactive_human.mac_lan_remote.q002",
-        "claim.interactive_human.mac_lan_remote.q020",
-        "claim.interactive_human.mac_lan_remote.q050",
-        "claim.interactive_human.mac_lan_remote.q200",
-        "claim.meta_agent_operator.mac_lan_remote.q002",
-        "claim.meta_agent_operator.mac_lan_remote.q020",
-        "claim.meta_agent_operator.mac_lan_remote.q050",
-        "claim.meta_agent_operator.mac_lan_remote.q200",
-        "claim.automation_agent.mac_lan_remote.q002",
-        "claim.automation_agent.mac_lan_remote.q020",
-        "claim.automation_agent.mac_lan_remote.q050",
-        "claim.automation_agent.mac_lan_remote.q200",
-        "claim.incident_responder.mac_lan_remote.q002",
-        "claim.incident_responder.mac_lan_remote.q020",
-        "claim.incident_responder.mac_lan_remote.q050",
-        "claim.incident_responder.mac_lan_remote.q200"
-      ],
-      "tracking_bead_ids": [
-        "ft-interactive-swarm-product-convergence-7xqz4.3.1",
-        "ft-interactive-swarm-product-convergence-7xqz4.3.4",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.8",
-        "ft-interactive-swarm-product-convergence-7xqz4.11.9",
-        "ft-interactive-swarm-product-convergence-7xqz4.12.3"
-      ],
-      "source_refs": [
-        "README.md#what-ft-doesnt-do-yet",
-        "docs/design/product-journey-contract.md",
-        "frankenterm/client/src/pane/clientpane.rs",
-        "crates/frankenterm-mux-server-impl/src/dispatch.rs"
-      ],
+      "affected_claim_ids": ["claim.interactive_human.mac_lan_remote.q002","claim.interactive_human.mac_lan_remote.q020","claim.interactive_human.mac_lan_remote.q050","claim.interactive_human.mac_lan_remote.q200","claim.meta_agent_operator.mac_lan_remote.q002","claim.meta_agent_operator.mac_lan_remote.q020","claim.meta_agent_operator.mac_lan_remote.q050","claim.meta_agent_operator.mac_lan_remote.q200","claim.automation_agent.mac_lan_remote.q002","claim.automation_agent.mac_lan_remote.q020","claim.automation_agent.mac_lan_remote.q050","claim.automation_agent.mac_lan_remote.q200","claim.incident_responder.mac_lan_remote.q002","claim.incident_responder.mac_lan_remote.q020","claim.incident_responder.mac_lan_remote.q050","claim.incident_responder.mac_lan_remote.q200"],
+      "tracking_bead_ids": ["ft-interactive-swarm-product-convergence-7xqz4.3.1","ft-interactive-swarm-product-convergence-7xqz4.3.4","ft-interactive-swarm-product-convergence-7xqz4.11.8","ft-interactive-swarm-product-convergence-7xqz4.11.9","ft-interactive-swarm-product-convergence-7xqz4.12.3"],
+      "source_refs": ["README.md#what-ft-doesnt-do-yet","docs/design/product-journey-contract.md","frankenterm/client/src/pane/clientpane.rs","crates/frankenterm-mux-server-impl/src/dispatch.rs"],
       "resolution_refs": [],
       "notes": "Every remote artifact must identify topology and transport; distributed observation cannot substitute for a Mac-to-LAN authoritative remote mux."
     }

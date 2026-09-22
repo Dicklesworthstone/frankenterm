@@ -783,10 +783,17 @@ fn checked_in_lineage_verifies_exact_retained_snapshots_offline() {
         .snapshot_ref
         .split_once('#')
         .map_or(current_snapshot.snapshot_ref.as_str(), |(path, _)| path);
-    assert_eq!(
-        fs::read(root.join(CATALOG_RELATIVE_PATH)).expect("current catalog is readable"),
-        fs::read(root.join(current_snapshot_path)).expect("current retained snapshot is readable"),
-        "the mutable catalog doorway must equal its signed retained current snapshot"
+    let doorway = fs::read(root.join(CATALOG_RELATIVE_PATH)).expect("current catalog is readable");
+    let retained =
+        fs::read(root.join(current_snapshot_path)).expect("current retained snapshot is readable");
+    assert!(
+        doorway == retained,
+        "the mutable catalog doorway must equal its signed retained current snapshot: \
+         doorway bytes={} sha256={}; retained bytes={} sha256={}",
+        doorway.len(),
+        hex::encode(Sha256::digest(&doorway)),
+        retained.len(),
+        hex::encode(Sha256::digest(&retained)),
     );
 }
 
