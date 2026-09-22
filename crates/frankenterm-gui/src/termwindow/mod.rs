@@ -10135,33 +10135,38 @@ impl TermWindow {
         })
     }
 
-    /// Resize overlays to match their corresponding tab/pane dimensions
+    /// Resize overlays from committed topology targets, not asynchronous pane sizes.
     pub fn resize_overlays(&self) {
         let Some(mux) = self.mux_or_log("resize overlays") else {
             return;
         };
-        for (_, state) in self.tab_state.borrow().iter() {
+        let tabs: Vec<_> = match mux.get_window(self.mux_window_id) {
+            Some(window) => window.iter().cloned().collect(),
+            None => return,
+        };
+        for (tab_id, state) in self.tab_state.borrow().iter() {
             if let Some(overlay) = state.overlay.as_ref().map(|o| &o.pane) {
-                overlay.resize(self.terminal_size).ok();
+                if let Some(tab) = tabs.iter().find(|tab| tab.tab_id() == *tab_id) {
+                    overlay.resize(tab.get_size()).ok();
+                }
             }
         }
         for (pane_id, state) in self.pane_state.borrow().iter() {
             if let Some(overlay) = state.overlay.as_ref().map(|o| &o.pane) {
                 if let Some(pane) = mux.get_pane(*pane_id) {
-                    let dims = pane.get_dimensions();
-                    overlay
-                        .resize(TerminalSize {
-                            cols: dims.cols,
-                            rows: dims.viewport_rows,
-                            dpi: self.terminal_size.dpi,
-                            pixel_height: (self.terminal_size.pixel_height
-                                / self.terminal_size.rows.max(1))
-                                * dims.viewport_rows,
-                            pixel_width: (self.terminal_size.pixel_width
-                                / self.terminal_size.cols.max(1))
-                                * dims.cols,
-                        })
-                        .ok();
+                    let Some((_, window_id, tab_id)) = mux.resolve_pane_id(*pane_id) else {
+                        continue;
+                    };
+                    if window_id != self.mux_window_id {
+                        continue;
+                    }
+                    if let Some(size) = tabs
+                        .iter()
+                        .find(|tab| tab.tab_id() == tab_id)
+                        .and_then(|tab| tab.presentation_size_for_pane(&pane))
+                    {
+                        overlay.resize(size).ok();
+                    }
                 }
             }
         }
@@ -10903,6 +10908,129 @@ impl Drop for TermWindow {
 mod tests {
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn independent_overlay_uses_tab_target_while_native_resize_is_pending() {
+        if run_scheduler_test_in_child(
+            "independent_overlay_uses_tab_target_while_native_resize_is_pending",
+        ) {
+            return;
+        }
+        use mux::pane::WithPaneLines;
+        use mux::tab::{FloatingPaneRect, SplitRequest, Tab};
+        use std::time::Duration;
+        use wezterm_term::{Line, StableRowIndex, TerminalSize};
+
+        let child = new_gui_test_pane(998_801, [0x81; 16]);
+        let pane = Arc::clone(&child.0);
+        let original = pane.get_dimensions();
+        let tab = Tab::new(&TerminalSize {
+            rows: original.viewport_rows,
+            cols: original.cols,
+            ..TerminalSize::default()
+        });
+        tab.assign_pane(&pane);
+        struct Hold {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl WithPaneLines for Hold {
+            fn with_lines_mut(&mut self, _: StableRowIndex, _: &mut [&mut Line]) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let (entered, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let held = Arc::clone(&pane);
+        let holder = std::thread::spawn(move || {
+            held.with_lines_mut(
+                0..1,
+                &mut Hold {
+                    entered,
+                    release: wait,
+                },
+            );
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let target = TerminalSize {
+            cols: 69,
+            rows: 21,
+            pixel_width: 690,
+            pixel_height: 420,
+            dpi: 144,
+        };
+        tab.resize(target);
+        let local = pane.downcast_ref::<mux::localpane::LocalPane>().unwrap();
+        assert!(
+            local.selection_source_snapshot().is_none(),
+            "terminal stays held"
+        );
+        assert_ne!(
+            (original.cols, original.viewport_rows),
+            (target.cols, target.rows)
+        );
+        assert_eq!(tab.presentation_size_for_pane(&pane), Some(target));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let other = new_gui_test_pane(998_802, [0x82; 16]);
+        assert!(tab.presentation_size_for_pane(&other.0).is_none());
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&other.0))
+            .unwrap();
+        let left = tab.presentation_size_for_pane(&pane).unwrap();
+        let right = tab.presentation_size_for_pane(&other.0).unwrap();
+        assert_eq!(left.cols + right.cols + 1, target.cols);
+        assert_eq!((left.rows, right.rows), (target.rows, target.rows));
+        assert_eq!(
+            (left.pixel_width, right.pixel_width),
+            (left.cols * 10, right.cols * 10)
+        );
+        assert_eq!((left.pixel_height, right.pixel_height), (420, 420));
+        tab.set_zoomed(true);
+        let zoomed = tab.iter_panes();
+        assert_eq!(zoomed.len(), 1);
+        assert_eq!(
+            tab.presentation_size_for_pane(&zoomed[0].pane),
+            Some(target)
+        );
+        let hidden = if Arc::ptr_eq(&zoomed[0].pane, &pane) {
+            &other.0
+        } else {
+            &pane
+        };
+        assert!(tab.presentation_size_for_pane(hidden).is_none());
+        tab.set_zoomed(false);
+
+        let floating = new_gui_test_pane(998_803, [0x83; 16]);
+        tab.add_floating_pane(
+            Arc::clone(&floating.0),
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tab.presentation_size_for_pane(&floating.0),
+            Some(TerminalSize {
+                cols: 20,
+                rows: 10,
+                pixel_width: 200,
+                pixel_height: 200,
+                dpi: 144,
+            })
+        );
+        tab.remove_floating_pane(floating.0.pane_id()).unwrap();
+        assert!(tab.presentation_size_for_pane(&floating.0).is_none());
+        // A new object with a reused numeric id cannot inherit the old target.
+        let replacement = new_gui_test_pane(pane.pane_id(), [0x84; 16]);
+        assert!(tab.presentation_size_for_pane(&replacement.0).is_none());
+    }
+
     #[test]
     fn fallback_completion_burst_coalesces_through_handler_until_font_read() {
         let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

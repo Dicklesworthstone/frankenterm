@@ -3306,8 +3306,11 @@ impl Pane for QuickSelectOverlay {
         self.delegate.writer()
     }
 
-    fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        self.delegate.resize(size)
+    fn resize(&self, _size: TerminalSize) -> anyhow::Result<()> {
+        // The tab owns the delegate's geometry. Its resize is asynchronous,
+        // so the overlay notification can still contain the previous size.
+        // Forwarding it would replace the tab's newer resize request.
+        Ok(())
     }
 
     fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {

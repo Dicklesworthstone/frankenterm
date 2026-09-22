@@ -6122,6 +6122,31 @@ impl Tab {
         self.inner.lock().iter_panes()
     }
 
+    /// Return the exact pane's presentation target from one topology snapshot.
+    /// Hidden tiled panes during zoom and panes absent from this tab have no
+    /// presentation target. No pane callbacks or terminal reads are performed.
+    pub fn presentation_size_for_pane(&self, pane: &Arc<dyn Pane>) -> Option<TerminalSize> {
+        let mut inner = self.inner.lock();
+        if let Some(position) = inner
+            .iter_panes()
+            .into_iter()
+            .find(|position| Arc::ptr_eq(&position.pane, pane))
+        {
+            return Some(TerminalSize {
+                rows: position.height,
+                cols: position.width,
+                pixel_width: position.pixel_width,
+                pixel_height: position.pixel_height,
+                dpi: inner.size.dpi,
+            });
+        }
+        inner
+            .floating_panes
+            .iter()
+            .find(|floating| Arc::ptr_eq(&floating.pane, pane))
+            .map(|floating| inner.floating_pane_size(floating.rect))
+    }
+
     pub fn iter_panes_ignoring_zoom(&self) -> Vec<PositionedPane> {
         self.inner.lock().iter_panes_ignoring_zoom()
     }
