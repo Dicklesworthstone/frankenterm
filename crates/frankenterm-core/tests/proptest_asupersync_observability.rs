@@ -5,8 +5,8 @@
 //! `AsupersyncIncidentContext`, and `SloBreachSummary`.
 
 use frankenterm_core::asupersync_observability::{
-    AsupersyncIncidentContext, AsupersyncObservabilityConfig, AsupersyncTelemetrySnapshot,
-    SloBreachSummary,
+    AsupersyncIncidentContext, AsupersyncObservabilityConfig, AsupersyncTelemetry,
+    AsupersyncTelemetrySnapshot, SloBreachSummary,
 };
 use frankenterm_core::runtime_slo_gates::{GateVerdict, RuntimeAlertTier};
 use frankenterm_core::runtime_telemetry::{HealthTier, RuntimePhase};
@@ -336,26 +336,37 @@ proptest! {
     }
 
     #[test]
-    fn gate_pass_ratio_non_negative(snap in arb_telemetry_snapshot()) {
+    fn gate_pass_ratio_uses_outcomes(mut snap in arb_telemetry_snapshot()) {
         let ratio = snap.gate_pass_ratio();
-        prop_assert!(ratio >= 0.0);
-        if snap.gate_evaluations == 0 {
-            let diff = (ratio - 1.0).abs();
-            prop_assert!(diff < f64::EPSILON);
+        prop_assert!((0.0..=1.0).contains(&ratio));
+        if snap.gate_conditional_passes == 0 && snap.gate_failures == 0 {
+            prop_assert_eq!(ratio, 1.0);
+        } else if snap.gate_passes == 0 {
+            prop_assert_eq!(ratio, 0.0);
         }
+        // Aggregate counters may lag or saturate independently of outcomes.
+        snap.gate_evaluations = 0;
+        prop_assert_eq!(snap.gate_pass_ratio(), ratio);
+        snap.gate_evaluations = u64::MAX;
+        prop_assert_eq!(snap.gate_pass_ratio(), ratio);
     }
 
     #[test]
-    fn health_distribution_non_negative(snap in arb_telemetry_snapshot()) {
+    fn health_distribution_uses_outcomes(mut snap in arb_telemetry_snapshot()) {
         let dist = snap.health_distribution();
         for d in &dist {
-            prop_assert!(*d >= 0.0);
+            prop_assert!((0.0..=1.0).contains(d));
         }
-        // When health_samples is 0, distribution is [1.0, 0.0, 0.0, 0.0]
-        if snap.health_samples == 0 {
-            let diff = (dist[0] - 1.0).abs();
-            prop_assert!(diff < f64::EPSILON);
+        prop_assert!((dist.iter().sum::<f64>() - 1.0).abs() <= 4.0 * f64::EPSILON);
+        if snap.health_green_samples == 0 && snap.health_yellow_samples == 0
+            && snap.health_red_samples == 0 && snap.health_black_samples == 0
+        {
+            prop_assert_eq!(dist, [1.0, 0.0, 0.0, 0.0]);
         }
+        snap.health_samples = 0;
+        prop_assert_eq!(snap.health_distribution(), dist);
+        snap.health_samples = u64::MAX;
+        prop_assert_eq!(snap.health_distribution(), dist);
     }
 
     #[test]
@@ -368,6 +379,23 @@ proptest! {
         let check = matches!(tier, HealthTier::Green | HealthTier::Yellow | HealthTier::Red | HealthTier::Black);
         prop_assert!(check);
     }
+}
+
+#[test]
+fn outcome_ratios_preserve_failures_when_aggregate_counters_are_zero() {
+    let mut snapshot = AsupersyncTelemetry::new().snapshot();
+    assert_eq!(snapshot.gate_pass_ratio(), 1.0);
+    assert_eq!(snapshot.health_distribution(), [1.0, 0.0, 0.0, 0.0]);
+
+    snapshot.gate_failures = 1;
+    snapshot.health_red_samples = 1;
+    assert_eq!(snapshot.gate_pass_ratio(), 0.0);
+    assert_eq!(snapshot.health_distribution(), [0.0, 0.0, 1.0, 0.0]);
+
+    snapshot.gate_passes = 1;
+    snapshot.health_green_samples = 1;
+    assert_eq!(snapshot.gate_pass_ratio(), 0.5);
+    assert_eq!(snapshot.health_distribution(), [0.5, 0.0, 0.5, 0.0]);
 }
 
 // =========================================================================
