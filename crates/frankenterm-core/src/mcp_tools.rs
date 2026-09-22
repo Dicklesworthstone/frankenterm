@@ -14389,6 +14389,7 @@ mod tests {
     #[cfg(unix)]
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
+    use super::AWAIT_EVENT_STORAGE_READY_HANG_GUARD;
     #[cfg(unix)]
     use super::set_cass_test_binary_override;
     use super::{
