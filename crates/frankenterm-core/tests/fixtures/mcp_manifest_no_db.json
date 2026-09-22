@@ -4,11 +4,7 @@
       "description": "Read-only explanation for a scored attention-router item",
       "mime_type": "application/json",
       "name": "ft attention router item",
-      "tags": [
-        "wa",
-        "attention",
-        "operator"
-      ],
+      "tags": ["wa", "attention", "operator"],
       "uri_template": "wa://attention-router/items/{item_id}",
       "version": "0.12.0"
     },
@@ -16,11 +12,7 @@
       "description": "Compile an objective into the same dry-run surface as wa.mission_objective_plan",
       "mime_type": "application/json",
       "name": "ft mission objective plan",
-      "tags": [
-        "wa",
-        "mission",
-        "robot"
-      ],
+      "tags": ["wa", "mission", "robot"],
       "uri_template": "wa://mission/objective-plan/{objective}",
       "version": "0.12.0"
     },
@@ -28,11 +20,7 @@
       "description": "Read-only operating-envelope run artifact shape",
       "mime_type": "application/json",
       "name": "ft operating envelope run artifact",
-      "tags": [
-        "wa",
-        "swarm",
-        "operating-envelope"
-      ],
+      "tags": ["wa", "swarm", "operating-envelope"],
       "uri_template": "wa://operating-envelope/runs/{run_id}",
       "version": "0.12.0"
     },
@@ -40,11 +28,7 @@
       "description": "Filter proof history by bead, category, status, or release-blocking",
       "mime_type": "application/json",
       "name": "ft proof history filtered",
-      "tags": [
-        "wa",
-        "proof",
-        "proof-history"
-      ],
+      "tags": ["wa", "proof", "proof-history"],
       "uri_template": "wa://proof-history/{filter}/{value}/{limit}",
       "version": "0.12.0"
     },
@@ -52,11 +36,7 @@
       "description": "Read-only score or explain receipt using the default demo manifest",
       "mime_type": "application/json",
       "name": "ft rehearsal score surface",
-      "tags": [
-        "wa",
-        "rehearsal",
-        "operator"
-      ],
+      "tags": ["wa", "rehearsal", "operator"],
       "uri_template": "wa://rehearsal-score/{surface}",
       "version": "0.12.0"
     },
@@ -64,10 +44,7 @@
       "description": "Filter rule catalog by agent type",
       "mime_type": "application/json",
       "name": "ft rules by agent",
-      "tags": [
-        "wa",
-        "rules"
-      ],
+      "tags": ["wa", "rules"],
       "uri_template": "wa://rules/{agent_type}",
       "version": "0.12.0"
     },
@@ -75,11 +52,7 @@
       "description": "Read-only swarm-capacity run artifact shape",
       "mime_type": "application/json",
       "name": "ft swarm capacity run artifact",
-      "tags": [
-        "wa",
-        "swarm-capacity",
-        "operator"
-      ],
+      "tags": ["wa", "swarm-capacity", "operator"],
       "uri_template": "wa://swarm-capacity/runs/{run_id}",
       "version": "0.12.0"
     }
@@ -89,12 +62,7 @@
       "description": "Read-only Agent Mail fallback outbox entries and replay state",
       "mime_type": "application/json",
       "name": "ft agent mail outbox",
-      "tags": [
-        "wa",
-        "agent-mail",
-        "outbox",
-        "coordination"
-      ],
+      "tags": ["wa", "agent-mail", "outbox", "coordination"],
       "uri": "wa://agent-mail/outbox",
       "version": "0.12.0"
     },
@@ -102,11 +70,7 @@
       "description": "Read-only attention-router status surface with degraded source health",
       "mime_type": "application/json",
       "name": "ft attention router current",
-      "tags": [
-        "wa",
-        "attention",
-        "operator"
-      ],
+      "tags": ["wa", "attention", "operator"],
       "uri": "wa://attention-router/current",
       "version": "0.12.0"
     },
@@ -114,11 +78,7 @@
       "description": "Active signed attestation retractions",
       "mime_type": "application/json",
       "name": "ft attestation retractions",
-      "tags": [
-        "wa",
-        "attestation",
-        "retractions"
-      ],
+      "tags": ["wa", "attestation", "retractions"],
       "uri": "wa://attestation/retractions",
       "version": "0.12.0"
     },
@@ -126,11 +86,7 @@
       "description": "Read-only herd-wave contract and dry-run planner surface",
       "mime_type": "application/json",
       "name": "ft herd wave",
-      "tags": [
-        "wa",
-        "herd-wave",
-        "operator"
-      ],
+      "tags": ["wa", "herd-wave", "operator"],
       "uri": "wa://herd-wave",
       "version": "0.12.0"
     },
@@ -138,11 +94,7 @@
       "description": "Read-only fail-closed swarm operating-envelope status",
       "mime_type": "application/json",
       "name": "ft operating envelope current",
-      "tags": [
-        "wa",
-        "swarm",
-        "operating-envelope"
-      ],
+      "tags": ["wa", "swarm", "operating-envelope"],
       "uri": "wa://operating-envelope/current",
       "version": "0.12.0"
     },
@@ -150,10 +102,7 @@
       "description": "Pane snapshot (same data surface as wa.state)",
       "mime_type": "application/json",
       "name": "ft panes",
-      "tags": [
-        "wa",
-        "panes"
-      ],
+      "tags": ["wa", "panes"],
       "uri": "wa://panes",
       "version": "0.12.0"
     },
@@ -161,12 +110,7 @@
       "description": "Read-only input-to-photon renderer SLO status and evidence pointers",
       "mime_type": "application/json",
       "name": "ft renderer input-to-photon SLO",
-      "tags": [
-        "wa",
-        "perf",
-        "renderer-slo",
-        "input-to-photon"
-      ],
+      "tags": ["wa", "perf", "renderer-slo", "input-to-photon"],
       "uri": "wa://perf/renderer-slo/input_to_photon",
       "version": "0.12.0"
     },
@@ -174,12 +118,7 @@
       "description": "Read-only SSIM parity renderer SLO status and evidence pointers",
       "mime_type": "application/json",
       "name": "ft renderer SSIM parity SLO",
-      "tags": [
-        "wa",
-        "perf",
-        "renderer-slo",
-        "ssim-parity"
-      ],
+      "tags": ["wa", "perf", "renderer-slo", "ssim-parity"],
       "uri": "wa://perf/renderer-slo/ssim_parity",
       "version": "0.12.0"
     },
@@ -187,11 +126,7 @@
       "description": "Read-only proof-history rows with release-blocking summary",
       "mime_type": "application/json",
       "name": "ft proof history",
-      "tags": [
-        "wa",
-        "proof",
-        "proof-history"
-      ],
+      "tags": ["wa", "proof", "proof-history"],
       "uri": "wa://proof-history",
       "version": "0.12.0"
     },
@@ -199,12 +134,7 @@
       "description": "Read-only proof-history rows blocking release",
       "mime_type": "application/json",
       "name": "ft proof history release blockers",
-      "tags": [
-        "wa",
-        "proof",
-        "proof-history",
-        "release-blocking"
-      ],
+      "tags": ["wa", "proof", "proof-history", "release-blocking"],
       "uri": "wa://proof-history/release-blocking",
       "version": "0.12.0"
     },
@@ -212,11 +142,7 @@
       "description": "Read-only rehearsal score receipt from the default demo manifest",
       "mime_type": "application/json",
       "name": "ft rehearsal score current",
-      "tags": [
-        "wa",
-        "rehearsal",
-        "operator"
-      ],
+      "tags": ["wa", "rehearsal", "operator"],
       "uri": "wa://rehearsal-score/current",
       "version": "0.12.0"
     },
@@ -224,10 +150,7 @@
       "description": "Rule catalog (same data surface as wa.rules_list with verbose output)",
       "mime_type": "application/json",
       "name": "ft rules",
-      "tags": [
-        "wa",
-        "rules"
-      ],
+      "tags": ["wa", "rules"],
       "uri": "wa://rules",
       "version": "0.12.0"
     },
@@ -235,11 +158,7 @@
       "description": "Read-only swarm-capacity status, doctor, and MCP resource shape",
       "mime_type": "application/json",
       "name": "ft swarm capacity current",
-      "tags": [
-        "wa",
-        "swarm-capacity",
-        "operator"
-      ],
+      "tags": ["wa", "swarm-capacity", "operator"],
       "uri": "wa://swarm-capacity/current",
       "version": "0.12.0"
     },
@@ -247,12 +166,7 @@
       "description": "Read-only sibling-agent scent with live CWDs, reservations, and TTL freshness",
       "mime_type": "application/json",
       "name": "ft swarm scent",
-      "tags": [
-        "wa",
-        "swarm",
-        "scent",
-        "attention"
-      ],
+      "tags": ["wa", "swarm", "scent", "attention"],
       "uri": "wa://swarm/scent",
       "version": "0.12.0"
     },
@@ -260,10 +174,7 @@
       "description": "Builtin workflow catalog and metadata",
       "mime_type": "application/json",
       "name": "ft workflows",
-      "tags": [
-        "wa",
-        "workflows"
-      ],
+      "tags": ["wa", "workflows"],
       "uri": "wa://workflows",
       "version": "0.12.0"
     }
@@ -277,10 +188,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -298,11 +206,7 @@
           },
           "surface": {
             "default": "status",
-            "enum": [
-              "status",
-              "next",
-              "explain"
-            ],
+            "enum": ["status", "next", "explain"],
             "type": "string"
           },
           "workspace": {
@@ -314,11 +218,7 @@
       },
       "name": "wa.attention",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "attention"
-      ],
+      "tags": ["wa", "robot", "attention"],
       "version": "0.12.0"
     },
     {
@@ -343,10 +243,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -385,18 +282,12 @@
             "type": "string"
           }
         },
-        "required": [
-          "query"
-        ],
+        "required": ["query"],
         "type": "object"
       },
       "name": "wa.cass_search",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
+      "tags": ["wa", "robot", "cass"],
       "version": "0.12.0"
     },
     {
@@ -407,10 +298,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -426,11 +314,7 @@
       },
       "name": "wa.cass_status",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
+      "tags": ["wa", "robot", "cass"],
       "version": "0.12.0"
     },
     {
@@ -447,10 +331,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -471,19 +352,12 @@
             "type": "integer"
           }
         },
-        "required": [
-          "source_path",
-          "line_number"
-        ],
+        "required": ["source_path", "line_number"],
         "type": "object"
       },
       "name": "wa.cass_view",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
+      "tags": ["wa", "robot", "cass"],
       "version": "0.12.0"
     },
     {
@@ -499,10 +373,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -519,17 +390,12 @@
             "type": "integer"
           }
         },
-        "required": [
-          "pane_id"
-        ],
+        "required": ["pane_id"],
         "type": "object"
       },
       "name": "wa.get_text",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot"
-      ],
+      "tags": ["wa", "robot"],
       "version": "0.12.0"
     },
     {
@@ -544,10 +410,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -560,11 +423,7 @@
       },
       "name": "wa.mission_explain",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "mission"
-      ],
+      "tags": ["wa", "robot", "mission"],
       "version": "0.12.0"
     },
     {
@@ -590,12 +449,7 @@
           },
           "capacity_posture": {
             "default": "admit",
-            "enum": [
-              "admit",
-              "defer",
-              "pause",
-              "unknown"
-            ],
+            "enum": ["admit", "defer", "pause", "unknown"],
             "type": "string"
           },
           "dependency_blocked": {
@@ -621,10 +475,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -644,12 +495,7 @@
           },
           "proof_availability": {
             "default": "available",
-            "enum": [
-              "not-required",
-              "available",
-              "blocked",
-              "unavailable"
-            ],
+            "enum": ["not-required", "available", "blocked", "unavailable"],
             "type": "string"
           },
           "source_degraded": {
@@ -676,11 +522,7 @@
           },
           "strictness": {
             "default": "normal",
-            "enum": [
-              "advisory",
-              "normal",
-              "strict"
-            ],
+            "enum": ["advisory", "normal", "strict"],
             "type": "string"
           },
           "target_bead": {
@@ -692,18 +534,12 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "objective"
-        ],
+        "required": ["objective"],
         "type": "object"
       },
       "name": "wa.mission_objective_plan",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "mission"
-      ],
+      "tags": ["wa", "robot", "mission"],
       "version": "0.12.0"
     },
     {
@@ -730,10 +566,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -759,11 +592,7 @@
       },
       "name": "wa.mission_state",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "mission"
-      ],
+      "tags": ["wa", "robot", "mission"],
       "version": "0.12.0"
     },
     {
@@ -786,10 +615,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -803,21 +629,12 @@
           "scenario": {
             "default": "current",
             "description": "Deterministic redacted source scenario; current fails closed when live collectors are unavailable",
-            "enum": [
-              "current",
-              "healthy",
-              "degraded",
-              "blocked",
-              "emergency"
-            ],
+            "enum": ["current", "healthy", "degraded", "blocked", "emergency"],
             "type": "string"
           },
           "surface": {
             "default": "status",
-            "enum": [
-              "status",
-              "explain"
-            ],
+            "enum": ["status", "explain"],
             "type": "string"
           }
         },
@@ -825,12 +642,7 @@
       },
       "name": "wa.operating_envelope",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "swarm",
-        "operating-envelope"
-      ],
+      "tags": ["wa", "robot", "swarm", "operating-envelope"],
       "version": "0.12.0"
     },
     {
@@ -845,10 +657,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -871,10 +680,7 @@
           },
           "surface": {
             "default": "score",
-            "enum": [
-              "score",
-              "explain"
-            ],
+            "enum": ["score", "explain"],
             "type": "string"
           }
         },
@@ -882,12 +688,7 @@
       },
       "name": "wa.rehearsal_score",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "rehearsal",
-        "demo"
-      ],
+      "tags": ["wa", "robot", "rehearsal", "demo"],
       "version": "0.12.0"
     },
     {
@@ -903,10 +704,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -920,11 +718,7 @@
       },
       "name": "wa.rules_list",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "rules"
-      ],
+      "tags": ["wa", "robot", "rules"],
       "version": "0.12.0"
     },
     {
@@ -935,10 +729,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -953,18 +744,12 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "text"
-        ],
+        "required": ["text"],
         "type": "object"
       },
       "name": "wa.rules_test",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "rules"
-      ],
+      "tags": ["wa", "robot", "rules"],
       "version": "0.12.0"
     },
     {
@@ -982,10 +767,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -998,10 +780,7 @@
       },
       "name": "wa.state",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot"
-      ],
+      "tags": ["wa", "robot"],
       "version": "0.12.0"
     },
     {
@@ -1012,10 +791,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -1043,19 +819,12 @@
             "type": "string"
           }
         },
-        "required": [
-          "scenario",
-          "objective"
-        ],
+        "required": ["scenario", "objective"],
         "type": "object"
       },
       "name": "wa.steer_plan",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "steer"
-      ],
+      "tags": ["wa", "robot", "steer"],
       "version": "0.12.0"
     },
     {
@@ -1070,10 +839,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           }
@@ -1082,11 +848,7 @@
       },
       "name": "wa.tx_plan",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "tx"
-      ],
+      "tags": ["wa", "robot", "tx"],
       "version": "0.12.0"
     },
     {
@@ -1101,10 +863,7 @@
           },
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -1118,11 +877,7 @@
       },
       "name": "wa.tx_show",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "tx"
-      ],
+      "tags": ["wa", "robot", "tx"],
       "version": "0.12.0"
     },
     {
@@ -1133,10 +888,7 @@
         "properties": {
           "format": {
             "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
+            "enum": ["json", "toon"],
             "maxLength": 16,
             "type": "string"
           },
@@ -1170,18 +922,12 @@
             "type": "integer"
           }
         },
-        "required": [
-          "pane_id",
-          "pattern"
-        ],
+        "required": ["pane_id", "pattern"],
         "type": "object"
       },
       "name": "wa.wait_for",
       "output_schema": null,
-      "tags": [
-        "wa",
-        "robot"
-      ],
+      "tags": ["wa", "robot"],
       "version": "0.12.0"
     }
   ]

@@ -1500,7 +1500,6 @@ fn parse_mcp_rehearsal_score_surface(surface: Option<&str>) -> Option<RehearsalS
 }
 
 fn resolve_mcp_rehearsal_manifest_path(
-    config: &Config,
     manifest_path: &str,
 ) -> std::result::Result<PathBuf, String> {
     let trimmed = manifest_path.trim();
@@ -1513,18 +1512,76 @@ fn resolve_mcp_rehearsal_manifest_path(
         return Err("manifest_path must be workspace-relative for MCP calls".to_string());
     }
     if path.components().any(|component| {
-        matches!(
+        !matches!(
             component,
-            std::path::Component::ParentDir | std::path::Component::RootDir
+            std::path::Component::Normal(_) | std::path::Component::CurDir
         )
     }) {
         return Err("manifest_path must not traverse outside the workspace".to_string());
     }
+    if !path
+        .components()
+        .any(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("manifest_path must name a file".to_string());
+    }
 
-    let layout = config
-        .workspace_layout(None)
-        .map_err(|error| format!("resolve workspace layout: {error}"))?;
-    Ok(layout.root.join(path))
+    Ok(path.to_path_buf())
+}
+
+const MCP_REHEARSAL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+
+fn read_mcp_rehearsal_manifest(
+    root: &Path,
+    relative: &Path,
+) -> std::result::Result<DemoScenarioManifest, String> {
+    #[cfg(unix)]
+    use cap_fs_ext::OpenOptionsSyncExt;
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use std::io::Read;
+
+    let read = || -> std::io::Result<String> {
+        let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+        let mut components = relative
+            .components()
+            .filter(|part| *part != std::path::Component::CurDir)
+            .peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(std::io::Error::other(
+                    "manifest path must remain within workspace",
+                ));
+            };
+            if components.peek().is_some() {
+                directory = directory.open_dir_nofollow(name)?;
+                continue;
+            }
+            if !directory.symlink_metadata(name)?.is_file() {
+                return Err(std::io::Error::other("manifest must be a regular file"));
+            }
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            options.nonblock(true);
+            let file = directory.open_with(name, &options)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MCP_REHEARSAL_MANIFEST_MAX_BYTES {
+                return Err(std::io::Error::other(
+                    "manifest must be a regular file of at most 1 MiB",
+                ));
+            }
+            let mut raw = String::new();
+            file.take(MCP_REHEARSAL_MANIFEST_MAX_BYTES + 1)
+                .read_to_string(&mut raw)?;
+            if raw.len() as u64 > MCP_REHEARSAL_MANIFEST_MAX_BYTES {
+                return Err(std::io::Error::other("manifest exceeds 1 MiB"));
+            }
+            return Ok(raw);
+        }
+        Err(std::io::Error::other("manifest path must name a file"))
+    };
+    let raw = read().map_err(|error| format!("read workspace manifest: {error}"))?;
+    DemoScenarioManifest::from_json(&raw).map_err(|error| format!("parse manifest: {error}"))
 }
 
 fn load_mcp_rehearsal_manifest(
@@ -1538,11 +1595,11 @@ fn load_mcp_rehearsal_manifest(
         return Ok((manifest, "inline_manifest".to_string()));
     }
 
-    let path = resolve_mcp_rehearsal_manifest_path(config, &params.manifest_path)?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| format!("read manifest {}: {error}", path.display()))?;
-    let manifest = DemoScenarioManifest::from_json(&raw)
-        .map_err(|error| format!("parse manifest {}: {error}", path.display()))?;
+    let path = resolve_mcp_rehearsal_manifest_path(&params.manifest_path)?;
+    let layout = config
+        .workspace_layout(None)
+        .map_err(|error| format!("resolve workspace layout: {error}"))?;
+    let manifest = read_mcp_rehearsal_manifest(&layout.root, &path)?;
     Ok((manifest, params.manifest_path.clone()))
 }
 
@@ -1652,7 +1709,7 @@ impl ToolHandler for WaRehearsalScoreTool {
                 "type": "object",
                 "properties": {
                     "surface": { "type": "string", "enum": ["score", "explain"], "default": "score" },
-                    "manifest_path": { "type": "string", "default": "fixtures/demo-lab/manifest.v1.json", "description": "Workspace-relative demo scenario manifest path" },
+                    "manifest_path": { "type": "string", "default": "fixtures/demo-lab/manifest.v1.json", "description": "Workspace-relative regular JSON file, at most 1 MiB; symlink path components are rejected" },
                     "manifest": { "type": "object", "description": "Inline DemoScenarioManifest object; overrides manifest_path when supplied" },
                     "rehearsal_id": { "type": "string", "default": "rehearsal-demo-manifest" },
                     "scenario_id": { "type": "string", "default": "demo_lab.manifest" }
@@ -7780,26 +7837,6 @@ impl WaAwaitEventTool {
     }
 
     #[cfg(test)]
-    fn new_with_response_delivery_and_completion_handler(
-        db_path: Arc<PathBuf>,
-        response_delivery: Arc<FrameworkResponseDeliveryCoordinator>,
-        completion_handler: McpAwaitEventDeliveryCompletionHandler,
-    ) -> Self {
-        Self {
-            #[cfg(test)]
-            db_path,
-            response_delivery: Some(response_delivery),
-            request_service: None,
-            delivery_completion: Some(Arc::new(
-                McpAwaitEventDeliveryCompletionExecutor::new_with_handler(completion_handler)
-                    .expect("test completion lane must start"),
-            )),
-            blocked_retry_observer: None,
-            iteration_observer: None,
-        }
-    }
-
-    #[cfg(test)]
     fn with_blocked_retry_observer(
         mut self,
         observer: Arc<dyn Fn(usize) + Send + Sync + 'static>,
@@ -8136,6 +8173,11 @@ impl ToolHandler for WaAwaitEventTool {
         #[cfg(test)]
         let iteration_observer = self.iteration_observer.as_ref().map(Arc::clone);
         let request_cx_for_operation = request_cx.clone();
+        #[cfg(test)]
+        let diagnostic_caller = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
         let request_operation: McpAwaitEventRequestOperation = Box::new(move |storage| {
             Box::pin(async move {
                 let mut delivery_leases = Vec::new();
@@ -8150,6 +8192,13 @@ impl ToolHandler for WaAwaitEventTool {
                 }
                 let redactor = crate::redactor::Redactor::new();
                 let started = Instant::now();
+                // First-scan milestones identify whether an unmet timeout
+                // expired before reading, during either read, or before row
+                // processing. Storage emits the inner breakdown for slow reads.
+                #[cfg(test)]
+                let mut diagnostic_first_scan = [None; 4];
+                #[cfg(test)]
+                let mut diagnostic_pages = 0_u64;
                 let timeout = std::time::Duration::from_secs(params.timeout_secs);
                 let poll = std::time::Duration::from_millis(params.poll_interval_ms);
                 // `scan_after_id` is a monotonic query high-watermark. Temporarily
@@ -8439,9 +8488,16 @@ impl ToolHandler for WaAwaitEventTool {
                         since: None,
                         until: None,
                     };
+                    #[cfg(test)]
+                    {
+                        diagnostic_pages += 1;
+                        diagnostic_first_scan[0].get_or_insert_with(|| started.elapsed());
+                    }
                     let page_result = storage
                         .get_events_stream_page_with_cx(&cx, query)
                         .await;
+                    #[cfg(test)]
+                    diagnostic_first_scan[1].get_or_insert_with(|| started.elapsed());
                     mcp_await_event_record_storage_call_health(
                         &storage_reusable,
                         &page_result,
@@ -8484,11 +8540,15 @@ impl ToolHandler for WaAwaitEventTool {
                     )
                     .await;
                     reconciliation?;
+                    #[cfg(test)]
+                    diagnostic_first_scan[2].get_or_insert_with(|| started.elapsed());
                     let checked_through = mcp_await_event_page_checked_through(&page);
                     let batch_len = page.events.len();
                     let mut processed_all_events = true;
 
                     for (event_index, event) in page.events.into_iter().enumerate() {
+                        #[cfg(test)]
+                        diagnostic_first_scan[3].get_or_insert_with(|| started.elapsed());
                         let event_id = event.id;
                         #[cfg(test)]
                         if let Some(observer) = iteration_observer.as_ref() {
@@ -8793,6 +8853,14 @@ impl ToolHandler for WaAwaitEventTool {
                 })
                 }
                 .await;
+                #[cfg(test)]
+                if operation.as_ref().is_ok_and(|data| data.timed_out) {
+                    eprintln!(
+                        "AWAIT_REQUEST_TIMING caller={diagnostic_caller} total_us={} pages={diagnostic_pages} first_scan_us[before_page,after_page,after_retention,first_row]={:?}",
+                        started.elapsed().as_micros(),
+                        diagnostic_first_scan.map(|time| time.map(|time| time.as_micros())),
+                    );
+                }
                 let storage_reusable = storage_reusable.load(Ordering::Acquire);
                 McpAwaitEventRequestTaskOutput::new(operation, delivery_leases, storage_reusable)
             })
@@ -14302,30 +14370,31 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CASS_TIMEOUT_SECS_MAX, CASS_TIMEOUT_SECS_MIN, CompatRuntime,
-        CompatRuntimeBuilder, Config, Content, MAX_MCP_ACCOUNT_SERVICE_BYTES,
+        CompatRuntimeBuilder, Config, Content, DemoScenarioManifest, MAX_MCP_ACCOUNT_SERVICE_BYTES,
         MAX_MCP_CASS_AGENT_FILTER_BYTES, MAX_MCP_CASS_QUERY_BYTES, MAX_MCP_RULES_AGENT_TYPE_BYTES,
         MAX_MCP_RULES_TEST_TEXT_BYTES, MAX_MCP_SEARCH_QUERY_BYTES,
         MAX_MCP_STATE_AGENT_FILTER_BYTES, MAX_MCP_SUBMIT_IDEMPOTENCY_KEY_BYTES,
         MAX_MCP_WAIT_PATTERN_BYTES, MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES,
-        MCP_STATE_FIELD_INPUT_MAX_BYTES, MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE,
-        McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface, RecoverablePanicSite,
-        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool,
-        WaAwaitEventTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaDomTool,
-        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
-        WaMissionAbortTool, WaMissionExplainTool, WaMissionObjectivePlanTool, WaMissionPauseTool,
-        WaMissionResumeTool, WaMissionStateTool, WaOperatingEnvelopeTool, WaRehearsalScoreTool,
-        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
-        WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool,
-        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
-        accounts_refresh_policy_input, audit_mcp_policy_denial_async, authorize_mcp_policy_call,
-        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
-        catch_recoverable, intent_hash_hex, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
-        redact_mcp_pane_state_fields, redact_mcp_pane_text_with_escape_contract,
-        redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
+        MCP_REHEARSAL_MANIFEST_MAX_BYTES, MCP_STATE_FIELD_INPUT_MAX_BYTES,
+        MCP_STATE_FIELD_MAX_BYTES, MCP_STATE_FIELD_OVERSIZE, McpContext, PaneCapabilities,
+        PaneFilterConfig, PolicySurface, RecoverablePanicSite, StorageHandle, Tool, ToolHandler,
+        WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
+        WaCassStatusTool, WaCassViewTool, WaDomTool, WaEventsAnnotateTool, WaEventsLabelTool,
+        WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+        WaMissionObjectivePlanTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+        WaOperatingEnvelopeTool, WaRehearsalScoreTool, WaReleaseTool, WaReservationsTool,
+        WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool,
+        WaSteerPlanTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool,
+        WaWorkflowRunTool, WaWorkflowStatusTool, accounts_refresh_policy_input,
+        audit_mcp_policy_denial_async, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        build_policy_engine_with_shared_rate_limiter, catch_recoverable, intent_hash_hex,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        read_mcp_rehearsal_manifest, redact_mcp_output_secrets, redact_mcp_pane_state_fields,
+        redact_mcp_pane_text_with_escape_contract, redact_mcp_wait_pattern_for_output,
+        resolve_mcp_rehearsal_manifest_path, serialize_mcp_audit_decision_context,
         tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
@@ -15875,7 +15944,12 @@ mod tests {
             false,
             false,
         );
-        let tool = WaAwaitEventTool::new(Arc::clone(&db_path));
+        let tool = WaAwaitEventTool::new_with_response_delivery(
+            Arc::clone(&db_path),
+            Arc::new(super::FrameworkResponseDeliveryCoordinator::default()),
+        );
+        tool.wait_for_delivery_completion_ready_for_test();
+        let stats = tool.request_service.as_ref().unwrap().stats_for_test();
 
         let partial = parse_json_content(
             tool.call(
@@ -15922,6 +15996,13 @@ mod tests {
         assert_eq!(resumed["data"]["timed_out"], false);
         assert_eq!(resumed["data"]["events"][0]["id"], first_event_id);
         assert_eq!(resumed["data"]["events"][1]["id"], second_event_id);
+        let settled =
+            wait_for_completion_stats(&stats, "both shared replay requests", |snapshot| {
+                snapshot.request_jobs_finished == 2
+            });
+        assert_eq!(settled.runtime_initializations, 1);
+        assert_eq!(settled.storage_initializations, 1);
+        assert_eq!(settled.request_admissions, 2);
     }
 
     #[test]
@@ -16361,20 +16442,34 @@ mod tests {
         let event_id = seed_event(db_path.as_ref().as_path());
         let cursor_epoch = event_cursor_epoch(db_path.as_ref().as_path());
         let cursor_scope = await_event_cursor_scope(&["rule:codex.*"], &[], None, false, true);
-        let (worker_started_tx, worker_started_rx) = crossbeam::channel::bounded(1);
-        let (release_worker_tx, release_worker_rx) = crossbeam::channel::bounded(1);
-        let completion_handler: super::McpAwaitEventDeliveryCompletionHandler =
-            Arc::new(move |job| {
-                worker_started_tx.send(()).unwrap();
-                let _ = release_worker_rx.recv_timeout(std::time::Duration::from_secs(5));
-                drop(job);
-            });
-        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
-        let tool = WaAwaitEventTool::new_with_response_delivery_and_completion_handler(
-            Arc::clone(&db_path),
-            Arc::clone(&response_delivery),
-            completion_handler,
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let service = Arc::new(
+            super::McpAwaitEventDeliveryCompletionExecutor::new_with_completion_stall_for_test(
+                Arc::clone(&db_path),
+                Arc::clone(&stall),
+            )
+            .expect("shared await service with completion gate must start"),
         );
+        let stats = service.stats_for_test();
+        let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let tool = WaAwaitEventTool {
+            db_path: Arc::clone(&db_path),
+            response_delivery: Some(Arc::clone(&response_delivery)),
+            request_service: Some(Arc::clone(&service)),
+            delivery_completion: Some(service),
+            blocked_retry_observer: None,
+            iteration_observer: None,
+        };
+        // Release before the service drops, including assertion unwinds, so
+        // this fixture cannot leave a runtime worker parked indefinitely.
+        struct CompletionGateGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CompletionGateGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let gate_guard = CompletionGateGuard(Arc::clone(&stall));
+        tool.wait_for_delivery_completion_ready_for_test();
 
         let claimed = parse_json_content(
             tool.call(
@@ -16401,9 +16496,17 @@ mod tests {
             response_delivery_for_thread.fail_all();
             completion_returned_tx.send(()).unwrap();
         });
-        worker_started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("completion worker did not receive the queued job");
+        let gate_wait_started = std::time::Instant::now();
+        while stats.snapshot().completion_stalls != 1
+            && gate_wait_started.elapsed() < std::time::Duration::from_secs(1)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            stats.snapshot().completion_stalls,
+            1,
+            "shared completion did not reach its gate within one second"
+        );
         completion_returned_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("transport completion waited for the deliberately blocked completion handler");
@@ -16426,7 +16529,39 @@ mod tests {
             checkpoint["data"]["bootstrap_state"],
             "storage_tail_checkpoint"
         );
-        release_worker_tx.send(()).unwrap();
+        let blocked =
+            wait_for_completion_stats(&stats, "both shared requests completed", |snapshot| {
+                snapshot.request_jobs_finished == 2
+            });
+        assert!(stall.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(blocked.completion_attempts_finished, 0);
+        assert_eq!(blocked.runtime_initializations, 1);
+        assert_eq!(blocked.storage_initializations, 1);
+        assert_eq!(blocked.request_admissions, 2);
+
+        drop(gate_guard);
+        let finalized =
+            wait_for_completion_stats(&stats, "real failed-delivery lease release", |snapshot| {
+                snapshot.completion_attempts_finished == 1
+            });
+        assert_eq!(finalized.completion_attempts_storage_reusable, 1);
+        assert_eq!(finalized.completion_attempts_storage_unusable, 0);
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(probe_lease) = reservation
+            else {
+                panic!("real completion must release the claimed event, got {reservation:?}");
+            };
+            assert!(storage.release_event_delivery(&probe_lease).await.unwrap());
+            storage.shutdown().await.unwrap();
+        });
     }
 
     #[test]
@@ -18260,6 +18395,7 @@ mod tests {
         );
         let mut cancelled_requests = 0_usize;
         let mut rejected_requests = 0_usize;
+        let mut waiter_cancellations = 0_u64;
         for doomed_request in doomed_requests {
             let (request_result, request_leases) = doomed_request
                 .join()
@@ -18269,8 +18405,17 @@ mod tests {
             let error =
                 request_result.expect_err("epoch-stopped gated request returns a typed error");
             if error.message.starts_with("cancelled:invalidated-epoch-") {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
+                cancelled_requests = cancelled_requests.saturating_add(1);
+            } else if error.code == MCP_ERR_TIMEOUT {
+                // Epoch invalidation cancels the Cx shared by the task and
+                // its response waiter. Either may observe cancellation first;
+                // the waiter returns the canonical envelope, not our label.
+                assert_eq!(error.message, "Request timed out or was cancelled");
+                waiter_cancellations = waiter_cancellations.saturating_add(1);
                 cancelled_requests = cancelled_requests.saturating_add(1);
             } else {
+                assert_eq!(error.code, MCP_ERR_CONFIG);
                 assert!(
                     error
                         .message
@@ -18351,6 +18496,7 @@ mod tests {
         assert_eq!(stopped.request_jobs_cancelled_for_shutdown, 0);
         assert_eq!(stopped.request_jobs_rejected_for_epoch, 1);
         assert_eq!(stopped.request_jobs_rejected_for_shutdown, 0);
+        assert_eq!(stopped.request_waiter_cancellations, waiter_cancellations);
 
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -19392,15 +19538,40 @@ mod tests {
                     .await
                     .unwrap()
             );
+            let reservation = storage
+                .reserve_event_delivery(event_id, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            let crate::storage::EventDeliveryReservation::Acquired(probe_lease) = reservation
+            else {
+                panic!("stale finalization must leave durable retryability: {reservation:?}");
+            };
+            assert!(
+                storage.release_event_delivery(&probe_lease).await.unwrap(),
+                "release the exact probe token before the unchanged await request"
+            );
             storage.shutdown().await.unwrap();
         });
 
         let response_delivery = Arc::new(super::FrameworkResponseDeliveryCoordinator::default());
+        let page_scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed_page_scans = Arc::clone(&page_scans);
         let tool = WaAwaitEventTool::new_with_response_delivery(
             Arc::clone(&db_path),
             Arc::clone(&response_delivery),
-        );
+        )
+        .with_iteration_observer(Arc::new(move |phase, scanned_event_id| {
+            if phase == super::McpAwaitEventIterationPhase::PageScan && scanned_event_id == event_id
+            {
+                observed_page_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
         tool.wait_for_delivery_completion_ready_for_test();
+        let completion_stats = tool
+            .delivery_completion
+            .as_ref()
+            .expect("claim-completion executor must exist")
+            .stats_for_test();
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -19417,6 +19588,13 @@ mod tests {
             .expect("event must remain retryable after stale-token finalization returns false"),
         );
         assert_eq!(envelope["ok"], true, "unexpected envelope: {envelope}");
+        assert_eq!(
+            envelope["data"]["satisfied"],
+            true,
+            "retryable event was not satisfied; envelope={envelope}; page_scans={}; service={:?}",
+            page_scans.load(std::sync::atomic::Ordering::Relaxed),
+            completion_stats.snapshot(),
+        );
         assert_eq!(envelope["data"]["final_cursor"], 0);
         assert_eq!(envelope["data"]["candidate_cursor"], event_id);
         assert_eq!(envelope["data"]["pending_finalize"], true);
@@ -19961,6 +20139,87 @@ mod tests {
             explain["data"]["selected_item"]["recommended_action"]["mutates"],
             false
         );
+    }
+
+    #[test]
+    fn rehearsal_manifest_file_read_is_bounded_and_validated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("manifests")).unwrap();
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/demo-lab/manifest.v1.json"
+        ));
+        let path = root.path().join("manifests/valid.json");
+        std::fs::write(&path, fixture).unwrap();
+        let relative = resolve_mcp_rehearsal_manifest_path("./manifests/valid.json").unwrap();
+        let loaded = read_mcp_rehearsal_manifest(root.path(), &relative).unwrap();
+        assert_eq!(loaded, DemoScenarioManifest::from_json(fixture).unwrap());
+        assert!(resolve_mcp_rehearsal_manifest_path("../outside.json").is_err());
+        for invalid in ["", "   ", ".", "./"] {
+            assert!(resolve_mcp_rehearsal_manifest_path(invalid).is_err());
+        }
+        assert!(resolve_mcp_rehearsal_manifest_path(&path.to_string_lossy()).is_err());
+        assert!(read_mcp_rehearsal_manifest(root.path(), Path::new("manifests")).is_err());
+        let oversized = root.path().join("oversized.json");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MCP_REHEARSAL_MANIFEST_MAX_BYTES + 1)
+            .unwrap();
+        assert!(
+            read_mcp_rehearsal_manifest(root.path(), Path::new("oversized.json"))
+                .unwrap_err()
+                .contains("at most 1 MiB")
+        );
+        std::fs::write(root.path().join("invalid.json"), "not JSON").unwrap();
+        assert!(read_mcp_rehearsal_manifest(root.path(), Path::new("invalid.json")).is_err());
+    }
+
+    // rustix 1.1.4 exposes mkfifoat on Linux, but not Apple targets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rehearsal_manifest_rejects_fifo_without_opening_a_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(root.path()).unwrap();
+        rustix::fs::mkfifoat(
+            &directory,
+            "manifest.json",
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let error =
+            read_mcp_rehearsal_manifest(root.path(), Path::new("manifest.json")).unwrap_err();
+        assert!(error.contains("manifest must be a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rehearsal_manifest_rejects_outside_file_and_directory_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("manifest.json"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/demo-lab/manifest.v1.json"
+            )),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("manifest.json"),
+            root.path().join("file.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("directory")).unwrap();
+        for path in ["file.json", "directory/manifest.json"] {
+            let relative = resolve_mcp_rehearsal_manifest_path(path).unwrap();
+            assert!(
+                read_mcp_rehearsal_manifest(root.path(), &relative).is_err(),
+                "symlink escaped capability: {path}"
+            );
+        }
+        // The outside payload itself is valid; refusal is a filesystem
+        // authority decision rather than a JSON parsing failure.
+        assert!(read_mcp_rehearsal_manifest(outside.path(), Path::new("manifest.json")).is_ok());
     }
 
     #[test]

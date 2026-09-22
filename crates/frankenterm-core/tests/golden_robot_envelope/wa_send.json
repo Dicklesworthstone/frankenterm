@@ -9,10 +9,7 @@
       },
       "format": {
         "description": "Optional output format override for this call",
-        "enum": [
-          "json",
-          "toon"
-        ],
+        "enum": ["json", "toon"],
         "maxLength": 16,
         "type": "string"
       },
@@ -29,12 +26,7 @@
       },
       "submit_level": {
         "description": "Optional SubmitReceipt guarantee level; setting this enables verified-submit receipts",
-        "enum": [
-          "write",
-          "composer",
-          "submitted",
-          "working"
-        ],
+        "enum": ["write", "composer", "submitted", "working"],
         "type": "string"
       },
       "text": {
@@ -64,10 +56,7 @@
         "type": "boolean"
       }
     },
-    "required": [
-      "pane_id",
-      "text"
-    ],
+    "required": ["pane_id", "text"],
     "type": "object"
   },
   "invalid_args_response": {

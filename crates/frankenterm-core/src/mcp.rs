@@ -519,8 +519,9 @@ fn check_refresh_cooldown(
 }
 
 #[cfg(test)]
-fn mcp_test_pane_state_override_slot() -> &'static std::sync::Mutex<HashMap<u64, IpcPaneState>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, IpcPaneState>>> =
+fn mcp_test_pane_state_override_slot()
+-> &'static std::sync::Mutex<HashMap<u64, (IpcPaneState, usize)>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (IpcPaneState, usize)>>> =
         std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -536,7 +537,16 @@ impl Drop for McpTestPaneStateOverrideGuard {
         let mut overrides = mcp_test_pane_state_override_slot()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        overrides.remove(&self.pane_id);
+        // Equal overlapping fixtures share custody. One test completing must
+        // not remove another test's still-live pane state.
+        if let Some((_, owners)) = overrides.get_mut(&self.pane_id) {
+            *owners = owners
+                .checked_sub(1)
+                .expect("fixture guard owns one reference");
+            if *owners == 0 {
+                overrides.remove(&self.pane_id);
+            }
+        }
     }
 }
 
@@ -548,7 +558,20 @@ pub(crate) fn set_mcp_test_pane_state_override(
     let mut overrides = mcp_test_pane_state_override_slot()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    overrides.insert(pane_id, state);
+    match overrides.get_mut(&pane_id) {
+        Some((existing, owners)) => {
+            assert_eq!(
+                existing, &state,
+                "conflicting concurrent MCP pane fixtures need distinct pane IDs"
+            );
+            *owners = owners
+                .checked_add(1)
+                .expect("fixture owner count cannot overflow");
+        }
+        None => {
+            overrides.insert(pane_id, (state, 1));
+        }
+    }
     McpTestPaneStateOverrideGuard { pane_id }
 }
 
@@ -558,7 +581,7 @@ fn mcp_test_pane_state_override(pane_id: u64) -> Option<IpcPaneState> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&pane_id)
-        .cloned()
+        .map(|(state, _)| state.clone())
 }
 
 async fn derive_osc_state_from_storage(
@@ -901,8 +924,8 @@ static MCP_AUDIT_DEADLINE_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of MCP audit-write failures since process load.
 /// Includes storage-write errors (record_mcp_audit), runtime build
 /// failures (record_mcp_audit_sync), storage-open retry exhaustion
-/// (record_mcp_audit_sync), and OS thread-spawn failures
-/// (record_mcp_audit_sync).
+/// (record_mcp_audit_sync), audit worker initialization failures,
+/// rejected queue admissions, oversized payloads, and isolated job panics.
 ///
 /// Forensic verification: `audit_table.row_count + this_counter ==
 /// cumulative_mcp_tool_calls` should hold modulo other audit
@@ -1032,6 +1055,58 @@ async fn record_mcp_audit(
     }
 }
 
+type McpAuditJob = Box<dyn FnOnce() + Send + 'static>;
+
+const MCP_AUDIT_WORKERS: usize = 4;
+const MCP_AUDIT_QUEUE_CAPACITY: usize = 1024;
+const MCP_AUDIT_MAX_JOB_BYTES: usize = 64 * 1024;
+
+fn new_mcp_audit_queue(
+    workers: usize,
+    capacity: usize,
+) -> std::io::Result<crossbeam::channel::Sender<McpAuditJob>> {
+    let (sender, receiver) = crossbeam::channel::bounded::<McpAuditJob>(capacity);
+    for _ in 0..workers {
+        let receiver = receiver.clone();
+        std::thread::Builder::new()
+            .name("ft-mcp-audit".to_string())
+            .spawn(move || {
+                for job in receiver {
+                    // Each job owns its runtime/storage epoch. A panic destroys
+                    // that epoch before this worker accepts another job.
+                    if frankenterm_sigpipe::catch_recoverable(
+                        frankenterm_sigpipe::RecoverablePanicSite::McpAudit,
+                        std::panic::AssertUnwindSafe(job),
+                    )
+                    .is_err()
+                    {
+                        record_mcp_audit_failure();
+                        tracing::warn!("MCP audit job panicked; isolated epoch discarded");
+                    }
+                }
+            })?;
+    }
+    Ok(sender)
+}
+
+fn mcp_audit_queue() -> std::result::Result<crossbeam::channel::Sender<McpAuditJob>, String> {
+    static QUEUE: std::sync::Mutex<Option<crossbeam::channel::Sender<McpAuditJob>>> =
+        std::sync::Mutex::new(None);
+    let mut queue = QUEUE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sender) = queue.as_ref() {
+        return Ok(sender.clone());
+    }
+    // An OS resource shortage must not permanently cache startup failure.
+    // Partial startup has no accepted jobs; dropping its sender stops those
+    // workers and a later call can try to initialize the bounded pool again.
+    let sender = new_mcp_audit_queue(MCP_AUDIT_WORKERS, MCP_AUDIT_QUEUE_CAPACITY)
+        .map_err(|error| error.to_string())?;
+    *queue = Some(sender.clone());
+    Ok(sender)
+}
+
 /// Record an MCP audit entry for tools that have a db_path available.
 ///
 /// Opens a StorageHandle, records the audit, and closes it.
@@ -1075,104 +1150,133 @@ fn record_mcp_audit_sync(
     let spawn_tool_name = tool_name.clone();
     let retry_window = max_retry_duration.unwrap_or_else(|| std::time::Duration::from_secs(10));
 
-    // Spawn a background task to record audit — non-blocking, fire-and-forget
-    if let Err(e) = std::thread::Builder::new()
-        .name("ft-mcp-audit".to_string())
-        .spawn(move || {
-            // ft-7p1bx: route through the canonical runtime_async builder so
-            // this runtime gets a real blocking pool — the bare asupersync
-            // builder ships max_blocking_threads=0, which degrades
-            // spawn_blocking to inline-on-executor execution.
-            use crate::runtime_async::CompatRuntime as _;
-            let rt = match crate::runtime_async::RuntimeBuilder::current_thread().build() {
-                Ok(r) => r,
+    // Bound both retained bytes and execution concurrency. Spawning a runtime
+    // and SQLite schema initialization for every poll created hundreds of
+    // competing writers and starved the requests being audited (ft-aagx6).
+    let job_bytes = summary
+        .len()
+        .saturating_add(db_path_str.len())
+        .saturating_add(tool_name.len())
+        .saturating_add(error_code.as_ref().map_or(0, String::len));
+    if job_bytes > MCP_AUDIT_MAX_JOB_BYTES {
+        record_mcp_audit_failure();
+        tracing::warn!("MCP audit job exceeds bounded payload capacity");
+        return;
+    }
+    let queue = match mcp_audit_queue() {
+        Ok(queue) => queue,
+        Err(error) => {
+            record_mcp_audit_failure();
+            tracing::warn!(%error, "Failed to initialize MCP audit workers");
+            return;
+        }
+    };
+    if let Err(error) = queue.try_send(Box::new(move || {
+        // ft-7p1bx: route through the canonical runtime_async builder so
+        // this runtime gets a real blocking pool — the bare asupersync
+        // builder ships max_blocking_threads=0, which degrades
+        // spawn_blocking to inline-on-executor execution.
+        use crate::runtime_async::CompatRuntime as _;
+        let rt = match crate::runtime_async::RuntimeBuilder::current_thread().build() {
+            Ok(r) => r,
+            Err(e) => {
+                // br-ft-luav8: silent failure point #2.
+                record_mcp_audit_failure();
+                tracing::warn!(
+                    tool = %tool_name,
+                    error = %e,
+                    "Failed to create native asupersync runtime for MCP audit"
+                );
+                return;
+            }
+        };
+        // br-ft-2fjx0: derive the deadline from the caller-
+        // supplied window. checked_add returning None (clock
+        // overflow / degraded clock) falls back to halving
+        // the window until it succeeds or saturates at zero
+        // (one-shot). The previous hardcoded 10s bypassed
+        // the entire window on overflow with no telemetry;
+        // the new path bottom-bounds at "no retries" rather
+        // than "no deadline guard".
+        let retry_deadline = {
+            let mut d = retry_window;
+            let mut deadline = std::time::Instant::now().checked_add(d);
+            let mut overflowed = false;
+            while deadline.is_none() && !d.is_zero() {
+                overflowed = true;
+                d /= 2;
+                deadline = std::time::Instant::now().checked_add(d);
+            }
+            if overflowed {
+                record_mcp_audit_deadline_overflow();
+                tracing::warn!(
+                    tool = %tool_name,
+                    original_window_ms = retry_window.as_millis() as u64,
+                    fallback_window_ms = d.as_millis() as u64,
+                    "br-ft-2fjx0: Instant::now().checked_add overflowed; \
+                     halved retry window until accepted"
+                );
+            }
+            deadline
+        };
+        loop {
+            let storage_open = rt.block_on(async {
+                // Detached audit persistence owns its own runtime, so it must
+                // bootstrap a fresh request-scoped capability context here.
+                let audit_open_cx = crate::cx::for_request();
+                let storage = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await?;
+                record_mcp_audit(
+                    &storage,
+                    &tool_name,
+                    summary.clone(),
+                    decision,
+                    result,
+                    error_code.as_deref(),
+                    elapsed_ms,
+                )
+                .await;
+                // Do not let a completed job leave its writer behind while
+                // the fixed worker starts another database epoch.
+                if let Err(error) = storage.shutdown().await {
+                    tracing::warn!(%error, "MCP audit storage shutdown failed");
+                }
+                Ok::<(), crate::Error>(())
+            });
+            match storage_open {
+                Ok(()) => break,
+                Err(_)
+                    if retry_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() < deadline) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
                 Err(e) => {
-                    // br-ft-luav8: silent failure point #2.
+                    // br-ft-luav8: silent failure point #3
+                    // (storage-open retry exhausted after 10s).
                     record_mcp_audit_failure();
                     tracing::warn!(
                         tool = %tool_name,
                         error = %e,
-                        "Failed to create native asupersync runtime for MCP audit"
+                        "Failed to open storage for MCP audit"
                     );
-                    return;
-                }
-            };
-            // br-ft-2fjx0: derive the deadline from the caller-
-            // supplied window. checked_add returning None (clock
-            // overflow / degraded clock) falls back to halving
-            // the window until it succeeds or saturates at zero
-            // (one-shot). The previous hardcoded 10s bypassed
-            // the entire window on overflow with no telemetry;
-            // the new path bottom-bounds at "no retries" rather
-            // than "no deadline guard".
-            let retry_deadline = {
-                let mut d = retry_window;
-                let mut deadline = std::time::Instant::now().checked_add(d);
-                let mut overflowed = false;
-                while deadline.is_none() && !d.is_zero() {
-                    overflowed = true;
-                    d /= 2;
-                    deadline = std::time::Instant::now().checked_add(d);
-                }
-                if overflowed {
-                    record_mcp_audit_deadline_overflow();
-                    tracing::warn!(
-                        tool = %tool_name,
-                        original_window_ms = retry_window.as_millis() as u64,
-                        fallback_window_ms = d.as_millis() as u64,
-                        "br-ft-2fjx0: Instant::now().checked_add overflowed; \
-                         halved retry window until accepted"
-                    );
-                }
-                deadline
-            };
-            loop {
-                let storage_open = rt.block_on(async {
-                    // Detached audit persistence owns its own runtime, so it must
-                    // bootstrap a fresh request-scoped capability context here.
-                    let audit_open_cx = crate::cx::for_request();
-                    let storage = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await?;
-                    record_mcp_audit(
-                        &storage,
-                        &tool_name,
-                        summary.clone(),
-                        decision,
-                        result,
-                        error_code.as_deref(),
-                        elapsed_ms,
-                    )
-                    .await;
-                    Ok::<(), crate::Error>(())
-                });
-                match storage_open {
-                    Ok(()) => break,
-                    Err(_)
-                        if retry_deadline
-                            .is_some_and(|deadline| std::time::Instant::now() < deadline) =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
-                    Err(e) => {
-                        // br-ft-luav8: silent failure point #3
-                        // (storage-open retry exhausted after 10s).
-                        record_mcp_audit_failure();
-                        tracing::warn!(
-                            tool = %tool_name,
-                            error = %e,
-                            "Failed to open storage for MCP audit"
-                        );
-                        break;
-                    }
+                    break;
                 }
             }
-        })
-    {
-        // br-ft-luav8: silent failure point #4 (OS thread spawn).
+        }
+    })) {
+        // Fire-and-forget callers cannot block on a full audit queue. Retain
+        // the existing explicit audit-loss counter instead of spawning around
+        // the bound or silently discarding an entry.
         record_mcp_audit_failure();
+        let reason = if error.is_full() {
+            "full"
+        } else {
+            "disconnected"
+        };
         tracing::warn!(
             tool = %spawn_tool_name,
-            error = %e,
-            "Failed to spawn MCP audit thread"
+            reason,
+            "MCP audit queue refused entry"
         );
     }
 }
@@ -1187,6 +1291,80 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
+
+    #[test]
+    fn audit_queue_bounds_pending_jobs_and_survives_a_job_panic() {
+        let _guard = audit_counter_test_lock();
+        let queue = new_mcp_audit_queue(1, 2).expect("isolated audit worker");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        queue
+            .try_send(Box::new(move || {
+                entered_tx.send(std::thread::current().id()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }))
+            .unwrap();
+        let worker = entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        queue
+            .try_send(Box::new(|| panic!("isolated audit job failure")))
+            .unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        queue
+            .try_send(Box::new(move || {
+                finished_tx.send(std::thread::current().id()).unwrap();
+            }))
+            .unwrap();
+        assert!(
+            queue
+                .try_send(Box::new(|| panic!("rejected job must never run")))
+                .unwrap_err()
+                .is_full()
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            worker
+        );
+        // Dropping this sole sender signals the isolated worker to exit.
+        drop(queue);
+    }
+
+    #[test]
+    fn equal_mcp_pane_overrides_retain_each_live_owner_in_both_drop_orders() {
+        let pane_id = 4_299;
+        let state = IpcPaneState {
+            pane_id,
+            known: true,
+            observed: Some(true),
+            alt_screen: Some(false),
+            last_status_at: Some(1_700_000_000_000),
+            in_gap: Some(false),
+            cursor_alt_screen: Some(false),
+            reason: None,
+        };
+        for drop_older_first in [true, false] {
+            let older = set_mcp_test_pane_state_override(state.clone());
+            let newer = set_mcp_test_pane_state_override(state.clone());
+            let remaining = if drop_older_first {
+                drop(older);
+                newer
+            } else {
+                drop(newer);
+                older
+            };
+            let visible = mcp_test_pane_state_override(pane_id)
+                .expect("one completing request cannot retire its live peer's fixture");
+            assert_eq!(visible, state);
+            drop(remaining);
+            assert!(mcp_test_pane_state_override(pane_id).is_none());
+        }
+    }
 
     // These tests inspect metadata only; transport tests keep the owning runtime alive.
     fn build_server(config: &Config) -> Result<crate::mcp_framework::FrameworkDeliveryServer> {
@@ -2492,6 +2670,8 @@ mod tests {
     /// owned fields, so the Ok arm is the production path.
     #[test]
     fn mcp_audit_decision_context_happy_path_does_not_bump_counter() {
+        // The round-trip test mutates this same process-wide counter.
+        let _guard = audit_counter_test_lock();
         reset_mcp_audit_decision_context_serde_failure_count_for_test();
         let before = mcp_audit_decision_context_serde_failure_count();
         let json = mcp_audit_decision_context(
@@ -2519,6 +2699,7 @@ mod tests {
     /// shape of mcp_audit_failure_count + reset_mcp_audit_failure_count_for_test.
     #[test]
     fn mcp_audit_decision_context_serde_failure_counter_round_trip() {
+        let _guard = audit_counter_test_lock();
         reset_mcp_audit_decision_context_serde_failure_count_for_test();
         assert_eq!(mcp_audit_decision_context_serde_failure_count(), 0);
         record_mcp_audit_decision_context_serde_failure();

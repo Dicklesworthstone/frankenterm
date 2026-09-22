@@ -2861,6 +2861,9 @@ pub enum SnapshotError {
     #[error("clean-shutdown mark failed after final checkpoint settlement")]
     ShutdownMarkFailed {
         checkpoint: Box<SnapshotResult>,
+        /// Whether the enclosing shutdown wait expired before its receipt.
+        /// This is diagnostic context, not evidence that the mutation failed.
+        wait_boundary_exhausted: bool,
         #[source]
         source: Box<SnapshotError>,
     },
@@ -2945,10 +2948,16 @@ impl std::fmt::Debug for SnapshotError {
                 .debug_struct("ShutdownTimedOut")
                 .field("timeout_ms", timeout_ms)
                 .finish(),
-            Self::ShutdownMarkFailed { checkpoint, source } => formatter
+            Self::ShutdownMarkFailed {
+                checkpoint,
+                wait_boundary_exhausted,
+                source,
+            } => formatter
                 .debug_struct("ShutdownMarkFailed")
                 .field("checkpoint_id", &checkpoint.checkpoint_id)
+                .field("wait_boundary_exhausted", wait_boundary_exhausted)
                 .field("source_class", &source.diagnostic_class())
+                .field("source", source)
                 .finish_non_exhaustive(),
             Self::LockTimedOut { deadline_nanos } => formatter
                 .debug_struct("LockTimedOut")
@@ -4642,13 +4651,43 @@ impl SnapshotEngine {
         E: SnapshotAuthorityWorkFailure + Send + 'static,
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
+        self.spawn_blocking_authority_with_diagnostic(
+            cx,
+            operation,
+            work,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_blocking_authority_with_diagnostic<T, E, F>(
+        &self,
+        cx: &crate::cx::Cx,
+        operation: SnapshotAuthorityOperation,
+        work: F,
+        #[cfg(test)] diagnostic: Option<Arc<ShutdownMarkDiagnostic>>,
+    ) -> std::result::Result<T, SnapshotError>
+    where
+        T: Send + 'static,
+        E: SnapshotAuthorityWorkFailure + Send + 'static,
+        F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
+    {
+        #[cfg(test)]
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 2);
         let attempt = self.try_begin_snapshot_authority(operation)?;
+        #[cfg(test)]
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 3);
         snapshot_cx_checkpoint(cx)?;
 
         let handoff_state = attempt.handoff_state();
         let authority_lifetime = Arc::clone(&attempt.authority);
         let db_path_for_identity_refresh = Arc::clone(&self.db_path);
+        #[cfg(test)]
+        let worker_diagnostic = diagnostic.clone();
         let outcome = crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+            #[cfg(test)]
+            ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 4);
             // Keep the database-keyed authority alive until the queued closure
             // has either suppressed itself or reached terminal return. A new
             // engine must not prune the Weak registry entry while old work can
@@ -4656,11 +4695,16 @@ impl SnapshotEngine {
             let outcome = run_authority_work_if_started(&handoff_state, work);
             match outcome {
                 AuthorityBlockingOutcome::Executed(result) => {
-                    match refresh_snapshot_authority_file_identities(
+                    #[cfg(test)]
+                    ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 11);
+                    let refreshed = refresh_snapshot_authority_file_identities(
                         db_path_for_identity_refresh.as_str(),
                         &authority_lifetime,
                         operation,
-                    ) {
+                    );
+                    #[cfg(test)]
+                    ShutdownMarkDiagnostic::record(worker_diagnostic.as_ref(), 12);
+                    match refreshed {
                         Ok(()) => AuthorityBlockingOutcome::Executed(result),
                         Err(error) => AuthorityBlockingOutcome::IdentityRefreshFailed(error),
                     }
@@ -4669,6 +4713,8 @@ impl SnapshotEngine {
             }
         })
         .await;
+        #[cfg(test)]
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 13);
 
         match outcome {
             Ok(AuthorityBlockingOutcome::Executed(Ok(result))) => {
@@ -6401,6 +6447,14 @@ impl SnapshotEngine {
             return Err(error);
         }
         let mut checkpoint_receipt: Option<SnapshotResult> = None;
+        #[cfg(test)]
+        let boundary_started = std::time::Instant::now();
+        #[cfg(test)]
+        let mark_diagnostic = Arc::new(ShutdownMarkDiagnostic::new(boundary_started));
+        #[cfg(test)]
+        let mut checkpoint_receipt_elapsed = None;
+        #[cfg(test)]
+        let mut mark_entry_elapsed = None;
         let result = crate::runtime_async::timeout_with_cx(cx, timeout, async {
             let reservation = self.reserve_capture_lifecycle(cx).await?;
             // Use the Cx-first capture variant so the inner RwLock
@@ -6418,20 +6472,51 @@ impl SnapshotEngine {
                     Some(&reservation),
                 )
                 .await?;
+            #[cfg(test)]
+            {
+                checkpoint_receipt_elapsed = Some(boundary_started.elapsed());
+            }
             checkpoint_receipt = Some(checkpoint.clone());
 
+            #[cfg(test)]
+            {
+                mark_entry_elapsed = Some(boundary_started.elapsed());
+            }
             if let Err(source) = self
-                .mark_shutdown_with_reservation(cx, &reservation, &checkpoint)
+                .mark_shutdown_with_reservation(
+                    cx,
+                    &reservation,
+                    &checkpoint,
+                    #[cfg(test)]
+                    Some(Arc::clone(&mark_diagnostic)),
+                )
                 .await
             {
                 return Err(SnapshotError::ShutdownMarkFailed {
                     checkpoint: Box::new(checkpoint),
+                    wait_boundary_exhausted: false,
                     source: Box::new(source),
                 });
             }
             Ok(checkpoint)
         })
         .await;
+
+        #[cfg(test)]
+        if !matches!(&result, Ok(Ok(_))) {
+            let elapsed = boundary_started.elapsed();
+            eprintln!(
+                "SNAPSHOT_SHUTDOWN_BOUNDARY total_us={} budget_us={} checkpoint_receipt_us={:?} mark_entry_us={:?} mark_elapsed_us={:?} mark_remaining_budget_us={:?} boundary_exhausted={}",
+                elapsed.as_micros(),
+                timeout.as_micros(),
+                checkpoint_receipt_elapsed.map(|mark| mark.as_micros()),
+                mark_entry_elapsed.map(|mark| mark.as_micros()),
+                mark_entry_elapsed.map(|mark| elapsed.saturating_sub(mark).as_micros()),
+                mark_entry_elapsed.map(|mark| timeout.saturating_sub(mark).as_micros()),
+                result.is_err(),
+            );
+            mark_diagnostic.report();
+        }
 
         match result {
             Ok(Ok(checkpoint)) => {
@@ -6466,6 +6551,7 @@ impl SnapshotEngine {
                 if let Some(checkpoint) = checkpoint_receipt.take() {
                     Err(SnapshotError::ShutdownMarkFailed {
                         checkpoint: Box::new(checkpoint),
+                        wait_boundary_exhausted: true,
                         source: Box::new(source),
                     })
                 } else {
@@ -6508,8 +6594,14 @@ impl SnapshotEngine {
             );
         }
         let reservation = self.reserve_capture_lifecycle(cx).await?;
-        self.mark_shutdown_with_reservation(cx, &reservation, checkpoint)
-            .await
+        self.mark_shutdown_with_reservation(
+            cx,
+            &reservation,
+            checkpoint,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
     async fn mark_shutdown_with_reservation(
@@ -6517,7 +6609,10 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
         reservation: &CaptureShutdownReservation<'_>,
         checkpoint: &SnapshotResult,
+        #[cfg(test)] diagnostic: Option<Arc<ShutdownMarkDiagnostic>>,
     ) -> std::result::Result<(), SnapshotError> {
+        #[cfg(test)]
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 0);
         snapshot_cx_checkpoint(cx)?;
         // Route the session_id read-lock through read_with_cx(cx) so the lock
         // wait honors caller cancellation rather than an ambient context.
@@ -6528,6 +6623,8 @@ impl SnapshotEngine {
                 .map_err(snapshot_lock_error)?
                 .clone()
         };
+        #[cfg(test)]
+        ShutdownMarkDiagnostic::record(diagnostic.as_ref(), 1);
         // The read may have waited behind a first capture. That capture can
         // lose its result, latch reconciliation, and release the session lock
         // without publishing an ID, so recheck before treating `None` as an
@@ -6546,7 +6643,9 @@ impl SnapshotEngine {
         let checkpoint_at = checkpoint.checkpoint_at;
         let state_hash = checkpoint.state_hash.clone();
         let owner_identity = self.owner_identity.clone();
-        self.spawn_blocking_authority_with_cx(
+        #[cfg(test)]
+        let work_diagnostic = diagnostic.clone();
+        self.spawn_blocking_authority_with_diagnostic(
             cx,
             SnapshotAuthorityOperation::ShutdownMark,
             move || {
@@ -6557,8 +6656,12 @@ impl SnapshotEngine {
                     checkpoint_at,
                     &state_hash,
                     owner_identity.as_ref(),
+                    #[cfg(test)]
+                    work_diagnostic.as_ref(),
                 )
             },
+            #[cfg(test)]
+            diagnostic,
         )
         .await?;
 
@@ -8154,6 +8257,48 @@ fn create_session_sync(
     tx.commit()
 }
 
+// Fixed, content-free phase timestamps. The outer shutdown future and blocking
+// worker hold separate Arcs, so timeout diagnostics do not wait for that worker.
+// Zero means not reached; stored elapsed microseconds are offset by one.
+#[cfg(test)]
+struct ShutdownMarkDiagnostic {
+    started: std::time::Instant,
+    phases: [std::sync::atomic::AtomicU64; 14],
+}
+
+#[cfg(test)]
+impl ShutdownMarkDiagnostic {
+    fn new(started: std::time::Instant) -> Self {
+        Self {
+            started,
+            phases: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn record(diagnostic: Option<&Arc<Self>>, phase: usize) {
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.reached(phase);
+        }
+    }
+
+    fn reached(&self, phase: usize) {
+        let elapsed = u64::try_from(self.started.elapsed().as_micros())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        self.phases[phase].store(elapsed, Ordering::Release);
+    }
+
+    fn report(&self) {
+        let elapsed = self
+            .phases
+            .each_ref()
+            .map(|phase| phase.load(Ordering::Acquire).checked_sub(1));
+        eprintln!(
+            "SNAPSHOT_SHUTDOWN_MARK_PHASES elapsed_us={elapsed:?} phase_order=mark_entry,session_read,admission_enter,admission_return,worker_entry,open_enter,open_return,transaction_entered,witness_verified,update_complete,transaction_return,identity_refresh_enter,identity_refresh_return,blocking_receipt"
+        );
+    }
+}
+
 fn mark_shutdown_authoritatively_sync(
     db_path: &str,
     session_id: &str,
@@ -8161,6 +8306,7 @@ fn mark_shutdown_authoritatively_sync(
     checkpoint_at: u64,
     state_hash: &str,
     owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
+    #[cfg(test)] diagnostic: Option<&Arc<ShutdownMarkDiagnostic>>,
 ) -> std::result::Result<(), SnapshotAuthorityDbError> {
     let identity = SnapshotCheckpointIdentity {
         checkpoint_id,
@@ -8170,11 +8316,27 @@ fn mark_shutdown_authoritatively_sync(
         state_hash: state_hash.to_string(),
     };
     let checkpoint_at = u64_to_sqlite_integer(checkpoint_at)?;
+    #[cfg(test)]
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.reached(5);
+    }
     let conn = open_conn(db_path).map_err(SnapshotAuthorityDbError::retry_safe)?;
-    run_snapshot_authority_transaction(&conn, |tx| {
+    #[cfg(test)]
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.reached(6);
+    }
+    let result = run_snapshot_authority_transaction(&conn, |tx| {
+        #[cfg(test)]
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.reached(7);
+        }
         crate::session_retention::ensure_session_authority_tables_have_no_unaudited_triggers(tx)?;
         if !exact_snapshot_checkpoint_is_verified(tx, &identity)? {
             return Err(rusqlite::Error::StatementChangedRows(0));
+        }
+        #[cfg(test)]
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.reached(8);
         }
         let updated = tx.execute(
             "UPDATE mux_sessions AS session
@@ -8222,8 +8384,18 @@ fn mark_shutdown_authoritatively_sync(
                 owner_identity.map(|identity| identity.process_start),
             ],
         )?;
-        require_exactly_one_changed_row(updated)
-    })
+        require_exactly_one_changed_row(updated)?;
+        #[cfg(test)]
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.reached(9);
+        }
+        Ok(())
+    });
+    #[cfg(test)]
+    if let Some(diagnostic) = diagnostic {
+        diagnostic.reached(10);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -8240,6 +8412,7 @@ fn mark_shutdown_sync(
         checkpoint_id,
         checkpoint_at,
         state_hash,
+        None,
         None,
     )
     .map_err(SnapshotAuthorityDbError::into_primary_source)

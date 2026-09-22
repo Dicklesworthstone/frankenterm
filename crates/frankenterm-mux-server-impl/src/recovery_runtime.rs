@@ -144,11 +144,17 @@ fn open_authority(
             namespace_id: options.recovery_namespace.context("missing namespace")?,
             policy_id: options.recovery_policy.context("missing policy")?,
         },
-    )?;
+    )
+    .inspect_err(|_| {
+        log::error!("mux recovery authority rejection stage=key_enrollment");
+    })?;
     let store = SnapshotPublicationStore::open_existing(
         options.recovery_store.as_ref().context("missing store")?,
         PublicationLimits::default(),
-    )?;
+    )
+    .inspect_err(|_| {
+        log::error!("mux recovery authority rejection stage=store_reopen");
+    })?;
     Ok((store, Arc::new(key)))
 }
 
@@ -186,7 +192,7 @@ pub fn load_recovery_for_startup(
     anyhow::ensure!(custody.is_none(), "guardian custody requires Unix");
     let selected = select_verified_recovery_roots_with_cx(cx, &store, &verifier)?;
     anyhow::ensure!(
-        selected.torn_or_rejected.is_empty(),
+        !selected.has_unresolved_authority(),
         "recovery root authority requires reconciliation"
     );
     let current = selected.current.context("no authenticated recovery root")?;
@@ -203,7 +209,32 @@ impl CaptureState {
         restored: Option<&RestoredPredecessor>,
     ) -> anyhow::Result<Self> {
         let (store, key) = open_authority(options, cx)?;
-        let topology = mux.capture_topology_coherent(Default::default())?;
+        let topology = mux
+            .capture_topology_coherent(Default::default())
+            .inspect_err(|error| {
+                // Never format error payloads: tab errors can contain arbitrary
+                // messages and topology errors carry live object identities.
+                let reason = match error {
+                    mux::MuxTopologyCaptureError::UnsupportedDomainPolicy => "domain_policy",
+                    mux::MuxTopologyCaptureError::AuthorityExhausted => "authority_exhausted",
+                    mux::MuxTopologyCaptureError::ConcurrentMutation { .. } => {
+                        "concurrent_mutation"
+                    }
+                    mux::MuxTopologyCaptureError::WindowOrder { .. } => "window_order",
+                    mux::MuxTopologyCaptureError::TabCapture { .. } => "tab_capture",
+                    mux::MuxTopologyCaptureError::TooManyWindows { .. } => "window_limit",
+                    mux::MuxTopologyCaptureError::TooManyTabs { .. } => "tab_limit",
+                    mux::MuxTopologyCaptureError::TooManyPanes { .. } => "pane_limit",
+                    mux::MuxTopologyCaptureError::TreeDepthExceeded { .. } => "tree_depth",
+                    mux::MuxTopologyCaptureError::MissingPaneRegistration(_) => "pane_registration",
+                    mux::MuxTopologyCaptureError::MissingDomain(_) => "missing_domain",
+                    mux::MuxTopologyCaptureError::MissingDurablePaneId(_) => {
+                        "missing_pane_identity"
+                    }
+                    mux::MuxTopologyCaptureError::NilDurablePaneId(_) => "nil_pane_identity",
+                };
+                log::error!("mux recovery authority rejection stage=topology reason={reason}");
+            })?;
         let mut state = Self {
             store,
             key,
@@ -222,7 +253,11 @@ impl CaptureState {
                 existing_guardian_custody: custody,
             },
         };
-        state.select_predecessor_with_restore(cx, None, restored)?;
+        state
+            .select_predecessor_with_restore(cx, None, restored)
+            .inspect_err(|_| {
+                log::error!("mux recovery authority rejection stage=predecessor_selection");
+            })?;
         Ok(state)
     }
 
@@ -251,7 +286,7 @@ impl CaptureState {
         let selected = select_verified_recovery_roots_with_cx(cx, &self.store, &verifier)?;
         // Never silently fall back past corruption and overwrite a newer root.
         anyhow::ensure!(
-            selected.torn_or_rejected.is_empty(),
+            !selected.has_unresolved_authority(),
             "recovery root authority requires reconciliation"
         );
         match selected.current {
@@ -623,6 +658,18 @@ mod tests {
         while !done(controller) {
             controller.poll(true);
             executor.try_tick().unwrap();
+            // Expected rejection tests satisfy `done` on terminal failure;
+            // successful-publication tests must not turn rejection into a
+            // misleading scheduling timeout.
+            assert!(
+                done(controller) || !controller.failed,
+                "recovery became terminal before the requested state: settled={} next_generation={:?}",
+                controller.is_settled(),
+                controller
+                    .state
+                    .as_ref()
+                    .map(|state| state.identity.generation),
+            );
             assert!(Instant::now() < deadline, "owned capture did not settle");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -652,7 +699,7 @@ mod tests {
         );
         let selection =
             select_verified_recovery_roots_with_cx(&cx::for_request(), &store, &verifier).unwrap();
-        assert!(selection.torn_or_rejected.is_empty());
+        assert!(!selection.has_unresolved_authority());
         selection.current.unwrap()
     }
 
@@ -769,7 +816,7 @@ mod tests {
 
         let _serial = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         let executor = promise::spawn::SimpleExecutor::new();
-        for superseded in [false, true] {
+        for (superseded, damaged) in [(false, false), (false, true), (true, false), (true, true)] {
             let (directory, options) = prepared();
             let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("retained-empty").unwrap());
             let original = Arc::new(mux::Mux::new(Some(domain)));
@@ -779,7 +826,137 @@ mod tests {
             pump_until(&mut predecessor, &executor, |c| {
                 c.state.as_ref().is_some_and(|s| s.identity.generation == 2)
             });
+            if damaged {
+                let path = options
+                    .recovery_store
+                    .as_ref()
+                    .unwrap()
+                    .join("roots/slot_a.root");
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(&path, bytes).unwrap();
+                let (store, key) = open_authority(&options, &cx::for_request()).unwrap();
+                let verifier = WholeMuxRecoveryVerifier::new_production(
+                    key,
+                    WholeMuxTrustedIdentityConfig::new(options.recovery_root_id.unwrap())
+                        .with_session_id(options.recovery_session.as_ref().unwrap()),
+                );
+                let selection =
+                    select_verified_recovery_roots_with_cx(&cx::for_request(), &store, &verifier)
+                        .unwrap();
+                assert_eq!(selection.torn_or_rejected.len(), 1);
+                assert_eq!(selection.torn_or_rejected[0].authority,
+                    frankenterm_core::snapshot_publication::RootDiagnosticAuthority::AuthenticatedReconstruction);
+                assert!(
+                    selection.torn_or_rejected[0]
+                        .reason
+                        .starts_with("corrupt envelope:")
+                );
+                assert!(!selection.has_unresolved_authority());
+                assert_eq!(selection.current.unwrap().generation(), 1);
+                // Authenticated repair must not forgive a filesystem authority failure.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                assert!(load_recovery_for_startup(&options, None, &cx::for_request()).is_err());
+                let zero_evidence_store = SnapshotPublicationStore::open_existing(
+                    options.recovery_store.as_ref().unwrap(),
+                    PublicationLimits {
+                        max_error_records: 0,
+                        ..PublicationLimits::default()
+                    },
+                )
+                .unwrap();
+                let rejected = select_verified_recovery_roots_with_cx(
+                    &cx::for_request(),
+                    &zero_evidence_store,
+                    &verifier,
+                )
+                .unwrap();
+                assert!(rejected.torn_or_rejected.is_empty());
+                assert!(rejected.has_unresolved_authority());
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let repaired = select_verified_recovery_roots_with_cx(
+                    &cx::for_request(),
+                    &zero_evidence_store,
+                    &verifier,
+                )
+                .unwrap();
+                assert!(repaired.torn_or_rejected.is_empty());
+                assert!(!repaired.has_unresolved_authority());
+                assert_eq!(repaired.current.unwrap().generation(), 1);
+                // Reject invalid discovery even though the repair symbols are intact.
+                let discovery = options
+                    .recovery_store
+                    .as_ref()
+                    .unwrap()
+                    .join("generations/slot_a.discovery");
+                let original = std::fs::read(&discovery).unwrap();
+                let mut changed = original.clone();
+                *changed.last_mut().unwrap() ^= 1;
+                std::fs::write(&discovery, changed).unwrap();
+                assert!(load_recovery_for_startup(&options, None, &cx::for_request()).is_err());
+                // An intact ordinary root must not mask invalid discovery when
+                // the caller requests zero retained diagnostic records.
+                let damaged_root = std::fs::read(&path).unwrap();
+                let mut intact_root = damaged_root.clone();
+                intact_root[0] ^= 1;
+                std::fs::write(&path, intact_root).unwrap();
+                let rejected = select_verified_recovery_roots_with_cx(
+                    &cx::for_request(),
+                    &zero_evidence_store,
+                    &verifier,
+                )
+                .unwrap();
+                assert!(
+                    rejected.torn_or_rejected.is_empty() && rejected.has_unresolved_authority()
+                );
+                std::fs::write(&path, &damaged_root).unwrap();
+                std::fs::write(discovery, original).unwrap();
+                // Make a readable generation-2 ordinary envelope containing the
+                // generation-1 encrypted graph; keep valid generation-1 discovery.
+                // The outer checksum is not authority: graph authentication must
+                // reject generation 2 even though older discovery still repairs.
+                use sha2::{Digest, Sha256};
+                let mut intact_root = damaged_root.clone();
+                intact_root[0] ^= 1;
+                let magic_len = frankenterm_core::snapshot_publication::ENVELOPE_MAGIC.len();
+                let header_start = magic_len + 4;
+                let header_len =
+                    u32::from_le_bytes(intact_root[magic_len..header_start].try_into().unwrap())
+                        as usize;
+                let header_end = header_start + header_len;
+                let mut header: frankenterm_core::snapshot_publication::GenerationEnvelopeHeader =
+                    serde_json::from_slice(&intact_root[header_start..header_end]).unwrap();
+                header.generation = 2;
+                let encoded_header = serde_json::to_vec(&header).unwrap();
+                let mut newer = intact_root[..magic_len].to_vec();
+                newer
+                    .extend_from_slice(&u32::try_from(encoded_header.len()).unwrap().to_le_bytes());
+                newer.extend_from_slice(&encoded_header);
+                newer.extend_from_slice(&intact_root[header_end..intact_root.len() - 32]);
+                let checksum = Sha256::digest(&newer);
+                newer.extend_from_slice(&checksum);
+                std::fs::write(&path, newer).unwrap();
+                let rejected =
+                    select_verified_recovery_roots_with_cx(&cx::for_request(), &store, &verifier)
+                        .unwrap();
+                assert_eq!(rejected.current.as_ref().unwrap().generation(), 1);
+                assert!(rejected.has_unresolved_authority());
+                assert!(
+                    rejected
+                        .torn_or_rejected
+                        .iter()
+                        .any(|diagnostic| diagnostic.generation == Some(2)
+                            && diagnostic.reason == "root graph rejected")
+                );
+                assert!(load_recovery_for_startup(&options, None, &cx::for_request()).is_err());
+                std::fs::write(&path, damaged_root).unwrap();
+            }
+            // The damaged case must authenticate real persisted repair data at
+            // startup, then exercise CaptureState::open and two publications
+            // below. Superseded cases must still refuse without writing.
+            let before_load = files(directory.path());
             let source = load_recovery_for_startup(&options, None, &cx::for_request()).unwrap();
+            assert_eq!(files(directory.path()), before_load);
             let source_digest = source.image().image_digest;
             let successor = Arc::new(mux::Mux::new(None));
             let published = crate::guardian_proxy::restore_from_options(

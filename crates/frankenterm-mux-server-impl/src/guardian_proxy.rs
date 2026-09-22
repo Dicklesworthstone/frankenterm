@@ -70,6 +70,52 @@ const GUARDIAN_CONNECT_ATTEMPTS: usize = 32;
 const GUARDIAN_CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const GUARDIAN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+fn wait_for_genesis_retry(started: Instant, attempts: usize) -> bool {
+    let remaining = GUARDIAN_CONNECT_RETRY_BUDGET.saturating_sub(started.elapsed());
+    if attempts >= GUARDIAN_CONNECT_ATTEMPTS || remaining.is_zero() {
+        return false;
+    }
+    let delay = GUARDIAN_CONNECT_RETRY_DELAY
+        .saturating_mul(1_u32 << attempts.saturating_sub(1).min(5))
+        .min(Duration::from_millis(250))
+        .min(remaining);
+    thread::sleep(delay);
+    started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET
+}
+
+fn reconcile_genesis_birth(
+    mut client: GuardianClient,
+    birth: (Uuid, Uuid, Uuid),
+    command: portable_pty::CommandBuilder,
+    size: PtySize,
+    started: Instant,
+    mut reconnect: impl FnMut() -> anyhow::Result<GuardianClient>,
+) -> anyhow::Result<(GuardianClient, GuardianReply)> {
+    let (pane, request, effect) = birth;
+    // The caller already owns the unresolved-birth fence. Every replay uses
+    // the same semantic request, even when its reply was lost after exec.
+    // Connection attempts must not consume this phase's exchange allowance.
+    // This bounds admission of retries; an admitted exchange retains its own
+    // transport timeout, so it is not a hard end-to-end execution deadline.
+    for attempt in 1..=GUARDIAN_CONNECT_ATTEMPTS {
+        anyhow::ensure!(
+            started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
+            "guardian exact birth reconciliation retry admission exhausted"
+        );
+        match client.spawn(pane, request, effect, command.clone(), size) {
+            Ok(reply) => return Ok((client, reply)),
+            Err(GuardianClientError::Io(_)) if wait_for_genesis_retry(started, attempt) => {
+                client =
+                    reconnect().context("reconnect guardian for exact birth reconciliation")?;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("submit guardian birth"));
+            }
+        }
+    }
+    anyhow::bail!("guardian exact birth reconciliation retry admission exhausted")
+}
+
 #[derive(Clone, Copy)]
 struct GuardianRestoreBudget<'a> {
     cx: &'a frankenterm_core::cx::Cx,
@@ -307,19 +353,19 @@ impl Domain for GuardianDomain {
         let result = promise::spawn::spawn_into_new_thread(move || {
             let _admission = admission;
             let started = Instant::now();
-            let mut attempts = 0;
-            let connect = |attempts: &mut usize, expected: Option<Uuid>, before_birth: bool| {
+            let connect = |expected: Option<Uuid>, before_birth: bool| {
+                let mut attempts = 0;
                 loop {
                     anyhow::ensure!(
                         !before_birth || !cancelled.load(Ordering::Acquire),
                         "guardian spawn cancelled before connection"
                     );
                     anyhow::ensure!(
-                        *attempts < GUARDIAN_CONNECT_ATTEMPTS
+                        attempts < GUARDIAN_CONNECT_ATTEMPTS
                             && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
                         "guardian birth connection retry admission exhausted"
                     );
-                    *attempts += 1;
+                    attempts += 1;
                     match GuardianClient::connect_for_genesis(&socket, &token, mux_incarnation) {
                         Ok(client) => {
                             anyhow::ensure!(
@@ -331,11 +377,7 @@ impl Domain for GuardianDomain {
                             return Ok(client);
                         }
                         Err(GuardianClientError::Io(_))
-                            if *attempts < GUARDIAN_CONNECT_ATTEMPTS
-                                && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET =>
-                        {
-                            thread::sleep(GUARDIAN_CONNECT_RETRY_DELAY);
-                        }
+                            if wait_for_genesis_retry(started, attempts) => {}
                         Err(error) => return Err(anyhow::Error::new(error)),
                     }
                 }
@@ -345,8 +387,8 @@ impl Domain for GuardianDomain {
                 .census
                 .as_ref()
                 .map(|census| census.guardian_incarnation());
-            let mut client = connect(&mut attempts, expected_guardian, true)
-                .context("connect guardian for Genesis birth")?;
+            let mut client =
+                connect(expected_guardian, true).context("connect guardian for Genesis birth")?;
             // Establish all avoidable connection state before creating a child.
             let census = {
                 let mut state = state.lock();
@@ -381,15 +423,18 @@ impl Domain for GuardianDomain {
             .context("capture guardian initial terminal model")?;
             let descriptor =
                 GuardianCheckpointDescriptorV1::for_genesis_artifact(effect, &checkpoint)?;
+            let mut stage_attempts = 0;
             loop {
                 anyhow::ensure!(
                     !cancelled.load(Ordering::Acquire),
                     "guardian spawn cancelled before checkpoint staging"
                 );
                 anyhow::ensure!(
-                    attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                    stage_attempts < GUARDIAN_CONNECT_ATTEMPTS
+                        && started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
                     "guardian checkpoint staging retry admission exhausted"
                 );
+                stage_attempts += 1;
                 match client.stage_genesis_checkpoint(
                     effect,
                     descriptor,
@@ -398,13 +443,12 @@ impl Domain for GuardianDomain {
                 ) {
                     Ok(_) => break,
                     Err(GuardianClientError::Io(_))
-                        if attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
+                        if wait_for_genesis_retry(started, stage_attempts) =>
                     {
                         // Begin authenticates an existing candidate and returns
                         // its durable prefix. The helper retains the exact upload
                         // identity, skips that prefix, and ends with Query.
-                        thread::sleep(Duration::from_millis(10));
-                        client = connect(&mut attempts, Some(census.guardian_incarnation()), true)
+                        client = connect(Some(census.guardian_incarnation()), true)
                             .context("reconnect guardian for checkpoint staging")?;
                     }
                     Err(error) => {
@@ -419,39 +463,20 @@ impl Domain for GuardianDomain {
                 "guardian spawn cancelled before birth"
             );
             anyhow::ensure!(
-                attempts < 32 && started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < GUARDIAN_CONNECT_RETRY_BUDGET,
                 "guardian birth retry admission exhausted before Spawn"
             );
             // From this point a lost response may hide a real child. Keep exact
             // identities until ownership has reached the cancellation-safe guard.
             state.lock().unadopted_birth = Some((pane, request, effect));
-            let reply = loop {
-                anyhow::ensure!(
-                    attempts < 32 && started.elapsed() < Duration::from_secs(5),
-                    "guardian exact birth reconciliation retry admission exhausted"
-                );
-                attempts += 1;
-                match client.spawn(pane, request, effect, command.clone(), pty_size) {
-                    Ok(reply) => break reply,
-                    Err(GuardianClientError::Io(_))
-                        if attempts < 32 && started.elapsed() < Duration::from_secs(5) =>
-                    {
-                        // Only replay the identical idempotent request after transport
-                        // loss. Each exchange keeps its own transport timeout; this
-                        // elapsed limit admits retries, not a hard total deadline.
-                        thread::sleep(Duration::from_millis(10));
-                        client = connect(&mut attempts, Some(census.guardian_incarnation()), false)
-                            .context("reconnect guardian for exact birth reconciliation")?;
-                        anyhow::ensure!(
-                            client.guardian_incarnation() == census.guardian_incarnation(),
-                            "guardian incarnation changed during birth reconciliation"
-                        );
-                    }
-                    Err(error) => {
-                        return Err(anyhow::Error::new(error).context("submit guardian birth"));
-                    }
-                }
-            };
+            let (client, reply) = reconcile_genesis_birth(
+                client,
+                (pane, request, effect),
+                command,
+                pty_size,
+                started,
+                || connect(Some(census.guardian_incarnation()), false),
+            )?;
             anyhow::ensure!(
                 reply
                     == (GuardianReply::Spawned {
@@ -12147,7 +12172,9 @@ mod tests {
             GuardianResponseEnvelope, GuardianSecret, decode_guardian_request,
             encode_guardian_response,
         };
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
         use std::os::unix::net::{UnixListener, UnixStream};
 
         // Authenticated wire fault injection, not a PTY/custody proof. The
@@ -12296,6 +12323,203 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(server.join().unwrap(), expected_attempts);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn genesis_exact_birth_reconciliation_paces_busy_wire_without_new_identity() {
+        use mux::guardian_protocol::{
+            GUARDIAN_MAX_FRAME_BYTES, GuardianHelloBuildIdentityV1, GuardianOperation,
+            GuardianResponseEnvelope, GuardianSecret, decode_guardian_request,
+            encode_guardian_response,
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+        #[cfg(unix)]
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        fn receive(stream: &mut UnixStream) -> Vec<u8> {
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let length = u32::from_be_bytes(prefix) as usize;
+            assert!(length + 4 <= GUARDIAN_MAX_FRAME_BYTES);
+            let mut frame = vec![0; length + 4];
+            frame[..4].copy_from_slice(&prefix);
+            stream.read_exact(&mut frame[4..]).unwrap();
+            frame
+        }
+
+        for case in ["busy-then-ready", "exhausted", "rejected"] {
+            let directory = tempfile::Builder::new()
+                .prefix("ft-genesis-retry-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+                .unwrap()
+                .keep();
+            let socket = directory.join("guardian.sock");
+            let token = directory.join("token");
+            frankenterm_pty_guardian::provision_guardian_token(&token).unwrap();
+            let secret =
+                GuardianSecret::from_bytes(std::fs::read(&token).unwrap().try_into().unwrap())
+                    .unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let guardian = Uuid::new_v4();
+            let owner = Uuid::new_v4();
+            let pane = Uuid::new_v4();
+            let request = Uuid::new_v4();
+            let effect = Uuid::new_v4();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                let mut first_spawn = None;
+                let mut payload = None;
+                let mut exchanges = 0;
+                while !server_stop.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "bounded Genesis wire server");
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("Genesis accept: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let hello = decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
+                    assert_eq!(hello.header().operation, GuardianOperation::Hello);
+                    assert_eq!(hello.header().mux_incarnation, owner);
+                    assert_eq!(
+                        hello.payload(),
+                        GuardianHelloBuildIdentityV1::for_compiled_mux()
+                            .unwrap()
+                            .encode()
+                    );
+                    let response = GuardianResponseEnvelope::reply(
+                        &hello,
+                        &GuardianReply::Hello {
+                            guardian_incarnation: guardian,
+                        },
+                    )
+                    .unwrap();
+                    stream
+                        .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                        .unwrap();
+                    let spawn = decode_guardian_request(&secret, &receive(&mut stream)).unwrap();
+                    assert_eq!(spawn.header().operation, GuardianOperation::Spawn);
+                    assert_eq!(spawn.header().mux_incarnation, owner);
+                    assert_eq!(spawn.header().pane_id, Some(pane));
+                    assert_eq!(spawn.header().request_id, request);
+                    assert_eq!(spawn.header().effect_id, Some(effect));
+                    if let Some(expected) = &payload {
+                        assert_eq!(spawn.payload(), expected);
+                    } else {
+                        payload = Some(spawn.payload().to_vec());
+                    }
+                    exchanges += 1;
+                    let first = first_spawn.get_or_insert_with(Instant::now);
+                    // Model the real protocol-owned worker's EOF busy fence.
+                    // The first exchange represents an already-applied birth;
+                    // only its identical receipt can later become available.
+                    if case == "exhausted"
+                        || (case == "busy-then-ready"
+                            && first.elapsed() < Duration::from_millis(600))
+                    {
+                        continue;
+                    }
+                    let response = if case == "rejected" {
+                        GuardianResponseEnvelope::rejection(
+                            &spawn,
+                            GuardianRejectionCode::InvalidRequest,
+                        )
+                    } else {
+                        GuardianResponseEnvelope::reply(
+                            &spawn,
+                            &GuardianReply::Spawned {
+                                pane_id: pane,
+                                generation: 0,
+                            },
+                        )
+                        .unwrap()
+                    };
+                    stream
+                        .write_all(&encode_guardian_response(&secret, &response).unwrap())
+                        .unwrap();
+                    break;
+                }
+                exchanges
+            });
+            let connect = || {
+                let client = GuardianClient::connect_for_genesis(&socket, &token, owner)?;
+                anyhow::ensure!(
+                    client.guardian_incarnation() == guardian,
+                    "guardian changed"
+                );
+                Ok(client)
+            };
+            let client = connect().unwrap();
+            let started = if case == "exhausted" {
+                let elapsed = GUARDIAN_CONNECT_RETRY_BUDGET
+                    .checked_sub(Duration::from_millis(200))
+                    .expect("retry budget exceeds the remaining test window");
+                Instant::now()
+                    .checked_sub(elapsed)
+                    .expect("monotonic clock supports the retry test interval")
+            } else {
+                Instant::now()
+            };
+            let result = reconcile_genesis_birth(
+                client,
+                (pane, request, effect),
+                portable_pty::CommandBuilder::new("/bin/sh"),
+                PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                started,
+                connect,
+            );
+            stop.store(true, Ordering::Release);
+            let exchanges = server.join().unwrap();
+            match case {
+                "busy-then-ready" => {
+                    let (_, reply) = result
+                        .expect("same birth receipt becomes available within existing budget");
+                    assert_eq!(
+                        reply,
+                        GuardianReply::Spawned {
+                            pane_id: pane,
+                            generation: 0
+                        }
+                    );
+                    assert!(exchanges > 1 && exchanges < GUARDIAN_CONNECT_ATTEMPTS);
+                }
+                "exhausted" => {
+                    assert!(result.is_err());
+                    assert!(started.elapsed() >= GUARDIAN_CONNECT_RETRY_BUDGET);
+                    assert!(exchanges > 0 && exchanges < GUARDIAN_CONNECT_ATTEMPTS);
+                }
+                "rejected" => {
+                    assert!(matches!(
+                        result.err().unwrap().downcast_ref::<GuardianClientError>(),
+                        Some(GuardianClientError::Rejected(
+                            GuardianRejectionCode::InvalidRequest
+                        ))
+                    ));
+                    assert_eq!(exchanges, 1);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 

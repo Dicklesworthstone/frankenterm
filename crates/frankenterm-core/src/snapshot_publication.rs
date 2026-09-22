@@ -439,12 +439,22 @@ pub struct ObjectPublicationReceipt {
     pub was_already_present: bool,
 }
 
+/// Only a decoded, authenticated reconstruction can resolve envelope corruption.
+/// All other authority diagnostics remain blocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootDiagnosticAuthority {
+    Unresolved,
+    EnvelopeCorruption,
+    AuthenticatedReconstruction,
+}
+
 /// Diagnostic for a root slot candidate that was torn, corrupted, or rejected by verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TornRootDiagnostic {
     pub slot: RootSlot,
     pub generation: Option<u64>,
     pub reason: String,
+    pub authority: RootDiagnosticAuthority,
 }
 
 /// Result of evaluating root slot candidates with an independent verifier.
@@ -456,8 +466,16 @@ pub struct VerifiedRootSelection<T> {
     pub previous: Option<T>,
     /// Candidates that were torn, corrupted, or failed verifier inspection.
     pub torn_or_rejected: Vec<TornRootDiagnostic>,
+    /// Authority is computed before bounded diagnostic evidence is truncated.
+    pub(crate) unresolved_authority: bool,
 }
 
+impl<T> VerifiedRootSelection<T> {
+    #[must_use]
+    pub fn has_unresolved_authority(&self) -> bool {
+        self.unresolved_authority
+    }
+}
 // =============================================================================
 // Verifier Trait
 // =============================================================================
@@ -2171,6 +2189,7 @@ impl SnapshotPublicationStore {
                                 slot,
                                 generation: None,
                                 reason: format!("security validation failed: {e}"),
+                                authority: RootDiagnosticAuthority::Unresolved,
                             });
                             continue;
                         }
@@ -2181,6 +2200,7 @@ impl SnapshotPublicationStore {
                         diagnostics.push(TornRootDiagnostic {
                             slot,
                             generation: None,
+                            authority: RootDiagnosticAuthority::Unresolved,
                             reason: format!(
                                 "slot file length {file_len} exceeds envelope limit of {max_envelope_bytes}"
                             ),
@@ -2200,6 +2220,7 @@ impl SnapshotPublicationStore {
                                 slot,
                                 generation: None,
                                 reason: format!("failed to read slot file: {e}"),
+                                authority: RootDiagnosticAuthority::Unresolved,
                             });
                             continue;
                         }
@@ -2216,6 +2237,7 @@ impl SnapshotPublicationStore {
                             slot,
                             generation: None,
                             reason: format!("corrupt envelope: {e}"),
+                            authority: RootDiagnosticAuthority::EnvelopeCorruption,
                         }),
                     }
                 }
@@ -2227,6 +2249,7 @@ impl SnapshotPublicationStore {
                         slot,
                         generation: None,
                         reason: format!("failed to open root slot: {e}"),
+                        authority: RootDiagnosticAuthority::Unresolved,
                     });
                 }
             }
@@ -2262,6 +2285,7 @@ impl SnapshotPublicationStore {
                         slot: candidate.slot,
                         generation: Some(candidate.generation),
                         reason: "independent verifier rejected candidate".to_owned(),
+                        authority: RootDiagnosticAuthority::Unresolved,
                     });
                 }
             }
@@ -2279,6 +2303,7 @@ impl SnapshotPublicationStore {
         let current = entries.next().map(|entry| entry.2);
         let previous = entries.next().map(|entry| entry.2);
 
+        let unresolved_authority = !diagnostics.is_empty();
         if diagnostics.len() > self.limits.max_error_records {
             diagnostics.truncate(self.limits.max_error_records);
         }
@@ -2287,6 +2312,7 @@ impl SnapshotPublicationStore {
             current,
             previous,
             torn_or_rejected: diagnostics,
+            unresolved_authority,
         })
     }
 
@@ -2874,6 +2900,7 @@ impl SnapshotPublicationStore {
                     slot,
                     generation: None,
                     reason: error.to_string(),
+                    authority: RootDiagnosticAuthority::Unresolved,
                 }),
             }
         }
@@ -2883,7 +2910,8 @@ impl SnapshotPublicationStore {
                 generation: discoveries[0].generation,
             });
         }
-        diagnostics.truncate(self.limits.max_error_records);
+        // Two fixed slots bound this intermediate evidence. Selection computes
+        // authority before applying the caller's diagnostic retention limit.
         Ok((discoveries, diagnostics))
     }
 

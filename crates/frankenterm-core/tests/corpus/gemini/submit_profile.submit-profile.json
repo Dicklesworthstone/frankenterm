@@ -9,21 +9,9 @@
     "crash_to_shell"
   ],
   "samples": {
-    "composer_nonempty": [
-      "Gemini",
-      "Press Enter to send",
-      "Ctrl+J"
-    ],
-    "composer_cleared": [
-      "Responding with gemini-",
-      "Using model",
-      "Interaction Summary"
-    ],
-    "working_state": [
-      "Responding with gemini-",
-      "Using model",
-      "Tool Calls:"
-    ],
+    "composer_nonempty": ["Gemini", "Press Enter to send", "Ctrl+J"],
+    "composer_cleared": ["Responding with gemini-", "Using model", "Interaction Summary"],
+    "working_state": ["Responding with gemini-", "Using model", "Tool Calls:"],
     "queued_behind_operation": [
       "authorize this app",
       "complete authentication",

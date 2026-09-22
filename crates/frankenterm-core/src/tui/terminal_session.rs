@@ -748,6 +748,9 @@ mod tests {
 
     #[test]
     fn session_guard_into_inner_calls_leave() {
+        let _lock = super::super::output_gate::tests::GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = MockTerminalSession::new();
         let guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
         assert_eq!(guard.phase(), SessionPhase::Active);
@@ -863,6 +866,9 @@ mod tests {
 
     #[test]
     fn session_guard_deref() {
+        let _lock = super::super::output_gate::tests::GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = MockTerminalSession::new();
         let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
         assert_eq!(guard.phase(), SessionPhase::Active);
@@ -937,6 +943,9 @@ mod tests {
 
     #[test]
     fn guard_preserves_screen_mode() {
+        let _lock = super::super::output_gate::tests::GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = MockTerminalSession::new();
         let guard = SessionGuard::enter(session, ScreenMode::Inline { ui_height: 15 }).unwrap();
         assert_eq!(

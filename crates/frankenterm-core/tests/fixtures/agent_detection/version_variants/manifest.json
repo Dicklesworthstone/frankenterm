@@ -3,14 +3,14 @@
   "expected_detected_count": 3,
   "expected_total_count": 9,
   "agents": [
-    {"slug": "claude", "detected": true, "version": "2.1.0"},
-    {"slug": "cline", "detected": false},
-    {"slug": "codex", "detected": true, "version": "0.9.0-beta"},
-    {"slug": "cursor", "detected": true, "version": "0.45.1"},
-    {"slug": "factory", "detected": false},
-    {"slug": "gemini", "detected": false},
-    {"slug": "github-copilot", "detected": false},
-    {"slug": "opencode", "detected": false},
-    {"slug": "windsurf", "detected": false}
+    { "slug": "claude", "detected": true, "version": "2.1.0" },
+    { "slug": "cline", "detected": false },
+    { "slug": "codex", "detected": true, "version": "0.9.0-beta" },
+    { "slug": "cursor", "detected": true, "version": "0.45.1" },
+    { "slug": "factory", "detected": false },
+    { "slug": "gemini", "detected": false },
+    { "slug": "github-copilot", "detected": false },
+    { "slug": "opencode", "detected": false },
+    { "slug": "windsurf", "detected": false }
   ]
 }

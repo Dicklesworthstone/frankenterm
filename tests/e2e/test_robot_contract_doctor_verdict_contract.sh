@@ -106,15 +106,50 @@ def projection_for(verdict)
   }
 end
 
-def validation_errors(verdict, input_path)
+# Validate the declaration and its canonical slot together. This is schema
+# and wiring evidence; execution receipts and signed-bundle verification
+# remain mandatory under the producing-bead closing checklist.
+def qualification_errors(verdict, slot)
+  errors = []
+  contract = verdict["contract"]
+  qualified = contract.is_a?(Hash) ? contract["full_release_qualified"] : nil
+  expected_status = case qualified
+                    when false then "pending_final_qualification"
+                    when true then "pass_with_tracked_exceptions"
+                    end
+  errors << "full_release_qualified" unless expected_status && verdict["overall_status"] == expected_status
+  unless slot.is_a?(Hash) && slot["produced_by_bead"] == "ft-7h5da.13.7"
+    errors << "manifest_qualification"
+    return errors
+  end
+  coherent_slot = if qualified == false
+    slot.key?("path") && slot["path"].nil? &&
+      slot["deferred_to_bead"] == "ft-7h5da.13.7" &&
+      slot["deferred_reason"].is_a?(String) && !slot["deferred_reason"].strip.empty?
+  elsif qualified == true
+    slot["path"] == LIVE_ARTIFACT && slot["deferred_to_bead"].nil? && slot["deferred_reason"].nil?
+  else
+    false
+  end
+  errors << "manifest_qualification" unless coherent_slot
+  errors
+end
+
+def validation_errors(verdict, input_path, live_slot = nil)
   errors = []
 
   errors << "schema_version" unless verdict["schema_version"] == "1.0.0"
   errors << "kind" unless verdict["kind"] == "robot-contract-doctor-attestation"
   errors << "category" unless verdict["category"] == "proofs/robot-contracts"
   errors << "produced_by_bead" unless verdict["produced_by_bead"] == "ft-7h5da.13.7"
-  expected_status = input_path == LIVE_ARTIFACT ? "pending_final_qualification" : "pass_with_tracked_exceptions"
-  errors << "overall_status" unless verdict["overall_status"] == expected_status
+  if input_path == LIVE_ARTIFACT
+    slot = live_slot || read_json(LIVE_MANIFEST).fetch("slots").find do |candidate|
+      candidate["category"] == "proofs/robot-contracts" && candidate["produced_by_bead"] == "ft-7h5da.13.7"
+    end
+    errors.concat(qualification_errors(verdict, slot))
+  else
+    errors << "overall_status" unless verdict["overall_status"] == "pass_with_tracked_exceptions"
+  end
 
   proof_categories = verdict["proof_categories"]
   errors << "proof_categories" unless proof_categories.is_a?(Array) && proof_categories.include?(4)
@@ -136,7 +171,6 @@ def validation_errors(verdict, input_path)
   errors << "tracked_exceptions_are_not_green_claims" unless contract["tracked_exceptions_are_not_green_claims"] == true
   if input_path == LIVE_ARTIFACT
     errors << "partial_cell_count" unless contract["partial_cell_count"] == 0
-    errors << "full_release_qualified" unless contract["full_release_qualified"] == false
   end
 
   boundaries = verdict["claim_boundaries"]
@@ -271,7 +305,7 @@ if repo_file?(LIVE_ARTIFACT)
   live = read_json(LIVE_ARTIFACT)
   assert_valid_verdict(live, LIVE_ARTIFACT)
   live_projection = expected_projection.merge(
-    "overall_status" => "pending_final_qualification",
+    "overall_status" => live.fetch("overall_status"),
     "api_surface_count" => LIVE_SURFACE_COUNT,
     "matrix_surface_count" => LIVE_SURFACE_COUNT,
   )
@@ -286,10 +320,47 @@ if repo_file?(LIVE_ARTIFACT)
     check: "robot_contract_doctor.live_stale_count_negative",
   )
   premature_green = Marshal.load(Marshal.dump(live))
+  premature_green["overall_status"] = "pending_final_qualification"
   premature_green["contract"]["full_release_qualified"] = true
   assert_ok(validation_errors(premature_green, LIVE_ARTIFACT).include?("full_release_qualified"),
     "focused receipts must not claim completed release qualification",
     check: "robot_contract_doctor.live_premature_release_negative")
+
+  # Exercise both states without modifying the live artifact or upgrading
+  # its evidence. These are causal validator controls, not runtime receipts.
+  pending = Marshal.load(Marshal.dump(live))
+  pending["overall_status"] = "pending_final_qualification"
+  pending["contract"]["full_release_qualified"] = false
+  pending_slot = {
+    "path" => nil, "produced_by_bead" => "ft-7h5da.13.7",
+    "deferred_to_bead" => "ft-7h5da.13.7", "deferred_reason" => "Qualification pending",
+  }
+  qualified = Marshal.load(Marshal.dump(pending))
+  qualified["overall_status"] = "pass_with_tracked_exceptions"
+  qualified["contract"]["full_release_qualified"] = true
+  qualified_slot = { "path" => LIVE_ARTIFACT, "produced_by_bead" => "ft-7h5da.13.7" }
+  assert_ok(validation_errors(pending, LIVE_ARTIFACT, pending_slot).empty?,
+    "honest pending qualification must remain accepted",
+    check: "robot_contract_doctor.pending_qualification_positive")
+  assert_ok(validation_errors(qualified, LIVE_ARTIFACT, qualified_slot).empty?,
+    "qualified declaration and resolved canonical slot must agree",
+    check: "robot_contract_doctor.qualified_qualification_positive")
+  [
+    [pending, qualified_slot], [qualified, pending_slot],
+    [qualified, qualified_slot.merge("deferred_to_bead" => "ft-7h5da.13.7")],
+    [qualified, qualified_slot.merge("deferred_reason" => "still pending")],
+    [qualified, qualified_slot.merge("produced_by_bead" => "unrelated")],
+    [pending, pending_slot.merge("deferred_reason" => " ")],
+  ].each_with_index do |(verdict, slot), index|
+    assert_ok(validation_errors(verdict, LIVE_ARTIFACT, slot).include?("manifest_qualification"),
+      "incoherent qualification must not resolve a canonical slot",
+      check: "robot_contract_doctor.qualification_slot_negative.#{index}")
+  end
+  missing_flag = Marshal.load(Marshal.dump(qualified))
+  missing_flag["contract"].delete("full_release_qualified")
+  assert_ok(validation_errors(missing_flag, LIVE_ARTIFACT, qualified_slot).include?("full_release_qualified"),
+    "missing qualification authority must fail closed",
+    check: "robot_contract_doctor.qualification_flag_missing_negative")
 
   # The manifest slot is either populated (producer closed) or explicitly
   # deferred to the producer bead (attestation: defer blocked producer slots).

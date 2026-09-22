@@ -63,10 +63,7 @@
       "format": {
         "description": "Optional output format override for this call",
         "maxLength": 16,
-        "enum": [
-          "json",
-          "toon"
-        ],
+        "enum": ["json", "toon"],
         "type": "string"
       },
       "text": {
@@ -80,9 +77,7 @@
         "type": "boolean"
       }
     },
-    "required": [
-      "text"
-    ],
+    "required": ["text"],
     "type": "object"
   },
   "invalid_format_response": {

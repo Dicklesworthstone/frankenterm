@@ -11,10 +11,7 @@
       },
       "format": {
         "description": "Optional output format override for this call",
-        "enum": [
-          "json",
-          "toon"
-        ],
+        "enum": ["json", "toon"],
         "maxLength": 16,
         "type": "string"
       },

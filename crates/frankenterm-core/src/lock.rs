@@ -51,6 +51,7 @@ pub const MAX_WATCHER_HANDOFF_BYTES: usize = 2048;
 // (ars_federation_payload_serde_drop_count).
 static LOCK_METADATA_ADMISSION_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 static WATCHER_HANDOFF_ADMISSION_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WATCHER_LOCK_RELEASE_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOCK_SIDECAR_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 const LOCK_SIDECAR_CREATE_ATTEMPTS: usize = 8;
 
@@ -67,6 +68,12 @@ pub fn lock_metadata_admission_failure_count() -> u64 {
 #[must_use]
 pub fn watcher_handoff_admission_failure_count() -> u64 {
     WATCHER_HANDOFF_ADMISSION_FAILURE_COUNT.load(AtomicOrdering::Relaxed)
+}
+
+/// Cumulative failed attempts to explicitly release watcher advisory locks.
+#[must_use]
+pub fn watcher_lock_release_failure_count() -> u64 {
+    WATCHER_LOCK_RELEASE_FAILURE_COUNT.load(AtomicOrdering::Relaxed)
 }
 
 /// Test helper: reset the counter so regression tests can assert
@@ -144,10 +151,59 @@ fn require_external_advisory_lock(
     file: &File,
     phase: &'static str,
 ) -> Result<(), LockSidecarReadFailure> {
-    match file.try_lock_exclusive() {
+    // Only an exclusive holder is authority. Shared observation locks must
+    // coexist so one observer cannot impersonate a holder to another.
+    match FileExt::try_lock_shared(file) {
         Err(error) if is_lock_contended(&error) => Ok(()),
-        Ok(()) => Err(LockSidecarReadFailure::new(phase, "holder_binding_missing")),
+        Ok(()) => {
+            release_advisory_lock(file, "metadata_probe_unlock")?;
+            Err(LockSidecarReadFailure::new(phase, "holder_binding_missing"))
+        }
         Err(error) => Err(stable_io_failure(phase, &error)),
+    }
+}
+
+fn release_advisory_lock(file: &File, phase: &'static str) -> Result<(), LockSidecarReadFailure> {
+    FileExt::unlock(file).map_err(|error| {
+        WATCHER_LOCK_RELEASE_FAILURE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        stable_io_failure(phase, &error)
+    })
+}
+
+/// Releases an acquired lock if construction fails before its owner is built.
+/// Closing a File is insufficient when a concurrent fork inherited its handle.
+#[must_use]
+struct AdvisoryUnlockOnDrop<'a> {
+    file: Option<&'a File>,
+    phase: &'static str,
+}
+
+impl<'a> AdvisoryUnlockOnDrop<'a> {
+    fn new(file: &'a File, phase: &'static str) -> Self {
+        Self {
+            file: Some(file),
+            phase,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.file = None;
+    }
+}
+
+impl Drop for AdvisoryUnlockOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file
+            && let Err(failure) = release_advisory_lock(file, self.phase)
+        {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-kullz",
+                phase = failure.phase,
+                kind = failure.kind,
+                "watcher lock construction cleanup failed"
+            );
+        }
     }
 }
 
@@ -557,13 +613,21 @@ enum OpenedLockReprobe {
 fn reprobe_opened_lock(
     opened: &OpenedLockLeaf,
 ) -> Result<OpenedLockReprobe, LockSidecarReadFailure> {
-    let outcome = match opened.file.try_lock_exclusive() {
-        Ok(()) => OpenedLockReprobe::Free,
-        Err(error) if is_lock_contended(&error) => OpenedLockReprobe::Held,
-        Err(error) => return Err(stable_io_failure("lock_reprobe", &error)),
-    };
-    opened.verify_namespace()?;
-    Ok(outcome)
+    match opened.file.try_lock_exclusive() {
+        Ok(()) => {
+            let namespace = opened.verify_namespace();
+            // A concurrent fork can retain the file description after our
+            // File closes. Release the probe before reporting either result.
+            release_advisory_lock(&opened.file, "lock_probe_unlock")?;
+            namespace?;
+            Ok(OpenedLockReprobe::Free)
+        }
+        Err(error) if is_lock_contended(&error) => {
+            opened.verify_namespace()?;
+            Ok(OpenedLockReprobe::Held)
+        }
+        Err(error) => Err(stable_io_failure("lock_reprobe", &error)),
+    }
 }
 
 fn open_lock_leaf_nofollow_with_hook(
@@ -717,6 +781,8 @@ fn write_lock_sidecar_in_directory_atomically(
                     .try_lock_exclusive()
                     .map_err(|_| LockSidecarWriteError::Unavailable)?;
             }
+            let authority_cleanup = lock_for_authority
+                .then(|| AdvisoryUnlockOnDrop::new(&metadata_file, "sidecar_write_unlock"));
             directory
                 .rename(&temp_name, directory, name)
                 .map_err(|_| LockSidecarWriteError::Unavailable)?;
@@ -747,6 +813,8 @@ fn write_lock_sidecar_in_directory_atomically(
                 "sidecar_write_identity",
             )
             .map_err(sidecar_write_error)?;
+            // Consume the entire option before moving the borrowed file.
+            let _ = authority_cleanup.map(AdvisoryUnlockOnDrop::disarm);
             Ok(metadata_file)
         })();
 
@@ -1139,6 +1207,7 @@ impl WatcherLock {
         // Try to acquire exclusive lock (non-blocking)
         match opened.file.try_lock_exclusive() {
             Ok(()) => {
+                let lock_cleanup = AdvisoryUnlockOnDrop::new(&opened.file, "acquire_lock_unlock");
                 opened
                     .verify_namespace()
                     .map_err(lock_path_admission_error)?;
@@ -1153,12 +1222,17 @@ impl WatcherLock {
                     MAX_LOCK_METADATA_BYTES,
                     true,
                 )?;
+                let metadata_cleanup =
+                    AdvisoryUnlockOnDrop::new(&metadata_file, "acquire_metadata_unlock");
 
                 after_metadata_write();
                 opened
                     .verify_namespace()
                     .map_err(lock_path_admission_error)?;
 
+                let lock_path = lock_path.to_path_buf();
+                metadata_cleanup.disarm();
+                lock_cleanup.disarm();
                 let OpenedLockLeaf {
                     directory: lock_directory,
                     name: lock_name,
@@ -1170,7 +1244,7 @@ impl WatcherLock {
                     _lock_file: lock_file,
                     _lock_directory: lock_directory,
                     _lock_name: lock_name,
-                    lock_path: lock_path.to_path_buf(),
+                    lock_path,
                     meta_path,
                     metadata,
                 };
@@ -1219,9 +1293,23 @@ impl Drop for WatcherLock {
         // path-based removal has an unavoidable replacement race in safe Rust:
         // another actor can swap the name between verification and unlink.
         // The retained sidecar authorizes an identity only while its exact
-        // admitted inode is advisory-locked. Field drop order releases that
-        // authority before the main watcher lock; the next successful acquire
-        // atomically publishes and locks its own metadata inode.
+        // admitted inode is advisory-locked. Explicitly release that authority
+        // before the main lock: close alone leaves locks held by descriptions
+        // inherited during a concurrent fork. Do not deliberately unlock the
+        // main file if releasing metadata failed; field drops remain fallback
+        // cleanup, not a guarantee about independently inherited descriptors.
+        let released = release_advisory_lock(&self._metadata_file, "metadata_unlock")
+            .and_then(|()| release_advisory_lock(&self._lock_file, "lock_unlock"));
+        if let Err(failure) = released {
+            tracing::warn!(
+                target: "frankenterm::lock",
+                event = "ft-kullz",
+                phase = failure.phase,
+                kind = failure.kind,
+                "watcher lock release failed; retaining ordinary handle cleanup"
+            );
+            return;
+        }
         tracing::debug!(
             target: "frankenterm::lock",
             event = "ft-interactive-systems-performance-4tenz.53",
@@ -1229,7 +1317,6 @@ impl Drop for WatcherLock {
             kind = "metadata_retained",
             "releasing watcher lock and retaining diagnostic metadata"
         );
-        // Note: The actual file lock is released when _lock_file is dropped
     }
 }
 
@@ -1468,46 +1555,15 @@ fn check_running_with_hooks(
         }
     };
 
-    // Try to acquire lock - if it fails, something is holding it
-    match opened.file.try_lock_exclusive() {
-        Ok(()) => match opened.verify_namespace() {
-            Ok(()) => LockStatus::Free,
-            Err(failure) => {
-                tracing::warn!(
-                    target: "frankenterm::lock",
-                    event = "ft-interactive-systems-performance-4tenz.53",
-                    phase = failure.phase,
-                    kind = failure.kind,
-                    "watcher lock status probe changed during verification"
-                );
-                LockStatus::ProbeUnavailable
-            }
-        },
-        Err(e) if is_lock_contended(&e) => {
-            if let Err(failure) = opened.verify_namespace() {
-                tracing::warn!(
-                    target: "frankenterm::lock",
-                    event = "ft-interactive-systems-performance-4tenz.53",
-                    phase = failure.phase,
-                    kind = failure.kind,
-                    "held watcher lock changed during verification"
-                );
-                return LockStatus::ProbeUnavailable;
-            }
-            probe_held_lock_metadata_with_hooks(
-                &opened,
-                after_metadata_decode,
-                after_main_lock_reprobe,
-            )
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "frankenterm::lock",
-                event = "ft-interactive-systems-performance-4tenz.53",
-                phase = "lock_probe",
-                kind = stable_io_failure("lock_probe", &error).kind,
-                "watcher lock status probe was unavailable"
-            );
+    match reprobe_opened_lock(&opened) {
+        Ok(OpenedLockReprobe::Free) => LockStatus::Free,
+        Ok(OpenedLockReprobe::Held) => probe_held_lock_metadata_with_hooks(
+            &opened,
+            after_metadata_decode,
+            after_main_lock_reprobe,
+        ),
+        Err(failure) => {
+            report_lock_reprobe_failure(failure);
             LockStatus::ProbeUnavailable
         }
     }
@@ -2462,6 +2518,104 @@ mod tests {
             assert!(lock_path.exists());
             drop(lock);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_guard_releases_authority_with_duplicated_descriptors_alive() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("duplicated.lock");
+        let held = WatcherLock::acquire(&lock_path).unwrap();
+        let predecessor = held.metadata().clone();
+        // dup and a concurrent subprocess fork retain the same open file
+        // descriptions. Keep both alive without relying on a fork timing race.
+        let inherited_metadata = held._metadata_file.try_clone().unwrap();
+        let inherited_lock = held._lock_file.try_clone().unwrap();
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(predecessor.clone())
+        );
+
+        drop(held);
+
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
+        let successor = WatcherLock::acquire(&lock_path).unwrap();
+        assert_ne!(successor.metadata().instance_id, predecessor.instance_id);
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(successor.metadata().clone())
+        );
+        drop(inherited_metadata);
+        drop(inherited_lock);
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(successor.metadata().clone())
+        );
+        drop(successor);
+        assert_eq!(check_running(&lock_path), LockStatus::Free);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_probe_releases_its_duplicated_file_description() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("probe-duplicate.lock");
+        let opened = open_lock_leaf_nofollow(&lock_path, true).unwrap().unwrap();
+        let inherited = opened.file.try_clone().unwrap();
+
+        assert_eq!(reprobe_opened_lock(&opened), Ok(OpenedLockReprobe::Free));
+        drop(opened);
+        let successor = WatcherLock::acquire(&lock_path).unwrap();
+        drop(inherited);
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(successor.metadata().clone())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn construction_error_releases_lock_with_duplicate_alive() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("construction-error.lock");
+        let opened = open_lock_leaf_nofollow(&lock_path, true).unwrap().unwrap();
+        let inherited = opened.file.try_clone().unwrap();
+        let result: io::Result<()> = (|| {
+            opened.file.try_lock_exclusive()?;
+            let _cleanup = AdvisoryUnlockOnDrop::new(&opened.file, "test_construction_unlock");
+            Err(io::Error::other("construction failed after acquisition"))
+        })();
+        assert!(result.is_err());
+        let successor = WatcherLock::acquire(&lock_path).unwrap();
+        drop(opened);
+        drop(inherited);
+        assert_eq!(
+            check_running(&lock_path),
+            LockStatus::HeldKnown(successor.metadata().clone())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_metadata_observer_is_not_holder_authority() {
+        let _counter_guard = lock_metadata_counter_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("shared-observer.lock");
+        let held = WatcherLock::acquire(&lock_path).unwrap();
+        FileExt::unlock(&held._metadata_file).unwrap();
+
+        let observer = File::open(held.meta_path()).unwrap();
+        FileExt::try_lock_shared(&observer).unwrap();
+        let second_observer = File::open(held.meta_path()).unwrap();
+        assert_eq!(
+            require_external_advisory_lock(&second_observer, "test_probe"),
+            Err(LockSidecarReadFailure::new(
+                "test_probe",
+                "holder_binding_missing"
+            ))
+        );
+        assert_eq!(check_running(&lock_path), LockStatus::HeldUnknown);
+        FileExt::unlock(&observer).unwrap();
     }
 
     #[test]

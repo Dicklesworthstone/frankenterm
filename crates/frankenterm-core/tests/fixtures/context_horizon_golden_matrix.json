@@ -92,10 +92,7 @@
         "top_operator_move": "rotate_context",
         "unavailable_domain_count": 0,
         "pane_risk_tiers": ["yellow"],
-        "required_reason_codes": [
-          "advisor.rotate_context",
-          "context.utilization_rising"
-        ],
+        "required_reason_codes": ["advisor.rotate_context", "context.utilization_rising"],
         "required_action_kinds": ["rotate_context"],
         "expected_handoff_readiness": ["not_needed"],
         "forbidden_substrings": []
@@ -173,10 +170,7 @@
         "top_operator_move": "reduce_fanout",
         "unavailable_domain_count": 0,
         "pane_risk_tiers": ["red"],
-        "required_reason_codes": [
-          "advisor.reduce_fanout",
-          "provider.rate_limit_recent"
-        ],
+        "required_reason_codes": ["advisor.reduce_fanout", "provider.rate_limit_recent"],
         "required_action_kinds": ["reduce_fanout"],
         "expected_handoff_readiness": ["prepare"],
         "forbidden_substrings": []

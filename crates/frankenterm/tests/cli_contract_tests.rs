@@ -439,6 +439,58 @@ mod dsr_source_metadata_contract {
     }
 
     #[test]
+    fn gitless_dsr_rerun_inputs_preserve_authority_without_missing_git_paths() {
+        let (owner, repository, source, identity) = fixture();
+        let mut watched = Vec::new();
+        let metadata = super::build_metadata::resolve_source_identity_with_rerun(
+            &source,
+            Some(&identity),
+            &mut |path| watched.push(path.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(metadata.revision, identity.revision);
+        assert!(!metadata.dirty);
+        assert_eq!(
+            watched,
+            vec![
+                source.join("src/input.txt"),
+                owner.path().join(".source.tar"),
+                source.clone(),
+            ]
+        );
+        assert!(watched.iter().all(|path| path.exists()));
+        assert!(!source.join(".git").exists());
+
+        // A real Git checkout still watches its administration and tracked
+        // content; the optimization applies only to the verified archive path.
+        watched.clear();
+        super::build_metadata::resolve_source_identity_with_rerun(
+            &repository,
+            Some(&identity),
+            &mut |path| watched.push(path.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            watched,
+            vec![
+                repository.join(".git/HEAD"),
+                repository.join(".git/index"),
+                repository.join(".git/refs"),
+                repository.join("src/input.txt"),
+            ]
+        );
+        fs::write(source.join("src/input.txt"), b"modified source\n").unwrap();
+        assert!(
+            super::build_metadata::resolve_source_identity_with_rerun(
+                &source,
+                Some(&identity),
+                &mut |_| {},
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn gitless_metadata_rejects_environment_only_or_mismatched_authority() {
         let (owner, _repository, source, good) = fixture();
         let absent = owner.path().join("no-archive/source");

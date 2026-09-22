@@ -10,10 +10,7 @@
         },
         "format": {
           "type": "string",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "description": "Optional output format override for this call"
         }
@@ -82,10 +79,7 @@
         },
         "format": {
           "type": "string",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "description": "Optional output format override for this call"
         }
@@ -302,10 +296,7 @@
         },
         "format": {
           "type": "string",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "description": "Optional output format override for this call"
         }
@@ -445,10 +436,7 @@
         },
         "format": {
           "type": "string",
-          "enum": [
-            "json",
-            "toon"
-          ],
+          "enum": ["json", "toon"],
           "maxLength": 16,
           "description": "Optional output format override for this call"
         }

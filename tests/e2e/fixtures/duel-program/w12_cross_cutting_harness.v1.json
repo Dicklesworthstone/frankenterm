@@ -34,12 +34,7 @@
         "decision",
         "evidence_emit"
       ],
-      "required_phases": [
-        "SETUP",
-        "ACT",
-        "ASSERT",
-        "TEARDOWN"
-      ],
+      "required_phases": ["SETUP", "ACT", "ASSERT", "TEARDOWN"],
       "assertion_payload_fields": [
         "label",
         "detail.status",
@@ -152,16 +147,11 @@
         "ft robot events --limit 50",
         "ft backup export --dry-run"
       ],
-      "positive_assertions": [
-        "redaction pipeline returns ok envelopes"
-      ],
+      "positive_assertions": ["redaction pipeline returns ok envelopes"],
       "negative_assertions": [
         "FT_W12_CANARY_SECRET_0001 is absent from every retained public surface"
       ],
-      "required_artifacts": [
-        "redaction-surfaces.json",
-        "canary-scan.json"
-      ]
+      "required_artifacts": ["redaction-surfaces.json", "canary-scan.json"]
     },
     {
       "id": "W1.semantic_api",
@@ -170,16 +160,9 @@
         "ft robot dom zones <shell-pane> --format json",
         "ft robot dom zones <alt-screen-agent-pane> --format json"
       ],
-      "positive_assertions": [
-        "shell pane returns structured zones, last-command, and exit-code"
-      ],
-      "negative_assertions": [
-        "alt-screen agent pane returns typed semantic_data_unavailable"
-      ],
-      "required_artifacts": [
-        "semantic-shell.json",
-        "semantic-alt-screen.json"
-      ]
+      "positive_assertions": ["shell pane returns structured zones, last-command, and exit-code"],
+      "negative_assertions": ["alt-screen agent pane returns typed semantic_data_unavailable"],
+      "required_artifacts": ["semantic-shell.json", "semantic-alt-screen.json"]
     },
     {
       "id": "W2.verified_submit",
@@ -188,16 +171,9 @@
         "ft robot send <agent-pane> '<prompt>' --verify-submit --format json",
         "ft robot send <stuck-composer-pane> '<prompt>' --verify-submit --format json"
       ],
-      "positive_assertions": [
-        "SubmitReceipt state is submitted with guarantee_met true"
-      ],
-      "negative_assertions": [
-        "stuck composer returns stuck_in_composer instead of submitted"
-      ],
-      "required_artifacts": [
-        "submit-submitted.json",
-        "submit-stuck-composer.json"
-      ]
+      "positive_assertions": ["SubmitReceipt state is submitted with guarantee_met true"],
+      "negative_assertions": ["stuck composer returns stuck_in_composer instead of submitted"],
+      "required_artifacts": ["submit-submitted.json", "submit-stuck-composer.json"]
     },
     {
       "id": "W3.watch_events",
@@ -211,9 +187,7 @@
         "cursor resume is monotonic",
         "composite await unblocks on the detection"
       ],
-      "negative_assertions": [
-        "missing cursor returns typed cursor_unavailable without hanging"
-      ],
+      "negative_assertions": ["missing cursor returns typed cursor_unavailable without hanging"],
       "required_artifacts": [
         "watch-events.ndjson",
         "watch-events-cursor.json",
@@ -228,12 +202,8 @@
         "ft steer run --receipt steering-receipt.json --format json",
         "ft steer run --receipt tampered-steering-receipt.json --format json"
       ],
-      "positive_assertions": [
-        "SteeringReceipt hash binds the mission and tx contracts"
-      ],
-      "negative_assertions": [
-        "tampered receipt is refused with receipt_hash_mismatch"
-      ],
+      "positive_assertions": ["SteeringReceipt hash binds the mission and tx contracts"],
+      "negative_assertions": ["tampered receipt is refused with receipt_hash_mismatch"],
       "required_artifacts": [
         "mission.json",
         "tx.json",

@@ -5003,28 +5003,42 @@ mod tests {
             let shutdown_notify = Arc::new(crate::runtime_async::notify::Notify::new());
             let task_shutdown_notify = Arc::clone(&shutdown_notify);
             let runner_cx = crate::cx::for_testing();
+            let (ready_tx, ready_rx) = crate::runtime_async::oneshot::channel();
 
             let runner_task = crate::runtime_async::task::spawn(async move {
-                runner
-                    .run_with_shutdown_with_cx(
-                        &runner_cx,
-                        &task_event_bus,
-                        &task_shutdown_flag,
-                        &task_shutdown_notify,
-                    )
-                    .await;
+                let mut running = std::pin::pin!(runner.run_with_shutdown_with_cx(
+                    &runner_cx,
+                    &task_event_bus,
+                    &task_shutdown_flag,
+                    &task_shutdown_notify,
+                ));
+                let mut ready_tx = Some(ready_tx);
+                futures::future::poll_fn(|poll_cx| {
+                    let result = std::future::Future::poll(running.as_mut(), poll_cx);
+                    // Startup performs real database work before subscribing.
+                    // A pending poll after that subscription proves the actual
+                    // idle wait has registered its wakers, regardless of how
+                    // many scheduler turns startup needed.
+                    if result.is_pending()
+                        && task_event_bus.stats().detection_subscribers > 0
+                        && let Some(ready_tx) = ready_tx.take()
+                    {
+                        let _ = ready_tx.send(());
+                    }
+                    result
+                })
+                .await;
             });
 
-            for _ in 0..4_096 {
-                if event_bus.stats().detection_subscribers > 0 {
-                    break;
-                }
-                crate::runtime_async::yield_now().await;
-            }
-            assert!(
-                event_bus.stats().detection_subscribers > 0,
-                "runner must reach its idle detection wait before shutdown"
-            );
+            let readiness_cx = crate::cx::for_testing();
+            crate::runtime_async::timeout_with_cx(
+                &readiness_cx,
+                Duration::from_secs(5),
+                crate::runtime_async::oneshot_recv(ready_rx),
+            )
+            .await
+            .expect("runner startup must reach its idle wait within the readiness bound")
+            .expect("runner must not exit before registering its idle wait");
 
             shutdown_flag.store(true, Ordering::SeqCst);
             shutdown_notify.notify_waiters();
@@ -5643,7 +5657,7 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (task_id, _handle) = runtime
+            let (task_id, mut handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
@@ -5653,12 +5667,17 @@ mod tests {
 
             let report = runtime.run_with_auto_advance();
             assert!(
-                !matches!(
+                matches!(
                     report.termination,
-                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                    asupersync::lab::AutoAdvanceTermination::Quiescent
                 ),
-                "LabRuntime got stuck; termination: {:?}",
+                "LabRuntime did not finish; termination: {:?}",
                 report.termination,
+            );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
             );
         }
 

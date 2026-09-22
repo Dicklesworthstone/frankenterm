@@ -73,10 +73,7 @@
     "work",
     "fleet"
   ],
-  "required_transports": [
-    "robot_cli",
-    "mcp_tool"
-  ],
+  "required_transports": ["robot_cli", "mcp_tool"],
   "rows": [
     {
       "id": "robot.state.toon.healthy",

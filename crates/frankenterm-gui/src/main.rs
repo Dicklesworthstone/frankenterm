@@ -3236,6 +3236,24 @@ impl Publish {
         }
     }
 
+    fn require_existing_gui_version(
+        &mut self,
+        running_version: &str,
+        launching_version: &str,
+    ) -> anyhow::Result<()> {
+        if running_version != launching_version {
+            // The same application path can now contain a newer executable
+            // while the predecessor still owns live local panes. Publish the
+            // new GUI for future launches without retiring that predecessor.
+            *self = Self::NoConnectButShouldPublish;
+            anyhow::bail!(
+                "Running GUI version {running_version:?} differs from launching version \
+                 {launching_version:?}; starting a new GUI and preserving the existing sessions"
+            );
+        }
+        Ok(())
+    }
+
     pub fn try_spawn(
         &mut self,
         cmd: Option<CommandBuilder>,
@@ -3278,6 +3296,11 @@ impl Publish {
                                 "Running GUI has different config from us, will start a new one"
                             );
                         }
+
+                        self.require_existing_gui_version(
+                            &vers.version_string,
+                            config::wezterm_version(),
+                        )?;
 
                         let window_id = if new_tab || config.prefer_to_spawn_tabs {
                             if let Ok(pane_id) = client.resolve_pane_id(None).await {
@@ -3810,6 +3833,32 @@ fn maybe_show_configuration_error_window() {
 mod tests {
     use super::*;
     use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
+
+    #[test]
+    fn same_path_gui_version_mismatch_preserves_new_gui_publication() {
+        let mut publish = Publish::TryPath(PathBuf::from("existing-gui.sock"));
+        let error = publish
+            .require_existing_gui_version("FrankenTerm old", "FrankenTerm new")
+            .expect_err("different compiled versions must not delegate a spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("preserving the existing sessions")
+        );
+        assert!(matches!(publish, Publish::NoConnectButShouldPublish));
+        assert!(publish.should_publish());
+    }
+
+    #[test]
+    fn same_path_same_version_gui_retains_delegation_target() {
+        let socket = PathBuf::from("existing-gui.sock");
+        let mut publish = Publish::TryPath(socket.clone());
+        publish
+            .require_existing_gui_version("FrankenTerm same", "FrankenTerm same")
+            .expect("same compiled version may retain its existing GUI");
+        assert!(matches!(&publish, Publish::TryPath(path) if path == &socket));
+        assert!(publish.should_publish());
+    }
 
     #[test]
     fn auto_connect_failure_does_not_skip_later_independent_domains() {

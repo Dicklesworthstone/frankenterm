@@ -693,6 +693,19 @@ fn advance_recovery_authority_population(
 }
 
 fn advance_dirty_recovery_authority(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    advance_dirty_recovery_authority_with_clock(conn, || {
+        let started = Instant::now();
+        move || started.elapsed()
+    })
+}
+
+fn advance_dirty_recovery_authority_with_clock<E>(
+    conn: &Connection,
+    start_clock: impl FnOnce() -> E,
+) -> Result<bool, rusqlite::Error>
+where
+    E: FnMut() -> Duration,
+{
     let dirty_rows: Vec<(i64, Option<String>, i64)> = {
         let mut statement = conn.prepare(
             "SELECT rowid,
@@ -718,10 +731,12 @@ fn advance_dirty_recovery_authority(conn: &Connection) -> Result<bool, rusqlite:
             )?
             .collect::<Result<_, _>>()?
     };
-    let started = Instant::now();
+    // Start after loading the bounded dirty batch, exactly as the production
+    // wall budget requires. Tests supply a logical clock at this same boundary.
+    let mut elapsed = start_clock();
     let mut processed = 0_usize;
     for (authority_rowid, session_id, dirty_generation) in &dirty_rows {
-        if processed > 0 && started.elapsed() >= RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET {
+        if processed > 0 && elapsed() >= RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET {
             break;
         }
         let checkpoint_id = session_id
@@ -889,11 +904,23 @@ fn newest_usable_recovery_session(
     conn: &Transaction<'_>,
     observer: &impl SessionOwnerObserver,
 ) -> Result<ProtectedRecoverySelection, rusqlite::Error> {
+    newest_usable_recovery_session_with_reconciliation(
+        conn,
+        observer,
+        advance_dirty_recovery_authority,
+    )
+}
+
+fn newest_usable_recovery_session_with_reconciliation(
+    conn: &Transaction<'_>,
+    observer: &impl SessionOwnerObserver,
+    reconcile: impl FnOnce(&Connection) -> Result<bool, rusqlite::Error>,
+) -> Result<ProtectedRecoverySelection, rusqlite::Error> {
     let mut state = load_recovery_selection_state(conn)?;
     if advance_recovery_authority_population(conn, &state)? {
         return Ok(ProtectedRecoverySelection::Pending);
     }
-    if advance_dirty_recovery_authority(conn)? {
+    if reconcile(conn)? {
         return Ok(ProtectedRecoverySelection::Pending);
     }
 
@@ -3357,7 +3384,10 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn bounded_reconciliation_statement_count_is_history_independent() {
-        fn first_step_statement_count(session_count: usize) -> usize {
+        fn first_step_statement_count(
+            session_count: usize,
+            clock_tick: Duration,
+        ) -> (usize, Connection) {
             let mut conn = make_test_db();
             for index in 0..session_count {
                 insert_session(
@@ -3378,24 +3408,89 @@ mod tests {
                 processes: BTreeMap::new(),
             };
             assert_eq!(
-                newest_usable_recovery_session(&transaction, &observer).unwrap(),
+                newest_usable_recovery_session_with_reconciliation(
+                    &transaction,
+                    &observer,
+                    |conn| {
+                        advance_dirty_recovery_authority_with_clock(conn, || {
+                            let mut elapsed = Duration::ZERO;
+                            move || {
+                                elapsed += clock_tick;
+                                elapsed
+                            }
+                        })
+                    },
+                )
+                .unwrap(),
                 ProtectedRecoverySelection::Pending
             );
             transaction.commit().unwrap();
             conn.trace(None);
-            RECOVERY_TRACE_STATEMENTS
+            let count = RECOVERY_TRACE_STATEMENTS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len()
+                .len();
+            (count, conn)
         }
 
-        let exact_batch_count = first_step_statement_count(4);
-        let long_history_count = first_step_statement_count(2_049);
+        // Statement work for a full batch is independent of history size;
+        // real scheduling must not decide how many candidates this test admits.
+        let (exact_batch_count, _) = first_step_statement_count(4, Duration::ZERO);
+        let (long_history_count, _) = first_step_statement_count(2_049, Duration::ZERO);
         assert_eq!(exact_batch_count, long_history_count);
         assert_eq!(
             long_history_count, 12,
             "BEGIN + two bounded authority queries + four canonical probes + four authority updates + COMMIT"
         );
+
+        // The same production loop must yield at the exact 40ms boundary
+        // after making one authoritative unit of progress, even if work remains.
+        let (yielded_count, conn) =
+            first_step_statement_count(4, RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET);
+        assert_eq!(
+            yielded_count, 6,
+            "BEGIN + two authority queries + one canonical probe + one update + COMMIT"
+        );
+        let states = || {
+            let mut statement = conn
+                .prepare(
+                    "SELECT session_id, state FROM session_recovery_usability ORDER BY session_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            states(),
+            vec![
+                ("statement-count-00000".to_string(), "unusable".to_string()),
+                ("statement-count-00001".to_string(), "dirty".to_string()),
+                ("statement-count-00002".to_string(), "dirty".to_string()),
+                ("statement-count-00003".to_string(), "dirty".to_string()),
+            ],
+            "the Pending result must commit exactly the first candidate's progress"
+        );
+        let transaction = begin_retention_transaction(&conn).unwrap();
+        let observer = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        assert_eq!(
+            newest_usable_recovery_session_with_reconciliation(&transaction, &observer, |conn| {
+                advance_dirty_recovery_authority_with_clock(conn, || || Duration::ZERO)
+            })
+            .unwrap(),
+            ProtectedRecoverySelection::Ready(None),
+            "the next transaction must finish the three remaining candidates"
+        );
+        transaction.commit().unwrap();
+        assert_eq!(states().len(), 4);
+        assert!(states().iter().all(|(_, state)| state == "unusable"));
     }
 
     #[test]

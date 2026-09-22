@@ -17,18 +17,8 @@
     "context_saturated",
     "stuck_tui_heavy"
   ],
-  "required_signal_kinds": [
-    "context_horizon",
-    "blocker_radar",
-    "herd_wave",
-    "resource_pressure"
-  ],
-  "telemetry_gap_states": [
-    "open",
-    "stagger_recommended",
-    "pause_admission",
-    "kill_switch"
-  ],
+  "required_signal_kinds": ["context_horizon", "blocker_radar", "herd_wave", "resource_pressure"],
+  "telemetry_gap_states": ["open", "stagger_recommended", "pause_admission", "kill_switch"],
   "fail_closed_reason_codes": [
     "capacity.workload.context_horizon.fail_closed_stale",
     "capacity.workload.context_horizon.fail_closed_redacted",

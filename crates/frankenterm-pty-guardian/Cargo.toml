@@ -36,6 +36,7 @@ hmac.workspace = true
 frankenterm-sigpipe.workspace = true
 frankenterm-term = { workspace = true, features = ["use_serde"] }
 libc.workspace = true
+log.workspace = true
 mio = { workspace = true, features = ["net", "os-ext", "os-poll"] }
 mux.workspace = true
 nix = { workspace = true, features = ["feature", "fs", "process", "signal", "term", "user"] }

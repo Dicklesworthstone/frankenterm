@@ -320,11 +320,11 @@ fn execute_cx_preserves_deadline_poll_and_cost_failure_classes() {
 }
 
 // ===========================================================================
-// 10. quota exhaustion preserves an exact settled prefix
+// 10. every disposition checks capability without charging a scheduler poll
 // ===========================================================================
 
 #[test]
-fn execute_cx_poll_quota_exhaustion_preserves_exact_prefix() {
+fn execute_cx_checkpoints_each_plan_without_consuming_poll_quota() {
     run_under_lab(|_lab_cx| {
         let plans = (0_u64..3)
             .map(|pane_id| ProcessPlan {
@@ -336,29 +336,28 @@ fn execute_cx_poll_quota_exhaustion_preserves_exact_prefix() {
             })
             .collect::<Vec<_>>();
         let cx = Cx::for_testing_with_budget(Budget::new().with_poll_quota(2));
+        let checkpoints_before = cx.checkpoint_state().checkpoint_count;
 
         let report = ProcessLauncher::execute_cx(&cx, &plans);
         assert_eq!(report.plans_total(), 3);
-        assert_eq!(report.plans_settled(), 2);
-        assert_eq!(report.manual_count(), 2);
+        assert_eq!(report.plans_settled(), 3);
+        assert_eq!(report.manual_count(), 3);
+        // Poll quota is charged by task polling, not synchronous checkpoints.
+        // This exact count fails if any per-plan capability gate is removed.
+        assert_eq!(cx.budget().poll_quota, 2);
+        assert_eq!(
+            cx.checkpoint_state().checkpoint_count - checkpoints_before,
+            3
+        );
         assert_eq!(
             report
                 .result_sample()
                 .iter()
                 .map(|result| result.old_pane_id)
                 .collect::<Vec<_>>(),
-            vec![0, 1]
+            vec![0, 1, 2]
         );
-        assert_eq!(
-            report
-                .interruption()
-                .map(|value| (value.plan_index, value.phase, value.reason,)),
-            Some((
-                2,
-                LaunchInterruptionPhase::BeforePlan,
-                LaunchInterruptionReason::PollQuotaExhausted,
-            ))
-        );
+        assert!(report.interruption().is_none());
     });
 }
 

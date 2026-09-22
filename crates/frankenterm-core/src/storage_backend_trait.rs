@@ -1988,6 +1988,64 @@ impl StorageBackendFactory for RusqliteBackend {
     }
 }
 
+#[cfg(test)]
+struct SlowCellQuery {
+    operation: &'static str,
+    started: std::time::Instant,
+    acquired_us: Option<u128>,
+    prepared_us: Option<u128>,
+    materialized_us: Option<u128>,
+    row_count: Option<usize>,
+}
+
+#[cfg(test)]
+impl SlowCellQuery {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            started: std::time::Instant::now(),
+            acquired_us: None,
+            prepared_us: None,
+            materialized_us: None,
+            row_count: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SlowCellQuery {
+    fn drop(&mut self) {
+        // This guard is declared before the connection and statement, so its
+        // destructor observes row reset, statement cache return and unlock too.
+        let total_us = self.started.elapsed().as_micros();
+        if total_us < 100_000 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        let tid = std::fs::read_link("/proc/thread-self")
+            .ok()
+            .and_then(|path| path.file_name()?.to_str()?.parse::<u64>().ok());
+        #[cfg(not(target_os = "linux"))]
+        let tid: Option<u64> = None;
+        let unix_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros());
+        let prepare_us = self
+            .prepared_us
+            .zip(self.acquired_us)
+            .map(|(end, start)| end.saturating_sub(start));
+        let rows_us = self
+            .materialized_us
+            .zip(self.prepared_us)
+            .map(|(end, start)| end.saturating_sub(start));
+        let teardown_us = self.materialized_us.map(|end| total_us.saturating_sub(end));
+        eprintln!(
+            "STORAGE_CELL_QUERY operation={} tid={tid:?} unix_us={unix_us} total_us={total_us} mutex_us={:?} prepare_us={prepare_us:?} rows_us={rows_us:?} teardown_us={teardown_us:?} row_count={:?}",
+            self.operation, self.acquired_us, self.row_count,
+        );
+    }
+}
+
 impl StorageBackend for RusqliteBackend {
     fn execute(&self, sql: &str) -> Result<usize, BackendError> {
         let conn = self.conn_guard()?;
@@ -2322,10 +2380,20 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Option<Vec<SqlCell>>, BackendError> {
+        #[cfg(test)]
+        let mut timing = SlowCellQuery::new("query_row_cells");
         let conn = self.conn_guard()?;
+        #[cfg(test)]
+        {
+            timing.acquired_us = Some(timing.started.elapsed().as_micros());
+        }
         let mut stmt = conn
             .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
+        #[cfg(test)]
+        {
+            timing.prepared_us = Some(timing.started.elapsed().as_micros());
+        }
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =
             params.iter().map(to_sqlite_value).collect();
@@ -2343,9 +2411,21 @@ impl StorageBackend for RusqliteBackend {
                         row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
                     out.push(rusqlite_value_to_sql_cell(v));
                 }
+                #[cfg(test)]
+                {
+                    timing.materialized_us = Some(timing.started.elapsed().as_micros());
+                    timing.row_count = Some(1);
+                }
                 Ok(Some(out))
             }
-            None => Ok(None),
+            None => {
+                #[cfg(test)]
+                {
+                    timing.materialized_us = Some(timing.started.elapsed().as_micros());
+                    timing.row_count = Some(0);
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -2354,10 +2434,20 @@ impl StorageBackend for RusqliteBackend {
         sql: &str,
         params: &[ToSqlValue<'_>],
     ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
+        #[cfg(test)]
+        let mut timing = SlowCellQuery::new("query_map_cells");
         let conn = self.conn_guard()?;
+        #[cfg(test)]
+        {
+            timing.acquired_us = Some(timing.started.elapsed().as_micros());
+        }
         let mut stmt = conn
             .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
+        #[cfg(test)]
+        {
+            timing.prepared_us = Some(timing.started.elapsed().as_micros());
+        }
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =
             params.iter().map(to_sqlite_value).collect();
@@ -2376,6 +2466,11 @@ impl StorageBackend for RusqliteBackend {
                 row_cells.push(rusqlite_value_to_sql_cell(v));
             }
             out.push(row_cells);
+        }
+        #[cfg(test)]
+        {
+            timing.materialized_us = Some(timing.started.elapsed().as_micros());
+            timing.row_count = Some(out.len());
         }
         Ok(out)
     }

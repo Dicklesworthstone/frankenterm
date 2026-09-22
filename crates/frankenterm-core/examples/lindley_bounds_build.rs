@@ -70,6 +70,22 @@
 //! trace lines survive partial failures. Neither exit 0 nor a declared source
 //! SHA authenticates the build or proves future, renderer or full-watch SLOs.
 //!
+//! `--next-block-experiment fit|validate <manifest.json>` analyzes retained live
+//! runs without changing their original verdicts. Both manifests declare
+//! `measurement_identity: {release_version, source_revision}` separately from
+//! `analyzer_source_revision`, and `blocks: [{path, sha256}]`. Fit takes exactly
+//! 20 distinct runs: one pilot plus 19 calibration blocks. Each block is the
+//! first 1000 rows of a complete 2000-row run. Retain and hash fit stdout before
+//! collecting a fresh validation run; its manifest takes one block plus
+//! `frozen_path` and `frozen_sha256`. External DSR receipts must authenticate
+//! both source identities; these declarations and hashes only bind inputs.
+//! Conditional on an independent pilot and exchangeable whole-workload blocks,
+//! the joint calibration supports at least 95% next-block service conformity,
+//! marginal over calibration and validation blocks. It is not a deterministic
+//! future bound, a confidence interval, or release qualification. Collection
+//! order, disjoint execution and absence of outcome-dependent retries require
+//! external campaign evidence; the analyzer cannot infer them from timestamps.
+//!
 //! Or via the wrapper:
 //!
 //! ```text
@@ -109,6 +125,19 @@ struct InputPayload<'a> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--next-block-experiment")
+    {
+        return match live_measurement::next_block_experiment(&args[1..]) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(1),
+            Err(error) => {
+                eprintln!("lindley next-block experiment: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if args == ["--pane-producer"] {
         return match live_measurement::pane_producer() {
             Ok(()) => ExitCode::SUCCESS,
@@ -129,7 +158,9 @@ fn main() -> ExitCode {
         };
     }
     if !args.is_empty() {
-        eprintln!("expected no arguments, --pane-producer or --measure-live");
+        eprintln!(
+            "expected no arguments, --pane-producer, --measure-live, or --next-block-experiment fit|validate <manifest.json>"
+        );
         return ExitCode::from(2);
     }
     match build_diagnostic() {
@@ -211,6 +242,18 @@ mod live_measurement {
         measured::run()
     }
 
+    pub fn next_block_experiment(args: &[String]) -> Result<bool, String> {
+        #[cfg(all(unix, feature = "vendored"))]
+        {
+            measured::next_block_experiment(args)
+        }
+        #[cfg(not(all(unix, feature = "vendored")))]
+        {
+            let _ = args;
+            Err("next-block experiment requires Unix and --features vendored".into())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -247,12 +290,15 @@ mod live_measurement {
         const BURST: usize = 10;
         const BURSTS_PER_PHASE: usize = 100;
 
-        #[derive(Clone, Serialize)]
+        #[derive(Clone, Serialize, serde::Deserialize)]
         struct Observation {
             sequence: u32,
             transient_read_rejections: u32,
             write_ack_ns: u64,
             storage_submit_ns: u64,
+            // Wall-clock return from capture_snapshot, before oracle validation;
+            // this shares the stage epoch and is not a CPU-time measurement.
+            snapshot_extraction_return_ns: u64,
             poll: FramePollDiagnostics,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
@@ -260,7 +306,7 @@ mod live_measurement {
             content_sha256: String,
         }
 
-        #[derive(Clone, Default, Serialize)]
+        #[derive(Clone, Default, Serialize, serde::Deserialize)]
         struct FramePollDiagnostics {
             read_attempts: u64,
             marker_misses: u64,
@@ -365,11 +411,18 @@ mod live_measurement {
 
         pub fn run() -> Result<bool, String> {
             use tracing::instrument::WithSubscriber;
-            // Only numeric, content-free text-transaction events enter the
-            // already retained stderr. No global subscriber or recorder.
+            if tracing::level_filters::STATIC_MAX_LEVEL < tracing::level_filters::LevelFilter::TRACE
+            {
+                return Err("append transaction diagnostics were compiled out".into());
+            }
+            // Numeric, content-free mux and verified append-transaction events
+            // enter retained stderr. Storage carries this scoped dispatcher
+            // only for append telemetry; ordinary writer logs keep their route.
             let subscriber = tracing_subscriber::fmt()
                 .json()
-                .with_env_filter("off,frankenterm::mux_text_diagnostics=trace")
+                .with_env_filter(
+                    "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace",
+                )
                 .with_writer(std::io::stderr)
                 .finish();
             #[cfg(unix)]
@@ -480,6 +533,9 @@ mod live_measurement {
             let service_holds: Vec<bool> = (0..3)
                 .map(|index| service_conforms(held_out, index, &model.stages[index]))
                 .collect();
+            let service_violations: Vec<_> = (0..3)
+                .map(|index| service_violation_diagnostics(held_out, index, &model.stages[index]))
+                .collect();
             let trace_json =
                 serde_json::to_string(&observations).map_err(|error| error.to_string())?;
             let trace_hash = hex::encode(Sha256::digest(trace_json.as_bytes()));
@@ -499,7 +555,7 @@ mod live_measurement {
                 "payload_bytes": 4096,
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
-                "diagnostic_timing": "write_ack_ns and storage_submit_ns share the stage epoch; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
+                "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is intentional batch waiting, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
                 "overlap_bytes": 4096,
                 "burst_events": BURST,
                 "calibration_rows": BURST * BURSTS_PER_PHASE,
@@ -508,6 +564,7 @@ mod live_measurement {
                 "observed_delay_bound_holds": observed_bound_holds,
                 "arrival_envelope_holds": arrival_holds,
                 "held_out_service_curves_hold": service_holds,
+                "held_out_service_violations": service_violations,
                 "calibration_method": "minimum composed bound over a predetermined common-rate grid, fitting stage arrival/departure envelopes and independently checking calibration conformance; frozen before held-out requests",
                 "calibration_rate_grid": "2^(k/8) events/ms for integer k=-80..160, restricted to rates strictly above declared arrival rate; fitted rates are not saturated throughput measurements",
                 "latency_field_semantics": "model p99_latency_ms fields contain fitted finite-trace service latencies with a fixed 1ns rounding margin, not quantile guarantees",
@@ -518,7 +575,7 @@ mod live_measurement {
                 "telemetry_model": model,
                 "observations": observations,
                 "excluded": ["production_watch_scheduler", "pattern_detection", "event_dispatch", "renderer", "future_workload_guarantee", "power_loss_durability"],
-                "grouping": "concurrent append_segment requests through production writer; physical transaction group size not observed",
+                "grouping": "concurrent append_segment requests through production writer; correlate retained append_transaction_result/member stderr by process-local transaction_id and pane_id/sequence for verified physical groups; no fixed batch size or power-loss durability claim",
             });
             println!("{JSON_BEGIN}");
             println!(
@@ -612,9 +669,9 @@ mod live_measurement {
                         })
                         .await?;
                     let captured = elapsed(epoch)?;
-                    let segment = cursor
-                        .capture_snapshot(&snapshot, 4096, None)
-                        .ok_or("new frame produced no delta")?;
+                    let segment = cursor.capture_snapshot(&snapshot, 4096, None);
+                    let snapshot_extraction_return_ns = elapsed(epoch)?;
+                    let segment = segment.ok_or("new frame produced no delta")?;
                     if !matches!(segment.kind, CapturedSegmentKind::Delta)
                         || segment.content.trim_matches('\n')
                             != super::frame(sequence).trim_matches('\n')
@@ -633,6 +690,7 @@ mod live_measurement {
                         transient_read_rejections,
                         write_ack_ns,
                         poll_diagnostics,
+                        snapshot_extraction_return_ns,
                     ));
                 }
                 let results = futures::future::join_all(pending.iter().map(
@@ -646,6 +704,7 @@ mod live_measurement {
                         rejections,
                         write_ack_ns,
                         poll,
+                        snapshot_extraction_return_ns,
                     )| async move {
                         let storage_submit_ns = elapsed(epoch)?;
                         let stored = storage
@@ -661,6 +720,7 @@ mod live_measurement {
                             transient_read_rejections: *rejections,
                             write_ack_ns: *write_ack_ns,
                             storage_submit_ns,
+                            snapshot_extraction_return_ns: *snapshot_extraction_return_ns,
                             poll: poll.clone(),
                             stages_ns: [
                                 [*started, *captured],
@@ -704,6 +764,397 @@ mod live_measurement {
             ))
         }
 
+        const NEXT_BLOCK_ROWS: usize = BURST * BURSTS_PER_PHASE;
+        const NEXT_BLOCK_CALIBRATION_BLOCKS: usize = 19;
+        const NEXT_BLOCK_SCHEMA: &str = "frankenterm.lindley-next-block-frozen.v1";
+        const NEXT_BLOCK_METHOD: &str = "pilot-rates-joint-max-latency-adjustment-v1";
+
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MeasurementIdentity {
+            release_version: String,
+            source_revision: String,
+        }
+
+        #[derive(Clone, Debug, Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CampaignBlockReference {
+            path: String,
+            sha256: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CampaignManifest {
+            measurement_identity: MeasurementIdentity,
+            analyzer_source_revision: String,
+            blocks: Vec<CampaignBlockReference>,
+            frozen_path: Option<String>,
+            frozen_sha256: Option<String>,
+        }
+
+        #[derive(Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FrozenNextBlockModel {
+            schema: String,
+            method: String,
+            measurement_identity: MeasurementIdentity,
+            analyzer_source_revision: String,
+            training_manifest_sha256: String,
+            training_blocks: Vec<CampaignBlockReference>,
+            training_trace_sha256: Vec<String>,
+            model: LindleyTelemetryModel,
+            release_ready: bool,
+            assumptions: String,
+        }
+
+        fn lowercase_hex(value: &str, length: usize) -> bool {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+
+        fn validate_campaign_identity(
+            identity: &MeasurementIdentity,
+            analyzer_source: &str,
+        ) -> Result<(), String> {
+            let version = &identity.release_version;
+            let core = version.split(['-', '+']).next().unwrap_or_default();
+            if !lowercase_hex(&identity.source_revision, 40)
+                || !lowercase_hex(analyzer_source, 40)
+                || version.len() > 128
+                || !version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-+".contains(&byte))
+                || core.split('.').count() != 3
+                || core
+                    .split('.')
+                    .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+                || version.ends_with(['-', '+', '.'])
+            {
+                return Err(
+                    "invalid measurement release/source or analyzer source identity".into(),
+                );
+            }
+            Ok(())
+        }
+
+        // Read-only, bounded input handling. Hash the retained bytes, not a
+        // reserialization; old native verdicts remain untouched on disk.
+        fn campaign_json(path: &str) -> Result<(serde_json::Value, String), String> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            if !fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("campaign input must be a regular file".into());
+            }
+            fs::File::open(path)
+                .map_err(|error| error.to_string())?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("campaign input exceeds 16 MiB".into());
+            }
+            let hash = hex::encode(Sha256::digest(&bytes));
+            Ok((
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?,
+                hash,
+            ))
+        }
+
+        fn campaign_block(
+            value: &serde_json::Value,
+            identity: &MeasurementIdentity,
+        ) -> Result<(Vec<Observation>, String), String> {
+            let measurement = &value["measurement"];
+            if value["release_version"] != identity.release_version
+                || measurement["declared_source_sha"] != identity.source_revision
+                || measurement["schema"] != "frankenterm.lindley-live-capture.v1"
+                || measurement["scope"]
+                    != "dedicated_mux_capture_delta_grouped_storage_finite_workload"
+                || measurement["calibration_rows"] != NEXT_BLOCK_ROWS
+                || measurement["held_out_rows"] != NEXT_BLOCK_ROWS
+                || measurement["payload_bytes"] != 4096
+                || measurement["overlap_bytes"] != 4096
+                || value["arrival"]["burst"].as_f64() != Some(BURST as f64)
+                || value["arrival"]["rate"].as_f64() != Some(0.1)
+            {
+                return Err("native block identity/workload mismatch".into());
+            }
+            let trace = measurement["trace_json"]
+                .as_str()
+                .ok_or("missing native trace")?;
+            let trace_hash = hex::encode(Sha256::digest(trace.as_bytes()));
+            if measurement["trace_sha256"] != trace_hash
+                || serde_json::from_str::<serde_json::Value>(trace)
+                    .map_err(|error| error.to_string())?
+                    != measurement["observations"]
+            {
+                return Err("native trace/hash mismatch".into());
+            }
+            let rows: Vec<Observation> =
+                serde_json::from_str(trace).map_err(|error| error.to_string())?;
+            if rows.len() != 2 * NEXT_BLOCK_ROWS
+                || rows.iter().enumerate().any(|(index, row)| {
+                    row.sequence as usize != index
+                        || row.stages_ns.iter().any(|pair| pair[1] < pair[0])
+                        || row.stages_ns[0][1] != row.stages_ns[1][0]
+                        || row.stages_ns[1][1] != row.stages_ns[2][0]
+                        || (index > 0 && row.stages_ns[0][0] < rows[index - 1].stages_ns[2][0])
+                })
+            {
+                return Err("invalid native observation sequence".into());
+            }
+            // Positional selection is fixed before collection; the other half
+            // and its original verdict remain retained, never used for tuning.
+            // Canonical typed-row identity also detects a reused run whose
+            // trace JSON was merely reformatted and rehashed.
+            let canonical_trace = serde_json::to_vec(&rows).map_err(|error| error.to_string())?;
+            let identity_hash = hex::encode(Sha256::digest(&canonical_trace));
+            Ok((
+                rows.into_iter().take(NEXT_BLOCK_ROWS).collect(),
+                identity_hash,
+            ))
+        }
+
+        fn load_campaign_blocks(
+            entries: &[CampaignBlockReference],
+            identity: &MeasurementIdentity,
+            expected_count: usize,
+        ) -> Result<(Vec<Vec<Observation>>, Vec<String>), String> {
+            if entries.len() != expected_count {
+                return Err("wrong native block count".into());
+            }
+            let mut blocks = Vec::with_capacity(entries.len());
+            let mut trace_hashes = Vec::with_capacity(entries.len());
+            let mut file_hashes = std::collections::BTreeSet::new();
+            for entry in entries {
+                let (value, hash) = campaign_json(&entry.path)?;
+                if !lowercase_hex(&entry.sha256, 64)
+                    || entry.sha256 != hash
+                    || !file_hashes.insert(hash)
+                {
+                    return Err("native block hash mismatch or duplicate".into());
+                }
+                let (rows, trace_hash) = campaign_block(&value, identity)?;
+                if trace_hashes.contains(&trace_hash) {
+                    return Err("duplicate native trace under different artifact bytes".into());
+                }
+                blocks.push(rows);
+                trace_hashes.push(trace_hash);
+            }
+            Ok((blocks, trace_hashes))
+        }
+
+        fn predictive_model(
+            pilot: &[Observation],
+            blocks: &[Vec<Observation>],
+        ) -> Result<LindleyTelemetryModel, String> {
+            if blocks.len() != NEXT_BLOCK_CALIBRATION_BLOCKS
+                || pilot.len() != NEXT_BLOCK_ROWS
+                || !arrival_conforms(pilot, 0.1)
+            {
+                return Err("expected one valid pilot and 19 calibration blocks".into());
+            }
+            let mut model = calibrate(pilot, 0.1)?;
+            // Freeze pilot rates. Each independent block supplies one score:
+            // its largest nonnegative excess latency over all three stages.
+            // The maximum of 19 scores is the 95% split-conformal quantile for
+            // one next exchangeable block, conditional on the pilot. This is
+            // marginal coverage, not coverage conditional on observed scores.
+            let mut adjustment = 0.0_f64;
+            for block in blocks {
+                if block.len() != NEXT_BLOCK_ROWS || !arrival_conforms(block, 0.1) {
+                    return Err("invalid calibration block envelope/size".into());
+                }
+                for (index, stage) in model.stages.iter().enumerate() {
+                    if block
+                        .iter()
+                        .any(|row| row.stages_ns[index][1] < row.stages_ns[index][0])
+                    {
+                        return Err("calibration departure precedes arrival".into());
+                    }
+                    let mut arrivals: Vec<_> =
+                        block.iter().map(|row| row.stages_ns[index][0]).collect();
+                    let mut departures: Vec<_> =
+                        block.iter().map(|row| row.stages_ns[index][1]).collect();
+                    arrivals.sort_unstable();
+                    departures.sort_unstable();
+                    adjustment = adjustment.max(
+                        fit_service_latency(
+                            &arrivals,
+                            &departures,
+                            stage.service_rate_events_per_ms,
+                        ) - stage.p99_latency_ms,
+                    );
+                }
+            }
+            for stage in &mut model.stages {
+                stage.p99_latency_ms += adjustment;
+            }
+            model.to_network_calculus_inputs()?;
+            if blocks.iter().any(|block| {
+                model
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .any(|(index, stage)| !service_conforms(block, index, stage))
+            }) {
+                return Err("independent calibration conformance failed".into());
+            }
+            Ok(model)
+        }
+
+        fn verify_frozen_model(
+            frozen: &FrozenNextBlockModel,
+            manifest: &CampaignManifest,
+            validation_trace_hashes: &[String],
+        ) -> Result<(), String> {
+            if frozen.schema != NEXT_BLOCK_SCHEMA
+                || frozen.method != NEXT_BLOCK_METHOD
+                || frozen.measurement_identity != manifest.measurement_identity
+                || frozen.analyzer_source_revision != manifest.analyzer_source_revision
+                || frozen.release_ready
+                || !lowercase_hex(&frozen.training_manifest_sha256, 64)
+                || frozen.training_blocks.len() != NEXT_BLOCK_CALIBRATION_BLOCKS + 1
+                || frozen.training_trace_sha256.len() != frozen.training_blocks.len()
+                || validation_trace_hashes
+                    .iter()
+                    .any(|hash| frozen.training_trace_sha256.contains(hash))
+                || manifest.blocks.iter().any(|block| {
+                    frozen
+                        .training_blocks
+                        .iter()
+                        .any(|training| training.sha256 == block.sha256)
+                })
+            {
+                return Err("frozen identity mismatch or validation reuses training".into());
+            }
+            let (training, hashes) = load_campaign_blocks(
+                &frozen.training_blocks,
+                &frozen.measurement_identity,
+                NEXT_BLOCK_CALIBRATION_BLOCKS + 1,
+            )?;
+            if hashes != frozen.training_trace_sha256
+                || predictive_model(&training[0], &training[1..])? != frozen.model
+            {
+                return Err("frozen model differs from its sealed calibration inputs".into());
+            }
+            Ok(())
+        }
+
+        fn load_frozen_model(
+            manifest: &CampaignManifest,
+        ) -> Result<(FrozenNextBlockModel, String), String> {
+            let (value, hash) = campaign_json(
+                manifest
+                    .frozen_path
+                    .as_deref()
+                    .ok_or("missing frozen path")?,
+            )?;
+            if manifest.frozen_sha256.as_deref() != Some(hash.as_str()) {
+                return Err("frozen model hash mismatch".into());
+            }
+            let frozen = serde_json::from_value(value).map_err(|error| error.to_string())?;
+            Ok((frozen, hash))
+        }
+
+        pub fn next_block_experiment(args: &[String]) -> Result<bool, String> {
+            let [mode, manifest_path] = args else {
+                return Err("expected fit|validate manifest.json".into());
+            };
+            let (value, manifest_hash) = campaign_json(manifest_path)?;
+            let manifest: CampaignManifest =
+                serde_json::from_value(value).map_err(|error| error.to_string())?;
+            validate_campaign_identity(
+                &manifest.measurement_identity,
+                &manifest.analyzer_source_revision,
+            )?;
+            let expected = match mode.as_str() {
+                "fit" if manifest.frozen_path.is_none() && manifest.frozen_sha256.is_none() => {
+                    NEXT_BLOCK_CALIBRATION_BLOCKS + 1
+                }
+                "validate" => 1,
+                _ => return Err("invalid mode or unexpected frozen input for fit".into()),
+            };
+            let (blocks, trace_hashes) =
+                load_campaign_blocks(&manifest.blocks, &manifest.measurement_identity, expected)?;
+            if mode == "fit" {
+                let frozen = FrozenNextBlockModel {
+                    schema: NEXT_BLOCK_SCHEMA.into(),
+                    method: NEXT_BLOCK_METHOD.into(),
+                    model: predictive_model(&blocks[0], &blocks[1..])?,
+                    measurement_identity: manifest.measurement_identity,
+                    analyzer_source_revision: manifest.analyzer_source_revision,
+                    training_manifest_sha256: manifest_hash,
+                    training_blocks: manifest.blocks,
+                    training_trace_sha256: trace_hashes,
+                    release_ready: false,
+                    assumptions: "Conditional on an independent pilot and exchangeable whole-workload calibration/validation blocks, at least 95% next-block service conformity marginal over those blocks; no outcome-dependent selection/retries. Not a deterministic future bound, confidence interval, or release qualification.".into(),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&frozen).map_err(|error| error.to_string())?
+                );
+                return Ok(true);
+            }
+            let (frozen, frozen_hash) = load_frozen_model(&manifest)?;
+            verify_frozen_model(&frozen, &manifest, &trace_hashes)?;
+            let (arrival, stages) = frozen.model.to_network_calculus_inputs()?;
+            let rows = &blocks[0];
+            let mut delays: Vec<_> = rows
+                .iter()
+                .map(|row| (row.stages_ns[2][1] - row.stages_ns[0][0]) as f64 / 1e6)
+                .collect();
+            delays.sort_by(f64::total_cmp);
+            let bound = pipeline_delay_bound(arrival, &stages);
+            let artifact = LindleyBoundsArtifact {
+                release_version: manifest.measurement_identity.release_version.clone(),
+                arrival,
+                stages,
+                analytical_bound_ms: bound.unwrap_or(f64::INFINITY),
+                empirical_p99_ms: delays[(99 * delays.len()).div_ceil(100) - 1],
+            };
+            let service: Vec<_> = frozen
+                .model
+                .stages
+                .iter()
+                .enumerate()
+                .map(|(index, stage)| service_conforms(rows, index, stage))
+                .collect();
+            let maximum = *delays.last().ok_or("missing validation rows")?;
+            let delay_holds = bound.is_some_and(|value| maximum <= value);
+            let arrival_holds = arrival_conforms(rows, 0.1);
+            let accepted = delay_holds
+                && arrival_holds
+                && service.iter().all(|value| *value)
+                && artifact.comparison().within_tolerance();
+            println!(
+                "{}",
+                serde_json::json!({
+                "schema": "frankenterm.lindley-next-block-validation.v1",
+                "measurement_identity": manifest.measurement_identity,
+                "analyzer_source_revision": manifest.analyzer_source_revision,
+                "accepted": accepted,
+                "frozen_sha256": frozen_hash,
+                "validation_manifest_sha256": manifest_hash,
+                "artifact": serde_json::from_str::<serde_json::Value>(&artifact.render_attestation_json()).map_err(|error| error.to_string())?,
+                "arrival_envelope_holds": arrival_holds,
+                "service_curves_hold": service,
+                "maximum_delay_bound_holds": delay_holds,
+                "maximum_delay_ms": maximum,
+                "service_violations": (0..3).map(|index| service_violation_diagnostics(rows, index, &frozen.model.stages[index])).collect::<Vec<_>>(),
+                "release_ready": false,
+                "conditional_assumptions": frozen.assumptions,
+                })
+            );
+            Ok(accepted)
+        }
+
         fn calibrate(
             rows: &[Observation],
             arrival_rate: f64,
@@ -737,7 +1188,7 @@ mod live_measurement {
             // neither held-out delays nor the agreement threshold enter fitting.
             let mut best: Option<(f64, Vec<LindleyStageTelemetry>)> = None;
             for step in -80..=160 {
-                let rate = 2.0_f64.powf(f64::from(step) / 8.0);
+                let rate = (f64::from(step) / 8.0).exp2();
                 if rate <= arrival_rate {
                     continue;
                 }
@@ -822,21 +1273,80 @@ mod live_measurement {
             departures.sort_unstable();
             departures.iter().all(|departure| {
                 let time = departure.saturating_sub(1);
-                let completed = departures.partition_point(|value| *value <= time);
-                let lower = arrivals
-                    .iter()
-                    .enumerate()
-                    .take_while(|(_, start)| **start <= time)
-                    .map(|(count, start)| {
-                        model.service_rate_events_per_ms.mul_add(
-                            (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
-                            count as f64,
-                        )
-                    })
-                    .fold(f64::INFINITY, f64::min);
-                // s=t is also a candidate in the min-plus convolution.
-                let arrived = arrivals.partition_point(|value| *value <= time);
-                lower.min(arrived as f64) <= completed as f64 + 1e-9
+                let (completed, lower) = service_cut(&arrivals, &departures, time, model);
+                lower <= completed as f64 + 1e-9
+            })
+        }
+
+        fn service_cut(
+            arrivals: &[u64],
+            departures: &[u64],
+            time: u64,
+            model: &LindleyStageTelemetry,
+        ) -> (usize, f64) {
+            let completed = departures.partition_point(|value| *value <= time);
+            let lower = arrivals
+                .iter()
+                .enumerate()
+                .take_while(|(_, start)| **start <= time)
+                .map(|(count, start)| {
+                    model.service_rate_events_per_ms.mul_add(
+                        (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
+                        count as f64,
+                    )
+                })
+                .fold(f64::INFINITY, f64::min);
+            // s=t is also a candidate in the min-plus convolution.
+            let arrived = arrivals.partition_point(|value| *value <= time);
+            (completed, lower.min(arrived as f64))
+        }
+
+        fn service_violation_diagnostics(
+            rows: &[Observation],
+            stage: usize,
+            model: &LindleyStageTelemetry,
+        ) -> serde_json::Value {
+            const MAX_SAMPLES: usize = 8;
+            let mut arrivals: Vec<_> = rows.iter().map(|row| row.stages_ns[stage][0]).collect();
+            let mut ordered: Vec<_> = rows.iter().collect();
+            arrivals.sort_unstable();
+            ordered.sort_unstable_by_key(|row| (row.stages_ns[stage][1], row.sequence));
+            let departures: Vec<_> = ordered.iter().map(|row| row.stages_ns[stage][1]).collect();
+            let mut count = 0;
+            let mut maximum_deficit = 0.0_f64;
+            let mut samples = Vec::new();
+            for row in ordered {
+                let cut = row.stages_ns[stage][1].saturating_sub(1);
+                let (completed, lower) = service_cut(&arrivals, &departures, cut, model);
+                if lower <= completed as f64 + 1e-9 {
+                    continue;
+                }
+                count += 1;
+                maximum_deficit = maximum_deficit.max(lower - completed as f64);
+                if samples.len() < MAX_SAMPLES {
+                    samples.push(serde_json::json!({
+                        "departure_sequence": row.sequence,
+                        "cut_ns": cut,
+                        "completed_events": completed,
+                        "required_departures": lower,
+                        "deficit_events": lower - completed as f64,
+                        "stages_ns": row.stages_ns,
+                        "write_ack_elapsed_ns": row.write_ack_ns.checked_sub(row.stages_ns[0][0]),
+                        "snapshot_extraction_elapsed_ns": row.snapshot_extraction_return_ns.checked_sub(row.stages_ns[1][0]),
+                        "extraction_to_submit_ns": row.storage_submit_ns.checked_sub(row.stages_ns[2][0]),
+                        "submit_to_completion_ns": row.stages_ns[2][1].checked_sub(row.storage_submit_ns),
+                        "poll": row.poll,
+                    }));
+                }
+            }
+            serde_json::json!({
+                "stage": (["capture", "delta_extract", "storage_write"][stage]),
+                "violating_departure_cuts": count,
+                "maximum_deficit_events": maximum_deficit,
+                "sample_limit": MAX_SAMPLES,
+                "samples_truncated": count > samples.len(),
+                "samples": samples,
+                "semantics": "departure minus 1ns; simultaneous departures repeat the same cut as the acceptance check; departure_sequence identifies the cut witness, not an individually attributable service debt; timing components are wall-clock, not CPU or isolated commit time",
             })
         }
 
@@ -949,6 +1459,7 @@ mod live_measurement {
                     transient_read_rejections: 0,
                     write_ack_ns: start,
                     storage_submit_ns: start,
+                    snapshot_extraction_return_ns: end,
                     poll: FramePollDiagnostics::default(),
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
@@ -961,6 +1472,268 @@ mod live_measurement {
                     LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
                 assert!(service_conforms(&[row(0, 0, 1_000_000)], 0, &model));
                 assert!(!service_conforms(&[row(0, 0, 3_000_000)], 0, &model));
+            }
+
+            #[test]
+            fn service_violation_diagnostics_use_predeparture_cut() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
+                // At 1ms + 1ns the predeparture cut is exactly the latency:
+                // checking at departure instead would incorrectly report debt.
+                let boundary = [row(7, 0, 1_000_001)];
+                assert!(service_conforms(&boundary, 0, &model));
+                assert_eq!(
+                    service_violation_diagnostics(&boundary, 0, &model)["violating_departure_cuts"],
+                    0
+                );
+                let delayed = [row(7, 0, 1_000_002)];
+                assert!(!service_conforms(&delayed, 0, &model));
+                let diagnostic = service_violation_diagnostics(&delayed, 0, &model);
+                assert_eq!(diagnostic["violating_departure_cuts"], 1);
+                assert_eq!(diagnostic["samples"][0]["cut_ns"], 1_000_001);
+                assert_eq!(diagnostic["samples"][0]["completed_events"], 0);
+                assert_eq!(diagnostic["samples"][0]["departure_sequence"], 7);
+                assert!(diagnostic["maximum_deficit_events"].as_f64().unwrap() > 1e-9);
+                assert!(service_conforms(&[row(0, 0, 0)], 0, &model));
+                assert_eq!(
+                    service_violation_diagnostics(&[row(0, 0, 0)], 0, &model)["violating_departure_cuts"],
+                    0
+                );
+            }
+
+            #[test]
+            fn service_violation_diagnostics_bound_samples_and_preserve_ties() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::PtyCapture, 1.0, 1.0).unwrap();
+                let rows: Vec<_> = (0..10).rev().map(|seq| row(seq, 0, 3_000_000)).collect();
+                let diagnostic = service_violation_diagnostics(&rows, 0, &model);
+                assert!(!service_conforms(&rows, 0, &model));
+                assert_eq!(diagnostic["violating_departure_cuts"], 10);
+                assert_eq!(diagnostic["samples_truncated"], true);
+                let samples = diagnostic["samples"].as_array().unwrap();
+                assert_eq!(samples.len(), 8);
+                for (index, sample) in samples.iter().enumerate() {
+                    assert_eq!(sample["departure_sequence"].as_u64(), Some(index as u64));
+                    assert_eq!(sample["cut_ns"], 2_999_999);
+                    assert_eq!(sample["completed_events"], 0);
+                }
+                // Non-FIFO completion must identify the departing observation,
+                // not associate the sorted departure with an arrival ordinal.
+                let reordered = [row(99, 0, 3_000_000), row(7, 0, 2_000_000)];
+                let diagnostic = service_violation_diagnostics(&reordered, 0, &model);
+                assert_eq!(diagnostic["samples"][0]["departure_sequence"], 7);
+                assert_eq!(diagnostic["samples"][1]["departure_sequence"], 99);
+                assert_eq!(diagnostic["samples"][1]["completed_events"], 1);
+            }
+
+            #[test]
+            fn service_violation_diagnostics_separate_batch_wait_from_storage_completion() {
+                let model =
+                    LindleyStageTelemetry::try_new(LatencyStage::StorageWrite, 1.0, 0.1).unwrap();
+                let mut observation = row(23, 0, 3_000_000);
+                observation.stages_ns = [
+                    [0, 1_000_000],
+                    [1_000_000, 1_000_010],
+                    [1_000_010, 3_000_000],
+                ];
+                observation.write_ack_ns = 100;
+                observation.snapshot_extraction_return_ns = 1_000_005;
+                observation.storage_submit_ns = 2_000_000;
+                observation.poll.read_elapsed_ns = 700_000;
+                observation.poll.wait_elapsed_ns = 299_900;
+                let diagnostic = service_violation_diagnostics(&[observation], 2, &model);
+                assert_eq!(diagnostic["stage"], "storage_write");
+                assert_eq!(diagnostic["violating_departure_cuts"], 1);
+                let sample = &diagnostic["samples"][0];
+                assert_eq!(sample["write_ack_elapsed_ns"], 100);
+                assert_eq!(sample["snapshot_extraction_elapsed_ns"], 5);
+                assert_eq!(sample["extraction_to_submit_ns"], 999_990);
+                assert_eq!(sample["submit_to_completion_ns"], 1_000_000);
+                assert_eq!(sample["poll"]["read_elapsed_ns"], 700_000);
+                assert_eq!(sample["poll"]["wait_elapsed_ns"], 299_900);
+            }
+
+            #[test]
+            fn next_block_calibration_preserves_pilot_rates_and_rejects_unseen_tail() {
+                let block = |delay: u64| -> Vec<Observation> {
+                    (0..1000)
+                        .map(|sequence| {
+                            let start = u64::from(sequence) * 100_000_000;
+                            row(sequence, start, start + delay)
+                        })
+                        .collect()
+                };
+                let pilot = block(1_000_000);
+                let base = calibrate(&pilot, 0.1).unwrap();
+                let mut training = vec![block(2_000_000); 19];
+                training[18] = block(3_000_000);
+                let frozen = predictive_model(&pilot, &training).unwrap();
+                for (index, stage) in frozen.stages.iter().enumerate() {
+                    assert_eq!(
+                        stage.service_rate_events_per_ms,
+                        base.stages[index].service_rate_events_per_ms
+                    );
+                    assert!(
+                        (stage.p99_latency_ms - base.stages[index].p99_latency_ms - 2.0).abs()
+                            < 1e-6
+                    );
+                    assert!(service_conforms(&block(3_000_000), index, stage));
+                    assert!(!service_conforms(&block(4_000_000), index, stage));
+                }
+                assert_eq!(frozen, predictive_model(&pilot, &training).unwrap());
+                assert!(predictive_model(&pilot, &training[..18]).is_err());
+                assert!(predictive_model(&pilot[..999], &training).is_err());
+                let excess_burst: Vec<_> = (0..1000)
+                    .map(|sequence| row(sequence, 0, 1_000_000))
+                    .collect();
+                assert!(predictive_model(&excess_burst, &training).is_err());
+                training[0] = excess_burst;
+                assert!(predictive_model(&pilot, &training).is_err());
+            }
+
+            fn next_block_identity() -> MeasurementIdentity {
+                MeasurementIdentity {
+                    release_version: "0.15.6-rc.99".into(),
+                    source_revision: "1111111111111111111111111111111111111111".into(),
+                }
+            }
+
+            fn native_block_value(offset: u64) -> serde_json::Value {
+                let rows: Vec<_> = (0..2000)
+                    .map(|sequence| {
+                        let start = offset + u64::from(sequence) * 100_000_000;
+                        let mut observation = row(sequence, start, start + 1_000_000);
+                        observation.stages_ns = [
+                            [start, start + 1_000_000],
+                            [start + 1_000_000, start + 2_000_000],
+                            [start + 2_000_000, start + 3_000_000],
+                        ];
+                        observation
+                    })
+                    .collect();
+                let trace = serde_json::to_string(&rows).unwrap();
+                let identity = next_block_identity();
+                serde_json::json!({
+                    "release_version": identity.release_version,
+                    "arrival": {"burst": 10, "rate": 0.1},
+                    "measurement": {
+                        "schema": "frankenterm.lindley-live-capture.v1",
+                        "declared_source_sha": identity.source_revision,
+                        "scope": "dedicated_mux_capture_delta_grouped_storage_finite_workload",
+                        "calibration_rows": 1000,
+                        "held_out_rows": 1000,
+                        "payload_bytes": 4096,
+                        "overlap_bytes": 4096,
+                        "trace_sha256": hex::encode(Sha256::digest(trace.as_bytes())),
+                        "trace_json": trace,
+                        "observations": rows,
+                    }
+                })
+            }
+
+            #[test]
+            fn next_block_rejects_identity_trace_and_workload_drift() {
+                let identity = next_block_identity();
+                let analyzer = "2222222222222222222222222222222222222222";
+                validate_campaign_identity(&identity, analyzer).unwrap();
+                assert!(validate_campaign_identity(&identity, "not-a-source-sha").is_err());
+                let mut wrong_identity = identity.clone();
+                wrong_identity.release_version = "../../artifact".into();
+                assert!(validate_campaign_identity(&wrong_identity, analyzer).is_err());
+                let original = native_block_value(0);
+                let (selected, _) = campaign_block(&original, &identity).unwrap();
+                assert_eq!(selected.len(), 1000);
+                assert_eq!(selected[0].sequence, 0);
+                assert_eq!(selected[999].sequence, 999);
+                let mut changed = original.clone();
+                changed["release_version"] = serde_json::json!("0.15.6-rc.98");
+                assert!(campaign_block(&changed, &identity).is_err());
+                changed = original.clone();
+                changed["measurement"]["declared_source_sha"] = serde_json::json!(analyzer);
+                assert!(campaign_block(&changed, &identity).is_err());
+                changed = original.clone();
+                changed["arrival"]["rate"] = serde_json::json!(0.2);
+                assert!(campaign_block(&changed, &identity).is_err());
+                changed = original.clone();
+                changed["measurement"]["observations"][0]["sequence"] = serde_json::json!(99);
+                assert!(campaign_block(&changed, &identity).is_err());
+                changed = original;
+                changed["measurement"]["trace_sha256"] = serde_json::json!("0".repeat(64));
+                assert!(campaign_block(&changed, &identity).is_err());
+            }
+
+            #[test]
+            fn next_block_freeze_binds_model_inputs_and_rejects_reused_validation() {
+                let directory = tempfile::tempdir().unwrap();
+                let identity = next_block_identity();
+                let analyzer = "2222222222222222222222222222222222222222";
+                let mut references = Vec::new();
+                for index in 0..21 {
+                    let path = directory.path().join(format!("block-{index}.json"));
+                    let text = serde_json::to_string(&native_block_value(index)).unwrap();
+                    fs::write(&path, &text).unwrap();
+                    references.push(CampaignBlockReference {
+                        path: path.to_string_lossy().into_owned(),
+                        sha256: hex::encode(Sha256::digest(text.as_bytes())),
+                    });
+                }
+                let (training, training_hashes) =
+                    load_campaign_blocks(&references[..20], &identity, 20).unwrap();
+                let (_, validation_hashes) =
+                    load_campaign_blocks(&references[20..], &identity, 1).unwrap();
+                let mut frozen = FrozenNextBlockModel {
+                    schema: NEXT_BLOCK_SCHEMA.into(),
+                    method: NEXT_BLOCK_METHOD.into(),
+                    measurement_identity: identity.clone(),
+                    analyzer_source_revision: analyzer.into(),
+                    training_manifest_sha256: "3".repeat(64),
+                    training_blocks: references[..20].to_vec(),
+                    training_trace_sha256: training_hashes.clone(),
+                    model: predictive_model(&training[0], &training[1..]).unwrap(),
+                    release_ready: false,
+                    assumptions: "test fixture only".into(),
+                };
+                let mut manifest = CampaignManifest {
+                    measurement_identity: identity.clone(),
+                    analyzer_source_revision: analyzer.into(),
+                    blocks: references[20..].to_vec(),
+                    frozen_path: None,
+                    frozen_sha256: None,
+                };
+                verify_frozen_model(&frozen, &manifest, &validation_hashes).unwrap();
+                assert!(verify_frozen_model(&frozen, &manifest, &training_hashes[..1]).is_err());
+                manifest.analyzer_source_revision = identity.source_revision.clone();
+                assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
+                manifest.analyzer_source_revision = analyzer.into();
+                frozen.model.stages[0].p99_latency_ms += 1.0;
+                assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
+                assert!(load_campaign_blocks(&references[..19], &identity, 20).is_err());
+                let mut duplicate = references[..20].to_vec();
+                duplicate[19] = duplicate[0].clone();
+                assert!(load_campaign_blocks(&duplicate, &identity, 20).is_err());
+                let mut reformatted = native_block_value(0);
+                let pretty_trace =
+                    serde_json::to_string_pretty(&reformatted["measurement"]["observations"])
+                        .unwrap();
+                reformatted["measurement"]["trace_sha256"] =
+                    serde_json::json!(hex::encode(Sha256::digest(pretty_trace.as_bytes())));
+                reformatted["measurement"]["trace_json"] = serde_json::json!(pretty_trace);
+                let reformatted_path = directory.path().join("reformatted.json");
+                let text = serde_json::to_string(&reformatted).unwrap();
+                fs::write(&reformatted_path, &text).unwrap();
+                duplicate[19] = CampaignBlockReference {
+                    path: reformatted_path.to_string_lossy().into_owned(),
+                    sha256: hex::encode(Sha256::digest(text.as_bytes())),
+                };
+                assert!(load_campaign_blocks(&duplicate, &identity, 20).is_err());
+                let frozen_path = directory.path().join("frozen.json");
+                let text = serde_json::to_string(&frozen).unwrap();
+                fs::write(&frozen_path, &text).unwrap();
+                manifest.frozen_path = Some(frozen_path.to_string_lossy().into_owned());
+                manifest.frozen_sha256 = Some(hex::encode(Sha256::digest(text.as_bytes())));
+                load_frozen_model(&manifest).unwrap();
+                manifest.frozen_sha256 = Some("0".repeat(64));
+                assert!(load_frozen_model(&manifest).is_err());
             }
 
             #[test]

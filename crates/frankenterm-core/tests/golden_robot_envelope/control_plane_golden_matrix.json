@@ -1803,10 +1803,7 @@
       "envelope": {
         "ok": true,
         "data": {
-          "commands": [
-            "ft robot state",
-            "ft robot get-text 1"
-          ],
+          "commands": ["ft robot state", "ft robot get-text 1"],
           "default_format": "json"
         },
         "elapsed_ms": 0,

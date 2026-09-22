@@ -716,6 +716,28 @@ async fn drain_runtime_recorder_deliveries_with_cx(
     recorder: &RuntimeRecorderPersistence,
     mode: RecorderDeliveryDrainMode,
 ) -> Result<usize> {
+    drain_runtime_recorder_deliveries_through_with_cx(
+        cx,
+        primary,
+        recorder,
+        mode,
+        None,
+        &mut HashSet::new(),
+    )
+    .await
+}
+
+// Keep singleton recorder batch identities across partial acknowledgements.
+// A prefix ends only at the exact requested delivery, never a guessed numeric
+// watermark: ledger ordering includes its creation timestamp.
+async fn drain_runtime_recorder_deliveries_through_with_cx(
+    cx: &crate::cx::Cx,
+    primary: &StorageHandle,
+    recorder: &RuntimeRecorderPersistence,
+    mode: RecorderDeliveryDrainMode,
+    through_segment_id: Option<i64>,
+    remaining_batch_deliveries: &mut HashSet<i64>,
+) -> Result<usize> {
     use crate::recorder_storage::{RecorderBackendKind, RecorderStorage as _};
 
     let selected_backend = recorder.storage.backend_kind();
@@ -723,6 +745,12 @@ async fn drain_runtime_recorder_deliveries_with_cx(
     loop {
         let pending = primary.pending_recorder_deliveries_with_cx(cx).await?;
         if pending.is_empty() {
+            if through_segment_id.is_some() {
+                return Err(runtime_backend_error(
+                    "recorder.delivery.ack",
+                    "requested capture delivery disappeared before exact acknowledgement",
+                ));
+            }
             return Ok(acknowledged);
         }
         for delivery in pending {
@@ -785,6 +813,10 @@ async fn drain_runtime_recorder_deliveries_with_cx(
                 ));
             }
             acknowledged = acknowledged.saturating_add(1);
+            remaining_batch_deliveries.remove(&delivery.segment_id);
+            if through_segment_id == Some(delivery.segment_id) {
+                return Ok(acknowledged);
+            }
         }
     }
 }
@@ -836,6 +868,53 @@ struct CaptureRetirementPublisher {
 enum PersistenceInput {
     Capture(CaptureEvent),
     Retirement(CaptureRetirementWake),
+}
+
+const PERSISTENCE_BATCH_ITEMS: usize = 16;
+const PERSISTENCE_BATCH_BYTES: usize = 1024 * 1024;
+
+fn persistence_batch_eligible(event: &CaptureEvent, max_segment_bytes: usize) -> bool {
+    !event.has_resync_decision()
+        && matches!(event.segment.kind, CapturedSegmentKind::Delta)
+        // An oversized delta becomes a GAP during bounding. It must retain
+        // the singleton pre-append gap and sequence-reconciliation boundary.
+        && event.segment.content.len() <= max_segment_bytes
+        && event.segment.content.len() <= PERSISTENCE_BATCH_BYTES
+}
+
+fn collect_persistence_batch(
+    cx: &RuntimeLoopCx,
+    first: CaptureEvent,
+    capture_rx: &SpscConsumer<CaptureEvent>,
+    retirement_rx: &SpscConsumer<CaptureRetirementWake>,
+    deferred: &mut Option<CaptureEvent>,
+    max_segment_bytes: usize,
+) -> Vec<CaptureEvent> {
+    let eligible = persistence_batch_eligible(&first, max_segment_bytes);
+    let mut bytes = first.segment.content.len();
+    let mut batch = vec![first];
+    while eligible && batch.len() < PERSISTENCE_BATCH_ITEMS && retirement_rx.depth() == 0 {
+        if cx.checkpoint().is_err() {
+            break;
+        }
+        let Some(next) = capture_rx.try_recv() else {
+            break;
+        };
+        if !persistence_batch_eligible(&next, max_segment_bytes)
+            || batch
+                .iter()
+                .any(|item| item.segment.pane_id == next.segment.pane_id)
+            || next.segment.content.len() > PERSISTENCE_BATCH_BYTES.saturating_sub(bytes)
+        {
+            // One bounded lookahead slot retains the FIFO barrier for the
+            // next iteration; it is never discarded or pushed to the tail.
+            *deferred = Some(next);
+            break;
+        }
+        bytes += next.segment.content.len();
+        batch.push(next);
+    }
+    batch
 }
 
 async fn recv_persistence_input(
@@ -9306,6 +9385,11 @@ impl ObservationRuntime {
             let mut incarnation_state = PersistenceIncarnationState::new();
             let mut capture_open = true;
             let mut retirement_open = true;
+            let mut deferred_capture = None;
+            // An append with an unacknowledged ledger entry is ambiguous.
+            // Do not retry it in Immediate mode in a later cohort: recovery
+            // performs the recorder-side identity check before replaying it.
+            let mut recorder_failure = None;
 
             if let Some(ref recorder) = recorder_persistence {
                 if let Err(error) = drain_runtime_recorder_deliveries_with_cx(
@@ -9351,15 +9435,25 @@ impl ObservationRuntime {
             // Process data and retirement wakeups until both bounded producers
             // close and their queues drain. Retirement is left-biased when
             // both are ready so closed panes release memory promptly.
-            while let Some(input) = recv_persistence_input(
-                &capture_rx,
-                &retirement_rx,
-                &mut capture_open,
-                &mut retirement_open,
-            )
-            .await
-            {
-                let mut event = match input {
+            while let Some(input) = {
+                if loop_cx.checkpoint().is_err() {
+                    None
+                } else if deferred_capture.is_some() {
+                    match retirement_rx.try_recv() {
+                        Some(wake) => Some(PersistenceInput::Retirement(wake)),
+                        None => deferred_capture.take().map(PersistenceInput::Capture),
+                    }
+                } else {
+                    recv_persistence_input(
+                        &capture_rx,
+                        &retirement_rx,
+                        &mut capture_open,
+                        &mut retirement_open,
+                    )
+                    .await
+                }
+            } {
+                let event = match input {
                     PersistenceInput::Capture(event) => event,
                     PersistenceInput::Retirement(wake) => {
                         let removed = match incarnation_state.retire_inactive(&capture_authority) {
@@ -9393,437 +9487,522 @@ impl ObservationRuntime {
                         continue;
                     }
                 };
-                let mut resync_decision = event.take_resync_decision();
-                let stamp = event.stamp();
-                let (persistence_guard, capture_pane_metadata) =
-                    match admit_capture_event_for_persistence(
-                        &capture_authority,
-                        &capture_metadata,
-                        &discovery_publication_rx,
-                        &event,
-                    )
-                    .await
-                    {
-                        Ok(admission) => admission,
-                        Err(error) => {
-                            metrics.capture_authority_rejections.increment();
-                            debug!(
-                                pane_id = event.segment.pane_id,
-                                pane_incarnation = stamp.pane_incarnation().get(),
-                                source_kind = ?stamp.source_kind(),
-                                error = %error,
-                                "Rejected stale capture event before semantic side effects"
-                            );
-                            if let Some(decision) = resync_decision.as_mut() {
-                                decision.finish(Err(error.to_string()));
-                            }
-                            continue;
-                        }
-                    };
-                let pane_incarnation = stamp.pane_incarnation();
-                metrics.record_capture_queue_depth(capture_rx.depth());
-                heartbeats.record_persistence();
-                // Check shutdown flag - if set, drain remaining events quickly
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    debug!("Persistence task: shutdown signal received, draining remaining events");
-                    // Continue to drain but don't block forever
-                }
-
-                if config_update_pending(&config_rx) {
-                    let new_config = config_take_update(&mut config_rx);
-                    if new_config.patterns != current_patterns {
-                        match PatternEngine::from_config_with_root(
-                            &new_config.patterns,
-                            patterns_root.as_deref(),
-                        ) {
-                            Ok(engine) => {
-                                let mut guard = pattern_engine.write().await;
-                                *guard = engine;
-                                current_patterns = new_config.patterns;
-                                info!("Pattern engine reloaded from updated config");
-                            }
-                            Err(err) => {
-                                warn!(
-                                    error = %err,
-                                    "Failed to reload pattern engine from updated config"
-                                );
-                            }
-                        }
-                    }
-                }
-                let pane_id = event.segment.pane_id;
-                incarnation_state.prepare_event_incarnation(pane_id, pane_incarnation);
-                let bounded_segment =
-                    bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
-                let captured_at = bounded_segment.captured_at;
-                let captured_seq = bounded_segment.seq;
-                let zone_type = semantic_zone_type_for_captured_segment(
+                let batch_started = Instant::now();
+                let batch = collect_persistence_batch(
                     &loop_cx,
-                    &wezterm_handle,
-                    &mut incarnation_state.semantic_zone_cache,
-                    semantic_zone_cache_ttl,
-                    &bounded_segment,
-                    pane_incarnation,
-                    true,
-                )
-                .await;
-                let recorder_delivery = match recorder_persistence.as_ref() {
-                    Some(recorder) => match prepare_runtime_recorder_delivery(
-                        recorder,
-                        &bounded_segment,
-                        &persistence_guard,
-                    ) {
-                        Ok(delivery) => Some(delivery),
-                        Err(error) => {
-                            error!(
-                                pane_id,
-                                seq = bounded_segment.seq,
-                                error = %error,
-                                "Selected recorder failed closed before primary segment commit"
-                            );
-                            if let Some(decision) = resync_decision.as_mut() {
-                                decision.finish(Err(error.to_string()));
-                            }
-                            shutdown_flag.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
-
-                // Persist the segment
-                // ft-xbnl0.2.3 tick 254: cx-first segment persist.
-                let checkpoint_write = begin_capture_checkpoint_write(
-                    &capture_checkpoints,
-                    pane_id,
-                    capture_pane_metadata.discovery_revision,
-                );
-                match persist_captured_segment_for_runtime(
-                    &loop_cx,
-                    &storage,
-                    &bounded_segment,
+                    event,
+                    &capture_rx,
+                    &retirement_rx,
+                    &mut deferred_capture,
                     max_persist_segment_bytes,
-                    zone_type.as_deref(),
-                    recorder_delivery,
-                    &persistence_guard,
-                )
-                .await
-                {
-                    Ok(persisted) => {
-                        confirm_capture_checkpoint(
-                            &capture_checkpoints,
-                            pane_id,
-                            &checkpoint_write,
-                            persisted.segment.seq,
-                            &bounded_segment.content,
-                        );
-                        // Check for sequence discontinuity and realign the
-                        // shared producer cursor. The correction is an
-                        // offset applied once, not a reset to storage's seq:
-                        // segments already captured and queued keep their
-                        // numbering and drain with the known offset, so one
-                        // dropped segment produces a bounded run of these
-                        // warnings instead of one per segment forever
-                        // (ft-xxfwy.32).
-                        if persisted.segment.seq != captured_seq {
-                            let mut cursors_guard = cursors.write().await;
-                            let Some(cursor) = cursors_guard.get_mut(&pane_id) else {
-                                let error = runtime_backend_error(
-                                    "capture.persistence.cursor",
-                                    format!(
-                                        "pane {pane_id} has no cursor for mandatory sequence correction"
-                                    ),
-                                );
-                                error!(
-                                    pane_id,
+                );
+                let mut prepared = Vec::with_capacity(batch.len());
+                for mut event in batch {
+                    if loop_cx.checkpoint().is_err() {
+                        break;
+                    }
+                    let mut resync_decision = event.take_resync_decision();
+                    let stamp = event.stamp();
+                    let (persistence_guard, capture_pane_metadata) =
+                        match admit_capture_event_for_persistence(
+                            &capture_authority,
+                            &capture_metadata,
+                            &discovery_publication_rx,
+                            &event,
+                        )
+                        .await
+                        {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                metrics.capture_authority_rejections.increment();
+                                debug!(
+                                    pane_id = event.segment.pane_id,
+                                    pane_incarnation = stamp.pane_incarnation().get(),
+                                    source_kind = ?stamp.source_kind(),
                                     error = %error,
-                                    "Durable capture cannot continue semantic fanout without cursor correction"
+                                    "Rejected stale capture event before semantic side effects"
                                 );
                                 if let Some(decision) = resync_decision.as_mut() {
                                     decision.finish(Err(error.to_string()));
                                 }
                                 continue;
-                            };
-                            let shift =
-                                cursor.realign_next_seq(&bounded_segment, persisted.segment.seq);
-                            if shift != 0 {
-                                warn!(
-                                    pane_id,
-                                    expected_seq = captured_seq,
-                                    actual_seq = persisted.segment.seq,
-                                    shift = %shift,
-                                    next_seq = cursor.next_seq,
-                                    "Sequence discontinuity detected, realigned producer cursor"
-                                );
-                            } else {
-                                debug!(
-                                    pane_id,
-                                    expected_seq = captured_seq,
-                                    actual_seq = persisted.segment.seq,
-                                    correction = %cursor.seq_correction(),
-                                    "Sequence discontinuity from a segment queued before the last realignment; offset already applied"
-                                );
                             }
-                        } else if let Some(cursor) = cursors.write().await.get_mut(&pane_id) {
-                            // Issuance metadata remains authoritative even
-                            // when numeric sequences match: other queued
-                            // captures may have changed the current correction.
-                            cursor.realign_next_seq(&bounded_segment, persisted.segment.seq);
-                        }
-
-                        if let Some(ref recorder) = recorder_persistence
-                            && let Err(error) = drain_runtime_recorder_deliveries_with_cx(
-                                &loop_cx,
-                                &storage,
-                                recorder,
-                                RecorderDeliveryDrainMode::Immediate,
-                            )
-                            .await
-                        {
-                            error!(
-                                pane_id,
-                                seq = persisted.segment.seq,
-                                backend = %crate::recorder_storage::RecorderStorage::backend_kind(
-                                    recorder.storage.as_ref()
-                                ),
-                                error = %error,
-                                "Selected recorder append failed; stopping capture fail-closed"
-                            );
-                            if let Some(decision) = resync_decision.as_mut() {
-                                decision.finish(Err(error.to_string()));
-                            }
-                            shutdown_flag.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-
-                        // This acknowledgement is deliberately tied to both
-                        // durable storage authorities: the canonical segment
-                        // commit and, when configured, the selected recorder
-                        // append. Mandatory cursor sequence reconciliation is
-                        // also complete. Independent replay and WAR recording
-                        // fanout remains below the acknowledgement boundary.
-                        // A retry after either durable write reuses stable
-                        // segment/event identities, so recorder batch
-                        // idempotency prevents duplicate selected-backend rows.
-                        if let Some(decision) = resync_decision.as_mut() {
-                            decision.finish(Ok(persisted.segment.seq));
-                        }
-                        if let Some(ref adapter) = replay_capture {
-                            if let Err(error) = record_authorized_replay_egress(
-                                adapter,
-                                &bounded_segment,
-                                persisted.segment.seq,
-                                &persistence_guard,
-                            ) {
-                                adapter.record_sequence_error("runtime.authorized_egress", error);
-                            }
-                        }
-
-                        // Track metrics
-                        metrics.segments_persisted.increment();
-
-                        // Record ingest lag (time from capture to persistence)
-                        let now = epoch_ms();
-                        let lag_ms = u64::try_from((now - captured_at).max(0)).unwrap_or(0);
-                        metrics.record_ingest_lag(lag_ms);
-                        metrics.record_db_write();
-
-                        debug!(
-                            pane_id = pane_id,
-                            seq = persisted.segment.seq,
-                            has_gap = persisted.gap.is_some(),
-                            "Persisted segment"
-                        );
-
-                        if let Some(ref manager) = recording {
-                            // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
-                            if let Err(err) = manager
-                                .record_segment_with_cx(&loop_cx, &bounded_segment)
-                                .await
-                            {
-                                warn!(
-                                    pane_id = pane_id,
-                                    error = %err,
-                                    "Failed to record segment"
-                                );
-                            }
-                        }
-
-                        // Publish delta/gap events for live stream subscribers.
-                        if let Some(ref bus) = event_bus {
-                            let delivered = bus.publish(crate::events::Event::SegmentCaptured {
-                                pane_id,
-                                seq: persisted.segment.seq,
-                                content_len: persisted.segment.content_len,
-                            });
-                            if delivered == 0 {
-                                debug!(pane_id, "No subscribers for segment event bus");
-                            }
-
-                            if let Some(gap) = &persisted.gap {
-                                let delivered_gap =
-                                    bus.publish(crate::events::Event::GapDetected {
-                                        pane_id: gap.pane_id,
-                                        seq_before: gap.seq_before,
-                                        seq_after: gap.seq_after,
-                                        reason: gap.reason.clone(),
-                                        detected_at_ms: gap.detected_at,
-                                    });
-                                if delivered_gap == 0 {
-                                    debug!(pane_id, "No subscribers for gap event bus");
-                                }
-                            }
-                        }
-
-                        // Run pattern detection on the content
-                        let mut detections = {
-                            let mut ctx = {
-                                let mut contexts = detection_contexts.write().await;
-                                contexts.remove(&pane_id).unwrap_or_else(|| {
-                                    let mut c = DetectionContext::new();
-                                    c.pane_id = Some(pane_id);
-                                    c
-                                })
-                            };
-
-                            // If this was a gap/discontinuity, clear the tail buffer because
-                            // previous context is no longer valid or contiguous.
-                            if persisted.gap.is_some() {
-                                ctx.tail_buffer.clear();
-                            }
-
-                            let detections = {
-                                let engine = pattern_engine.read().await;
-                                engine
-                                    .detect_with_context(bounded_segment.content.as_str(), &mut ctx)
-                            };
-
-                            {
-                                let mut contexts = detection_contexts.write().await;
-                                contexts.insert(pane_id, ctx);
-                            }
-                            detections
                         };
+                    let pane_incarnation = stamp.pane_incarnation();
+                    metrics.record_capture_queue_depth(capture_rx.depth());
+                    heartbeats.record_persistence();
+                    // Check shutdown flag - if set, drain remaining events quickly
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        debug!(
+                            "Persistence task: shutdown signal received, draining remaining events"
+                        );
+                        // Continue to drain but don't block forever
+                    }
 
-                        if let Some(detection) = incarnation_state.observe_bocpd(
-                            &bounded_segment,
-                            pane_incarnation,
-                            persisted.gap.is_some(),
-                        ) {
-                            detections.push(detection);
-                        }
-
-                        if !detections.is_empty() {
-                            debug!(
-                                pane_id = pane_id,
-                                count = detections.len(),
-                                "Pattern detections"
-                            );
-
-                            let pane_uuid = Some(capture_pane_metadata.pane_uuid.clone());
-
-                            // Persist each detection as an event
-                            // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
-                            for detection in detections {
-                                if let Some(ref manager) = recording {
-                                    if let Err(err) = manager
-                                        .record_event_with_cx(
-                                            &loop_cx,
-                                            pane_id,
-                                            &detection,
-                                            captured_at,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            pane_id = pane_id,
-                                            rule_id = %detection.rule_id,
-                                            error = %err,
-                                            "Failed to record detection"
-                                        );
-                                    }
+                    if config_update_pending(&config_rx) {
+                        let new_config = config_take_update(&mut config_rx);
+                        if new_config.patterns != current_patterns {
+                            match PatternEngine::from_config_with_root(
+                                &new_config.patterns,
+                                patterns_root.as_deref(),
+                            ) {
+                                Ok(engine) => {
+                                    let mut guard = pattern_engine.write().await;
+                                    *guard = engine;
+                                    current_patterns = new_config.patterns;
+                                    info!("Pattern engine reloaded from updated config");
                                 }
-                                let stored_event = detection_to_stored_event(
-                                    pane_id,
-                                    pane_uuid.as_deref(),
-                                    &detection,
-                                    Some(persisted.segment.id),
-                                );
-
-                                // ft-xbnl0.2.3 tick 251: cx-first event record.
-                                let delegated_hold = match persistence_guard.delegate_storage() {
-                                    Ok(hold) => hold,
-                                    Err(error) => {
-                                        error!(
-                                            pane_id,
-                                            rule_id = detection.rule_id,
-                                            error = %error,
-                                            "Failed to delegate capture authority to event storage"
-                                        );
-                                        continue;
-                                    }
-                                };
-                                match storage
-                                    .record_capture_event_outcome_with_cx(
-                                        &loop_cx,
-                                        stored_event,
-                                        delegated_hold,
-                                    )
-                                    .await
-                                {
-                                    Ok(outcome) => {
-                                        if let Some(event_id) = outcome.inserted_event_id() {
-                                            metrics.events_recorded.increment();
-
-                                            // Publish to event bus for workflow runners (if configured)
-                                            if let Some(ref bus) = event_bus {
-                                                // FND-010 / INV-RED-1: the stored row is
-                                                // redacted, but the live event bus was
-                                                // publishing the RAW in-memory detection
-                                                // (matched_text can contain a secret) to
-                                                // subscribers (web SSE, workflow runners).
-                                                // Redact the emitted copy too.
-                                                let event = crate::events::Event::PatternDetected {
-                                                    pane_id,
-                                                    pane_uuid: pane_uuid.clone(),
-                                                    detection: redact_detection(&detection),
-                                                    event_id: Some(event_id),
-                                                };
-                                                let delivered = bus.publish(event);
-                                                if delivered == 0 {
-                                                    debug!(
-                                                        pane_id = pane_id,
-                                                        rule_id = %detection.rule_id,
-                                                        "No subscribers for detection event bus"
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            debug!(
-                                                pane_id,
-                                                rule_id = %detection.rule_id,
-                                                event_id = outcome.event_id(),
-                                                "Suppressed duplicate detection after durable dedupe"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            pane_id = pane_id,
-                                            rule_id = detection.rule_id,
-                                            error = %e,
-                                            "Failed to record event"
-                                        );
-                                    }
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        "Failed to reload pattern engine from updated config"
+                                    );
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        metrics::counter!("capture.persist.failures").increment(1);
-                        error!(pane_id = pane_id, error = %e, "Failed to persist segment");
-                        if let Some(decision) = resync_decision.as_mut() {
-                            decision.finish(Err(e.to_string()));
+                    let pane_id = event.segment.pane_id;
+                    incarnation_state.prepare_event_incarnation(pane_id, pane_incarnation);
+                    let bounded_segment =
+                        bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
+                    let zone_type = semantic_zone_type_for_captured_segment(
+                        &loop_cx,
+                        &wezterm_handle,
+                        &mut incarnation_state.semantic_zone_cache,
+                        semantic_zone_cache_ttl,
+                        &bounded_segment,
+                        pane_incarnation,
+                        true,
+                    )
+                    .await;
+                    let recorder_delivery = match recorder_persistence.as_ref() {
+                        Some(recorder) => match prepare_runtime_recorder_delivery(
+                            recorder,
+                            &bounded_segment,
+                            &persistence_guard,
+                        ) {
+                            Ok(delivery) => Some(delivery),
+                            Err(error) => {
+                                error!(
+                                    pane_id,
+                                    seq = bounded_segment.seq,
+                                    error = %error,
+                                    "Selected recorder failed closed before primary segment commit"
+                                );
+                                if let Some(decision) = resync_decision.as_mut() {
+                                    decision.finish(Err(error.to_string()));
+                                }
+                                shutdown_flag.store(true, Ordering::SeqCst);
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+
+                    // Persist the segment
+                    // ft-xbnl0.2.3 tick 254: cx-first segment persist.
+                    let checkpoint_write = begin_capture_checkpoint_write(
+                        &capture_checkpoints,
+                        pane_id,
+                        capture_pane_metadata.discovery_revision,
+                    );
+                    prepared.push((
+                        bounded_segment,
+                        zone_type,
+                        recorder_delivery,
+                        persistence_guard,
+                        capture_pane_metadata,
+                        checkpoint_write,
+                        resync_decision,
+                        pane_incarnation,
+                    ));
+                }
+
+                // Poll every admitted primary+ledger write; do not use
+                // try_join or drop sibling replies after one failure. The
+                // canonical helper retains exact authority, redaction, BEGIN
+                // retry rules and durable sequence reconciliation. Distinct
+                // panes keep checkpoint/cursor preparation independent.
+                let settled = futures::future::join_all(prepared.into_iter().map(|prepared| {
+                    let cx = &loop_cx;
+                    let storage = &storage;
+                    async move {
+                        // Include collection and every cohort member's
+                        // preparation in this wait; captured_at remains the
+                        // original ingress timestamp for final ingest lag.
+                        metrics::histogram!("capture.persist.batch_admission_wait_us")
+                            .record(batch_started.elapsed().as_secs_f64() * 1_000_000.0);
+                        let result = persist_captured_segment_for_runtime(
+                            cx,
+                            storage,
+                            &prepared.0,
+                            max_persist_segment_bytes,
+                            prepared.1.as_deref(),
+                            prepared.2.clone(),
+                            &prepared.3,
+                        )
+                        .await;
+                        (prepared, result)
+                    }
+                }))
+                .await;
+                let mut remaining_deliveries: HashSet<i64> = settled
+                    .iter()
+                    .filter_map(|(_, result)| {
+                        result.as_ref().ok().map(|capture| capture.segment.id)
+                    })
+                    .collect();
+                for (
+                    (
+                        bounded_segment,
+                        _zone_type,
+                        _recorder_delivery,
+                        persistence_guard,
+                        capture_pane_metadata,
+                        checkpoint_write,
+                        mut resync_decision,
+                        pane_incarnation,
+                    ),
+                    result,
+                ) in settled
+                {
+                    let pane_id = bounded_segment.pane_id;
+                    let captured_at = bounded_segment.captured_at;
+                    let captured_seq = bounded_segment.seq;
+                    match result {
+                        Ok(persisted) => {
+                            confirm_capture_checkpoint(
+                                &capture_checkpoints,
+                                pane_id,
+                                &checkpoint_write,
+                                persisted.segment.seq,
+                                &bounded_segment.content,
+                            );
+                            // Check for sequence discontinuity and realign the
+                            // shared producer cursor. The correction is an
+                            // offset applied once, not a reset to storage's seq:
+                            // segments already captured and queued keep their
+                            // numbering and drain with the known offset, so one
+                            // dropped segment produces a bounded run of these
+                            // warnings instead of one per segment forever
+                            // (ft-xxfwy.32).
+                            if persisted.segment.seq != captured_seq {
+                                let mut cursors_guard = cursors.write().await;
+                                let Some(cursor) = cursors_guard.get_mut(&pane_id) else {
+                                    let error = runtime_backend_error(
+                                        "capture.persistence.cursor",
+                                        format!(
+                                            "pane {pane_id} has no cursor for mandatory sequence correction"
+                                        ),
+                                    );
+                                    error!(
+                                        pane_id,
+                                        error = %error,
+                                        "Durable capture cannot continue semantic fanout without cursor correction"
+                                    );
+                                    if let Some(decision) = resync_decision.as_mut() {
+                                        decision.finish(Err(error.to_string()));
+                                    }
+                                    continue;
+                                };
+                                let shift = cursor
+                                    .realign_next_seq(&bounded_segment, persisted.segment.seq);
+                                if shift != 0 {
+                                    warn!(
+                                        pane_id,
+                                        expected_seq = captured_seq,
+                                        actual_seq = persisted.segment.seq,
+                                        shift = %shift,
+                                        next_seq = cursor.next_seq,
+                                        "Sequence discontinuity detected, realigned producer cursor"
+                                    );
+                                } else {
+                                    debug!(
+                                        pane_id,
+                                        expected_seq = captured_seq,
+                                        actual_seq = persisted.segment.seq,
+                                        correction = %cursor.seq_correction(),
+                                        "Sequence discontinuity from a segment queued before the last realignment; offset already applied"
+                                    );
+                                }
+                            } else if let Some(cursor) = cursors.write().await.get_mut(&pane_id) {
+                                // Issuance metadata remains authoritative even
+                                // when numeric sequences match: other queued
+                                // captures may have changed the current correction.
+                                cursor.realign_next_seq(&bounded_segment, persisted.segment.seq);
+                            }
+
+                            if let Some(ref recorder) = recorder_persistence {
+                                if recorder_failure.is_none()
+                                    && remaining_deliveries.contains(&persisted.segment.id)
+                                {
+                                    if let Err(error) =
+                                        drain_runtime_recorder_deliveries_through_with_cx(
+                                            &loop_cx,
+                                            &storage,
+                                            recorder,
+                                            RecorderDeliveryDrainMode::Immediate,
+                                            Some(persisted.segment.id),
+                                            &mut remaining_deliveries,
+                                        )
+                                        .await
+                                    {
+                                        recorder_failure = Some(error.to_string());
+                                    }
+                                }
+                                if let Some(error) = recorder_failure.as_ref() {
+                                    error!(
+                                        pane_id,
+                                        seq = persisted.segment.seq,
+                                        backend = %crate::recorder_storage::RecorderStorage::backend_kind(
+                                            recorder.storage.as_ref()
+                                        ),
+                                        error = %error,
+                                        "Selected recorder append failed; stopping capture fail-closed"
+                                    );
+                                    if let Some(decision) = resync_decision.as_mut() {
+                                        decision.finish(Err(error.to_string()));
+                                    }
+                                    shutdown_flag.store(true, Ordering::SeqCst);
+                                    continue;
+                                }
+                            }
+
+                            // This acknowledgement is deliberately tied to both
+                            // durable storage authorities: the canonical segment
+                            // commit and, when configured, the selected recorder
+                            // append. Mandatory cursor sequence reconciliation is
+                            // also complete. Independent replay and WAR recording
+                            // fanout remains below the acknowledgement boundary.
+                            // A retry after either durable write reuses stable
+                            // segment/event identities, so recorder batch
+                            // idempotency prevents duplicate selected-backend rows.
+                            if let Some(decision) = resync_decision.as_mut() {
+                                decision.finish(Ok(persisted.segment.seq));
+                            }
+                            if let Some(ref adapter) = replay_capture {
+                                if let Err(error) = record_authorized_replay_egress(
+                                    adapter,
+                                    &bounded_segment,
+                                    persisted.segment.seq,
+                                    &persistence_guard,
+                                ) {
+                                    adapter
+                                        .record_sequence_error("runtime.authorized_egress", error);
+                                }
+                            }
+
+                            // Track metrics
+                            metrics.segments_persisted.increment();
+
+                            // Record ingest lag (time from capture to persistence)
+                            let now = epoch_ms();
+                            let lag_ms = u64::try_from((now - captured_at).max(0)).unwrap_or(0);
+                            metrics.record_ingest_lag(lag_ms);
+                            metrics.record_db_write();
+
+                            debug!(
+                                pane_id = pane_id,
+                                seq = persisted.segment.seq,
+                                has_gap = persisted.gap.is_some(),
+                                "Persisted segment"
+                            );
+
+                            if let Some(ref manager) = recording {
+                                // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
+                                if let Err(err) = manager
+                                    .record_segment_with_cx(&loop_cx, &bounded_segment)
+                                    .await
+                                {
+                                    warn!(
+                                        pane_id = pane_id,
+                                        error = %err,
+                                        "Failed to record segment"
+                                    );
+                                }
+                            }
+
+                            // Publish delta/gap events for live stream subscribers.
+                            if let Some(ref bus) = event_bus {
+                                let delivered =
+                                    bus.publish(crate::events::Event::SegmentCaptured {
+                                        pane_id,
+                                        seq: persisted.segment.seq,
+                                        content_len: persisted.segment.content_len,
+                                    });
+                                if delivered == 0 {
+                                    debug!(pane_id, "No subscribers for segment event bus");
+                                }
+
+                                if let Some(gap) = &persisted.gap {
+                                    let delivered_gap =
+                                        bus.publish(crate::events::Event::GapDetected {
+                                            pane_id: gap.pane_id,
+                                            seq_before: gap.seq_before,
+                                            seq_after: gap.seq_after,
+                                            reason: gap.reason.clone(),
+                                            detected_at_ms: gap.detected_at,
+                                        });
+                                    if delivered_gap == 0 {
+                                        debug!(pane_id, "No subscribers for gap event bus");
+                                    }
+                                }
+                            }
+
+                            // Run pattern detection on the content
+                            let mut detections = {
+                                let mut ctx = {
+                                    let mut contexts = detection_contexts.write().await;
+                                    contexts.remove(&pane_id).unwrap_or_else(|| {
+                                        let mut c = DetectionContext::new();
+                                        c.pane_id = Some(pane_id);
+                                        c
+                                    })
+                                };
+
+                                // If this was a gap/discontinuity, clear the tail buffer because
+                                // previous context is no longer valid or contiguous.
+                                if persisted.gap.is_some() {
+                                    ctx.tail_buffer.clear();
+                                }
+
+                                let detections = {
+                                    let engine = pattern_engine.read().await;
+                                    engine.detect_with_context(
+                                        bounded_segment.content.as_str(),
+                                        &mut ctx,
+                                    )
+                                };
+
+                                {
+                                    let mut contexts = detection_contexts.write().await;
+                                    contexts.insert(pane_id, ctx);
+                                }
+                                detections
+                            };
+
+                            if let Some(detection) = incarnation_state.observe_bocpd(
+                                &bounded_segment,
+                                pane_incarnation,
+                                persisted.gap.is_some(),
+                            ) {
+                                detections.push(detection);
+                            }
+
+                            if !detections.is_empty() {
+                                debug!(
+                                    pane_id = pane_id,
+                                    count = detections.len(),
+                                    "Pattern detections"
+                                );
+
+                                let pane_uuid = Some(capture_pane_metadata.pane_uuid.clone());
+
+                                // Persist each detection as an event
+                                // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
+                                for detection in detections {
+                                    if let Some(ref manager) = recording {
+                                        if let Err(err) = manager
+                                            .record_event_with_cx(
+                                                &loop_cx,
+                                                pane_id,
+                                                &detection,
+                                                captured_at,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                pane_id = pane_id,
+                                                rule_id = %detection.rule_id,
+                                                error = %err,
+                                                "Failed to record detection"
+                                            );
+                                        }
+                                    }
+                                    let stored_event = detection_to_stored_event(
+                                        pane_id,
+                                        pane_uuid.as_deref(),
+                                        &detection,
+                                        Some(persisted.segment.id),
+                                    );
+
+                                    // ft-xbnl0.2.3 tick 251: cx-first event record.
+                                    let delegated_hold = match persistence_guard.delegate_storage()
+                                    {
+                                        Ok(hold) => hold,
+                                        Err(error) => {
+                                            error!(
+                                                pane_id,
+                                                rule_id = detection.rule_id,
+                                                error = %error,
+                                                "Failed to delegate capture authority to event storage"
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    match storage
+                                        .record_capture_event_outcome_with_cx(
+                                            &loop_cx,
+                                            stored_event,
+                                            delegated_hold,
+                                        )
+                                        .await
+                                    {
+                                        Ok(outcome) => {
+                                            if let Some(event_id) = outcome.inserted_event_id() {
+                                                metrics.events_recorded.increment();
+
+                                                // Publish to event bus for workflow runners (if configured)
+                                                if let Some(ref bus) = event_bus {
+                                                    // FND-010 / INV-RED-1: the stored row is
+                                                    // redacted, but the live event bus was
+                                                    // publishing the RAW in-memory detection
+                                                    // (matched_text can contain a secret) to
+                                                    // subscribers (web SSE, workflow runners).
+                                                    // Redact the emitted copy too.
+                                                    let event =
+                                                        crate::events::Event::PatternDetected {
+                                                            pane_id,
+                                                            pane_uuid: pane_uuid.clone(),
+                                                            detection: redact_detection(&detection),
+                                                            event_id: Some(event_id),
+                                                        };
+                                                    let delivered = bus.publish(event);
+                                                    if delivered == 0 {
+                                                        debug!(
+                                                            pane_id = pane_id,
+                                                            rule_id = %detection.rule_id,
+                                                            "No subscribers for detection event bus"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                debug!(
+                                                    pane_id,
+                                                    rule_id = %detection.rule_id,
+                                                    event_id = outcome.event_id(),
+                                                    "Suppressed duplicate detection after durable dedupe"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                pane_id = pane_id,
+                                                rule_id = detection.rule_id,
+                                                error = %e,
+                                                "Failed to record event"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            metrics::counter!("capture.persist.failures").increment(1);
+                            error!(pane_id = pane_id, error = %e, "Failed to persist segment");
+                            if let Some(decision) = resync_decision.as_mut() {
+                                decision.finish(Err(e.to_string()));
+                            }
                         }
                     }
                 }
@@ -12014,6 +12193,7 @@ impl RuntimeHandle {
                 match pane_list_result {
                     Ok(Ok(panes)) => {
                         let checkpoint_timeout = shutdown_timeout.min(Duration::from_secs(5));
+                        let checkpoint_started = Instant::now();
                         match snapshot_engine
                             .shutdown_checkpoint_with_cx(&snapshot_cx, &panes, checkpoint_timeout)
                             .await
@@ -12044,8 +12224,10 @@ impl RuntimeHandle {
                                         "runtime terminal checkpoint committed but clean mark failed"
                                     );
                                     warnings.push(format!(
-                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed: {error:?}",
-                                        checkpoint.checkpoint_id
+                                        "RuntimeBuilder terminal checkpoint {} committed, but its clean mark failed after {}ms (wait limit {}ms): {error:?}",
+                                        checkpoint.checkpoint_id,
+                                        checkpoint_started.elapsed().as_millis(),
+                                        checkpoint_timeout.as_millis(),
                                     ));
                                 } else {
                                     warn!(
@@ -16658,6 +16840,532 @@ mod tests {
     }
 
     #[test]
+    fn normal_watch_batches_two_authorized_recorder_captures_in_one_real_transaction() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+            use tracing::instrument::WithSubscriber;
+            for fail_ack in [false, true] {
+                let capture = ConnectorDiagnosticCapture(Arc::new(StdMutex::new(Vec::new())));
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter("off,frankenterm::append_transaction=trace")
+                    .with_writer(capture.clone())
+                    .finish();
+                let (_dir, db_path) = temp_db_path();
+                let storage = StorageHandle::new(&db_path)
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap();
+                for pane_id in [501, 502] {
+                    storage
+                        .upsert_pane(test_pane_record(pane_id))
+                        .await
+                        .unwrap();
+                }
+                if fail_ack {
+                    let db = rusqlite::Connection::open(&db_path).unwrap();
+                    db.execute_batch(
+                    "CREATE TRIGGER refuse_recorder_ack BEFORE DELETE ON recorder_delivery_ledger \
+                     BEGIN SELECT RAISE(FAIL, 'owned acknowledgement failure'); END;",
+                ).unwrap();
+                }
+                let recorder_dir = tempfile::tempdir().unwrap();
+                let recorder_config = recorder_delivery_config_for_test(
+                    RecorderBackendKind::AppendLog,
+                    recorder_dir.path(),
+                );
+                let recorder =
+                    Arc::new(bootstrap_recorder_storage(recorder_config.clone()).unwrap());
+                let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+                let replay = Arc::new(
+                    crate::replay_capture::CaptureAdapter::new(
+                        replay_sink.clone(),
+                        crate::replay_capture::CaptureConfig::default(),
+                    )
+                    .unwrap(),
+                );
+                let runtime = ObservationRuntime::new(
+                    RuntimeConfig::default(),
+                    storage.clone(),
+                    Arc::new(RwLock::new(PatternEngine::new())),
+                )
+                .with_recorder_storage(recorder)
+                .unwrap()
+                .with_replay_capture_adapter(replay)
+                .with_wezterm_handle(Arc::new(crate::wezterm::MockWezterm::new()));
+                let revision = DiscoveryRevision(40);
+                let mut observed = HashMap::new();
+                let (ring_tx, ring_rx) = spsc_channel(4);
+                let mut later_cohort = None;
+                for pane_id in [501, 502] {
+                    let identity = runtime.capture_authority.activate_pane(pane_id).unwrap();
+                    let lease = runtime
+                        .capture_authority
+                        .issue_source(identity, CaptureSourceKind::Polling)
+                        .unwrap();
+                    runtime.capture_metadata.write().await.insert(
+                        identity.pane_incarnation(),
+                        CapturePaneMetadata {
+                            pane_uuid: format!("batch-{pane_id}"),
+                            discovery_generation: 1,
+                            discovery_revision: revision,
+                        },
+                    );
+                    runtime
+                        .cursors
+                        .write()
+                        .await
+                        .insert(pane_id, PaneCursor::new(pane_id));
+                    observed.insert(
+                        pane_id,
+                        ObservedCapturePane {
+                            info: make_pane(pane_id, &format!("batch-{pane_id}")),
+                            lifecycle_identity: test_lifecycle_identity(pane_id),
+                            lifecycle_revision: PaneLifecycleRevision::new(1),
+                            pane_uuid: format!("batch-{pane_id}"),
+                            revision,
+                            requires_storage_resync: false,
+                        },
+                    );
+                    ring_tx
+                        .try_send(test_capture_event_for_lease(pane_id, 0, &lease))
+                        .unwrap();
+                    if fail_ack && pane_id == 501 {
+                        later_cohort = Some(test_capture_event_for_lease(pane_id, 1, &lease));
+                    }
+                }
+                if let Some(event) = later_cohort {
+                    // Repeated pane is a real cohort boundary. The failure latch
+                    // must survive it, not just suppress the first cohort's tail.
+                    ring_tx.try_send(event).unwrap();
+                }
+                drop(ring_tx);
+                let (_publication_tx, publication_rx) =
+                    watch::channel(DiscoveryCapturePublication {
+                        epoch: 1,
+                        observed_panes: Arc::new(observed),
+                        transitioning_pane_ids: Arc::new(HashSet::new()),
+                        transitions: Arc::new(HashMap::new()),
+                    });
+                // Discovery establishes an authoritative baseline before it
+                // publishes a capture generation. An empty cache deliberately
+                // remains uncertain after appends, even when they commit.
+                let checkpoints = Arc::new(StdMutex::new(LruCache::new(4)));
+                let checkpoint_cx = crate::cx::for_testing();
+                for pane_id in [501, 502] {
+                    let baseline = load_capture_checkpoint_from_storage(
+                        &checkpoint_cx,
+                        &storage,
+                        pane_id,
+                        revision,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(baseline.next_seq, 0);
+                    assert!(baseline.raw_tail.is_empty());
+                    checkpoints
+                        .lock()
+                        .unwrap()
+                        .put(pane_id, CachedCaptureCheckpoint::Certain(baseline));
+                }
+                let (entered, release) = storage.pause_writer_before_receive_for_test();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match entered.try_recv() {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "writer never reached owned barrier"
+                            );
+                            sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(error) => panic!("writer barrier failed: {error}"),
+                    }
+                }
+                let (retirement_tx, retirement_rx) = spsc_channel(1);
+                drop(retirement_tx);
+                let persistence = runtime.spawn_persistence_task(
+                    ring_rx,
+                    Arc::clone(&runtime.cursors),
+                    publication_rx,
+                    Arc::clone(&checkpoints),
+                    retirement_rx,
+                    Arc::new(StdMutex::new(())),
+                );
+                while storage.write_queue_depth() != 2 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "normal recorder watch must admit both writes before either reply"
+                    );
+                    sleep(Duration::from_millis(1)).await;
+                }
+                assert!(
+                    replay_sink.recorder_events().is_empty(),
+                    "no precommit fanout"
+                );
+                assert_eq!(runtime.metrics.segments_persisted(), 0);
+                release.send(()).unwrap();
+                persistence.await.unwrap();
+                let cx = crate::cx::for_testing();
+                let pending = storage
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .unwrap();
+                let events = replay_sink.recorder_events();
+                let mirrored = recorder_delivery_events_for_test(
+                    RecorderBackendKind::AppendLog,
+                    &recorder_config,
+                );
+                if fail_ack {
+                    assert!(runtime.shutdown_flag.load(Ordering::SeqCst));
+                    assert_eq!(runtime.metrics.segments_persisted(), 0);
+                    assert!(
+                        events.is_empty(),
+                        "no fanout before recorder acknowledgement"
+                    );
+                    assert_eq!(
+                        pending.len(),
+                        3,
+                        "every primary commit retains its delivery obligation"
+                    );
+                    assert_eq!(
+                        mirrored.len(),
+                        1,
+                        "later cohorts cannot retry an ambiguous append in Immediate mode"
+                    );
+                    let db = rusqlite::Connection::open(&db_path).unwrap();
+                    db.execute_batch("DROP TRIGGER refuse_recorder_ack")
+                        .unwrap();
+                    drop(db);
+                    let recorder = runtime.recorder_persistence.as_ref().unwrap();
+                    assert_eq!(
+                        drain_runtime_recorder_deliveries_with_cx(
+                            &cx,
+                            &storage,
+                            recorder,
+                            RecorderDeliveryDrainMode::Recovery,
+                        )
+                        .await
+                        .unwrap(),
+                        3
+                    );
+                    assert!(
+                        storage
+                            .pending_recorder_deliveries_with_cx(&cx)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let recovered = recorder_delivery_events_for_test(
+                        RecorderBackendKind::AppendLog,
+                        &recorder_config,
+                    );
+                    assert_eq!(
+                        recovered.len(),
+                        3,
+                        "recovery must not duplicate the first append"
+                    );
+                    assert_eq!(
+                        recovered
+                            .iter()
+                            .map(|event| (event.pane_id, event.sequence))
+                            .collect::<Vec<_>>(),
+                        vec![(501, 0), (502, 0), (501, 1)]
+                    );
+                } else {
+                    assert_eq!(runtime.metrics.segments_persisted(), 2);
+                    assert!(pending.is_empty());
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|event| (event.pane_id, event.sequence))
+                            .collect::<Vec<_>>(),
+                        vec![(501, 0), (502, 0)]
+                    );
+                    assert_eq!(mirrored.len(), 2);
+                    assert_eq!(
+                        mirrored
+                            .iter()
+                            .map(|event| event.pane_id)
+                            .collect::<HashSet<_>>(),
+                        HashSet::from([501, 502])
+                    );
+                }
+                let trace = capture.records();
+                let members: Vec<_> = trace
+                    .iter()
+                    .filter(|row| row["fields"]["event"] == "append_transaction_member")
+                    .collect();
+                assert_eq!(
+                    members.len(),
+                    if fail_ack { 3 } else { 2 },
+                    "real committed SQL member receipts"
+                );
+                assert_eq!(
+                    members[0]["fields"]["transaction_id"], members[1]["fields"]["transaction_id"],
+                    "both normal-watch writes share a real commit"
+                );
+                assert_eq!(
+                    members
+                        .iter()
+                        .map(|row| row["fields"]["pane_id"].as_u64().unwrap())
+                        .collect::<HashSet<_>>(),
+                    HashSet::from([501, 502])
+                );
+                for pane_id in [501, 502] {
+                    let checkpoint = certain_capture_checkpoint(&checkpoints, pane_id, revision)
+                        .expect("committed contiguous captures preserve the proven baseline");
+                    let count = if fail_ack && pane_id == 501 { 2 } else { 1 };
+                    assert_eq!(checkpoint.next_seq, count);
+                    assert_eq!(checkpoint.raw_tail, "test".repeat(count as usize));
+                }
+                storage.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_prefix_ack_tracks_exact_ids_in_ledger_order_for_both_backends() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempfile::tempdir().expect("prefix fixture");
+                let path = dir.path().join("primary.sqlite3");
+                let primary = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
+                let cx = crate::cx::for_testing();
+                let mut ids = Vec::new();
+                for pane in [411, 412] {
+                    primary.upsert_pane(test_pane_record(pane)).await.unwrap();
+                    let segment = primary
+                        .append_segment_with_recorder_delivery_for_test(
+                            &cx,
+                            pane,
+                            "prefix payload",
+                            recorder_delivery_seed_for_test(backend, pane, 0, "prefix payload"),
+                        )
+                        .await
+                        .unwrap();
+                    ids.push(segment.id);
+                }
+                // Simulate wall-clock reversal between primary commits. The
+                // canonical outbox order deliberately opposes numeric IDs.
+                let db = rusqlite::Connection::open(&path).unwrap();
+                db.execute(
+                    "UPDATE recorder_delivery_ledger SET created_at = CASE WHEN segment_id = ?1 THEN 2 ELSE 1 END",
+                    [ids[0]],
+                ).unwrap();
+                drop(db);
+                let pending = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    pending.iter().map(|row| row.segment_id).collect::<Vec<_>>(),
+                    vec![ids[1], ids[0]]
+                );
+                let config = recorder_delivery_config_for_test(backend, dir.path());
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(config.clone()).unwrap(),
+                ))
+                .unwrap();
+                let mut remaining = std::collections::HashSet::from([ids[0], ids[1]]);
+                let cancelled = crate::cx::for_testing();
+                cancelled.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel prefix drain"),
+                );
+                assert!(
+                    drain_runtime_recorder_deliveries_through_with_cx(
+                        &cancelled,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Immediate,
+                        Some(ids[1]),
+                        &mut remaining,
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(remaining, std::collections::HashSet::from([ids[0], ids[1]]));
+                assert_eq!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, None);
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_through_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Immediate,
+                        Some(ids[1]),
+                        &mut remaining,
+                    )
+                    .await
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(remaining, std::collections::HashSet::from([ids[0]]));
+                let next = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .unwrap();
+                assert_eq!(next.len(), 1);
+                assert_eq!(next[0].segment_id, ids[0]);
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_through_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Immediate,
+                        Some(ids[0]),
+                        &mut remaining,
+                    )
+                    .await
+                    .unwrap(),
+                    1
+                );
+                assert!(remaining.is_empty());
+                assert!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let events = recorder_delivery_events_for_test(backend, &config);
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0], pending[0].event);
+                assert_eq!(events[1], pending[1].event);
+                assert!(
+                    drain_runtime_recorder_deliveries_through_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Immediate,
+                        Some(i64::MAX),
+                        &mut remaining,
+                    )
+                    .await
+                    .is_err(),
+                    "absent target cannot be acknowledged from an empty ledger"
+                );
+                primary.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_prefix_crash_before_ack_preserves_batch_obligations_for_both_backends() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let dir = tempfile::tempdir().expect("prefix crash fixture");
+                let path = dir.path().join("primary.sqlite3");
+                let primary = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
+                let cx = crate::cx::for_testing();
+                for pane in [413, 414] {
+                    primary.upsert_pane(test_pane_record(pane)).await.unwrap();
+                    primary
+                        .append_segment_with_recorder_delivery_for_test(
+                            &cx,
+                            pane,
+                            "ambiguous append",
+                            recorder_delivery_seed_for_test(backend, pane, 0, "ambiguous append"),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let pending = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 2);
+                let expected_ids: std::collections::HashSet<_> =
+                    pending.iter().map(|row| row.segment_id).collect();
+                let mut remaining = expected_ids.clone();
+                let config = recorder_delivery_config_for_test(backend, dir.path());
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(config.clone()).unwrap(),
+                ))
+                .unwrap();
+                let error = drain_runtime_recorder_deliveries_through_with_cx(
+                    &cx,
+                    &primary,
+                    &recorder,
+                    RecorderDeliveryDrainMode::CrashAfterAppendBeforeAck,
+                    Some(pending[0].segment_id),
+                    &mut remaining,
+                )
+                .await
+                .expect_err("append-before-ack seam must fail");
+                assert!(error.to_string().contains("injected process loss"));
+                assert_eq!(remaining, expected_ids);
+                assert_eq!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                primary.shutdown().await.unwrap();
+                drop(recorder);
+                let primary = StorageHandle::new(&path.to_string_lossy()).await.unwrap();
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(config.clone()).unwrap(),
+                ))
+                .unwrap();
+                for delivery in &pending {
+                    assert_eq!(
+                        drain_runtime_recorder_deliveries_through_with_cx(
+                            &cx,
+                            &primary,
+                            &recorder,
+                            RecorderDeliveryDrainMode::Recovery,
+                            Some(delivery.segment_id),
+                            &mut remaining,
+                        )
+                        .await
+                        .unwrap(),
+                        1
+                    );
+                }
+                assert!(remaining.is_empty());
+                assert!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let events = recorder_delivery_events_for_test(backend, &config);
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "retry must not duplicate the already appended first event"
+                );
+                assert_eq!(events[0], pending[0].event);
+                assert_eq!(events[1], pending[1].event);
+                primary.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn recorder_delivery_restart_drains_primary_commit_exactly_once_for_both_backends() {
         run_async_test_isolated(|| async {
             use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
@@ -17901,12 +18609,159 @@ mod tests {
     }
 
     fn test_capture_event(seq: u64) -> CaptureEvent {
+        test_capture_event_for_pane(1, seq)
+    }
+
+    fn test_capture_event_for_pane(pane_id: u64, seq: u64) -> CaptureEvent {
         let authority = CaptureAuthority::new();
-        let pane = authority.activate_pane(1).expect("test pane authority");
+        let pane = authority
+            .activate_pane(pane_id)
+            .expect("test pane authority");
         let lease = authority
             .issue_source(pane, CaptureSourceKind::Polling)
             .expect("test polling authority");
-        test_capture_event_for_lease(1, seq, &lease)
+        test_capture_event_for_lease(pane_id, seq, &lease)
+    }
+
+    #[test]
+    fn persistence_batches_keep_fifo_barriers_and_finite_payload_bounds() {
+        let cx = crate::cx::for_testing();
+        let (tx, rx) = spsc_channel(32);
+        let (retire_tx, retire_rx) = spsc_channel(1);
+        tx.try_send(test_capture_event_for_pane(2, 0)).unwrap();
+        tx.try_send(test_capture_event_for_pane(1, 1)).unwrap();
+        tx.try_send(test_capture_event_for_pane(3, 0)).unwrap();
+        let mut deferred = None;
+        let batch = collect_persistence_batch(
+            &cx,
+            test_capture_event(0),
+            &rx,
+            &retire_rx,
+            &mut deferred,
+            1024,
+        );
+        assert_eq!(
+            batch
+                .iter()
+                .map(|event| event.segment.pane_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let first = deferred.take().unwrap();
+        assert_eq!((first.segment.pane_id, first.segment.seq), (1, 1));
+        let next = collect_persistence_batch(&cx, first, &rx, &retire_rx, &mut deferred, 1024);
+        assert_eq!(
+            next.iter()
+                .map(|event| event.segment.pane_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(deferred.is_none());
+        for kind in [
+            CapturedSegmentKind::Delta,
+            CapturedSegmentKind::Gap {
+                reason: "barrier".into(),
+            },
+        ] {
+            let mut barrier = test_capture_event_for_pane(4, 0);
+            barrier.segment.content = if matches!(kind, CapturedSegmentKind::Delta) {
+                "x".repeat(1025)
+            } else {
+                "gap".to_string()
+            };
+            barrier.segment.kind = kind;
+            tx.try_send(barrier).unwrap();
+            assert_eq!(
+                collect_persistence_batch(
+                    &cx,
+                    test_capture_event(0),
+                    &rx,
+                    &retire_rx,
+                    &mut deferred,
+                    1024
+                )
+                .len(),
+                1
+            );
+            assert!(!persistence_batch_eligible(&deferred.take().unwrap(), 1024));
+        }
+        let (decision, _receipt) = CaptureResyncDecision::channel();
+        let resync = test_capture_event_for_pane(4, 0).with_resync_decision(decision);
+        assert!(!persistence_batch_eligible(&resync, 1024));
+        for pane in 2..=20 {
+            tx.try_send(test_capture_event_for_pane(pane, 0)).unwrap();
+        }
+        assert_eq!(
+            collect_persistence_batch(
+                &cx,
+                test_capture_event(0),
+                &rx,
+                &retire_rx,
+                &mut deferred,
+                1024
+            )
+            .len(),
+            PERSISTENCE_BATCH_ITEMS
+        );
+        while rx.try_recv().is_some() {}
+        let mut first = test_capture_event(0);
+        first.segment.content = "x".repeat(PERSISTENCE_BATCH_BYTES);
+        tx.try_send(test_capture_event_for_pane(2, 0)).unwrap();
+        assert_eq!(
+            collect_persistence_batch(
+                &cx,
+                first,
+                &rx,
+                &retire_rx,
+                &mut deferred,
+                PERSISTENCE_BATCH_BYTES
+            )
+            .len(),
+            1
+        );
+        assert_eq!(deferred.take().unwrap().segment.pane_id, 2);
+        retire_tx
+            .try_send(CaptureRetirementWake {
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        tx.try_send(test_capture_event_for_pane(2, 0)).unwrap();
+        assert_eq!(
+            collect_persistence_batch(
+                &cx,
+                test_capture_event(0),
+                &rx,
+                &retire_rx,
+                &mut deferred,
+                1024
+            )
+            .len(),
+            1
+        );
+        assert_eq!(rx.depth(), 1, "retirement blocks further cohort admission");
+        retire_rx.try_recv().unwrap();
+        let cancelled = crate::cx::for_testing();
+        cancelled.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("stop batch admission"),
+        );
+        assert_eq!(
+            collect_persistence_batch(
+                &cancelled,
+                test_capture_event(0),
+                &rx,
+                &retire_rx,
+                &mut deferred,
+                1024
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            rx.depth(),
+            1,
+            "cancellation cannot consume further queued captures"
+        );
     }
 
     fn test_capture_event_for_lease(pane_id: u64, seq: u64, lease: &CaptureLease) -> CaptureEvent {

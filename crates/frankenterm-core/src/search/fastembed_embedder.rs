@@ -144,7 +144,7 @@ impl FastEmbedEmbedder {
         let dimension = model_dimension(&config.model);
         let model_name = model_display_name(&config.model);
 
-        let init_opts = fastembed::InitOptions::new(config.model.clone())
+        let init_opts = fastembed::TextInitOptions::new(config.model.clone())
             .with_cache_dir(config.cache_dir.clone())
             .with_max_length(config.max_length)
             .with_show_download_progress(config.show_download_progress);

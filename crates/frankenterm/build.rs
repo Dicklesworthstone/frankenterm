@@ -94,9 +94,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Rerun triggers
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
-    println!("cargo:rerun-if-changed=../../.git/refs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     for variable in ["DSR_RELEASE_GIT_SHA", "DSR_RELEASE_GIT_REF"] {
         println!("cargo:rerun-if-env-changed={variable}");
@@ -184,6 +181,16 @@ pub fn resolve_source_identity(
     root: &Path,
     dsr: Option<&DsrSourceIdentity>,
 ) -> io::Result<SourceIdentity> {
+    resolve_source_identity_with_rerun(root, dsr, &mut |path| {
+        println!("cargo:rerun-if-changed={}", path.display());
+    })
+}
+
+pub fn resolve_source_identity_with_rerun(
+    root: &Path,
+    dsr: Option<&DsrSourceIdentity>,
+    rerun: &mut impl FnMut(&Path),
+) -> io::Result<SourceIdentity> {
     if let Some(dsr) = dsr {
         dsr.validate()?;
     }
@@ -195,6 +202,11 @@ pub fn resolve_source_identity(
         Err(error) => return Err(error),
     };
     if has_git {
+        // Missing watched files make Cargo rerun the build script forever.
+        // Gitless DSR archives instead watch their verified source inventory.
+        for name in ["HEAD", "index", "refs"] {
+            rerun(&root.join(".git").join(name));
+        }
         let revision = source_git(root)
             .args(["rev-parse", "--verify", "HEAD"])
             .output()
@@ -211,7 +223,7 @@ pub fn resolve_source_identity(
         let tracked = tracked_source_paths(root);
         if let Ok(paths) = &tracked {
             for path in paths {
-                println!("cargo:rerun-if-changed={}", path.display());
+                rerun(path);
             }
         }
         let dirty = tracked.is_err()
@@ -231,9 +243,9 @@ pub fn resolve_source_identity(
         .parent()
         .ok_or_else(|| invalid_source("source has no parent"))?
         .join(".source.tar");
-    verify_dsr_archive(root, &archive, &dsr.revision)?;
-    println!("cargo:rerun-if-changed={}", archive.display());
-    println!("cargo:rerun-if-changed={}", root.display());
+    verify_dsr_archive(root, &archive, &dsr.revision, rerun)?;
+    rerun(&archive);
+    rerun(root);
     Ok(SourceIdentity {
         revision: dsr.revision.clone(),
         dirty: false,
@@ -312,7 +324,12 @@ fn plain_metadata(path: &Path) -> io::Result<fs::Metadata> {
 /// Check the immutable sibling archive that DSR retained and verified before
 /// starting Cargo. This checks its Git commit comment and every extracted file;
 /// the release's DSR pre/post source receipts remain the publication authority.
-pub fn verify_dsr_archive(root: &Path, archive_path: &Path, revision: &str) -> io::Result<()> {
+fn verify_dsr_archive(
+    root: &Path,
+    archive_path: &Path,
+    revision: &str,
+    rerun: &mut impl FnMut(&Path),
+) -> io::Result<()> {
     const MAX_ENTRIES: usize = 200_000;
     const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
     if !plain_metadata(root)?.is_dir() {
@@ -407,7 +424,7 @@ pub fn verify_dsr_archive(root: &Path, archive_path: &Path, revision: &str) -> i
         if file.read(&mut source_buffer[..1])? != 0 {
             return Err(invalid_source("source grew while verifying archive"));
         }
-        println!("cargo:rerun-if-changed={}", source_path.display());
+        rerun(&source_path);
     }
     if !commit_seen || expected.is_empty() {
         return Err(invalid_source("DSR source archive has no committed source"));

@@ -82,7 +82,12 @@
           "agent_mail.degraded"
         ],
         "next_action": "wait_or_coordinate_existing_owner",
-        "forbidden_actions": ["auto_claim", "reopen_without_handoff", "rerun_ci", "repair_agent_mail"]
+        "forbidden_actions": [
+          "auto_claim",
+          "reopen_without_handoff",
+          "rerun_ci",
+          "repair_agent_mail"
+        ]
       }
     },
     {
@@ -148,7 +153,10 @@
     {
       "id": "owner_active_fresh_comment",
       "description": "A fresh assignee/comment means the lane remains owned even if it is high impact.",
-      "source_commands": ["br show ft-owner.1 --json", "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"],
+      "source_commands": [
+        "br show ft-owner.1 --json",
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+      ],
       "input": {
         "candidate_id": "ft-owner.1",
         "br_ready_ids": [],
@@ -203,7 +211,11 @@
       "expected": {
         "final_verdict": "external_wait",
         "supporting_verdicts": ["owner_blocked"],
-        "reason_codes": ["github.current_head_queued", "github.no_failure_log", "br.assignee_active"],
+        "reason_codes": [
+          "github.current_head_queued",
+          "github.no_failure_log",
+          "br.assignee_active"
+        ],
         "next_action": "read_only_recheck_later",
         "forbidden_actions": ["rerun_ci", "call_ci_passed", "call_ci_failed"]
       }
@@ -241,7 +253,10 @@
     {
       "id": "mail_degraded_fallback",
       "description": "Agent Mail list/inbox are degraded, so Beads/git fallback is usable but must be cited before any claim.",
-      "source_commands": ["scripts/swarm-tick.sh --agent-mail-fallback frankenterm", "br ready --json"],
+      "source_commands": [
+        "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+        "br ready --json"
+      ],
       "input": {
         "candidate_id": "coordination-snapshot",
         "br_ready_ids": [],
@@ -271,7 +286,11 @@
     {
       "id": "true_claimable",
       "description": "The happy path remains claimable only when BR ready, BR show, BV, dirty paths, ownership, and external evidence all agree.",
-      "source_commands": ["br ready --json", "br show ft-ready.1 --json", "git status --short --branch"],
+      "source_commands": [
+        "br ready --json",
+        "br show ft-ready.1 --json",
+        "git status --short --branch"
+      ],
       "input": {
         "candidate_id": "ft-ready.1",
         "br_ready_ids": ["ft-ready.1"],

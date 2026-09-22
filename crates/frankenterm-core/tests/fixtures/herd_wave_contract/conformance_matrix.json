@@ -23,7 +23,12 @@
     {
       "requirement_id": "state.normal_elevated_critical_emergency",
       "level": "MUST",
-      "fixture_ids": ["normal_no_wave_privacy_guard", "synchronized_compaction", "search_index_burst", "retry_storm"],
+      "fixture_ids": [
+        "normal_no_wave_privacy_guard",
+        "synchronized_compaction",
+        "search_index_burst",
+        "retry_storm"
+      ],
       "surfaces": ["robot_json", "robot_toon"],
       "status": "covered",
       "divergence": ""

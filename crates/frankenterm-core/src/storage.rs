@@ -2067,6 +2067,8 @@ fn ensure_db_permissions(_path: &Path, _is_new: bool) -> Result<()> {
 #[derive(Clone)]
 struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
+    #[cfg(test)]
+    receive_gate: WriterReceiveGateForTest,
     queued_depth: Arc<AtomicUsize>,
     terminal_state: Arc<AtomicU8>,
     terminal_admission_gate: Arc<AtomicUsize>,
@@ -2483,6 +2485,8 @@ impl WriteCommandSender {
     fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
         Self {
             inner,
+            #[cfg(test)]
+            receive_gate: Arc::new(Mutex::new(None)),
             queued_depth: Arc::new(AtomicUsize::new(0)),
             terminal_state: Arc::new(AtomicU8::new(WRITER_TERMINAL_HEALTHY)),
             terminal_admission_gate: Arc::new(AtomicUsize::new(0)),
@@ -2927,17 +2931,70 @@ impl Drop for RusqliteReadBackendLoan {
     }
 }
 
+type StorageProviderRegistration = (String, std::sync::Weak<dyn StorageBackendProvider>);
+
+const STORAGE_PROVIDER_SWEEP_BUDGET: usize = 8;
+
+#[derive(Default)]
+struct StorageBackendProviderRegistry {
+    providers: std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
+    sweep: std::collections::VecDeque<StorageProviderRegistration>,
+}
+
+impl StorageBackendProviderRegistry {
+    // Return retired ownership to the caller for disposal outside its lock.
+    // Tickets carry Weak identity: an older registration can never remove a
+    // replacement at the same path. No sweep upgrades a provider or calls it.
+    fn register(
+        &mut self,
+        path: &str,
+        provider: &Arc<dyn StorageBackendProvider>,
+    ) -> Vec<StorageProviderRegistration> {
+        let mut retired = Vec::new();
+        let weak = Arc::downgrade(provider);
+        if self
+            .providers
+            .get(path)
+            .is_some_and(|current| std::sync::Weak::ptr_eq(current, &weak))
+        {
+            // Re-registering the same owner must not create duplicate live
+            // sweep tickets that could accumulate without ever expiring.
+            retired.push((String::new(), weak));
+        } else {
+            if let Some(previous) = self.providers.insert(path.to_string(), weak.clone()) {
+                retired.push((String::new(), previous));
+            }
+            self.sweep.push_back((path.to_string(), weak));
+        }
+        for _ in 0..self.sweep.len().min(STORAGE_PROVIDER_SWEEP_BUDGET) {
+            let ticket = self.sweep.pop_front().expect("bounded sweep ticket");
+            let current = self
+                .providers
+                .get(&ticket.0)
+                .is_some_and(|weak| std::sync::Weak::ptr_eq(weak, &ticket.1));
+            if !current {
+                retired.push(ticket);
+            } else if ticket.1.strong_count() == 0 {
+                if let Some(entry) = self.providers.remove_entry(&ticket.0) {
+                    retired.push(entry);
+                }
+                retired.push(ticket);
+            } else {
+                self.sweep.push_back(ticket);
+            }
+        }
+        retired
+    }
+}
+
 static STORAGE_BACKEND_PROVIDERS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
-    >,
+    std::sync::Mutex<StorageBackendProviderRegistry>,
 > = std::sync::OnceLock::new();
 
-fn storage_backend_provider_registry() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Weak<dyn StorageBackendProvider>>,
-> {
+fn storage_backend_provider_registry() -> &'static std::sync::Mutex<StorageBackendProviderRegistry>
+{
     STORAGE_BACKEND_PROVIDERS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| std::sync::Mutex::new(StorageBackendProviderRegistry::default()))
 }
 
 fn default_storage_backend_provider() -> Arc<dyn StorageBackendProvider> {
@@ -2955,7 +3012,11 @@ fn register_storage_backend_provider(db_path: &str, provider: &Arc<dyn StorageBa
     let mut registry = storage_backend_provider_registry()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    registry.insert(db_path.to_string(), Arc::downgrade(provider));
+    let retired = registry.register(db_path, provider);
+    // Subscribers may perform storage lookups or block on an output sink.
+    // Publication is complete; neither callback belongs under this global lock.
+    drop(registry);
+    drop(retired);
     tracing::debug!(
         target: "ft.storage.backend",
         db_path = db_path,
@@ -2968,11 +3029,18 @@ fn storage_backend_provider_for_path(db_path: &str) -> Option<Arc<dyn StorageBac
     let mut registry = storage_backend_provider_registry()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let Some(provider) = registry.get(db_path).and_then(std::sync::Weak::upgrade) else {
-        registry.remove(db_path);
-        return None;
+    let provider = registry
+        .providers
+        .get(db_path)
+        .and_then(std::sync::Weak::upgrade);
+    let retired = if provider.is_none() {
+        registry.providers.remove_entry(db_path)
+    } else {
+        None
     };
-    Some(provider)
+    drop(registry);
+    drop(retired);
+    provider
 }
 
 fn with_provider_read_backend<F, R>(
@@ -3769,11 +3837,26 @@ impl StorageHandle {
         let terminal_admission_gate_for_writer = Arc::clone(&write_tx.terminal_admission_gate);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
+        #[cfg(test)]
+        let receive_gate = Arc::clone(&write_tx.receive_gate);
 
+        // Retain the dispatcher only for explicitly enabled append telemetry;
+        // do not replace the writer thread's ordinary event routing.
+        let writer_dispatch = tracing::enabled!(
+            target: "frankenterm::append_transaction", tracing::Level::TRACE
+        )
+        .then(|| tracing::dispatcher::get_default(Clone::clone));
         // Spawn writer thread
         let writer_handle = thread::Builder::new()
             .name("ft-storage-writer".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                WRITER_RECEIVE_GATE_FOR_TEST.with(|slot| {
+                    *slot.borrow_mut() = Some(receive_gate);
+                });
+                APPEND_TRANSACTION_DISPATCH.with(|slot| {
+                    *slot.borrow_mut() = writer_dispatch;
+                });
                 let backend = init_result;
                 let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
                 writer_loop(
@@ -7031,6 +7114,18 @@ impl StorageHandle {
         self.write_tx.max_capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_writer_before_receive_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut gate = self.write_tx.receive_gate.lock().expect("writer test gate");
+        assert!(gate.is_none(), "one owned writer barrier at a time");
+        *gate = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     /// Maximum idle read connections retained per database path.
     /// Exposed so callers/tests can confirm the parsed `[storage] read_pool_size`
     /// reached the handle and default rusqlite provider (ft-y76wt).
@@ -8552,12 +8647,87 @@ impl StorageHandle {
         Self::checkpoint_storage_operation(cx, "get_events_stream_page")?;
         let db_path = Arc::clone(&self.db_path);
 
+        #[cfg(test)]
+        return Self::diagnose_await_event_read(cx, "event_page", db_path, move |backend| {
+            query_events_stream_page_backend(backend, &query)
+        })
+        .await;
+
+        #[cfg(not(test))]
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_events_stream_page_backend(backend, &query)
             })
         })
         .await
+    }
+
+    /// Test-build observation of the unchanged blocking read path. Only slow
+    /// operations emit fixed labels and monotonic timings; no database identity
+    /// or event data is logged. Separate pool return from executor resumption.
+    #[cfg(test)]
+    async fn diagnose_await_event_read<T, F>(
+        cx: &crate::cx::Cx,
+        operation: &'static str,
+        db_path: Arc<String>,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn StorageBackend) -> Result<T> + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let started = std::time::Instant::now();
+        let stamps = Arc::new(std::array::from_fn::<_, 4, _>(|_| AtomicU64::new(0)));
+        let worker_stamps = Arc::clone(&stamps);
+        let result = Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Task join error",
+            move || {
+                let stamp = |index: usize| {
+                    worker_stamps[index].store(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        Ordering::Release,
+                    );
+                };
+                stamp(0);
+                let result = pooled_backend(db_path.as_str(), |backend| {
+                    stamp(1);
+                    let result = work(backend);
+                    stamp(2);
+                    result
+                });
+                stamp(3);
+                let marks = worker_stamps.each_ref().map(|mark| mark.load(Ordering::Acquire));
+                let sql_ns = marks[2].saturating_sub(marks[1]);
+                if sql_ns >= 100_000_000 {
+                    let (tid, unix_us) = slow_storage_worker_identity();
+                    eprintln!(
+                        "AWAIT_STORAGE_WORKER operation={operation} tid={tid:?} unix_us={unix_us} sql_us={} since_sql_end_us={}",
+                        sql_ns / 1_000,
+                        started.elapsed().as_micros().saturating_sub(u128::from(marks[2] / 1_000)),
+                    );
+                }
+                result
+            },
+        )
+        .await;
+        let total = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if total >= 100_000_000 {
+            let marks = stamps.each_ref().map(|stamp| stamp.load(Ordering::Acquire));
+            eprintln!(
+                "AWAIT_STORAGE_TIMING operation={operation} total_us={} dispatch_us={} reader_us={} sql_us={} pool_return_us={} resume_us={} completed_marks={:?} ok={}",
+                total / 1_000,
+                marks[0] / 1_000,
+                marks[1].saturating_sub(marks[0]) / 1_000,
+                marks[2].saturating_sub(marks[1]) / 1_000,
+                marks[3].saturating_sub(marks[2]) / 1_000,
+                total.saturating_sub(marks[3]) / 1_000,
+                marks.map(|mark| mark != 0),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// Read the singleton retention summary.  This is a one-row query intended
@@ -8640,6 +8810,13 @@ impl StorageHandle {
         validate_event_retention_cursor_epoch(cursor_epoch, "event retention cursor epoch")?;
         let db_path = Arc::clone(&self.db_path);
         let cursor_epoch = cursor_epoch.to_string();
+        #[cfg(test)]
+        return Self::diagnose_await_event_read(cx, "event_retention", db_path, move |backend| {
+            check_event_retention_backend(backend, after_id, through_id, Some(&cursor_epoch))
+        })
+        .await;
+
+        #[cfg(not(test))]
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 check_event_retention_backend(backend, after_id, through_id, Some(&cursor_epoch))
@@ -13574,6 +13751,17 @@ fn close_and_drain_writer_queue(
     }
 }
 
+/// Per-handle test barrier before the real writer receives its next batch.
+#[cfg(test)]
+type WriterReceiveGateForTest =
+    Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static WRITER_RECEIVE_GATE_FOR_TEST: std::cell::RefCell<Option<WriterReceiveGateForTest>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Main loop for the writer thread.
 ///
 /// Opportunistically processes burst traffic while preserving caller-visible
@@ -13630,6 +13818,18 @@ fn writer_loop(
     // whether by `Disconnected` (sender dropped) or `Cancelled`
     // (cx-aware shutdown) — terminates the loop cleanly.
     'main: loop {
+        #[cfg(test)]
+        WRITER_RECEIVE_GATE_FOR_TEST.with(|slot| {
+            let gate = slot
+                .borrow()
+                .as_ref()
+                .and_then(|gate| gate.lock().expect("writer test gate").take());
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                // A failing test drops its sender; no writer can be stranded.
+                let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+            }
+        });
         match rx.try_recv() {
             Ok(first_cmd) => {
                 WriteCommandSender::mark_command_dequeued(queued_depth);
@@ -15919,6 +16119,218 @@ mod writer_io_scheduler_tests {
         assert_eq!(
             redactors, redactors_before,
             "group rollback must restore one exact snapshot per uniquely touched pane"
+        );
+    }
+
+    #[derive(Clone)]
+    struct AppendTraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AppendTraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn append_trace_subscriber(
+        buffer: &AppendTraceBuffer,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let buffer = buffer.clone();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,frankenterm::append_transaction=trace")
+            .with_writer(move || buffer.clone())
+            .finish()
+    }
+
+    fn append_trace_rows(buffer: &AppendTraceBuffer) -> Vec<serde_json::Value> {
+        let bytes = buffer.0.lock().expect("trace buffer").clone();
+        let text = String::from_utf8(bytes).expect("UTF-8 diagnostic");
+        assert!(!text.contains("fixture-private-payload"));
+        text.lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("JSON event")["fields"]
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn append_transaction_trace_correlates_real_commits_and_rejects_rollback_members() {
+        let buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = append_trace_subscriber(&buffer);
+        tracing::subscriber::with_default(subscriber, || {
+            let backend = real_writer_backend_with_panes(&[71]);
+            let mut redactors = HashMap::new();
+            let single = append_segment_commit_backend(
+                &backend,
+                71,
+                "fixture-private-payload",
+                None,
+                None,
+                None,
+                &mut redactors,
+            )
+            .expect("singleton commit");
+            let writes: Vec<_> = ["fixture-private-payload-a", "fixture-private-payload-b"]
+                .into_iter()
+                .map(|content| {
+                    pending_append_segment_from_command(segment_command(71, content))
+                        .unwrap_or_else(|_| panic!("append command"))
+                })
+                .collect();
+            let grouped = append_segment_group_commit_backend(&backend, &writes, &mut redactors)
+                .expect("group commit");
+            set_append_commit_fault_for_test(AppendCommitFaultForTest::GroupAfterRedaction(1));
+            assert!(
+                append_segment_group_commit_backend(&backend, &writes, &mut redactors).is_err()
+            );
+            assert_eq!(
+                query_segments_backend(&backend, 71, 10)
+                    .expect("stored rows")
+                    .len(),
+                3
+            );
+            let rows = append_trace_rows(&buffer);
+            let results: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"] == "append_transaction_result")
+                .collect();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0]["attempted_members"], 1);
+            assert_eq!(results[1]["attempted_members"], 2);
+            assert_eq!(results[2]["attempted_members"], 2);
+            assert_eq!(results[0]["verified_committed"], true);
+            assert_eq!(results[1]["verified_committed"], true);
+            assert_eq!(results[2]["verified_committed"], false);
+            assert!(
+                results
+                    .iter()
+                    .all(|row| row["elapsed_ns"].as_u64().is_some())
+            );
+            assert_ne!(results[0]["transaction_id"], results[1]["transaction_id"]);
+            assert_ne!(results[1]["transaction_id"], results[2]["transaction_id"]);
+            let members: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event"] == "append_transaction_member")
+                .collect();
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0]["segment_id"], single.segment.id);
+            assert_eq!(members[0]["transaction_id"], results[0]["transaction_id"]);
+            for (member, committed) in members[1..].iter().zip(&grouped) {
+                assert_eq!(member["segment_id"], committed.segment.id);
+                assert_eq!(member["sequence"], committed.segment.seq);
+                assert_eq!(member["pane_id"], 71);
+                assert_eq!(member["transaction_id"], results[1]["transaction_id"]);
+            }
+        });
+    }
+
+    #[test]
+    fn append_transaction_dispatch_preserves_ordinary_writer_event_routing() {
+        let ordinary_buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let diagnostic_buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let output = ordinary_buffer.clone();
+        let ordinary_subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,frankenterm::ordinary_writer_test=warn")
+            .with_writer(move || output.clone())
+            .finish();
+        let diagnostic = tracing::Dispatch::new(append_trace_subscriber(&diagnostic_buffer));
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(ordinary_subscriber, || {
+                APPEND_TRANSACTION_DISPATCH.with(|slot| *slot.borrow_mut() = Some(diagnostic));
+                let backend = real_writer_backend_with_panes(&[71]);
+                append_segment_commit_backend(
+                    &backend,
+                    71,
+                    "fixture-private-payload",
+                    None,
+                    None,
+                    None,
+                    &mut HashMap::new(),
+                )
+                .expect("real SQLite append under separate diagnostic dispatcher");
+                tracing::warn!(
+                    target: "frankenterm::ordinary_writer_test",
+                    event = "ordinary_writer_event",
+                );
+            });
+        })
+        .join()
+        .expect("routing thread");
+        let ordinary = append_trace_rows(&ordinary_buffer);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0]["event"], "ordinary_writer_event");
+        let diagnostic = append_trace_rows(&diagnostic_buffer);
+        assert_eq!(diagnostic.len(), 2);
+        assert_eq!(diagnostic[0]["event"], "append_transaction_result");
+        assert_eq!(diagnostic[1]["event"], "append_transaction_member");
+    }
+
+    #[test]
+    fn append_transaction_trace_reaches_real_writer_from_scoped_subscriber() {
+        use tracing::instrument::WithSubscriber;
+        let buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = append_trace_subscriber(&buffer);
+        run_storage_async_test(
+            async {
+                let directory = tempfile::tempdir().expect("owned storage directory");
+                let path = directory.path().join("trace.sqlite3");
+                let storage = StorageHandle::new(&path.to_string_lossy())
+                    .await
+                    .expect("open storage");
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 71,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1,
+                        last_seen_at: 1,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed pane");
+                let stored = storage
+                    .append_segment(71, "fixture-private-payload", None)
+                    .await
+                    .expect("real writer response");
+                storage.shutdown().await.expect("join writer");
+                let rows = append_trace_rows(&buffer);
+                let members: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["event"] == "append_transaction_member")
+                    .collect();
+                assert_eq!(
+                    members.len(),
+                    1,
+                    "scoped subscriber must reach the actual writer thread"
+                );
+                assert_eq!(members[0]["segment_id"], stored.id);
+                assert_eq!(members[0]["sequence"], stored.seq);
+                let result = rows
+                    .iter()
+                    .find(|row| row["event"] == "append_transaction_result")
+                    .expect("verified transaction result");
+                assert_eq!(result["verified_committed"], true);
+                assert_eq!(result["attempted_members"], 1);
+                assert_eq!(result["transaction_id"], members[0]["transaction_id"]);
+            }
+            .with_subscriber(subscriber),
         );
     }
 
@@ -19700,6 +20112,80 @@ struct CommittedAppendSegment {
     retained_tail_moved: bool,
 }
 
+/// Opt-in timings of the verified transaction call, excluding caller queueing,
+/// mirror publication and reply delivery. No payloads or error strings enter
+/// this stream. IDs are process-local, including across writer instances.
+struct AppendTransactionTrace {
+    transaction_id: u64,
+    attempted_members: usize,
+    started: Instant,
+    dispatch: tracing::Dispatch,
+}
+
+std::thread_local! {
+    static APPEND_TRANSACTION_DISPATCH: std::cell::RefCell<Option<tracing::Dispatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl AppendTransactionTrace {
+    fn start(attempted_members: usize) -> Option<Self> {
+        let dispatch = APPEND_TRANSACTION_DISPATCH.with(|slot| slot.borrow().clone());
+        let enabled = || {
+            tracing::enabled!(
+                target: "frankenterm::append_transaction", tracing::Level::TRACE
+            )
+        };
+        let enabled = match dispatch.as_ref() {
+            Some(dispatch) => tracing::dispatcher::with_default(dispatch, enabled),
+            None => enabled(),
+        };
+        if !enabled {
+            return None;
+        }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let transaction_id = NEXT_ID
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |id| {
+                id.checked_add(1)
+            })
+            .ok()?;
+        Some(Self {
+            transaction_id,
+            attempted_members,
+            dispatch: dispatch.unwrap_or_else(|| tracing::dispatcher::get_default(Clone::clone)),
+            started: Instant::now(),
+        })
+    }
+
+    fn finish<'a>(self, committed: Option<impl Iterator<Item = &'a Segment>>) {
+        // Capture the duration before formatting or writing any diagnostics.
+        // None is deliberately not named "rolled_back": poisoned/unknown
+        // transaction outcomes must never be promoted to proven rollback.
+        let elapsed_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            tracing::trace!(
+                target: "frankenterm::append_transaction",
+                event = "append_transaction_result",
+                transaction_id = self.transaction_id,
+                attempted_members = self.attempted_members,
+                verified_committed = committed.is_some(),
+                elapsed_ns,
+            );
+            if let Some(segments) = committed {
+                for segment in segments {
+                    tracing::trace!(
+                        target: "frankenterm::append_transaction",
+                        event = "append_transaction_member",
+                        transaction_id = self.transaction_id,
+                        pane_id = segment.pane_id,
+                        sequence = segment.seq,
+                        segment_id = segment.id,
+                    );
+                }
+            }
+        });
+    }
+}
+
 type SegmentRedactorSnapshots = HashMap<u64, Option<SegmentPersistRedactor>>;
 
 fn snapshot_segment_redactors_for_appends(
@@ -19750,6 +20236,7 @@ fn append_segment_commit_backend(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Result<CommittedAppendSegment> {
     let snapshot = segment_redactors.get(&pane_id).cloned();
+    let transaction_trace = AppendTransactionTrace::start(1);
     let result = run_writer_transaction(
         backend,
         // Reserve the writer before redaction and MAX(seq) establish a read
@@ -19781,6 +20268,14 @@ fn append_segment_commit_backend(
         },
     );
 
+    if let Some(trace) = transaction_trace {
+        trace.finish(
+            result
+                .as_ref()
+                .ok()
+                .map(|committed| std::iter::once(&committed.segment)),
+        );
+    }
     if result
         .as_ref()
         .err()
@@ -19809,12 +20304,21 @@ fn append_segment_group_commit_backend(
     // whole segment group is dropped ("Failed to insert segment: ... database
     // is locked" within 350 ms of watcher start, ft-xxfwy.32). Taking the
     // write lock up front makes the writer wait instead.
+    let transaction_trace = AppendTransactionTrace::start(writes.len());
     let result = run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "append segment group commit",
         || append_segment_group_commit_inner(backend, writes, segment_redactors),
     );
+    if let Some(trace) = transaction_trace {
+        trace.finish(
+            result
+                .as_ref()
+                .ok()
+                .map(|committed| committed.iter().map(|value| &value.segment)),
+        );
+    }
     if result
         .as_ref()
         .err()
@@ -21892,12 +22396,32 @@ where
 const DEFAULT_READ_POOL_MAX_PER_PATH: usize = 8;
 const MAX_IDLE_READ_BACKENDS: usize = 64;
 
+struct IdleReadBackend {
+    backend: RusqliteBackend,
+    returned_at: std::time::Instant,
+}
+
 static READ_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>,
 > = std::sync::OnceLock::new();
 
-fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<RusqliteBackend>>>
+#[cfg(test)]
+thread_local! {
+    // Pool regressions must retain their exact backends across real
+    // returns/acquires without unrelated parallel tests evicting them.
+    static CACHE_REUSE_TEST_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>
 {
+    #[cfg(test)]
+    if CACHE_REUSE_TEST_POOL.with(std::cell::Cell::get) {
+        static ISOLATED_POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Vec<IdleReadBackend>>>,
+        > = std::sync::OnceLock::new();
+        return ISOLATED_POOL
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    }
     READ_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -22436,23 +22960,25 @@ impl PooledReadConn {
                 // the pool Mutex turned every subsequent database read
                 // into a re-panic. Post-fix bumps the observability
                 // counter (visible via PoolTelemetrySnapshot.pool_lock_poisoned)
-                // and continues with the recovered HashMap. The .get_mut+pop
-                // pattern below is safe under recovery — if the inner Vec
-                // is in a transient state, get_mut returns None or the pop
-                // is a no-op; worst case a stale entry survives until the
-                // next return.
+                // and continues with the recovered HashMap. Remove drained
+                // entries under the same lock: a discarded or panicked loan
+                // may never return a backend to reclaim its path key.
                 let mut pool = read_pool().lock().unwrap_or_else(|poison| {
                     saturating_atomic_u64_add(&POOL_LOCK_POISONED, 1);
                     poison.into_inner()
                 });
-                pool.get_mut(db_path).and_then(|v| v.pop())
+                let recycled = pool.get_mut(db_path).and_then(|entry| entry.pop());
+                if pool.get(db_path).is_some_and(Vec::is_empty) {
+                    pool.remove(db_path);
+                }
+                recycled
             };
             let backend = match recycled {
                 Some(c) => {
                     // br-ft-rvt1z: pool hit — recycled an existing
                     // pre-warmed connection.
                     saturating_atomic_u64_add(&POOL_HITS, 1);
-                    c
+                    c.backend
                 }
                 None => {
                     // br-ft-rvt1z: pool miss — first acquire for this
@@ -22510,19 +23036,65 @@ impl PooledReadConn {
     }
 }
 
+// Resolve worker identity only for an already-observed slow operation. Never
+// log database paths or contents, and do not add filesystem work to fast loans.
+#[cfg(test)]
+fn slow_storage_worker_identity() -> (Option<u64>, u128) {
+    #[cfg(target_os = "linux")]
+    let tid = std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|path| path.file_name()?.to_str()?.parse().ok());
+    #[cfg(not(target_os = "linux"))]
+    let tid = None;
+    let unix_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros());
+    (tid, unix_us)
+}
+
+#[cfg(test)]
+fn diagnose_pool_return(started: std::time::Instant, marks: [u128; 4], autocommit: bool) {
+    if marks[3] >= 100_000 {
+        let (tid, unix_us) = slow_storage_worker_identity();
+        eprintln!(
+            "STORAGE_POOL_RETURN tid={tid:?} unix_us={unix_us} total_us={} state_us={} pool_mutex_selection_us={} evicted_close_us={} returning_close_us={} autocommit={autocommit} since_return_end_us={}",
+            marks[3],
+            marks[0],
+            marks[1].saturating_sub(marks[0]),
+            marks[2].saturating_sub(marks[1]),
+            marks[3].saturating_sub(marks[2]),
+            started.elapsed().as_micros().saturating_sub(marks[3]),
+        );
+    }
+}
+
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
         if let Some(backend) = self.backend.take() {
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             // If the closure panicked or returned mid-transaction, the
             // backend has an open transaction. Returning it to the pool
             // would leak that transaction state to the next consumer.
             // Discard the connection in that case; rusqlite's Drop closes it
             // cleanly (which also rolls back the open transaction).
-            let is_autocommit = backend
-                .with_connection(|conn| conn.is_autocommit())
-                .unwrap_or(false);
+            // This is an authoritative state query, not a raw connection
+            // loan. A raw loan reinstalls the authorizer and flushes prepared
+            // statements on return, defeating the read pool's cache reuse.
+            let is_autocommit = matches!(
+                backend.transaction_state(),
+                Ok(BackendTransactionState::Autocommit)
+            );
+            #[cfg(test)]
+            let state_us = started.elapsed().as_micros();
             if !is_autocommit {
                 drop(backend);
+                #[cfg(test)]
+                diagnose_pool_return(
+                    started,
+                    [state_us, state_us, state_us, started.elapsed().as_micros()],
+                    false,
+                );
                 return;
             }
             let mut returning_backend = Some(backend);
@@ -22543,18 +23115,26 @@ impl Drop for PooledReadConn {
                         .values()
                         .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
                     if path_has_capacity && total_idle >= MAX_IDLE_READ_BACKENDS {
-                        let evict_path = pool
+                        // At most MAX_IDLE_READ_BACKENDS entries are inspected.
+                        // Evict the oldest idle return, never an arbitrary hash
+                        // bucket that may contain a just-used hot connection.
+                        let evict = pool
                             .iter()
-                            .find(|(path, entry)| {
-                                path.as_str() != self.db_path.as_str() && !entry.is_empty()
+                            .filter(|(path, _)| path.as_str() != self.db_path.as_str())
+                            .flat_map(|(path, entry)| {
+                                entry
+                                    .iter()
+                                    .enumerate()
+                                    .map(move |(index, idle)| (path, index, idle.returned_at))
                             })
-                            .map(|(path, _)| path.clone());
-                        if let Some(evict_path) = evict_path {
+                            .min_by_key(|(_, _, returned_at)| *returned_at)
+                            .map(|(path, index, _)| (path.clone(), index));
+                        if let Some((evict_path, evict_index)) = evict {
                             let remove_entry = {
                                 let entry = pool
                                     .get_mut(&evict_path)
                                     .expect("selected read-pool entry must still exist");
-                                evicted_backend = entry.pop();
+                                evicted_backend = Some(entry.remove(evict_index).backend);
                                 entry.is_empty()
                             };
                             if remove_entry {
@@ -22571,11 +23151,12 @@ impl Drop for PooledReadConn {
                         .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
                     if path_has_capacity && total_after_eviction < MAX_IDLE_READ_BACKENDS {
                         let entry = pool.entry(self.db_path.clone()).or_default();
-                        entry.push(
-                            returning_backend
+                        entry.push(IdleReadBackend {
+                            backend: returning_backend
                                 .take()
                                 .expect("returning read backend must still be owned"),
-                        );
+                            returned_at: std::time::Instant::now(),
+                        });
                         // br-ft-rvt1z: counted only on successful return.
                         saturating_atomic_u64_add(&POOL_RETURNS, 1);
                     } else {
@@ -22588,8 +23169,23 @@ impl Drop for PooledReadConn {
             }
             // Close evicted or unretained backends after releasing the pool
             // mutex so SQLite teardown never serializes unrelated borrowers.
+            #[cfg(test)]
+            let selected_us = started.elapsed().as_micros();
             drop(evicted_backend);
+            #[cfg(test)]
+            let evicted_us = started.elapsed().as_micros();
             drop(returning_backend);
+            #[cfg(test)]
+            diagnose_pool_return(
+                started,
+                [
+                    state_us,
+                    selected_us,
+                    evicted_us,
+                    started.elapsed().as_micros(),
+                ],
+                true,
+            );
         }
     }
 }
@@ -42517,10 +43113,16 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
         });
         let authority = Arc::new(WriterJoinAuthority::new(native_writer));
         let queued_authority = Arc::clone(&authority);
+        let (retirement_tx, retirement_rx) = std::sync::mpsc::channel::<()>();
         let cx = crate::cx::for_testing();
         let mut queued = Box::pin(crate::runtime_async::spawn_blocking_with_cx(
             &cx,
-            move || queued_authority.drive(std::time::Duration::from_secs(5)),
+            move || {
+                // This sender is owned by the queued closure, so receiver
+                // disconnection proves the worker actually discarded it.
+                let _retirement_signal = retirement_tx;
+                queued_authority.drive(std::time::Duration::from_secs(5))
+            },
         ));
         let first_poll = std::future::poll_fn(|poll_cx| {
             Poll::Ready(queued.as_mut().poll(poll_cx))
@@ -42530,12 +43132,7 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
             matches!(first_poll, Poll::Pending),
             "join settlement must queue behind the occupied worker"
         );
-        for _ in 0..1_000 {
-            if pool.pending_count() == 1 {
-                break;
-            }
-            crate::runtime_async::task::yield_now().await;
-        }
+        // The first poll synchronously enqueues before awaiting its reply.
         assert_eq!(pool.pending_count(), 1, "join settlement must be queued");
 
         drop(queued);
@@ -42546,12 +43143,11 @@ fn writer_join_authority_drop_before_blocking_start_retains_pending_handle() {
             blocker.wait_timeout(std::time::Duration::from_secs(5)),
             "occupied blocking worker did not finish"
         );
-        for _ in 0..1_000 {
-            if pool.pending_count() == 0 {
-                break;
-            }
-            crate::runtime_async::task::yield_now().await;
-        }
+        assert_eq!(
+            retirement_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "cancelled closure must relinquish its captured state"
+        );
         assert_eq!(pool.pending_count(), 0, "cancelled queued join must retire");
         assert!(
             matches!(
@@ -43941,9 +44537,268 @@ mod pool_telemetry_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn provider_registry_reclaims_unique_expired_registrations() {
+        let mut registry = super::StorageBackendProviderRegistry::default();
+        for index in 0..256 {
+            let provider = default_storage_backend_provider();
+            drop(registry.register(&format!("expired-{index}"), &provider));
+            assert_eq!(Arc::strong_count(&provider), 1);
+            assert_eq!(registry.providers.len(), 1);
+            assert_eq!(registry.sweep.len(), 1);
+        }
+        let survivor = default_storage_backend_provider();
+        drop(registry.register("survivor", &survivor));
+        assert_eq!(registry.providers.len(), 1);
+        assert!(registry.providers["survivor"].upgrade().is_some());
+    }
+
+    #[test]
+    fn provider_registry_preserves_replacements_and_external_owners() {
+        let mut registry = super::StorageBackendProviderRegistry::default();
+        let owners: Vec<_> = (0..32)
+            .map(|_| default_storage_backend_provider())
+            .collect();
+        for (index, provider) in owners.iter().enumerate() {
+            drop(registry.register(&format!("live-{index}"), provider));
+        }
+        let old = default_storage_backend_provider();
+        drop(registry.register("replaced", &old));
+        let replacement = default_storage_backend_provider();
+        drop(registry.register("replaced", &replacement));
+        drop(old);
+        // Advance beyond a full sweep while repeatedly registering the same
+        // owner. Duplicate live tickets must not accumulate either.
+        for _ in 0..256 {
+            drop(registry.register("replaced", &replacement));
+        }
+        assert_eq!(registry.providers.len(), 33);
+        assert_eq!(registry.sweep.len(), 33);
+        assert!(Arc::ptr_eq(
+            &registry.providers["replaced"].upgrade().unwrap(),
+            &replacement,
+        ));
+        for (index, provider) in owners.iter().enumerate() {
+            assert!(Arc::ptr_eq(
+                &registry.providers[&format!("live-{index}")]
+                    .upgrade()
+                    .unwrap(),
+                provider,
+            ));
+            assert_eq!(Arc::strong_count(provider), 1);
+        }
+        drop(owners);
+        for _ in 0..32 {
+            drop(registry.register("replaced", &replacement));
+        }
+        assert_eq!(registry.providers.len(), 1);
+        assert_eq!(registry.sweep.len(), 1);
+    }
+
     fn pool_counter_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    // Callers hold pool_counter_test_lock for this guard's entire lifetime.
+    struct IsolatedPool;
+
+    impl IsolatedPool {
+        fn enter() -> Self {
+            super::CACHE_REUSE_TEST_POOL.with(|isolated| {
+                assert!(!isolated.replace(true), "isolated pool cannot nest");
+            });
+            Self
+        }
+    }
+
+    impl Drop for IsolatedPool {
+        fn drop(&mut self) {
+            let retired = {
+                let mut pool = read_pool()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *pool)
+            };
+            super::CACHE_REUSE_TEST_POOL.with(|isolated| isolated.set(false));
+            drop(retired);
+        }
+    }
+
+    #[test]
+    fn pooled_return_preserves_cached_statement_and_immutable_authorizer() {
+        use rusqlite::hooks::{AuthAction, Authorization};
+
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        let directory = tempfile::tempdir().expect("cache regression directory");
+        let _isolated_pool = IsolatedPool::enter();
+        let path = directory
+            .path()
+            .join("cached.db")
+            .to_string_lossy()
+            .into_owned();
+        let connection = rusqlite::Connection::open(&path).expect("open SQLite");
+        connection
+            .execute_batch(
+                "CREATE TABLE protected (value INTEGER); INSERT INTO protected VALUES (42)",
+            )
+            .expect("seed actual SQLite value");
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let prepare_counter = Arc::clone(&prepares);
+        let backend =
+            RusqliteBackend::new_with_authorizer(connection, move |context| match context.action {
+                AuthAction::Select => {
+                    prepare_counter.fetch_add(1, Ordering::Relaxed);
+                    Authorization::Allow
+                }
+                AuthAction::Delete { .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })
+            .expect("install immutable authorizer");
+        read_pool().lock().expect("isolated pool").insert(
+            path.clone(),
+            vec![super::IdleReadBackend {
+                backend,
+                returned_at: std::time::Instant::now(),
+            }],
+        );
+        let first = PooledReadConn::acquire(&path).expect("acquire authored SQLite backend");
+        let query = "SELECT value FROM protected";
+        let expected = Some(vec![super::SqlCell::Integer(42)]);
+        assert_eq!(
+            first.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert!(
+            first
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        assert_eq!(prepares.load(Ordering::Relaxed), 1);
+        drop(first);
+
+        let second = PooledReadConn::acquire(&path).expect("reacquire actual returned backend");
+        assert_eq!(
+            second.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prepares.load(Ordering::Relaxed),
+            1,
+            "returning an autocommit backend must preserve its prepared statement"
+        );
+        assert!(
+            second
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        // Causal negative control: the former return-time probe performs a
+        // raw loan, which reinstalls the authorizer and invalidates the cache.
+        assert!(
+            second
+                .backend_ref()
+                .with_connection(rusqlite::Connection::is_autocommit)
+                .expect("former raw return probe")
+        );
+        assert_eq!(
+            second.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prepares.load(Ordering::Relaxed),
+            2,
+            "the former raw probe must demonstrate actual cache invalidation"
+        );
+        drop(second);
+
+        let third = PooledReadConn::acquire(&path).expect("reacquire after negative control");
+        assert_eq!(
+            third.backend_ref().query_row_cells(query, &[]).unwrap(),
+            expected
+        );
+        assert_eq!(prepares.load(Ordering::Relaxed), 2);
+        assert!(
+            third
+                .backend_ref()
+                .execute_batch("DELETE FROM protected")
+                .is_err()
+        );
+        drop(third);
+    }
+
+    #[test]
+    fn backend_registration_releases_registry_before_subscriber_callback() {
+        use tracing_subscriber::prelude::*;
+
+        struct LookupSubscriber {
+            path: String,
+            provider: Arc<dyn StorageBackendProvider>,
+            events: Arc<AtomicUsize>,
+            completed: Arc<std::sync::atomic::AtomicBool>,
+            worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LookupSubscriber {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "ft.storage.backend" {
+                    return;
+                }
+                self.events.fetch_add(1, Ordering::Relaxed);
+                let path = self.path.clone();
+                let expected = Arc::clone(&self.provider);
+                let (reply, result) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::spawn(move || {
+                    let found = super::storage_backend_provider_for_path(&path)
+                        .is_some_and(|actual| Arc::ptr_eq(&actual, &expected));
+                    let _ = reply.send(found);
+                });
+                *self.worker.lock().expect("lookup worker slot") = Some(worker);
+                // Bound the negative case: the old code held the registry
+                // while waiting here. Returning releases it, so even a failing
+                // regression can join its worker instead of leaking a thread.
+                self.completed.store(
+                    result.recv_timeout(std::time::Duration::from_secs(5)) == Ok(true),
+                    Ordering::Release,
+                );
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("registry test directory");
+        let path = directory
+            .path()
+            .join("subscriber.db")
+            .to_string_lossy()
+            .into_owned();
+        let provider = default_storage_backend_provider();
+        let events = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = Arc::new(Mutex::new(None));
+        let subscriber = tracing_subscriber::registry().with(LookupSubscriber {
+            path: path.clone(),
+            provider: Arc::clone(&provider),
+            events: Arc::clone(&events),
+            completed: Arc::clone(&completed),
+            worker: Arc::clone(&worker),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            register_storage_backend_provider(&path, &provider);
+        });
+        if let Some(worker) = worker.lock().expect("lookup worker slot").take() {
+            worker.join().expect("lookup worker did not panic");
+        }
+        assert_eq!(events.load(Ordering::Relaxed), 1, "subscriber must execute");
+        assert!(
+            completed.load(Ordering::Acquire),
+            "subscriber must observe the published provider before returning"
+        );
     }
 
     /// Snapshot the process-global counters for delta assertions.
@@ -44014,6 +44869,71 @@ mod pool_telemetry_tests {
     }
 
     #[test]
+    fn read_pool_evicts_oldest_idle_backend_instead_of_hot_hash_bucket() {
+        let _guard = pool_counter_test_lock().lock().expect("pool test lock");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _isolated_pool = IsolatedPool::enter();
+        for index in 0..MAX_IDLE_READ_BACKENDS {
+            let path = temp_dir.path().join(format!("lru-{index}.db"));
+            std::fs::File::create(&path).expect("seed database");
+            PooledReadConn::acquire(&path.to_string_lossy())
+                .expect("acquire real backend")
+                .with_borrowed_backend(|backend| {
+                    backend.execute_batch(
+                        "CREATE TEMP TABLE connection_marker(value); INSERT INTO connection_marker VALUES (42)",
+                    ).expect("seed connection-local marker");
+                });
+        }
+        let (hot_path, cold_path) = {
+            let mut pool = read_pool().lock().expect("isolated pool");
+            // Deliberately choose the former algorithm's victim as the hot
+            // path. Assign exact idle ages, avoiding clock-resolution or sleep
+            // assumptions while exercising real acquisition/return/eviction.
+            let hot = pool.keys().next().unwrap().clone();
+            let cold = pool.keys().find(|path| **path != hot).unwrap().clone();
+            let now = std::time::Instant::now();
+            for (path, entries) in pool.iter_mut() {
+                entries[0].returned_at = if *path == hot {
+                    now
+                } else if *path == cold {
+                    now.checked_sub(std::time::Duration::from_secs(2)).unwrap()
+                } else {
+                    now.checked_sub(std::time::Duration::from_secs(1)).unwrap()
+                };
+            }
+            (hot, cold)
+        };
+        let pressure_path = temp_dir.path().join("lru-pressure.db");
+        std::fs::File::create(&pressure_path).expect("seed pressure database");
+        drop(PooledReadConn::acquire(&pressure_path.to_string_lossy()).unwrap());
+        {
+            let pool = read_pool().lock().expect("isolated pool");
+            assert!(
+                pool.contains_key(&hot_path),
+                "recent idle backend was evicted"
+            );
+            assert!(
+                !pool.contains_key(&cold_path),
+                "oldest idle backend survived"
+            );
+            assert_eq!(
+                pool.values().map(Vec::len).sum::<usize>(),
+                MAX_IDLE_READ_BACKENDS
+            );
+        }
+        let loan = PooledReadConn::acquire(&hot_path).expect("reacquire hot backend");
+        assert_eq!(
+            loan.backend_ref()
+                .query_row_cells("SELECT value FROM connection_marker", &[])
+                .unwrap(),
+            Some(vec![super::SqlCell::Integer(42)]),
+        );
+        let before_return = std::time::Instant::now();
+        drop(loan);
+        assert!(read_pool().lock().unwrap()[&hot_path][0].returned_at >= before_return);
+    }
+
+    #[test]
     fn read_pool_process_wide_idle_capacity_is_bounded_across_paths() {
         let _guard = pool_counter_test_lock()
             .lock()
@@ -44059,6 +44979,51 @@ mod pool_telemetry_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for db_path in db_paths {
             pool.remove(&db_path);
+        }
+    }
+
+    #[test]
+    fn read_pool_panicked_borrow_does_not_retain_empty_path_entries() {
+        let _guard = pool_counter_test_lock()
+            .lock()
+            .expect("pool telemetry test lock should not be poisoned");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let _isolated_pool = IsolatedPool::enter();
+
+        // Exceed the idle-backend cap with completed failed loans. The cap
+        // counts backends, so it cannot reclaim an empty path entry.
+        for index in 0..=MAX_IDLE_READ_BACKENDS {
+            let path = temp_dir.path().join(format!("panicked-read-{index}.db"));
+            std::fs::File::create(&path).expect("seed database file");
+            let path = path.to_string_lossy().into_owned();
+            drop(PooledReadConn::acquire(&path).expect("warm read pool"));
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PooledReadConn::acquire(&path)
+                    .expect("borrow warmed backend")
+                    .with_borrowed_backend(|backend| {
+                        assert!(
+                            backend
+                                .with_connection(|conn| conn.is_autocommit())
+                                .expect("probe real borrowed backend")
+                        );
+                        panic!("read-pool borrower panic");
+                    });
+            }));
+            let payload = result.expect_err("borrower must panic");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"read-pool borrower panic")
+            );
+
+            let retained = read_pool()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&path);
+            assert!(
+                !retained,
+                "failed read loan retained its empty path: {path}"
+            );
         }
     }
 

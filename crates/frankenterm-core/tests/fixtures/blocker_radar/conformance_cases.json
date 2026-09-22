@@ -290,7 +290,10 @@
         "unavailable_source_states": [],
         "unavailable_failure_classes": [],
         "action_kinds": ["file_followup_bead"],
-        "required_reason_codes": ["rch.substrate_blocked", "rch.remote_command_failed_before_test_binary"],
+        "required_reason_codes": [
+          "rch.substrate_blocked",
+          "rch.remote_command_failed_before_test_binary"
+        ],
         "required_citation_ids": ["citation.rch.worker.vmi1153651"],
         "artifact_paths": []
       }
@@ -519,10 +522,24 @@
         "active_agent_states": [],
         "dirty_paths": [],
         "unavailable_source_states": ["degraded", "degraded", "unknown"],
-        "unavailable_failure_classes": ["unavailable_evidence", "unavailable_evidence", "unavailable_evidence"],
+        "unavailable_failure_classes": [
+          "unavailable_evidence",
+          "unavailable_evidence",
+          "unavailable_evidence"
+        ],
         "action_kinds": ["run_bv_robot_triage", "run_bv_robot_triage", "run_bv_robot_triage"],
-        "required_reason_codes": ["source.degraded", "rch.evidence_not_collected", "ci.evidence_not_collected", "evidence.unknown", "manual.evidence_missing"],
-        "required_citation_ids": ["citation.rch.uncollected", "citation.github_actions.uncollected", "citation.manual.unknown"],
+        "required_reason_codes": [
+          "source.degraded",
+          "rch.evidence_not_collected",
+          "ci.evidence_not_collected",
+          "evidence.unknown",
+          "manual.evidence_missing"
+        ],
+        "required_citation_ids": [
+          "citation.rch.uncollected",
+          "citation.github_actions.uncollected",
+          "citation.manual.unknown"
+        ],
         "artifact_paths": []
       }
     },
@@ -579,8 +596,19 @@
         "unavailable_source_states": [],
         "unavailable_failure_classes": [],
         "action_kinds": ["file_followup_bead", "recheck_status", "inspect_artifact"],
-        "required_reason_codes": ["rch.local_fallback_refused", "rch.require_remote_refused_local", "ci.queued", "github.actions.run_queued", "artifact.missing", "github.actions.artifact_missing"],
-        "required_citation_ids": ["citation.rch.local_fallback.refused", "citation.github.run.1001", "citation.artifact.package.macos"],
+        "required_reason_codes": [
+          "rch.local_fallback_refused",
+          "rch.require_remote_refused_local",
+          "ci.queued",
+          "github.actions.run_queued",
+          "artifact.missing",
+          "github.actions.artifact_missing"
+        ],
+        "required_citation_ids": [
+          "citation.rch.local_fallback.refused",
+          "citation.github.run.1001",
+          "citation.artifact.package.macos"
+        ],
         "artifact_paths": ["tests/e2e/artifacts/packages/frankenterm-macos.dmg"]
       }
     }

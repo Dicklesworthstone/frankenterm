@@ -3,7 +3,7 @@
     "name": "codex_usage_warning_25_positive",
     "text": "Warning: You have less than 25% of your 24h limit remaining.",
     "expected_rule_ids": ["codex.usage.warning_25"],
-    "expected_extracted": {"remaining": "25", "limit_hours": "24"}
+    "expected_extracted": { "remaining": "25", "limit_hours": "24" }
   },
   {
     "name": "codex_usage_warning_25_negative",
@@ -15,7 +15,7 @@
     "name": "codex_usage_warning_10_positive",
     "text": "Warning: You have less than 10% of your 8h limit remaining.",
     "expected_rule_ids": ["codex.usage.warning_10"],
-    "expected_extracted": {"remaining": "10", "limit_hours": "8"}
+    "expected_extracted": { "remaining": "10", "limit_hours": "8" }
   },
   {
     "name": "codex_usage_warning_10_negative",
@@ -27,7 +27,7 @@
     "name": "codex_usage_warning_5_positive",
     "text": "Warning: You have less than 5% of your 12h limit remaining.",
     "expected_rule_ids": ["codex.usage.warning_5"],
-    "expected_extracted": {"remaining": "5", "limit_hours": "12"}
+    "expected_extracted": { "remaining": "5", "limit_hours": "12" }
   },
   {
     "name": "codex_usage_warning_5_negative",
@@ -39,7 +39,7 @@
     "name": "codex_usage_reached_positive",
     "text": "You've hit your usage limit for the 3h window. Please try again at 2:30 PM.",
     "expected_rule_ids": ["codex.usage.reached"],
-    "expected_extracted": {"reset_time": "2:30 PM"}
+    "expected_extracted": { "reset_time": "2:30 PM" }
   },
   {
     "name": "codex_usage_reached_negative",
@@ -51,7 +51,12 @@
     "name": "codex_token_usage_positive",
     "text": "Token usage: total=125,432 input=50,000 (+ 20,000 cached) output=55,432",
     "expected_rule_ids": ["codex.session.token_usage"],
-    "expected_extracted": {"total": "125,432", "input": "50,000", "cached": "20,000", "output": "55,432"}
+    "expected_extracted": {
+      "total": "125,432",
+      "input": "50,000",
+      "cached": "20,000",
+      "output": "55,432"
+    }
   },
   {
     "name": "codex_token_usage_negative",
@@ -63,7 +68,7 @@
     "name": "codex_resume_hint_positive",
     "text": "To resume this session, run: codex resume a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "expected_rule_ids": ["codex.session.resume_hint"],
-    "expected_extracted": {"session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+    "expected_extracted": { "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
   },
   {
     "name": "codex_resume_hint_negative",
@@ -75,7 +80,7 @@
     "name": "codex_device_code_positive",
     "text": "Enter this one-time code at https://auth.openai.com: ABCD-12345",
     "expected_rule_ids": ["codex.auth.device_code_prompt"],
-    "expected_extracted": {"code": "ABCD-12345"}
+    "expected_extracted": { "code": "ABCD-12345" }
   },
   {
     "name": "codex_device_code_negative",
@@ -87,7 +92,7 @@
     "name": "claude_compaction_positive",
     "text": "Conversation compacted 150,000 tokens to 25,000 tokens",
     "expected_rule_ids": ["claude_code.compaction"],
-    "expected_extracted": {"tokens_before": "150,000", "tokens_after": "25,000"}
+    "expected_extracted": { "tokens_before": "150,000", "tokens_after": "25,000" }
   },
   {
     "name": "claude_compaction_negative",
@@ -99,7 +104,7 @@
     "name": "claude_compaction_complete_positive",
     "text": "Compaction complete, saved 50,000 tokens",
     "expected_rule_ids": ["claude_code.compaction.complete"],
-    "expected_extracted": {"tokens_saved": "50,000"}
+    "expected_extracted": { "tokens_saved": "50,000" }
   },
   {
     "name": "claude_compaction_complete_negative",
@@ -111,7 +116,7 @@
     "name": "claude_banner_positive",
     "text": "Claude Code v1.2.3 starting session",
     "expected_rule_ids": ["claude_code.banner"],
-    "expected_extracted": {"version": "1.2.3"}
+    "expected_extracted": { "version": "1.2.3" }
   },
   {
     "name": "claude_banner_negative",
@@ -123,7 +128,7 @@
     "name": "claude_usage_warning_positive",
     "text": "usage limit warning: 12% remaining",
     "expected_rule_ids": ["claude_code.usage.warning"],
-    "expected_extracted": {"remaining": "12"}
+    "expected_extracted": { "remaining": "12" }
   },
   {
     "name": "claude_usage_warning_negative",
@@ -135,7 +140,7 @@
     "name": "claude_usage_reached_positive",
     "text": "usage limit reached, try again in 2 minutes",
     "expected_rule_ids": ["claude_code.usage.reached"],
-    "expected_extracted": {"reset_time": "2 minutes"}
+    "expected_extracted": { "reset_time": "2 minutes" }
   },
   {
     "name": "claude_usage_reached_negative",
@@ -147,7 +152,7 @@
     "name": "claude_approval_needed_positive",
     "text": "Do you want to allow this command?",
     "expected_rule_ids": ["claude_code.approval_needed"],
-    "expected_extracted": {"action": "allow"}
+    "expected_extracted": { "action": "allow" }
   },
   {
     "name": "claude_approval_needed_negative",
@@ -159,7 +164,7 @@
     "name": "claude_cost_summary_positive",
     "text": "Session complete. Total cost: $1.25",
     "expected_rule_ids": ["claude_code.session.cost_summary"],
-    "expected_extracted": {"cost": "1.25"}
+    "expected_extracted": { "cost": "1.25" }
   },
   {
     "name": "claude_cost_summary_negative",
@@ -182,7 +187,7 @@
     "name": "claude_context_warning_positive",
     "text": "Warning: context window 85% context used",
     "expected_rule_ids": ["claude_code.context.warning"],
-    "expected_extracted": {"percent": "85"}
+    "expected_extracted": { "percent": "85" }
   },
   {
     "name": "claude_context_warning_negative",
@@ -205,7 +210,7 @@
     "name": "claude_error_overloaded_positive",
     "text": "Server overloaded, please retry in 30 seconds",
     "expected_rule_ids": ["claude_code.error.overloaded"],
-    "expected_extracted": {"retry_after": "30"}
+    "expected_extracted": { "retry_after": "30" }
   },
   {
     "name": "claude_error_overloaded_negative",
@@ -217,7 +222,7 @@
     "name": "claude_error_timeout_positive",
     "text": "Request timed out after 30 seconds",
     "expected_rule_ids": ["claude_code.error.timeout"],
-    "expected_extracted": {"duration": "30"}
+    "expected_extracted": { "duration": "30" }
   },
   {
     "name": "claude_error_timeout_negative",
@@ -229,7 +234,7 @@
     "name": "claude_model_selected_positive",
     "text": "Using model: claude-opus-4-20250101",
     "expected_rule_ids": ["claude_code.model.selected"],
-    "expected_extracted": {"model": "claude-opus-4-20250101"}
+    "expected_extracted": { "model": "claude-opus-4-20250101" }
   },
   {
     "name": "claude_model_selected_negative",
@@ -252,7 +257,7 @@
     "name": "claude_thinking_positive",
     "text": "Thinking for 15 seconds on complex problem",
     "expected_rule_ids": ["claude_code.thinking"],
-    "expected_extracted": {"duration": "15"}
+    "expected_extracted": { "duration": "15" }
   },
   {
     "name": "claude_thinking_negative",
@@ -264,7 +269,7 @@
     "name": "claude_tool_use_positive",
     "text": "Using tool: Bash",
     "expected_rule_ids": ["claude_code.tool_use"],
-    "expected_extracted": {"tool_name": "Bash"}
+    "expected_extracted": { "tool_name": "Bash" }
   },
   {
     "name": "claude_tool_use_negative",
@@ -276,7 +281,7 @@
     "name": "gemini_usage_warning_positive",
     "text": "Usage limit warning: 10% of your Pro models quota remaining.",
     "expected_rule_ids": ["gemini.usage.warning"],
-    "expected_extracted": {"remaining": "10"}
+    "expected_extracted": { "remaining": "10" }
   },
   {
     "name": "gemini_usage_warning_negative",
@@ -299,13 +304,17 @@
     "name": "gemini_session_summary_positive",
     "text": "Interaction Summary: Session ID: abc-def-123 Tool Calls: 12",
     "expected_rule_ids": ["gemini.session.summary"],
-    "expected_extracted": {"session_id": "abc-def-123", "tool_calls": "12"}
+    "expected_extracted": { "session_id": "abc-def-123", "tool_calls": "12" }
   },
   {
     "name": "gemini_session_summary_tokens_positive",
     "text": "Session Summary: Session ID: abc-def-123 Tool Calls: 12 Tokens Used: 9,876",
     "expected_rule_ids": ["gemini.session.summary"],
-    "expected_extracted": {"session_id": "abc-def-123", "tool_calls": "12", "tokens_used": "9,876"}
+    "expected_extracted": {
+      "session_id": "abc-def-123",
+      "tool_calls": "12",
+      "tokens_used": "9,876"
+    }
   },
   {
     "name": "gemini_session_summary_negative",
@@ -317,7 +326,7 @@
     "name": "gemini_session_resume_hint_positive",
     "text": "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890",
     "expected_rule_ids": ["gemini.session.resume_hint"],
-    "expected_extracted": {"session_id": "abcdef12-3456-7890-abcd-ef1234567890"}
+    "expected_extracted": { "session_id": "abcdef12-3456-7890-abcd-ef1234567890" }
   },
   {
     "name": "gemini_session_resume_hint_negative",
@@ -329,13 +338,13 @@
     "name": "gemini_model_used_positive",
     "text": "Responding with gemini-1.5-pro",
     "expected_rule_ids": ["gemini.model.used"],
-    "expected_extracted": {"model": "gemini-1.5-pro"}
+    "expected_extracted": { "model": "gemini-1.5-pro" }
   },
   {
     "name": "gemini_model_used_alt_positive",
     "text": "Using model: gemini-2.0-flash-exp",
     "expected_rule_ids": ["gemini.model.used"],
-    "expected_extracted": {"model": "gemini-2.0-flash-exp"}
+    "expected_extracted": { "model": "gemini-2.0-flash-exp" }
   },
   {
     "name": "gemini_model_used_negative",
@@ -358,7 +367,7 @@
     "name": "wezterm_pane_exited_positive",
     "text": "pane exited with status 1",
     "expected_rule_ids": ["wezterm.pane.exited"],
-    "expected_extracted": {"exit_code": "1"}
+    "expected_extracted": { "exit_code": "1" }
   },
   {
     "name": "wezterm_pane_exited_negative",
@@ -394,7 +403,7 @@
     "name": "codex_rate_limit_detected_positive",
     "text": "Error 429: retry after 60 seconds",
     "expected_rule_ids": ["codex.rate_limit.detected"],
-    "expected_extracted": {"retry_after": "60 seconds"}
+    "expected_extracted": { "retry_after": "60 seconds" }
   },
   {
     "name": "codex_rate_limit_detected_negative",
@@ -406,7 +415,7 @@
     "name": "claude_rate_limit_detected_positive",
     "text": "Error 529: retry after 30 seconds",
     "expected_rule_ids": ["claude_code.rate_limit.detected"],
-    "expected_extracted": {"retry_after": "30 seconds"}
+    "expected_extracted": { "retry_after": "30 seconds" }
   },
   {
     "name": "claude_rate_limit_detected_negative",
@@ -418,7 +427,7 @@
     "name": "gemini_rate_limit_detected_positive",
     "text": "RESOURCE_EXHAUSTED: retry after 2 minutes",
     "expected_rule_ids": ["gemini.rate_limit.detected"],
-    "expected_extracted": {"retry_after": "2 minutes"}
+    "expected_extracted": { "retry_after": "2 minutes" }
   },
   {
     "name": "gemini_rate_limit_detected_negative",

@@ -80,6 +80,8 @@ pub enum RecoverablePanicSite {
     McpEventDeliveryCompletion,
     /// An isolated MCP await-event request task.
     McpAwaitEventRequest,
+    /// One detached audit job in the bounded MCP audit worker pool.
+    McpAudit,
     /// A project dataflow subscriber callback.
     CoreDataflowCallback,
     /// Best-effort recording finalization during `Drop`.
@@ -121,6 +123,7 @@ impl RecoverablePanicSite {
             Self::StorageWriter => "storage.writer",
             Self::McpEventDeliveryCompletion => "mcp.event_delivery_completion",
             Self::McpAwaitEventRequest => "mcp.await_event_request",
+            Self::McpAudit => "mcp.audit",
             Self::CoreDataflowCallback => "core.dataflow_callback",
             Self::CoreRecordingFinalize => "core.recording_finalize",
             Self::CoreSearchBridge => "core.search_bridge",
@@ -782,6 +785,7 @@ mod tests {
             RecoverablePanicSite::StorageWriter,
             RecoverablePanicSite::McpEventDeliveryCompletion,
             RecoverablePanicSite::McpAwaitEventRequest,
+            RecoverablePanicSite::McpAudit,
             RecoverablePanicSite::CoreDataflowCallback,
             RecoverablePanicSite::CoreRecordingFinalize,
             RecoverablePanicSite::CoreSearchBridge,

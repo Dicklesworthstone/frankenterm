@@ -2657,7 +2657,7 @@ Call graph:
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (task_id, _handle) = runtime
+            let (task_id, mut handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
@@ -2667,12 +2667,17 @@ Call graph:
 
             let report = runtime.run_with_auto_advance();
             assert!(
-                !matches!(
+                matches!(
                     report.termination,
-                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                    asupersync::lab::AutoAdvanceTermination::Quiescent
                 ),
-                "LabRuntime got stuck; termination: {:?}",
+                "LabRuntime did not finish; termination: {:?}",
                 report.termination,
+            );
+            let outcome = handle.try_join();
+            assert!(
+                matches!(outcome, Ok(Some(()))),
+                "LabRuntime root task did not complete successfully: {outcome:?}"
             );
         }
 
