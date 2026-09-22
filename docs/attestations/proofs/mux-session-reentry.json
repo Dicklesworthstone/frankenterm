@@ -14,17 +14,9 @@
     "mapping": "docs/specs/mux-session-reentry-mapping.md",
     "release_bundle_slot": "proofs/mux-session-reentry.json",
     "bounded_model": {
-      "panes": [
-        1,
-        2
-      ],
-      "windows": [
-        1
-      ],
-      "subscribers": [
-        1,
-        2
-      ],
+      "panes": [1, 2],
+      "windows": [1],
+      "subscribers": [1, 2],
       "covered_paths": [
         "duplicate live pane registration",
         "pane removal and terminal queue event",

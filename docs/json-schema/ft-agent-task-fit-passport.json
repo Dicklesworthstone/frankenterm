@@ -185,12 +185,7 @@
     },
     "claimed_domain": {
       "type": "object",
-      "required": [
-        "domain",
-        "ownership_state",
-        "source_artifact",
-        "freshness_state"
-      ],
+      "required": ["domain", "ownership_state", "source_artifact", "freshness_state"],
       "additionalProperties": false,
       "properties": {
         "domain": {
@@ -199,13 +194,7 @@
         },
         "ownership_state": {
           "type": "string",
-          "enum": [
-            "none",
-            "claimed",
-            "reserved",
-            "active_conflict",
-            "stale_claim"
-          ]
+          "enum": ["none", "claimed", "reserved", "active_conflict", "stale_claim"]
         },
         "source_artifact": {
           "type": "string",
@@ -255,14 +244,7 @@
         },
         "quality": {
           "type": "string",
-          "enum": [
-            "strong",
-            "usable",
-            "weak",
-            "missing",
-            "contradictory",
-            "stale"
-          ]
+          "enum": ["strong", "usable", "weak", "missing", "contradictory", "stale"]
         },
         "freshness_state": {
           "$ref": "#/$defs/freshness_state"
@@ -475,10 +457,7 @@
     },
     "toon_projection": {
       "type": "object",
-      "required": [
-        "columns",
-        "rows"
-      ],
+      "required": ["columns", "rows"],
       "additionalProperties": false,
       "properties": {
         "columns": {
@@ -496,12 +475,7 @@
             "type": "array",
             "minItems": 6,
             "items": {
-              "type": [
-                "string",
-                "number",
-                "boolean",
-                "null"
-              ]
+              "type": ["string", "number", "boolean", "null"]
             }
           }
         }
@@ -546,41 +520,19 @@
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "within_budget",
-        "stale",
-        "missing",
-        "unknown"
-      ]
+      "enum": ["fresh", "within_budget", "stale", "missing", "unknown"]
     },
     "redaction_state": {
       "type": "string",
-      "enum": [
-        "redacted_summary",
-        "metadata_only",
-        "privacy_redacted",
-        "raw_forbidden"
-      ]
+      "enum": ["redacted_summary", "metadata_only", "privacy_redacted", "raw_forbidden"]
     },
     "confidence": {
       "type": "string",
-      "enum": [
-        "high",
-        "medium",
-        "low",
-        "none"
-      ]
+      "enum": ["high", "medium", "low", "none"]
     },
     "fit_level": {
       "type": "string",
-      "enum": [
-        "strong",
-        "adequate",
-        "weak",
-        "blocked",
-        "unknown"
-      ]
+      "enum": ["strong", "adequate", "weak", "blocked", "unknown"]
     },
     "forbidden_action": {
       "type": "string",

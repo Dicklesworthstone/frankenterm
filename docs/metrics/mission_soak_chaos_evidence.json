@@ -36,16 +36,8 @@
     },
     "soak_cycles": {
       "count": 3,
-      "cycle_total_duration_seconds": [
-        16,
-        18,
-        17
-      ],
-      "resume_pass_counts": [
-        4,
-        4,
-        4
-      ]
+      "cycle_total_duration_seconds": [16, 18, 17],
+      "resume_pass_counts": [4, 4, 4]
     },
     "assertions": {
       "deterministic_resume_behavior": true,

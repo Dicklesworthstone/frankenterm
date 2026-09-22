@@ -174,9 +174,7 @@
       "title": "Privacy, redaction, retention, and size budgets",
       "status": "closed",
       "readiness_state": "measured",
-      "implementation_surfaces": [
-        "crates/frankenterm-core-replay-types/src/swarm_causal_event.rs"
-      ],
+      "implementation_surfaces": ["crates/frankenterm-core-replay-types/src/swarm_causal_event.rs"],
       "proof": {
         "test_job": "j-29871232832766239",
         "clippy_job": "j-29871232832766242",

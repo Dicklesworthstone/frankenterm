@@ -48,12 +48,7 @@
     },
     "proof_status": {
       "type": "string",
-      "enum": [
-        "advisory_only",
-        "runnable",
-        "blocked",
-        "unknown"
-      ]
+      "enum": ["advisory_only", "runnable", "blocked", "unknown"]
     },
     "command": {
       "$ref": "#/$defs/command"
@@ -77,17 +72,11 @@
       }
     },
     "cargo_jobs": {
-      "type": [
-        "integer",
-        "null"
-      ],
+      "type": ["integer", "null"],
       "minimum": 1
     },
     "estimated_slots": {
-      "type": [
-        "integer",
-        "null"
-      ],
+      "type": ["integer", "null"],
       "minimum": 1
     },
     "reason_codes": {
@@ -134,22 +123,11 @@
     },
     "severity": {
       "type": "string",
-      "enum": [
-        "info",
-        "warning",
-        "blocked",
-        "critical"
-      ]
+      "enum": ["info", "warning", "blocked", "critical"]
     },
     "command": {
       "type": "object",
-      "required": [
-        "raw",
-        "normalized",
-        "classification",
-        "would_intercept",
-        "target_dir"
-      ],
+      "required": ["raw", "normalized", "classification", "would_intercept", "target_dir"],
       "additionalProperties": false,
       "properties": {
         "raw": {
@@ -157,28 +135,16 @@
           "minLength": 1
         },
         "normalized": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "classification": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "would_intercept": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "target_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       }
     },
@@ -193,17 +159,11 @@
       "additionalProperties": false,
       "properties": {
         "system_data_free_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "private_tmp_free_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "repo_write_probe": {
@@ -216,26 +176,15 @@
     },
     "probe": {
       "type": "object",
-      "required": [
-        "status",
-        "error_code",
-        "message"
-      ],
+      "required": ["status", "error_code", "message"],
       "additionalProperties": false,
       "properties": {
         "status": {
           "type": "string",
-          "enum": [
-            "ok",
-            "failed",
-            "not_checked"
-          ]
+          "enum": ["ok", "failed", "not_checked"]
         },
         "error_code": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "message": {
           "type": "string"
@@ -244,31 +193,17 @@
     },
     "beads": {
       "type": "object",
-      "required": [
-        "db_writeable",
-        "jsonl_writeable",
-        "active_bead",
-        "blocking_beads"
-      ],
+      "required": ["db_writeable", "jsonl_writeable", "active_bead", "blocking_beads"],
       "additionalProperties": false,
       "properties": {
         "db_writeable": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "jsonl_writeable": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "active_bead": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "blocking_beads": {
           "type": "array",
@@ -280,24 +215,14 @@
     },
     "agent_mail": {
       "type": "object",
-      "required": [
-        "db_open",
-        "api_reachable",
-        "reservation_conflicts"
-      ],
+      "required": ["db_open", "api_reachable", "reservation_conflicts"],
       "additionalProperties": false,
       "properties": {
         "db_open": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "api_reachable": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "reservation_conflicts": {
           "type": "array",
@@ -320,10 +245,7 @@
       "additionalProperties": false,
       "properties": {
         "posture": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "active_project_exclusion": {
           "type": "boolean"
@@ -337,49 +259,29 @@
           "minimum": 0
         },
         "selected_worker": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "worker_slots_available": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "workers_healthy": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "workers_total": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         }
       }
     },
     "worker_rejection": {
       "type": "object",
-      "required": [
-        "worker",
-        "reason_code",
-        "detail",
-        "severity"
-      ],
+      "required": ["worker", "reason_code", "detail", "severity"],
       "additionalProperties": false,
       "properties": {
         "worker": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "reason_code": {
           "$ref": "#/$defs/reason_code"
@@ -394,11 +296,7 @@
     },
     "recommendation": {
       "type": "object",
-      "required": [
-        "action",
-        "reason_code",
-        "operator_approval_required"
-      ],
+      "required": ["action", "reason_code", "operator_approval_required"],
       "additionalProperties": false,
       "properties": {
         "action": {
@@ -428,29 +326,15 @@
     },
     "citation": {
       "type": "object",
-      "required": [
-        "kind",
-        "path",
-        "summary"
-      ],
+      "required": ["kind", "path", "summary"],
       "additionalProperties": false,
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "command_output",
-            "artifact",
-            "bead",
-            "agent_mail",
-            "manual_note",
-            "fixture"
-          ]
+          "enum": ["command_output", "artifact", "bead", "agent_mail", "manual_note", "fixture"]
         },
         "path": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "summary": {
           "type": "string",

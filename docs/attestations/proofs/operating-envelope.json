@@ -3,10 +3,118 @@
   "kind": "operating-envelope-convergence-attestation",
   "category": "proofs/robot-contracts",
   "release_version": "0.0.0-substrate",
-  "generated_at": "2026-09-19T22:14:08Z",
+  "generated_at": "2026-09-21T18:57:59Z",
   "produced_by_bead": "ft-booek.7",
-  "status": "passed_scoped_remote_pending_bundle_verification",
+  "status": "scoped_remote_and_development_integrity_verified",
+  "current_proof": {
+    "historical_source_revision": "773f5898277ebb612717065386835359d163e9df",
+    "evidence_directory": "artifacts/releases/operating-envelope/evidence",
+    "historical_remote_results": {
+      "operating_envelope_library": {"passed": 41, "failed": 0, "log": "rc53-envelope-records-ts1-rch.log"},
+      "schema": {"passed": 3, "failed": 0, "log": "rc53-parity-envelope-ts1-rch-attempt2.log"},
+      "cli": {"passed": 3, "failed": 0, "log": "rc53-envelope-cli-ts1-rch-attempt2.log"},
+      "mcp": {"passed": 3, "failed": 0, "log": "rc53-envelope-mcp-ts1-rch.log"},
+      "prior_deferred_manifest": {"passed": 17, "failed": 0, "log": "rc53-manifest-completeness-114-rch.log"},
+      "controlled_fixture_records": {"count": 10, "path": "rc53-operating-envelope-fixture-records.jsonl"}
+    },
+    "current_mcp_results": {
+      "job": "j-30023644042233729",
+      "worker": "ts1",
+      "worker_host": "ubuntu@100.74.254.33",
+      "sync_hash": "01e3da8f8db2804f",
+      "log": "rc55-manifest-capability-imports-full-rch.log",
+      "passed": 3,
+      "tests": ["operating_envelope_tool_explains_reason_code", "operating_envelope_tool_rejects_execute_attempt", "operating_envelope_tool_returns_dry_run_status"],
+      "aggregate": {"passed": 31912, "failed": 0, "ignored": 5, "filtered_out": 0, "test_threads": 64, "duration_seconds": 150.38, "exit_code": 0},
+      "source_fences": ["rc55-manifest-capability-imports-source.sha256", "rc55-manifest-capability-imports-remote-before.sha256", "rc55-manifest-capability-imports-remote-after.sha256"],
+      "source_boundary": "Eight-file local/before/after worker hashes agree, including the final b24011a4 MCP source inventory below. All 31912 executed full-core library tests passed with 64 test threads; five tests were ignored. This is scoped source proof, not an exact whole-workspace tree receipt or native executable qualification."
+    },
+    "manifest_completeness": {
+      "job": "j-30023644042233725",
+      "worker": "vmi1149989",
+      "base_commit": "dcd4b8f2c84c698c4d02ce5a0c2c7619ac347777",
+      "overlay_fingerprint": "72fd66a7b1f666e3af30e6703f2a3830ef4cb1357fccb4597e97f5223e6cde34",
+      "source_tree": "d5552e6fb9fb78fcba374c80693498ec7df4b5f7",
+      "log": "rc55-envelope-manifest-closed-rch.log",
+      "source_fence": "rc55-envelope-manifest-closed-remote-before.jsonl",
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "filtered_out": 0,
+      "exit_code": 0,
+      "boundary": "The selected manifest and actual exported closed producer graph passed all completeness tests and their negative controls. The retained source fence identifies the artifact bytes tested before adding this result; final artifact bytes require the separate development bundle hash round-trip."
+    },
+    "boundary": "RC53 CLI evidence is historical remote CLI-test execution, not native RC55 executable qualification. Controlled planner fixtures do not establish live service mutation, automated execution or target-class capacity. The current selected manifest has the separate 17-test completeness result above.",
+    "inventory_comparison": "Against RC53, 23 JSON inventory files have identical parsed values with formatting-only byte changes; planner, CLI source, schema test and runbook bytes are unchanged. MCP source changed and has the separate current scoped result above. The manifest change is producer wiring."
+  },
   "proof_categories": [4, 5],
+  "retained_evidence_sha256": {
+    "rc55-manifest-capability-imports-full-rch.log": "1ee452c628a466fe2c0f23283959cd0264fef1f106b94a910554dd74aee0dec0",
+    "rc55-manifest-capability-imports-source.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
+    "rc55-manifest-capability-imports-remote-before.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
+    "rc55-manifest-capability-imports-remote-after.sha256": "7f177fcd757c4a5b07a7b575c27a1a8801ce1431bc24eee3b5c0c5bece42f1c7",
+    "rc53-envelope-cli-ts1-rch-attempt2.log": "699cb2881935553a4a12f0ec97fe66f1e5a5d51893a909e57c44679eefb1eea5",
+    "rc53-envelope-mcp-ts1-rch.log": "47807dbf21d7fd6fca220b328d5a77bbdccf3b901900b063afb95d70358a36af",
+    "rc53-envelope-records-ts1-rch.log": "c6a02f82cbb605fdeddc7f6fa169f6ed585780dd4452f9380a6f531de6b08e46",
+    "rc53-manifest-completeness-114-rch.log": "398d816d3f35b7f5f2e00824a96867359c64eae6d4f1407c6a7437eb092f58d9",
+    "rc53-operating-envelope-fixture-records.jsonl": "9d31d4b4311d02f0c0481bb43b921723b0e6385beafebcfa71050ac07809a89e",
+    "rc53-parity-envelope-ts1-rch-attempt2.log": "00d0e5cb6b1c133979a5e23d866b56c98a92e67e5b8dee0ef2826835cf8a9e44",
+    "rc55-registry-phases-full-rch.log": "d67a6e4367527ab936c9752166fcc1681b683549a468b0ff5a398d9c94ff7c0a",
+    "rc55-registry-phases-source.sha256": "32f6f051f61655e8de8369741d8bb04a8daf4ef91d3fc639b9456f45891f1279",
+    "rc55-registry-phases-remote-before.sha256": "32f6f051f61655e8de8369741d8bb04a8daf4ef91d3fc639b9456f45891f1279",
+    "rc55-registry-phases-remote-after.sha256": "32f6f051f61655e8de8369741d8bb04a8daf4ef91d3fc639b9456f45891f1279",
+    "rc55-envelope-manifest-closed-rch.log": "a3d30f365cde9d6494d4c2d88814dd62c1a37ee237670e8682c75d2d02106665",
+    "rc55-envelope-manifest-closed-remote-before.jsonl": "367e502aa67e0c79788bb9afcadb08ea5428b43dae8e1a85dbae6b7a8091285f"
+  },
+  "current_source_sha256": {
+    "README.md": "171da9f5812c4a6f319e1aaf361a24fe0023c73e1c89a723f087699666bf1dd5",
+    "crates/frankenterm-core/src/mcp_tools.rs": "b24011a4dd1d55755f713983055a0795b192ab5e3271794f397ebb364b6d66ee",
+    "crates/frankenterm-core/src/operating_envelope.rs": "7d1d05c1369f392fc7d764126d062c5e5fd2a5004a6458eef9dae5520a96e4e0",
+    "crates/frankenterm-core/tests/attestation_manifest_completeness.rs": "8c3fc0eee299de17d094838ff28f060db1d87fd63e6e06f29cfac606640efd4a",
+    "crates/frankenterm-core/tests/operating_envelope_schema.rs": "cb8b0478cfd60ed71919912ee4531549beea5b0e0d3df1ce2bdbf6029c2f11e3",
+    "crates/frankenterm/src/main.rs": "9c236b653978c5a8f5996245dc258fda205fc66f283603f0fafc56b10853b144",
+    "docs/attestations/proofs/resource-cockpit-target-class.json": "5d4a6b6c1908bfa0c360592ccbdec7718d8eeba2a51197ef2884cdf42d1b3a9b",
+    "docs/json-schema/ft-operating-envelope-proof-calendar.json": "106e048929809775ad7b9efa2581bfbba949fdaff5dfcec4be2e83bd9884c9f1",
+    "docs/json-schema/ft-operating-envelope.json": "61d3245642f6adcaba6a92932ec5f1b4b6acb93518a2ceef4ef51419038a98f3",
+    "docs/operator-runbook.md": "13c372b993db6ce3d36d6cc5f69a40d7b7b5cf4a0554bbf0dbe96721c832d765",
+    "docs/proof-taxonomy.json": "5f45670796eddd67b339f00311b56269366bbac02cc60dbeac826c05c3db60b0",
+    "docs/release/attestation-checklist.md": "3c3fc54c44a8e2450373d92f7d6b2712e5cdee93858fdf5721d1ffa1b2a50aac",
+    "docs/robot-contracts/operating-envelope.md": "573da981f293869b1434958b3d0b66c7b0e47f7c69d4bc798a8ba61ef80cfe7a",
+    "fixtures/operating-envelope/agent-mail-unavailable.json": "7f75bc9171d7245723577792736c8de8d733bec198b419826ea6f44825eb7aff",
+    "fixtures/operating-envelope/dirty-overlap.json": "4726d3978497f1d071fbb114733eb0aca2289332ba1518a14164062fb0e9caff",
+    "fixtures/operating-envelope/healthy.json": "d1514089e953ab2143511a064a9c35374e0582b5a8f91f96216afb3cf54a298d",
+    "fixtures/operating-envelope/invalid/malformed-path.json": "3e059f0a0b9db51b59e4e2218176fd46943d576e23208147c496f0d87edfd6b7",
+    "fixtures/operating-envelope/invalid/missing-contract-id.json": "2bd1b6674f6617a81d17d8f19dd7e08d3a093d765fa95460d33e7721053a4a27",
+    "fixtures/operating-envelope/invalid/missing-field.json": "acb71b4a83d6c57fee2bd741a0c9a19df2bc2190296acfc4b739af5ad43c0721",
+    "fixtures/operating-envelope/invalid/unknown-version.json": "10d06e51a7380e5d8377a802c347aceb8b9f69486225c9149a36bc5c55b1d25e",
+    "fixtures/operating-envelope/manifest.json": "7ef8d6d227d4538481cf91ca615028489ad6a857a3a770b1dc3a23d89407dc4f",
+    "fixtures/operating-envelope/proof-calendar/cases.v1.json": "689232d564e045d152c9a915c38d9e845135a1593623367cc0433f04576f8215",
+    "fixtures/operating-envelope/proof-calendar/invalid/cases.v1.json": "d10fc16995fd9ada0eb2b524e570e90c3b39663af2ad4a3096023aae10f25701",
+    "fixtures/operating-envelope/rch-no-worker.json": "24e6860940aa4c2452200e2368e1dd76bfd8d263d7c21db87356863679401a82",
+    "fixtures/operating-envelope/rch-topology-failure.json": "0b8b26d9d2a78a64f592d9aafa0b9ebeec9fd7db6b549d78b60d3a98441132e9",
+    "fixtures/operating-envelope/target-class-skipped.json": "1cf210b41d09c80d4b7bcee1e94806be3bec262c307c16f06ec86a2b975f4b8d",
+    "fixtures/operating-envelope/valid/agent-mail-unavailable.json": "7f75bc9171d7245723577792736c8de8d733bec198b419826ea6f44825eb7aff",
+    "fixtures/operating-envelope/valid/dirty-overlap.json": "4726d3978497f1d071fbb114733eb0aca2289332ba1518a14164062fb0e9caff",
+    "fixtures/operating-envelope/valid/healthy.json": "d1514089e953ab2143511a064a9c35374e0582b5a8f91f96216afb3cf54a298d",
+    "fixtures/operating-envelope/valid/rch-no-worker.json": "24e6860940aa4c2452200e2368e1dd76bfd8d263d7c21db87356863679401a82",
+    "fixtures/operating-envelope/valid/rch-topology-failure.json": "0b8b26d9d2a78a64f592d9aafa0b9ebeec9fd7db6b549d78b60d3a98441132e9",
+    "fixtures/operating-envelope/valid/target-hardware-skipped.json": "1cf210b41d09c80d4b7bcee1e94806be3bec262c307c16f06ec86a2b975f4b8d",
+    "tests/e2e/test_operating_envelope_fixture_manifest.sh": "5ba6e1dea19ed8b948dd26d3302941d00d3425817d83a4e045d31813040aca15"
+  },
+  "current_inventory_verification": {
+    "verified_at": "2026-09-21T18:57:59Z",
+    "identity": "The 33 SHA-256 values in current_source_sha256 and sixteen retained_evidence_sha256 values identify the recorded source and evidence inventory; no whole-workspace commit equivalence is asserted.",
+    "manifest_binding": "The selected docs/attestations/manifest.json now resolves this producer only. Its exact hash is bound externally by the development bundle; it is deliberately excluded from current_source_sha256. All 32 slots and required categories are preserved, and Lindley, redaction and Doctor remain deferred.",
+    "boundary": "Recheck these hashes after source edits. The eight-file RCH fence qualifies the named MCP results only; inventory hashing is not additional runtime proof. Selected-manifest Cargo completeness passed with the actual closed producer export.",
+    "closure_metadata": "The first selected-manifest run retained the actual in-progress producer export and correctly failed its closure predicate (16 passed, one failed). After closing ft-booek.7 and exporting the real graph, j-30023644042233725 passed all 17 tests. Embedded fallback metadata agrees with that closed graph; generic producer-closure predicates and negative controls are unchanged."
+  },
+  "current_static_validation": {
+    "command": "bash tests/e2e/test_operating_envelope_fixture_manifest.sh --json",
+    "exit_code": 0,
+    "receipt": "/private/var/tmp/ft-release-20260921/operating-envelope-wired-static.json",
+    "summary": {"valid_fixture_count": 6, "invalid_fixture_count": 4, "root_alias_count": 6, "proof_calendar_case_count": 7, "proof_calendar_invalid_case_count": 6, "retained_run_case_count": 10},
+    "boundary": "Static fixture and record-shape validation; no live service or native capacity execution."
+  },
   "scope": "Release-bundle attestation for the ft.operating_envelope.v1 read-only fail-closed admission contract, retained fixture/proof-calendar corpus, no-mock retained-run contract, operator runbook, and release-attestation wiring.",
   "contract": {
     "contract_id": "ft.operating_envelope.v1",
@@ -81,10 +189,7 @@
       "claim_id": "operating_envelope.operator_runbook",
       "bead_id": "ft-booek.6",
       "readiness_state": "measured",
-      "evidence": [
-        "docs/operator-runbook.md",
-        "docs/robot-contracts/operating-envelope.md"
-      ]
+      "evidence": ["docs/operator-runbook.md", "docs/robot-contracts/operating-envelope.md"]
     },
     {
       "claim_id": "operating_envelope.proof_calendar",
@@ -106,7 +211,7 @@
     {
       "claim_id": "operating_envelope.release_attestation_wiring",
       "bead_id": "ft-booek.7",
-      "readiness_state": "pending_bundle_verification",
+      "readiness_state": "development_integrity_and_manifest_completeness_verified",
       "evidence": [
         "docs/attestations/manifest.json",
         "docs/attestations/proofs/operating-envelope.json",
@@ -129,7 +234,7 @@
       }
     }
   ],
-  "static_validation": {
+  "historical_static_validation": {
     "status": "pass",
     "verified_at": "2026-09-19T22:14:08Z",
     "checkout_head": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
@@ -146,14 +251,14 @@
     "active_bead_dependency_cycle_count": 0,
     "boundary": "Static fixture and retained-run record-shape validation only. The shell constructs ten synthetic retained-run examples; it does not execute ten live service scenarios. The remote Rust harness separately executes the real read-only planner against controlled source snapshots."
   },
-  "rch_proof": {
+  "historical_rch_proof": {
     "status": "passed_operating_envelope_scope",
     "remote_required": true,
     "local_cargo_counted": false,
     "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-rc40-operating-envelope cargo test -j 1 --profile test-recovery --target x86_64-unknown-linux-gnu -p frankenterm-core --no-default-features --lib --test operating_envelope_schema --locked operating_envelope -- --nocapture",
     "requested_target_dir": "/tmp/ft-rc40-operating-envelope",
     "blocking_reason": null,
-    "current_evidence": {
+    "historical_rc40_evidence": {
       "worker": "vmi1227854",
       "worker_host": "root@109.123.245.77",
       "job": "j-30023644042232722",
@@ -161,7 +266,7 @@
       "base_sha": "957b23d1d2a61011d5259a656fd0ff8cbc756dfa",
       "source_tree": "1a549e2416874ae56d797830d6aabbbfdd139509",
       "overlay_fingerprint": "fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195",
-      "source_identity_authority": "The retained RCH transcript ends with a clean-overlay receipt binding the base, overlay fingerprint and source tree. The tree object exists in the local repository and was compared read-only with the current scoped source.",
+      "source_identity_authority": "The historical RCH transcript ends with a clean-overlay receipt binding the base, overlay fingerprint and source tree. Its source comparison refers to the recorded September 19 checkout, not the current inventory.",
       "remote_target_dir": "/var/tmp/ft-rch-proof.PWbxQPza/frankenterm/.rch-target-vmi1227854-pool-69c6f828614b0641c0378d677dbd816a",
       "scope_comparison": {
         "verified_at": "2026-09-19T22:14:08Z",
@@ -198,10 +303,10 @@
         }
       ],
       "release_ready": false,
-      "remaining_closeout": "Preserve the verified RC40 log in the final evidence bundle, complete manifest wiring/completeness and final-artifact development bundle round-trip, then bind final source/profile/targets through DSR. This retained scoped RC40 execution does not claim RC47 runtime qualification, live service mutation, or target-class capacity."
+      "closeout_at_recorded_date": "At the recorded September 19 checkout, manifest wiring/completeness and bundle verification remained pending. Current proof and development verification above supersede this historical closeout note; native qualification and target-class capacity are not asserted."
     },
     "historical_september_evidence": {
-      "receipt_availability": "Referenced September 12 log and scope-receipt paths are absent in the current workspace; their historical results were not reverified and are superseded by current_evidence.",
+      "receipt_availability": "Referenced September 12 log and scope-receipt paths are absent; their historical results were not reverified. This record is historical context only, not active closure evidence.",
       "worker": "ts1",
       "worker_host": "ubuntu@100.74.254.33",
       "platform": "Linux x86_64",
@@ -209,7 +314,7 @@
       "remote_target_dir": "/home/ubuntu/rch/frankenterm/.rch-target-ts1-pool-976f2216c532a80ff79f16d1140be4c1",
       "scope_hash_receipt": "/tmp/ft-8r43i.5kXohF/operating-envelope-1115-remote.sha256",
       "scope_hash_receipt_sha256": "2e989482760cad2075858d5bd8e43dd5172a48b05ccab8e9d5c4cdd2b0eb020c",
-      "scope_hashes_match_current_source": true,
+      "scope_hashes_matched_recorded_historical_source": true,
       "runs": [
         {
           "source_snapshot": "af0a3623dafdf604",
@@ -241,7 +346,7 @@
         }
       ],
       "release_ready": false,
-      "remaining_closeout": "Root must retain these log bytes in the release evidence bundle, verify manifest completeness and unsigned development bundle round-trip, and bind final release source/profile/targets through DSR. Neither aggregate RCH command exited zero. No target-class capacity claim is promoted."
+      "closeout_at_recorded_date": "Neither historical aggregate RCH command exited zero. Their then-pending bundle steps are superseded by the current proof and development verification above. No target-class capacity claim is promoted."
     },
     "historical_attempts_note": "The following June attempts are retained as history and superseded for scoped runtime execution by the September receipts above.",
     "attempts": [
@@ -289,12 +394,12 @@
       "exit 143"
     ]
   },
-  "source_inventory_verification": {
+  "historical_source_inventory_verification": {
     "verified_at": "2026-09-19T22:14:08Z",
     "checkout_head": "6e2a48ee97a3e7ec05f0c6169dce5df9569b4590",
-    "boundary": "Inventory hashes describe current on-disk dependencies, not additional runtime proof. Manifest, completeness test, README and checklist changed since the prior inventory and were refreshed. The manifest still defers this slot; any later manifest or dependency edit requires another inventory refresh before final bundle verification."
+    "boundary": "These historical inventory hashes describe the September 19 checkout named above. That checkout still deferred the operating-envelope slot. They are retained as history only; current_source_sha256 and current_inventory_verification supersede them for the present wiring."
   },
-  "source_artifacts": [
+  "historical_source_artifacts": [
     {
       "path": "docs/json-schema/ft-operating-envelope.json",
       "media_type": "application/schema+json",
@@ -387,26 +492,24 @@
     "required_category": true,
     "bundle_hashing": "scripts/attestation-build.sh hashes this artifact into dev and release bundles.",
     "final_artifact_verification": {
-      "status": "pending",
-      "canonical_slot_deferred": true,
+      "status": "development_integrity_verified_not_release_qualified",
+      "canonical_slot_deferred": false,
       "publisher_authenticated": false,
       "release_ready": false
     },
     "development_verification": {
-      "status": "historical_report_for_prior_artifact_bytes_not_reverified",
+      "status": "passed_development_integrity",
       "build_exit_code": 0,
       "verify_exit_code": 0,
-      "artifact_count": 30,
-      "deferred_slot_count": 2,
-      "bundle": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250/0.0.0-dev.json",
-      "build_log": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250-build.log",
-      "build_log_sha256": "a7a92c510045b55fde481ba2b23e6d477213913d96c62e0523c43d23d137c3b1",
-      "verify_log": "/tmp/ft-8r43i.5kXohF/attestation-producers-1250-verify.log",
-      "verify_log_sha256": "29faa68bee3c66a968389cc2d59e41c22c2f370823ead91c83b8d5e97e78271a",
+      "artifact_count": 29,
+      "deferred_slot_count": 3,
+      "bundle": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final/0.0.0-dev.json",
+      "build_log": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final-build.log",
+      "verify_log": "/private/var/tmp/ft-release-20260921/operating-envelope-j33729-final-verify.json",
       "verification_mode": "development_integrity",
       "publisher_authenticated": false,
       "release_ready": false,
-      "boundary": "This historical unsigned round-trip was reported for prior artifact bytes. Its temporary receipt paths are not present in the current workspace and were not reverified; it does not verify this edited file. Rebuild and reverify after final artifact/manifest freeze. Refresh the nested manifest digest when any manifest entry changes. Four current canonical deferred slots still prevent strict-deferred release qualification."
+      "boundary": "Unsigned development verification of selected on-disk artifact bytes by the existing shell assembler and verifier, not a clean-source release binding or native CLI execution proof. Selected-manifest completeness passed with the actual closed producer graph. Lindley, redaction and Doctor remain deferred, and final DSR/signing qualification is required before publication. Bundle hashes are retained outside this artifact to avoid a self-referential hash cycle."
     }
   }
 }

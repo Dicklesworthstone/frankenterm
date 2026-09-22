@@ -161,10 +161,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": [
-              "json",
-              "toon"
-            ]
+            "enum": ["json", "toon"]
           },
           "allOf": [
             {
@@ -257,11 +254,7 @@
     },
     "future_harness_requirements": {
       "type": "object",
-      "required": [
-        "must_generate",
-        "must_fail_when",
-        "proof_policy"
-      ],
+      "required": ["must_generate", "must_fail_when", "proof_policy"],
       "additionalProperties": false,
       "properties": {
         "must_generate": {
@@ -328,11 +321,7 @@
     },
     "source_fixture_requirement": {
       "type": "object",
-      "required": [
-        "source_id",
-        "command_or_api",
-        "required_reason_codes"
-      ],
+      "required": ["source_id", "command_or_api", "required_reason_codes"],
       "additionalProperties": false,
       "properties": {
         "source_id": {
@@ -376,11 +365,7 @@
         },
         "confidence": {
           "type": "string",
-          "enum": [
-            "low",
-            "medium",
-            "high"
-          ]
+          "enum": ["low", "medium", "high"]
         },
         "explanation_must_include": {
           "$ref": "#/$defs/non_empty_string_array"
@@ -389,10 +374,7 @@
     },
     "volatility": {
       "type": "object",
-      "required": [
-        "level",
-        "strategy"
-      ],
+      "required": ["level", "strategy"],
       "additionalProperties": false,
       "properties": {
         "level": {

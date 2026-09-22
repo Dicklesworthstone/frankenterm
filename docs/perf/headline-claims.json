@@ -37,7 +37,7 @@
       "metric": {
         "kind": "throughput",
         "unit": "panes",
-        "report_percentile": 0.50,
+        "report_percentile": 0.5,
         "floor": 200,
         "comparison_direction": "higher_is_better"
       },
@@ -91,7 +91,7 @@
       "metric": {
         "kind": "compression_ratio",
         "unit": "ratio_in_to_out",
-        "report_percentile": 0.50,
+        "report_percentile": 0.5,
         "expected_range": [5.0, 10.0],
         "comparison_direction": "higher_is_better"
       },
@@ -115,7 +115,7 @@
       "metric": {
         "kind": "speedup_ratio",
         "unit": "ratio_baseline_over_optimized",
-        "report_percentile": 0.50,
+        "report_percentile": 0.5,
         "expected_range": [10.0, 100.0],
         "comparison_direction": "higher_is_better"
       },
@@ -142,7 +142,7 @@
     "regression_gate": {
       "method": "ebci-upper-bound",
       "alpha": 0.05,
-      "regression_threshold_relative": 0.10,
+      "regression_threshold_relative": 0.1,
       "implemented_by_bead": "ft-9zzkg"
     }
   }

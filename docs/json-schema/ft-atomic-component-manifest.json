@@ -90,11 +90,7 @@
     "inventory": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "mode",
-        "file_count",
-        "total_bytes"
-      ],
+      "required": ["mode", "file_count", "total_bytes"],
       "properties": {
         "mode": {
           "const": "exact"
@@ -113,11 +109,7 @@
     "verification": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "algorithm",
-        "offline",
-        "path_policy"
-      ],
+      "required": ["algorithm", "offline", "path_policy"],
       "properties": {
         "algorithm": {
           "const": "sha256"
@@ -126,10 +118,7 @@
           "const": true
         },
         "path_policy": {
-          "enum": [
-            "relative_utf8_browser_symlink_sidecar_v2",
-            "relative_utf8_no_symlink_v1"
-          ]
+          "enum": ["relative_utf8_browser_symlink_sidecar_v2", "relative_utf8_no_symlink_v1"]
         }
       }
     }
@@ -179,14 +168,7 @@
     "file": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "bytes",
-        "executable",
-        "kind",
-        "path",
-        "role",
-        "sha256"
-      ],
+      "required": ["bytes", "executable", "kind", "path", "role", "sha256"],
       "properties": {
         "bytes": {
           "type": "integer",
@@ -214,9 +196,7 @@
       "allOf": [
         {
           "if": {
-            "required": [
-              "component"
-            ]
+            "required": ["component"]
           },
           "then": {
             "properties": {
@@ -233,14 +213,10 @@
                 "const": "executable"
               }
             },
-            "required": [
-              "kind"
-            ]
+            "required": ["kind"]
           },
           "then": {
-            "required": [
-              "component"
-            ]
+            "required": ["component"]
           }
         }
       ]
@@ -248,12 +224,7 @@
     "input": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "bytes",
-        "path",
-        "role",
-        "sha256"
-      ],
+      "required": ["bytes", "path", "role", "sha256"],
       "properties": {
         "bytes": {
           "type": "integer",

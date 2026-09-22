@@ -8,10 +8,7 @@
   "supersedes_bead": "ft-tf6g3.20",
   "status": "pass",
   "coverage_gate_status": "pass",
-  "proof_category": [
-    6,
-    2
-  ],
+  "proof_category": [6, 2],
   "scope": "Machine-readable state-space coverage measurements for formal-method proof lanes. TLC summaries come from scripts/run-tlc.sh; Stateright summaries come from the model stats API wrapper.",
   "tools": {
     "tla": "scripts/measure-tla-coverage.sh",

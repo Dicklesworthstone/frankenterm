@@ -67,10 +67,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "enum": [
-              "json",
-              "toon"
-            ]
+            "enum": ["json", "toon"]
           },
           "allOf": [
             {
@@ -139,14 +136,7 @@
     },
     "wording_state": {
       "type": "string",
-      "enum": [
-        "supported",
-        "planned",
-        "skipped",
-        "stale",
-        "unavailable",
-        "deprecated"
-      ]
+      "enum": ["supported", "planned", "skipped", "stale", "unavailable", "deprecated"]
     },
     "repo_relative_path": {
       "type": "string",

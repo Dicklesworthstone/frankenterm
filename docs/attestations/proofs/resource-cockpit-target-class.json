@@ -12,10 +12,7 @@
     "target_class_doc": "docs/perf/target-class-hardware.md",
     "harness": "scripts/run-target-class-cockpit.sh",
     "artifact_pattern": "tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json",
-    "major_skus": [
-      "macos-apple-silicon-dev",
-      "linux-x86_64-high-core"
-    ]
+    "major_skus": ["macos-apple-silicon-dev", "linux-x86_64-high-core"]
   },
   "current_artifact": {
     "path": "tests/e2e/artifacts/target-class/linux-x86_64-high-core/20260512T150000Z/summary.json",

@@ -4,12 +4,7 @@
   "release_version": "ft-e87u6.10-recovery",
   "generated_at": "2026-05-09T00:00:00Z",
   "produced_by_bead": "ft-e87u6.10",
-  "source_beads": [
-    "ft-35yac.1",
-    "ft-35yac.1.2",
-    "ft-35yac.2",
-    "ft-tf6g3.24"
-  ],
+  "source_beads": ["ft-35yac.1", "ft-35yac.1.2", "ft-35yac.2", "ft-tf6g3.24"],
   "attestation_manifest_slot": {
     "category": "tui/render-parity",
     "media_type": "application/json",
@@ -76,10 +71,7 @@
     "script_count": 12,
     "action_kind_count": 32,
     "covered_action_kinds": 30,
-    "explicitly_omitted_action_kinds": [
-      "prev_tab",
-      "apply_ruleset_profile"
-    ],
+    "explicitly_omitted_action_kinds": ["prev_tab", "apply_ruleset_profile"],
     "omission_rationale": {
       "prev_tab": "covered indirectly by NextTab plus symmetry",
       "apply_ruleset_profile": "rare action sharing the CycleRulesetProfile code path"
@@ -145,10 +137,7 @@
       "triangle_inequality_on_diverged_cells",
       "continuation_flag_does_not_affect_diff"
     ],
-    "input_alphabet_properties": [
-      "keymap_action_kind_is_stable",
-      "event_script_serde_roundtrip"
-    ],
+    "input_alphabet_properties": ["keymap_action_kind_is_stable", "event_script_serde_roundtrip"],
     "corpus_invariant_tests": [
       "every_synthesized_script_is_well_formed",
       "every_keymap_action_kind_appears_in_corpus_or_is_explicitly_omitted"

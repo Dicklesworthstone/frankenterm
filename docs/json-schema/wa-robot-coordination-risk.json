@@ -240,13 +240,7 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": [
-              "id",
-              "title",
-              "updated_at",
-              "age_seconds",
-              "stale_over_2h"
-            ],
+            "required": ["id", "title", "updated_at", "age_seconds", "stale_over_2h"],
             "properties": {
               "id": {
                 "type": "string"

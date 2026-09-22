@@ -29,7 +29,15 @@
     },
     "kind": {
       "type": "string",
-      "enum": ["assertion", "stage_enter", "stage_exit", "measurement", "error", "decision", "evidence_emit"],
+      "enum": [
+        "assertion",
+        "stage_enter",
+        "stage_exit",
+        "measurement",
+        "error",
+        "decision",
+        "evidence_emit"
+      ],
       "description": "One of the 7 canonical row kinds. Test authors should prefer the named helpers on TestLogger (.assertion, .stage_enter, .stage_exit, .measurement, .error, .decision, .evidence_emit) over emitting kind strings manually."
     },
     "payload": {

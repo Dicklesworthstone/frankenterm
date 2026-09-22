@@ -90,34 +90,15 @@
   "$defs": {
     "evidence_state": {
       "type": "string",
-      "enum": [
-        "measured",
-        "inferred",
-        "simulated",
-        "stale",
-        "unavailable",
-        "mixed"
-      ]
+      "enum": ["measured", "inferred", "simulated", "stale", "unavailable", "mixed"]
     },
     "risk_tier": {
       "type": "string",
-      "enum": [
-        "green",
-        "yellow",
-        "red",
-        "black",
-        "unknown"
-      ]
+      "enum": ["green", "yellow", "red", "black", "unknown"]
     },
     "handoff_readiness": {
       "type": "string",
-      "enum": [
-        "not_needed",
-        "prepare",
-        "ready",
-        "blocked",
-        "unknown"
-      ]
+      "enum": ["not_needed", "prepare", "ready", "blocked", "unknown"]
     },
     "action_kind": {
       "type": "string",
@@ -133,12 +114,7 @@
     },
     "policy_state": {
       "type": "string",
-      "enum": [
-        "allowed_dry_run",
-        "requires_approval",
-        "blocked",
-        "unavailable"
-      ]
+      "enum": ["allowed_dry_run", "requires_approval", "blocked", "unavailable"]
     },
     "failure_class": {
       "type": "string",
@@ -211,25 +187,16 @@
           "$ref": "#/$defs/evidence_state"
         },
         "context_utilization": {
-          "type": [
-            "number",
-            "null"
-          ],
+          "type": ["number", "null"],
           "minimum": 0,
           "maximum": 1
         },
         "tokens_consumed": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "token_budget": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "rotation_depth": {
@@ -237,10 +204,7 @@
           "minimum": 0
         },
         "ms_since_last_rotation": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "compaction_pressure": {
@@ -280,16 +244,10 @@
         },
         "scope": {
           "type": "string",
-          "enum": [
-            "pane",
-            "fleet"
-          ]
+          "enum": ["pane", "fleet"]
         },
         "pane_id": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "action_kind": {
@@ -307,10 +265,7 @@
           "minLength": 1
         },
         "suggested_command": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "reason_codes": {
           "$ref": "#/$defs/non_empty_string_array"
@@ -322,13 +277,7 @@
     },
     "citation": {
       "type": "object",
-      "required": [
-        "citation_id",
-        "source",
-        "evidence_state",
-        "redacted",
-        "summary"
-      ],
+      "required": ["citation_id", "source", "evidence_state", "redacted", "summary"],
       "additionalProperties": false,
       "properties": {
         "citation_id": {
@@ -354,12 +303,7 @@
     },
     "unavailable_domain": {
       "type": "object",
-      "required": [
-        "domain",
-        "evidence_state",
-        "reason_codes",
-        "failure_class"
-      ],
+      "required": ["domain", "evidence_state", "reason_codes", "failure_class"],
       "additionalProperties": false,
       "properties": {
         "domain": {

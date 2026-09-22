@@ -83,12 +83,7 @@
     },
     "source_snapshot": {
       "type": "object",
-      "required": [
-        "commit",
-        "tree",
-        "source_state",
-        "commit_pushed"
-      ],
+      "required": ["commit", "tree", "source_state", "commit_pushed"],
       "additionalProperties": false,
       "properties": {
         "commit": {
@@ -101,11 +96,7 @@
         },
         "source_state": {
           "type": "string",
-          "enum": [
-            "source_landed",
-            "static_clean",
-            "planning_only"
-          ]
+          "enum": ["source_landed", "static_clean", "planning_only"]
         },
         "commit_pushed": {
           "type": "boolean"
@@ -114,10 +105,7 @@
     },
     "env_var": {
       "type": "object",
-      "required": [
-        "name",
-        "value"
-      ],
+      "required": ["name", "value"],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -143,10 +131,7 @@
       "properties": {
         "command_shape_version": {
           "type": "string",
-          "enum": [
-            "rch-no-self-healing-v1",
-            "static-verifier-v1"
-          ]
+          "enum": ["rch-no-self-healing-v1", "static-verifier-v1"]
         },
         "argv": {
           "type": "array",
@@ -172,10 +157,7 @@
           }
         },
         "target_dir": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^/tmp/[A-Za-z0-9._-]+$"
         },
         "material_remote_required": {
@@ -197,24 +179,13 @@
       "properties": {
         "expected_kind": {
           "type": "string",
-          "enum": [
-            "cargo_check",
-            "cargo_test",
-            "cargo_clippy",
-            "static_verifier"
-          ]
+          "enum": ["cargo_check", "cargo_test", "cargo_clippy", "static_verifier"]
         },
         "package": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "test_filter": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "feature_set": {
           "type": "array",
@@ -227,22 +198,13 @@
         },
         "evidence_classification": {
           "type": "string",
-          "enum": [
-            "remote_required_pending",
-            "static_only_clean",
-            "blocked_infra",
-            "ineligible"
-          ]
+          "enum": ["remote_required_pending", "static_only_clean", "blocked_infra", "ineligible"]
         }
       }
     },
     "path_snapshot": {
       "type": "object",
-      "required": [
-        "owned_paths",
-        "dirty_paths_at_capture",
-        "artifact_paths"
-      ],
+      "required": ["owned_paths", "dirty_paths_at_capture", "artifact_paths"],
       "additionalProperties": false,
       "properties": {
         "owned_paths": {
@@ -288,12 +250,7 @@
         },
         "agent_mail_state": {
           "type": "string",
-          "enum": [
-            "green",
-            "degraded_read_only",
-            "unavailable",
-            "unknown"
-          ]
+          "enum": ["green", "degraded_read_only", "unavailable", "unknown"]
         },
         "rch_admission_state": {
           "type": "string",
@@ -313,24 +270,15 @@
           "type": "boolean"
         },
         "selected_worker": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^[A-Za-z0-9._-]+$"
         },
         "rch_job_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "pattern": "^j-[0-9]+$"
         },
         "remote_failure_phase": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "enum": [
             "admission",
             "topology_preflight",
@@ -341,10 +289,7 @@
           ]
         },
         "remote_failure_detail": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1,
           "maxLength": 256
         }
@@ -352,12 +297,7 @@
     },
     "replay_eligibility": {
       "type": "object",
-      "required": [
-        "state",
-        "reason_codes",
-        "freshness_deadline",
-        "replay_allowed"
-      ],
+      "required": ["state", "reason_codes", "freshness_deadline", "replay_allowed"],
       "additionalProperties": false,
       "properties": {
         "state": {

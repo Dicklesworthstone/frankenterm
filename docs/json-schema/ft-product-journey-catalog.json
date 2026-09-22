@@ -161,15 +161,11 @@
           "variants": {
             "contains": {
               "type": "object",
-              "required": [
-                "support"
-              ],
+              "required": ["support"],
               "properties": {
                 "support": {
                   "type": "object",
-                  "required": [
-                    "state"
-                  ],
+                  "required": ["state"],
                   "properties": {
                     "state": {
                       "const": "supported"
@@ -180,9 +176,7 @@
             }
           }
         },
-        "required": [
-          "variants"
-        ]
+        "required": ["variants"]
       }
     },
     {
@@ -191,9 +185,7 @@
           "contradictions": {
             "contains": {
               "type": "object",
-              "required": [
-                "status"
-              ],
+              "required": ["status"],
               "properties": {
                 "status": {
                   "const": "resolved"
@@ -202,9 +194,7 @@
             }
           }
         },
-        "required": [
-          "contradictions"
-        ]
+        "required": ["contradictions"]
       }
     }
   ],
@@ -215,72 +205,37 @@
     },
     "product_persona": {
       "type": "string",
-      "enum": [
-        "interactive_human",
-        "meta_agent_operator",
-        "automation_agent",
-        "incident_responder"
-      ]
+      "enum": ["interactive_human", "meta_agent_operator", "automation_agent", "incident_responder"]
     },
     "fleet_point": {
       "type": "string",
-      "enum": [
-        "q002",
-        "q020",
-        "q050",
-        "q200"
-      ]
+      "enum": ["q002", "q020", "q050", "q200"]
     },
     "topology": {
       "type": "string",
-      "enum": [
-        "local_only",
-        "mac_lan_remote"
-      ]
+      "enum": ["local_only", "mac_lan_remote"]
     },
     "transport": {
       "type": "string",
-      "enum": [
-        "local_mux",
-        "remote_mux"
-      ]
+      "enum": ["local_mux", "remote_mux"]
     },
     "support_state": {
       "type": "string",
-      "enum": [
-        "supported",
-        "conditional",
-        "unavailable"
-      ]
+      "enum": ["supported", "conditional", "unavailable"]
     },
     "evidence_state": {
       "type": "string",
-      "enum": [
-        "proxy_only",
-        "fixture_only",
-        "skipped_not_proven",
-        "blocked",
-        "missing"
-      ],
+      "enum": ["proxy_only", "fixture_only", "skipped_not_proven", "blocked", "missing"],
       "description": "Schema v1 cannot mint proven evidence; positive evidence authority requires a later signed-receipt contract."
     },
     "run_verdict": {
       "type": "string",
-      "enum": [
-        "fail",
-        "degraded",
-        "not_run",
-        "target_unavailable"
-      ],
+      "enum": ["fail", "degraded", "not_run", "target_unavailable"],
       "description": "Schema v1 cannot mint a passing run verdict; positive run authority requires a later signed-receipt contract."
     },
     "producer_coverage": {
       "type": "string",
-      "enum": [
-        "direct",
-        "partial",
-        "gap"
-      ]
+      "enum": ["direct", "partial", "gap"]
     },
     "release_requirement": {
       "type": "string",
@@ -288,12 +243,7 @@
     },
     "target_mode": {
       "type": "string",
-      "enum": [
-        "m4_pro_native",
-        "m5_native",
-        "m5_pro_max_native",
-        "threadripper_pro_5995wx_native"
-      ]
+      "enum": ["m4_pro_native", "m5_native", "m5_pro_max_native", "threadripper_pro_5995wx_native"]
     },
     "actor_mode": {
       "type": "string",
@@ -306,18 +256,11 @@
     },
     "target_availability": {
       "type": "string",
-      "enum": [
-        "available",
-        "unavailable",
-        "unknown"
-      ]
+      "enum": ["available", "unavailable", "unknown"]
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "stale",
-        "unknown"
-      ],
+      "enum": ["stale", "unknown"],
       "description": "Schema v1 cannot mint current freshness; positive candidate-and-route freshness authority requires a later signed-receipt contract."
     },
     "review_authority_kind": {
@@ -332,10 +275,7 @@
     },
     "contradiction_status": {
       "type": "string",
-      "enum": [
-        "open",
-        "resolved"
-      ]
+      "enum": ["open", "resolved"]
     },
     "stable_id": {
       "type": "string",
@@ -471,13 +411,7 @@
     },
     "persona_definition": {
       "type": "object",
-      "required": [
-        "persona",
-        "title",
-        "goals",
-        "success_outcomes",
-        "source_refs"
-      ],
+      "required": ["persona", "title", "goals", "success_outcomes", "source_refs"],
       "additionalProperties": false,
       "properties": {
         "persona": {
@@ -500,13 +434,7 @@
     },
     "fleet_point_definition": {
       "type": "object",
-      "required": [
-        "fleet_point",
-        "pane_count",
-        "title",
-        "workload_characteristics",
-        "source_refs"
-      ],
+      "required": ["fleet_point", "pane_count", "title", "workload_characteristics", "source_refs"],
       "additionalProperties": false,
       "properties": {
         "fleet_point": {
@@ -514,12 +442,7 @@
         },
         "pane_count": {
           "type": "integer",
-          "enum": [
-            2,
-            20,
-            50,
-            200
-          ]
+          "enum": [2, 20, 50, 200]
         },
         "title": {
           "type": "string",
@@ -535,10 +458,7 @@
     },
     "topology_target_posture": {
       "type": "object",
-      "required": [
-        "controller_modes",
-        "session_host_modes"
-      ],
+      "required": ["controller_modes", "session_host_modes"],
       "additionalProperties": false,
       "properties": {
         "controller_modes": {
@@ -561,13 +481,7 @@
     },
     "topology_definition": {
       "type": "object",
-      "required": [
-        "topology",
-        "title",
-        "target_posture",
-        "description",
-        "source_refs"
-      ],
+      "required": ["topology", "title", "target_posture", "description", "source_refs"],
       "additionalProperties": false,
       "properties": {
         "topology": {
@@ -626,13 +540,7 @@
     },
     "actor_mode_definition": {
       "type": "object",
-      "required": [
-        "actor_mode",
-        "title",
-        "personas",
-        "description",
-        "source_refs"
-      ],
+      "required": ["actor_mode", "title", "personas", "description", "source_refs"],
       "additionalProperties": false,
       "properties": {
         "actor_mode": {
@@ -775,11 +683,7 @@
     },
     "coverage_key": {
       "type": "object",
-      "required": [
-        "persona",
-        "fleet_point",
-        "topology"
-      ],
+      "required": ["persona", "fleet_point", "topology"],
       "additionalProperties": false,
       "properties": {
         "persona": {
@@ -797,11 +701,7 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "state",
-            "promotion_receipt_ref",
-            "promotion_receipt_sha256"
-          ],
+          "required": ["state", "promotion_receipt_ref", "promotion_receipt_sha256"],
           "additionalProperties": false,
           "properties": {
             "state": {
@@ -818,13 +718,7 @@
         },
         {
           "type": "object",
-          "required": [
-            "state",
-            "reason",
-            "constraints",
-            "fallback",
-            "tracking_bead_ids"
-          ],
+          "required": ["state", "reason", "constraints", "fallback", "tracking_bead_ids"],
           "additionalProperties": false,
           "properties": {
             "state": {
@@ -848,12 +742,7 @@
         },
         {
           "type": "object",
-          "required": [
-            "state",
-            "reason",
-            "fallback",
-            "tracking_bead_ids"
-          ],
+          "required": ["state", "reason", "fallback", "tracking_bead_ids"],
           "additionalProperties": false,
           "properties": {
             "state": {
@@ -972,40 +861,26 @@
               {
                 "properties": {
                   "freshness_state": {
-                    "enum": [
-                      "stale"
-                    ]
+                    "enum": ["stale"]
                   }
                 },
-                "required": [
-                  "freshness_state"
-                ]
+                "required": ["freshness_state"]
               },
               {
                 "properties": {
                   "evidence_state": {
-                    "enum": [
-                      "proxy_only",
-                      "fixture_only"
-                    ]
+                    "enum": ["proxy_only", "fixture_only"]
                   }
                 },
-                "required": [
-                  "evidence_state"
-                ]
+                "required": ["evidence_state"]
               },
               {
                 "properties": {
                   "run_verdict": {
-                    "enum": [
-                      "fail",
-                      "degraded"
-                    ]
+                    "enum": ["fail", "degraded"]
                   }
                 },
-                "required": [
-                  "run_verdict"
-                ]
+                "required": ["run_verdict"]
               },
               {
                 "properties": {
@@ -1013,9 +888,7 @@
                     "minItems": 1
                   }
                 },
-                "required": [
-                  "evidence_refs"
-                ]
+                "required": ["evidence_refs"]
               }
             ]
           },
@@ -1039,9 +912,7 @@
                     "const": "m5_pro_max_native"
                   }
                 },
-                "required": [
-                  "controller_target_class_id"
-                ]
+                "required": ["controller_target_class_id"]
               },
               {
                 "properties": {
@@ -1049,9 +920,7 @@
                     "const": "m5_pro_max_native"
                   }
                 },
-                "required": [
-                  "session_host_target_class_id"
-                ]
+                "required": ["session_host_target_class_id"]
               }
             ]
           },
@@ -1163,12 +1032,7 @@
     },
     "legacy_mapping": {
       "type": "object",
-      "required": [
-        "legacy_id",
-        "journey_ids",
-        "source_refs",
-        "notes"
-      ],
+      "required": ["legacy_id", "journey_ids", "source_refs", "notes"],
       "additionalProperties": false,
       "properties": {
         "legacy_id": {
@@ -1314,9 +1178,7 @@
                 "const": "automated_informational"
               }
             },
-            "required": [
-              "authority_kind"
-            ]
+            "required": ["authority_kind"]
           },
           "then": {
             "properties": {
@@ -1339,15 +1201,10 @@
           "if": {
             "properties": {
               "disposition": {
-                "enum": [
-                  "approved",
-                  "changes_requested"
-                ]
+                "enum": ["approved", "changes_requested"]
               }
             },
-            "required": [
-              "disposition"
-            ]
+            "required": ["disposition"]
           },
           "then": false
         },
@@ -1358,9 +1215,7 @@
                 "const": "ft.product-journey-review.2026-07-27.initial"
               }
             },
-            "required": [
-              "review_id"
-            ]
+            "required": ["review_id"]
           },
           "then": {
             "properties": {
@@ -1465,13 +1320,7 @@
     },
     "change_record": {
       "type": "object",
-      "required": [
-        "change_id",
-        "catalog_revision",
-        "changed_at_utc",
-        "summary",
-        "source_refs"
-      ],
+      "required": ["change_id", "catalog_revision", "changed_at_utc", "summary", "source_refs"],
       "additionalProperties": false,
       "properties": {
         "change_id": {
@@ -1502,9 +1351,7 @@
                 "const": "change.2026_07_27.1"
               }
             },
-            "required": [
-              "change_id"
-            ]
+            "required": ["change_id"]
           },
           "then": {
             "properties": {

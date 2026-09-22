@@ -215,12 +215,7 @@
       ]
     },
     "proof_status": {
-      "enum": [
-        "proven_predicate_met",
-        "skipped_not_proven",
-        "unavailable",
-        "stale"
-      ]
+      "enum": ["proven_predicate_met", "skipped_not_proven", "unavailable", "stale"]
     },
     "pressure_tier": {
       "enum": [
@@ -318,12 +313,7 @@
     },
     "run_identity": {
       "type": "object",
-      "required": [
-        "run_id",
-        "evidence_level",
-        "artifact_paths",
-        "hardware_predicate"
-      ],
+      "required": ["run_id", "evidence_level", "artifact_paths", "hardware_predicate"],
       "additionalProperties": false,
       "properties": {
         "run_id": {
@@ -347,12 +337,7 @@
         },
         "hardware_predicate": {
           "type": "object",
-          "required": [
-            "logical_cpus",
-            "memory_gib",
-            "target_class",
-            "proof_status"
-          ],
+          "required": ["logical_cpus", "memory_gib", "target_class", "proof_status"],
           "additionalProperties": false,
           "properties": {
             "logical_cpus": {
@@ -733,12 +718,7 @@
     },
     "latency_cohort": {
       "type": "object",
-      "required": [
-        "stage",
-        "stage_name",
-        "certificate_status",
-        "reason_code"
-      ],
+      "required": ["stage", "stage_name", "certificate_status", "reason_code"],
       "additionalProperties": false,
       "properties": {
         "stage": {

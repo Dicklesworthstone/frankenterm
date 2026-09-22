@@ -10,11 +10,7 @@
       "type": "object",
       "additionalProperties": true,
       "required": ["id"],
-      "anyOf": [
-        { "required": ["domain"] },
-        { "required": ["title"] },
-        { "required": ["cwd"] }
-      ],
+      "anyOf": [{ "required": ["domain"] }, { "required": ["title"] }, { "required": ["cwd"] }],
       "properties": {
         "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "domain": { "type": "string", "minLength": 1, "pattern": "\\S" },

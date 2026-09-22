@@ -53,10 +53,7 @@
       "$ref": "#/$defs/agent"
     },
     "thread_id": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "recipients": {
@@ -93,10 +90,7 @@
       "$ref": "#/$defs/state"
     },
     "state_reason": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1,
       "maxLength": 512
     },
@@ -181,12 +175,7 @@
     },
     "agent": {
       "type": "object",
-      "required": [
-        "name",
-        "program",
-        "model",
-        "project_key"
-      ],
+      "required": ["name", "program", "model", "project_key"],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -209,11 +198,7 @@
     },
     "recipients": {
       "type": "object",
-      "required": [
-        "to",
-        "cc",
-        "bcc"
-      ],
+      "required": ["to", "cc", "bcc"],
       "additionalProperties": false,
       "properties": {
         "to": {
@@ -256,16 +241,10 @@
         },
         "body_storage": {
           "type": "string",
-          "enum": [
-            "digest_only",
-            "bounded_markdown"
-          ]
+          "enum": ["digest_only", "bounded_markdown"]
         },
         "body_preview_redacted": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "maxLength": 512
         },
         "body_byte_count": {
@@ -286,22 +265,11 @@
     },
     "importance": {
       "type": "string",
-      "enum": [
-        "low",
-        "normal",
-        "high",
-        "urgent"
-      ]
+      "enum": ["low", "normal", "high", "urgent"]
     },
     "attachment_ref": {
       "type": "object",
-      "required": [
-        "path",
-        "sha256",
-        "byte_count",
-        "content_type",
-        "retention"
-      ],
+      "required": ["path", "sha256", "byte_count", "content_type", "retention"],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -323,18 +291,12 @@
           "maximum": 67108864
         },
         "content_type": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "retention": {
           "type": "string",
-          "enum": [
-            "reference_only",
-            "digest_only"
-          ]
+          "enum": ["reference_only", "digest_only"]
         }
       }
     },
@@ -368,13 +330,7 @@
     },
     "failure_reason": {
       "type": "object",
-      "required": [
-        "class",
-        "summary",
-        "retry_count",
-        "retry_limit",
-        "last_attempt_at"
-      ],
+      "required": ["class", "summary", "retry_count", "retry_limit", "last_attempt_at"],
       "additionalProperties": false,
       "properties": {
         "class": {
@@ -412,11 +368,7 @@
     },
     "operator_decision": {
       "type": "object",
-      "required": [
-        "operator",
-        "decided_at",
-        "reason"
-      ],
+      "required": ["operator", "decided_at", "reason"],
       "additionalProperties": false,
       "properties": {
         "operator": {
@@ -435,12 +387,7 @@
     },
     "replay_receipt": {
       "type": "object",
-      "required": [
-        "dry_run_at",
-        "replayed_at",
-        "delivered_message_id",
-        "failure_summary"
-      ],
+      "required": ["dry_run_at", "replayed_at", "delivered_message_id", "failure_summary"],
       "additionalProperties": false,
       "properties": {
         "dry_run_at": {
@@ -464,17 +411,11 @@
           ]
         },
         "delivered_message_id": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1
         },
         "failure_summary": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "minLength": 1,
           "maxLength": 512
         }
@@ -482,11 +423,7 @@
     },
     "retention": {
       "type": "object",
-      "required": [
-        "retain_until",
-        "automatic_discard",
-        "redaction"
-      ],
+      "required": ["retain_until", "automatic_discard", "redaction"],
       "additionalProperties": false,
       "properties": {
         "retain_until": {
@@ -514,13 +451,7 @@
     },
     "reservation_intent": {
       "type": "object",
-      "required": [
-        "paths",
-        "exclusive",
-        "ttl_seconds",
-        "reason_sha256",
-        "reason_preview_redacted"
-      ],
+      "required": ["paths", "exclusive", "ttl_seconds", "reason_sha256", "reason_preview_redacted"],
       "additionalProperties": false,
       "properties": {
         "paths": {
@@ -542,22 +473,14 @@
           "$ref": "#/$defs/sha256"
         },
         "reason_preview_redacted": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "maxLength": 512
         }
       }
     },
     "beads_fallback": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "action",
-        "comment_sha256",
-        "comment_preview_redacted"
-      ],
+      "required": ["bead_id", "action", "comment_sha256", "comment_preview_redacted"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -566,12 +489,7 @@
         },
         "action": {
           "type": "string",
-          "enum": [
-            "comment_only",
-            "status_transition",
-            "closeout_blocked",
-            "closeout_complete"
-          ]
+          "enum": ["comment_only", "status_transition", "closeout_blocked", "closeout_complete"]
         },
         "comment_sha256": {
           "$ref": "#/$defs/sha256"

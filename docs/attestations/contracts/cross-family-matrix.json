@@ -1,10 +1,7 @@
 {
   "schema_version": 1,
   "bead_id": "ft-tf6g3.46",
-  "proof_category": [
-    "4-conformance",
-    "9-differential"
-  ],
+  "proof_category": ["4-conformance", "9-differential"],
   "sample_workload_class": "deterministic-6-state-cross-product",
   "invariants_doc": "docs/contract-families-cross-invariants.md",
   "invariants_sha256": "782b3bc8ea75fd38d751ae0b30bd21382459df353097722725200a33e20fbcec",

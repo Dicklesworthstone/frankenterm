@@ -129,36 +129,15 @@
     },
     "source_kind": {
       "type": "string",
-      "enum": [
-        "rch",
-        "github_actions",
-        "agent_mail",
-        "beads",
-        "git",
-        "manual",
-        "fixture"
-      ]
+      "enum": ["rch", "github_actions", "agent_mail", "beads", "git", "manual", "fixture"]
     },
     "severity": {
       "type": "string",
-      "enum": [
-        "info",
-        "warning",
-        "blocked",
-        "critical"
-      ]
+      "enum": ["info", "warning", "blocked", "critical"]
     },
     "substrate": {
       "type": "string",
-      "enum": [
-        "rch",
-        "github_actions",
-        "agent_mail",
-        "beads",
-        "git",
-        "package_artifact",
-        "unknown"
-      ]
+      "enum": ["rch", "github_actions", "agent_mail", "beads", "git", "package_artifact", "unknown"]
     },
     "action_kind": {
       "type": "string",
@@ -214,17 +193,11 @@
           "$ref": "#/$defs/evidence_state"
         },
         "collected_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "command_or_api": {
@@ -310,10 +283,7 @@
           "$ref": "#/$defs/evidence_state"
         },
         "updated_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "stale_over_threshold": {
@@ -345,10 +315,7 @@
           "$ref": "#/$defs/severity"
         },
         "expected_owner": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "related_bead_ids": {
           "$ref": "#/$defs/string_array"
@@ -384,28 +351,16 @@
           "$ref": "#/$defs/evidence_state"
         },
         "run_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "url": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "worker_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "artifact_name": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "source_ids": {
           "$ref": "#/$defs/non_empty_string_array"
@@ -441,10 +396,7 @@
           "minLength": 1
         },
         "suggested_command": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "reason_codes": {
           "$ref": "#/$defs/non_empty_string_array"
@@ -456,10 +408,7 @@
     },
     "forbidden_action": {
       "type": "object",
-      "required": [
-        "command_pattern",
-        "reason"
-      ],
+      "required": ["command_pattern", "reason"],
       "additionalProperties": false,
       "properties": {
         "command_pattern": {
@@ -474,12 +423,7 @@
     },
     "citation": {
       "type": "object",
-      "required": [
-        "citation_id",
-        "source_id",
-        "summary",
-        "redacted"
-      ],
+      "required": ["citation_id", "source_id", "summary", "redacted"],
       "additionalProperties": false,
       "properties": {
         "citation_id": {
@@ -502,12 +446,7 @@
     },
     "unavailable_source": {
       "type": "object",
-      "required": [
-        "source_kind",
-        "evidence_state",
-        "reason_codes",
-        "failure_class"
-      ],
+      "required": ["source_kind", "evidence_state", "reason_codes", "failure_class"],
       "additionalProperties": false,
       "properties": {
         "source_kind": {

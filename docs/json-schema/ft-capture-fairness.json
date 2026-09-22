@@ -39,10 +39,7 @@
     },
     "budget": {
       "type": "object",
-      "required": [
-        "max_captures_per_sec",
-        "max_bytes_per_sec"
-      ],
+      "required": ["max_captures_per_sec", "max_bytes_per_sec"],
       "additionalProperties": false,
       "properties": {
         "max_captures_per_sec": {
@@ -75,11 +72,7 @@
     },
     "pass_fail": {
       "type": "object",
-      "required": [
-        "selected_within_permits",
-        "selected_within_ready_set",
-        "no_raw_content"
-      ],
+      "required": ["selected_within_permits", "selected_within_ready_set", "no_raw_content"],
       "additionalProperties": false,
       "properties": {
         "selected_within_permits": {

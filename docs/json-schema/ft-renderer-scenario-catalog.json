@@ -143,10 +143,7 @@
       "items": { "$ref": "#/$defs/driver_canary_definition" }
     },
     "rq_s1_synthetic_substrate": {
-      "oneOf": [
-        { "$ref": "#/$defs/rq_s1_synthetic_substrate" },
-        { "type": "null" }
-      ]
+      "oneOf": [{ "$ref": "#/$defs/rq_s1_synthetic_substrate" }, { "type": "null" }]
     },
     "gesture_authority_map": {
       "type": "array",
@@ -671,10 +668,7 @@
               "items": { "$ref": "#/$defs/ime_composition_segment" }
             },
             "candidate_window_geometry": {
-              "oneOf": [
-                { "$ref": "#/$defs/ime_candidate_window_geometry" },
-                { "type": "null" }
-              ]
+              "oneOf": [{ "$ref": "#/$defs/ime_candidate_window_geometry" }, { "type": "null" }]
             }
           }
         }
@@ -737,10 +731,7 @@
               "items": { "$ref": "#/$defs/accessibility_node_geometry" }
             },
             "caret_rect": {
-              "oneOf": [
-                { "$ref": "#/$defs/pixel_rect" },
-                { "type": "null" }
-              ]
+              "oneOf": [{ "$ref": "#/$defs/pixel_rect" }, { "type": "null" }]
             }
           }
         }
@@ -842,10 +833,7 @@
       "properties": {
         "window_id": { "$ref": "#/$defs/identifier" },
         "tab_id": {
-          "oneOf": [
-            { "$ref": "#/$defs/identifier" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/identifier" }, { "type": "null" }]
         },
         "affected_pane_ids": {
           "type": "array",
@@ -1242,10 +1230,7 @@
       "additionalProperties": false,
       "properties": {
         "stream_id": {
-          "oneOf": [
-            { "$ref": "#/$defs/identifier" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/identifier" }, { "type": "null" }]
         },
         "bytes_per_second": {
           "type": "integer",
@@ -1471,10 +1456,7 @@
         "state_oracle_ref": { "$ref": "#/$defs/repository_ref" },
         "visual_oracle_ref": { "$ref": "#/$defs/repository_ref" },
         "independent_standard_oracle_ref": {
-          "oneOf": [
-            { "$ref": "#/$defs/repository_ref" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/repository_ref" }, { "type": "null" }]
         },
         "accessibility_oracle_ref": { "$ref": "#/$defs/repository_ref" },
         "comparator_policy_refs": {
@@ -1512,7 +1494,13 @@
     },
     "content_decoder": {
       "type": "string",
-      "enum": ["identity", "utf8_validate_v1", "hex_decode_v1", "json_fixture_state_v1", "generator_v1"]
+      "enum": [
+        "identity",
+        "utf8_validate_v1",
+        "hex_decode_v1",
+        "json_fixture_state_v1",
+        "generator_v1"
+      ]
     },
     "content_semantic_kind": {
       "type": "string",
@@ -1692,10 +1680,7 @@
         "authorizes_headless_checkpoint_comparison": { "type": "boolean" },
         "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
         "limitation": {
-          "oneOf": [
-            { "$ref": "#/$defs/nonempty_text" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/nonempty_text" }, { "type": "null" }]
         },
         "tracking_refs": {
           "type": "array",
@@ -1712,10 +1697,7 @@
         "evidence_source_id": { "$ref": "#/$defs/identifier" },
         "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
         "limitation": {
-          "oneOf": [
-            { "$ref": "#/$defs/nonempty_text" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/nonempty_text" }, { "type": "null" }]
         },
         "tracking_refs": {
           "type": "array",
@@ -1797,7 +1779,13 @@
     },
     "foreground_key_event": {
       "type": "object",
-      "required": ["key_event_id", "logical_key", "modifiers", "encoded_bytes_hex", "target_pane_id"],
+      "required": [
+        "key_event_id",
+        "logical_key",
+        "modifiers",
+        "encoded_bytes_hex",
+        "target_pane_id"
+      ],
       "additionalProperties": false,
       "properties": {
         "key_event_id": { "$ref": "#/$defs/identifier" },
@@ -1851,10 +1839,7 @@
         "total_duration_us": { "$ref": "#/$defs/positive_u64" },
         "event_count": { "type": "integer", "minimum": 1, "maximum": 256 },
         "output_stream": {
-          "oneOf": [
-            { "$ref": "#/$defs/output_stream_definition" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/output_stream_definition" }, { "type": "null" }]
         },
         "foreground_key_events": {
           "type": "array",
@@ -1926,12 +1911,7 @@
     },
     "detector_scope": {
       "type": "string",
-      "enum": [
-        "checkpoint_oracle_pair",
-        "interval",
-        "whole_timeline",
-        "all_observed_frames"
-      ]
+      "enum": ["checkpoint_oracle_pair", "interval", "whole_timeline", "all_observed_frames"]
     },
     "detector_contract": {
       "type": "object",
@@ -2069,10 +2049,7 @@
         "injected_phase": { "$ref": "#/$defs/timeline_phase" },
         "bound_detector_id": { "$ref": "#/$defs/checkpoint_detector_id" },
         "required_feature": {
-          "oneOf": [
-            { "$ref": "#/$defs/terminal_feature" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/terminal_feature" }, { "type": "null" }]
         },
         "expected_failure_code": {
           "type": "string",
@@ -2088,10 +2065,7 @@
         "evidence_source_id": { "$ref": "#/$defs/identifier" },
         "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
         "limitation": {
-          "oneOf": [
-            { "$ref": "#/$defs/nonempty_text" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/nonempty_text" }, { "type": "null" }]
         },
         "tracking_refs": {
           "type": "array",
@@ -2248,7 +2222,13 @@
     },
     "observed_boundary_class": {
       "type": "string",
-      "enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]
+      "enum": [
+        "internal_state",
+        "software_present",
+        "metal_drawable",
+        "display_presented",
+        "photon"
+      ]
     },
     "observed_frame_selection": {
       "type": "string",
@@ -2605,7 +2585,13 @@
         },
         {
           "type": "object",
-          "required": ["scope", "overlay_id", "detector_id", "start_checkpoint_id", "end_checkpoint_id"],
+          "required": [
+            "scope",
+            "overlay_id",
+            "detector_id",
+            "start_checkpoint_id",
+            "end_checkpoint_id"
+          ],
           "additionalProperties": false,
           "properties": {
             "scope": { "const": "interval" },
@@ -2795,10 +2781,7 @@
           "items": { "$ref": "#/$defs/requirement_binding" }
         },
         "output_overlap_resize_mode": {
-          "oneOf": [
-            { "$ref": "#/$defs/resize_mode" },
-            { "type": "null" }
-          ]
+          "oneOf": [{ "$ref": "#/$defs/resize_mode" }, { "type": "null" }]
         },
         "configured_steady_quality": { "$ref": "#/$defs/quality_mode" },
         "timeline": {

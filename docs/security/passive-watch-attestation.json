@@ -18,20 +18,14 @@
       "zero outbound mutating IPC per fuzz input",
       "zero non-capture storage writes per fuzz input"
     ],
-    "allowed_actions": [
-      "capture",
-      "pattern_detection",
-      "watch_metadata_write"
-    ],
+    "allowed_actions": ["capture", "pattern_detection", "watch_metadata_write"],
     "forbidden_actions": [
       "outbound_send",
       "outbound_spawn",
       "outbound_close",
       "non_capture_storage_write"
     ],
-    "review_signal_actions": [
-      "other"
-    ]
+    "review_signal_actions": ["other"]
   },
   "artifact_basis": {
     "status": "foundation_slice_attested",

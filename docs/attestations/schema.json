@@ -269,12 +269,7 @@
     },
     "confidenceSummary": {
       "type": "object",
-      "required": [
-        "schema_version",
-        "schema_path",
-        "records",
-        "best_confidence_by_category"
-      ],
+      "required": ["schema_version", "schema_path", "records", "best_confidence_by_category"],
       "additionalProperties": false,
       "properties": {
         "schema_version": { "const": "1.0.0" },
@@ -370,7 +365,13 @@
     },
     "deferredSlot": {
       "type": "object",
-      "required": ["category", "media_type", "produced_by_bead", "deferred_to_bead", "deferred_reason"],
+      "required": [
+        "category",
+        "media_type",
+        "produced_by_bead",
+        "deferred_to_bead",
+        "deferred_reason"
+      ],
       "additionalProperties": false,
       "properties": {
         "category": { "$ref": "#/$defs/category" },
@@ -464,11 +465,7 @@
         "corrected_claim_value": true,
         "retraction_conflict": {
           "type": "object",
-          "required": [
-            "competing_retractions",
-            "selected_by",
-            "superseded_paths"
-          ],
+          "required": ["competing_retractions", "selected_by", "superseded_paths"],
           "additionalProperties": false,
           "properties": {
             "competing_retractions": {
@@ -828,7 +825,12 @@
               "format": "uri"
             }
           },
-          "required": ["method", "sigstore_bundle", "certificate_identity", "certificate_oidc_issuer"]
+          "required": [
+            "method",
+            "sigstore_bundle",
+            "certificate_identity",
+            "certificate_oidc_issuer"
+          ]
         },
         {
           "properties": {

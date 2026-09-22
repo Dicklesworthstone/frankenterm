@@ -191,11 +191,7 @@
           ]
         },
         "claim_delivery": {
-          "enum": [
-            "finalized_after_output_flush",
-            "already_finalized",
-            "finalized_by_competitor"
-          ]
+          "enum": ["finalized_after_output_flush", "already_finalized", "finalized_by_competitor"]
         },
         "event_id": { "type": "integer", "minimum": 1 }
       },
@@ -211,10 +207,7 @@
             }
           },
           "not": {
-            "anyOf": [
-              { "required": ["claim_delivery"] },
-              { "required": ["event_id"] }
-            ]
+            "anyOf": [{ "required": ["claim_delivery"] }, { "required": ["event_id"] }]
           }
         },
         {
@@ -245,10 +238,7 @@
         "terminal": { "const": true },
         "retryable": { "const": true },
         "reason": {
-          "enum": [
-            "delivery_lease_active",
-            "finalization_ownership_lost_after_output_flush"
-          ]
+          "enum": ["delivery_lease_active", "finalization_ownership_lost_after_output_flush"]
         },
         "cursor": { "$ref": "#/$defs/cursor" },
         "cursor_epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
@@ -538,18 +528,11 @@
           ],
           "properties": {
             "reason": {
-              "enum": [
-                "ipc_subscribe_unavailable",
-                "ipc_stream_eof",
-                "ipc_stream_read_failure"
-              ]
+              "enum": ["ipc_subscribe_unavailable", "ipc_stream_eof", "ipc_stream_read_failure"]
             }
           },
           "not": {
-            "anyOf": [
-              { "required": ["missed_count"] },
-              { "required": ["fault_kind"] }
-            ]
+            "anyOf": [{ "required": ["missed_count"] }, { "required": ["fault_kind"] }]
           }
         }
       ],

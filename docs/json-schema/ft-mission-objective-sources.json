@@ -111,40 +111,19 @@
     },
     "source_state": {
       "type": "string",
-      "enum": [
-        "available",
-        "degraded",
-        "unavailable",
-        "stale",
-        "blocked"
-      ]
+      "enum": ["available", "degraded", "unavailable", "stale", "blocked"]
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "stale",
-        "unknown",
-        "not_collected"
-      ]
+      "enum": ["fresh", "stale", "unknown", "not_collected"]
     },
     "evidence_level": {
       "type": "string",
-      "enum": [
-        "live_command",
-        "retained_artifact",
-        "fixture",
-        "manual_note",
-        "not_collected"
-      ]
+      "enum": ["live_command", "retained_artifact", "fixture", "manual_note", "not_collected"]
     },
     "snapshot_payload": {
       "type": "object",
-      "required": [
-        "summary",
-        "counters",
-        "rows"
-      ],
+      "required": ["summary", "counters", "rows"],
       "additionalProperties": false,
       "properties": {
         "summary": {
@@ -154,13 +133,7 @@
         "counters": {
           "type": "object",
           "additionalProperties": {
-            "type": [
-              "integer",
-              "number",
-              "string",
-              "boolean",
-              "null"
-            ]
+            "type": ["integer", "number", "string", "boolean", "null"]
           }
         },
         "rows": {
@@ -173,12 +146,7 @@
     },
     "source_row": {
       "type": "object",
-      "required": [
-        "row_id",
-        "state",
-        "reason_codes",
-        "artifact_paths"
-      ],
+      "required": ["row_id", "state", "reason_codes", "artifact_paths"],
       "additionalProperties": false,
       "properties": {
         "row_id": {
@@ -231,17 +199,11 @@
           "$ref": "#/$defs/freshness_state"
         },
         "collected_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "command_or_api": {
@@ -263,16 +225,10 @@
           "$ref": "#/$defs/string_array"
         },
         "unavailable_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "degraded_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "payload": {
           "$ref": "#/$defs/snapshot_payload"
@@ -284,12 +240,7 @@
     },
     "redaction_policy": {
       "type": "object",
-      "required": [
-        "policy_id",
-        "raw_pane_content_allowed",
-        "secret_material_allowed",
-        "notes"
-      ],
+      "required": ["policy_id", "raw_pane_content_allowed", "secret_material_allowed", "notes"],
       "additionalProperties": false,
       "properties": {
         "policy_id": {

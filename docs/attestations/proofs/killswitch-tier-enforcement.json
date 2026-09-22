@@ -1,17 +1,10 @@
 {
   "schema": "ft.proof.killswitch-tier-enforcement.v1",
   "produced_by_bead": "ft-xxfwy.14",
-  "closes": [
-    "ft-l59nq"
-  ],
+  "closes": ["ft-l59nq"],
   "generator": "crates/frankenterm-core/tests/killswitch_tier_matrix.rs",
   "rule_id": "policy.kill_switch",
-  "tiers": [
-    "disarmed",
-    "soft_stop",
-    "hard_stop",
-    "emergency_halt"
-  ],
+  "tiers": ["disarmed", "soft_stop", "hard_stop", "emergency_halt"],
   "action_kinds": [
     "SendText",
     "SendCtrlC",

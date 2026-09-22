@@ -70,12 +70,7 @@
   "$defs": {
     "agent_mail_state": {
       "type": "string",
-      "enum": [
-        "green",
-        "degraded_read_only",
-        "unavailable",
-        "unknown"
-      ]
+      "enum": ["green", "degraded_read_only", "unavailable", "unknown"]
     },
     "bead_id": {
       "type": "string",
@@ -83,11 +78,7 @@
     },
     "dirty_path": {
       "type": "object",
-      "required": [
-        "path",
-        "status",
-        "category"
-      ],
+      "required": ["path", "status", "category"],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -110,20 +101,12 @@
     },
     "current_checkout": {
       "type": "object",
-      "required": [
-        "git_status_source",
-        "dirty_paths",
-        "shared_tracker_dirty"
-      ],
+      "required": ["git_status_source", "dirty_paths", "shared_tracker_dirty"],
       "additionalProperties": false,
       "properties": {
         "git_status_source": {
           "type": "string",
-          "enum": [
-            "git_status_short",
-            "swarm_tick_fallback",
-            "robot_coordination_risk"
-          ]
+          "enum": ["git_status_short", "swarm_tick_fallback", "robot_coordination_risk"]
         },
         "dirty_paths": {
           "type": "array",
@@ -206,12 +189,7 @@
     },
     "gate_decision": {
       "type": "object",
-      "required": [
-        "state",
-        "replay_allowed",
-        "reason_codes",
-        "explanation"
-      ],
+      "required": ["state", "replay_allowed", "reason_codes", "explanation"],
       "additionalProperties": false,
       "properties": {
         "state": {
@@ -238,13 +216,7 @@
     },
     "in_progress_owner": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "assignee",
-        "updated_at",
-        "stale_over_2h",
-        "owned_paths"
-      ],
+      "required": ["bead_id", "assignee", "updated_at", "stale_over_2h", "owned_paths"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -274,11 +246,7 @@
     },
     "queued_receipt_owner": {
       "type": "object",
-      "required": [
-        "receipt_id",
-        "bead_id",
-        "owned_paths"
-      ],
+      "required": ["receipt_id", "bead_id", "owned_paths"],
       "additionalProperties": false,
       "properties": {
         "receipt_id": {
@@ -305,10 +273,7 @@
     },
     "prerequisite_bead": {
       "type": "object",
-      "required": [
-        "bead_id",
-        "status"
-      ],
+      "required": ["bead_id", "status"],
       "additionalProperties": false,
       "properties": {
         "bead_id": {
@@ -316,12 +281,7 @@
         },
         "status": {
           "type": "string",
-          "enum": [
-            "closed",
-            "open",
-            "blocked",
-            "in_progress"
-          ]
+          "enum": ["closed", "open", "blocked", "in_progress"]
         }
       }
     },
@@ -352,10 +312,7 @@
         },
         "freshness_state": {
           "type": "string",
-          "enum": [
-            "fresh",
-            "stale"
-          ]
+          "enum": ["fresh", "stale"]
         },
         "replay_allowed_before_gate": {
           "type": "boolean"
@@ -364,10 +321,7 @@
     },
     "rch_admission_snapshot": {
       "type": "object",
-      "required": [
-        "state",
-        "selected_worker"
-      ],
+      "required": ["state", "selected_worker"],
       "additionalProperties": false,
       "properties": {
         "state": {
@@ -382,10 +336,7 @@
           ]
         },
         "selected_worker": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": ["string", "null"],
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9._-]+$"
         }

@@ -50,7 +50,13 @@
       "claim_surface": "end_to_end_capture_path",
       "status": "modeled_pending_empirical",
       "stage_source": "LindleyTelemetryModel::documented_end_to_end_capture_default",
-      "required_stages": ["capture", "delta_extract", "storage_write", "pattern_detect", "event_emit"],
+      "required_stages": [
+        "capture",
+        "delta_extract",
+        "storage_write",
+        "pattern_detect",
+        "event_emit"
+      ],
       "pending_reason": "PatternDetection and EventEmission have a deterministic budget-backed service curve, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path"
     },
     {

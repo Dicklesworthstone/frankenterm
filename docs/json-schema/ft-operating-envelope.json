@@ -46,11 +46,7 @@
     },
     "controller_mode": {
       "type": "string",
-      "enum": [
-        "dry_run",
-        "admission_preview",
-        "attestation_preview"
-      ]
+      "enum": ["dry_run", "admission_preview", "attestation_preview"]
     },
     "target_class": {
       "$ref": "#/$defs/target_class"
@@ -123,11 +119,7 @@
       "properties": {
         "profile": {
           "type": "string",
-          "enum": [
-            "developer_laptop",
-            "target_64_core_256g",
-            "fixture"
-          ]
+          "enum": ["developer_laptop", "target_64_core_256g", "fixture"]
         },
         "requested_agent_count": {
           "type": "integer",
@@ -151,13 +143,7 @@
     },
     "input_domains": {
       "type": "object",
-      "required": [
-        "capacity_resource",
-        "rch",
-        "beads",
-        "agent_mail",
-        "git"
-      ],
+      "required": ["capacity_resource", "rch", "beads", "agent_mail", "git"],
       "additionalProperties": false,
       "properties": {
         "capacity_resource": {
@@ -196,34 +182,15 @@
     },
     "source_state": {
       "type": "string",
-      "enum": [
-        "available",
-        "degraded",
-        "unavailable",
-        "stale",
-        "blocked",
-        "not_collected"
-      ]
+      "enum": ["available", "degraded", "unavailable", "stale", "blocked", "not_collected"]
     },
     "freshness_state": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "within_budget",
-        "stale",
-        "unknown",
-        "not_collected"
-      ]
+      "enum": ["fresh", "within_budget", "stale", "unknown", "not_collected"]
     },
     "evidence_level": {
       "type": "string",
-      "enum": [
-        "live_command",
-        "retained_artifact",
-        "fixture",
-        "manual_note",
-        "not_collected"
-      ]
+      "enum": ["live_command", "retained_artifact", "fixture", "manual_note", "not_collected"]
     },
     "proof_state": {
       "type": "string",
@@ -238,30 +205,16 @@
     },
     "redaction_posture": {
       "type": "object",
-      "required": [
-        "pane_content",
-        "secret_material",
-        "notes"
-      ],
+      "required": ["pane_content", "secret_material", "notes"],
       "additionalProperties": false,
       "properties": {
         "pane_content": {
           "type": "string",
-          "enum": [
-            "not_collected",
-            "redacted",
-            "raw_forbidden",
-            "not_applicable"
-          ]
+          "enum": ["not_collected", "redacted", "raw_forbidden", "not_applicable"]
         },
         "secret_material": {
           "type": "string",
-          "enum": [
-            "not_collected",
-            "redacted",
-            "raw_forbidden",
-            "not_applicable"
-          ]
+          "enum": ["not_collected", "redacted", "raw_forbidden", "not_applicable"]
         },
         "notes": {
           "type": "array",
@@ -308,17 +261,11 @@
           "$ref": "#/$defs/freshness_state"
         },
         "collected_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "freshness_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "command_or_api": {
@@ -343,16 +290,10 @@
           "$ref": "#/$defs/reason_codes"
         },
         "unavailable_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "degraded_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "evidence": {
           "type": "array",
@@ -404,14 +345,7 @@
     },
     "evidence_item": {
       "type": "object",
-      "required": [
-        "evidence_id",
-        "category",
-        "state",
-        "subject",
-        "reason_codes",
-        "artifact_paths"
-      ],
+      "required": ["evidence_id", "category", "state", "subject", "reason_codes", "artifact_paths"],
       "additionalProperties": false,
       "properties": {
         "evidence_id": {
@@ -459,35 +393,15 @@
         },
         "outcome": {
           "type": "string",
-          "enum": [
-            "admit",
-            "defer",
-            "degrade",
-            "shed",
-            "block",
-            "wait"
-          ]
+          "enum": ["admit", "defer", "degrade", "shed", "block", "wait"]
         },
         "envelope_tier": {
           "type": "string",
-          "enum": [
-            "green",
-            "yellow",
-            "orange",
-            "red",
-            "black",
-            "unknown"
-          ]
+          "enum": ["green", "yellow", "orange", "red", "black", "unknown"]
         },
         "confidence": {
           "type": "string",
-          "enum": [
-            "proven",
-            "measured",
-            "mixed",
-            "stale",
-            "unavailable"
-          ]
+          "enum": ["proven", "measured", "mixed", "stale", "unavailable"]
         },
         "target_hardware_state": {
           "$ref": "#/$defs/proof_state"
@@ -500,12 +414,7 @@
         },
         "dirty_tree_state": {
           "type": "string",
-          "enum": [
-            "clean",
-            "dirty_non_overlap",
-            "dirty_overlap",
-            "unknown"
-          ]
+          "enum": ["clean", "dirty_non_overlap", "dirty_overlap", "unknown"]
         },
         "max_parallel_agents": {
           "type": "integer",
@@ -554,17 +463,11 @@
           ]
         },
         "starts_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "expires_at_ms": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "max_parallel_agents": {
@@ -641,40 +544,23 @@
       "properties": {
         "missing_signal_behavior": {
           "type": "string",
-          "enum": [
-            "lower_envelope",
-            "block"
-          ]
+          "enum": ["lower_envelope", "block"]
         },
         "stale_signal_behavior": {
           "type": "string",
-          "enum": [
-            "lower_envelope",
-            "block"
-          ]
+          "enum": ["lower_envelope", "block"]
         },
         "contradictory_signal_behavior": {
           "type": "string",
-          "enum": [
-            "lower_envelope",
-            "block"
-          ]
+          "enum": ["lower_envelope", "block"]
         },
         "privacy_redaction_behavior": {
           "type": "string",
-          "enum": [
-            "lower_envelope",
-            "block",
-            "not_applicable"
-          ]
+          "enum": ["lower_envelope", "block", "not_applicable"]
         },
         "target_hardware_gap_behavior": {
           "type": "string",
-          "enum": [
-            "defer_target_class_claim",
-            "lower_envelope",
-            "not_applicable"
-          ]
+          "enum": ["defer_target_class_claim", "lower_envelope", "not_applicable"]
         },
         "reason_codes": {
           "$ref": "#/$defs/reason_codes"
@@ -721,12 +607,7 @@
     },
     "redaction_policy": {
       "type": "object",
-      "required": [
-        "policy_id",
-        "raw_pane_content_allowed",
-        "secret_material_allowed",
-        "notes"
-      ],
+      "required": ["policy_id", "raw_pane_content_allowed", "secret_material_allowed", "notes"],
       "additionalProperties": false,
       "properties": {
         "policy_id": {

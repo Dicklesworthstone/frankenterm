@@ -30,13 +30,7 @@
     }
   },
   "report_shape": {
-    "glyph_key_fields": [
-      "scenario_id",
-      "glyph",
-      "font_family",
-      "font_size_px",
-      "render_backend"
-    ],
+    "glyph_key_fields": ["scenario_id", "glyph", "font_family", "font_size_px", "render_backend"],
     "per_glyph_fields": [
       "ssim",
       "h0_bottleneck",

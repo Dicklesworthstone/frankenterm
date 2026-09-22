@@ -86,20 +86,11 @@
   "$defs": {
     "inventory_status": {
       "type": "string",
-      "enum": [
-        "complete",
-        "partial",
-        "telemetry_gap",
-        "blocked"
-      ]
+      "enum": ["complete", "partial", "telemetry_gap", "blocked"]
     },
     "freshness": {
       "type": "string",
-      "enum": [
-        "fresh",
-        "stale",
-        "missing"
-      ]
+      "enum": ["fresh", "stale", "missing"]
     },
     "pressure_reason": {
       "type": "string",
@@ -142,11 +133,7 @@
       "properties": {
         "source_status": {
           "type": "string",
-          "enum": [
-            "retained_complete",
-            "retained_partial",
-            "telemetry_gap"
-          ]
+          "enum": ["retained_complete", "retained_partial", "telemetry_gap"]
         },
         "commands": {
           "type": "array",
@@ -293,10 +280,7 @@
           "minLength": 1
         },
         "host_label": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "telemetry_status": {
           "$ref": "#/$defs/freshness"
@@ -373,39 +357,22 @@
         },
         "status": {
           "type": "string",
-          "enum": [
-            "ok",
-            "warning",
-            "critical",
-            "unavailable"
-          ]
+          "enum": ["ok", "warning", "critical", "unavailable"]
         },
         "available_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "used_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "capacity_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "used_percent": {
-          "type": [
-            "number",
-            "null"
-          ],
+          "type": ["number", "null"],
           "minimum": 0,
           "maximum": 100
         },
@@ -451,11 +418,7 @@
         },
         "scan_kind": {
           "type": "string",
-          "enum": [
-            "target_shallow",
-            "tmp_shallow",
-            "project_du_bounded"
-          ]
+          "enum": ["target_shallow", "tmp_shallow", "project_du_bounded"]
         },
         "depth_limit": {
           "type": "integer",
@@ -467,11 +430,7 @@
         },
         "timeout_state": {
           "type": "string",
-          "enum": [
-            "complete",
-            "partial_timeout",
-            "not_run"
-          ]
+          "enum": ["complete", "partial_timeout", "not_run"]
         },
         "partial_output": {
           "type": "boolean"
@@ -489,26 +448,14 @@
         },
         "status": {
           "type": "string",
-          "enum": [
-            "ok",
-            "warning",
-            "critical",
-            "timeout",
-            "unavailable"
-          ]
+          "enum": ["ok", "warning", "critical", "timeout", "unavailable"]
         },
         "total_bytes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "entry_count": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "pressure_reason": {

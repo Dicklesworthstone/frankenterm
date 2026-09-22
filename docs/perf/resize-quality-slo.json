@@ -380,9 +380,7 @@
   },
   "attestation_publishing": {
     "status": "deferred",
-    "blocked_by": [
-      "BR-RC-FOUNDATION.G3.1 (attestation graph schema + signing pipeline)"
-    ],
+    "blocked_by": ["BR-RC-FOUNDATION.G3.1 (attestation graph schema + signing pipeline)"],
     "design": {
       "per_release_artifact": "perf/resize-quality-slo.<version>.json",
       "per_slo_fields": ["pass", "fail", "degraded", "measurement_evidence_path"],

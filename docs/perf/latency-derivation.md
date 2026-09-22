@@ -278,8 +278,32 @@ owned mux pane through `WeztermClient::get_text_with_cx`, extracts deltas with
 `PaneCursor::capture_snapshot` and a 4096-byte overlap window, and submits
 ten concurrent `StorageHandle::append_segment_with_cx` requests per burst.
 The storage duration includes waiting for the other captures in the burst.
-It exercises the production grouped writer; it does not observe or certify
-the number of requests in each physical SQLite transaction.
+It exercises the production grouped writer. Retained stderr contains
+`append_transaction_result` records with process-local `transaction_id`,
+`attempted_members`, `verified_committed` and `elapsed_ns`, and
+`append_transaction_member` records with the same ID plus `pane_id`,
+`sequence` and `segment_id`. Join members to the observation's sequence in
+the owned pane to determine the actual verified physical transaction groups.
+The producer requires these trace events to be compiled in. Ten concurrent
+requests do not certify a ten-member transaction: grouping must be observed
+from the retained records. A verified commit is not power-loss durability proof.
+
+Transaction elapsed time covers the verified transaction call, excluding caller
+queueing, mirror publication and reply delivery. Observation timestamps separate
+intentional extraction-to-submit batch waiting from submit-to-completion time;
+the latter includes those surrounding operations as well as the transaction.
+All durations are wall-clock, not CPU measurements. Mux phase traces and poll
+read/wait totals provide further attribution, with diagnostic overhead retained.
+
+`measurement.held_out_service_violations` reports each stage's total violating
+departure cuts, maximum deficit in events, and at most eight samples ordered by
+departure time and sequence. Samples include the cut time, completed and required
+departure counts, the departing sequence, stage timestamps, poll totals and the
+timing components above. Cuts use departure minus 1 ns; simultaneous departures
+repeat the same cut, matching the acceptance check. The sequence identifies the
+cut witness, not an individually attributable service debt. Counts and maximum
+deficits include omitted samples; `samples_truncated` makes the output bound
+explicit. These diagnostics do not change calibration or acceptance.
 
 The producer freezes its model after 1,000 calibration requests, then records
 1,000 held-out requests. It fits aggregate arrival/departure envelopes over a
