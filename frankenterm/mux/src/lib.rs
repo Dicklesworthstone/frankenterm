@@ -32131,6 +32131,47 @@ mod tests {
 
     #[test]
     fn synchronized_output_preserves_order_across_scheduler_saturation() {
+        const CHILD: &str = "FT_ISOLATED_SYNCHRONIZED_OUTPUT_SATURATION";
+        const TEST: &str = "tests::synchronized_output_preserves_order_across_scheduler_saturation";
+        if std::env::var_os(CHILD).is_none() {
+            // The scheduler is process-global. MUX_TEST_LOCK excludes other
+            // test bodies, but cannot stop their already-started background
+            // workers from enqueueing onto this newly installed scheduler.
+            // Own the whole process so zero queued work proves this event
+            // path's contract rather than the rest of the suite's quiescence.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    assert!(
+                        output.status.success(),
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "synchronized-output subprocess timed out: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         let _guard = global_test_lock();
         Mux::shutdown();
         let mux = Arc::new(Mux::new(None));
@@ -32156,6 +32197,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
         let events = [
             SynchronizedOutputEvent::Depth {
                 outcome: SynchronizedOutputDepthOutcome::Opened { new_depth: 1 },

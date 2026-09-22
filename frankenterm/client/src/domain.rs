@@ -7362,6 +7362,138 @@ mod tests {
     }
 
     #[test]
+    fn three_tab_snapshot_preserves_precreated_window_across_mixed_dpi_normalization() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let domain_id = 91_027;
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "mixed-dpi-snapshot-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let (client, peer) = Client::new_test_client_with_rpc_peer(Some(domain_id), config);
+        let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
+        let _domain = register_test_client_domain(&mux, &inner);
+        let window = mux.new_empty_window(Some("default".to_string()), None);
+        let window_id = *window;
+        let high_dpi = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 960,
+            pixel_height: 648,
+            dpi: 144,
+        };
+        let low_dpi = TerminalSize {
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 0,
+            ..high_dpi
+        };
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("fixture must contain one leaf");
+        };
+        listing.tabs.clear();
+        listing.tab_titles.clear();
+        for offset in 0..3 {
+            let mut entry = template.clone();
+            entry.tab_id += offset;
+            entry.pane_id += offset;
+            entry.size = if offset == 1 { low_dpi } else { high_dpi };
+            listing.tabs.push(PaneNode::Leaf(entry));
+            listing.tab_titles.push(format!("remote tab {offset}"));
+        }
+        let apply = |panes, preferred_window| {
+            let _application = inner.begin_remote_metadata_application().unwrap();
+            ClientDomain::process_topology_snapshot(
+                &mux,
+                Arc::clone(&inner),
+                RpcTopologySnapshot::Current {
+                    session_incarnation: MuxSessionIncarnation::from_bytes([0x93; 16]),
+                    panes,
+                },
+                preferred_window,
+            )
+            .expect("mixed-DPI snapshot must retain exact attachment authority");
+        };
+        apply(listing.clone(), Some(window_id));
+        let tabs = (0..3)
+            .map(|offset| {
+                mux.get_tab(
+                    inner
+                        .remote_to_local_tab_id(template.tab_id + offset)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let panes = (0..3)
+            .map(|offset| {
+                mux.get_pane(
+                    inner
+                        .remote_to_local_pane_id(&mux, template.pane_id + offset)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (offset, tab) in tabs.iter().enumerate() {
+            assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(window_id));
+            assert_eq!(tab.get_size(), if offset == 1 { low_dpi } else { high_dpi });
+        }
+        mux.activate_tab_exact_in_window(window_id, &tabs[2], false)
+            .expect("activate third attached tab");
+        while executor.try_tick().unwrap() {}
+        for _ in 0..3 {
+            assert!(matches!(
+                promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
+                codec::Pdu::SetPalette(_)
+            ));
+        }
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty());
+
+        // The observed bridge changed B's pixels and DPI, keeping 80x24 cells.
+        tabs[1].resize(high_dpi);
+        assert!(matches!(
+            promise::spawn::block_on(peer.respond_next_unit()).unwrap(),
+            codec::Pdu::Resize(resize) if resize.size == high_dpi
+        ));
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty());
+        let PaneNode::Leaf(second) = &mut listing.tabs[1] else {
+            panic!("second tab must remain a leaf");
+        };
+        second.size = high_dpi;
+        for _ in 0..2 {
+            apply(listing.clone(), None);
+            while executor.try_tick().unwrap() {}
+            assert!(peer.is_empty(), "snapshot must not echo a resize command");
+            for offset in 0..3 {
+                let tab = mux
+                    .get_tab(
+                        inner
+                            .remote_to_local_tab_id(template.tab_id + offset)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let pane = mux
+                    .get_pane(
+                        inner
+                            .remote_to_local_pane_id(&mux, template.pane_id + offset)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert!(Arc::ptr_eq(&tab, &tabs[offset]));
+                assert!(Arc::ptr_eq(&pane, &panes[offset]));
+                assert_eq!(mux.window_containing_tab(tab.tab_id()), Some(window_id));
+                assert_eq!(tab.get_size(), high_dpi);
+            }
+        }
+    }
+
+    #[test]
     fn stale_legacy_topology_snapshot_preserves_newer_local_geometry() {
         assert_stale_topology_snapshot_preserves_geometry(false, 1);
     }

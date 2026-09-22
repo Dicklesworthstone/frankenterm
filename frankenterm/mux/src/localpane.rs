@@ -2742,7 +2742,7 @@ impl Pane for LocalPane {
             let range = range.start.max(history.start)..range.end.min(history.end);
             let limit = limit.map_or(MAX_RESULTS, |limit| (limit as usize).min(MAX_RESULTS));
             let mut results = Vec::new();
-            let mut unique = HashMap::new();
+            let mut unique = SearchMatchSet::default();
             let mut source_witness = None;
             let mut first = range.start;
             while first < range.end && results.len() < limit {
@@ -2759,6 +2759,7 @@ impl Pane for LocalPane {
                 let terminal = Arc::clone(&self.terminal);
                 let requested = first..end;
                 let worker_pattern = pattern.clone();
+                let worker_history = history.clone();
                 let remaining = limit - results.len();
                 let worker = permit.start(
                     move || worker_cancel.load(Ordering::Acquire),
@@ -2800,8 +2801,8 @@ impl Pane for LocalPane {
                                 worker_pattern,
                                 requested,
                                 remaining,
-                                read.first_row(),
-                                &lines,
+                                (read.first_row(), &lines),
+                                &worker_history,
                                 &mut unique,
                                 &matcher_cancel,
                             )?;
@@ -2867,13 +2868,36 @@ impl Pane for LocalPane {
 #[error("search layout refreshed")]
 struct SearchLayoutRefreshed;
 
+#[derive(Default)]
+struct SearchMatchSet {
+    values: HashMap<String, usize>,
+    retained_bytes: usize,
+}
+
+impl SearchMatchSet {
+    fn id_for(&mut self, text: &str) -> anyhow::Result<usize> {
+        if let Some(id) = self.values.get(text) {
+            return Ok(*id);
+        }
+        let bytes = self
+            .retained_bytes
+            .checked_add(text.len())
+            .filter(|bytes| *bytes <= frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("search unique match text exceeds memory budget"))?;
+        let id = self.values.len();
+        self.values.insert(text.to_owned(), id);
+        self.retained_bytes = bytes;
+        Ok(id)
+    }
+}
+
 fn search_owned_lines(
     pattern: Pattern,
     range: Range<StableRowIndex>,
     limit: usize,
-    first_row: StableRowIndex,
-    physical: &[&Line],
-    uniq_matches: &mut HashMap<String, usize>,
+    (first_row, physical): (StableRowIndex, &[&Line]),
+    history: &Range<StableRowIndex>,
+    uniq_matches: &mut SearchMatchSet,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<Vec<SearchResult>> {
     enum CompiledPattern {
@@ -2893,98 +2917,136 @@ fn search_owned_lines(
 
     let mut results = vec![];
     let folded = matches!(pattern, CompiledPattern::CaseInSensitiveString(_));
-    let mut regex_error = None;
-    search_logical_lines(first_row, physical, &range, |sr, lines| {
-        if results.len() >= limit || cancelled.load(Ordering::Acquire) {
-            // We've reach the limit, stop iteration.
-            return false;
-        }
-
-        if lines.is_empty() {
-            // Nothing to do on this iteration, carry on with the next.
-            return true;
-        }
-        let haystack = if lines.len() == 1 {
-            lines[0].as_str()
-        } else {
-            let mut s = String::new();
-            for line in lines {
-                s.push_str(&line.as_str());
+    let mut match_error: Option<anyhow::Error> = None;
+    search_logical_lines(
+        first_row,
+        physical,
+        &range,
+        history,
+        cancelled,
+        |sr, lines| {
+            if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+                // We've reach the limit, stop iteration.
+                return false;
             }
-            Cow::Owned(s)
-        };
-        let stable_idx = sr.start;
 
-        if haystack.is_empty() {
-            return true;
-        }
-
-        let haystack = match &pattern {
-            CompiledPattern::CaseInSensitiveString(_) => Cow::Owned(haystack.to_lowercase()),
-            _ => haystack,
-        };
-        let mut coords = None;
-
-        match &pattern {
-            CompiledPattern::CaseInSensitiveString(s) | CompiledPattern::CaseSensitiveString(s) => {
-                for (idx, s) in haystack.match_indices(s) {
-                    if results.len() >= limit || cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    found_match(
-                        s,
-                        idx,
-                        lines,
-                        stable_idx,
-                        uniq_matches,
-                        &mut coords,
-                        &mut results,
-                        &range,
-                        folded,
-                    );
+            if lines.is_empty() {
+                // Nothing to do on this iteration, carry on with the next.
+                return true;
+            }
+            // Bound concatenation, case-fold expansion and the lazily allocated
+            // coordinate map together, before allocating matcher scratch space.
+            let mut haystack_bytes = 0usize;
+            let mut scratch_bytes = 0usize;
+            for line in lines {
+                if cancelled.load(Ordering::Acquire) {
+                    return false;
+                }
+                let bytes = line.as_str().len();
+                let bounded = (|| {
+                    haystack_bytes = haystack_bytes.checked_add(bytes)?;
+                    scratch_bytes = scratch_bytes
+                        .checked_add(bytes.checked_mul(if folded { 4 } else { 2 })?)?
+                        .checked_add(line.len().checked_mul(2 * std::mem::size_of::<Coord>())?)?;
+                    (scratch_bytes <= frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES)
+                        .then_some(())
+                })();
+                if bounded.is_none() {
+                    match_error = Some(anyhow::anyhow!(
+                        "search logical group exceeds matcher memory budget"
+                    ));
+                    return false;
                 }
             }
-            CompiledPattern::Regex(re) => {
-                // Allow for the regex to contain captures
-                for capture_res in re.captures_iter(&*haystack) {
-                    if results.len() >= limit || cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let c = match capture_res {
-                        Ok(c) => c,
-                        Err(error) => {
-                            regex_error = Some(error);
+            let haystack = if lines.len() == 1 {
+                lines[0].as_str()
+            } else {
+                let mut s = String::with_capacity(haystack_bytes);
+                for line in lines {
+                    s.push_str(&line.as_str());
+                }
+                Cow::Owned(s)
+            };
+            let stable_idx = sr.start;
+
+            if haystack.is_empty() {
+                return true;
+            }
+
+            let haystack = match &pattern {
+                CompiledPattern::CaseInSensitiveString(_) => Cow::Owned(haystack.to_lowercase()),
+                _ => haystack,
+            };
+            let mut coords = None;
+
+            match &pattern {
+                CompiledPattern::CaseInSensitiveString(s)
+                | CompiledPattern::CaseSensitiveString(s) => {
+                    for (idx, s) in haystack.match_indices(s) {
+                        if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Err(error) = found_match(
+                            s,
+                            idx,
+                            lines,
+                            stable_idx,
+                            uniq_matches,
+                            &mut coords,
+                            &mut results,
+                            &range,
+                            folded,
+                        ) {
+                            match_error = Some(error);
                             return false;
                         }
-                    };
-                    {
-                        // Look for the captures in reverse order, as index==0 is
-                        // the whole matched string.  We can't just call
-                        // `c.iter().rev()` as the capture iterator isn't double-ended.
-                        for idx in (0..c.len()).rev() {
-                            if let Some(m) = c.get(idx) {
-                                found_match(
-                                    m.as_str(),
-                                    m.start(),
-                                    lines,
-                                    stable_idx,
-                                    uniq_matches,
-                                    &mut coords,
-                                    &mut results,
-                                    &range,
-                                    folded,
-                                );
-                                break;
+                    }
+                }
+                CompiledPattern::Regex(re) => {
+                    // Allow for the regex to contain captures
+                    for capture_res in re.captures_iter(&*haystack) {
+                        if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let c = match capture_res {
+                            Ok(c) => c,
+                            Err(error) => {
+                                match_error = Some(error.into());
+                                return false;
+                            }
+                        };
+                        {
+                            // Look for the captures in reverse order, as index==0 is
+                            // the whole matched string.  We can't just call
+                            // `c.iter().rev()` as the capture iterator isn't double-ended.
+                            for idx in (0..c.len()).rev() {
+                                if let Some(m) = c.get(idx) {
+                                    if let Err(error) = found_match(
+                                        m.as_str(),
+                                        m.start(),
+                                        lines,
+                                        stable_idx,
+                                        uniq_matches,
+                                        &mut coords,
+                                        &mut results,
+                                        &range,
+                                        folded,
+                                    ) {
+                                        match_error = Some(error);
+                                        return false;
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Keep iterating
-        true
-    });
+            // Keep iterating
+            results.len() < limit
+        },
+    )?;
 
     #[derive(Copy, Clone, Debug)]
     struct Coord {
@@ -2999,40 +3061,33 @@ fn search_owned_lines(
         byte_idx: usize,
         lines: &[&Line],
         stable_idx: StableRowIndex,
-        uniq_matches: &mut HashMap<String, usize>,
+        uniq_matches: &mut SearchMatchSet,
         coords: &mut Option<Vec<Coord>>,
         results: &mut Vec<SearchResult>,
         range: &Range<StableRowIndex>,
         folded: bool,
-    ) {
+    ) -> anyhow::Result<()> {
         // Zero-width regex alternatives are not selectable text. Do not let
         // them exhaust the result budget before a later nonempty match.
         if text.is_empty() {
-            return;
+            return Ok(());
         }
         if coords.is_none() {
             coords.replace(make_coords(lines, stable_idx, folded));
         }
         let Some(coords) = coords.as_ref() else {
-            return;
+            return Ok(());
         };
         if coords.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let (start_x, start_y) = haystack_idx_to_coord(byte_idx, coords);
+        let (start_x, start_y) = haystack_idx_to_coord(byte_idx, coords, false);
         if !range.contains(&start_y) {
-            return;
+            return Ok(());
         }
-        let match_id = match uniq_matches.get(text).copied() {
-            Some(id) => id,
-            None => {
-                let id = uniq_matches.len();
-                uniq_matches.insert(text.to_owned(), id);
-                id
-            }
-        };
-        let (end_x, end_y) = haystack_idx_to_coord(byte_idx + text.len(), coords);
+        let match_id = uniq_matches.id_for(text)?;
+        let (end_x, end_y) = haystack_idx_to_coord(byte_idx + text.len(), coords, true);
         results.push(SearchResult {
             start_x,
             start_y,
@@ -3040,6 +3095,7 @@ fn search_owned_lines(
             end_y,
             match_id,
         });
+        Ok(())
     }
 
     fn make_coords(lines: &[&Line], stable_row: StableRowIndex, folded: bool) -> Vec<Coord> {
@@ -3071,9 +3127,18 @@ fn search_owned_lines(
         coords
     }
 
-    fn haystack_idx_to_coord(idx: usize, coords: &[Coord]) -> (usize, StableRowIndex) {
+    fn haystack_idx_to_coord(
+        idx: usize,
+        coords: &[Coord],
+        is_end: bool,
+    ) -> (usize, StableRowIndex) {
         let c = match coords.binary_search_by(|ele| ele.byte_idx.cmp(&idx)) {
-            Ok(index) | Err(index) => index,
+            Ok(index) => index,
+            // A Unicode match can start inside one displayed grapheme (or
+            // inside its case-fold expansion). Select that containing cell;
+            // the exclusive end still rounds up to include the entire cell.
+            Err(index) if !is_end => index.saturating_sub(1),
+            Err(index) => index,
         };
         let coord = coords.get(c).map(|c| *c).unwrap_or_else(|| {
             let Some(last) = coords.last() else {
@@ -3092,8 +3157,8 @@ fn search_owned_lines(
         (coord.grapheme_idx, coord.stable_row)
     }
 
-    if let Some(error) = regex_error {
-        return Err(error.into());
+    if let Some(error) = match_error {
+        return Err(error);
     }
     anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
     results.retain(|result| range.contains(&result.start_y));
@@ -3105,34 +3170,40 @@ fn search_logical_lines(
     first: StableRowIndex,
     physical: &[&Line],
     requested: &Range<StableRowIndex>,
+    history: &Range<StableRowIndex>,
+    cancelled: &AtomicBool,
     mut visit: impl FnMut(Range<StableRowIndex>, &[&Line]) -> bool,
-) {
+) -> anyhow::Result<()> {
     let mut start = usize::try_from(requested.start.saturating_sub(first))
         .unwrap_or(usize::MAX)
         .min(physical.len());
-    let mut context = 0usize;
     while start > 0 && physical[start - 1].last_cell_was_wrapped() {
-        let cells = physical[start - 1].len().max(1);
-        if context.saturating_add(cells) > 1024 {
-            break;
-        }
-        context += cells;
+        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
         start -= 1;
     }
+    // A match can cross any physical row boundary. Splitting a logical line
+    // at an arbitrary cell count loses literals and changes regex anchors.
+    // Hydration already bounds rows and payload; if its context is incomplete,
+    // refuse rather than report an authoritative empty or partial result.
+    anyhow::ensure!(
+        start != 0 || first == history.start || physical.is_empty(),
+        "search logical group exceeds captured prefix context"
+    );
     while start < physical.len() && first.saturating_add(start as StableRowIndex) < requested.end {
         let mut end = start;
-        let mut cells = 0usize;
         while end < physical.len() {
-            let count = physical[end].len().max(1);
-            if end > start && cells.saturating_add(count) > 1024 {
-                break;
-            }
-            cells = cells.saturating_add(count);
+            anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
             end += 1;
             if !physical[end - 1].last_cell_was_wrapped() {
                 break;
             }
         }
+        anyhow::ensure!(
+            end < physical.len()
+                || !physical[end - 1].last_cell_was_wrapped()
+                || first.saturating_add(end as StableRowIndex) == history.end,
+            "search logical group exceeds captured suffix context"
+        );
         let rows = first.saturating_add(start as StableRowIndex)
             ..first.saturating_add(end as StableRowIndex);
         if !visit(rows, &physical[start..end]) {
@@ -3140,6 +3211,7 @@ fn search_logical_lines(
         }
         start = end;
     }
+    Ok(())
 }
 
 struct LocalPaneDCSHandler {
@@ -8060,6 +8132,121 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!((matches[0].start_y, matches[0].start_x), (999, 2));
         assert_eq!((matches[0].end_y, matches[0].end_x), (1001, 0));
+        for rows in [300, 2] {
+            for (prefix, tail, literal, start_x) in [
+                (1023, "XY", "XY", 3),
+                (1022, "界Y", "界Y", 2),
+                (1023, "İY", "İY", 3),
+            ] {
+                let sink = Arc::new(ColdResizeTestSink::default());
+                let mut term = Terminal::new(
+                    term_size(4, rows),
+                    Arc::new(ColdResizeTestConfig(Arc::clone(&sink))),
+                    "FrankenTerm",
+                    "search-logical-boundary",
+                    Box::new(Vec::new()),
+                );
+                term.advance_bytes(format!("{}{}", "a".repeat(prefix), tail).as_bytes());
+                if rows == 2 {
+                    assert!(sink.retained_scrollback_rows() > 0);
+                }
+                *pane.terminal.lock() = term;
+                for pattern in [
+                    Pattern::CaseSensitiveString(literal.into()),
+                    Pattern::CaseInSensitiveString(literal.to_lowercase()),
+                    Pattern::Regex(literal.into()),
+                ] {
+                    let found = promise::spawn::block_on(pane.search(
+                        pattern,
+                        StableRowIndex::MIN..StableRowIndex::MAX,
+                        Some(10),
+                    ))
+                    .unwrap();
+                    assert_eq!(found.len(), 1);
+                    assert_eq!((found[0].start_y, found[0].start_x), (255, start_x));
+                    assert_eq!((found[0].end_y, found[0].end_x), (256, 1));
+                }
+                if rows == 2 {
+                    assert!(sink.payload_reads.load(Ordering::Acquire) > 0);
+                }
+            }
+        }
+        let mut term = Terminal::new(
+            term_size(4, 1100),
+            Arc::new(ColdResizeTestConfig(
+                Arc::new(ColdResizeTestSink::default()),
+            )),
+            "FrankenTerm",
+            "search-overlapping-chunk-context",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes("a".repeat(4003).as_bytes());
+        *pane.terminal.lock() = term;
+        let found = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("aaa".into()),
+            0..1100,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found.len(), 4003 / 3);
+        for (index, found) in found.iter().enumerate() {
+            let start = index * 3;
+            let end = start + 3;
+            assert_eq!(
+                (found.start_y, found.start_x),
+                ((start / 4) as StableRowIndex, start % 4)
+            );
+            assert_eq!(
+                (found.end_y, found.end_x),
+                ((end / 4) as StableRowIndex, end % 4)
+            );
+        }
+        let anchored =
+            promise::spawn::block_on(pane.search(Pattern::Regex("^aaa".into()), 0..1100, None))
+                .unwrap();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "chunk overlap must not create a regex line start"
+        );
+        assert_eq!((anchored[0].start_y, anchored[0].start_x), (0, 0));
+        // An arbitrarily long wrapped group can exceed the bounded captured
+        // context. Both literal and regex search must refuse completeness,
+        // rather than silently return no match or reinterpret regex anchors.
+        let mut term = Terminal::new(
+            term_size(4, 4100),
+            Arc::new(ColdResizeTestConfig(
+                Arc::new(ColdResizeTestSink::default()),
+            )),
+            "FrankenTerm",
+            "search-incomplete-group",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes(b"FOUND\r\n");
+        term.advance_bytes(format!("{}XY", "a".repeat(14_000)).as_bytes());
+        *pane.terminal.lock() = term;
+        for pattern in [
+            Pattern::CaseSensitiveString("FOUND".into()),
+            Pattern::Regex("FOUND".into()),
+        ] {
+            let found =
+                promise::spawn::block_on(pane.search(pattern.clone(), 0..4100, Some(1))).unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "a satisfied limit must stop before unrelated incomplete context"
+            );
+            assert_eq!((found[0].start_y, found[0].start_x), (0, 0));
+            assert!(promise::spawn::block_on(pane.search(pattern, 0..4100, Some(2))).is_err());
+        }
+        for pattern in [
+            Pattern::CaseSensitiveString("XY".into()),
+            Pattern::Regex("XY".into()),
+        ] {
+            let error = promise::spawn::block_on(pane.search(pattern, 0..4100, Some(10)))
+                .expect_err("truncated logical context must not claim complete search");
+            assert!(error.to_string().contains("captured suffix context"));
+        }
         let mut term = Terminal::new(
             term_size(4, 2),
             Arc::new(ColdResizeTestConfig(
@@ -8095,6 +8282,97 @@ mod tests {
                 .unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!((matches[0].start_x, matches[0].end_x), (2, 4));
+        let mut term = Terminal::new(
+            term_size(4, 2),
+            Arc::new(ColdResizeTestConfig(
+                Arc::new(ColdResizeTestSink::default()),
+            )),
+            "FrankenTerm",
+            "search-combining-grapheme",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes("e\u{301}Z".as_bytes());
+        *pane.terminal.lock() = term;
+        for pattern in [
+            Pattern::CaseSensitiveString("\u{301}".into()),
+            Pattern::Regex("\u{301}".into()),
+        ] {
+            let found = promise::spawn::block_on(pane.search(pattern, 0..2, Some(10))).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!((found[0].start_y, found[0].start_x), (0, 0));
+            assert_eq!((found[0].end_y, found[0].end_x), (0, 1));
+        }
+    }
+
+    #[test]
+    fn search_unique_match_budget_is_retained_across_chunks() {
+        let mut unique = SearchMatchSet::default();
+        let retained = "x".repeat(frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES - 1);
+        assert_eq!(unique.id_for(&retained).unwrap(), 0);
+        drop(retained);
+        let lines: Vec<_> = ["A", "B", "A"]
+            .iter()
+            .map(|text| Line::from_text(text, &termwiz::cell::CellAttributes::blank(), 1, None))
+            .collect();
+        let physical: Vec<_> = lines.iter().collect();
+        let cancelled = AtomicBool::new(false);
+        let first = search_owned_lines(
+            Pattern::Regex(".".into()),
+            0..1,
+            1,
+            (0, &physical),
+            &(0..3),
+            &mut unique,
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            unique.retained_bytes,
+            frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES
+        );
+        let error = search_owned_lines(
+            Pattern::Regex(".".into()),
+            1..2,
+            1,
+            (0, &physical),
+            &(0..3),
+            &mut unique,
+            &cancelled,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unique match text exceeds memory budget"));
+        assert_eq!(unique.values.len(), 2);
+        let repeated = search_owned_lines(
+            Pattern::Regex(".".into()),
+            2..3,
+            1,
+            (0, &physical),
+            &(0..3),
+            &mut unique,
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].match_id, first[0].match_id);
+        assert_eq!((repeated[0].start_y, repeated[0].start_x), (2, 0));
+        assert_eq!(
+            unique.retained_bytes,
+            frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES
+        );
+        cancelled.store(true, Ordering::Release);
+        assert!(search_owned_lines(
+            Pattern::Regex(".".into()),
+            2..3,
+            1,
+            (0, &physical),
+            &(0..3),
+            &mut unique,
+            &cancelled
+        )
+        .is_err());
     }
 
     fn cold_resize_read_all(pane: &LocalPane) -> anyhow::Result<String> {
@@ -11016,7 +11294,7 @@ mod tests {
                     term.screen()
                         .selection_anchor_read_ranges(&anchors[0], term.current_seqno())
                         .unwrap(),
-                    Some(vec![StableRowIndex::MIN..StableRowIndex::MIN + 1]),
+                    Some(std::iter::once(StableRowIndex::MIN..StableRowIndex::MIN + 1).collect()),
                     "output must invalidate the index and require a one-row bootstrap"
                 );
             }
@@ -11085,7 +11363,10 @@ mod tests {
                             term.screen()
                                 .selection_anchor_read_ranges(&anchors[0], term.current_seqno())
                                 .unwrap(),
-                            Some(vec![StableRowIndex::MIN..StableRowIndex::MIN + 1])
+                            Some(
+                                std::iter::once(StableRowIndex::MIN..StableRowIndex::MIN + 1)
+                                    .collect(),
+                            )
                         );
                         assert!(term
                             .screen()
