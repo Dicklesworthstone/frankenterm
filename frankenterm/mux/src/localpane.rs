@@ -89,6 +89,9 @@ std::thread_local! {
     static LAST_METADATA_REFUSAL: std::cell::Cell<Option<MetadataRefusalStage>> = const {
         std::cell::Cell::new(None)
     };
+    static COLD_VIEWPORT_AFTER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 fn record_metadata_refusal(stage: MetadataRefusalStage) {
@@ -289,7 +292,20 @@ struct ColdViewportEntry {
 type ColdViewportRetired = (
     Arc<frankenterm_term::screen::ScreenLineRead>,
     Vec<ColdViewportEntry>,
+    Option<ColdViewportFollowup>,
 );
+
+struct ColdViewportFollowup {
+    read: frankenterm_term::screen::ScreenLineRead,
+    requested: Range<StableRowIndex>,
+    layout: (SequenceNo, RenderableDimensions),
+}
+
+#[derive(Clone)]
+struct ColdViewportIntent {
+    anchor: frankenterm_term::screen::ColdViewportAnchor,
+    dimensions: RenderableDimensions,
+}
 
 // Return both rejected publications and evictions to the originating worker.
 // That worker keeps its permit until this queue is drained and destroyed.
@@ -297,12 +313,17 @@ struct ColdViewportRetirement {
     read: Option<Arc<frankenterm_term::screen::ScreenLineRead>>,
     evicted: Vec<ColdViewportEntry>,
     sender: std::sync::mpsc::SyncSender<ColdViewportRetired>,
+    followup: Option<ColdViewportFollowup>,
 }
 
 impl Drop for ColdViewportRetirement {
     fn drop(&mut self) {
         if let Some(read) = self.read.take() {
-            let _ = self.sender.send((read, std::mem::take(&mut self.evicted)));
+            let _ = self.sender.send((
+                read,
+                std::mem::take(&mut self.evicted),
+                self.followup.take(),
+            ));
         }
     }
 }
@@ -1653,7 +1674,7 @@ impl Pane for LocalPane {
         if cold {
             let logical_context = term.screen().expand_cold_logical_range(lines.clone());
             drop(term);
-            let (first, mut snapshot) = self.cold_viewport_lines(logical_context);
+            let (first, mut snapshot) = self.cold_viewport_lines(logical_context, None);
             let mut start = 0;
             for end in 0..snapshot.len() {
                 if !snapshot[end].last_cell_was_wrapped() || end + 1 == snapshot.len() {
@@ -5167,8 +5188,12 @@ impl LocalPane {
                         // numeric row in the meantime. A stale layout first
                         // requests a bounded geometry refresh; the next capture
                         // then requests the anchor's actual logical group.
+                        let intent = ColdViewportIntent {
+                            anchor: anchor.clone(),
+                            dimensions,
+                        };
                         drop(term);
-                        self.cold_viewport_lines(requested);
+                        self.cold_viewport_lines(requested, Some(intent));
                         return None;
                     }
                 } else {
@@ -5316,7 +5341,11 @@ impl LocalPane {
         });
     }
 
-    fn cold_viewport_lines(&self, requested: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+    fn cold_viewport_lines(
+        &self,
+        requested: Range<StableRowIndex>,
+        intent: Option<ColdViewportIntent>,
+    ) -> (StableRowIndex, Vec<Line>) {
         let empty = || (requested.start, Vec::new());
         if requested.end.saturating_sub(requested.start).max(0) as usize
             > frankenterm_term::screen::ScreenLineRead::MAX_ROWS
@@ -5398,16 +5427,20 @@ impl LocalPane {
             cancelled: Arc::clone(&cancelled),
         });
         drop(pending);
-        let completion = ColdViewportCompletion {
+        let completion = Arc::new(ColdViewportCompletion {
             state: Arc::clone(&self.cold_viewport_pending),
             cancelled: Arc::clone(&cancelled),
-        };
-        let response_range = requested.clone();
+        });
+        let mut response_range = requested.clone();
         let retry = Arc::clone(&self.cold_viewport_retry);
         let capture_registration = registration.clone();
         let capture_retry = Arc::clone(&retry);
         let worker_cancelled = Arc::clone(&cancelled);
-        let worker = permit.start(move || worker_cancelled.load(Ordering::Acquire), move |result, permit| {
+        let worker = permit.start(move || worker_cancelled.load(Ordering::Acquire), move |mut result, permit| {
+            let mut required_layout = None;
+            // One anchor read and at most one visible-context read, charged to
+            // the same worker. No GUI capture is needed between publications.
+            for stage in 0..2 {
             let mut plans = match result {
                 Ok(plans) => plans,
                 Err(error) => {
@@ -5463,12 +5496,23 @@ impl LocalPane {
             };
             let Some(read) = plans.pop() else { return; };
             let (sender, retired) = sync_channel(1);
-            let retirement = ColdViewportRetirement { read: Some(Arc::new(read)), evicted: Vec::with_capacity(1), sender };
+            let retirement = ColdViewportRetirement { read: Some(Arc::new(read)), evicted: Vec::with_capacity(1), sender, followup: None };
+            let publish_registration = registration.clone();
+            let publish_retry = Arc::clone(&retry);
+            let publish_completion = Arc::clone(&completion);
+            let publish_failure = Arc::clone(&failure_state);
+            let publish_range = response_range.clone();
+            let publish_intent = if stage == 0 { intent.clone() } else { None };
+            let publish_terminal = terminal_for_failure.clone();
             schedule_local_pane_main_thread(
                 promise::spawn::MainThreadServiceClass::Interactive,
                 LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
                 "cold_viewport_publish",
                 || async move {
+                    let registration = publish_registration;
+                    let retry = publish_retry;
+                    let completion = publish_completion;
+                    let failure_state = publish_failure;
                     let mut retirement = retirement;
                     if completion.cancelled.load(Ordering::Acquire) {
                         retry_cold_viewport(registration, retry);
@@ -5476,13 +5520,13 @@ impl LocalPane {
                     }
                     if let Some(read) = retirement.read.as_ref().map(Arc::clone) {
                             let _ = registration.try_with_current(|pane| {
-                                let Some(pending) = completion.state.try_lock() else {
+                                let Some(mut pending) = completion.state.try_lock() else {
                                     retry_cold_viewport(registration.clone(), Arc::clone(&retry));
                                     return;
                                 };
                                 if !pending.as_ref().is_some_and(|pending| Arc::ptr_eq(&pending.cancelled, &completion.cancelled)) { return; }
                                 let mut published = false;
-                                let _ = pane.publish_line_reads(std::slice::from_ref(read.as_ref()), &mut || {
+                                let mut publish = || {
                                     let Some(mut cache) = COLD_VIEWPORT_CACHE.try_lock() else { return; };
                                     if let Some(index) = cache.iter().position(|entry| entry.registration == registration.wire_identity()) {
                                         if let Some(entry) = cache.remove(index) { retirement.evicted.push(entry); }
@@ -5491,11 +5535,48 @@ impl LocalPane {
                                         if let Some(entry) = cache.pop_front() { retirement.evicted.push(entry); }
                                     }
                                     cache.push_back(ColdViewportEntry {
-                                        registration: registration.wire_identity(), requested: response_range.clone(), read: Arc::clone(&read),
+                                        registration: registration.wire_identity(), requested: publish_range.clone(), read: Arc::clone(&read),
                                     });
                                     published = true;
-                                });
+                                };
+                                if let Some((sequence, dimensions)) = required_layout {
+                                    let _ = pane.publish_line_reads_at_layout(std::slice::from_ref(read.as_ref()), sequence, dimensions, &mut publish);
+                                } else {
+                                    let _ = pane.publish_line_reads(std::slice::from_ref(read.as_ref()), &mut publish);
+                                }
                                 if published { *failure_state.lock() = None; }
+                                #[cfg(test)]
+                                if published { COLD_VIEWPORT_AFTER_PUBLISH.with(|hook| {
+                                    let hook = hook.borrow_mut().take();
+                                    if let Some(hook) = hook { hook(); }
+                                }); }
+                                // publish_line_reads has released terminal ownership.
+                                // Capture only after the anchor's actual read was
+                                // accepted, with the pending identity still held.
+                                if published {
+                                    if let Some(intent) = publish_intent.as_ref() {
+                                        if let (Some(row), Ok(Some(layout))) = (read.resolve_viewport_anchor(&intent.anchor), pane.get_line_layout()) {
+                                            let dimensions = layout.1;
+                                            if same_line_layout_geometry(&dimensions, &intent.dimensions) {
+                                                let first = row.max(dimensions.scrollback_top).min(dimensions.physical_top);
+                                                if let Some(end) = StableRowIndex::try_from(dimensions.viewport_rows).ok().and_then(|rows| first.checked_add(rows)) {
+                                                    let requested = publish_terminal.upgrade().and_then(|terminal| {
+                                                        let term = terminal.try_lock()?;
+                                                        term.screen().validates_line_read(&read).then(|| term.screen().expand_cold_logical_range(first..end))
+                                                    });
+                                                    if let Some(requested) = requested {
+                                                    if read.cached_lines(requested.clone()).is_none() {
+                                                        if let Some(Ok(plan)) = pane.capture_line_read(requested.clone(), &mut Default::default()) {
+                                                            if let Some(pending) = pending.as_mut() { pending.requested = requested.clone(); }
+                                                            retirement.followup = Some(ColdViewportFollowup { read: plan, requested, layout });
+                                                        }
+                                                    }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 drop(pending);
                                 if published { pane.notify_lines_ready(); }
                                 else { retry_cold_viewport(registration.clone(), Arc::clone(&retry)); }
@@ -5505,7 +5586,36 @@ impl LocalPane {
             );
             // Only the blocking worker waits. Queue cancellation drops the
             // retirement guard, so it also returns source ownership here.
-            drop(retired.recv());
+            let Ok((read, evicted, followup)) = retired.recv() else { break; };
+            // Retire prior payloads before hydrating another bounded plan.
+            drop(read);
+            drop(evicted);
+            let Some(followup) = followup else { break; };
+            if completion.cancelled.load(Ordering::Acquire) { break; }
+            let ColdViewportFollowup { read, requested, layout } = followup;
+            response_range = requested;
+            required_layout = Some(layout);
+            *worker_witness.lock() = Some(read.failure_witness());
+            // The generic worker timer ends before this continuation. Keep
+            // its hydration visible separately from publication wait time.
+            let followup_started = log::log_enabled!(target: "mux::cold_read_profile", log::Level::Debug)
+                .then(Instant::now);
+            result = catch_recoverable(RecoverablePanicSite::MuxPaneCallback, AssertUnwindSafe(|| {
+            if completion.cancelled.load(Ordering::Acquire) {
+                Err(anyhow::anyhow!("cold read cancelled"))
+            } else if read.requested_row_count() > frankenterm_term::screen::ScreenLineRead::MAX_ROWS {
+                Err(anyhow::anyhow!("line read row limit"))
+            } else { read.hydrate_with_payload_limit(
+                frankenterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES,
+                || completion.cancelled.load(Ordering::Acquire),
+            ).map(|read| vec![read]) }
+            })).unwrap_or_else(|_| Err(anyhow::anyhow!("cold read worker failed")));
+            if let Some(started) = followup_started {
+                log::debug!(target: "mux::cold_read_profile",
+                    "cold_viewport_followup_complete hydrate_us={} read_ok={}",
+                    started.elapsed().as_micros(), result.is_ok());
+            }
+            }
             drop(permit);
         });
         let worker = match worker {
@@ -7853,6 +7963,9 @@ mod tests {
         refuse_next_payload: AtomicBool,
         payload_refusals: AtomicUsize,
         read_gate: Mutex<Option<(std::sync::mpsc::SyncSender<()>, Receiver<()>)>>,
+        read_gate_row: Mutex<Option<StableRowIndex>>,
+        panic_next_payload: AtomicBool,
+        payload_panics: AtomicUsize,
     }
 
     impl frankenterm_term::config::ScrollbackSpillSink for ColdResizeTestSink {
@@ -7943,10 +8056,22 @@ mod tests {
                 self.payload_refusals.fetch_add(1, Ordering::Release);
                 return None;
             }
-            let gate = self.read_gate.lock().take();
+            let gate = if self
+                .read_gate_row
+                .lock()
+                .is_none_or(|expected| expected == row)
+            {
+                self.read_gate.lock().take()
+            } else {
+                None
+            };
             if let Some((entered, release)) = gate {
                 entered.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if self.panic_next_payload.swap(false, Ordering::AcqRel) {
+                self.payload_panics.fetch_add(1, Ordering::Release);
+                panic!("one-shot cold viewport sink failure");
             }
             self.rows.lock().1.get(&row).cloned()
         }
@@ -12054,7 +12179,7 @@ mod tests {
                             for _ in 0..32 {
                                 if viewport {
                                     assert!(pane
-                                        .cold_viewport_lines(viewport_row..viewport_row + 1)
+                                        .cold_viewport_lines(viewport_row..viewport_row + 1, None)
                                         .1
                                         .is_empty());
                                 } else {
@@ -12081,7 +12206,7 @@ mod tests {
                     }
                     if viewport {
                         let (first, lines) =
-                            pane.cold_viewport_lines(viewport_row..viewport_row + 1);
+                            pane.cold_viewport_lines(viewport_row..viewport_row + 1, None);
                         if !lines.is_empty() {
                             assert_eq!(first, viewport_row);
                             assert_eq!(lines, vec![expected_row.clone()]);
@@ -12160,6 +12285,383 @@ mod tests {
     }
 
     #[test]
+    fn cold_viewport_anchor_prefetches_visible_context_without_another_frame() {
+        const CHILD: &str = "FT_COLD_VIEWPORT_PREFETCH_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "localpane::tests::cold_viewport_anchor_prefetches_visible_context_without_another_frame", "--nocapture"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "prefetch test timed out: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(32, 512 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        for case in [
+            "visible",
+            "resize",
+            "prune",
+            "registration",
+            "supersede",
+            "busy",
+            "panic",
+        ] {
+            let (pane, mux, registration, _, token) = cold_resize_fixture(false);
+            let sink = Arc::new(ColdResizeTestSink::default());
+            let mut terminal = Terminal::new(
+                term_size(20, 4),
+                Arc::new(ColdResizeTestConfig(sink.clone())),
+                "FrankenTerm",
+                "prefetch",
+                Box::new(Vec::new()),
+            );
+            for index in 0..12 {
+                terminal.advance_bytes(
+                    format!("abcde\u{301}fghij界klmnopqrUVWXYZ{index:02}\r\n").as_bytes(),
+                );
+            }
+            *pane.terminal.lock() = terminal;
+            LocalPane::prepare_cold_layout_after_resize(
+                pane.pane_id(),
+                &pane.terminal,
+                &pane.line_layout_observation,
+                &pane.resize_queue,
+                token,
+                registration.clone(),
+            );
+            let dimensions = pane.get_dimensions();
+            let history = pane
+                .capture_line_read(
+                    dimensions.scrollback_top..dimensions.physical_top,
+                    &mut Default::default(),
+                )
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(pane
+                .publish_line_reads(std::slice::from_ref(&history), &mut || {})
+                .unwrap());
+            let lines: Vec<_> = history
+                .lines()
+                .map(|line| line.as_str().into_owned())
+                .collect();
+            let offset = lines.iter().position(|line| line == "UVWXYZ04").unwrap();
+            let row = history.first_row() + offset as StableRowIndex;
+            let expected = lines[offset..offset + 4].to_vec();
+            let anchor = history.capture_viewport_anchor(row).unwrap();
+            let viewport = NativeViewport {
+                row,
+                anchor: None,
+                cold_anchor: Some(anchor.clone()),
+            };
+            COLD_VIEWPORT_CACHE.lock().clear();
+            // The anchor group ends before this row. Only the follow-up's
+            // real payload read can reach this gate; no renderer polling.
+            let anchor_range = pane
+                .terminal
+                .lock()
+                .screen()
+                .cold_viewport_anchor_read_range(&anchor)
+                .unwrap()
+                .unwrap();
+            assert!(row + 2 >= anchor_range.end);
+            assert!(sink.rows.lock().1.contains_key(&(row + 2)));
+            if case == "busy" {
+                let notifications = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&notifications);
+                mux.subscribe(move |notification| {
+                    if matches!(notification, crate::MuxNotification::PaneOutput(719)) {
+                        counted.fetch_add(1, Ordering::Release);
+                    }
+                    true
+                })
+                .unwrap();
+                let (request, requested) = sync_channel(1);
+                let (locked, observed_lock) = sync_channel(1);
+                let (release, released) = sync_channel(1);
+                let terminal = Arc::clone(&pane.terminal);
+                let holder = std::thread::spawn(move || {
+                    requested.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let _guard = terminal.lock();
+                    locked.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                COLD_VIEWPORT_AFTER_PUBLISH.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        request.send(()).unwrap();
+                        observed_lock.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }))
+                });
+                assert!(pane
+                    .try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                    .is_none());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    while executor.try_tick().unwrap() {}
+                    if pane.cold_viewport_pending.lock().is_none() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "busy continuation did not retire"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                assert!(
+                    notifications.load(Ordering::Acquire) > 0,
+                    "accepted anchor must wake renderer when continuation is busy"
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let frame = loop {
+                    while executor.try_tick().unwrap() {}
+                    if let Some(frame) =
+                        pane.try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                    {
+                        break frame;
+                    }
+                    assert!(Instant::now() < deadline, "normal fallback did not recover");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert_eq!(
+                    frame
+                        .lines
+                        .iter()
+                        .map(|line| line.as_str().into_owned())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                continue;
+            }
+            let (entered, observed) = sync_channel(1);
+            let (release, released) = sync_channel(1);
+            *sink.read_gate_row.lock() = Some(row + 2);
+            *sink.read_gate.lock() = Some((entered, released));
+            assert!(pane
+                .try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                .is_none());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if observed.try_recv().is_ok() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: visible read never started without a second frame",
+                    case = case
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let pending_token = Arc::clone(
+                &pane
+                    .cold_viewport_pending
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .cancelled,
+            );
+            let old_cache = Arc::clone(
+                &COLD_VIEWPORT_CACHE
+                    .lock()
+                    .iter()
+                    .find(|entry| entry.registration == registration.wire_identity())
+                    .unwrap()
+                    .read,
+            );
+            assert!(old_cache.cached_lines(row..row + 4).is_none());
+            let retry_notifications = Arc::new(AtomicUsize::new(0));
+            if case == "panic" {
+                // The first publication wake has already been consumed while
+                // pumping to the visible-only read gate. Count only later
+                // notifications and do not poll the renderer to cause retries.
+                let counted = Arc::clone(&retry_notifications);
+                mux.subscribe(move |notification| {
+                    if matches!(notification, crate::MuxNotification::PaneOutput(719)) {
+                        counted.fetch_add(1, Ordering::Release);
+                    }
+                    true
+                })
+                .unwrap();
+                sink.panic_next_payload.store(true, Ordering::Release);
+            }
+            let mut successor = None;
+            match case {
+                "resize" => pane.terminal.lock().resize(term_size(13, 4)),
+                "prune" => sink.rows.lock().1.retain(|key, _| *key > row + 3),
+                "registration" => {
+                    assert!(registration.retire_if_current());
+                    let dynamic: Arc<dyn Pane> = pane.clone();
+                    let generation = crate::PaneRegistrationGeneration::new(
+                        pane.pane_id(),
+                        &mux.pane_retirements,
+                        Arc::downgrade(&mux),
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let inserted = {
+                            let _guard = mux.pane_registration.lock();
+                            mux.insert_pane_registration_locked(
+                                pane.pane_id(),
+                                pane.domain_id(),
+                                &dynamic,
+                                &generation,
+                            )
+                            .is_ok()
+                        };
+                        if inserted {
+                            break;
+                        }
+                        while executor.try_tick().unwrap() {}
+                        assert!(Instant::now() < deadline, "retirement fence did not settle");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_ne!(
+                        mux.capture_pane_registration(&dynamic)
+                            .unwrap()
+                            .wire_identity(),
+                        registration.wire_identity()
+                    );
+                }
+                "supersede" => {
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    pending_token.store(true, Ordering::Release);
+                    *pane.cold_viewport_pending.lock() = Some(ColdViewportPending {
+                        requested: row + 8..row + 9,
+                        cancelled: Arc::clone(&cancelled),
+                    });
+                    successor = Some(cancelled);
+                }
+                _ => {}
+            }
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                // Only the worker's completion guard retains this token after
+                // the pending slot is replaced. Waiting also exercises permit
+                // lifetime rather than racing a still-unpublished completion.
+                let done = if successor.is_some() {
+                    Arc::strong_count(&pending_token) == 1
+                } else {
+                    pane.cold_viewport_pending.lock().is_none()
+                };
+                if done {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "prefetch completion did not retire: {}",
+                    case
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if case == "panic" {
+                assert_eq!(sink.payload_panics.load(Ordering::Acquire), 1);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while retry_notifications.load(Ordering::Acquire) == 0 {
+                    while executor.try_tick().unwrap() {}
+                    assert!(
+                        Instant::now() < deadline,
+                        "contained follow-up panic lost retry wake"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    pane.cold_viewport_failure.lock().is_some(),
+                    "panic must enter ordinary read-failure handling"
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let frame = loop {
+                    while executor.try_tick().unwrap() {}
+                    if let Some(frame) =
+                        pane.try_capture_render_frame(Some(viewport.clone()), 0, 0, &[], false)
+                    {
+                        break frame;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "contained follow-up panic never recovered"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert_eq!(
+                    frame
+                        .lines
+                        .iter()
+                        .map(|line| line.as_str().into_owned())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(sink.payload_panics.load(Ordering::Acquire), 1);
+            } else if case == "visible" {
+                let reads = sink.payload_reads.load(Ordering::Acquire);
+                let frame = pane
+                    .try_capture_render_frame(Some(viewport), 0, 0, &[], false)
+                    .expect("visible context must already be cached");
+                assert_eq!(
+                    frame
+                        .lines
+                        .iter()
+                        .map(|line| line.as_str().into_owned())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    sink.payload_reads.load(Ordering::Acquire),
+                    reads,
+                    "final frame must not launch another read"
+                );
+            } else {
+                assert!(
+                    COLD_VIEWPORT_CACHE
+                        .lock()
+                        .iter()
+                        .filter(|entry| entry.registration == registration.wire_identity())
+                        .all(|entry| Arc::ptr_eq(&entry.read, &old_cache)),
+                    "stale follow-up published: {}",
+                    case
+                );
+            }
+            if let Some(successor) = successor {
+                let mut pending = pane.cold_viewport_pending.lock();
+                assert!(Arc::ptr_eq(
+                    &pending.as_ref().unwrap().cancelled,
+                    &successor
+                ));
+                pending.take();
+            }
+        }
+    }
+
+    #[test]
     fn cold_viewport_old_completion_cannot_clear_new_request() {
         let old = Arc::new(AtomicBool::new(false));
         let new = Arc::new(AtomicBool::new(false));
@@ -12213,6 +12715,7 @@ mod tests {
             }],
             read: Some(read),
             sender,
+            followup: None,
         };
         drop(retirement);
         assert!(
