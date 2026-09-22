@@ -9571,7 +9571,7 @@ mod tests {
             "nonresident history cannot produce a hot-row anchor"
         );
         drop(token);
-        let retained: Vec<_> = (0..16)
+        let mut retained: Vec<_> = (0..16)
             .map(|_| {
                 pane.capture_selection_anchor(floor, sequence, dimensions, points)
                     .unwrap()
@@ -9580,10 +9580,19 @@ mod tests {
             .collect();
         assert_eq!(
             pane.capture_selection_anchor(floor, sequence, dimensions, points),
-            Ok(None),
-            "registry capacity refuses remapping, not ordinary selection"
+            Err(SelectionAnchorCaptureError::Busy),
+            "temporary registry capacity must keep selection capture retryable"
         );
         assert_eq!(retained.len(), 16);
+        drop(retained.pop().unwrap());
+        let recovered = pane
+            .capture_selection_anchor(floor, sequence, dimensions, points)
+            .unwrap()
+            .expect("retiring a token must admit the same resident selection");
+        assert_eq!(
+            pane.selection_anchor_snapshot(&recovered).unwrap().3,
+            Some(points)
+        );
     }
 
     #[test]
