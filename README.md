@@ -502,7 +502,7 @@ The README claim-to-slot map identifies populated artifacts and explicitly defer
 | Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
-| Deferred: operating-envelope read-only admission proof | [`proofs/robot-contracts`](docs/attestations/manifest.json) | `ft-booek.7` |
+| Scoped remote operating-envelope read-only admission proof; target-class capacity remains unproven | [`proofs/robot-contracts`](docs/attestations/proofs/operating-envelope.json) | `ft-booek.7` |
 | Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
 | Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
 | `runtime_async` Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
