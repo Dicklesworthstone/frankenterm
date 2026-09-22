@@ -8109,6 +8109,26 @@ mod tests {
         ) {
             return;
         }
+        #[derive(Debug)]
+        struct BoundaryConfig(ColdResizeTestConfig);
+        impl TerminalConfiguration for BoundaryConfig {
+            fn color_palette(&self) -> ColorPalette {
+                self.0.color_palette()
+            }
+            fn scrollback_size(&self) -> usize {
+                // The shared resize fixture retains only 32 rows. This corpus
+                // needs all 257 paragraph rows plus its closing control lines.
+                512
+            }
+            fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+                self.0.scrollback_tier_config()
+            }
+            fn scrollback_spill_sink(
+                &self,
+            ) -> Option<Arc<dyn frankenterm_term::config::ScrollbackSpillSink>> {
+                self.0.scrollback_spill_sink()
+            }
+        }
         let (pane, _mux, _registration, _old_sink, _token) = cold_resize_fixture(false);
         let sink = Arc::new(ColdResizeTestSink::default());
         let mut term = Terminal::new(
@@ -8141,7 +8161,7 @@ mod tests {
                 let sink = Arc::new(ColdResizeTestSink::default());
                 let mut term = Terminal::new(
                     term_size(4, rows),
-                    Arc::new(ColdResizeTestConfig(Arc::clone(&sink))),
+                    Arc::new(BoundaryConfig(ColdResizeTestConfig(Arc::clone(&sink)))),
                     "FrankenTerm",
                     "search-logical-boundary",
                     Box::new(Vec::new()),
@@ -8155,6 +8175,7 @@ mod tests {
                     term.advance_bytes(b"\r\nnext\r\nnext\r\nnext\r\n");
                     assert!(term.screen().phys_to_stable_row_index(0) > 256);
                     let retained = sink.rows.lock();
+                    assert!(retained.1.len() > 256 && retained.1.len() <= 512);
                     assert!(retained.1.contains_key(&255));
                     assert!(retained.1.contains_key(&256));
                 }
