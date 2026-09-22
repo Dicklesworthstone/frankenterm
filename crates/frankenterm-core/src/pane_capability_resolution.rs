@@ -542,10 +542,13 @@ mod tests {
             let free = resolve_pane_capabilities(&cx, 8, Some(&storage), None).await;
             assert_eq!(free.capabilities.is_reserved, Some(false));
             assert_eq!(free.capabilities.reserved_by, None);
+            assert_eq!(free.capabilities.alt_screen, None);
+            assert!(free.capabilities.has_recent_gap);
+            assert!(!free.capabilities.prompt_active);
             assert!(
                 free.warnings
                     .iter()
-                    .any(|warning| warning.contains("IPC socket unavailable")),
+                    .any(|warning| warning.contains("Watcher source unavailable")),
                 "missing watcher evidence is reported, not assumed: {:?}",
                 free.warnings
             );

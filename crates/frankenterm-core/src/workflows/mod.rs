@@ -10244,6 +10244,22 @@ Try again at 3:00 PM UTC.
 
             let pane_id = 201u64;
             create_test_pane(&storage, pane_id).await;
+            // This fixture exercises successful injection, so provide actual
+            // captured prompt evidence and the live observed pane registry.
+            storage
+                .append_segment(pane_id, "\x1b]133;A\x07", None)
+                .await
+                .unwrap();
+            let mut registry = crate::ingest::PaneRegistry::new();
+            registry.discovery_tick(vec![
+                serde_json::from_value(serde_json::json!({
+                    "pane_id": pane_id, "tab_id": 1, "window_id": 1,
+                    "domain_name": "local", "is_active": true,
+                }))
+                .unwrap(),
+            ]);
+            let runner =
+                runner.with_watcher_registry(Arc::new(crate::runtime_async::RwLock::new(registry)));
 
             // Create a device code detection
             let det = make_session_detection(
@@ -10320,6 +10336,22 @@ Try again at 3:00 PM UTC.
 
             let pane_id = 202u64;
             create_test_pane(&storage, pane_id).await;
+            // Keep the first run's send admissible using the same real
+            // evidence source as watch; the second run still tests cooldown.
+            storage
+                .append_segment(pane_id, "\x1b]133;A\x07", None)
+                .await
+                .unwrap();
+            let mut registry = crate::ingest::PaneRegistry::new();
+            registry.discovery_tick(vec![
+                serde_json::from_value(serde_json::json!({
+                    "pane_id": pane_id, "tab_id": 1, "window_id": 1,
+                    "domain_name": "local", "is_active": true,
+                }))
+                .unwrap(),
+            ]);
+            let runner =
+                runner.with_watcher_registry(Arc::new(crate::runtime_async::RwLock::new(registry)));
 
             let det = make_session_detection(
                 "codex.auth.device_code_prompt",
