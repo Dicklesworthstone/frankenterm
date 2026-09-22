@@ -26,11 +26,14 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.7`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.8`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.7` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.8` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Cold-history selection keeps its original anchors while a resized or newly appended history is rebuilding its optional layout index. A temporary lack of projection no longer permanently invalidates the selection; genuinely pruned text still invalidates it. Remote regressions cover the resize publication race, bounded index allocation refusal, exact Unicode text recovery, and retention pruning. Native qualification of these changes remains pending.
+- Search reads spilled history through bounded workers outside the terminal lock. It validates hydrated layout and source identity before returning matches, preserves Unicode cell coordinates, and releases worker capacity on cancellation. Overlapping GUI chunks retain both sets of highlights; repeated failures stop with a visible message instead of retrying indefinitely. Native qualification remains pending. The existing 1,024-cell logical-segment limit can still omit matches crossing that boundary and is tracked in `ft-m6bsx`.
 
 - Mux connections flush the codec-discovery response before sending startup notifications. Clients retain negotiated notifications in their bounded quarantine while registration completes, preventing valid startup events from retiring the connection. Native qualification of this candidate remains pending.
 
