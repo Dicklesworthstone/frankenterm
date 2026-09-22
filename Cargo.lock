@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3671,7 +3671,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-alloc"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "criterion",
  "thiserror 2.0.20",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-build-identity"
-version = "0.15.11"
+version = "0.15.12"
 
 [[package]]
 name = "frankenterm-cell"
@@ -3803,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-ars"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -3946,11 +3946,11 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-atlas-pack-types"
-version = "0.15.11"
+version = "0.15.12"
 
 [[package]]
 name = "frankenterm-core-audit-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "frankenterm-core-replay-types",
@@ -3965,7 +3965,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-cass-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "chrono",
  "serde",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-caut-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-config-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "toml",
@@ -3992,14 +3992,14 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-connector-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "frankenterm-core-connectors"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "frankenterm-core-connector-types",
  "proptest",
@@ -4008,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-error-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-fleet"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "chrono",
  "frankenterm-core",
@@ -4032,7 +4032,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-mcp"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "fastmcp-rust",
  "proptest",
@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-policy-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "hex",
  "proptest",
@@ -4055,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-replay"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "chrono",
  "flate2",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-replay-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "proptest",
  "serde",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-resource-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "proptest",
  "serde",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-tantivy"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "chrono",
  "fancy-regex 0.19.2",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-telemetry-types"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -4133,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-core-x11-resize-types"
-version = "0.15.11"
+version = "0.15.12"
 
 [[package]]
 name = "frankenterm-dynamic"
@@ -4191,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-flight-recorder"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
@@ -4273,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-gui"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4391,7 +4391,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-mux-server"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "anyhow",
  "async_ossl",
@@ -4419,7 +4419,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-mux-server-impl"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "anyhow",
  "asupersync",
@@ -4485,7 +4485,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-pty-guardian"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-redactor"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "aho-corasick",
  "hex",
@@ -4545,7 +4545,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-sigpipe"
-version = "0.15.11"
+version = "0.15.12"
 
 [[package]]
 name = "frankenterm-ssh"
@@ -4671,7 +4671,7 @@ dependencies = [
 
 [[package]]
 name = "frankenterm-topo"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -4748,7 +4748,7 @@ dependencies = [
 
 [[package]]
 name = "ft-perf-gate"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -4757,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "ft-test-log"
-version = "0.15.11"
+version = "0.15.12"
 dependencies = [
  "chrono",
  "serde",

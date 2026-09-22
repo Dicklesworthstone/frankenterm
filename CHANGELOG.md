@@ -26,11 +26,11 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.11`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.12`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.11` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.12` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
 
 - Concurrent cold-history workers share a geometry calculation when their source, coordinate mapping, width and wrap policy match. Cancelled waiters retire promptly, and synchronous readers never wait for that worker. The cache holds weak references and accounts for retained allocation headers; native timing qualification remains pending.
 - After hydrating a cold viewport anchor, the worker can continue directly to its visible context under the same bounded permit. This avoids another GUI capture round trip while retaining source, layout, cancellation and retirement checks.
