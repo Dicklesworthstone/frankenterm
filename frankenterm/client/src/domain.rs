@@ -7401,6 +7401,7 @@ mod tests {
             entry.tab_id += offset;
             entry.pane_id += offset;
             entry.size = if offset == 1 { low_dpi } else { high_dpi };
+            entry.workspace = "default".to_string();
             listing.tabs.push(PaneNode::Leaf(entry));
             listing.tab_titles.push(format!("remote tab {offset}"));
         }
