@@ -26,12 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.12`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.13`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.12` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.13` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
 
+- Copy mode and quick select no longer send stale pane dimensions back during asynchronous resizing. Independent overlays use their owning tab's layout, including split, zoomed, and floating panes. A held-terminal regression passes; fixed-build macOS verification remains pending.
 - Concurrent cold-history workers share a geometry calculation when their source, coordinate mapping, width and wrap policy match. Cancelled waiters retire promptly, and synchronous readers never wait for that worker. The cache holds weak references and accounts for retained allocation headers; native timing qualification remains pending.
 - After hydrating a cold viewport anchor, the worker can continue directly to its visible context under the same bounded permit. This avoids another GUI capture round trip while retaining source, layout, cancellation and retirement checks.
 - Native copy-mode start/end-of-content navigation reads cold rows through bounded workers. First publication of an identity physical-row layout returns fresh coordinate authority; reflow, source changes and superseded actions cannot publish stale cursor movement. Native callback qualification remains pending.

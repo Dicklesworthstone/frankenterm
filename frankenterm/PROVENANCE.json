@@ -641,7 +641,7 @@
         "cosmetic": 30,
         "docs": 6,
         "feat": 207,
-        "fix": 288,
+        "fix": 289,
         "other": 54,
         "refactor": 12,
         "rename": 2,
@@ -649,13 +649,13 @@
         "security-fix": 7,
         "test": 112
       },
-      "fork_side_commit_count": 734,
+      "fork_side_commit_count": 735,
       "last_modified": {
         "author": "Jeff Emanuel",
         "classification": "fix",
-        "committed_at": "2026-09-22T12:32:31-04:00",
-        "sha": "5206553c4a3cebfdb7142e9d58e3e21a4a3fc76e",
-        "subject": "fix(gui): complete cold copy navigation with atomic identity publication"
+        "committed_at": "2026-09-22T15:33:24-04:00",
+        "sha": "6abb196ab2c387846d3e0d934f4c1ae96ebbfb28",
+        "subject": "fix(gui): prevent overlays from rolling back pending pane resizes"
       },
       "name": "mux",
       "path": "frankenterm/mux",
@@ -1065,7 +1065,7 @@
     "subject": "Import WezTerm source at 05343b38 as FrankenTerm owned code"
   },
   "fork_repo": "frankenterm",
-  "fork_side_commit_total": 2924,
+  "fork_side_commit_total": 2925,
   "generated_at": "2026-09-22T08:15:05.956429Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
