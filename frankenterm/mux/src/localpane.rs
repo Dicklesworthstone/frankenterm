@@ -1406,8 +1406,8 @@ fn retry_backoff_for_attempt(policy: ResizeRetryPolicy, attempt: usize) -> Durat
         .min(policy.max_backoff)
 }
 
-fn next_search_grapheme_idx(last_grapheme_idx: usize) -> usize {
-    last_grapheme_idx.saturating_add(1)
+fn next_search_grapheme_idx(last_grapheme_idx: usize, width: usize) -> usize {
+    last_grapheme_idx.saturating_add(width)
 }
 
 fn next_resize_retry_attempt(attempt: usize) -> usize {
@@ -2708,195 +2708,434 @@ impl Pane for LocalPane {
         range: Range<StableRowIndex>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let term = self.locked_terminal();
-        let screen = term.screen();
+        const CHUNK: StableRowIndex = 1000;
+        const CONTEXT: StableRowIndex = 1024;
+        const MAX_RESULTS: usize = 100_000;
+        struct CancelOnDrop(Arc<AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        'restart: for _ in 0..3 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let _cancel = CancelOnDrop(Arc::clone(&cancelled));
+            let (sequence, history, resident_start) = {
+                let term = self.locked_terminal();
+                let (first, count) = term.screen().scrollback_geometry();
+                let end = first
+                    .checked_add(StableRowIndex::try_from(count)?)
+                    .ok_or_else(|| anyhow::anyhow!("search history range overflow"))?;
+                anyhow::ensure!(
+                    term.current_seqno() != SequenceNo::MAX,
+                    "search source saturated"
+                );
+                (
+                    term.current_seqno(),
+                    first..end,
+                    term.screen().phys_to_stable_row_index(0),
+                )
+            };
+            let range = range.start.max(history.start)..range.end.min(history.end);
+            let limit = limit.map_or(MAX_RESULTS, |limit| (limit as usize).min(MAX_RESULTS));
+            let mut results = Vec::new();
+            let mut unique = HashMap::new();
+            let mut source_witness = None;
+            let mut first = range.start;
+            while first < range.end && results.len() < limit {
+                let end = first.saturating_add(CHUNK).min(range.end);
+                let captured = first.saturating_sub(CONTEXT).max(history.start)
+                    ..end.saturating_add(CONTEXT).min(history.end);
+                let captured_start = captured.start;
+                let permit = crate::pane::LineReadPermit::try_acquire()
+                    .ok_or_else(|| anyhow::anyhow!("search read admission busy"))?;
+                let mut completion = promise::Promise::new();
+                let future = completion.get_future().expect("new search promise");
+                let worker_cancel = Arc::clone(&cancelled);
+                let matcher_cancel = Arc::clone(&cancelled);
+                let terminal = Arc::clone(&self.terminal);
+                let requested = first..end;
+                let worker_pattern = pattern.clone();
+                let remaining = limit - results.len();
+                let worker = permit.start(
+                    move || worker_cancel.load(Ordering::Acquire),
+                    move |reads, _permit| {
+                        let outcome = (|| {
+                            let reads = reads?;
+                            let read = reads
+                                .first()
+                                .ok_or_else(|| anyhow::anyhow!("search read missing"))?;
+                            {
+                                let mut term = terminal
+                                    .try_lock()
+                                    .ok_or_else(|| anyhow::anyhow!("search publication busy"))?;
+                                anyhow::ensure!(
+                                    term.current_seqno() == sequence,
+                                    "search source changed"
+                                );
+                                anyhow::ensure!(
+                                    term.screen().try_validate_line_read(read)?,
+                                    "search source expired"
+                                );
+                                // An oldest-row bootstrap may rebase its first
+                                // visual row. Publish proven geometry before
+                                // interpreting any requested numeric position.
+                                if term.screen().line_read_changes_layout(read) {
+                                    term.increment_seqno();
+                                    let seqno = term.current_seqno();
+                                    term.screen_mut().install_line_read_layout(read, seqno);
+                                    return Err(SearchLayoutRefreshed.into());
+                                }
+                            }
+                            anyhow::ensure!(
+                                read.first_row() == captured_start,
+                                "search layout changed"
+                            );
+                            let lines: Vec<_> = read.lines().collect();
+                            let mut unique = unique;
+                            let matches = search_owned_lines(
+                                worker_pattern,
+                                requested,
+                                remaining,
+                                read.first_row(),
+                                &lines,
+                                &mut unique,
+                                &matcher_cancel,
+                            )?;
+                            let term = terminal
+                                .try_lock()
+                                .ok_or_else(|| anyhow::anyhow!("search publication busy"))?;
+                            anyhow::ensure!(
+                                term.current_seqno() == sequence,
+                                "search source changed"
+                            );
+                            anyhow::ensure!(
+                                term.screen().try_validate_line_read(read)?,
+                                "search source expired"
+                            );
+                            anyhow::ensure!(
+                                !matcher_cancel.load(Ordering::Acquire),
+                                "search cancelled"
+                            );
+                            Ok((matches, unique))
+                        })();
+                        completion.result(outcome);
+                    },
+                )?;
+                let plan = {
+                    let term = self
+                        .terminal
+                        .try_lock()
+                        .ok_or_else(|| anyhow::anyhow!("search capture busy"))?;
+                    anyhow::ensure!(term.current_seqno() == sequence, "search source changed");
+                    term.screen().capture_line_read(captured.clone())?
+                };
+                if source_witness.is_none() && captured.start < resident_start {
+                    source_witness = Some(plan.failure_witness());
+                }
+                worker.submit(vec![plan]);
+                let (matches, next_unique) = match future.await {
+                    Ok(value) => value,
+                    Err(error) if error.is::<SearchLayoutRefreshed>() => continue 'restart,
+                    Err(error) => return Err(error),
+                };
+                unique = next_unique;
+                results.extend(matches);
+                first = end;
+            }
+            let term = self
+                .terminal
+                .try_lock()
+                .ok_or_else(|| anyhow::anyhow!("search completion busy"))?;
+            anyhow::ensure!(term.current_seqno() == sequence, "search source changed");
+            if let Some(witness) = source_witness {
+                anyhow::ensure!(
+                    witness.matches(term.screen()),
+                    "search retained source changed"
+                );
+            }
+            return Ok(results);
+        }
+        anyhow::bail!("search layout did not settle")
+    }
+}
 
-        enum CompiledPattern {
-            CaseSensitiveString(String),
-            CaseInSensitiveString(String),
-            Regex(Regex),
+#[derive(Debug, thiserror::Error)]
+#[error("search layout refreshed")]
+struct SearchLayoutRefreshed;
+
+fn search_owned_lines(
+    pattern: Pattern,
+    range: Range<StableRowIndex>,
+    limit: usize,
+    first_row: StableRowIndex,
+    physical: &[&Line],
+    uniq_matches: &mut HashMap<String, usize>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Vec<SearchResult>> {
+    enum CompiledPattern {
+        CaseSensitiveString(String),
+        CaseInSensitiveString(String),
+        Regex(Regex),
+    }
+
+    let pattern = match pattern {
+        Pattern::CaseSensitiveString(s) => CompiledPattern::CaseSensitiveString(s),
+        Pattern::CaseInSensitiveString(s) => {
+            // normalize the case so we match everything lowercase
+            CompiledPattern::CaseInSensitiveString(s.to_lowercase())
+        }
+        Pattern::Regex(r) => CompiledPattern::Regex(Regex::new(&r)?),
+    };
+
+    let mut results = vec![];
+    let folded = matches!(pattern, CompiledPattern::CaseInSensitiveString(_));
+    let mut regex_error = None;
+    search_logical_lines(first_row, physical, &range, |sr, lines| {
+        if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+            // We've reach the limit, stop iteration.
+            return false;
         }
 
-        let pattern = match pattern {
-            Pattern::CaseSensitiveString(s) => CompiledPattern::CaseSensitiveString(s),
-            Pattern::CaseInSensitiveString(s) => {
-                // normalize the case so we match everything lowercase
-                CompiledPattern::CaseInSensitiveString(s.to_lowercase())
+        if lines.is_empty() {
+            // Nothing to do on this iteration, carry on with the next.
+            return true;
+        }
+        let haystack = if lines.len() == 1 {
+            lines[0].as_str()
+        } else {
+            let mut s = String::new();
+            for line in lines {
+                s.push_str(&line.as_str());
             }
-            Pattern::Regex(r) => CompiledPattern::Regex(Regex::new(&r)?),
+            Cow::Owned(s)
         };
+        let stable_idx = sr.start;
 
-        let mut results = vec![];
-        let mut uniq_matches: HashMap<String, usize> = HashMap::new();
+        if haystack.is_empty() {
+            return true;
+        }
 
-        screen.for_each_logical_line_in_stable_range(range, |sr, lines| {
-            if let Some(limit) = limit {
-                if results.len() == limit as usize {
-                    // We've reach the limit, stop iteration.
-                    return false;
-                }
-            }
+        let haystack = match &pattern {
+            CompiledPattern::CaseInSensitiveString(_) => Cow::Owned(haystack.to_lowercase()),
+            _ => haystack,
+        };
+        let mut coords = None;
 
-            if lines.is_empty() {
-                // Nothing to do on this iteration, carry on with the next.
-                return true;
-            }
-            let haystack = if lines.len() == 1 {
-                lines[0].as_str()
-            } else {
-                let mut s = String::new();
-                for line in lines {
-                    s.push_str(&line.as_str());
-                }
-                Cow::Owned(s)
-            };
-            let stable_idx = sr.start;
-
-            if haystack.is_empty() {
-                return true;
-            }
-
-            let haystack = match &pattern {
-                CompiledPattern::CaseInSensitiveString(_) => Cow::Owned(haystack.to_lowercase()),
-                _ => haystack,
-            };
-            let mut coords = None;
-
-            match &pattern {
-                CompiledPattern::CaseInSensitiveString(s)
-                | CompiledPattern::CaseSensitiveString(s) => {
-                    for (idx, s) in haystack.match_indices(s) {
-                        found_match(
-                            s,
-                            idx,
-                            lines,
-                            stable_idx,
-                            &mut uniq_matches,
-                            &mut coords,
-                            &mut results,
-                        );
+        match &pattern {
+            CompiledPattern::CaseInSensitiveString(s) | CompiledPattern::CaseSensitiveString(s) => {
+                for (idx, s) in haystack.match_indices(s) {
+                    if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+                        break;
                     }
+                    found_match(
+                        s,
+                        idx,
+                        lines,
+                        stable_idx,
+                        uniq_matches,
+                        &mut coords,
+                        &mut results,
+                        &range,
+                        folded,
+                    );
                 }
-                CompiledPattern::Regex(re) => {
-                    // Allow for the regex to contain captures
-                    for capture_res in re.captures_iter(&*haystack) {
-                        if let Ok(c) = capture_res {
-                            // Look for the captures in reverse order, as index==0 is
-                            // the whole matched string.  We can't just call
-                            // `c.iter().rev()` as the capture iterator isn't double-ended.
-                            for idx in (0..c.len()).rev() {
-                                if let Some(m) = c.get(idx) {
-                                    found_match(
-                                        m.as_str(),
-                                        m.start(),
-                                        lines,
-                                        stable_idx,
-                                        &mut uniq_matches,
-                                        &mut coords,
-                                        &mut results,
-                                    );
-                                    break;
-                                }
+            }
+            CompiledPattern::Regex(re) => {
+                // Allow for the regex to contain captures
+                for capture_res in re.captures_iter(&*haystack) {
+                    if results.len() >= limit || cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let c = match capture_res {
+                        Ok(c) => c,
+                        Err(error) => {
+                            regex_error = Some(error);
+                            return false;
+                        }
+                    };
+                    {
+                        // Look for the captures in reverse order, as index==0 is
+                        // the whole matched string.  We can't just call
+                        // `c.iter().rev()` as the capture iterator isn't double-ended.
+                        for idx in (0..c.len()).rev() {
+                            if let Some(m) = c.get(idx) {
+                                found_match(
+                                    m.as_str(),
+                                    m.start(),
+                                    lines,
+                                    stable_idx,
+                                    uniq_matches,
+                                    &mut coords,
+                                    &mut results,
+                                    &range,
+                                    folded,
+                                );
+                                break;
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Keep iterating
-            true
+        // Keep iterating
+        true
+    });
+
+    #[derive(Copy, Clone, Debug)]
+    struct Coord {
+        byte_idx: usize,
+        grapheme_idx: usize,
+        width: usize,
+        stable_row: StableRowIndex,
+    }
+
+    fn found_match(
+        text: &str,
+        byte_idx: usize,
+        lines: &[&Line],
+        stable_idx: StableRowIndex,
+        uniq_matches: &mut HashMap<String, usize>,
+        coords: &mut Option<Vec<Coord>>,
+        results: &mut Vec<SearchResult>,
+        range: &Range<StableRowIndex>,
+        folded: bool,
+    ) {
+        // Zero-width regex alternatives are not selectable text. Do not let
+        // them exhaust the result budget before a later nonempty match.
+        if text.is_empty() {
+            return;
+        }
+        if coords.is_none() {
+            coords.replace(make_coords(lines, stable_idx, folded));
+        }
+        let Some(coords) = coords.as_ref() else {
+            return;
+        };
+        if coords.is_empty() {
+            return;
+        }
+
+        let (start_x, start_y) = haystack_idx_to_coord(byte_idx, coords);
+        if !range.contains(&start_y) {
+            return;
+        }
+        let match_id = match uniq_matches.get(text).copied() {
+            Some(id) => id,
+            None => {
+                let id = uniq_matches.len();
+                uniq_matches.insert(text.to_owned(), id);
+                id
+            }
+        };
+        let (end_x, end_y) = haystack_idx_to_coord(byte_idx + text.len(), coords);
+        results.push(SearchResult {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            match_id,
         });
+    }
 
-        #[derive(Copy, Clone, Debug)]
-        struct Coord {
-            byte_idx: usize,
-            grapheme_idx: usize,
-            stable_row: StableRowIndex,
-        }
+    fn make_coords(lines: &[&Line], stable_row: StableRowIndex, folded: bool) -> Vec<Coord> {
+        let mut byte_idx = 0;
+        let mut coords = vec![];
 
-        fn found_match(
-            text: &str,
-            byte_idx: usize,
-            lines: &[&Line],
-            stable_idx: StableRowIndex,
-            uniq_matches: &mut HashMap<String, usize>,
-            coords: &mut Option<Vec<Coord>>,
-            results: &mut Vec<SearchResult>,
-        ) {
-            if coords.is_none() {
-                coords.replace(make_coords(lines, stable_idx));
-            }
-            let Some(coords) = coords.as_ref() else {
-                return;
+        for (row_idx, line) in lines.iter().enumerate() {
+            let Ok(row_offset) = StableRowIndex::try_from(row_idx) else {
+                break;
             };
-            if coords.is_empty() {
-                return;
-            }
-
-            let match_id = match uniq_matches.get(text).copied() {
-                Some(id) => id,
-                None => {
-                    let id = uniq_matches.len();
-                    uniq_matches.insert(text.to_owned(), id);
-                    id
-                }
+            let Some(stable_row) = stable_row.checked_add(row_offset) else {
+                break;
             };
-            let (start_x, start_y) = haystack_idx_to_coord(byte_idx, coords);
-            let (end_x, end_y) = haystack_idx_to_coord(byte_idx + text.len(), coords);
-            results.push(SearchResult {
-                start_x,
-                start_y,
-                end_x,
-                end_y,
-                match_id,
-            });
-        }
-
-        fn make_coords(lines: &[&Line], stable_row: StableRowIndex) -> Vec<Coord> {
-            let mut byte_idx = 0;
-            let mut coords = vec![];
-
-            for (row_idx, line) in lines.iter().enumerate() {
-                let Ok(row_offset) = StableRowIndex::try_from(row_idx) else {
-                    break;
+            for cell in line.visible_cells() {
+                coords.push(Coord {
+                    byte_idx,
+                    grapheme_idx: cell.cell_index(),
+                    width: cell.width(),
+                    stable_row,
+                });
+                byte_idx += if folded {
+                    cell.str().to_lowercase().len()
+                } else {
+                    cell.str().len()
                 };
-                let Some(stable_row) = stable_row.checked_add(row_offset) else {
-                    break;
-                };
-                for cell in line.visible_cells() {
-                    coords.push(Coord {
-                        byte_idx,
-                        grapheme_idx: cell.cell_index(),
-                        stable_row,
-                    });
-                    byte_idx += cell.str().len();
-                }
             }
-
-            coords
         }
 
-        fn haystack_idx_to_coord(idx: usize, coords: &[Coord]) -> (usize, StableRowIndex) {
-            let c = match coords.binary_search_by(|ele| ele.byte_idx.cmp(&idx)) {
-                Ok(index) | Err(index) => index,
-            };
-            let coord = coords.get(c).map(|c| *c).unwrap_or_else(|| {
-                let Some(last) = coords.last() else {
-                    return Coord {
-                        byte_idx: 0,
-                        grapheme_idx: 0,
-                        stable_row: 0,
-                    };
+        coords
+    }
+
+    fn haystack_idx_to_coord(idx: usize, coords: &[Coord]) -> (usize, StableRowIndex) {
+        let c = match coords.binary_search_by(|ele| ele.byte_idx.cmp(&idx)) {
+            Ok(index) | Err(index) => index,
+        };
+        let coord = coords.get(c).map(|c| *c).unwrap_or_else(|| {
+            let Some(last) = coords.last() else {
+                return Coord {
+                    byte_idx: 0,
+                    grapheme_idx: 0,
+                    width: 0,
+                    stable_row: 0,
                 };
-                Coord {
-                    grapheme_idx: next_search_grapheme_idx(last.grapheme_idx),
-                    ..*last
-                }
-            });
-            (coord.grapheme_idx, coord.stable_row)
-        }
+            };
+            Coord {
+                grapheme_idx: next_search_grapheme_idx(last.grapheme_idx, last.width),
+                ..*last
+            }
+        });
+        (coord.grapheme_idx, coord.stable_row)
+    }
 
-        Ok(results)
+    if let Some(error) = regex_error {
+        return Err(error.into());
+    }
+    anyhow::ensure!(!cancelled.load(Ordering::Acquire), "search cancelled");
+    results.retain(|result| range.contains(&result.start_y));
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn search_logical_lines(
+    first: StableRowIndex,
+    physical: &[&Line],
+    requested: &Range<StableRowIndex>,
+    mut visit: impl FnMut(Range<StableRowIndex>, &[&Line]) -> bool,
+) {
+    let mut start = usize::try_from(requested.start.saturating_sub(first))
+        .unwrap_or(usize::MAX)
+        .min(physical.len());
+    let mut context = 0usize;
+    while start > 0 && physical[start - 1].last_cell_was_wrapped() {
+        let cells = physical[start - 1].len().max(1);
+        if context.saturating_add(cells) > 1024 {
+            break;
+        }
+        context += cells;
+        start -= 1;
+    }
+    while start < physical.len() && first.saturating_add(start as StableRowIndex) < requested.end {
+        let mut end = start;
+        let mut cells = 0usize;
+        while end < physical.len() {
+            let count = physical[end].len().max(1);
+            if end > start && cells.saturating_add(count) > 1024 {
+                break;
+            }
+            cells = cells.saturating_add(count);
+            end += 1;
+            if !physical[end - 1].last_cell_was_wrapped() {
+                break;
+            }
+        }
+        let rows = first.saturating_add(start as StableRowIndex)
+            ..first.saturating_add(end as StableRowIndex);
+        if !visit(rows, &physical[start..end]) {
+            break;
+        }
+        start = end;
     }
 }
 
@@ -7549,6 +7788,284 @@ mod tests {
         assert_eq!(pane.get_line_layout(), Ok(None));
     }
 
+    fn isolated_search_test(name: &str) -> bool {
+        const CHILD: &str = "FT_ISOLATED_SEARCH_TEST";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(name)) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                return true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "search subprocess timed out: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cold_search_finds_retained_paragraph_and_resident_control() {
+        if isolated_search_test(
+            "localpane::tests::cold_search_finds_retained_paragraph_and_resident_control",
+        ) {
+            return;
+        }
+        let (pane, _mux, _registration, _old_sink, _token) = cold_resize_fixture(false);
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut term = Terminal::new(
+            term_size(80, 4),
+            Arc::new(ColdResizeTestConfig(Arc::clone(&sink))),
+            "FrankenTerm",
+            "cold-search",
+            Box::new(Vec::new()),
+        );
+        let paragraph = format!(
+            "RAGGED_04806 {}{} END_04806",
+            "ab 界 e\u{301} 🚀 xy\u{a0}z ".repeat(7),
+            "q".repeat(64)
+        );
+        assert_eq!(paragraph.len(), 241);
+        term.advance_bytes(paragraph.as_bytes());
+        term.advance_bytes(b"\r\n");
+        for _ in 0..12 {
+            term.advance_bytes(b"later unselected history\r\n");
+        }
+        term.advance_bytes(b"RESIDENT_SEARCH_CONTROL");
+        *pane.terminal.lock() = term;
+        let (range, resident_start) = {
+            let term = pane.terminal.lock();
+            let (first, count) = term.screen().scrollback_geometry();
+            (
+                first..first + count as StableRowIndex,
+                term.screen().phys_to_stable_row_index(0),
+            )
+        };
+        let read = pane
+            .capture_line_read(range.clone(), &mut Default::default())
+            .unwrap()
+            .unwrap()
+            .hydrate(|| false)
+            .unwrap();
+        assert!(pane.terminal.lock().screen().validates_line_read(&read));
+        let selected_row = read.first_row()
+            + read
+                .lines()
+                .position(|line| line.as_str().starts_with("RAGGED_04806"))
+                .expect("real cold hydration must contain the searched paragraph")
+                as StableRowIndex;
+        assert!(selected_row < resident_start, "target must be cold-only");
+        drop(read);
+        let resident = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("RESIDENT_SEARCH_CONTROL".into()),
+            range.clone(),
+            Some(10),
+        ))
+        .unwrap();
+        assert_eq!(resident.len(), 1, "resident search positive control");
+        let cold = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("RAGGED_04806".into()),
+            range.clone(),
+            Some(10),
+        ))
+        .unwrap();
+        assert_eq!(cold.len(), 1, "search must include retained cold payload");
+        assert_eq!(cold[0].start_y, selected_row);
+        assert_eq!(cold[0].start_x, 0);
+        assert_eq!(cold[0].end_x, "RAGGED_04806".len());
+        for cols in [69, 106] {
+            pane.terminal.lock().resize(term_size(cols, 4));
+            // No preparation call: search itself must publish newly hydrated
+            // geometry before interpreting rebased stable coordinates.
+            let matches = promise::spawn::block_on(pane.search(
+                Pattern::CaseSensitiveString(paragraph.clone()),
+                StableRowIndex::MIN..StableRowIndex::MAX,
+                Some(10),
+            ))
+            .unwrap();
+            assert_eq!(matches.len(), 1, "whole paragraph after resize to {}", cols);
+            let found = matches[0];
+            let read = pane
+                .capture_line_read(found.start_y..found.end_y + 1, &mut Default::default())
+                .unwrap()
+                .unwrap()
+                .hydrate(|| false)
+                .unwrap();
+            assert!(pane.terminal.lock().screen().validates_line_read(&read));
+            let mut actual = String::new();
+            for (offset, line) in read.lines().enumerate() {
+                let row = read.first_row() + offset as StableRowIndex;
+                for cell in line.visible_cells() {
+                    if (row != found.start_y || cell.cell_index() >= found.start_x)
+                        && (row != found.end_y || cell.cell_index() < found.end_x)
+                    {
+                        actual.push_str(cell.str());
+                    }
+                }
+            }
+            assert_eq!(actual, paragraph);
+        }
+        let range = StableRowIndex::MIN..StableRowIndex::MAX;
+        // Reserve the other three slots in this isolated process. Recovery
+        // below can only run after the abandoned worker releases its own slot.
+        let mut held = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while held.len() < 4 {
+            if let Some(permit) = crate::pane::LineReadPermit::try_acquire() {
+                held.push(permit);
+            } else {
+                assert!(Instant::now() < deadline, "search worker did not retire");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        drop(held.pop());
+        // Pause a real payload read. Search must not own the terminal mutex
+        // while blocked on storage, and abandoning its future must be safe.
+        use std::future::Future;
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        *sink.read_gate.lock() = Some((entered_tx, release_rx));
+        let mut abandoned = Box::pin(pane.search(
+            Pattern::CaseSensitiveString("RAGGED_04806".into()),
+            range.clone(),
+            Some(10),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let pending = abandoned.as_mut().poll(&mut context).is_pending();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+        let terminal_free = pane.terminal.try_lock().is_some();
+        drop(abandoned);
+        let _ = release_tx.send(());
+        sink.read_gate.lock().take();
+        assert!(pending && entered.is_ok() && terminal_free);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let recovered = promise::spawn::block_on(pane.search(
+                Pattern::CaseSensitiveString("RAGGED_04806".into()),
+                range.clone(),
+                Some(10),
+            ));
+            if let Ok(matches) = recovered {
+                assert_eq!(matches.len(), 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled search must release its worker"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(held);
+        // Prune real retained source after capture but before hydration.
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        *sink.read_gate.lock() = Some((entered_tx, release_rx));
+        let mut stale = Box::pin(pane.search(
+            Pattern::CaseSensitiveString("RAGGED_04806".into()),
+            range,
+            Some(10),
+        ));
+        let pending = stale.as_mut().poll(&mut context).is_pending();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+        let removed = sink.rows.lock().1.remove(&selected_row).is_some();
+        let _ = release_tx.send(());
+        sink.read_gate.lock().take();
+        assert!(pending && entered.is_ok() && removed);
+        assert!(
+            promise::spawn::block_on(stale).is_err(),
+            "pruned search must not publish empty success"
+        );
+    }
+
+    #[test]
+    fn search_preserves_wrap_and_internal_chunk_boundary_coordinates() {
+        if isolated_search_test(
+            "localpane::tests::search_preserves_wrap_and_internal_chunk_boundary_coordinates",
+        ) {
+            return;
+        }
+        let (pane, _mux, _registration, _old_sink, _token) = cold_resize_fixture(false);
+        let sink = Arc::new(ColdResizeTestSink::default());
+        let mut term = Terminal::new(
+            term_size(4, 1010),
+            Arc::new(ColdResizeTestConfig(sink)),
+            "FrankenTerm",
+            "search-boundary",
+            Box::new(Vec::new()),
+        );
+        for _ in 0..999 {
+            term.advance_bytes(b"x\r\n");
+        }
+        term.advance_bytes(b"aaNEEDLEzz");
+        *pane.terminal.lock() = term;
+        let matches = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("NEEDLE".into()),
+            0..1010,
+            Some(10),
+        ))
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start_y, matches[0].start_x), (999, 2));
+        assert_eq!((matches[0].end_y, matches[0].end_x), (1001, 0));
+        let mut term = Terminal::new(
+            term_size(4, 2),
+            Arc::new(ColdResizeTestConfig(
+                Arc::new(ColdResizeTestSink::default()),
+            )),
+            "FrankenTerm",
+            "search-folded",
+            Box::new(Vec::new()),
+        );
+        term.advance_bytes("İZ".as_bytes());
+        *pane.terminal.lock() = term;
+        let matches = promise::spawn::block_on(pane.search(
+            Pattern::CaseInSensitiveString("z".into()),
+            0..2,
+            Some(10),
+        ))
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start_y, matches[0].start_x), (0, 1));
+        assert_eq!((matches[0].end_y, matches[0].end_x), (0, 2));
+        pane.terminal.lock().advance_bytes("界".as_bytes());
+        let matches = promise::spawn::block_on(pane.search(
+            Pattern::CaseSensitiveString("界".into()),
+            0..2,
+            Some(10),
+        ))
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start_y, matches[0].start_x), (0, 2));
+        assert_eq!((matches[0].end_y, matches[0].end_x), (0, 4));
+        let matches =
+            promise::spawn::block_on(pane.search(Pattern::Regex("^|界".into()), 0..2, Some(1)))
+                .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start_x, matches[0].end_x), (2, 4));
+    }
+
     fn cold_resize_read_all(pane: &LocalPane) -> anyhow::Result<String> {
         let read = {
             let term = pane.terminal.lock();
@@ -11531,8 +12048,9 @@ mod tests {
 
     #[test]
     fn search_end_grapheme_index_saturates() {
-        assert_eq!(next_search_grapheme_idx(0), 1);
-        assert_eq!(next_search_grapheme_idx(usize::MAX), usize::MAX);
+        assert_eq!(next_search_grapheme_idx(0, 1), 1);
+        assert_eq!(next_search_grapheme_idx(0, 2), 2);
+        assert_eq!(next_search_grapheme_idx(usize::MAX, 2), usize::MAX);
     }
 
     #[test]

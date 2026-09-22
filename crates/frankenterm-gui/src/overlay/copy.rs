@@ -42,6 +42,27 @@ lazy_static::lazy_static! {
 }
 
 const SEARCH_CHUNK_SIZE: StableRowIndex = 1000;
+// Local search joins at most 1,024 cells into a logical segment. One row
+// per cell is the conservative overlap, including one-column terminals.
+const SEARCH_CHUNK_CONTEXT: StableRowIndex = 1024;
+
+fn older_search_chunk(
+    previous_start: StableRowIndex,
+    history: Range<StableRowIndex>,
+) -> Range<StableRowIndex> {
+    previous_start
+        .saturating_sub(SEARCH_CHUNK_SIZE)
+        .max(history.start)
+        ..previous_start
+            .saturating_add(SEARCH_CHUNK_CONTEXT)
+            .min(history.end)
+}
+
+fn retain_search_chunk_ownership(results: &mut Vec<SearchResult>, owned_end: StableRowIndex) {
+    // Overlap supplies trailing context only. A result belongs to the unique
+    // chunk containing its start row, independent of backend-local match IDs.
+    results.retain(|result| result.start_y < owned_end);
+}
 const SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK: u32 = 100_000;
 const MAX_SEARCH_RESULTS_PER_CHUNK: usize = 100_000;
 const MAX_EXPANDED_SEARCH_ROWS_PER_CHUNK: usize = 200_000;
@@ -50,6 +71,7 @@ const MAX_TOTAL_EXPANDED_SEARCH_ROWS: usize = 200_000;
 const PARALLEL_SORT_MIN_RESULTS: usize = 4096;
 const SEARCH_RETRY_BASE_MILLIS: u64 = 50;
 const SEARCH_RETRY_MAX_MILLIS: u64 = 1000;
+const MAX_SEARCH_RETRIES: u8 = 4;
 
 pub struct CopyOverlay {
     delegate: Arc<dyn Pane>,
@@ -138,6 +160,7 @@ struct CopyRenderable {
     /// Used to debounce queries while the user is typing
     typing_cookie: usize,
     searching: Option<Searching>,
+    search_failed: Option<SearchRunIdentity>,
     next_search_run_id: usize,
     search_abort: Option<AbortHandle>,
     search_preparation_cancel: Option<Arc<AtomicBool>>,
@@ -158,6 +181,30 @@ struct Searching {
     run: SearchRunIdentity,
     range: Range<StableRowIndex>,
     retry_attempt: u8,
+}
+
+fn finish_exhausted_search(
+    searching: &mut Option<Searching>,
+    failed: &mut Option<SearchRunIdentity>,
+    run: SearchRunIdentity,
+) -> bool {
+    if !searching
+        .as_ref()
+        .is_some_and(|pending| pending.run == run && pending.retry_attempt >= MAX_SEARCH_RETRIES)
+    {
+        return false;
+    }
+    *failed = Some(run);
+    searching.take();
+    true
+}
+
+fn admit_search_restart(failed: &mut Option<SearchRunIdentity>, preserve_result: bool) -> bool {
+    if preserve_result && failed.is_some() {
+        return false;
+    }
+    *failed = None;
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +245,15 @@ struct PreparedCopyChunk {
     by_line: HashMap<StableRowIndex, Vec<MatchResult>>,
     dirty_rows: RangeSet<StableRowIndex>,
     expanded_rows: usize,
+}
+
+fn merge_search_row_matches(
+    current: &mut HashMap<StableRowIndex, Vec<MatchResult>>,
+    incoming: HashMap<StableRowIndex, Vec<MatchResult>>,
+) {
+    for (row, mut matches) in incoming {
+        current.entry(row).or_default().append(&mut matches);
+    }
 }
 
 struct Dimensions {
@@ -537,8 +593,9 @@ fn prepare_copy_search_chunk(
 }
 
 async fn prepare_copy_search_chunk_off_thread(
-    results: Vec<SearchResult>,
+    mut results: Vec<SearchResult>,
     searched: Range<StableRowIndex>,
+    owned_end: StableRowIndex,
     cols: usize,
     result_base: usize,
     result_capacity: usize,
@@ -552,6 +609,7 @@ async fn prepare_copy_search_chunk_off_thread(
             let _ = sender.send(Err("copy search preparation lane busy".to_string()));
             return;
         };
+        retain_search_chunk_ownership(&mut results, owned_end);
         let prepared = prepare_copy_search_chunk(
             results,
             &searched,
@@ -656,6 +714,89 @@ mod dirty_tracking_tests {
             pixel_height: 80,
             reverse_video: false,
         }
+    }
+
+    #[test]
+    fn copy_search_overlap_preserves_boundary_match_once() {
+        let history = 0..3000;
+        let newer = 2000..3000;
+        let older = older_search_chunk(newer.start, history.clone());
+        assert_eq!(older, 1000..3000);
+        let crossing = SearchResult {
+            start_x: 79,
+            start_y: 1999,
+            end_x: 4,
+            end_y: 2000,
+            match_id: 0,
+        };
+        let duplicate = SearchResult {
+            start_x: 8,
+            start_y: 2000,
+            end_x: 12,
+            end_y: 2000,
+            match_id: 0,
+        };
+        let cancel = AtomicBool::new(false);
+        let newest =
+            prepare_copy_search_chunk(vec![crossing, duplicate], &newer, 80, 0, 100, 200, &cancel)
+                .unwrap();
+        assert_eq!(newest.results, vec![duplicate]);
+        let mut candidates = vec![crossing, duplicate];
+        retain_search_chunk_ownership(&mut candidates, newer.start);
+        let previous = prepare_copy_search_chunk(
+            candidates,
+            &older,
+            80,
+            newest.results.len(),
+            100,
+            200,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(previous.results, vec![crossing]);
+        assert_eq!(older_search_chunk(older.start, history), 0..2024);
+        assert_eq!(previous.by_line.get(&1999).unwrap().len(), 1);
+        assert_eq!(previous.by_line.get(&2000).unwrap().len(), 1);
+        let mut installed = newest.by_line;
+        merge_search_row_matches(&mut installed, previous.by_line);
+        let shared = installed.get(&2000).unwrap();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(
+            (shared[0].range.clone(), shared[0].result_index),
+            (8..12, 0)
+        );
+        assert_eq!((shared[1].range.clone(), shared[1].result_index), (0..4, 1));
+    }
+
+    #[test]
+    fn copy_search_retry_exhaustion_retires_exact_run() {
+        let run = search_identity(1, 10, 80);
+        let mut searching = Some(pending(run, 0..100));
+        let mut failed = None;
+        for attempt in 0..MAX_SEARCH_RETRIES {
+            searching.as_mut().unwrap().retry_attempt = attempt;
+            assert!(!finish_exhausted_search(&mut searching, &mut failed, run));
+            assert!(searching.is_some());
+            assert!(failed.is_none());
+        }
+        searching.as_mut().unwrap().retry_attempt = MAX_SEARCH_RETRIES;
+        let superseded = search_identity(0, 10, 80);
+        assert!(!finish_exhausted_search(
+            &mut searching,
+            &mut failed,
+            superseded
+        ));
+        assert!(finish_exhausted_search(&mut searching, &mut failed, run));
+        assert!(searching.is_none());
+        assert_eq!(failed, Some(run));
+        assert_eq!(
+            classify_search_completion(None, run, &(0..100), run, false),
+            SearchCompletionStatus::Superseded
+        );
+        assert!(!admit_search_restart(&mut failed, true));
+        assert_eq!(failed, Some(run));
+        assert!(admit_search_restart(&mut failed, false));
+        assert!(failed.is_none());
     }
 
     #[test]
@@ -991,6 +1132,7 @@ impl CopyOverlay {
             selection_mode: SelectionMode::Cell,
             typing_cookie: 0,
             searching: None,
+            search_failed: None,
             next_search_run_id: 0,
             search_abort: None,
             search_preparation_cancel: None,
@@ -1143,10 +1285,9 @@ impl CopyRenderable {
         source_range: Range<StableRowIndex>,
     ) {
         let result_count = prepared.results.len();
-        // Search chunks are clipped to disjoint row ranges, so their row maps
-        // can transfer ownership wholesale without copying every match under
-        // the renderer lock.
-        self.by_line.extend(prepared.by_line);
+        // Start-row ownership is disjoint; wrapped matches can still share
+        // covered rows with another chunk. Preserve both highlight lists.
+        merge_search_row_matches(&mut self.by_line, prepared.by_line);
         self.dirty_results.add_set(&prepared.dirty_rows);
         self.expanded_result_rows = self
             .expanded_result_rows
@@ -1233,6 +1374,9 @@ impl CopyRenderable {
     }
 
     fn restart_search(&mut self, preserve_result: bool, retry_attempt: u8) {
+        if !admit_search_restart(&mut self.search_failed, preserve_result) {
+            return;
+        }
         self.cancel_search_task();
         self.cancel_debounce();
         self.cancel_retry();
@@ -1304,7 +1448,7 @@ impl CopyRenderable {
                 range: range.clone(),
                 retry_attempt,
             });
-            self.spawn_search_chunk(pane, window, run, pattern, range);
+            self.spawn_search_chunk(pane, window, run, pattern, range, end);
         } else {
             self.last_result_seqno = self.delegate.get_current_seqno();
             self.searching.take();
@@ -1320,6 +1464,7 @@ impl CopyRenderable {
         run: SearchRunIdentity,
         pattern: Pattern,
         range: Range<StableRowIndex>,
+        owned_end: StableRowIndex,
     ) {
         let reservation = match super::reserve_overlay_main_thread(
             promise::spawn::MainThreadServiceClass::Interactive,
@@ -1359,6 +1504,7 @@ impl CopyRenderable {
                         prepare_copy_search_chunk_off_thread(
                             results,
                             preparation_range,
+                            owned_end,
                             run.cols,
                             result_base,
                             result_capacity,
@@ -1409,6 +1555,24 @@ impl CopyRenderable {
     }
 
     fn schedule_search_retry(&mut self, run: SearchRunIdentity, retry_attempt: u8) {
+        if finish_exhausted_search(&mut self.searching, &mut self.search_failed, run) {
+            self.cancel_search_task();
+            self.cancel_retry();
+            for row in self.by_line.keys() {
+                self.dirty_results.add(*row);
+            }
+            self.results.clear();
+            self.result_source_ends.clear();
+            self.result_source_ranges.clear();
+            self.by_line.clear();
+            self.expanded_result_rows = 0;
+            self.result_pos.take();
+            self.desired_result.take();
+            self.desired_result_ordinal.take();
+            self.clear_selection();
+            self.mark_search_ui_dirty();
+            return;
+        }
         let reservation = match super::reserve_overlay_main_thread(
             promise::spawn::MainThreadServiceClass::Render,
             4 * 1024,
@@ -1597,10 +1761,14 @@ impl CopyRenderable {
         // Search next chunk
         let pane: Arc<dyn Pane> = self.delegate.clone();
         let window = self.window.clone();
-        let end = range.start;
-        let range = end
-            .saturating_sub(SEARCH_CHUNK_SIZE)
-            .max(dims.scrollback_top)..end;
+        let owned_end = range.start;
+        let Some(history_end) = checked_stable_row_end(dims.scrollback_top, dims.scrollback_rows)
+        else {
+            self.searching.take();
+            self.mark_search_ui_dirty();
+            return;
+        };
+        let range = older_search_chunk(owned_end, dims.scrollback_top..history_end);
 
         let next_run = search_run_identity(run.id, source_end, dims);
         let retry_attempt = self
@@ -1614,7 +1782,7 @@ impl CopyRenderable {
             range: range.clone(),
             retry_attempt,
         });
-        self.spawn_search_chunk(pane, window, next_run, pattern, range);
+        self.spawn_search_chunk(pane, window, next_run, pattern, range, owned_end);
         self.mark_search_ui_dirty();
     }
 
@@ -2500,6 +2668,9 @@ impl CopyOverlay {
                         let remain = match &self.renderer.searching {
                             Some(Searching { remain, .. }) => {
                                 format!(" searching {remain} lines")
+                            }
+                            None if self.renderer.search_failed.is_some() => {
+                                " search failed; edit query to retry".to_string()
                             }
                             None => String::new(),
                         };
