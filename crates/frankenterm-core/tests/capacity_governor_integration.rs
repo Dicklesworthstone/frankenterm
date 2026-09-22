@@ -18,7 +18,10 @@ fn robot_heavy_cargo_without_rch_requires_policy_approval() {
     let mut engine = PolicyEngine::permissive();
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(7)
-        .with_capabilities(PaneCapabilities::prompt())
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::prompt()
+        })
         .with_command_text(command);
 
     let decision = engine.authorize(&input);
@@ -41,7 +44,10 @@ fn robot_heavy_cargo_with_rch_prefix_is_allowed() {
     let mut engine = PolicyEngine::permissive();
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(7)
-        .with_capabilities(PaneCapabilities::prompt())
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::prompt()
+        })
         .with_command_text(command);
 
     let decision = engine.authorize(&input);

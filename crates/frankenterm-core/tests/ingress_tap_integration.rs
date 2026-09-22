@@ -48,6 +48,7 @@ fn safe_caps() -> PaneCapabilities {
     PaneCapabilities {
         prompt_active: true,
         alt_screen: Some(false),
+        is_reserved: Some(false),
         ..PaneCapabilities::default()
     }
 }

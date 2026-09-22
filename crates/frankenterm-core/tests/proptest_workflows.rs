@@ -65,7 +65,7 @@ fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
         any::<bool>(),
         any::<Option<bool>>(),
         any::<bool>(),
-        any::<bool>(),
+        any::<Option<bool>>(),
     )
         .prop_map(|(prompt, cmd, alt, gap, reserved)| PaneCapabilities {
             prompt_active: prompt,
@@ -330,7 +330,7 @@ proptest! {
             BroadcastPrecondition::PromptActive => caps.prompt_active,
             BroadcastPrecondition::NotAltScreen => !caps.alt_screen.unwrap_or(false),
             BroadcastPrecondition::NoRecentGap => !caps.has_recent_gap,
-            BroadcastPrecondition::NotReserved => !caps.is_reserved,
+            BroadcastPrecondition::NotReserved => caps.is_reserved == Some(false),
         };
         prop_assert_eq!(result, expected,
             "Precondition check should match manual computation");
@@ -365,7 +365,7 @@ proptest! {
             command_running: false,
             alt_screen: Some(false),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             reserved_by: None,
         };
         let failures = check_preconditions(&default_broadcast_preconditions(), &caps);

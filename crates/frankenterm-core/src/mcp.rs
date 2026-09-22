@@ -88,6 +88,9 @@ mod mcp_tools;
 mod mcp_types;
 
 #[cfg(test)]
+use crate::pane_capability_resolution::IpcPaneState;
+use crate::pane_capability_resolution::{CapabilityResolution, resolve_alt_screen_state};
+#[cfg(test)]
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 pub use mcp_bridge::{
     build_server, build_server_degraded, build_server_with_db,
@@ -145,15 +148,6 @@ use mcp_types::{
     RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
     TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
-use crate::pane_capability_resolution::{CapabilityResolution, resolve_alt_screen_state};
-#[cfg(test)]
-use crate::pane_capability_resolution::IpcPaneState;
-use mcp_types::{
-    McpEnvelope, McpMissionAssignmentCounters,
-    McpMissionAssignmentData, McpMissionFailureCatalogEntry, McpMissionTransitionInfo,
-    McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
-    now_ms,
-};
 #[cfg(all(test, not(feature = "fuzz")))]
 use mcp_types::{
     EventsParams, GetTextParams, MissionAbortParams, MissionExplainParams, MissionPauseParams,
@@ -166,6 +160,11 @@ use mcp_types::{
     apply_tail_truncation, default_cass_context_lines, default_cass_limit, default_cass_offset,
     default_cass_timeout_secs, default_events_limit, default_tail, default_timeout_secs,
     default_ttl_ms, default_wait_tail,
+};
+use mcp_types::{
+    McpEnvelope, McpMissionAssignmentCounters, McpMissionAssignmentData,
+    McpMissionFailureCatalogEntry, McpMissionTransitionInfo, McpReservationInfo,
+    McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams, now_ms,
 };
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
@@ -523,6 +522,7 @@ fn check_refresh_cooldown(
 /// Resolve pane capabilities for an MCP action through the shared resolver,
 /// locating the watcher IPC socket from this server's workspace config.
 async fn resolve_pane_capabilities(
+    cx: &crate::cx::Cx,
     config: &Config,
     storage: Option<&StorageHandle>,
     pane_id: u64,
@@ -531,13 +531,13 @@ async fn resolve_pane_capabilities(
         Ok(layout) => (Some(layout.ipc_socket_path), None),
         Err(err) => (None, Some(format!("Workspace layout unavailable: {err}"))),
     };
-    let mut resolution =
-        crate::pane_capability_resolution::resolve_pane_capabilities(
-            pane_id,
-            storage,
-            ipc_socket_path.as_deref(),
-        )
-        .await;
+    let mut resolution = crate::pane_capability_resolution::resolve_pane_capabilities(
+        cx,
+        pane_id,
+        storage,
+        ipc_socket_path.as_deref(),
+    )
+    .await;
     resolution.warnings.extend(layout_warning);
     resolution
 }

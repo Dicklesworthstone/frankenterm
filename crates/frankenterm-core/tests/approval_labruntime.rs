@@ -53,7 +53,10 @@ fn base_input() -> PolicyInput {
         .with_pane(1)
         .with_domain("local")
         .with_text_summary("echo hi")
-        .with_capabilities(PaneCapabilities::prompt())
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::prompt()
+        })
 }
 
 fn test_pane() -> PaneRecord {
@@ -243,7 +246,10 @@ fn approval_different_action_fingerprint_prevents_consumption() {
             .with_pane(1)
             .with_domain("local")
             .with_text_summary("echo different")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            });
 
         let consumed = store
             .consume(&request.allow_once_code, &different_text)
@@ -404,7 +410,10 @@ fn approval_plan_bound_scope_violation_rejected() {
             .with_pane(99)
             .with_domain("local")
             .with_text_summary("echo hi")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            });
 
         let consumed = store
             .consume_for_plan(&request.allow_once_code, &wrong_pane, "sha256:scopedplan")
@@ -1029,7 +1038,10 @@ fn approval_wrong_action_kind_prevents_consumption() {
             .with_pane(1)
             .with_domain("local")
             .with_text_summary("echo hi")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            });
 
         let consumed = store
             .consume(&request.allow_once_code, &wrong_action)

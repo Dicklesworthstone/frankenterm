@@ -1024,8 +1024,16 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx = WorkflowContext::new(storage, 42, PaneCapabilities::prompt(), "cx-inj-1")
-                .with_injector(injector);
+            let mut ctx = WorkflowContext::new(
+                storage,
+                42,
+                PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                },
+                "cx-inj-1",
+            )
+            .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_text_with_cx(&cx, "echo hello").await;
             assert!(result.is_ok());
@@ -1043,8 +1051,16 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx = WorkflowContext::new(storage, 43, PaneCapabilities::prompt(), "cx-inj-2")
-                .with_injector(injector);
+            let mut ctx = WorkflowContext::new(
+                storage,
+                43,
+                PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                },
+                "cx-inj-2",
+            )
+            .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_c_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -1070,8 +1086,16 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx = WorkflowContext::new(storage, 44, PaneCapabilities::prompt(), "cx-inj-3")
-                .with_injector(injector);
+            let mut ctx = WorkflowContext::new(
+                storage,
+                44,
+                PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                },
+                "cx-inj-3",
+            )
+            .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_d_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -1097,8 +1121,16 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx = WorkflowContext::new(storage, 45, PaneCapabilities::prompt(), "cx-inj-4")
-                .with_injector(injector);
+            let mut ctx = WorkflowContext::new(
+                storage,
+                45,
+                PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                },
+                "cx-inj-4",
+            )
+            .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_z_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -1132,9 +1164,16 @@ mod tests {
                 let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
                 let injector = make_injector_from_handle(handle);
                 let storage = make_storage();
-                let mut ctx =
-                    WorkflowContext::new(storage, 50, PaneCapabilities::prompt(), "cx-cancel-1")
-                        .with_injector(injector);
+                let mut ctx = WorkflowContext::new(
+                    storage,
+                    50,
+                    PaneCapabilities {
+                        is_reserved: Some(false),
+                        ..PaneCapabilities::prompt()
+                    },
+                    "cx-cancel-1",
+                )
+                .with_injector(injector);
                 let cx = crate::cx::for_testing();
                 cx.cancel_with(
                     crate::outcome::CancelKind::User,

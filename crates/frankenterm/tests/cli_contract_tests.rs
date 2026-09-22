@@ -4631,6 +4631,159 @@ fn contract_tx_show_include_contract_json_envelope() {
 
 #[cfg(unix)]
 #[test]
+fn contract_prepared_send_fence_preserves_plan_and_approval_until_retry() {
+    let (dir, ws) = setup_workspace();
+    let mux = TxOwnedMux::new(&dir);
+    // Human sends may proceed without watcher shell evidence. Require a real
+    // plan-bound approval explicitly, without manufacturing pane capabilities.
+    let mut configuration = frankenterm_core::config::Config::default();
+    configuration.safety.rules = serde_json::from_value(serde_json::json!({
+        "rules": [{
+            "id": "prepared-send-fence-contract",
+            "decision": "require_approval",
+            "match_on": {"actions": ["send_text"]}
+        }]
+    }))
+    .unwrap();
+    let config_path = dir.path().join("prepared-send.toml");
+    std::fs::write(&config_path, configuration.to_toml().unwrap()).unwrap();
+    let text = "prepared-fence-payload";
+    let prepared = mux
+        .command(&ws)
+        .arg("--config")
+        .arg(&config_path)
+        .args([
+            "prepare",
+            "send",
+            "--pane-id",
+            "0",
+            text,
+            "--no-paste",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("prepare against actual owned mux");
+    assert!(
+        prepared.status.success(),
+        "prepare failed: {}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let prepared: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_eq!(prepared["requires_approval"], true);
+    let plan_id = prepared["plan_id"].as_str().unwrap();
+    let approval_code = prepared["approval"]["code"].as_str().unwrap();
+    let database = dir.path().join(".ft/ft.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let credentials = || {
+        connection
+            .query_row(
+                "SELECT p.plan_hash, p.consumed_at, a.code_hash, a.used_at \
+                 FROM prepared_plans p JOIN approval_tokens a ON a.plan_hash = p.plan_hash \
+                 WHERE p.plan_id = ?1",
+                [plan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .expect("real plan and its bound approval must remain stored")
+    };
+    let before = credentials();
+    assert_eq!(before.1, None);
+    assert_eq!(before.3, None);
+    let commit = || {
+        mux.command(&ws)
+            .arg("--config")
+            .arg(&config_path)
+            .args([
+                "commit",
+                plan_id,
+                "--text",
+                text,
+                "--approval-code",
+                approval_code,
+            ])
+            .output()
+            .expect("commit against actual owned mux")
+    };
+    let fence = frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(&database)
+        .expect("hold parent process effect fence");
+    let refused = commit();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("robot.kill_switch.fence_pending"),
+        "expected fence refusal, got: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(credentials(), before);
+    mux.assert_effects(&[]);
+    drop(fence);
+
+    // A token issued while the pane was free must not bypass a subsequently
+    // persisted foreign reservation, even without watcher shell evidence.
+    connection
+        .execute(
+            "INSERT INTO pane_reservations \
+             (pane_id, owner_kind, owner_id, created_at, expires_at, status) \
+             VALUES (0, 'agent', 'foreign-owner', ?1, ?2, 'active')",
+            rusqlite::params![
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                prepared["expires_at"].as_i64().unwrap(),
+            ],
+        )
+        .unwrap();
+    let reservation_id = connection.last_insert_rowid();
+    let reserved = commit();
+    assert!(!reserved.status.success());
+    assert!(
+        String::from_utf8_lossy(&reserved.stderr).contains("Action denied by policy"),
+        "expected reservation denial, got: {}",
+        String::from_utf8_lossy(&reserved.stderr)
+    );
+    assert_eq!(credentials(), before);
+    mux.assert_effects(&[]);
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE pane_reservations SET status = 'released', released_at = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    reservation_id,
+                ],
+            )
+            .unwrap(),
+        1
+    );
+
+    // Exactly the same credentials must still work after the cross-process
+    // fence is released: refusal cannot consume either single-use authority.
+    let accepted = commit();
+    assert!(
+        accepted.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let after = credentials();
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.2, before.2);
+    assert!(after.1.is_some());
+    assert!(after.3.is_some());
+    mux.assert_effects(&["0\tprepared-fence-payload"]);
+}
+
+#[cfg(unix)]
+#[test]
 fn contract_tx_owned_mux_missing_pane_refuses_without_effects() {
     let (dir, ws) = setup_workspace();
     let mut mux = TxOwnedMux::new(&dir);

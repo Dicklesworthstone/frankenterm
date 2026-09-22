@@ -1347,10 +1347,27 @@ impl WorkflowRunner {
         // workflows are triggered by detections on active panes where normal-screen
         // is the expected state. PaneCapabilities::default() leaves alt_screen as
         // None which causes the policy engine to require approval for SendText.
+        let mut capabilities = PaneCapabilities::prompt();
+        match self
+            .storage
+            .get_active_reservation_with_cx(cx, pane_id)
+            .await
+        {
+            Ok(Some(reservation)) => {
+                capabilities.is_reserved = Some(true);
+                capabilities.reserved_by = Some(reservation.owner_id);
+            }
+            Ok(None) => capabilities.is_reserved = Some(false),
+            Err(_) => {
+                tracing::warn!(pane_id, "Workflow reservation authority unavailable");
+            }
+        }
+        // Preconditions need initial ownership evidence too. The injector
+        // refreshes it again for each action, since this snapshot can go stale.
         let mut ctx = WorkflowContext::new(
             self.storage.clone(),
             pane_id,
-            PaneCapabilities::prompt(),
+            capabilities,
             execution_id,
         )
         .with_injector(self.injector.clone());

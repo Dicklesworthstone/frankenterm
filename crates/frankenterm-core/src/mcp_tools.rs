@@ -905,13 +905,14 @@ fn set_tx_contract_workspace_test_root(root: Option<PathBuf>) {
 /// and `wa.get_text`: OSC-133 prompt state from stored segments, alt-screen
 /// and gap state from the watcher IPC, reservations from storage.
 async fn resolve_tx_prepare_capabilities(
+    cx: &crate::cx::Cx,
     config: &Config,
     storage: &StorageHandle,
     contract: &crate::plan::MissionTxContract,
 ) -> std::collections::HashMap<u64, PaneCapabilities> {
     let mut capabilities = std::collections::HashMap::new();
     for pane_id in contract.referenced_pane_ids() {
-        let resolution = resolve_pane_capabilities(config, Some(storage), pane_id).await;
+        let resolution = resolve_pane_capabilities(cx, config, Some(storage), pane_id).await;
         capabilities.insert(pane_id, resolution.capabilities);
     }
     capabilities
@@ -2997,7 +2998,7 @@ impl ToolHandler for WaGetTextTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: GetTextParams = match parse_mcp_tool_params(
@@ -3046,7 +3047,7 @@ impl ToolHandler for WaGetTextTool {
         let result: std::result::Result<McpGetTextData, McpToolError> =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP get-text storage open.
-                let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let open_cx = ctx.cx().clone();
                 let storage = if let Some(path) = db_path.as_ref() {
                     Some(
                         StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
@@ -3063,8 +3064,7 @@ impl ToolHandler for WaGetTextTool {
                 // GH#72: honor any configured vendored mux socket.
                 let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
                 // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
-                let wezterm_cx = crate::cx::Cx::current()
-                    .unwrap_or_else(crate::cx::for_request);
+                let wezterm_cx = open_cx.clone();
                 let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await {
                     Ok(pane_info) => Some(pane_info),
                     Err(err) => {
@@ -3087,7 +3087,7 @@ impl ToolHandler for WaGetTextTool {
                         )
                     })?;
                 let resolution =
-                    resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
+                    resolve_pane_capabilities(&wezterm_cx, &config, storage.as_ref(), params.pane_id).await;
                 let capabilities = resolution.capabilities;
 
                 let mut engine = build_policy_engine_with_shared_rate_limiter(
@@ -3300,7 +3300,7 @@ impl ToolHandler for WaDomTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: DomParams = match parse_mcp_tool_params(
@@ -3323,7 +3323,7 @@ impl ToolHandler for WaDomTool {
 
         let result: std::result::Result<crate::robot_types::DomData, McpToolError> = runtime
             .block_on(async move {
-                let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let open_cx = ctx.cx().clone();
                 let storage = if let Some(path) = db_path.as_ref() {
                     Some(
                         StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
@@ -3337,7 +3337,7 @@ impl ToolHandler for WaDomTool {
                 let redactor = crate::redactor::Redactor::new();
                 // GH#72: honor any configured vendored mux socket.
                 let wezterm = crate::wezterm::wezterm_handle_from_config(config.as_ref());
-                let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let wezterm_cx = open_cx.clone();
 
                 // Semantic zones require a live local pane; no remote-pane path.
                 // A missing pane is an honest "unavailable" observation, not an
@@ -3357,8 +3357,13 @@ impl ToolHandler for WaDomTool {
                 };
                 let domain = pane_info.inferred_domain();
 
-                let resolution =
-                    resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
+                let resolution = resolve_pane_capabilities(
+                    &wezterm_cx,
+                    &config,
+                    storage.as_ref(),
+                    params.pane_id,
+                )
+                .await;
                 let capabilities = resolution.capabilities;
 
                 let mut engine = build_policy_engine_with_shared_rate_limiter(
@@ -3562,7 +3567,7 @@ impl ToolHandler for WaWaitForTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: WaitForParams = match parse_mcp_tool_params(
@@ -3642,7 +3647,7 @@ impl ToolHandler for WaWaitForTool {
         let is_regex = params.regex;
 
         let result = runtime.block_on(async move {
-            let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let open_cx = ctx.cx().clone();
             let storage = if let Some(path) = db_path.as_ref() {
                 Some(
                     StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
@@ -3656,7 +3661,7 @@ impl ToolHandler for WaWaitForTool {
             let remote_pane = load_distributed_remote_pane(storage.as_ref(), pane_id)
                 .await
                 .map_err(McpToolError::from_error)?;
-            let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let wezterm_cx = open_cx.clone();
             let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, pane_id).await {
                 Ok(pane_info) => Some(pane_info),
                 Err(err) => {
@@ -3674,7 +3679,8 @@ impl ToolHandler for WaWaitForTool {
                 .ok_or_else(|| {
                     McpToolError::from_error(WeztermError::PaneNotFound(pane_id).into())
                 })?;
-            let resolution = resolve_pane_capabilities(&config, storage.as_ref(), pane_id).await;
+            let resolution =
+                resolve_pane_capabilities(&wezterm_cx, &config, storage.as_ref(), pane_id).await;
             let capabilities = resolution.capabilities;
 
             let mut engine = build_policy_engine_with_shared_rate_limiter(
@@ -3881,7 +3887,7 @@ impl ToolHandler for WaSearchTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: SearchParams = match parse_mcp_tool_params(
@@ -3981,8 +3987,7 @@ impl ToolHandler for WaSearchTool {
         let result: std::result::Result<SearchExecution, McpToolError> =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP search storage open.
-                let search_open_cx =
-                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let search_open_cx = ctx.cx().clone();
                 let storage =
                     StorageHandle::new_with_cx(&search_open_cx, &db_path.to_string_lossy())
                         .await
@@ -4034,8 +4039,13 @@ impl ToolHandler for WaSearchTool {
                                 Some("Use wa.state to list available panes.".to_string()),
                             )
                         })?;
-                    let resolution =
-                        resolve_pane_capabilities(&config, Some(&storage), pane_id).await;
+                    let resolution = resolve_pane_capabilities(
+                        &search_open_cx,
+                        &config,
+                        Some(&storage),
+                        pane_id,
+                    )
+                    .await;
                     input = input
                         .with_pane(pane_id)
                         .with_domain(domain)
@@ -9632,7 +9642,7 @@ impl ToolHandler for WaSendTool {
 
             tracing::debug!(phase = "capabilities_begin", "wa.send request progress");
             let resolution =
-                resolve_pane_capabilities(&config, Some(&storage), params.pane_id).await;
+                resolve_pane_capabilities(&wezterm_cx, &config, Some(&storage), params.pane_id).await;
             tracing::debug!(phase = "capabilities_complete", "wa.send request progress");
             let capabilities = resolution.capabilities;
 
@@ -10100,7 +10110,7 @@ impl ToolHandler for WaWorkflowRunTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
         let params: WorkflowRunParams = match serde_json::from_value(arguments) {
@@ -10159,7 +10169,7 @@ impl ToolHandler for WaWorkflowRunTool {
         let result: std::result::Result<McpWorkflowRunData, McpToolError> =
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP workflow run storage open.
-                let wf_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let wf_open_cx = ctx.cx().clone();
                 let storage =
                     StorageHandle::new_with_cx(&wf_open_cx, &db_path.to_string_lossy())
                         .await
@@ -10175,7 +10185,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 let domain = pane_info.inferred_domain();
 
                 let resolution =
-                    resolve_pane_capabilities(&config, Some(storage.as_ref()), params.pane_id)
+                    resolve_pane_capabilities(&wf_open_cx, &config, Some(storage.as_ref()), params.pane_id)
                         .await;
                 let capabilities = resolution.capabilities;
 
@@ -10930,7 +10940,7 @@ impl ToolHandler for WaTxRunTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: TxRunParams = if arguments.is_null() {
             TxRunParams::default()
@@ -11045,8 +11055,7 @@ impl ToolHandler for WaTxRunTool {
             }
         };
         let storage = match runtime.block_on(async {
-            let tx_run_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            StorageHandle::new_with_cx(&tx_run_cx, &layout.db_path.to_string_lossy()).await
+            StorageHandle::new_with_cx(ctx.cx(), &layout.db_path.to_string_lossy()).await
         }) {
             Ok(storage) => storage,
             Err(err) => {
@@ -11081,6 +11090,7 @@ impl ToolHandler for WaTxRunTool {
             .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
         let resolved_capabilities = runtime.block_on(resolve_tx_prepare_capabilities(
+            ctx.cx(),
             self.config.as_ref(),
             &storage,
             &contract,
@@ -11253,7 +11263,7 @@ impl ToolHandler for WaTxRollbackTool {
         }
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
         let params: TxRollbackParams = if arguments.is_null() {
             TxRollbackParams::default()
@@ -11374,8 +11384,7 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
         let storage = match runtime.block_on(async {
-            let rollback_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            StorageHandle::new_with_cx(&rollback_cx, &layout.db_path.to_string_lossy()).await
+            StorageHandle::new_with_cx(ctx.cx(), &layout.db_path.to_string_lossy()).await
         }) {
             Ok(storage) => storage,
             Err(err) => {
@@ -11410,6 +11419,7 @@ impl ToolHandler for WaTxRollbackTool {
             .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
         let resolved_capabilities = runtime.block_on(resolve_tx_prepare_capabilities(
+            ctx.cx(),
             self.config.as_ref(),
             &storage,
             &contract,
@@ -14398,11 +14408,11 @@ mod tests {
         tx_run_test_wezterm_override_slot, tx_run_wezterm_handle, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
-    use crate::pane_capability_resolution::{IpcPaneState, set_test_pane_state_override};
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_CONFIG, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY,
         MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WORKFLOW,
     };
+    use crate::pane_capability_resolution::{IpcPaneState, set_test_pane_state_override};
     use crate::plan::{
         ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId,
         MISSION_TX_SCHEMA_VERSION, Mission, MissionActorRole, MissionId, MissionKillSwitchLevel,
@@ -14860,7 +14870,7 @@ mod tests {
     fn seed_tx_run_real_targets(
         db_path: &Path,
         mock: &Arc<crate::wezterm::MockWezterm>,
-    ) -> Vec<crate::mcp::McpTestPaneStateOverrideGuard> {
+    ) -> Vec<crate::pane_capability_resolution::TestPaneStateOverrideGuard> {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -15273,6 +15283,7 @@ mod tests {
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
         let mut contract = sample_tx_contract(MissionTxState::Planned);
         let resolved_capabilities = runtime.block_on(super::resolve_tx_prepare_capabilities(
+            &crate::cx::for_testing(),
             config.as_ref(),
             &storage,
             &contract,

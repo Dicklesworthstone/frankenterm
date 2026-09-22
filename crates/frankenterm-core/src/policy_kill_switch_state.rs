@@ -258,7 +258,11 @@ pub fn acquire_kill_switch_fence(db_path: &Path) -> Result<KillSwitchFence, Kill
     })
 }
 
-fn backend_fence(
+/// Share workspace effect authority with storage-writer mutations. Acquire in
+/// the executing writer, not in a cancellable caller that only enqueues work.
+/// Contention is nonblocking; callers must refuse before mutation and retain
+/// the returned guard until their SQL has committed.
+pub(crate) fn backend_fence(
     backend: &dyn StorageBackend,
 ) -> Result<Option<KillSwitchFence>, KillSwitchStateError> {
     let path = backend

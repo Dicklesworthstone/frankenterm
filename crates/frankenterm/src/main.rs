@@ -16066,9 +16066,7 @@ fn list_agent_config_xattr_names(
         let size = match rustix::fs::flistxattr(file.as_fd(), &mut empty[..]) {
             Ok(0) => return Ok(Vec::new()),
             Ok(size) => size,
-            Err(err)
-                if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP =>
-            {
+            Err(err) if err == rustix::io::Errno::NOTSUP || err == rustix::io::Errno::OPNOTSUPP => {
                 return Ok(Vec::new());
             }
             Err(err) => return Err(inspect_error(err)),
@@ -16090,10 +16088,7 @@ fn list_agent_config_xattr_names(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn validate_agent_config_xattr_names(
-    names: &[u8],
-    path: &Path,
-) -> std::result::Result<(), String> {
+fn validate_agent_config_xattr_names(names: &[u8], path: &Path) -> std::result::Result<(), String> {
     let unexpected: Vec<String> = names
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty() && !AGENT_CONFIG_OS_MANAGED_XATTRS.contains(name))
@@ -23092,12 +23087,13 @@ async fn authorize_read_or_search_policy(
 
     if let Some(pane_id) = pane_id {
         input = input.with_pane(pane_id);
-        let resolution = resolve_pane_capabilities(pane_id, storage, ipc_socket_path).await;
+        let storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        let resolution =
+            resolve_pane_capabilities(&storage_cx, pane_id, storage, ipc_socket_path).await;
         input = input.with_capabilities(resolution.capabilities);
         let distributed_remote_pane = if let Some(storage) = storage {
             // ft-xbnl0.2.3 tick 235: cx-first storage read.
-            let storage_cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
             match storage.get_pane_with_cx(&storage_cx, pane_id).await {
                 Ok(record) => record.filter(|pane| is_distributed_remote_domain(&pane.domain)),
                 Err(err) => {
@@ -24101,13 +24097,15 @@ use frankenterm_core::pane_capability_resolution::resolve_pane_capabilities;
 /// impossible to satisfy from `ft tx run` / `ft tx rollback` no matter what
 /// the pane is actually doing.
 async fn resolve_tx_contract_capabilities(
+    cx: &frankenterm_core::cx::Cx,
     contract: &frankenterm_core::plan::MissionTxContract,
     storage: &frankenterm_core::storage::StorageHandle,
     ipc_socket_path: Option<&Path>,
 ) -> HashMap<u64, frankenterm_core::policy::PaneCapabilities> {
     let mut capabilities = HashMap::new();
     for pane_id in contract.referenced_pane_ids() {
-        let resolution = resolve_pane_capabilities(pane_id, Some(storage), ipc_socket_path).await;
+        let resolution =
+            resolve_pane_capabilities(cx, pane_id, Some(storage), ipc_socket_path).await;
         for warning in &resolution.warnings {
             tracing::debug!(pane_id, %warning, "tx capability resolution warning");
         }
@@ -24115,7 +24113,6 @@ async fn resolve_tx_contract_capabilities(
     }
     capabilities
 }
-
 
 fn build_mux_send_policy_input(
     pane_id: u64,
@@ -50538,6 +50535,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .ok();
                                 let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
                                 let resolution = resolve_pane_capabilities(
+                                    &cx,
                                     pane_id,
                                     storage.as_ref(),
                                     Some(ipc_socket),
@@ -50641,12 +50639,25 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 .with_tuning(&config.tuning)
                                 .with_command_gate_config(config.safety.command_gate.clone())
                                 .with_policy_rules(config.safety.rules.clone());
+                                // Serialize fresh authority reads and the entire
+                                // write/ENTER effect with reservation changes.
+                                let effect_fence = match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(Path::new(storage.db_path())) {
+                                    Ok(fence) => fence,
+                                    Err(error) => {
+                                        let response = RobotResponse::<RobotSendData>::error_with_code(
+                                            error.code(), error.detail(), None, elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
                                 let mut engine =
                                     with_persisted_kill_switch(engine, &storage, "robot send")
                                         .await;
 
                                 let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
                                 let resolution = resolve_pane_capabilities(
+                                    &cx,
                                     pane_id,
                                     Some(&storage),
                                     Some(ipc_socket),
@@ -50767,6 +50778,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     }
                                 };
 
+                                drop(effect_fence);
                                 let mut wait_for_data = None;
                                 let mut verification_error = None;
                                 if injection.is_allowed() {
@@ -56825,6 +56837,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             );
                                         let resolved_capabilities =
                                             resolve_tx_contract_capabilities(
+                                                cx,
                                                 &contract,
                                                 &storage,
                                                 Some(layout.ipc_socket_path.as_path()),
@@ -57078,6 +57091,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             );
                                         let resolved_capabilities =
                                             resolve_tx_contract_capabilities(
+                                                cx,
                                                 &contract,
                                                 &storage,
                                                 Some(layout.ipc_socket_path.as_path()),
@@ -61129,6 +61143,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await
                     .ok();
                 let resolution = resolve_pane_capabilities(
+                    &cx,
                     pane_id,
                     storage.as_ref(),
                     Some(layout.ipc_socket_path.as_path()),
@@ -61225,10 +61240,27 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .with_tuning(&config.tuning)
                 .with_command_gate_config(config.safety.command_gate.clone())
                 .with_policy_rules(config.safety.rules.clone());
-                let mut engine =
-                    with_persisted_kill_switch(engine, &storage, "panes bookmark").await;
+                let effect_fence =
+                    match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(
+                        Path::new(storage.db_path()),
+                    ) {
+                        Ok(fence) => fence,
+                        Err(error) => {
+                            emit_bounded_display_error_with_hint(
+                                emit_json,
+                                "Send admission unavailable: ",
+                                &error,
+                                Some(
+                                    "Retry after the pending policy or reservation transition settles.",
+                                ),
+                            );
+                            return Ok(());
+                        }
+                    };
+                let mut engine = with_persisted_kill_switch(engine, &storage, "send").await;
 
                 let resolution = resolve_pane_capabilities(
+                    &cx,
                     pane_id,
                     Some(&storage),
                     Some(layout.ipc_socket_path.as_path()),
@@ -61347,6 +61379,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
                 };
 
+                drop(effect_fence);
                 let mut wait_for_data = None;
                 let mut verification_error = None;
                 if injection.is_allowed() {
@@ -63653,6 +63686,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             &storage,
                         ));
                     let resolved_capabilities = resolve_tx_contract_capabilities(
+                        &open_cx,
                         &contract,
                         &storage,
                         Some(layout.ipc_socket_path.as_path()),
@@ -64336,6 +64370,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 let domain = pane_info.inferred_domain();
 
                 let resolution = resolve_pane_capabilities(
+                    &cx,
                     pane_id,
                     Some(&storage),
                     Some(layout.ipc_socket_path.as_path()),
@@ -64946,7 +64981,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     };
                     let domain = pane_info.inferred_domain();
 
+                    let effect_fence =
+                        match frankenterm_core::policy_kill_switch_state::acquire_kill_switch_fence(
+                            Path::new(storage.db_path()),
+                        ) {
+                            Ok(fence) => fence,
+                            Err(error) => {
+                                eprintln!(
+                                    "Error: Send admission unavailable ({}): {}",
+                                    error.code(),
+                                    error.detail()
+                                );
+                                std::process::exit(1);
+                            }
+                        };
                     let resolution = resolve_pane_capabilities(
+                        &cx,
                         pane_id,
                         Some(storage.as_ref()),
                         Some(layout.ipc_socket_path.as_path()),
@@ -64954,7 +65004,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .await;
                     let capabilities = resolution.capabilities;
 
-                    let mut engine = frankenterm_core::policy::PolicyEngine::new(
+                    let engine = frankenterm_core::policy::PolicyEngine::new(
                         config.safety.rate_limit_per_pane,
                         config.safety.rate_limit_global,
                         config.safety.require_prompt_active,
@@ -64963,6 +65013,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
 
+                    let mut engine =
+                        with_persisted_kill_switch(engine, &storage, "commit send").await;
                     let summary = bounded_send_text_summary(&engine, &text);
                     let input = build_mux_send_policy_input(
                         pane_id,
@@ -65061,8 +65113,9 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                     }
 
                     let send_result = wezterm
-                        .send_text_with_options(pane_id, &text, no_paste, no_newline)
+                        .send_text_with_options_with_cx(&cx, pane_id, &text, no_paste, no_newline)
                         .await;
+                    drop(effect_fence);
 
                     let decision_for_audit = decision.clone();
                     let injection = match send_result {
@@ -65840,6 +65893,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 .flatten();
             let domain = stored_pane.as_ref().map(|pane| pane.domain.clone());
             let capabilities = resolve_pane_capabilities(
+                &storage_cx,
                 pane_id,
                 Some(&storage),
                 Some(layout.ipc_socket_path.as_path()),
@@ -78141,6 +78195,8 @@ async fn handle_tx_command(
                     Some(&storage),
                 );
                 let resolved_capabilities = resolve_tx_contract_capabilities(
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
                     &contract,
                     &storage,
                     Some(layout.ipc_socket_path.as_path()),
@@ -78353,6 +78409,8 @@ async fn handle_tx_command(
                     Some(&storage),
                 );
                 let resolved_capabilities = resolve_tx_contract_capabilities(
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
                     &contract,
                     &storage,
                     Some(layout.ipc_socket_path.as_path()),
@@ -96070,8 +96128,7 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 8192,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_session_recovery_guidance(&report);
@@ -96155,8 +96212,7 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 1,
             orphaned_restore_intents: 1,
             total_data_bytes: 4096,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let structured = serde_json::to_value(&report).expect("serialize session doctor report");
@@ -96238,8 +96294,7 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 1,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
         assert!(session_restore_lifecycle_needs_reconciliation(
             &orphaned_checkpoint
@@ -96290,8 +96345,7 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 0,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_session_recovery_guidance(&report);
@@ -96329,9 +96383,12 @@ mod operator_guidance_tests {
         assert!(!session_persistence_is_healthy(&open));
         assert_eq!(guidance.status, "maintenance_recommended");
         assert!(guidance.summary.contains("1f-2a-0"));
-        assert!(guidance.next_steps.iter().any(|step| {
-            step.command == "ft session acknowledge-cleanup 1f-2a-0 --force"
-        }));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| { step.command == "ft session acknowledge-cleanup 1f-2a-0 --force" })
+        );
 
         let malformed = SessionDoctorReport {
             cleanup_attempt: SessionCleanupAttemptStatus::Malformed,
@@ -96339,9 +96396,12 @@ mod operator_guidance_tests {
         };
         let guidance = build_session_recovery_guidance(&malformed);
         assert!(!session_persistence_is_healthy(&malformed));
-        assert!(guidance.next_steps.iter().any(|step| {
-            step.command == "ft session acknowledge-cleanup malformed --force"
-        }));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| { step.command == "ft session acknowledge-cleanup malformed --force" })
+        );
 
         let completed = SessionDoctorReport {
             cleanup_attempt: SessionCleanupAttemptStatus::Completed {
@@ -96353,7 +96413,10 @@ mod operator_guidance_tests {
             ..malformed
         };
         assert!(session_persistence_is_healthy(&completed));
-        assert_eq!(build_session_recovery_guidance(&completed).status, "healthy");
+        assert_eq!(
+            build_session_recovery_guidance(&completed).status,
+            "healthy"
+        );
     }
 
     #[test]
@@ -96373,8 +96436,7 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 1024,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_status_health_operator_guidance(
@@ -100121,8 +100183,7 @@ mod tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 5_120,
-            cleanup_attempt:
-                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
+            cleanup_attempt: frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
         let guidance = build_session_recovery_guidance(&report);
 
@@ -123036,7 +123097,10 @@ printf x > "$MINISIGN_MARKER"
         // canonical state where the require_prompt_active gate must fire.
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(42)
-            .with_capabilities(PaneCapabilities::running())
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::running()
+            })
             .with_command_text("echo hi");
 
         let decision = engine.authorize(&input);
@@ -123186,7 +123250,10 @@ printf x > "$MINISIGN_MARKER"
         run_async_test(async {
             let (storage, _) = setup_storage("watcher_safety_tuning").await;
             let mut config = Config::default();
-            let input = |capabilities| {
+            let input = |mut capabilities: PaneCapabilities| {
+                // This fixture isolates safety/tuning rules with verified-free
+                // reservation authority, independent of shell prompt state.
+                capabilities.is_reserved = Some(false);
                 PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
                     .with_pane(42)
                     .with_capabilities(capabilities)
@@ -123257,7 +123324,10 @@ printf x > "$MINISIGN_MARKER"
             let config = Config::default();
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
                 .with_pane(42)
-                .with_capabilities(PaneCapabilities::prompt())
+                .with_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                })
                 .with_command_text("echo watcher-policy-probe");
             let mut engine = build_watcher_policy_engine(&config, &storage).await;
             assert_eq!(engine.kill_switch_state().level, KillSwitchLevel::Disarmed);

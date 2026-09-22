@@ -266,7 +266,7 @@ impl BroadcastPrecondition {
             Self::PromptActive => caps.prompt_active,
             Self::NotAltScreen => !caps.alt_screen.unwrap_or(false),
             Self::NoRecentGap => !caps.has_recent_gap,
-            Self::NotReserved => !caps.is_reserved,
+            Self::NotReserved => caps.is_reserved == Some(false),
         }
     }
 
@@ -1236,7 +1236,7 @@ mod tests {
             command_running: false,
             alt_screen: Some(false),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             reserved_by: None,
         }
     }
@@ -1404,7 +1404,7 @@ mod tests {
     fn precondition_not_reserved() {
         let mut caps = caps_ready();
         assert!(BroadcastPrecondition::NotReserved.check(&caps));
-        caps.is_reserved = true;
+        caps.is_reserved = Some(true);
         assert!(!BroadcastPrecondition::NotReserved.check(&caps));
     }
 
@@ -1426,7 +1426,7 @@ mod tests {
             prompt_active: false,
             alt_screen: Some(true),
             has_recent_gap: true,
-            is_reserved: true,
+            is_reserved: Some(true),
             ..Default::default()
         };
         let preconds = default_broadcast_preconditions();
@@ -1589,7 +1589,13 @@ mod tests {
             },
         );
         // Pane 2: in alt screen — should fail
-        caps.insert(2, PaneCapabilities::alt_screen());
+        caps.insert(
+            2,
+            PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::alt_screen()
+            },
+        );
 
         let config = CoordinateAgentsConfig::default();
         let result = plan_pause_all(&panes, &caps, &config);

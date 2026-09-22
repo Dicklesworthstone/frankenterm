@@ -28723,6 +28723,20 @@ fn list_active_limit_windows_backend(
 // Pane Reservation Sync Operations
 // =============================================================================
 
+fn reservation_mutation_fence(
+    backend: &dyn StorageBackend,
+) -> Result<Option<crate::policy_kill_switch_state::KillSwitchFence>> {
+    crate::policy_kill_switch_state::backend_fence(backend).map_err(|error| {
+        let code = match error {
+            crate::policy_kill_switch_state::KillSwitchStateError::FencePending => {
+                "reservation_mutation_fence_pending"
+            }
+            _ => "reservation_mutation_fence_unavailable",
+        };
+        StorageError::Database(code.to_string()).into()
+    })
+}
+
 /// Create a pane reservation, enforcing one-active-per-pane.
 ///
 /// If an active, unexpired reservation already exists for the pane, returns
@@ -28735,6 +28749,10 @@ fn create_reservation_backend(
     reason: Option<&str>,
     ttl_ms: i64,
 ) -> Result<PaneReservation> {
+    // The executing writer owns this guard through autocommit. Cancelling a
+    // queued caller cannot release it. Never wait/retry here: a dispatch holding
+    // the same fence may itself need the writer to service other commands.
+    let _effect_fence = reservation_mutation_fence(backend)?;
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let now = now_ms();
 
@@ -28797,6 +28815,7 @@ fn create_reservation_backend(
 }
 
 fn release_reservation_backend(backend: &dyn StorageBackend, reservation_id: i64) -> Result<bool> {
+    let _effect_fence = reservation_mutation_fence(backend)?;
     let now = now_ms();
     let updated_rows = backend
         .query_map_typed(
@@ -28888,6 +28907,7 @@ fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<
 }
 
 fn expire_stale_reservations_backend(backend: &dyn StorageBackend) -> Result<usize> {
+    let _effect_fence = reservation_mutation_fence(backend)?;
     let now = now_ms();
     let expired_rows = backend
         .query_map_typed(
@@ -39775,6 +39795,120 @@ fn storage_blank_event_dedupe_key_is_not_identity() {
             "blank dedupe keys should be stored as NULL, not as an identity"
         );
 
+        storage.shutdown_with_cx(&cx).await.unwrap();
+    });
+}
+
+#[test]
+fn reservation_backend_refuses_unavailable_effect_authority_without_mutation() {
+    let directory = tempfile::tempdir().unwrap().keep();
+    let path = directory.join("unavailable-fence.db");
+    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO panes (pane_id, title, cwd, observed, first_seen_at, last_seen_at)
+         VALUES (1, 'test', '/tmp', 1, 1, 1)", [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO pane_reservations (id, pane_id, owner_kind, owner_id,
+         created_at, expires_at, status) VALUES (7, 1, 'workflow', 'retained', 1, 0, 'active')",
+        [],
+    ).unwrap();
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".policy-kill-switch.lock");
+    // A directory cannot be opened as the writable lock file. No existing
+    // authority file is replaced or removed to manufacture this failure.
+    std::fs::create_dir(std::path::PathBuf::from(lock_path)).unwrap();
+    with_test_storage_backend(&mut conn, |backend| {
+        for error in [
+            create_reservation_backend(backend, 1, "workflow", "new", None, 60_000).unwrap_err(),
+            release_reservation_backend(backend, 7).unwrap_err(),
+            expire_stale_reservations_backend(backend).unwrap_err(),
+        ] {
+            assert!(matches!(error, crate::Error::Storage(StorageError::Database(ref code))
+                if code == "reservation_mutation_fence_unavailable"), "{error:?}");
+        }
+        Ok(())
+    }).unwrap();
+    let retained: (i64, String, String, Option<i64>) = conn.query_row(
+        "SELECT id, owner_id, status, released_at FROM pane_reservations", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(retained, (7, "retained".to_string(), "active".to_string(), None));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM pane_reservations", [],
+        |row| row.get::<_, i64>(0)).unwrap(), 1);
+}
+
+#[test]
+fn reservation_writer_mutations_share_dispatch_fence() {
+    run_storage_async_test(async {
+        // Retain the owned fixture rather than deleting diagnostic database bytes.
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("reservation-fence.db");
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, path.to_str().unwrap())
+            .await
+            .unwrap();
+        storage.upsert_pane_with_cx(&cx, PaneRecord {
+            pane_id: 31,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1,
+            last_seen_at: 1,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }).await.unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let assert_pending = |error: crate::Error| {
+            assert!(matches!(error, crate::Error::Storage(StorageError::Database(ref code))
+                if code == "reservation_mutation_fence_pending"), "{error:?}");
+        };
+
+        let fence = crate::policy_kill_switch_state::acquire_kill_switch_fence(&path).unwrap();
+        assert_pending(storage.create_reservation_with_cx(
+            &cx, 31, "workflow", "owner", None, 60_000,
+        ).await.unwrap_err());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pane_reservations", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(fence);
+        let reservation = storage.create_reservation_with_cx(
+            &cx, 31, "workflow", "owner", None, 60_000,
+        ).await.unwrap();
+
+        let fence = crate::policy_kill_switch_state::acquire_kill_switch_fence(&path).unwrap();
+        assert_pending(storage.release_reservation_with_cx(&cx, reservation.id).await.unwrap_err());
+        let retained = storage.get_active_reservation_with_cx(&cx, 31).await.unwrap().unwrap();
+        assert_eq!(retained.id, reservation.id);
+        assert_eq!(retained.owner_id, "owner");
+        drop(fence);
+        assert!(storage.release_reservation_with_cx(&cx, reservation.id).await.unwrap());
+
+        let expired = storage.create_reservation_with_cx(
+            &cx, 31, "workflow", "next-owner", None, 60_000,
+        ).await.unwrap();
+        // Fixture clock boundary, before acquiring effect authority; no sleeps.
+        conn.execute("UPDATE pane_reservations SET expires_at = 0 WHERE id = ?1", [expired.id]).unwrap();
+        let fence = crate::policy_kill_switch_state::acquire_kill_switch_fence(&path).unwrap();
+        assert_pending(storage.expire_stale_reservations_with_cx(&cx).await.unwrap_err());
+        let state: (String, Option<i64>) = conn.query_row(
+            "SELECT status, released_at FROM pane_reservations WHERE id = ?1",
+            [expired.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, ("active".to_string(), None));
+        drop(fence);
+        assert_eq!(storage.expire_stale_reservations_with_cx(&cx).await.unwrap(), 1);
+        let state: (String, Option<i64>) = conn.query_row(
+            "SELECT status, released_at FROM pane_reservations WHERE id = ?1",
+            [expired.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state.0, "released");
+        assert!(state.1.is_some());
         storage.shutdown_with_cx(&cx).await.unwrap();
     });
 }

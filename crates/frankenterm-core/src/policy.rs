@@ -503,14 +503,16 @@ pub struct PaneCapabilities {
     pub alt_screen: Option<bool>,
     /// Whether there's a recent capture gap (cleared after verified prompt boundary)
     pub has_recent_gap: bool,
-    /// Whether the pane is reserved by another workflow
-    pub is_reserved: bool,
+    /// Reservation authority: `None` is unknown, `Some(false)` is verified
+    /// unreserved, and `Some(true)` carries its owner in `reserved_by`.
+    pub is_reserved: Option<bool>,
     /// The workflow ID that has reserved this pane, if any
     pub reserved_by: Option<String>,
 }
 
 impl PaneCapabilities {
-    /// Create capabilities for a pane with an active prompt (normal screen)
+    /// Create shell-state capabilities for an active prompt. Reservation
+    /// authority remains unknown until independently resolved.
     #[must_use]
     pub fn prompt() -> Self {
         Self {
@@ -520,7 +522,8 @@ impl PaneCapabilities {
         }
     }
 
-    /// Create capabilities for a pane running a command
+    /// Create shell-state capabilities for a running command; reservation
+    /// authority remains unknown.
     #[must_use]
     pub fn running() -> Self {
         Self {
@@ -536,7 +539,7 @@ impl PaneCapabilities {
         Self::default()
     }
 
-    /// Create capabilities for alt-screen mode (vim, less, htop, etc.)
+    /// Create alt-screen capabilities; reservation authority remains unknown.
     #[must_use]
     pub fn alt_screen() -> Self {
         Self {
@@ -562,7 +565,7 @@ impl PaneCapabilities {
             && !self.command_running
             && self.alt_screen == Some(false)
             && !self.has_recent_gap
-            && !self.is_reserved
+            && self.is_reserved == Some(false)
     }
 
     /// Mark that a verified prompt boundary was seen (clears recent_gap)
@@ -598,7 +601,7 @@ impl PaneCapabilities {
             command_running,
             alt_screen: in_alt_screen,
             has_recent_gap: in_gap,
-            is_reserved: false,
+            is_reserved: None,
             reserved_by: None,
         }
     }
@@ -2868,7 +2871,13 @@ impl DecisionContext {
             "has_recent_gap",
             input.capabilities.has_recent_gap.to_string(),
         );
-        ctx.add_evidence("is_reserved", input.capabilities.is_reserved.to_string());
+        ctx.add_evidence(
+            "is_reserved",
+            input
+                .capabilities
+                .is_reserved
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        );
         ctx.add_evidence("surface", input.surface.as_str());
         let identity_principal = input.identity_principal(None);
         let identity_resource = input.identity_resource();
@@ -6129,7 +6138,7 @@ impl PolicyEngine {
             }
 
             // Pane reserved
-            if caps.is_reserved {
+            if caps.is_reserved == Some(true) {
                 self.add_factor(
                     &mut factors,
                     "state.is_reserved",
@@ -6340,9 +6349,12 @@ impl PolicyEngine {
     /// use frankenterm_core::policy::{PolicyEngine, PolicyInput, ActionKind, ActorKind, PaneCapabilities};
     ///
     /// let mut engine = PolicyEngine::permissive();
+    /// // This example supplies an independently verified unreserved state.
+    /// let mut caps = PaneCapabilities::prompt();
+    /// caps.is_reserved = Some(false);
     /// let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
     ///     .with_pane(1)
-    ///     .with_capabilities(PaneCapabilities::prompt());
+    ///     .with_capabilities(caps);
     ///
     /// let decision = engine.authorize(&input);
     /// assert!(decision.is_allowed());
@@ -6855,6 +6867,67 @@ impl PolicyEngine {
             }
         }
 
+        // A missing reservation lookup is not proof that a target is free.
+        // Deny before approval or permissive rules can authorize a mutation.
+        if input.pane_id.is_some()
+            && input.action.is_mutating()
+            && input.capabilities.is_reserved.is_none()
+        {
+            context.record_rule(
+                "policy.reservation_unknown",
+                true,
+                Some("deny"),
+                Some("reservation authority unavailable".to_string()),
+            );
+            context.set_determining_rule("policy.reservation_unknown");
+            return PolicyDecision::deny_with_rule(
+                "Pane reservation authority is unknown; retry after a successful lookup",
+                "policy.reservation_unknown",
+            )
+            .with_context(context);
+        }
+
+        // Reservation ownership is a hard boundary, not an approvable safety
+        // warning. Check it before any rate/prompt/gap approval can short-circuit.
+        if input.action.is_mutating() && input.capabilities.is_reserved == Some(true) {
+            let is_owner = matches!(
+                (&input.capabilities.reserved_by, &input.workflow_id),
+                (Some(reserved_by), Some(workflow_id)) if reserved_by == workflow_id
+            );
+            if is_owner {
+                context.record_rule(
+                    "policy.pane_reserved",
+                    false,
+                    None,
+                    Some("reserved by same workflow".to_string()),
+                );
+            } else {
+                let reason = format!(
+                    "Pane is reserved by workflow {}",
+                    input
+                        .capabilities
+                        .reserved_by
+                        .as_deref()
+                        .unwrap_or("unknown")
+                );
+                context.record_rule(
+                    "policy.pane_reserved",
+                    true,
+                    Some("deny"),
+                    Some(reason.clone()),
+                );
+                context.set_determining_rule("policy.pane_reserved");
+                return PolicyDecision::deny_with_rule(reason, "policy.pane_reserved")
+                    .with_context(context);
+            }
+        }
+        context.record_rule(
+            "policy.pane_reserved",
+            false,
+            None,
+            Some("no reservation conflict".to_string()),
+        );
+
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
             let rate_limit_outcome = {
@@ -7073,48 +7146,6 @@ impl PolicyEngine {
         // The [safety].block_alt_screen gate is evaluated inside the
         // alt-screen check above (ft-0eby0): it must run before the
         // unconditional alt-screen deny, otherwise it is unreachable.
-
-        // Check reservation conflicts
-        if input.action.is_mutating() && input.capabilities.is_reserved {
-            let is_owner = matches!(
-                (&input.capabilities.reserved_by, &input.workflow_id),
-                (Some(reserved_by), Some(workflow_id)) if reserved_by == workflow_id
-            );
-            if is_owner {
-                // Owning workflow: record and fall through to command safety gate
-                context.record_rule(
-                    "policy.pane_reserved",
-                    false,
-                    None,
-                    Some("reserved by same workflow".to_string()),
-                );
-            } else {
-                // Non-owner: deny
-                let reason = format!(
-                    "Pane is reserved by workflow {}",
-                    input
-                        .capabilities
-                        .reserved_by
-                        .as_deref()
-                        .unwrap_or("unknown")
-                );
-                context.record_rule(
-                    "policy.pane_reserved",
-                    true,
-                    Some("deny"),
-                    Some(reason.clone()),
-                );
-                context.set_determining_rule("policy.pane_reserved");
-                return PolicyDecision::deny_with_rule(reason, "policy.pane_reserved")
-                    .with_context(context);
-            }
-        }
-        context.record_rule(
-            "policy.pane_reserved",
-            false,
-            None,
-            Some("no reservation conflict".to_string()),
-        );
 
         // Trauma guard only applies to pane-injection send_text flows.
         if matches!(input.action, ActionKind::SendText) {
@@ -7920,7 +7951,8 @@ impl InjectionResult {
 /// let client = WeztermClient::new();
 /// let mut injector = PolicyGatedInjector::new(engine, client);
 ///
-/// // Capabilities are derived from current pane state
+/// // Shell state alone leaves reservation authority unknown. Attach storage
+/// // for a fresh reservation lookup before attempting real injection.
 /// let caps = PaneCapabilities::prompt();
 /// let result = injector.send_text(1, "ls -la", ActorKind::Robot, &caps, None).await;
 ///
@@ -8123,10 +8155,25 @@ where
             None
         };
 
+        let mut capabilities = capabilities.clone();
+        if let Some(storage) = self.storage.as_ref() {
+            // Workflow capabilities may predate a reservation transfer. Resolve
+            // ownership for this admission; failed reads must erase stale trust.
+            capabilities.is_reserved = None;
+            capabilities.reserved_by = None;
+            match storage.get_active_reservation_with_cx(cx, pane_id).await {
+                Ok(Some(reservation)) => {
+                    capabilities.is_reserved = Some(true);
+                    capabilities.reserved_by = Some(reservation.owner_id);
+                }
+                Ok(None) => capabilities.is_reserved = Some(false),
+                Err(_) => {}
+            }
+        }
         let mut input = PolicyInput::new(action, actor)
             .with_surface(PolicySurface::Mux)
             .with_pane(pane_id)
-            .with_capabilities(capabilities.clone())
+            .with_capabilities(capabilities)
             .with_text_summary(&summary);
 
         if let Some(wf_id) = workflow_id {
@@ -8498,10 +8545,27 @@ where
         };
         let summary = self.engine.redact_secrets(text);
         let tap_summary = self.ingress_tap.as_ref().map(|_| summary.clone());
+        let mut capabilities = capabilities.clone();
+        if let Some(storage) = self.storage.as_ref() {
+            capabilities.is_reserved = None;
+            capabilities.reserved_by = None;
+            // Detached admission is synchronous, like its kill-switch refresh.
+            // A cancelled request cannot reuse a previously verified owner.
+            if cx.checkpoint().is_ok() {
+                match storage.get_active_reservation_blocking(pane_id) {
+                    Ok(Some(reservation)) => {
+                        capabilities.is_reserved = Some(true);
+                        capabilities.reserved_by = Some(reservation.owner_id);
+                    }
+                    Ok(None) => capabilities.is_reserved = Some(false),
+                    Err(_) => {}
+                }
+            }
+        }
         let mut input = PolicyInput::new(action, actor)
             .with_surface(PolicySurface::Mux)
             .with_pane(pane_id)
-            .with_capabilities(capabilities.clone())
+            .with_capabilities(capabilities)
             .with_text_summary(&summary);
         if let Some(wf_id) = workflow_id {
             input = input.with_workflow(wf_id);
@@ -8803,6 +8867,12 @@ async fn find_workflow_start_action_id_with_cx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Explicit fixture authority, independent of shell-state constructors.
+    fn unreserved(mut caps: PaneCapabilities) -> PaneCapabilities {
+        caps.is_reserved = Some(false);
+        caps
+    }
 
     fn run_async_test<F>(future: F)
     where
@@ -9232,7 +9302,7 @@ mod tests {
         for pane_id in [10u64, 20u64, 30u64] {
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_pane(pane_id)
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(unreserved(PaneCapabilities::prompt()));
             let _ = engine.authorize(&input);
         }
         assert_eq!(
@@ -9272,7 +9342,7 @@ mod tests {
         for pane_id in [101u64, 202u64] {
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_pane(pane_id)
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(unreserved(PaneCapabilities::prompt()));
             let _ = engine.authorize(&input);
         }
         assert_eq!(
@@ -9425,7 +9495,7 @@ mod tests {
         for pane_id in [10u64, 20u64] {
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_pane(pane_id)
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(unreserved(PaneCapabilities::prompt()));
             let _ = engine.authorize(&input);
         }
 
@@ -9633,7 +9703,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("rm -rf /");
 
         let decision = engine.authorize(&input);
@@ -9646,7 +9716,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("git reset --hard HEAD~1");
 
         let decision = engine.authorize(&input);
@@ -9659,7 +9729,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("please review the diff and proceed");
 
         let decision = engine.authorize(&input);
@@ -9678,7 +9748,7 @@ mod tests {
         };
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cargo test -p core")
             .with_trauma_decision(trauma);
 
@@ -9699,7 +9769,7 @@ mod tests {
         };
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("git status")
             .with_trauma_decision(trauma);
 
@@ -9720,7 +9790,7 @@ mod tests {
         };
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("FT_BYPASS_TRAUMA=1 git status")
             .with_trauma_decision(trauma);
 
@@ -9733,7 +9803,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cargo test -p frankenterm-core -- --nocapture");
 
         let decision = engine.authorize(&input);
@@ -9750,7 +9820,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cd /tmp && cargo test -p frankenterm-core -- --nocapture");
 
         let decision = engine.authorize(&input);
@@ -9763,7 +9833,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
@@ -9775,7 +9845,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
@@ -9791,7 +9861,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text(
                 "rch exec -- bash -lc 'cargo test -p frankenterm-core -- --nocapture'",
             );
@@ -9848,7 +9918,7 @@ mod tests {
             PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_surface(PolicySurface::Robot)
                 .with_pane(1)
-                .with_capabilities(PaneCapabilities::prompt())
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
                 .with_text_summary("rm -rf /")
                 .with_command_text("rm -rf /"),
         );
@@ -9874,6 +9944,7 @@ mod tests {
         let request = PolicyRecommendationRequest::new(
             PolicyInput::new(ActionKind::Close, ActorKind::Robot)
                 .with_surface(PolicySurface::Robot)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
                 .with_pane(3),
         );
 
@@ -10006,6 +10077,7 @@ mod tests {
         let request = PolicyRecommendationRequest::new(
             PolicyInput::new(ActionKind::Close, ActorKind::Robot)
                 .with_surface(PolicySurface::Robot)
+                .with_capabilities(unreserved(PaneCapabilities::prompt()))
                 .with_pane(3),
         );
         let receipt = engine.recommend(&request);
@@ -10034,7 +10106,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cd /tmp && RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
@@ -10073,7 +10145,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cargo fmt --check");
 
         let decision = engine.authorize(&input);
@@ -10085,7 +10157,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("cargo build --workspace");
 
         let decision = engine.authorize(&input);
@@ -10227,7 +10299,7 @@ mod tests {
             );
             injector.set_decision_capture(adapter);
 
-            let mut caps = PaneCapabilities::prompt();
+            let mut caps = unreserved(PaneCapabilities::prompt());
             caps.alt_screen = Some(true);
 
             let result = injector
@@ -10267,7 +10339,7 @@ mod tests {
                     PolicyEngine::strict(),
                     crate::wezterm::default_wezterm_handle(),
                 );
-                let mut caps = PaneCapabilities::prompt();
+                let mut caps = unreserved(PaneCapabilities::prompt());
                 caps.alt_screen = Some(true);
                 let result = injector
                     .send_ctrl_c_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
@@ -10286,7 +10358,7 @@ mod tests {
                     PolicyEngine::strict(),
                     crate::wezterm::default_wezterm_handle(),
                 );
-                let mut caps = PaneCapabilities::prompt();
+                let mut caps = unreserved(PaneCapabilities::prompt());
                 caps.alt_screen = Some(true);
                 let result = injector
                     .send_ctrl_d_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
@@ -10305,7 +10377,7 @@ mod tests {
                     PolicyEngine::strict(),
                     crate::wezterm::default_wezterm_handle(),
                 );
-                let mut caps = PaneCapabilities::prompt();
+                let mut caps = unreserved(PaneCapabilities::prompt());
                 caps.alt_screen = Some(true);
                 let result = injector
                     .send_ctrl_z_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
@@ -10324,7 +10396,7 @@ mod tests {
                     PolicyEngine::strict(),
                     crate::wezterm::default_wezterm_handle(),
                 );
-                let mut caps = PaneCapabilities::prompt();
+                let mut caps = unreserved(PaneCapabilities::prompt());
                 caps.alt_screen = Some(true);
                 let result = injector
                     .send_control_with_cx(&cx, 1, "\x07", ActorKind::Robot, &caps, None)
@@ -10358,7 +10430,7 @@ mod tests {
                 crate::wezterm::default_wezterm_handle(),
             );
 
-            let mut caps = PaneCapabilities::prompt();
+            let mut caps = unreserved(PaneCapabilities::prompt());
             caps.alt_screen = Some(true);
 
             let cx = crate::cx::for_request();
@@ -10437,7 +10509,7 @@ mod tests {
             use crate::policy_kill_switch_state::tests::transition_in_test_process;
             let (_directory, storage, mut injector) = persisted_stop_injector().await;
             let cx = crate::cx::for_request();
-            let caps = PaneCapabilities::prompt();
+            let caps = unreserved(PaneCapabilities::prompt());
             // Plant a trip in another process after authorization but before
             // actual dispatch. It must report pending while this effect owns
             // the fence; no acknowledged trip may be passed by this send.
@@ -10556,7 +10628,7 @@ mod tests {
                     42,
                     "echo corrupt\n",
                     ActorKind::Workflow,
-                    &PaneCapabilities::prompt(),
+                    &unreserved(PaneCapabilities::prompt()),
                     None,
                 )
                 .await;
@@ -10581,7 +10653,7 @@ mod tests {
                     42,
                     "echo unreadable\n",
                     ActorKind::Workflow,
-                    &PaneCapabilities::prompt(),
+                    &unreserved(PaneCapabilities::prompt()),
                     None,
                 )
                 .await;
@@ -10600,7 +10672,7 @@ mod tests {
                     42,
                     "echo cancelled\n",
                     ActorKind::Workflow,
-                    &PaneCapabilities::prompt(),
+                    &unreserved(PaneCapabilities::prompt()),
                     None,
                 )
                 .await;
@@ -10626,7 +10698,7 @@ mod tests {
                 PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone()),
             );
             let cx = crate::cx::for_request();
-            let caps = PaneCapabilities::prompt();
+            let caps = unreserved(PaneCapabilities::prompt());
             let allowed = wrapper
                 .send_text(
                     &cx,
@@ -10740,7 +10812,7 @@ mod tests {
             let mut injector =
                 PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
             let cx = crate::cx::for_request();
-            let caps = PaneCapabilities::prompt();
+            let caps = unreserved(PaneCapabilities::prompt());
             let queued = injector.inject_with_cx_detached(
                 &cx,
                 42,
@@ -10830,6 +10902,85 @@ mod tests {
     }
 
     #[test]
+    fn detached_send_serializes_reservation_creation_through_dispatch() {
+        run_async_test(async {
+            let (_directory, storage, direct) = persisted_stop_injector().await;
+            let mock = Arc::new(direct.client);
+            let handle: crate::wezterm::WeztermHandle = mock.clone();
+            let mut injector =
+                PolicyGatedInjector::with_storage(direct.engine, handle, storage.clone());
+            let cx = crate::cx::for_request();
+            let caps = PaneCapabilities::prompt();
+            let queued = injector.inject_with_cx_detached(
+                &cx,
+                42,
+                "echo abandoned\n",
+                ActionKind::SendText,
+                ActorKind::Workflow,
+                &caps,
+                None,
+            );
+            let pending = crate::runtime_async::timeout_with_cx(
+                &cx,
+                std::time::Duration::from_secs(5),
+                storage.create_reservation(42, "workflow", "foreign", None, 60_000),
+            )
+            .await
+            .expect("reservation writer must refuse contention without waiting")
+            .expect_err("an admitted queued send owns the workspace effect fence");
+            assert!(pending.to_string().contains("fence_pending"), "{pending}");
+            assert!(storage.get_active_reservation(42).await.unwrap().is_none());
+            drop(queued);
+            assert!(mock.pane_state(42).await.unwrap().content.is_empty());
+
+            let reservation = storage
+                .create_reservation(42, "workflow", "foreign", None, 60_000)
+                .await
+                .expect("dropping an unpolled send releases mutation authority");
+            let denied = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo reserved\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(denied, InjectionResult::Denied { ref decision, .. }
+                    if decision.rule_id() == Some("policy.pane_reserved")),
+                "{denied:?}"
+            );
+            assert!(mock.pane_state(42).await.unwrap().content.is_empty());
+            assert!(storage.release_reservation(reservation.id).await.unwrap());
+
+            let allowed = injector
+                .inject_with_cx_detached(
+                    &cx,
+                    42,
+                    "echo ordered\n",
+                    ActionKind::SendText,
+                    ActorKind::Workflow,
+                    &caps,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(allowed, InjectionResult::Allowed { .. }),
+                "{allowed:?}"
+            );
+            assert_eq!(mock.pane_state(42).await.unwrap().content, "echo ordered\n");
+            storage
+                .create_reservation(42, "workflow", "after-send", None, 60_000)
+                .await
+                .expect("completed dispatch releases reservation mutation authority");
+            storage.shutdown_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn injector_policy_context_marks_mux_surface() {
         run_async_test(async {
             let actors = [
@@ -10845,7 +10996,7 @@ mod tests {
                     crate::wezterm::default_wezterm_handle(),
                 );
 
-                let mut caps = PaneCapabilities::prompt();
+                let mut caps = unreserved(PaneCapabilities::prompt());
                 caps.alt_screen = Some(true);
 
                 let result = injector.send_text(1, "echo hi", actor, &caps, None).await;
@@ -11256,7 +11407,7 @@ mod tests {
         let mut engine = PolicyEngine::strict();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }
@@ -11266,7 +11417,7 @@ mod tests {
         let mut engine = PolicyEngine::strict();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
         assert_eq!(decision.rule_id(), Some("policy.prompt_required"));
@@ -11275,9 +11426,11 @@ mod tests {
     #[test]
     fn authorize_requires_approval_for_unknown_state() {
         let mut engine = PolicyEngine::strict();
+        let mut caps = PaneCapabilities::unknown();
+        caps.is_reserved = Some(false); // Only shell state is unknown here.
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::unknown());
+            .with_capabilities(caps);
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         // When fully unknown, alt_screen check fires first (before prompt check)
@@ -11287,9 +11440,11 @@ mod tests {
     #[test]
     fn authorize_allows_human_with_unknown_state() {
         let mut engine = PolicyEngine::strict();
+        let mut caps = PaneCapabilities::unknown();
+        caps.is_reserved = Some(false); // Human trust does not replace this lookup.
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::unknown());
+            .with_capabilities(caps);
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }
@@ -11297,7 +11452,7 @@ mod tests {
     #[test]
     fn authorize_denies_send_in_alt_screen() {
         let mut engine = PolicyEngine::permissive();
-        let caps = PaneCapabilities::alt_screen();
+        let caps = unreserved(PaneCapabilities::alt_screen());
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
             .with_capabilities(caps);
@@ -11311,7 +11466,7 @@ mod tests {
     fn authorize_denies_send_in_alt_screen_even_for_human() {
         // Alt-screen is a hard safety gate - even humans can't override
         let mut engine = PolicyEngine::permissive();
-        let caps = PaneCapabilities::alt_screen();
+        let caps = unreserved(PaneCapabilities::alt_screen());
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
             .with_capabilities(caps);
@@ -11324,7 +11479,7 @@ mod tests {
     #[test]
     fn authorize_requires_approval_for_unknown_alt_screen() {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.alt_screen = None; // Unknown
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -11339,7 +11494,7 @@ mod tests {
     #[test]
     fn authorize_allows_human_with_unknown_alt_screen() {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.alt_screen = None; // Unknown
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
@@ -11375,7 +11530,7 @@ mod tests {
     #[test]
     fn authorize_requires_approval_with_recent_gap() {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.has_recent_gap = true;
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -11391,7 +11546,7 @@ mod tests {
     fn authorize_allows_human_with_recent_gap() {
         // Humans are trusted - they can proceed despite gaps
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.has_recent_gap = true;
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
@@ -11406,7 +11561,7 @@ mod tests {
     fn authorize_read_actions_ignore_alt_screen_and_gap() {
         // Read operations should be allowed regardless of pane state
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::alt_screen();
+        let mut caps = unreserved(PaneCapabilities::alt_screen());
         caps.has_recent_gap = true;
 
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
@@ -11420,8 +11575,8 @@ mod tests {
     #[test]
     fn authorize_denies_reserved_pane() {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
-        caps.is_reserved = true;
+        let mut caps = unreserved(PaneCapabilities::prompt());
+        caps.is_reserved = Some(true);
         caps.reserved_by = Some("other-workflow".to_string());
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
@@ -11435,10 +11590,133 @@ mod tests {
     }
 
     #[test]
+    fn unknown_reservation_denies_mutation_even_for_human_or_matching_workflow() {
+        for actor in [ActorKind::Human, ActorKind::Workflow, ActorKind::Robot] {
+            let mut engine = PolicyEngine::permissive();
+            let mut caps = PaneCapabilities::prompt();
+            caps.is_reserved = None;
+            caps.reserved_by = Some("owner".to_string());
+            assert!(!caps.is_input_safe());
+            let input = PolicyInput::new(ActionKind::SendText, actor)
+                .with_pane(1)
+                .with_workflow("owner")
+                .with_capabilities(caps);
+            for decision in [engine.authorize_preview(&input), engine.authorize(&input)] {
+                assert!(decision.is_denied());
+                assert_eq!(decision.rule_id(), Some("policy.reservation_unknown"));
+            }
+            let read = PolicyInput::new(ActionKind::ReadOutput, actor)
+                .with_pane(1)
+                .with_capabilities(input.capabilities.clone());
+            assert!(engine.authorize(&read).is_allowed());
+        }
+    }
+
+    #[test]
+    fn reservation_conflict_precedes_approvable_send_gates() {
+        for actor in [ActorKind::Human, ActorKind::Robot, ActorKind::Workflow] {
+            for gate in [
+                "policy.alt_screen_unknown",
+                "policy.prompt_unknown",
+                "policy.recent_gap",
+                "policy.rate_limit",
+            ] {
+                for ownership in ["foreign", "owner", "free"] {
+                    let mut engine = PolicyEngine::new(1, 100, true);
+                    let mut caps = unreserved(PaneCapabilities::prompt());
+                    match gate {
+                        "policy.alt_screen_unknown" => caps.alt_screen = None,
+                        "policy.prompt_unknown" => caps.prompt_active = false,
+                        "policy.recent_gap" => caps.has_recent_gap = true,
+                        "policy.rate_limit" => {
+                            let first = PolicyInput::new(ActionKind::SendText, actor)
+                                .with_pane(1)
+                                .with_capabilities(unreserved(PaneCapabilities::prompt()));
+                            assert!(engine.authorize(&first).is_allowed());
+                        }
+                        _ => unreachable!(),
+                    }
+                    caps.is_reserved = Some(ownership != "free");
+                    caps.reserved_by = match ownership {
+                        "foreign" => Some("other-workflow".to_string()),
+                        "owner" => Some("my-workflow".to_string()),
+                        _ => None,
+                    };
+                    let input = PolicyInput::new(ActionKind::SendText, actor)
+                        .with_pane(1)
+                        .with_workflow("my-workflow")
+                        .with_capabilities(caps);
+                    for decision in [engine.authorize_preview(&input), engine.authorize(&input)] {
+                        if ownership == "foreign" {
+                            assert!(decision.is_denied(), "{actor:?} {gate}: {decision:?}");
+                            assert_eq!(decision.rule_id(), Some("policy.pane_reserved"));
+                        } else if actor != ActorKind::Human || gate == "policy.rate_limit" {
+                            assert!(
+                                decision.requires_approval(),
+                                "{actor:?} {gate}: {decision:?}"
+                            );
+                            assert_eq!(decision.rule_id(), Some(gate));
+                        } else {
+                            assert!(decision.is_allowed(), "{actor:?} {gate}: {decision:?}");
+                        }
+                    }
+                    let read = PolicyInput::new(ActionKind::ReadOutput, actor)
+                        .with_pane(1)
+                        .with_capabilities(input.capabilities.clone());
+                    assert!(engine.authorize(&read).is_allowed());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_free_and_exact_reservation_owner_can_mutate() {
+        for reserved in [false, true] {
+            let mut engine = PolicyEngine::permissive();
+            let mut caps = PaneCapabilities::prompt();
+            caps.is_reserved = Some(reserved);
+            caps.reserved_by = reserved.then(|| "owner".to_string());
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+                .with_pane(1)
+                .with_workflow("owner")
+                .with_capabilities(caps);
+            assert!(engine.authorize(&input).is_allowed());
+        }
+    }
+
+    #[test]
+    fn reservation_authority_applies_to_targeted_mutations_not_pane_less_spawn() {
+        for action in [ActionKind::Close, ActionKind::Split, ActionKind::Spawn] {
+            let mut engine = PolicyEngine::permissive();
+            let input = PolicyInput::new(action, ActorKind::Human).with_pane(7);
+            let decision = engine.authorize(&input);
+            assert!(decision.is_denied());
+            assert_eq!(decision.rule_id(), Some("policy.reservation_unknown"));
+        }
+        let mut engine = PolicyEngine::permissive();
+        assert!(
+            engine
+                .authorize(&PolicyInput::new(ActionKind::Spawn, ActorKind::Human))
+                .is_allowed()
+        );
+        for caps in [
+            PaneCapabilities::prompt(),
+            PaneCapabilities::running(),
+            PaneCapabilities::alt_screen(),
+        ] {
+            assert_eq!(
+                caps.is_reserved, None,
+                "shell state cannot establish reservation authority"
+            );
+            assert!(!caps.is_input_safe());
+        }
+    }
+
+    #[test]
     fn authorize_allows_owning_workflow_on_reserved_pane() {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
-        caps.is_reserved = true;
+        let mut caps = unreserved(PaneCapabilities::prompt());
+        caps.is_reserved = Some(true);
         caps.reserved_by = Some("my-workflow".to_string());
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
@@ -11453,7 +11731,9 @@ mod tests {
     #[test]
     fn authorize_requires_approval_for_destructive_robot_actions() {
         let mut engine = PolicyEngine::permissive();
-        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot).with_pane(1);
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some("policy.destructive_action"));
@@ -11462,7 +11742,9 @@ mod tests {
     #[test]
     fn authorize_allows_destructive_human_actions() {
         let mut engine = PolicyEngine::permissive();
-        let input = PolicyInput::new(ActionKind::Close, ActorKind::Human).with_pane(1);
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }
@@ -11472,7 +11754,7 @@ mod tests {
         let mut engine = PolicyEngine::new(1, 100, false);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         assert!(engine.authorize(&input).is_allowed());
         let decision = engine.authorize(&input);
@@ -11491,7 +11773,7 @@ mod tests {
         let make = |actor: ActorKind| {
             PolicyInput::new(ActionKind::SendText, actor)
                 .with_pane(1)
-                .with_capabilities(PaneCapabilities::alt_screen())
+                .with_capabilities(unreserved(PaneCapabilities::alt_screen()))
         };
 
         // Enabled: untrusted (Robot) send to an alt-screen pane requires approval.
@@ -11529,7 +11811,7 @@ mod tests {
                 .with_pane(1)
                 .with_capabilities(PaneCapabilities {
                     has_recent_gap: true,
-                    ..PaneCapabilities::prompt()
+                    ..unreserved(PaneCapabilities::prompt())
                 })
         };
 
@@ -11553,7 +11835,7 @@ mod tests {
         let mut engine = PolicyEngine::new(1, 100, false);
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         assert!(engine.authorize(&input).is_allowed());
         let decision = engine.authorize(&input);
@@ -11921,7 +12203,7 @@ mod tests {
 
     #[test]
     fn pane_capabilities_prompt_is_input_safe() {
-        let caps = PaneCapabilities::prompt();
+        let caps = unreserved(PaneCapabilities::prompt());
         assert!(caps.prompt_active);
         assert!(!caps.command_running);
         assert_eq!(caps.alt_screen, Some(false));
@@ -11952,22 +12234,22 @@ mod tests {
 
     #[test]
     fn pane_capabilities_gap_prevents_input() {
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.has_recent_gap = true;
         assert!(!caps.is_input_safe());
     }
 
     #[test]
     fn pane_capabilities_reservation_prevents_input() {
-        let mut caps = PaneCapabilities::prompt();
-        caps.is_reserved = true;
+        let mut caps = unreserved(PaneCapabilities::prompt());
+        caps.is_reserved = Some(true);
         caps.reserved_by = Some("other_workflow".to_string());
         assert!(!caps.is_input_safe());
     }
 
     #[test]
     fn pane_capabilities_clear_gap_on_prompt() {
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.has_recent_gap = true;
         assert!(caps.has_recent_gap);
 
@@ -11992,12 +12274,18 @@ mod tests {
         let mut osc_state = Osc133State::new();
         osc_state.state = ShellState::PromptActive;
 
-        let caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(false), false);
+        let mut caps = PaneCapabilities::from_ingest_state(Some(&osc_state), Some(false), false);
 
         assert!(caps.prompt_active);
         assert!(!caps.command_running);
         assert_eq!(caps.alt_screen, Some(false));
         assert!(!caps.has_recent_gap);
+        assert_eq!(caps.is_reserved, None);
+        assert!(
+            !caps.is_input_safe(),
+            "ingest does not prove reservation authority"
+        );
+        caps.is_reserved = Some(false);
         assert!(caps.is_input_safe());
     }
 
@@ -12530,7 +12818,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
         let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
@@ -12558,7 +12846,7 @@ mod tests {
         // This would normally require approval due to destructive action
         let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
             .with_pane(999)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         let decision = engine.authorize(&input);
         // Allow rule should short-circuit the destructive action check
@@ -12586,7 +12874,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
@@ -12853,7 +13141,7 @@ mod tests {
         let mut engine = PolicyEngine::new(1, 100, false).with_policy_rules(rules);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         // First call allowed
         assert!(engine.authorize(&input).is_allowed());
@@ -13053,7 +13341,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         let risk = engine.calculate_risk(&input);
         assert!(risk.is_low());
@@ -13092,7 +13380,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("rm -rf /tmp/test");
 
         let risk = engine.calculate_risk(&input);
@@ -13123,7 +13411,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("sudo apt update");
 
         let risk = engine.calculate_risk(&input);
@@ -13139,7 +13427,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("npm test\x03");
 
         let risk = engine.calculate_risk(&input);
@@ -13155,7 +13443,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("npm test");
 
         let risk = engine.calculate_risk(&input);
@@ -13172,7 +13460,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("\x1bc");
 
         let risk = engine.calculate_risk(&input);
@@ -13188,7 +13476,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("\x1b[200~echo forged\x1b[201~");
 
         let risk = engine.calculate_risk(&input);
@@ -13228,7 +13516,7 @@ mod tests {
         let engine = PolicyEngine::permissive().with_risk_config(config);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::alt_screen());
+            .with_capabilities(unreserved(PaneCapabilities::alt_screen()));
 
         let risk = engine.calculate_risk(&input);
         // Alt-screen factor should not be present
@@ -13243,7 +13531,7 @@ mod tests {
         let engine = PolicyEngine::permissive().with_risk_config(config);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::alt_screen());
+            .with_capabilities(unreserved(PaneCapabilities::alt_screen()));
 
         let risk = engine.calculate_risk(&input);
         let alt_factor = risk.factors.iter().find(|f| f.id == "state.alt_screen");
@@ -13298,7 +13586,7 @@ mod tests {
         let engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::alt_screen())
+            .with_capabilities(unreserved(PaneCapabilities::alt_screen()))
             .with_command_text("sudo rm -rf /tmp");
 
         let risk1 = engine.calculate_risk(&input);
@@ -13314,9 +13602,9 @@ mod tests {
         let engine = PolicyEngine::permissive();
 
         let caps = PaneCapabilities {
-            alt_screen: Some(true), // 60
-            has_recent_gap: true,   // 35
-            is_reserved: true,      // 50
+            alt_screen: Some(true),  // 60
+            has_recent_gap: true,    // 35
+            is_reserved: Some(true), // 50
             ..Default::default()
         };
 
@@ -13539,7 +13827,7 @@ mod tests {
 
         let caps = PaneCapabilities {
             prompt_active: true,
-            is_reserved: true,
+            is_reserved: Some(true),
             reserved_by: Some("other-workflow".to_string()),
             ..Default::default()
         };
@@ -15590,7 +15878,7 @@ mod tests {
         // Trigger a deny: send text while command is running
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -15604,7 +15892,9 @@ mod tests {
     fn decision_log_records_require_approval() {
         let mut engine = PolicyEngine::new(30, 100, false);
         // Trigger require_approval: destructive action by robot
-        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot).with_pane(1);
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
 
@@ -15646,7 +15936,7 @@ mod tests {
         // Trigger deny: send text while command running -> rule_id = "policy.prompt_required"
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         engine.authorize(&input);
 
         let log = engine.decision_log();
@@ -15705,7 +15995,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         engine.authorize(&input);
 
         let log = engine.decision_log();
@@ -15784,7 +16074,7 @@ mod tests {
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -16020,7 +16310,7 @@ mod tests {
         // SendText is mutating — should be denied
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
         assert_eq!(decision.rule_id(), Some("policy.quarantine"));
@@ -16116,7 +16406,7 @@ mod tests {
         let mut engine = PolicyEngine::new(1, 100, false);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         // Exhaust the per-pane budget and confirm the rate-limit gate fires.
         assert!(engine.authorize(&input).is_allowed());
@@ -16163,7 +16453,7 @@ mod tests {
         // Write to any pane should be blocked (kill switch blocks at registry level)
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(99)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
         assert_eq!(decision.rule_id(), Some("policy.quarantine"));
@@ -16192,7 +16482,7 @@ mod tests {
         // Blocked before release
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         assert!(engine.authorize(&input).is_denied());
 
         // Release from quarantine
@@ -16228,7 +16518,7 @@ mod tests {
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(5)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         engine.authorize(&input);
 
         // The denial should be recorded in the decision log
@@ -16253,7 +16543,7 @@ mod tests {
         // Strict engine requires prompt active, so non-prompt sends are denied
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -16269,7 +16559,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
 
@@ -16289,7 +16579,7 @@ mod tests {
         let mut engine = PolicyEngine::from_safety_config(&config);
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
 
@@ -16304,7 +16594,7 @@ mod tests {
         // Destructive action by robot → require approval
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("git reset --hard");
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
@@ -16321,7 +16611,7 @@ mod tests {
         // Generate two deny decisions
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         engine.authorize(&input);
         engine.authorize(&input);
 
@@ -16356,7 +16646,7 @@ mod tests {
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(7)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -16381,7 +16671,7 @@ mod tests {
         for _ in 0..5 {
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
                 .with_pane(1)
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(unreserved(PaneCapabilities::prompt()));
             engine.authorize(&input);
         }
 
@@ -16536,7 +16826,7 @@ mod tests {
         // Deny an action against quarantined pane
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(20)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -16573,7 +16863,7 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
 
         engine.authorize(&input);
         engine.authorize(&input);
@@ -16589,7 +16879,7 @@ mod tests {
         let mut engine = PolicyEngine::strict();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(unreserved(PaneCapabilities::running()));
         let decision = engine.authorize(&input);
         assert!(decision.is_denied());
 
@@ -16906,6 +17196,7 @@ mod tests {
             domain: None,
             capabilities: PaneCapabilities {
                 prompt_active: true,
+                is_reserved: Some(false),
                 ..Default::default()
             },
             text_summary: None,
@@ -17717,7 +18008,7 @@ mod tests {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(0)
             .with_domain("org-b")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }
@@ -17749,7 +18040,7 @@ mod tests {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(5)
             .with_domain("org-b")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(!decision.is_allowed());
         assert_eq!(
@@ -17787,7 +18078,7 @@ mod tests {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(3)
             .with_domain("org-a")
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }

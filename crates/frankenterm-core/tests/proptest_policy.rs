@@ -11,6 +11,11 @@ use frankenterm_core::policy::*;
 use frankenterm_core::policy_decision_log::{DecisionOutcome, PolicyDecisionEntry};
 use proptest::prelude::*;
 
+fn unreserved(mut caps: PaneCapabilities) -> PaneCapabilities {
+    caps.is_reserved = Some(false);
+    caps
+}
+
 // ============================================================================
 // Strategies
 // ============================================================================
@@ -81,7 +86,7 @@ fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
         proptest::bool::ANY,
         proptest::option::of(proptest::bool::ANY),
         proptest::bool::ANY,
-        proptest::bool::ANY,
+        proptest::option::of(proptest::bool::ANY),
         proptest::option::of("[a-z-]{3,20}"),
     )
         .prop_map(
@@ -352,7 +357,7 @@ proptest! {
             && !caps.command_running
             && caps.alt_screen == Some(false)
             && !caps.has_recent_gap
-            && !caps.is_reserved;
+            && caps.is_reserved == Some(false);
         prop_assert_eq!(caps.is_input_safe(), expected,
             "is_input_safe should match conjunction of all safety conditions");
     }
@@ -372,10 +377,13 @@ proptest! {
         }
     }
 
-    /// Property 13: PaneCapabilities::prompt() is input safe
+    /// Property 13: prompt state needs independent reservation authority
     #[test]
     fn prop_pane_capabilities_prompt_safe(_dummy in Just(())) {
-        let caps = PaneCapabilities::prompt();
+        let mut caps = PaneCapabilities::prompt();
+        prop_assert_eq!(caps.is_reserved, None);
+        prop_assert!(!caps.is_input_safe());
+        caps.is_reserved = Some(false);
         prop_assert!(caps.is_input_safe(), "prompt() should be input safe");
         prop_assert!(caps.prompt_active);
         prop_assert!(!caps.command_running);
@@ -940,7 +948,7 @@ proptest! {
         action in prop_oneof![Just(ActionKind::SendText), Just(ActionKind::SendControl)],
     ) {
         let mut engine = PolicyEngine::permissive();
-        let mut caps = PaneCapabilities::prompt();
+        let mut caps = unreserved(PaneCapabilities::prompt());
         caps.alt_screen = None; // Unknown
         let input = PolicyInput::new(action, ActorKind::Human)
             .with_pane(1)
@@ -957,7 +965,7 @@ proptest! {
         action in prop_oneof![Just(ActionKind::SendText), Just(ActionKind::SendControl)],
     ) {
         let mut engine = PolicyEngine::permissive();
-        let caps = PaneCapabilities::alt_screen();
+        let caps = unreserved(PaneCapabilities::alt_screen());
         let input = PolicyInput::new(action, actor)
             .with_pane(1)
             .with_capabilities(caps);
@@ -989,7 +997,9 @@ proptest! {
     ) {
         let mut engine = PolicyEngine::permissive();
         // Close is destructive but not a send action, so alt-screen/prompt checks don't apply
-        let input = PolicyInput::new(ActionKind::Close, actor).with_pane(1);
+        let input = PolicyInput::new(ActionKind::Close, actor)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         prop_assert!(decision.requires_approval(),
             "Destructive action by {:?} should require approval", actor);
@@ -1000,7 +1010,9 @@ proptest! {
     #[test]
     fn prop_engine_destructive_human_allowed(_dummy in Just(())) {
         let mut engine = PolicyEngine::permissive();
-        let input = PolicyInput::new(ActionKind::Close, ActorKind::Human).with_pane(1);
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(unreserved(PaneCapabilities::prompt()));
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_allowed(),
             "Human destructive actions should be allowed");
@@ -1015,7 +1027,7 @@ proptest! {
         prop_assume!(my_wf != other_wf);
         let mut engine = PolicyEngine::permissive();
         let mut caps = PaneCapabilities::prompt();
-        caps.is_reserved = true;
+        caps.is_reserved = Some(true);
         caps.reserved_by = Some(other_wf.clone());
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
             .with_pane(1)
@@ -1032,7 +1044,7 @@ proptest! {
     fn prop_engine_reserved_pane_allows_owner(wf_id in "[a-z]{3,10}") {
         let mut engine = PolicyEngine::permissive();
         let mut caps = PaneCapabilities::prompt();
-        caps.is_reserved = true;
+        caps.is_reserved = Some(true);
         caps.reserved_by = Some(wf_id.clone());
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
             .with_pane(1)
@@ -1289,7 +1301,7 @@ proptest! {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("rm -rf /");
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_denied(), "rm -rf / should be denied");
@@ -1302,7 +1314,7 @@ proptest! {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text("rm -rf ~");
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_denied(), "rm -rf ~ should be denied");
@@ -1334,7 +1346,7 @@ proptest! {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(unreserved(PaneCapabilities::prompt()))
             .with_command_text(&text);
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_allowed(),
@@ -1522,7 +1534,7 @@ proptest! {
         );
 
         // Should match regardless of surface (catch-all)
-        input.capabilities = PaneCapabilities::prompt();
+        input.capabilities = unreserved(PaneCapabilities::prompt());
         let decision = engine.authorize(&input);
         prop_assert!(!decision.is_allowed(),
             "Catch-all rule should deny on any surface {:?}", surface);
@@ -1554,7 +1566,7 @@ proptest! {
 
         let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
         input.surface = input_surface;
-        input.capabilities = PaneCapabilities::prompt();
+        input.capabilities = unreserved(PaneCapabilities::prompt());
         let decision = engine.authorize(&input);
 
         if target_surface == input_surface {
@@ -1592,7 +1604,7 @@ proptest! {
 
         let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
         input.surface = surface;
-        input.capabilities = PaneCapabilities::prompt();
+        input.capabilities = unreserved(PaneCapabilities::prompt());
         let decision = engine.authorize(&input);
         prop_assert!(!decision.is_allowed(),
             "Surface matching should be case-insensitive: rule='{}', input='{}'",
@@ -1640,7 +1652,7 @@ proptest! {
 
         let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
         input.surface = test_surface;
-        input.capabilities = PaneCapabilities::prompt();
+        input.capabilities = unreserved(PaneCapabilities::prompt());
         let decision = engine.authorize(&input);
 
         let should_match = test_surface == s1 || test_surface == s2;

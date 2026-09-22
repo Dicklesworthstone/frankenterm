@@ -3369,7 +3369,7 @@ steps:
     fn broadcast_precondition_no_gap_and_not_reserved() {
         let safe = PaneCapabilities {
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             ..Default::default()
         };
         assert!(BroadcastPrecondition::NoRecentGap.check(&safe));
@@ -3377,11 +3377,12 @@ steps:
 
         let risky = PaneCapabilities {
             has_recent_gap: true,
-            is_reserved: true,
+            is_reserved: Some(true),
             ..Default::default()
         };
         assert!(!BroadcastPrecondition::NoRecentGap.check(&risky));
         assert!(!BroadcastPrecondition::NotReserved.check(&risky));
+        assert!(!BroadcastPrecondition::NotReserved.check(&PaneCapabilities::unknown()));
     }
 
     #[test]
@@ -3391,7 +3392,7 @@ steps:
             prompt_active: false,
             alt_screen: Some(true),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             ..Default::default()
         };
         let failures = check_preconditions(&preconditions, &caps);
@@ -3407,7 +3408,7 @@ steps:
             prompt_active: true,
             alt_screen: Some(false),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             ..Default::default()
         };
         let failures = check_preconditions(&preconditions, &caps);
@@ -3536,7 +3537,7 @@ steps:
             command_running: false,
             alt_screen: Some(false),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             reserved_by: None,
         }
     }
@@ -3547,7 +3548,7 @@ steps:
             command_running: true,
             alt_screen: Some(false),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             reserved_by: None,
         }
     }
@@ -3558,7 +3559,7 @@ steps:
             command_running: false,
             alt_screen: Some(true),
             has_recent_gap: false,
-            is_reserved: false,
+            is_reserved: Some(false),
             reserved_by: None,
         }
     }
@@ -4745,7 +4746,10 @@ steps:
         let mut engine = PolicyEngine::strict();
 
         // Create capabilities where command is running (not at prompt)
-        let caps = PaneCapabilities::running();
+        let caps = PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::running()
+        };
 
         // Try to authorize a send - should be denied
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
@@ -4785,7 +4789,10 @@ steps:
             let mut injector = PolicyGatedInjector::new(engine, client);
 
             // Create capabilities where command is running (not at prompt)
-            let caps = PaneCapabilities::running();
+            let caps = PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::running()
+            };
 
             // Try to send text - should be denied by policy
             let result = injector
@@ -4826,7 +4833,10 @@ steps:
                 crate::policy::PolicyEngine::permissive(),
                 Arc::new(MockWezterm),
             ));
-            let caps = PaneCapabilities::prompt();
+            let caps = PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            };
             let cx = crate::cx::for_request();
             let (a, b) = futures::future::join(
                 injector.send_text(&cx, 1, "a", ActorKind::Workflow, &caps, Some("wf-a")),
@@ -6040,7 +6050,10 @@ steps:
             step_idx: usize,
         ) -> BoxFuture<'_, StepResult> {
             if step_idx == 0 {
-                ctx.update_capabilities(PaneCapabilities::prompt());
+                ctx.update_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                });
             }
             Box::pin(async move {
                 match step_idx {

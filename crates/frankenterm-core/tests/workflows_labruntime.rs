@@ -363,7 +363,10 @@ fn policy_gated_injector_returns_denied_for_running_command() {
         let client = frankenterm_core::wezterm::default_wezterm_handle();
         let mut injector = PolicyGatedInjector::new(engine, client);
 
-        let caps = PolicyPaneCaps::running();
+        let caps = PolicyPaneCaps {
+            is_reserved: Some(false),
+            ..PolicyPaneCaps::running()
+        };
 
         let result = injector
             .send_text(

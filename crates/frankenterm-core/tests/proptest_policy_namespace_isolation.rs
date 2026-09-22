@@ -162,7 +162,7 @@ proptest! {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(pane_id)
             .with_domain(ns.as_str())
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities { is_reserved: Some(false), ..PaneCapabilities::prompt() });
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_allowed(), "same-namespace pane access must be allowed");
     }
@@ -195,7 +195,7 @@ proptest! {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(pane_id)
             .with_domain(ns_b.as_str())
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities { is_reserved: Some(false), ..PaneCapabilities::prompt() });
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_denied(), "cross-tenant pane access must be denied under strict policy");
     }
@@ -224,7 +224,7 @@ proptest! {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(pane_id)
             .with_domain(ns_b.as_str())
-            .with_capabilities(PaneCapabilities::prompt());
+            .with_capabilities(PaneCapabilities { is_reserved: Some(false), ..PaneCapabilities::prompt() });
         let decision = engine.authorize(&input);
         prop_assert!(decision.is_allowed(), "disabled namespace isolation must not deny");
     }

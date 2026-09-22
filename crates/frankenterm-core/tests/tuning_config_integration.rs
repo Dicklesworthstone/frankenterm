@@ -169,7 +169,10 @@ approval_ttl_secs = 77
     let send_input = || {
         PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(7)
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            })
     };
 
     assert!(engine.authorize(&send_input()).is_allowed());

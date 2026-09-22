@@ -4180,11 +4180,16 @@ fn tx_prepare_policy_input(
     let mut capabilities = snapshot
         .map(|snapshot| snapshot.capabilities.clone())
         .unwrap_or_else(PaneCapabilities::unknown);
-    if let Some(snapshot) = snapshot
-        && let Some(reserved_by) = snapshot.reserved_by.clone()
-    {
-        capabilities.is_reserved = true;
-        capabilities.reserved_by = Some(reserved_by);
+    if let Some(snapshot) = snapshot {
+        capabilities.is_reserved = snapshot
+            .reservation_lookup_error
+            .is_none()
+            .then_some(snapshot.reserved_by.is_some());
+        capabilities.reserved_by = if snapshot.reservation_lookup_error.is_none() {
+            snapshot.reserved_by.clone()
+        } else {
+            None
+        };
     }
 
     let mut input = PolicyInput::new(tx_prepare_action_kind(&step.action), context.actor)
@@ -9975,6 +9980,28 @@ mod tests {
         assert_eq!(targets.lookup_count(1), 1);
         assert_eq!(targets.lookup_count(2), 1);
         assert_eq!(targets.lookup_count(3), 1);
+    }
+
+    #[test]
+    fn tx_prepare_reservation_lookup_failure_revokes_stale_owner_authority() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let context = sample_prepare_context();
+        let mut snapshot = live_target_snapshot(1, 1_700_000_000_000);
+        snapshot.reserved_by = Some("wf-test".to_string());
+        snapshot.reservation_lookup_error = Some("unavailable".to_string());
+        let input =
+            tx_prepare_policy_input(&contract.plan.steps[0], Some(1), Some(&snapshot), &context);
+        assert_eq!(input.capabilities.is_reserved, None);
+        assert_eq!(input.capabilities.reserved_by, None);
+        let mut engine = crate::policy::PolicyEngine::permissive();
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.reservation_unknown"));
+        snapshot.reservation_lookup_error = None;
+        let owned =
+            tx_prepare_policy_input(&contract.plan.steps[0], Some(1), Some(&snapshot), &context);
+        assert_eq!(owned.capabilities.is_reserved, Some(true));
+        assert!(engine.authorize(&owned).is_allowed());
     }
 
     #[test]

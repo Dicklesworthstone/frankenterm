@@ -51,9 +51,39 @@ pub struct CapabilityResolution {
     pub warnings: Vec<String>,
 }
 
+struct BoundedWarning {
+    text: String,
+    overflowed: bool,
+}
+
+impl std::fmt::Write for BoundedWarning {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.overflowed
+            || !self
+                .text
+                .len()
+                .checked_add(value.len())
+                .is_some_and(|length| length <= WARNING_DETAIL_MAX_BYTES)
+        {
+            self.overflowed = true;
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(value);
+        Ok(())
+    }
+}
+
 fn bounded_detail(prefix: &str, detail: &dyn std::fmt::Display) -> String {
+    let mut buffer = BoundedWarning {
+        text: String::with_capacity(WARNING_DETAIL_MAX_BYTES),
+        overflowed: false,
+    };
+    if std::fmt::write(&mut buffer, format_args!("{prefix}{detail}")).is_err() || buffer.overflowed
+    {
+        return "diagnostic unavailable".to_string();
+    }
     crate::output::truncate_bounded(
-        &format!("{prefix}{detail}"),
+        &buffer.text,
         WARNING_DETAIL_MAX_COLUMNS,
         WARNING_DETAIL_MAX_BYTES,
     )
@@ -64,11 +94,12 @@ fn bounded_detail(prefix: &str, detail: &dyn std::fmt::Display) -> String {
 /// # Errors
 /// Returns a bounded diagnostic if the segments cannot be read.
 pub async fn derive_osc_state_from_storage(
+    cx: &crate::cx::Cx,
     storage: &StorageHandle,
     pane_id: u64,
 ) -> Result<Option<Osc133State>, String> {
     let segments = storage
-        .get_segments(pane_id, OSC_SEGMENT_LIMIT)
+        .get_segments_with_cx(cx, pane_id, OSC_SEGMENT_LIMIT)
         .await
         .map_err(|error| bounded_detail("failed to read segments: ", &error))?;
     if segments.is_empty() {
@@ -94,17 +125,19 @@ pub async fn derive_osc_state_from_storage(
 /// malformed.
 #[cfg(unix)]
 pub async fn fetch_pane_state_from_ipc(
+    cx: &crate::cx::Cx,
     socket_path: &Path,
     pane_id: u64,
 ) -> Result<Option<IpcPaneState>, String> {
+    cx.checkpoint()
+        .map_err(|error| bounded_detail("pane state request cancelled: ", &error))?;
     #[cfg(test)]
     if let Some(state) = test_pane_state_override(pane_id) {
         return Ok(Some(state));
     }
 
     let client = crate::ipc::IpcClient::new(socket_path);
-    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    match client.pane_state_with_cx(&cx, pane_id).await {
+    match client.pane_state_with_cx(cx, pane_id).await {
         Ok(response) => {
             if !response.ok {
                 let detail = response
@@ -130,9 +163,12 @@ pub async fn fetch_pane_state_from_ipc(
 /// Always errors: watcher IPC is Unix-only.
 #[cfg(not(unix))]
 pub async fn fetch_pane_state_from_ipc(
+    cx: &crate::cx::Cx,
     _socket_path: &Path,
     _pane_id: u64,
 ) -> Result<Option<IpcPaneState>, String> {
+    cx.checkpoint()
+        .map_err(|error| bounded_detail("pane state request cancelled: ", &error))?;
     #[cfg(test)]
     if let Some(state) = test_pane_state_override(_pane_id) {
         return Ok(Some(state));
@@ -143,7 +179,7 @@ pub async fn fetch_pane_state_from_ipc(
 /// Alt-screen state the watcher can vouch for, or `None` when unknown.
 #[must_use]
 pub fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
-    if !state.known {
+    if !state.known || state.observed == Some(false) {
         return None;
     }
     if let Some(cursor_state) = state.cursor_alt_screen {
@@ -161,8 +197,10 @@ pub fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
 /// inactive, unknown alt-screen stays `None`, and unknown capture continuity
 /// is treated as a recent gap. The active reservation is always consulted
 /// when storage is available so reservation conflicts are denied on every
-/// surface.
+/// surface. Missing or failed reservation lookups retain unknown authority;
+/// only a successful empty lookup establishes that the pane is unreserved.
 pub async fn resolve_pane_capabilities(
+    cx: &crate::cx::Cx,
     pane_id: u64,
     storage: Option<&StorageHandle>,
     ipc_socket_path: Option<&Path>,
@@ -171,7 +209,7 @@ pub async fn resolve_pane_capabilities(
     let mut osc_state = None;
 
     if let Some(storage) = storage {
-        match derive_osc_state_from_storage(storage, pane_id).await {
+        match derive_osc_state_from_storage(cx, storage, pane_id).await {
             Ok(state) => osc_state = state,
             Err(error) => warnings.push(bounded_detail("OSC 133 state unavailable: ", &error)),
         }
@@ -184,7 +222,7 @@ pub async fn resolve_pane_capabilities(
     let mut gap_known = false;
 
     if let Some(socket_path) = ipc_socket_path {
-        match fetch_pane_state_from_ipc(socket_path, pane_id).await {
+        match fetch_pane_state_from_ipc(cx, socket_path, pane_id).await {
             Ok(Some(state)) => {
                 if state.pane_id != pane_id {
                     warnings.push(format!(
@@ -203,10 +241,12 @@ pub async fn resolve_pane_capabilities(
                         "Pane is not observed by watcher; state may be incomplete.".to_string(),
                     );
                 }
-                alt_screen = resolve_alt_screen_state(&state);
-                if let Some(state_in_gap) = state.in_gap {
-                    gap_known = true;
-                    in_gap = state_in_gap;
+                if state.pane_id == pane_id && state.known && state.observed != Some(false) {
+                    alt_screen = resolve_alt_screen_state(&state);
+                    if let Some(state_in_gap) = state.in_gap {
+                        gap_known = true;
+                        in_gap = state_in_gap;
+                    }
                 }
                 if alt_screen.is_none() {
                     warnings
@@ -239,16 +279,12 @@ pub async fn resolve_pane_capabilities(
         PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
 
     if let Some(storage) = storage {
-        let reservation_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        match storage
-            .get_active_reservation_with_cx(&reservation_cx, pane_id)
-            .await
-        {
+        match storage.get_active_reservation_with_cx(cx, pane_id).await {
             Ok(Some(reservation)) => {
-                capabilities.is_reserved = true;
+                capabilities.is_reserved = Some(true);
                 capabilities.reserved_by = Some(reservation.owner_id);
             }
-            Ok(None) => {}
+            Ok(None) => capabilities.is_reserved = Some(false),
             Err(error) => {
                 warnings.push(bounded_detail("Reservation lookup failed: ", &error));
             }
@@ -332,6 +368,69 @@ pub(crate) fn test_pane_state_override(pane_id: u64) -> Option<IpcPaneState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_async::CompatRuntime;
+
+    #[test]
+    fn warning_formatting_stops_at_the_byte_budget() {
+        struct StreamingDetail(std::cell::Cell<usize>);
+        impl std::fmt::Display for StreamingDetail {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..1_000_000 {
+                    self.0.set(self.0.get() + 1);
+                    formatter.write_str(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    )?;
+                }
+                Ok(())
+            }
+        }
+        let detail = StreamingDetail(std::cell::Cell::new(0));
+        assert_eq!(bounded_detail("", &detail), "diagnostic unavailable");
+        assert_eq!(detail.0.get(), WARNING_DETAIL_MAX_BYTES / 64 + 1);
+        assert_eq!(bounded_detail("Error: ", &"échec"), "Error: échec");
+    }
+
+    #[test]
+    fn foreign_unknown_and_unobserved_watcher_states_cannot_clear_a_gap() {
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (pane_id, returned_id, known, observed) in [
+            (4_301, 4_302, true, Some(true)),
+            (4_303, 4_303, false, Some(true)),
+            (4_304, 4_304, true, Some(false)),
+        ] {
+            let state = IpcPaneState {
+                pane_id: returned_id,
+                known,
+                observed,
+                alt_screen: Some(false),
+                last_status_at: Some(1),
+                in_gap: Some(false),
+                cursor_alt_screen: Some(false),
+                reason: None,
+            };
+            assert!(
+                test_pane_state_override_slot()
+                    .lock()
+                    .unwrap()
+                    .insert(pane_id, (state, 1))
+                    .is_none()
+            );
+            let _guard = TestPaneStateOverrideGuard { pane_id };
+            let resolution = runtime.block_on(resolve_pane_capabilities(
+                &crate::cx::for_testing(),
+                pane_id,
+                None,
+                Some(Path::new("/nonexistent/ft-capability-test.sock")),
+            ));
+            assert_eq!(resolution.capabilities.alt_screen, None);
+            assert!(resolution.capabilities.has_recent_gap);
+            assert!(resolution.warnings.iter().any(|warning| {
+                warning == "Capture continuity unknown; treating as recent gap."
+            }));
+        }
+    }
 
     #[test]
     fn osc_segment_limit_is_bounded() {
@@ -380,15 +479,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let reserved = resolve_pane_capabilities(7, Some(&storage), None).await;
-            assert!(reserved.capabilities.is_reserved);
+            let cx = crate::cx::for_testing();
+            let reserved = resolve_pane_capabilities(&cx, 7, Some(&storage), None).await;
+            assert_eq!(reserved.capabilities.is_reserved, Some(true));
             assert_eq!(
                 reserved.capabilities.reserved_by.as_deref(),
                 Some("wf-owner")
             );
 
-            let free = resolve_pane_capabilities(8, Some(&storage), None).await;
-            assert!(!free.capabilities.is_reserved);
+            let free = resolve_pane_capabilities(&cx, 8, Some(&storage), None).await;
+            assert_eq!(free.capabilities.is_reserved, Some(false));
             assert_eq!(free.capabilities.reserved_by, None);
             assert!(
                 free.warnings
@@ -396,6 +496,66 @@ mod tests {
                     .any(|warning| warning.contains("IPC socket unavailable")),
                 "missing watcher evidence is reported, not assumed: {:?}",
                 free.warnings
+            );
+
+            let mut policy = crate::policy::PolicyEngine::permissive();
+            let free_input = crate::policy::PolicyInput::new(
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActorKind::Human,
+            )
+            .with_pane(8)
+            .with_capabilities(free.capabilities);
+            assert!(policy.authorize(&free_input).is_allowed());
+
+            // A cancelled caller cannot inherit a successful empty reservation
+            // lookup from a fresh context manufactured inside the resolver.
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("resolver caller cancelled"),
+            );
+            let cancelled_resolution =
+                resolve_pane_capabilities(&cancelled, 8, Some(&storage), None).await;
+            assert_eq!(cancelled_resolution.capabilities.is_reserved, None);
+            assert_eq!(cancelled_resolution.capabilities.reserved_by, None);
+            assert!(
+                cancelled_resolution
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.starts_with("Reservation lookup failed:"))
+            );
+
+            // A corrupt expiry field must not turn an existing reservation into
+            // an apparently free pane. Exercise the actual database decoder,
+            // resolver, and authorization path rather than fabricating an error.
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE pane_reservations SET expires_at = 'invalid-expiry' WHERE pane_id = 7",
+                        [],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert!(storage.get_active_reservation(7).await.is_err());
+            let unreadable = resolve_pane_capabilities(&cx, 7, Some(&storage), None).await;
+            assert_eq!(unreadable.capabilities.is_reserved, None);
+            assert!(
+                unreadable
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.starts_with("Reservation lookup failed:"))
+            );
+            let unreadable_input = crate::policy::PolicyInput::new(
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActorKind::Human,
+            )
+            .with_pane(7)
+            .with_capabilities(unreadable.capabilities);
+            assert_eq!(
+                policy.authorize(&unreadable_input).rule_id(),
+                Some("policy.reservation_unknown")
             );
             storage.shutdown().await.unwrap();
         });
@@ -418,6 +578,7 @@ mod tests {
             .build()
             .unwrap();
         let resolution = runtime.block_on(resolve_pane_capabilities(
+            &crate::cx::for_testing(),
             3,
             None,
             Some(Path::new("/nonexistent/ft-capability-test.sock")),
@@ -426,7 +587,7 @@ mod tests {
             resolution.capabilities.alt_screen, None,
             "an unknown watcher state cannot vouch for alt-screen"
         );
-        assert!(!resolution.capabilities.is_reserved);
+        assert_eq!(resolution.capabilities.is_reserved, None);
         assert!(
             resolution
                 .warnings

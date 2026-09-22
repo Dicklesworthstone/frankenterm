@@ -52,7 +52,10 @@ fn emergency_kill_switch_denies_every_action_kind_no_bypass() {
         for &action in ALL_ACTIONS {
             let input = PolicyInput::new(action, actor)
                 .with_pane(1)
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                });
             let decision = engine.authorize(&input);
             assert!(
                 decision.is_denied(),
@@ -78,7 +81,10 @@ fn deny_by_default_robot_send_to_running_command() {
     let mut engine = PolicyEngine::strict();
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(1)
-        .with_capabilities(PaneCapabilities::running());
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::running()
+        });
     let decision = engine.authorize(&input);
     assert!(
         decision.is_denied(),
@@ -94,7 +100,10 @@ fn gated_action_requires_approval_never_silently_allowed() {
     let mut engine = PolicyEngine::strict();
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(1)
-        .with_capabilities(PaneCapabilities::unknown());
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::unknown()
+        });
     let decision = engine.authorize(&input);
     assert!(
         decision.requires_approval(),
@@ -132,7 +141,10 @@ fn sends_never_silently_allowed_into_ambiguous_state_pane() {
     for &action in SEND_ACTIONS {
         let input = PolicyInput::new(action, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::unknown());
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::unknown()
+            });
         let decision = engine.authorize(&input);
         assert!(
             !decision.is_allowed(),
@@ -150,7 +162,10 @@ fn sends_never_silently_allowed_into_ambiguous_state_pane() {
     for &action in SEND_ACTIONS {
         let input = PolicyInput::new(action, ActorKind::Robot)
             .with_pane(1)
-            .with_capabilities(PaneCapabilities::running());
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::running()
+            });
         let decision = engine.authorize(&input);
         assert!(
             decision.is_denied() && !decision.is_allowed(),

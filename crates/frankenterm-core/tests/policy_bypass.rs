@@ -43,7 +43,10 @@ fn test_multiline_bypass_mitigation() {
     let input_text = "echo safe\nrm -rf /";
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(1)
-        .with_capabilities(PaneCapabilities::prompt())
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::prompt()
+        })
         .with_command_text(input_text);
 
     let decision = engine.authorize(&input);
@@ -66,7 +69,10 @@ fn test_comment_bypass_mitigation() {
     let input_text = "# harmless comment\nrm -rf /";
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(1)
-        .with_capabilities(PaneCapabilities::prompt())
+        .with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::prompt()
+        })
         .with_command_text(input_text);
 
     let decision = engine.authorize(&input);

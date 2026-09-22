@@ -1102,7 +1102,10 @@ mod tests {
             .with_pane(1)
             .with_domain("local")
             .with_text_summary("echo hi")
-            .with_capabilities(PaneCapabilities::prompt())
+            .with_capabilities(PaneCapabilities {
+                is_reserved: Some(false),
+                ..PaneCapabilities::prompt()
+            })
     }
 
     fn parse_decision_context(serialized: Option<&str>) -> crate::policy::DecisionContext {
@@ -2507,7 +2510,10 @@ mod tests {
                 .with_pane(1)
                 .with_domain("local")
                 .with_text_summary("echo different") // Different text
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                });
 
             let consumed = store
                 .consume(&request.allow_once_code, &different_text)
@@ -2847,7 +2853,10 @@ mod tests {
                 .with_pane(99)
                 .with_domain("local")
                 .with_text_summary("echo hi")
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                });
 
             let consumed = store
                 .consume_for_plan(&request.allow_once_code, &wrong_pane, plan_hash)
@@ -3108,7 +3117,13 @@ mod tests {
             assert_eq!(context.actor, ActorKind::Robot);
             assert_eq!(context.surface, PolicySurface::Mux);
             assert_eq!(context.text_summary.as_deref(), Some("echo hi"));
-            assert_eq!(context.capabilities, PaneCapabilities::prompt());
+            assert_eq!(
+                context.capabilities,
+                PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                }
+            );
             assert_eq!(
                 context.determining_rule.as_deref(),
                 Some("approval.allow_once.consume")
@@ -3171,7 +3186,10 @@ mod tests {
                     .with_pane(1)
                     .with_domain("local")
                     .with_text_summary(text_summary)
-                    .with_capabilities(PaneCapabilities::prompt());
+                    .with_capabilities(PaneCapabilities {
+                        is_reserved: Some(false),
+                        ..PaneCapabilities::prompt()
+                    });
                 let request = store.issue(&input, None).await.unwrap();
                 let audit_context = ApprovalAuditContext {
                     correlation_id: Some(audit_correlation_id),
@@ -3586,7 +3604,10 @@ mod tests {
                 .with_pane(1)
                 .with_domain("local")
                 .with_text_summary("echo hi")
-                .with_capabilities(PaneCapabilities::prompt());
+                .with_capabilities(PaneCapabilities {
+                    is_reserved: Some(false),
+                    ..PaneCapabilities::prompt()
+                });
 
             let consumed = store
                 .consume(&request.allow_once_code, &wrong_action)

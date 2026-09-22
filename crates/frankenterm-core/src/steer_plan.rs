@@ -196,17 +196,20 @@ fn combined_envelope_verdict(
     }
 }
 
-/// Run the live policy preflight for the future steer execution step.
+/// Run the policy evaluator against a synthetic steer rehearsal scenario.
 ///
 /// The input is intentionally synthetic and harmless: the operator objective is
 /// audit context, not command text, so destructive words in an objective cannot
 /// trip command-gate policy as though they were executable shell bytes.
 fn policy_preflight_decision(scenario: SteerPlanScenario, objective: &str) -> PolicyDecision {
-    let capabilities = if scenario == SteerPlanScenario::ApprovalRequired {
+    let mut capabilities = if scenario == SteerPlanScenario::ApprovalRequired {
         PaneCapabilities::unknown()
     } else {
         PaneCapabilities::prompt()
     };
+    // The scenario models an unreserved target. This is fixture evidence,
+    // never reservation authority for a subsequent live execution.
+    capabilities.is_reserved = Some(false);
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
         .with_pane(0)
         .with_capabilities(capabilities)
