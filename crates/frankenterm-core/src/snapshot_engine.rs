@@ -16830,6 +16830,65 @@ mod tests {
     }
 
     #[test]
+    fn session_cleanup_unresolved_durable_attempt_defers_without_latching() {
+        run_async_test(async {
+            use crate::session_retention::{
+                SESSION_CLEANUP_ATTEMPT_KEY, SessionCleanupAttemptStatus,
+                session_cleanup_attempt_status,
+            };
+
+            let (_tmp, db_path) = setup_test_db();
+            let conn = Connection::open(db_path.as_str()).expect("open cleanup fixture");
+            // Another process admitted an attempt and died before finishing.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS config (
+                     key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+                 )",
+            )
+            .unwrap();
+            let open_receipt = serde_json::json!({
+                "schema": "ft.session_cleanup_attempt.v1",
+                "attempt_id": "dead-1",
+                "state": "open",
+                "owner_pid": 1,
+                "started_at_ms": 1,
+                "max_age_days": 30,
+                "max_closed_sessions": 0,
+                "max_total_size_mb": 0,
+                "finished_at_ms": null,
+                "sessions_deleted": null,
+                "orphan_rows_deleted": null,
+            });
+            conn.execute(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, open_receipt.to_string()],
+            )
+            .unwrap();
+
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(db_path, config);
+            let mut schedule = SessionCleanupSchedule::default();
+            let cx = crate::cx::for_testing();
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
+
+            assert!(schedule.last_authoritative_success.is_none());
+            assert!(
+                schedule.retry_deferred_at.is_some(),
+                "an unresolved durable attempt defers cleanup so an acknowledgement can resume it"
+            );
+            assert!(
+                !engine.snapshot_authority.reconciliation_is_required(),
+                "no cleanup SQL ran, so snapshot authority must not latch"
+            );
+            assert!(matches!(
+                session_cleanup_attempt_status(&conn).unwrap(),
+                SessionCleanupAttemptStatus::Open { ref attempt_id, .. } if attempt_id == "dead-1"
+            ));
+        });
+    }
+
+    #[test]
     fn session_cleanup_authoritative_success_advances_interval_zero_cadence() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();

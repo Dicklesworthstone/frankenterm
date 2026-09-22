@@ -635,6 +635,8 @@ fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
                                     reconciliation_required_restore_attempts: 0,
                                     orphaned_restore_intents: 0,
                                     total_data_bytes,
+                                    cleanup_attempt:
+                                        frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
                                 }
                             },
                         )
@@ -909,6 +911,7 @@ proptest! {
             "reconciliation_required_restore_attempts": report.reconciliation_required_restore_attempts,
             "orphaned_restore_intents": report.orphaned_restore_intents,
             "total_data_bytes": report.total_data_bytes,
+            "cleanup_attempt": {"state": "none"},
         });
         prop_assert_eq!(value, expected);
     }

@@ -1758,6 +1758,8 @@ SEE ALSO:
                                       Allow cleanup of proven-dead recovery data
     ft session preserve-recovery <id> Keep recovery data protected
     ft session doctor                 Health check on session data
+    ft session acknowledge-cleanup <attempt> --force
+                                      Resume retention after an interrupted cleanup
     ft session dump                   Write a private forensic live-mux export
     ft session verify-dump <path>     Verify a dump offline
 
@@ -8493,6 +8495,21 @@ enum SessionCommands {
         session_id: String,
 
         /// Confirm the recovery-data loss authorization
+        #[arg(long)]
+        force: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Resume retention cleanup after an interrupted cleanup attempt
+    AcknowledgeCleanup {
+        /// Attempt ID shown by `ft session doctor`, or `malformed` for a
+        /// malformed receipt
+        attempt: String,
+
+        /// Confirm that no process is still running this cleanup attempt
         #[arg(long)]
         force: bool,
 
@@ -81808,6 +81825,87 @@ async fn handle_session_command(
             }
         }
 
+        SessionCommands::AcknowledgeCleanup {
+            attempt,
+            force,
+            format,
+        } => {
+            use frankenterm_core::session_retention::{
+                SessionCleanupAcknowledgement, SessionCleanupAttemptSelector,
+            };
+
+            let output_format = resolve_snapshot_session_output_format(&format);
+            if !force {
+                emit_snapshot_session_error(
+                    output_format,
+                    "cleanup_acknowledgement_requires_force",
+                    "Acknowledging a cleanup attempt requires --force; inspect `ft session doctor` and independently confirm that no process is still running this cleanup.",
+                )?;
+                std::process::exit(1);
+            }
+            let selector = if attempt == "malformed" {
+                SessionCleanupAttemptSelector::Malformed
+            } else {
+                SessionCleanupAttemptSelector::AttemptId(attempt.clone())
+            };
+            let acknowledged_at = u64::try_from(now_epoch_ms()).map_err(|_| {
+                anyhow::anyhow!("system clock cannot represent cleanup acknowledgement time")
+            })?;
+            let blocking_db_path = db_path.clone();
+            let outcome = frankenterm_core::runtime_async::spawn_blocking_with_cx(&cx, move || {
+                let conn = rusqlite::Connection::open(&blocking_db_path)
+                    .map_err(|_| anyhow::anyhow!("session cleanup database open failed"))?;
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| anyhow::anyhow!("session cleanup database preparation failed"))?;
+                frankenterm_core::session_retention::acknowledge_session_cleanup_attempt(
+                    &conn,
+                    &selector,
+                    acknowledged_at,
+                )
+                .map_err(|_| anyhow::anyhow!("session cleanup acknowledgement failed"))
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("session cleanup acknowledgement did not settle"))
+            .and_then(|result| result);
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    trace_bounded_cli_internal_error("session cleanup acknowledgement", &error);
+                    emit_snapshot_session_error(
+                        output_format,
+                        "cleanup_acknowledgement_failed",
+                        "Cleanup acknowledgement could not be recorded.",
+                    )?;
+                    std::process::exit(1);
+                }
+            };
+            if outcome == SessionCleanupAcknowledgement::Mismatch {
+                emit_snapshot_session_error(
+                    output_format,
+                    "cleanup_acknowledgement_mismatch",
+                    "The unresolved cleanup attempt is not the one named; re-run `ft session doctor` and acknowledge the attempt it reports.",
+                )?;
+                std::process::exit(1);
+            }
+            let payload = serde_json::json!({
+                "ok": true,
+                "action": "acknowledge_cleanup",
+                "attempt": attempt,
+                "outcome": outcome,
+                "acknowledged_at": acknowledged_at,
+            });
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                if outcome == SessionCleanupAcknowledgement::Acknowledged {
+                    println!(
+                        "Cleanup attempt {} acknowledged; automatic retention cleanup resumes.",
+                        redact_single_line_for_output(&attempt)
+                    );
+                } else {
+                    println!("No unresolved cleanup attempt; nothing changed.");
+                }
+            }
+        }
+
         SessionCommands::PreserveRecovery { session_id, format } => {
             let output_format = resolve_snapshot_session_output_format(&format);
             if let Err(error) =
@@ -81945,6 +82043,21 @@ async fn handle_session_command(
                     "⚠ {} restore chain(s) are marked resolved without a valid durable outcome — inspect exact intent/outcome receipts before retrying restore.",
                     report.invalid_resolved_restore_chains
                 );
+            }
+            match &report.cleanup_attempt {
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::Open {
+                    attempt_id,
+                    owner_pid,
+                    ..
+                } => println!(
+                    "⚠ Retention cleanup attempt {attempt_id} (pid {owner_pid}) has not yet published a terminal receipt; automatic cleanup is suppressed. Once no process is still cleaning, run `ft session acknowledge-cleanup {attempt_id} --force`."
+                ),
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::Malformed => {
+                    println!(
+                        "⚠ The retention cleanup receipt is malformed; automatic cleanup is suppressed. Run `ft session acknowledge-cleanup malformed --force` to resume it."
+                    );
+                }
+                _ => {}
             }
             if session_persistence_is_healthy(&report) {
                 println!("✓ All healthy.");
@@ -95691,6 +95804,7 @@ fn session_persistence_is_healthy(
     !session_restore_lifecycle_needs_reconciliation(report)
         && report.unclean_sessions == 0
         && report.orphaned_pane_states == 0
+        && !report.cleanup_attempt.blocks_cleanup()
 }
 
 fn session_recovery_diagnostic_check(
@@ -95796,6 +95910,42 @@ fn build_session_recovery_guidance(
                 report.recovery_candidate_sessions,
                 report.unknown_owner_sessions,
             ),
+            next_steps,
+        };
+    }
+
+    if report.cleanup_attempt.blocks_cleanup() {
+        use frankenterm_core::session_retention::SessionCleanupAttemptStatus;
+
+        let (summary, acknowledge) = match &report.cleanup_attempt {
+            SessionCleanupAttemptStatus::Open {
+                attempt_id,
+                owner_pid,
+                ..
+            } => (
+                format!(
+                    "Retention cleanup attempt {attempt_id} (pid {owner_pid}) has not yet published a terminal receipt; automatic cleanup is suppressed until it completes or is acknowledged."
+                ),
+                format!("ft session acknowledge-cleanup {attempt_id} --force"),
+            ),
+            _ => (
+                "The retention cleanup receipt is malformed; automatic cleanup is suppressed until it is acknowledged.".to_string(),
+                "ft session acknowledge-cleanup malformed --force".to_string(),
+            ),
+        };
+        push_unique_operator_step(
+            &mut next_steps,
+            "Review detailed report",
+            "ft session doctor -f json",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Acknowledge once no process is still cleaning",
+            &acknowledge,
+        );
+        return OperatorGuidance {
+            status: "maintenance_recommended".to_string(),
+            summary,
             next_steps,
         };
     }
@@ -96118,6 +96268,8 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 8192,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_session_recovery_guidance(&report);
@@ -96201,6 +96353,8 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 1,
             orphaned_restore_intents: 1,
             total_data_bytes: 4096,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let structured = serde_json::to_value(&report).expect("serialize session doctor report");
@@ -96282,6 +96436,8 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 1,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
         assert!(session_restore_lifecycle_needs_reconciliation(
             &orphaned_checkpoint
@@ -96332,12 +96488,70 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 0,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_session_recovery_guidance(&report);
         assert!(session_persistence_is_healthy(&report));
         assert_eq!(guidance.status, "no_sessions");
         assert!(guidance.summary.contains("first watcher run"));
+    }
+
+    #[test]
+    fn session_recovery_guidance_surfaces_unresolved_cleanup_attempt() {
+        use frankenterm_core::session_retention::SessionCleanupAttemptStatus;
+
+        let open = SessionDoctorReport {
+            total_sessions: 3,
+            unclean_sessions: 0,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 0,
+            total_checkpoints: 3,
+            orphaned_pane_states: 0,
+            orphaned_checkpoints: 0,
+            invalid_resolved_restore_chains: 0,
+            unresolved_restore_attempts: 0,
+            outcome_complete_restore_attempts: 0,
+            reconciliation_required_restore_attempts: 0,
+            orphaned_restore_intents: 0,
+            total_data_bytes: 0,
+            cleanup_attempt: SessionCleanupAttemptStatus::Open {
+                attempt_id: "1f-2a-0".to_string(),
+                owner_pid: 31,
+                started_at_ms: 42,
+            },
+        };
+        let guidance = build_session_recovery_guidance(&open);
+        assert!(!session_persistence_is_healthy(&open));
+        assert_eq!(guidance.status, "maintenance_recommended");
+        assert!(guidance.summary.contains("1f-2a-0"));
+        assert!(guidance.next_steps.iter().any(|step| {
+            step.command == "ft session acknowledge-cleanup 1f-2a-0 --force"
+        }));
+
+        let malformed = SessionDoctorReport {
+            cleanup_attempt: SessionCleanupAttemptStatus::Malformed,
+            ..open
+        };
+        let guidance = build_session_recovery_guidance(&malformed);
+        assert!(!session_persistence_is_healthy(&malformed));
+        assert!(guidance.next_steps.iter().any(|step| {
+            step.command == "ft session acknowledge-cleanup malformed --force"
+        }));
+
+        let completed = SessionDoctorReport {
+            cleanup_attempt: SessionCleanupAttemptStatus::Completed {
+                attempt_id: "1f-2a-1".to_string(),
+                finished_at_ms: 50,
+                sessions_deleted: 1,
+                orphan_rows_deleted: 0,
+            },
+            ..malformed
+        };
+        assert!(session_persistence_is_healthy(&completed));
+        assert_eq!(build_session_recovery_guidance(&completed).status, "healthy");
     }
 
     #[test]
@@ -96357,6 +96571,8 @@ mod operator_guidance_tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 1024,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
 
         let guidance = build_status_health_operator_guidance(
@@ -100103,6 +100319,8 @@ mod tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 5_120,
+            cleanup_attempt:
+                frankenterm_core::session_retention::SessionCleanupAttemptStatus::None,
         };
         let guidance = build_session_recovery_guidance(&report);
 

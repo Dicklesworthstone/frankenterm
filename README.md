@@ -1083,6 +1083,7 @@ ft snapshot restore <id> --dry-run # metadata-only descriptor/status report
 ft session list --limit 50 --offset 0              # bounded page of saved sessions
 ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
 ft session doctor                # health check for session persistence
+ft session acknowledge-cleanup <attempt> --force # resume retention after an interrupted cleanup attempt that doctor reports
 ft session dump                  # private, checksummed live pane-content/topology export
 ft session verify-dump <path>    # offline schema/checksum/private-file verification
 ft session list-durable          # discover continuously persisted cold-scrollback panes

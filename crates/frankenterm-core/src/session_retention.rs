@@ -346,6 +346,9 @@ pub enum SessionCleanupIndeterminatePhase {
     /// The cleanup SQL pipeline returned an error after execution began. Earlier
     /// independently committed phases may already be durable.
     CleanupExecution,
+    /// Every cleanup phase returned, but publishing the terminal receipt
+    /// failed. The durable receipt stays open and fences later attempts.
+    ReceiptFinalization,
 }
 
 impl SessionCleanupIndeterminatePhase {
@@ -353,6 +356,7 @@ impl SessionCleanupIndeterminatePhase {
         match self {
             Self::BlockingTaskSettlement => "blocking_task_settlement",
             Self::CleanupExecution => "cleanup_execution",
+            Self::ReceiptFinalization => "receipt_finalization",
         }
     }
 }
@@ -377,6 +381,17 @@ pub enum SessionCleanupError {
     /// cleanup pipeline was not invoked.
     #[error("session cleanup database preparation failed")]
     DatabasePreparation,
+    /// The durable attempt receipt could not be read or created (for example a
+    /// busy database). The receipt transaction rolled back before any cleanup
+    /// SQL ran, so a later retry is safe.
+    #[error("session cleanup attempt receipt could not be admitted")]
+    AttemptAdmission,
+    /// An earlier cleanup attempt, possibly from another engine or process,
+    /// left an open or malformed durable receipt. No cleanup SQL ran. Cleanup
+    /// stays suppressed until that attempt finishes or an operator
+    /// acknowledges it (`ft session acknowledge-cleanup`).
+    #[error("session cleanup suppressed: an earlier cleanup attempt is unresolved")]
+    UnresolvedAttempt,
     /// Cleanup may have durably changed SQLite state, but no authoritative
     /// completion receipt is available. Callers must reconcile and must not
     /// automatically retry.
@@ -2100,11 +2115,29 @@ pub(crate) fn cleanup_sessions_from_path(
             );
             SessionCleanupError::DatabasePreparation
         })?;
-    cleanup_sessions(&conn, config).map_err(|error| {
-        // The cleanup pipeline currently commits policy phases independently.
-        // Any earlier phase may be durable when a later phase fails, so a
-        // generic database error would fabricate retry safety until exact
-        // partial receipts/continuations land.
+    run_session_cleanup_attempt(&conn, config, cleanup_sessions)
+}
+
+/// Run one cleanup pipeline under the durable attempt receipt.
+///
+/// The open receipt commits in its own transaction before `pipeline` issues
+/// any destructive statement and is finalized only after every phase returned.
+/// Any process death or observation loss in between leaves the receipt open,
+/// which suppresses automatic cleanup in every later engine and process until
+/// an operator acknowledges it.
+fn run_session_cleanup_attempt<F>(
+    conn: &Connection,
+    config: &SessionRetentionConfig,
+    pipeline: F,
+) -> Result<CleanupResult, SessionCleanupError>
+where
+    F: FnOnce(&Connection, &SessionRetentionConfig) -> Result<CleanupResult, rusqlite::Error>,
+{
+    let receipt = admit_session_cleanup_attempt(conn, config, epoch_ms())?;
+    let result = pipeline(conn, config).map_err(|error| {
+        // The cleanup pipeline commits policy phases independently. Any
+        // earlier phase may be durable when a later phase fails; the open
+        // receipt keeps later attempts fenced until reconciliation.
         warn!(
             error_class = session_cleanup_database_error_class(&error),
             "session cleanup execution outcome is indeterminate"
@@ -2112,7 +2145,374 @@ pub(crate) fn cleanup_sessions_from_path(
         SessionCleanupError::IndeterminateCleanup {
             phase: SessionCleanupIndeterminatePhase::CleanupExecution,
         }
-    })
+    })?;
+    finalize_session_cleanup_attempt(conn, &receipt, &result, epoch_ms()).map_err(|error| {
+        warn!(
+            error_class = session_cleanup_database_error_class(&error),
+            "session cleanup completed but its receipt could not be finalized"
+        );
+        SessionCleanupError::IndeterminateCleanup {
+            phase: SessionCleanupIndeterminatePhase::ReceiptFinalization,
+        }
+    })?;
+    Ok(result)
+}
+
+/// `config` table key holding the durable session-cleanup attempt receipt.
+pub const SESSION_CLEANUP_ATTEMPT_KEY: &str = "session_retention.cleanup_attempt";
+const SESSION_CLEANUP_ATTEMPT_SCHEMA: &str = "ft.session_cleanup_attempt.v1";
+/// Upper bound on a stored receipt; anything larger is treated as malformed
+/// without being parsed.
+const SESSION_CLEANUP_ATTEMPT_MAX_BYTES: usize = 4096;
+const SESSION_CLEANUP_ATTEMPT_ID_MAX_BYTES: usize = 64;
+/// Attempt id written when an operator acknowledges a malformed receipt.
+const SESSION_CLEANUP_MALFORMED_ATTEMPT_ID: &str = "malformed-receipt";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionCleanupAttemptState {
+    Open,
+    Completed,
+    Acknowledged,
+}
+
+/// Durable, content-free record of one automatic cleanup attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionCleanupAttemptReceipt {
+    schema: String,
+    attempt_id: String,
+    state: SessionCleanupAttemptState,
+    owner_pid: u32,
+    started_at_ms: u64,
+    max_age_days: u64,
+    max_closed_sessions: u64,
+    max_total_size_mb: u64,
+    finished_at_ms: Option<u64>,
+    sessions_deleted: Option<u64>,
+    orphan_rows_deleted: Option<u64>,
+}
+
+/// Finite, content-free view of the durable session-cleanup attempt receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionCleanupAttemptStatus {
+    /// No cleanup attempt has been recorded.
+    None,
+    /// An attempt was admitted and has not published a terminal receipt. It
+    /// may still be running in another process, or its owner died mid-cleanup.
+    Open {
+        /// Attempt identifier to pass to `ft session acknowledge-cleanup`.
+        attempt_id: String,
+        /// Process that admitted the attempt.
+        owner_pid: u32,
+        /// Admission time (epoch ms).
+        started_at_ms: u64,
+    },
+    /// The latest attempt finished and published its accounting.
+    Completed {
+        /// Attempt identifier.
+        attempt_id: String,
+        /// Completion time (epoch ms).
+        finished_at_ms: u64,
+        /// Sessions deleted by the attempt.
+        sessions_deleted: u64,
+        /// Orphaned lifecycle/checkpoint/pane-state rows removed.
+        orphan_rows_deleted: u64,
+    },
+    /// An operator resolved an open or malformed attempt.
+    Acknowledged {
+        /// Attempt identifier.
+        attempt_id: String,
+        /// Acknowledgement time (epoch ms).
+        acknowledged_at_ms: u64,
+    },
+    /// The stored receipt is unreadable, oversized, or has an unknown shape.
+    Malformed,
+}
+
+impl SessionCleanupAttemptStatus {
+    /// Whether automatic cleanup must stay suppressed.
+    #[must_use]
+    pub const fn blocks_cleanup(&self) -> bool {
+        matches!(self, Self::Open { .. } | Self::Malformed)
+    }
+}
+
+/// Which unresolved attempt an operator acknowledges. Naming the exact
+/// attempt prevents acknowledging a newer attempt than the one inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCleanupAttemptSelector {
+    /// The open attempt with this identifier.
+    AttemptId(String),
+    /// A malformed receipt, which carries no trustworthy identifier.
+    Malformed,
+}
+
+/// Result of an operator acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCleanupAcknowledgement {
+    /// The selected unresolved attempt is now acknowledged; cleanup resumes.
+    Acknowledged,
+    /// Nothing was unresolved; the call changed nothing.
+    AlreadyResolved,
+    /// The unresolved attempt is not the selected one; nothing changed.
+    Mismatch,
+}
+
+fn parse_session_cleanup_attempt(raw: &str) -> Option<SessionCleanupAttemptReceipt> {
+    if raw.len() > SESSION_CLEANUP_ATTEMPT_MAX_BYTES {
+        return None;
+    }
+    // Structs also deserialize positionally from JSON arrays; only an object
+    // is an admissible receipt.
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let receipt: SessionCleanupAttemptReceipt = serde_json::from_value(value).ok()?;
+    let id = receipt.attempt_id.as_bytes();
+    let well_formed = receipt.schema == SESSION_CLEANUP_ATTEMPT_SCHEMA
+        && !id.is_empty()
+        && id.len() <= SESSION_CLEANUP_ATTEMPT_ID_MAX_BYTES
+        && id.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        && match receipt.state {
+            SessionCleanupAttemptState::Open => receipt.finished_at_ms.is_none(),
+            SessionCleanupAttemptState::Completed => {
+                receipt.finished_at_ms.is_some()
+                    && receipt.sessions_deleted.is_some()
+                    && receipt.orphan_rows_deleted.is_some()
+            }
+            SessionCleanupAttemptState::Acknowledged => receipt.finished_at_ms.is_some(),
+        };
+    well_formed.then_some(receipt)
+}
+
+fn session_cleanup_attempt_status_from(
+    raw: Option<&str>,
+) -> (SessionCleanupAttemptStatus, Option<SessionCleanupAttemptReceipt>) {
+    let Some(raw) = raw else {
+        return (SessionCleanupAttemptStatus::None, None);
+    };
+    let Some(receipt) = parse_session_cleanup_attempt(raw) else {
+        return (SessionCleanupAttemptStatus::Malformed, None);
+    };
+    let status = match receipt.state {
+        SessionCleanupAttemptState::Open => SessionCleanupAttemptStatus::Open {
+            attempt_id: receipt.attempt_id.clone(),
+            owner_pid: receipt.owner_pid,
+            started_at_ms: receipt.started_at_ms,
+        },
+        SessionCleanupAttemptState::Completed => SessionCleanupAttemptStatus::Completed {
+            attempt_id: receipt.attempt_id.clone(),
+            finished_at_ms: receipt.finished_at_ms.unwrap_or_default(),
+            sessions_deleted: receipt.sessions_deleted.unwrap_or_default(),
+            orphan_rows_deleted: receipt.orphan_rows_deleted.unwrap_or_default(),
+        },
+        SessionCleanupAttemptState::Acknowledged => SessionCleanupAttemptStatus::Acknowledged {
+            attempt_id: receipt.attempt_id.clone(),
+            acknowledged_at_ms: receipt.finished_at_ms.unwrap_or_default(),
+        },
+    };
+    (status, Some(receipt))
+}
+
+/// Same DDL as the canonical storage schema, so a snapshot database that was
+/// created without the full storage schema can still hold the receipt.
+const SESSION_CLEANUP_CONFIG_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+fn read_session_cleanup_attempt(conn: &Connection) -> Result<Option<String>, rusqlite::Error> {
+    let config_table_exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !config_table_exists {
+        return Ok(None);
+    }
+    // Reject oversized and non-text values before copying them into Rust.
+    // An empty string is deliberately malformed, preserving the cleanup fence.
+    conn.query_row(
+        "SELECT CASE
+             WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?2
+             THEN value ELSE '' END
+         FROM config WHERE key = ?1",
+        rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, SESSION_CLEANUP_ATTEMPT_MAX_BYTES],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+fn write_session_cleanup_attempt(
+    conn: &Connection,
+    receipt: &SessionCleanupAttemptReceipt,
+    updated_at_ms: u64,
+) -> Result<(), rusqlite::Error> {
+    let value = serde_json::to_string(receipt)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(SESSION_CLEANUP_CONFIG_TABLE_DDL, [])?;
+    conn.execute(
+        "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        rusqlite::params![
+            SESSION_CLEANUP_ATTEMPT_KEY,
+            value,
+            u64_to_sqlite_integer(updated_at_ms)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read the durable session-cleanup attempt status without mutating it.
+///
+/// # Errors
+/// Returns the underlying SQLite error if the `config` table cannot be read.
+pub fn session_cleanup_attempt_status(
+    conn: &Connection,
+) -> Result<SessionCleanupAttemptStatus, rusqlite::Error> {
+    let raw = read_session_cleanup_attempt(conn)?;
+    Ok(session_cleanup_attempt_status_from(raw.as_deref()).0)
+}
+
+/// Unique, content-free attempt identifier: owner pid, admission time, and a
+/// process-local sequence number (so two attempts in one millisecond differ).
+fn next_session_cleanup_attempt_id(now_ms: u64) -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:x}-{now_ms:x}-{sequence:x}", std::process::id())
+}
+
+/// Durably admit one cleanup attempt, or refuse before any cleanup SQL.
+fn admit_session_cleanup_attempt(
+    conn: &Connection,
+    config: &SessionRetentionConfig,
+    now_ms: u64,
+) -> Result<SessionCleanupAttemptReceipt, SessionCleanupError> {
+    let admission_error = |error: rusqlite::Error| {
+        warn!(
+            error_class = session_cleanup_database_error_class(&error),
+            "session cleanup attempt receipt could not be admitted"
+        );
+        SessionCleanupError::AttemptAdmission
+    };
+    // IMMEDIATE takes the write lock up front, so two processes cannot both
+    // observe "no open attempt" and both admit one.
+    let tx = begin_retention_transaction(conn).map_err(admission_error)?;
+    let raw = read_session_cleanup_attempt(&tx).map_err(admission_error)?;
+    let (status, _) = session_cleanup_attempt_status_from(raw.as_deref());
+    if status.blocks_cleanup() {
+        drop(tx);
+        warn!(
+            receipt_state = if matches!(status, SessionCleanupAttemptStatus::Malformed) {
+                "malformed"
+            } else {
+                "open"
+            },
+            "session cleanup suppressed: an earlier cleanup attempt is unresolved; inspect `ft session doctor` and acknowledge it with `ft session acknowledge-cleanup`"
+        );
+        return Err(SessionCleanupError::UnresolvedAttempt);
+    }
+    let receipt = SessionCleanupAttemptReceipt {
+        schema: SESSION_CLEANUP_ATTEMPT_SCHEMA.to_string(),
+        attempt_id: next_session_cleanup_attempt_id(now_ms),
+        state: SessionCleanupAttemptState::Open,
+        owner_pid: std::process::id(),
+        started_at_ms: now_ms,
+        max_age_days: config.max_age_days,
+        max_closed_sessions: u64::try_from(config.max_closed_sessions).unwrap_or(u64::MAX),
+        max_total_size_mb: config.max_total_size_mb,
+        finished_at_ms: None,
+        sessions_deleted: None,
+        orphan_rows_deleted: None,
+    };
+    write_session_cleanup_attempt(&tx, &receipt, now_ms).map_err(admission_error)?;
+    tx.commit().map_err(admission_error)?;
+    Ok(receipt)
+}
+
+/// Publish the terminal accounting for exactly the admitted open attempt.
+fn finalize_session_cleanup_attempt(
+    conn: &Connection,
+    admitted: &SessionCleanupAttemptReceipt,
+    result: &CleanupResult,
+    now_ms: u64,
+) -> Result<(), rusqlite::Error> {
+    let tx = begin_retention_transaction(conn)?;
+    let raw = read_session_cleanup_attempt(&tx)?;
+    let (_, current) = session_cleanup_attempt_status_from(raw.as_deref());
+    if current.as_ref() != Some(admitted) {
+        return Err(rusqlite::Error::StatementChangedRows(0));
+    }
+    let as_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    let completed = SessionCleanupAttemptReceipt {
+        state: SessionCleanupAttemptState::Completed,
+        finished_at_ms: Some(now_ms),
+        sessions_deleted: Some(as_u64(result.total_sessions_deleted())),
+        orphan_rows_deleted: Some(
+            as_u64(result.orphaned_restore_lifecycle_rows)
+                .saturating_add(as_u64(result.orphaned_checkpoints))
+                .saturating_add(as_u64(result.orphaned_pane_states)),
+        ),
+        ..admitted.clone()
+    };
+    write_session_cleanup_attempt(&tx, &completed, now_ms)?;
+    tx.commit()
+}
+
+/// Operator acknowledgement that an unresolved cleanup attempt has been
+/// reconciled, allowing automatic cleanup to resume.
+///
+/// Only the exact selected attempt is acknowledged; a completed or already
+/// acknowledged receipt is left untouched.
+///
+/// # Errors
+/// Returns the underlying SQLite error if the receipt cannot be read or
+/// written.
+pub fn acknowledge_session_cleanup_attempt(
+    conn: &Connection,
+    selector: &SessionCleanupAttemptSelector,
+    acknowledged_at_ms: u64,
+) -> Result<SessionCleanupAcknowledgement, rusqlite::Error> {
+    let tx = begin_retention_transaction(conn)?;
+    let raw = read_session_cleanup_attempt(&tx)?;
+    let acknowledged = match (session_cleanup_attempt_status_from(raw.as_deref()), selector) {
+        ((SessionCleanupAttemptStatus::Open { attempt_id, .. }, Some(receipt)), SessionCleanupAttemptSelector::AttemptId(selected))
+            if attempt_id == *selected =>
+        {
+            SessionCleanupAttemptReceipt {
+                state: SessionCleanupAttemptState::Acknowledged,
+                finished_at_ms: Some(acknowledged_at_ms),
+                ..receipt
+            }
+        }
+        ((SessionCleanupAttemptStatus::Malformed, _), SessionCleanupAttemptSelector::Malformed) => {
+            SessionCleanupAttemptReceipt {
+                schema: SESSION_CLEANUP_ATTEMPT_SCHEMA.to_string(),
+                attempt_id: SESSION_CLEANUP_MALFORMED_ATTEMPT_ID.to_string(),
+                state: SessionCleanupAttemptState::Acknowledged,
+                owner_pid: 0,
+                started_at_ms: acknowledged_at_ms,
+                max_age_days: 0,
+                max_closed_sessions: 0,
+                max_total_size_mb: 0,
+                finished_at_ms: Some(acknowledged_at_ms),
+                sessions_deleted: None,
+                orphan_rows_deleted: None,
+            }
+        }
+        ((status, _), _) if status.blocks_cleanup() => {
+            return Ok(SessionCleanupAcknowledgement::Mismatch);
+        }
+        _ => return Ok(SessionCleanupAcknowledgement::AlreadyResolved),
+    };
+    write_session_cleanup_attempt(&tx, &acknowledged, acknowledged_at_ms)?;
+    tx.commit()?;
+    Ok(SessionCleanupAcknowledgement::Acknowledged)
 }
 
 /// Collapse SQLite/rusqlite failures into a finite, content-free telemetry
@@ -6121,5 +6521,441 @@ mod tests {
         } else {
             assert!(observed <= u128::from(u64::MAX));
         }
+    }
+
+    // ====================================================================
+    // ft-0yuxe.1: durable session-cleanup attempt receipt
+    // ====================================================================
+
+    /// File-backed database with one deletable old closed session, so every
+    /// connection opened on `path` models a separate process.
+    fn receipt_fixture() -> (tempfile::NamedTempFile, String) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap().to_owned();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
+        let now = epoch_ms() as i64;
+        insert_session(&conn, "old-closed", now - 31 * 86_400_000, true);
+        insert_session(&conn, "recent-closed", now - 1000, true);
+        (file, path)
+    }
+
+    fn age_only_config() -> SessionRetentionConfig {
+        SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 0,
+        }
+    }
+
+    fn open_process(path: &str) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn
+    }
+
+    fn open_attempt_id(conn: &Connection) -> String {
+        match session_cleanup_attempt_status(conn).unwrap() {
+            SessionCleanupAttemptStatus::Open { attempt_id, .. } => attempt_id,
+            other => panic!("expected an open attempt, got {other:?}"),
+        }
+    }
+
+    fn store_raw_receipt(conn: &Connection, raw: &str) {
+        conn.execute(SESSION_CLEANUP_CONFIG_TABLE_DDL, []).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+            rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, raw],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_attempt_receipt_finalizes_once_and_admits_the_next_attempt() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+
+        let first = cleanup_sessions_from_path(&path, &config).expect("first cleanup");
+        assert_eq!(first.total_sessions_deleted(), 1);
+        let conn = open_process(&path);
+        let SessionCleanupAttemptStatus::Completed {
+            attempt_id: first_id,
+            sessions_deleted,
+            ..
+        } = session_cleanup_attempt_status(&conn).unwrap()
+        else {
+            panic!("a finished attempt must publish a completed receipt");
+        };
+        assert_eq!(sessions_deleted, 1);
+
+        let second = cleanup_sessions_from_path(&path, &config).expect("second cleanup");
+        assert_eq!(second.total_sessions_deleted(), 0);
+        let SessionCleanupAttemptStatus::Completed {
+            attempt_id: second_id,
+            sessions_deleted,
+            ..
+        } = session_cleanup_attempt_status(&conn).unwrap()
+        else {
+            panic!("the next attempt must also complete");
+        };
+        assert_ne!(first_id, second_id);
+        assert_eq!(sessions_deleted, 0);
+    }
+
+    #[test]
+    fn crash_after_receipt_creation_fences_a_new_process_before_any_mutation() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        {
+            // The owning process admits and then dies before any cleanup SQL.
+            let owner = open_process(&path);
+            admit_session_cleanup_attempt(&owner, &config, 42).unwrap();
+        }
+
+        let error = cleanup_sessions_from_path(&path, &config)
+            .expect_err("an open receipt must fence the next process");
+        assert_eq!(error, SessionCleanupError::UnresolvedAttempt);
+        assert!(!error.requires_reconciliation());
+        let conn = open_process(&path);
+        assert_eq!(count_sessions(&conn), 2, "the refused attempt deleted nothing");
+        assert!(session_cleanup_attempt_status(&conn).unwrap().blocks_cleanup());
+    }
+
+    #[test]
+    fn crash_after_each_mutation_phase_keeps_the_fence_across_processes() {
+        type Phase = fn(&Connection, &SessionRetentionConfig);
+        let phases: [(&str, Phase); 3] = [
+            ("age", |conn, config| {
+                delete_sessions_by_age(conn, config.max_age_days).unwrap();
+            }),
+            ("orphans", |conn, _| {
+                cleanup_orphaned_data(conn).unwrap();
+            }),
+            ("full pipeline", |conn, config| {
+                cleanup_sessions(conn, config).unwrap();
+            }),
+        ];
+        for (label, phase) in phases {
+            let (_file, path) = receipt_fixture();
+            let config = age_only_config();
+            let receipt_before;
+            {
+                let owner = open_process(&path);
+                admit_session_cleanup_attempt(&owner, &config, 7).unwrap();
+                receipt_before = read_session_cleanup_attempt(&owner).unwrap();
+                phase(&owner, &config);
+                // Process dies here, before terminal publication.
+            }
+            let sessions_after_crash = count_sessions(&open_process(&path));
+
+            assert_eq!(
+                cleanup_sessions_from_path(&path, &config),
+                Err(SessionCleanupError::UnresolvedAttempt),
+                "{label}: restart must not repeat an unresolved attempt"
+            );
+            let conn = open_process(&path);
+            assert_eq!(count_sessions(&conn), sessions_after_crash, "{label}");
+            assert_eq!(
+                read_session_cleanup_attempt(&conn).unwrap(),
+                receipt_before,
+                "{label}: the refused attempt must not rewrite the receipt"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_failure_after_mutation_is_indeterminate_and_leaves_the_receipt_open() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        let conn = open_process(&path);
+
+        let error = run_session_cleanup_attempt(&conn, &config, |conn, config| {
+            delete_sessions_by_age(conn, config.max_age_days)?;
+            Err(rusqlite::Error::StatementChangedRows(0))
+        })
+        .expect_err("a failure after mutation is not retry-safe");
+        assert_eq!(
+            error,
+            SessionCleanupError::IndeterminateCleanup {
+                phase: SessionCleanupIndeterminatePhase::CleanupExecution,
+            }
+        );
+        assert!(session_cleanup_attempt_status(&conn).unwrap().blocks_cleanup());
+    }
+
+    #[test]
+    fn terminal_publication_never_overwrites_a_receipt_it_does_not_own() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        let conn = open_process(&path);
+
+        let error = run_session_cleanup_attempt(&conn, &config, |conn, config| {
+            let result = cleanup_sessions(conn, config)?;
+            // An operator acknowledges the attempt while it is still running.
+            let attempt_id = open_attempt_id(&open_process(&path));
+            assert_eq!(
+                acknowledge_session_cleanup_attempt(
+                    &open_process(&path),
+                    &SessionCleanupAttemptSelector::AttemptId(attempt_id),
+                    99,
+                )
+                .unwrap(),
+                SessionCleanupAcknowledgement::Acknowledged
+            );
+            Ok(result)
+        })
+        .expect_err("publication over a foreign receipt must fail");
+        assert_eq!(
+            error,
+            SessionCleanupError::IndeterminateCleanup {
+                phase: SessionCleanupIndeterminatePhase::ReceiptFinalization,
+            }
+        );
+        assert!(matches!(
+            session_cleanup_attempt_status(&conn).unwrap(),
+            SessionCleanupAttemptStatus::Acknowledged {
+                acknowledged_at_ms: 99,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn busy_admission_is_retry_safe_and_leaves_no_receipt() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        let holder = open_process(&path);
+        let lock = begin_retention_transaction(&holder).unwrap();
+
+        let contender = open_process(&path);
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        assert_eq!(
+            admit_session_cleanup_attempt(&contender, &config, 1),
+            Err(SessionCleanupError::AttemptAdmission)
+        );
+        drop(lock);
+
+        assert_eq!(
+            session_cleanup_attempt_status(&contender).unwrap(),
+            SessionCleanupAttemptStatus::None
+        );
+        assert_eq!(count_sessions(&contender), 2);
+        assert!(
+            cleanup_sessions_from_path(&path, &config).is_ok(),
+            "a retry after retry-safe contention must proceed"
+        );
+    }
+
+    #[test]
+    fn open_receipt_fences_a_concurrent_process_until_its_owner_finishes() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        let owner = open_process(&path);
+        let receipt = admit_session_cleanup_attempt(&owner, &config, 5).unwrap();
+
+        assert_eq!(
+            cleanup_sessions_from_path(&path, &config),
+            Err(SessionCleanupError::UnresolvedAttempt),
+            "two processes must never both own cleanup"
+        );
+
+        let result = cleanup_sessions(&owner, &config).unwrap();
+        finalize_session_cleanup_attempt(&owner, &receipt, &result, 6).unwrap();
+        assert_eq!(
+            finalize_session_cleanup_attempt(&owner, &receipt, &result, 7)
+                .map_err(|_| "second publication"),
+            Err("second publication"),
+            "terminal accounting is published exactly once"
+        );
+        assert!(cleanup_sessions_from_path(&path, &config).is_ok());
+    }
+
+    #[test]
+    fn malformed_receipts_block_cleanup_until_acknowledged_as_malformed() {
+        let valid_open = serde_json::json!({
+            "schema": SESSION_CLEANUP_ATTEMPT_SCHEMA,
+            "attempt_id": "abc-1",
+            "state": "open",
+            "owner_pid": 1,
+            "started_at_ms": 1,
+            "max_age_days": 30,
+            "max_closed_sessions": 0,
+            "max_total_size_mb": 0,
+            "finished_at_ms": null,
+            "sessions_deleted": null,
+            "orphan_rows_deleted": null,
+        });
+        let with = |field: &str, value: serde_json::Value| {
+            let mut receipt = valid_open.clone();
+            receipt[field] = value;
+            receipt.to_string()
+        };
+        let mut unknown_field = valid_open.clone();
+        unknown_field["extra"] = serde_json::json!(1);
+        let malformed = [
+            "not json".to_owned(),
+            "[\"ft.session_cleanup_attempt.v1\",\"abc-1\",\"open\",1,1,30,0,0,null,null,null]"
+                .to_owned(),
+            format!("\"{}\"", "x".repeat(SESSION_CLEANUP_ATTEMPT_MAX_BYTES)),
+            unknown_field.to_string(),
+            with("schema", serde_json::json!("ft.session_cleanup_attempt.v0")),
+            with("attempt_id", serde_json::json!("")),
+            with("attempt_id", serde_json::json!("../etc/passwd")),
+            with("attempt_id", serde_json::json!("a".repeat(65))),
+            with("state", serde_json::json!("running")),
+            with("finished_at_ms", serde_json::json!(5)),
+            with("state", serde_json::json!("completed")),
+        ];
+        for raw in malformed {
+            let (_file, path) = receipt_fixture();
+            let conn = open_process(&path);
+            store_raw_receipt(&conn, &raw);
+
+            assert_eq!(
+                session_cleanup_attempt_status(&conn).unwrap(),
+                SessionCleanupAttemptStatus::Malformed,
+                "{raw}"
+            );
+            assert_eq!(
+                cleanup_sessions_from_path(&path, &age_only_config()),
+                Err(SessionCleanupError::UnresolvedAttempt),
+                "{raw}"
+            );
+            assert_eq!(count_sessions(&conn), 2, "{raw}");
+            assert_eq!(
+                acknowledge_session_cleanup_attempt(
+                    &conn,
+                    &SessionCleanupAttemptSelector::AttemptId("abc-1".to_owned()),
+                    3,
+                )
+                .unwrap(),
+                SessionCleanupAcknowledgement::Mismatch,
+                "{raw}: a malformed receipt has no trustworthy id"
+            );
+            assert_eq!(
+                acknowledge_session_cleanup_attempt(
+                    &conn,
+                    &SessionCleanupAttemptSelector::Malformed,
+                    3,
+                )
+                .unwrap(),
+                SessionCleanupAcknowledgement::Acknowledged,
+                "{raw}"
+            );
+            assert!(cleanup_sessions_from_path(&path, &age_only_config()).is_ok());
+        }
+    }
+
+    #[test]
+    fn oversized_and_non_text_receipts_are_bounded_and_fail_closed() {
+        let oversized = "界".repeat(SESSION_CLEANUP_ATTEMPT_MAX_BYTES / 2);
+        for raw in [
+            rusqlite::types::Value::Text(oversized),
+            rusqlite::types::Value::Blob(vec![b'x'; SESSION_CLEANUP_ATTEMPT_MAX_BYTES * 2]),
+        ] {
+            let (_file, path) = receipt_fixture();
+            let conn = open_process(&path);
+            conn.execute(SESSION_CLEANUP_CONFIG_TABLE_DDL, []).unwrap();
+            conn.execute(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, 1)",
+                rusqlite::params![SESSION_CLEANUP_ATTEMPT_KEY, raw],
+            )
+            .unwrap();
+            assert_eq!(
+                read_session_cleanup_attempt(&conn).unwrap().as_deref(),
+                Some("")
+            );
+            assert_eq!(
+                session_cleanup_attempt_status(&conn).unwrap(),
+                SessionCleanupAttemptStatus::Malformed
+            );
+            assert_eq!(
+                cleanup_sessions_from_path(&path, &age_only_config()),
+                Err(SessionCleanupError::UnresolvedAttempt)
+            );
+            assert_eq!(count_sessions(&conn), 2);
+            assert_eq!(
+                acknowledge_session_cleanup_attempt(
+                    &conn,
+                    &SessionCleanupAttemptSelector::Malformed,
+                    3,
+                )
+                .unwrap(),
+                SessionCleanupAcknowledgement::Acknowledged
+            );
+            assert!(cleanup_sessions_from_path(&path, &age_only_config()).is_ok());
+        }
+    }
+
+    #[test]
+    fn acknowledgement_is_exact_and_idempotent() {
+        let (_file, path) = receipt_fixture();
+        let config = age_only_config();
+        let conn = open_process(&path);
+        assert_eq!(
+            acknowledge_session_cleanup_attempt(
+                &conn,
+                &SessionCleanupAttemptSelector::Malformed,
+                1
+            )
+            .unwrap(),
+            SessionCleanupAcknowledgement::AlreadyResolved,
+            "nothing to acknowledge before any attempt"
+        );
+
+        admit_session_cleanup_attempt(&conn, &config, 2).unwrap();
+        let attempt_id = open_attempt_id(&conn);
+        for wrong in [
+            SessionCleanupAttemptSelector::AttemptId("other".to_owned()),
+            SessionCleanupAttemptSelector::Malformed,
+        ] {
+            assert_eq!(
+                acknowledge_session_cleanup_attempt(&conn, &wrong, 3).unwrap(),
+                SessionCleanupAcknowledgement::Mismatch
+            );
+            assert_eq!(open_attempt_id(&conn), attempt_id);
+        }
+
+        let exact = SessionCleanupAttemptSelector::AttemptId(attempt_id.clone());
+        assert_eq!(
+            acknowledge_session_cleanup_attempt(&conn, &exact, 4).unwrap(),
+            SessionCleanupAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            session_cleanup_attempt_status(&conn).unwrap(),
+            SessionCleanupAttemptStatus::Acknowledged {
+                attempt_id,
+                acknowledged_at_ms: 4,
+            }
+        );
+        assert_eq!(
+            acknowledge_session_cleanup_attempt(&conn, &exact, 5).unwrap(),
+            SessionCleanupAcknowledgement::AlreadyResolved
+        );
+        let result = cleanup_sessions_from_path(&path, &config).expect("cleanup resumes");
+        assert_eq!(result.total_sessions_deleted(), 1);
+        assert_eq!(
+            acknowledge_session_cleanup_attempt(&conn, &exact, 6).unwrap(),
+            SessionCleanupAcknowledgement::AlreadyResolved,
+            "a completed receipt is never rewritten by an acknowledgement"
+        );
+    }
+
+    #[test]
+    fn receipt_storage_works_without_the_full_storage_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        assert_eq!(
+            session_cleanup_attempt_status(&conn).unwrap(),
+            SessionCleanupAttemptStatus::None
+        );
+        let receipt = admit_session_cleanup_attempt(&conn, &age_only_config(), 1).unwrap();
+        finalize_session_cleanup_attempt(&conn, &receipt, &CleanupResult::default(), 2).unwrap();
+        assert!(matches!(
+            session_cleanup_attempt_status(&conn).unwrap(),
+            SessionCleanupAttemptStatus::Completed { .. }
+        ));
     }
 }

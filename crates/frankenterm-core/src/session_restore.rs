@@ -5162,6 +5162,9 @@ pub struct SessionDoctorReport {
     pub reconciliation_required_restore_attempts: usize,
     pub orphaned_restore_intents: usize,
     pub total_data_bytes: usize,
+    /// Durable automatic-cleanup attempt receipt; `open`/`malformed` means
+    /// retention cleanup is suppressed until acknowledged.
+    pub cleanup_attempt: crate::session_retention::SessionCleanupAttemptStatus,
 }
 
 /// Run health check on session data.
@@ -5384,6 +5387,7 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
             "restore_attempt_lifecycle.orphaned_intent_count",
         )?,
         total_data_bytes: decode_usize(total_data_bytes, "session_checkpoints.total_bytes_sum")?,
+        cleanup_attempt: crate::session_retention::session_cleanup_attempt_status(conn)?,
     })
 }
 
@@ -14007,8 +14011,15 @@ mod tests {
             reconciliation_required_restore_attempts: 1,
             orphaned_restore_intents: 0,
             total_data_bytes: 4096,
+            cleanup_attempt: crate::session_retention::SessionCleanupAttemptStatus::Open {
+                attempt_id: "1f-2a-0".to_string(),
+                owner_pid: 31,
+                started_at_ms: 42,
+            },
         };
         let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["cleanup_attempt"]["state"], "open");
+        assert_eq!(json["cleanup_attempt"]["attempt_id"], "1f-2a-0");
         assert_eq!(json["total_sessions"], 3);
         assert_eq!(json["unclean_sessions"], 1);
         assert_eq!(json["recovery_candidate_sessions"], 1);
@@ -14035,6 +14046,7 @@ mod tests {
             reconciliation_required_restore_attempts: 0,
             orphaned_restore_intents: 0,
             total_data_bytes: 0,
+            cleanup_attempt: crate::session_retention::SessionCleanupAttemptStatus::None,
         };
         let c = report.clone();
         assert_eq!(c.total_sessions, 1);
