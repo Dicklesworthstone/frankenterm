@@ -7,8 +7,15 @@
     "requested_by": "fixture",
     "summary": "Do not run Cargo locally when RCH cannot provide a trustworthy proof worker.",
     "workspace_root": "/Users/jemanuel/projects/frankenterm",
-    "target_bead_ids": ["ft-4tp7g"],
-    "allowed_action_classes": ["read_status", "add_beads_comment", "create_bead", "wait"],
+    "target_bead_ids": [
+      "ft-4tp7g"
+    ],
+    "allowed_action_classes": [
+      "read_status",
+      "add_beads_comment",
+      "create_bead",
+      "wait"
+    ],
     "forbidden_action_classes": [
       "run_rch_proof",
       "pane_mutation",
@@ -32,7 +39,9 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "redacted",
-        "notes": ["RCH adapter records proof-blocker classes without retaining Cargo output."]
+        "notes": [
+          "RCH adapter records proof-blocker classes without retaining Cargo output."
+        ]
       },
       "raw_pane_content_stored": false,
       "reason_codes": [
@@ -48,35 +57,54 @@
           "category": "rch_worker_selection",
           "state": "blocked",
           "subject": "worker selection",
-          "reason_codes": ["rch.worker_selection.no_available_worker"],
-          "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+          "reason_codes": [
+            "rch.worker_selection.no_available_worker"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/rch-degraded.json"
+          ]
         },
         {
           "evidence_id": "evidence-rch-active-project-exclusion",
           "category": "rch_active_project_exclusion",
           "state": "blocked",
           "subject": "active project exclusion",
-          "reason_codes": ["rch.active_project_exclusion.active_project_present"],
-          "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+          "reason_codes": [
+            "rch.active_project_exclusion.active_project_present"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/rch-degraded.json"
+          ]
         },
         {
           "evidence_id": "evidence-rch-topology-not-run",
           "category": "rch_topology_preflight",
           "state": "blocked",
           "subject": "topology preflight",
-          "reason_codes": ["rch.topology_preflight.not_run"],
-          "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+          "reason_codes": [
+            "rch.topology_preflight.not_run"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/rch-degraded.json"
+          ]
         },
         {
           "evidence_id": "evidence-rch-cargo-not-run",
           "category": "rch_cargo_verdict",
           "state": "blocked",
           "subject": "Cargo proof verdict",
-          "reason_codes": ["rch.cargo_verdict.not_run", "local_cargo_forbidden"],
-          "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+          "reason_codes": [
+            "rch.cargo_verdict.not_run",
+            "local_cargo_forbidden"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/rch-degraded.json"
+          ]
         }
       ],
-      "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/rch-degraded.json"
+      ]
     },
     {
       "source_id": "beads-rch-degraded",
@@ -90,28 +118,41 @@
       "redaction_posture": {
         "pane_content": "not_collected",
         "secret_material": "not_collected",
-        "notes": ["Beads adapter records blocked status and bead ids only."]
+        "notes": [
+          "Beads adapter records blocked status and bead ids only."
+        ]
       },
       "raw_pane_content_stored": false,
-      "reason_codes": ["beads.blocked_rch_substrate"],
+      "reason_codes": [
+        "beads.blocked_rch_substrate"
+      ],
       "evidence": [
         {
           "evidence_id": "evidence-beads-rch-blocked",
           "category": "beads_blocked_queue",
           "state": "warn",
           "subject": "ft-4tp7g",
-          "reason_codes": ["beads.blocked_rch_substrate"],
-          "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+          "reason_codes": [
+            "beads.blocked_rch_substrate"
+          ],
+          "artifact_paths": [
+            "fixtures/mission-planner/objective-plan/rch-degraded.json"
+          ]
         }
       ],
-      "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/rch-degraded.json"
+      ]
     }
   ],
   "capacity_admission": {
     "action": "defer",
     "pressure_tier": "unknown",
     "proof_state": "unavailable",
-    "reason_codes": ["rch_substrate_blocked", "capacity.remote_proof_unavailable"]
+    "reason_codes": [
+      "rch_substrate_blocked",
+      "capacity.remote_proof_unavailable"
+    ]
   },
   "steps": [
     {
@@ -123,8 +164,13 @@
       "side_effect_class": "beads_metadata",
       "requires_approval": false,
       "forbidden": false,
-      "reason_codes": ["rch_substrate_blocked", "coordination.record_blocker"],
-      "proof_requirement_ids": ["proof-static-json"]
+      "reason_codes": [
+        "rch_substrate_blocked",
+        "coordination.record_blocker"
+      ],
+      "proof_requirement_ids": [
+        "proof-static-json"
+      ]
     },
     {
       "step_id": "step-rch-proof-forbidden",
@@ -135,8 +181,13 @@
       "side_effect_class": "proof_run",
       "requires_approval": false,
       "forbidden": true,
-      "reason_codes": ["rch.worker_selection.no_available_worker", "local_cargo_forbidden"],
-      "proof_requirement_ids": ["proof-rch-cargo"]
+      "reason_codes": [
+        "rch.worker_selection.no_available_worker",
+        "local_cargo_forbidden"
+      ],
+      "proof_requirement_ids": [
+        "proof-rch-cargo"
+      ]
     }
   ],
   "proof_requirements": [
@@ -157,7 +208,9 @@
       "required": false,
       "status": "blocked",
       "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test ...",
-      "artifact_paths": ["fixtures/mission-planner/objective-plan/rch-degraded.json"]
+      "artifact_paths": [
+        "fixtures/mission-planner/objective-plan/rch-degraded.json"
+      ]
     }
   ],
   "forbidden_actions": [
@@ -182,7 +235,9 @@
     "policy_id": "ft.redaction.objective_plan.v1",
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
-    "notes": ["RCH degraded fixture stores blocker classes only."]
+    "notes": [
+      "RCH degraded fixture stores blocker classes only."
+    ]
   },
   "raw_pane_content_stored": false,
   "artifact_paths": [

@@ -36,7 +36,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "ready_count": 1,
       "blocked_count": 3,
       "in_progress_count": 2,
@@ -45,7 +47,9 @@
           "blocked_bead_id": "ft-u7r37.3",
           "blocking_bead_id": "ft-u7r37.1",
           "blocker_status": "in_progress",
-          "reason_codes": ["mission_twin.snapshot_contract_required"]
+          "reason_codes": [
+            "mission_twin.snapshot_contract_required"
+          ]
         }
       ],
       "owner_states": [],
@@ -60,18 +64,27 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": ["rch.critical_pressure"],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "reason_codes": [
+        "rch.critical_pressure"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "admission_state": "not_ready",
       "healthy_workers": 3,
       "total_workers": 8,
       "critical_pressure_count": 5,
-      "admission_reasons": ["critical_pressure=5"],
+      "admission_reasons": [
+        "critical_pressure=5"
+      ],
       "blocked_proof_lanes": [
         {
           "bead_id": "ft-u7r37.1",
           "command_family": "cargo",
-          "reason_codes": ["rch.admission.not_ready", "rch.critical_pressure"]
+          "reason_codes": [
+            "rch.admission.not_ready",
+            "rch.critical_pressure"
+          ]
         }
       ]
     },
@@ -85,7 +98,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "availability_state": "healthy",
       "active_agents": [],
       "fallback_reason_codes": []
@@ -100,7 +115,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "branch": "main",
       "head": "3333333333333333333333333333333333333333",
       "remote_heads": [],
@@ -118,7 +135,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "active_reservations": []
     },
     "operating_envelope": {
@@ -130,8 +149,12 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": ["rch.critical_pressure"],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"],
+      "reason_codes": [
+        "rch.critical_pressure"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"
+      ],
       "verdict": "shed",
       "source_snapshot_artifact_paths": [
         "fixtures/mission-twin/snapshot/valid/rch-critical-pressure-5.json"

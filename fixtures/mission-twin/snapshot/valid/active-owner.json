@@ -35,8 +35,12 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": ["mission_twin.active_owner_present"],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "reason_codes": [
+        "mission_twin.active_owner_present"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "ready_count": 2,
       "blocked_count": 1,
       "in_progress_count": 2,
@@ -48,7 +52,9 @@
           "owner_state": "active",
           "age_seconds": 48,
           "last_activity_source": "agent_mail",
-          "reason_codes": ["recent_closeout"]
+          "reason_codes": [
+            "recent_closeout"
+          ]
         }
       ],
       "stale_owner_candidates": []
@@ -63,7 +69,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "admission_state": "ready",
       "healthy_workers": 8,
       "total_workers": 8,
@@ -81,7 +89,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "availability_state": "healthy",
       "active_agents": [
         {
@@ -102,7 +112,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "branch": "main",
       "head": "4444444444444444444444444444444444444444",
       "remote_heads": [],
@@ -120,7 +132,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "active_reservations": [
         {
           "holder": "SilverTrout",
@@ -140,9 +154,13 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ],
       "verdict": "admit",
-      "source_snapshot_artifact_paths": ["fixtures/mission-twin/snapshot/valid/active-owner.json"]
+      "source_snapshot_artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/active-owner.json"
+      ]
     }
   },
   "validation": {

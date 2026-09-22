@@ -36,7 +36,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "ready_count": 2,
       "blocked_count": 1,
       "in_progress_count": 1,
@@ -54,7 +56,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "admission_state": "ready",
       "healthy_workers": 8,
       "total_workers": 8,
@@ -71,11 +75,19 @@
       "evidence_level": "not_collected",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": ["agent_mail.red", "mission_twin.agent_mail_fallback"],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "reason_codes": [
+        "agent_mail.red",
+        "mission_twin.agent_mail_fallback"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "availability_state": "red",
       "active_agents": [],
-      "fallback_reason_codes": ["agent_mail.red", "swarm_tick_fallback"]
+      "fallback_reason_codes": [
+        "agent_mail.red",
+        "swarm_tick_fallback"
+      ]
     },
     "git": {
       "source_id": "git",
@@ -87,7 +99,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "branch": "main",
       "head": "2222222222222222222222222222222222222222",
       "remote_heads": [
@@ -110,7 +124,9 @@
       "redacted": true,
       "raw_pane_content_stored": false,
       "reason_codes": [],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "active_reservations": []
     },
     "operating_envelope": {
@@ -122,10 +138,16 @@
       "evidence_level": "fixture",
       "redacted": true,
       "raw_pane_content_stored": false,
-      "reason_codes": ["mission_twin.mail_fallback_mode"],
-      "artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"],
+      "reason_codes": [
+        "mission_twin.mail_fallback_mode"
+      ],
+      "artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ],
       "verdict": "admit",
-      "source_snapshot_artifact_paths": ["fixtures/mission-twin/snapshot/valid/agent-mail-red.json"]
+      "source_snapshot_artifact_paths": [
+        "fixtures/mission-twin/snapshot/valid/agent-mail-red.json"
+      ]
     }
   },
   "validation": {
