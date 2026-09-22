@@ -654,7 +654,7 @@
         "author": "Jeff Emanuel",
         "classification": "fix",
         "committed_at": "2026-09-22T15:33:24-04:00",
-        "sha": "6abb196ab2c387846d3e0d934f4c1ae96ebbfb28",
+        "sha": "3176312365f9c3903a5f7c8c320d6005b80062d9",
         "subject": "fix(gui): prevent overlays from rolling back pending pane resizes"
       },
       "name": "mux",
@@ -1066,7 +1066,7 @@
   },
   "fork_repo": "frankenterm",
   "fork_side_commit_total": 2925,
-  "generated_at": "2026-09-22T08:15:05.956429Z",
+  "generated_at": "2026-09-22T20:23:59.633113Z",
   "produced_by": "scripts/regen-provenance.py",
   "schema_version": "1",
   "vendored_crate_count": 47,
