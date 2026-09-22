@@ -1225,6 +1225,7 @@ fn executable_send_text_contract(
     for step in &mut contract.plan.steps {
         step.action = StepAction::SendText {
             pane_id,
+            // SendText appends the command terminator through WeztermClient.
             text: format!("{commit_prefix}:{}", step.step_id.0),
             paste_mode: Some(false),
         };
@@ -1263,103 +1264,157 @@ fn write_executable_send_text_tx_contract(dir: &TempDir) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
-struct TxWeztermCliStub {
-    binary_path: std::path::PathBuf,
-    list_fixture_path: std::path::PathBuf,
+fn run_tx_owned_mux(root: &std::path::Path) -> ! {
+    use mux::domain::{Domain, LocalDomain};
+    use std::sync::Arc;
+
+    config::designate_this_as_the_main_thread();
+    let config_file = root.join("owned-mux.toml").into_os_string();
+    config::common_init(Some(&config_file), &[], false).expect("initialize owned mux config");
+    config::configuration_result().expect("owned config must load");
+    config::create_user_owned_dirs(config::CACHE_DIR.as_path()).unwrap();
+    wezterm_blob_leases::register_storage(Arc::new(
+        wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR).unwrap(),
+    ))
+    .unwrap();
+    let executor = promise::spawn::SimpleExecutor::with_io_runtime().unwrap();
+    let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local").unwrap());
+    let mux = Arc::new(mux::Mux::new(Some(Arc::clone(&domain))));
+    mux::Mux::set_mux(&mux);
+    let window = mux.new_empty_window(None, None);
+    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+    // This process records only bytes received through the real PTY. Neither
+    // transaction metadata nor the dispatch response can manufacture effects.
+    command.args([
+        "-c",
+        "stty -echo || exit 1; : > \"$2\"; exec tee \"$1\"",
+        "tx-input-recorder",
+    ]);
+    command.arg(root.join("tx-wezterm-effects.log"));
+    command.arg(root.join("recorder-ready"));
+    let tab = promise::spawn::block_on(domain.spawn(
+        &mux,
+        config::configuration().initial_size(0, None),
+        Some(command),
+        None,
+        *window,
+    ))
+    .expect("spawn actual PTY recorder");
+    let pane = tab.get_active_pane().unwrap();
+    assert_eq!(pane.pane_id(), 0, "fresh subprocess pane identity");
+    drop(window);
+    let dispatch = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::production(
+        frankenterm_mux_server_impl::dispatch::DispatchIoPreference::Auto,
+    )
+    .unwrap();
+    let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
+        &config::configuration().unix_domains[0],
+        dispatch,
+    )
+    .unwrap();
+    let _listener = std::thread::spawn(move || listener.run());
+    let deadline = std::time::Instant::now() + REAL_MUX_ROBOT_WAIT_TIMEOUT;
+    let mut ready = false;
+    let mut removed = false;
+    let mut timed_out = false;
+    loop {
+        while executor.try_tick().unwrap() {}
+        if !ready && root.join("recorder-ready").exists() {
+            std::fs::write(root.join("ready"), b"ready").unwrap();
+            ready = true;
+        }
+        if !removed && root.join("remove-pane").exists() {
+            mux.remove_pane(0);
+            removed = true;
+        }
+        if removed && pane.is_dead() && !root.join("pane-removed").exists() {
+            std::fs::write(root.join("pane-removed"), b"reaped").unwrap();
+        }
+        if root.join("stop").exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Exact test-owned pane only. Process exit also closes the listener and
+    // sessions; no daemon or user session is discovered by this fixture.
+    if !removed {
+        mux.remove_pane(0);
+    }
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !pane.is_dead() && std::time::Instant::now() < reap_deadline {
+        while executor.try_tick().unwrap() {}
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        pane.is_dead(),
+        "owned PTY child must be reaped before server exit"
+    );
+    std::process::exit(i32::from(timed_out));
+}
+
+#[cfg(unix)]
+impl Drop for TxOwnedMux {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.root.join("stop"), b"stop");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!(
+                            "owned mux failed: {}",
+                            std::fs::read_to_string(self.root.join("mux.stderr"))
+                                .unwrap_or_default()
+                        );
+                        if !std::thread::panicking() {
+                            panic!("owned mux failed: {status}");
+                        }
+                    }
+                    return;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => {
+                    // Only the Child handle created above is eligible for
+                    // forced cleanup, never a PID read from a fixture file.
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    if !std::thread::panicking() {
+                        panic!("owned mux did not stop cooperatively");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TxOwnedMux {
+    child: std::process::Child,
+    socket_path: std::path::PathBuf,
+    root: std::path::PathBuf,
     effect_log_path: std::path::PathBuf,
     home: std::path::PathBuf,
     data_home: std::path::PathBuf,
     config_home: std::path::PathBuf,
     runtime_dir: std::path::PathBuf,
+    barriers: std::cell::RefCell<Vec<String>>,
+    target_removed: bool,
 }
 
 #[cfg(unix)]
-impl TxWeztermCliStub {
+impl TxOwnedMux {
     fn new(dir: &TempDir) -> Self {
-        let binary_path = dir.path().join("tx-wezterm-stub.sh");
+        if let Some(root) = std::env::var_os("FT_TX_OWNED_MUX_CHILD") {
+            run_tx_owned_mux(std::path::Path::new(&root));
+        }
         let effect_log_path = dir.path().join("tx-wezterm-effects.log");
-        let list_fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("frankenterm-core")
-            .join("tests")
-            .join("fixtures")
-            .join("wezterm_cli")
-            .join("local_single_pane.json");
-        assert!(
-            list_fixture_path.is_file(),
-            "missing WezTerm CLI fixture {}",
-            list_fixture_path.display()
-        );
-
-        let script = r#"#!/bin/sh
-set -eu
-
-if [ "${1:-}" != "cli" ]; then
-  echo "unsupported wezterm stub invocation: $*" >&2
-  exit 64
-fi
-shift
-if [ "${1:-}" = "--no-auto-start" ]; then
-  shift
-fi
-
-operation="${1:-}"
-if [ -z "$operation" ]; then
-  echo "missing wezterm cli operation" >&2
-  exit 64
-fi
-shift
-
-case "$operation" in
-  list)
-    cat "$FT_TEST_WEZTERM_LIST_JSON"
-    ;;
-  send-text)
-    pane_id=""
-    text=""
-    while [ "$#" -gt 0 ]; do
-      case "${1:-}" in
-        --pane-id)
-          pane_id="${2:-}"
-          shift 2
-          ;;
-        --no-paste|--no-newline)
-          shift
-          ;;
-        --)
-          shift
-          if [ "$#" -ne 1 ]; then
-            echo "send-text stub expects exactly one text argument" >&2
-            exit 64
-          fi
-          text="$1"
-          shift
-          ;;
-        *)
-          echo "unsupported send-text args: $*" >&2
-          exit 64
-          ;;
-      esac
-    done
-    if [ -z "$pane_id" ]; then
-      echo "missing --pane-id" >&2
-      exit 64
-    fi
-    printf '%s\t%s\n' "$pane_id" "$text" >> "$FT_TEST_WEZTERM_EFFECT_LOG"
-    ;;
-  *)
-    echo "unsupported wezterm cli operation: $operation" >&2
-    exit 64
-    ;;
-esac
-"#;
-        std::fs::write(&binary_path, script).expect("write transaction WezTerm CLI stub");
-        let mut permissions = std::fs::metadata(&binary_path)
-            .expect("stat transaction WezTerm CLI stub")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&binary_path, permissions)
-            .expect("make transaction WezTerm CLI stub executable");
         std::fs::write(&effect_log_path, b"").expect("create transaction effect log");
 
         let home = dir.path().join("tx-home");
@@ -1384,36 +1439,105 @@ esac
         )
         .expect("seed live transaction target pane");
 
-        Self {
-            binary_path,
-            list_fixture_path,
+        let root = dir.path().to_path_buf();
+        let socket_path = root.join("mux.sock");
+        let config_path = root.join("owned-mux.toml");
+        std::fs::write(&config_path, format!(
+            "[[unix_domains]]\nname = \"tx-owned\"\nsocket_path = {}\nno_serve_automatically = true\n",
+            serde_json::to_string(&socket_path).unwrap()
+        )).expect("write owned mux config");
+        let test_name = std::thread::current()
+            .name()
+            .expect("named libtest thread")
+            .to_owned();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(&root)
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env("FT_TX_OWNED_MUX_CHILD", &root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env_remove("WEZTERM_FT_SOCKET")
+            .env_remove("FRANKENTERM_CONFIG_FILE")
+            .env_remove("FRANKENTERM_CONFIG_DIR")
+            .env_remove("WEZTERM_CONFIG_FILE")
+            .env_remove("WEZTERM_CONFIG_DIR")
+            .env_remove("WEZTERM_UNIX_SOCKET")
+            .env_remove("FRANKENTERM_UNIX_SOCKET")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(root.join("mux.stdout")).unwrap())
+            .stderr(std::fs::File::create(root.join("mux.stderr")).unwrap())
+            .spawn()
+            .expect("start actual mux in owned test subprocess");
+        let mut fixture = Self {
+            child,
+            socket_path,
+            root,
             effect_log_path,
             home,
             data_home,
             config_home,
             runtime_dir,
+            barriers: std::cell::RefCell::new(Vec::new()),
+            target_removed: false,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !fixture.root.join("ready").exists() {
+            assert!(
+                fixture.child.try_wait().unwrap().is_none(),
+                "owned mux exited: {}",
+                std::fs::read_to_string(fixture.root.join("mux.stderr")).unwrap()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned mux readiness deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        fixture
     }
 
     fn command(&self, workspace: &str) -> Command {
         let mut command = Command::cargo_bin("ft").expect("ft binary should be built");
         command
+            .current_dir(workspace)
             .timeout(REAL_MUX_ROBOT_WAIT_TIMEOUT)
             .env("FT_WORKSPACE", workspace)
-            .env("FT_WEZTERM_CLI", &self.binary_path)
-            .env("FT_TEST_WEZTERM_LIST_JSON", &self.list_fixture_path)
-            .env("FT_TEST_WEZTERM_EFFECT_LOG", &self.effect_log_path)
+            .env("FT_WEZTERM_CLI", self.root.join("disabled-external-cli"))
             .env("HOME", &self.home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
             .env_remove("FRANKENTERM_CONFIG_FILE")
             .env_remove("FRANKENTERM_CONFIG_DIR")
             .env_remove("WEZTERM_CONFIG_FILE")
             .env_remove("WEZTERM_CONFIG_DIR")
             .env_remove("WEZTERM_FT_SOCKET")
-            .env_remove("WEZTERM_UNIX_SOCKET");
+            .env("WEZTERM_UNIX_SOCKET", &self.socket_path)
+            .env("FRANKENTERM_UNIX_SOCKET", &self.socket_path);
         command
+    }
+
+    fn remove_target(&mut self) {
+        std::fs::write(self.root.join("remove-pane"), b"remove").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !self.root.join("pane-removed").exists() {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "mux must remain alive for refusal"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned pane removal deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.target_removed = true;
     }
 
     fn run_json(&self, workspace: &str, args: &[&str]) -> serde_json::Value {
@@ -1477,7 +1601,7 @@ esac
                     step.action.action_type_name()
                 );
             };
-            assert_eq!(*pane_id, 0, "stub fixture exposes only pane 0");
+            assert_eq!(*pane_id, 0, "owned mux fixture exposes only pane 0");
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_surface(PolicySurface::Robot)
                 .with_capabilities(PaneCapabilities::unknown())
@@ -1495,7 +1619,7 @@ esac
                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
                 rusqlite::params![
                     format!(
-                        "tx-cli-stub-{phase}-approval-{}-{approval_nonce}",
+                        "tx-owned-mux-{phase}-approval-{}-{approval_nonce}",
                         step.ordinal
                     ),
                     now_ms,
@@ -1517,18 +1641,99 @@ esac
         }
     }
 
-    fn effects(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.effect_log_path)
-            .expect("read transaction effect log")
-            .lines()
-            .map(ToString::to_string)
-            .collect()
-    }
-
     fn assert_effects(&self, expected: &[&str]) {
+        let expected: String = expected
+            .iter()
+            .map(|line| format!("{}\n", line.strip_prefix("0\t").expect("owned pane zero")))
+            .collect();
+        if !self.target_removed {
+            use frankenterm_core::runtime_async::CompatRuntime as _;
+            use frankenterm_core::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
+            let barrier = format!("tx-owned-barrier-{}", self.barriers.borrow().len());
+            let mut mux_config =
+                DirectMuxClientConfig::default().with_socket_path(self.socket_path.clone());
+            mux_config.read_timeout = std::time::Duration::from_secs(5);
+            mux_config.write_timeout = std::time::Duration::from_secs(5);
+            let client = frankenterm_core::wezterm::WeztermClient::with_socket(
+                self.socket_path.display().to_string(),
+            )
+            .with_mux_pool(std::sync::Arc::new(MuxPool::new(MuxPoolConfig {
+                mux: mux_config,
+                ..MuxPoolConfig::default()
+            })));
+            let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                client.send_text_no_paste(0, &barrier).await.unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let output = client.get_text(0, false).await.unwrap();
+                    if output
+                        .lines()
+                        .any(|line| line.trim_end_matches(' ') == barrier)
+                    {
+                        let effects: String = output
+                            .lines()
+                            .map(|line| line.trim_end_matches(' '))
+                            .filter(|line| {
+                                !line.is_empty() && !line.starts_with("tx-owned-barrier-")
+                            })
+                            .map(|line| format!("{line}\n"))
+                            .collect();
+                        assert_eq!(
+                            effects, expected,
+                            "actual mux pane output must match PTY effects"
+                        );
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "PTY FIFO readback barrier deadline"
+                    );
+                    frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5))
+                        .await;
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::fs::read_to_string(&self.effect_log_path)
+                .unwrap()
+                .ends_with(&format!("{barrier}\n"))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PTY file barrier deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.barriers.borrow_mut().push(barrier);
+        }
+        // The echoed FIFO barrier proves all preceding input reached the
+        // recorder. For refusal the child has instead been confirmed reaped.
+        let raw = std::fs::read_to_string(&self.effect_log_path).expect("read actual PTY input");
+        let mut effects = String::new();
+        let mut seen_barriers = Vec::new();
+        for line in raw.split_inclusive('\n') {
+            if let Some(marker) = line.strip_suffix('\n')
+                && self
+                    .barriers
+                    .borrow()
+                    .iter()
+                    .any(|barrier| barrier == marker)
+            {
+                seen_barriers.push(marker.to_owned());
+            } else {
+                effects.push_str(line);
+            }
+        }
         assert_eq!(
-            self.effects(),
-            expected,
+            seen_barriers,
+            *self.barriers.borrow(),
+            "each FIFO barrier must arrive exactly once"
+        );
+        assert_eq!(
+            effects.as_bytes(),
+            expected.as_bytes(),
             "real SendText effects and compensations must match the durable reports"
         );
     }
@@ -1616,13 +1821,9 @@ fn write_ft_0rlfq_tx_contract(dir: &TempDir) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
-fn run_ft_0rlfq_json(
-    workspace: &str,
-    wezterm_stub: &TxWeztermCliStub,
-    args: &[&str],
-) -> serde_json::Value {
+fn run_ft_0rlfq_json(workspace: &str, owned_mux: &TxOwnedMux, args: &[&str]) -> serde_json::Value {
     let started = std::time::Instant::now();
-    let output = wezterm_stub
+    let output = owned_mux
         .command(workspace)
         .args(args)
         .output()
@@ -4427,15 +4628,48 @@ fn contract_tx_show_include_contract_json_envelope() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
+fn contract_tx_owned_mux_missing_pane_refuses_without_effects() {
+    let (dir, ws) = setup_workspace();
+    let mut mux = TxOwnedMux::new(&dir);
+    let contract_path = write_executable_send_text_tx_contract(&dir);
+    mux.remove_target();
+    let payload = mux.run_json(&ws, &["tx", "run", "--format", "json"]);
+    assert_eq!(payload["ok"], true);
+    assert_eq!(
+        payload["data"]["commit_report"]["outcome"],
+        "immediate_failure"
+    );
+    assert_eq!(payload["data"]["commit_report"]["committed_count"], 0);
+    assert_eq!(payload["data"]["commit_report"]["failed_count"], 1);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(contract_path).unwrap()).unwrap();
+    assert_tx_receipt_partition(
+        &persisted,
+        &tx_report_receipts(&payload["data"]["commit_report"], "commit_report"),
+        &[],
+    );
+    let receipts = persisted["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(receipts[0]["outcome"], "failed");
+    assert_eq!(receipts[0]["reason_code"], "send_text_failed");
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt["outcome"] != "committed")
+    );
+    mux.assert_effects(&[]);
+}
+
+#[cfg(unix)]
+#[test]
 fn contract_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     let contract_path = write_executable_send_text_tx_contract(&dir);
     let authoritative_contract_path = contract_path
         .canonicalize()
         .expect("canonicalize locked tx contract");
-    let payload = wezterm_stub.run_json(
+    let payload = owned_mux.run_json(
         &ws,
         &["tx", "run", "--format", "json", "--fail-step", "tx-step:2"],
     );
@@ -4482,7 +4716,7 @@ fn contract_tx_run_partial_failure_json_envelope() {
     let emitted_commit_receipts = tx_report_receipts(&data["commit_report"], "commit_report");
     let emitted_compensation_receipts =
         tx_report_receipts(&data["compensation_report"], "compensation_report");
-    let show_payload = wezterm_stub.run_json(
+    let show_payload = owned_mux.run_json(
         &ws,
         &[
             "robot",
@@ -4504,7 +4738,7 @@ fn contract_tx_run_partial_failure_json_envelope() {
         &emitted_commit_receipts,
         &emitted_compensation_receipts,
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\ttx-test-commit:tx-step:1",
         "0\ttx-test-compensate:tx-step:1",
     ]);
@@ -4719,16 +4953,15 @@ fn contract_robot_tx_show_include_contract_json_envelope() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
 fn contract_robot_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     let contract_path = write_executable_send_text_tx_contract(&dir);
-    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
+    TxOwnedMux::approve_robot_run(&ws, &contract_path);
     let authoritative_contract_path = contract_path
         .canonicalize()
         .expect("canonicalize locked tx contract");
-    let payload = wezterm_stub.run_json(
+    let payload = owned_mux.run_json(
         &ws,
         &[
             "robot",
@@ -4801,7 +5034,7 @@ fn contract_robot_tx_run_partial_failure_json_envelope() {
     let emitted_commit_receipts = tx_report_receipts(&data["commit_report"], "commit_report");
     let emitted_compensation_receipts =
         tx_report_receipts(&data["compensation_report"], "compensation_report");
-    let show_payload = wezterm_stub.run_json(
+    let show_payload = owned_mux.run_json(
         &ws,
         &["tx", "show", "--include-contract", "--format", "json"],
     );
@@ -4816,7 +5049,7 @@ fn contract_robot_tx_run_partial_failure_json_envelope() {
         &emitted_commit_receipts,
         &emitted_compensation_receipts,
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\ttx-test-commit:tx-step:1",
         "0\ttx-test-compensate:tx-step:1",
     ]);
@@ -4901,15 +5134,14 @@ fn contract_robot_tx_run_safe_mode_json_envelope() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
 fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     // Exercise the real durable run path first: receipts alone are not proof
     // that the external commit effects happened.
     let contract_path = write_executable_send_text_tx_contract(&dir);
-    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
-    let run_payload = wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
+    TxOwnedMux::approve_robot_run(&ws, &contract_path);
+    let run_payload = owned_mux.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
     assert_eq!(run_payload["ok"], true);
     assert_eq!(run_payload["data"]["final_state"], "committed");
     assert_eq!(run_payload["data"]["commit_report"]["committed_count"], 3);
@@ -4925,7 +5157,7 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         "the durable commit must persist exactly three receipts"
     );
 
-    let fail_payload = wezterm_stub.run_json(
+    let fail_payload = owned_mux.run_json(
         &ws,
         &[
             "robot",
@@ -4980,7 +5212,7 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         Some(6),
         "the failed rollback must retain all commit and compensation receipts"
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\ttx-test-commit:tx-step:1",
         "0\ttx-test-commit:tx-step:2",
         "0\ttx-test-commit:tx-step:3",
@@ -4991,7 +5223,7 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     // Approval consumption is not wired yet (ft-0rlfq.9), so the original
     // scoped approvals remain active across this compensation retry.
     let recovery_payload =
-        wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
+        owned_mux.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
 
     assert_eq!(recovery_payload["ok"], true);
     assert!(recovery_payload["elapsed_ms"].as_u64().is_some());
@@ -5035,7 +5267,7 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         Some(7),
         "rollback recovery must append only the one newly compensated receipt"
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\ttx-test-commit:tx-step:1",
         "0\ttx-test-commit:tx-step:2",
         "0\ttx-test-commit:tx-step:3",
@@ -5047,14 +5279,13 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
 fn contract_robot_tx_rollback_conflict_is_serialized_without_dispatch_or_mutation() {
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     let contract_path = write_executable_send_text_tx_contract(&dir);
-    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
+    TxOwnedMux::approve_robot_run(&ws, &contract_path);
 
-    let run_payload = wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
+    let run_payload = owned_mux.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
     assert_eq!(run_payload["ok"], true);
     assert_eq!(run_payload["data"]["final_state"], "committed");
 
@@ -5082,7 +5313,7 @@ fn contract_robot_tx_rollback_conflict_is_serialized_without_dispatch_or_mutatio
         std::fs::read(&contract_path).expect("snapshot contradictory transaction contract");
 
     let rollback_payload =
-        wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
+        owned_mux.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
 
     assert_eq!(rollback_payload["ok"], false);
     assert_eq!(
@@ -5105,7 +5336,7 @@ fn contract_robot_tx_rollback_conflict_is_serialized_without_dispatch_or_mutatio
         contradictory_bytes,
         "proof conflict must leave the authoritative contract byte-for-byte unchanged"
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\ttx-test-commit:tx-step:1",
         "0\ttx-test-commit:tx-step:2",
         "0\ttx-test-commit:tx-step:3",
@@ -5241,15 +5472,14 @@ fn contract_ft_0rlfq_terminal_backend_unavailable_leaves_no_transaction_evidence
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
 fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_ledger() {
     // This fixture proves the cross-process contract/receipt/ledger boundary
-    // against real SendText effects recorded by the isolated CLI stub.
+    // against bytes received by the actual isolated PTY child.
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     let contract_path = write_ft_0rlfq_tx_contract(&dir);
 
-    let run_payload = run_ft_0rlfq_json(&ws, &wezterm_stub, &["tx", "run", "--format", "json"]);
+    let run_payload = run_ft_0rlfq_json(&ws, &owned_mux, &["tx", "run", "--format", "json"]);
     assert_eq!(run_payload["ok"], true);
     assert_eq!(run_payload["data"]["final_state"], "committed");
     assert_eq!(
@@ -5262,7 +5492,7 @@ fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_l
 
     let show_after_run = run_ft_0rlfq_json(
         &ws,
-        &wezterm_stub,
+        &owned_mux,
         &[
             "robot",
             "--format",
@@ -5285,13 +5515,13 @@ fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_l
     assert_eq!(persisted_after_run["intent"]["requested_by"], "operator");
     assert_tx_receipt_partition(&persisted_after_run, &emitted_commit_receipts, &[]);
     assert_ft_0rlfq_terminal_ledgers(dir.path(), 1, &["tx-step:1", "tx-step:2"], &[]);
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\tft-0rlfq-commit:tx-step:1",
         "0\tft-0rlfq-commit:tx-step:2",
     ]);
 
     let rollback_payload =
-        run_ft_0rlfq_json(&ws, &wezterm_stub, &["tx", "rollback", "--format", "json"]);
+        run_ft_0rlfq_json(&ws, &owned_mux, &["tx", "rollback", "--format", "json"]);
     assert_eq!(rollback_payload["ok"], true);
     assert_eq!(rollback_payload["data"]["final_state"], "rolled_back");
     assert_eq!(
@@ -5309,7 +5539,7 @@ fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_l
 
     let show_after_rollback = run_ft_0rlfq_json(
         &ws,
-        &wezterm_stub,
+        &owned_mux,
         &[
             "robot",
             "--format",
@@ -5342,7 +5572,7 @@ fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_l
         &["tx-step:1", "tx-step:2"],
         &["tx-step:1", "tx-step:2"],
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\tft-0rlfq-commit:tx-step:1",
         "0\tft-0rlfq-commit:tx-step:2",
         "0\tft-0rlfq-compensate:tx-step:2",
@@ -5352,20 +5582,16 @@ fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_l
 
 #[cfg(unix)]
 #[test]
-#[ignore = "drives tx sends through the legacy WezTerm CLI stub; pane input over the CLI fails closed since da8e16eab, so the run reports immediate_failure. Needs a mux-server harness: ft-ydqah"]
 fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_ledger() {
     // This fixture proves the cross-process contract/receipt/ledger boundary
-    // against real SendText effects recorded by the isolated CLI stub.
+    // against bytes received by the actual isolated PTY child.
     let (dir, ws) = setup_workspace();
-    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let owned_mux = TxOwnedMux::new(&dir);
     let contract_path = write_ft_0rlfq_tx_contract(&dir);
-    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
+    TxOwnedMux::approve_robot_run(&ws, &contract_path);
 
-    let run_payload = run_ft_0rlfq_json(
-        &ws,
-        &wezterm_stub,
-        &["robot", "--format", "json", "tx", "run"],
-    );
+    let run_payload =
+        run_ft_0rlfq_json(&ws, &owned_mux, &["robot", "--format", "json", "tx", "run"]);
     assert_eq!(run_payload["ok"], true);
     assert_eq!(run_payload["data"]["final_state"], "committed");
     assert_eq!(
@@ -5378,7 +5604,7 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
 
     let show_after_run = run_ft_0rlfq_json(
         &ws,
-        &wezterm_stub,
+        &owned_mux,
         &["tx", "show", "--include-contract", "--format", "json"],
     );
     let persisted_after_run = assert_ft_0rlfq_persisted_tx(
@@ -5394,14 +5620,14 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
     assert_eq!(persisted_after_run["intent"]["requested_by"], "operator");
     assert_tx_receipt_partition(&persisted_after_run, &emitted_commit_receipts, &[]);
     assert_ft_0rlfq_terminal_ledgers(dir.path(), 1, &["tx-step:1", "tx-step:2"], &[]);
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\tft-0rlfq-commit:tx-step:1",
         "0\tft-0rlfq-commit:tx-step:2",
     ]);
 
     let rollback_payload = run_ft_0rlfq_json(
         &ws,
-        &wezterm_stub,
+        &owned_mux,
         &["robot", "--format", "json", "tx", "rollback"],
     );
     assert_eq!(rollback_payload["ok"], true);
@@ -5421,7 +5647,7 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
 
     let show_after_rollback = run_ft_0rlfq_json(
         &ws,
-        &wezterm_stub,
+        &owned_mux,
         &["tx", "show", "--include-contract", "--format", "json"],
     );
     let persisted_after_rollback = assert_ft_0rlfq_persisted_tx(
@@ -5447,7 +5673,7 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
         &["tx-step:1", "tx-step:2"],
         &["tx-step:1", "tx-step:2"],
     );
-    wezterm_stub.assert_effects(&[
+    owned_mux.assert_effects(&[
         "0\tft-0rlfq-commit:tx-step:1",
         "0\tft-0rlfq-commit:tx-step:2",
         "0\tft-0rlfq-compensate:tx-step:2",
