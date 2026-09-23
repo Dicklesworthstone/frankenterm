@@ -269,7 +269,7 @@ impl ColdSelectionOwnership {
 
     fn claim(&self) -> bool {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & Self::CLOSED == 0 && state & Self::COUNT_MASK < Self::COUNT_MASK)
                     .then_some(state + 1)
             })
@@ -278,7 +278,7 @@ impl ColdSelectionOwnership {
 
     fn mark_legacy(&self) -> bool {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & Self::CLOSED == 0).then_some(state | Self::LEGACY)
             })
             .is_ok()
@@ -290,7 +290,7 @@ impl ColdSelectionOwnership {
 
     fn release(&self) -> bool {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 let owners = state & Self::COUNT_MASK;
                 if owners == 0 || state & Self::CLOSED != 0 {
                     None
