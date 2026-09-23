@@ -805,6 +805,13 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn get_current_seqno(&self) -> SequenceNo;
 
+    /// Local paint-cache publication, independent of terminal content authority.
+    /// Observers retain their own fence; reading this must never consume damage.
+    /// MAX is sticky and requires unconditional repaint rather than wrapping.
+    fn get_render_cache_generation(&self) -> u64 {
+        0
+    }
+
     /// Returns misc metadata that is pane-specific
     fn get_metadata(&self) -> Value {
         Value::Null

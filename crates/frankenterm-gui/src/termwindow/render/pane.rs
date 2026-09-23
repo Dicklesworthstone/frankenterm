@@ -27,6 +27,161 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
+/// One explicit scroll intent, retained independently of text selection.
+/// Replacing this value drops the old backend lease and all pending replies.
+pub(crate) type ViewportSource = (
+    crate::selection::SelectionAuthority,
+    termwiz::surface::SequenceNo,
+    RenderableDimensions,
+);
+
+pub(crate) struct ViewportAnchor {
+    original: ViewportSource,
+    authority: crate::selection::SelectionAuthority,
+    row: StableRowIndex,
+    state: Option<mux::pane::PaneSelectionAnchor>,
+    captured: bool,
+    unavailable: bool,
+    deadline: Option<Instant>,
+}
+
+impl ViewportAnchor {
+    pub(crate) fn new(
+        pane: &dyn mux::pane::Pane,
+        row: StableRowIndex,
+        dimensions: RenderableDimensions,
+    ) -> Option<Self> {
+        let original = crate::selection::SelectionAuthority::capture_source(pane).filter(
+            |(_, _, observed)| mux::renderable::same_line_layout_geometry(observed, &dimensions),
+        )?;
+        Some(Self::from_source(original, row))
+    }
+
+    pub(crate) fn from_source(original: ViewportSource, row: StableRowIndex) -> Self {
+        Self {
+            original,
+            authority: original.0,
+            row,
+            state: None,
+            captured: false,
+            unavailable: false,
+            deadline: Some(Instant::now() + std::time::Duration::from_secs(30)),
+        }
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        pane: &dyn mux::pane::Pane,
+    ) -> Result<Option<(StableRowIndex, RenderableDimensions)>, mux::pane::PaneSelectionAnchorError>
+    {
+        use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
+        if self.unavailable {
+            return Err(Error::Unsupported);
+        }
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + std::time::Duration::from_secs(30));
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.retire();
+            return Err(Error::SourceChanged);
+        }
+        if !self.captured {
+            if self.state.is_none() {
+                // Before token allocation, the saved row belongs to this
+                // exact pane instance/local layout, not merely matching wire
+                // sequence and dimensions on a replacement connection.
+                let current =
+                    crate::selection::SelectionAuthority::capture(pane).ok_or(Error::Busy)?;
+                if current != self.original.0 {
+                    return Err(Error::SourceChanged);
+                }
+            }
+            let points = [
+                Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                    column: None,
+                    row: self.row,
+                }),
+                None,
+                None,
+            ];
+            let status = if let Some(client) =
+                pane.downcast_ref::<frankenterm_client::pane::ClientPane>()
+            {
+                use frankenterm_client::pane::{
+                    RemoteSelectionCapture, RemoteSelectionCaptureStatus,
+                };
+                let status = if let Some(state) = self.state.as_mut() {
+                    client.poll_remote_selection_capture(
+                        state
+                            .downcast_mut::<RemoteSelectionCapture>()
+                            .ok_or(Error::SourceChanged)?,
+                    )
+                } else {
+                    let mut capture = None;
+                    // This is the proxy-local layout floor, not the wire
+                    // terminal sequence. Preserve it across capture admission.
+                    let status = client.capture_remote_selection(
+                        self.original.0.layout_floor(),
+                        self.original.1,
+                        self.original.2,
+                        points,
+                        &mut capture,
+                    );
+                    self.state =
+                        capture.map(|capture| Box::new(capture) as mux::pane::PaneSelectionAnchor);
+                    status
+                };
+                match status {
+                    RemoteSelectionCaptureStatus::Ready(_) => Status::Captured,
+                    RemoteSelectionCaptureStatus::Busy => Status::Pending,
+                    RemoteSelectionCaptureStatus::Invalidated => return Err(Error::SourceChanged),
+                    RemoteSelectionCaptureStatus::Unremappable => return Err(Error::Unsupported),
+                }
+            } else {
+                pane.capture_selection_anchor_capability(
+                    self.original.1,
+                    self.original.2,
+                    points,
+                    &mut self.state,
+                )?
+            };
+            match status {
+                Status::Pending => return Ok(None),
+                Status::Captured => self.captured = true,
+            }
+        }
+        let current =
+            crate::selection::SelectionAuthority::capture_source(pane).ok_or(Error::Busy)?;
+        let Some((_, sequence, dimensions, points)) = pane.selection_anchor_capability_snapshot(
+            self.state.as_ref().ok_or(Error::SourceChanged)?,
+        )?
+        else {
+            return Ok(None);
+        };
+        if sequence != current.1 || dimensions != current.2 {
+            return Ok(None);
+        }
+        let point = points
+            .and_then(|points| points[0])
+            .ok_or(Error::SourceChanged)?;
+        self.authority = current.0;
+        self.deadline = None;
+        Ok(Some((point.row, dimensions)))
+    }
+
+    fn retire(&mut self) {
+        self.state = None;
+        self.unavailable = true;
+        self.deadline = None;
+    }
+
+    fn allows_current_coordinates(&self, pane: &dyn mux::pane::Pane) -> bool {
+        crate::selection::SelectionAuthority::capture(pane) == Some(self.authority)
+    }
+}
+
 /// LayerStack adapter for the current tiled-pane grid.
 ///
 /// This is intentionally geometry-first: `paint.rs` still owns the
@@ -303,6 +458,70 @@ impl crate::TermWindow {
         let pane_id = pos.pane.pane_id();
         if self.admit_gui_pane(pane_id).is_none() {
             return self.paint_pane_waiting_for_gui_state(pos);
+        }
+        // Keep the lease alive while decorated, but only a bare remote pane
+        // publishes this viewport; overlays own their coordinate transaction.
+        let source_pane = crate::selection::selection_source_pane(&*pos.pane);
+        if source_pane
+            .downcast_ref::<frankenterm_client::pane::ClientPane>()
+            .is_some()
+        {
+            if let Some(source) = crate::selection::SelectionAuthority::capture_source(source_pane)
+            {
+                if let Some(mut state) = self.pane_state(pane_id) {
+                    state.last_viewport_source = Some(source);
+                }
+            }
+            let bare = pos
+                .pane
+                .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                .is_some();
+            let anchor = self
+                .pane_state(pane_id)
+                .and_then(|mut state| state.remote_viewport.take());
+            if let Some(mut anchor) = anchor {
+                let pending = if anchor.unavailable {
+                    false
+                } else {
+                    match anchor.poll(source_pane) {
+                        Ok(Some((row, dimensions))) => {
+                            if bare {
+                                self.set_viewport_with_remote_capture(
+                                    pane_id,
+                                    Some(row),
+                                    dimensions,
+                                    false,
+                                );
+                            }
+                            false
+                        }
+                        Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => true,
+                        Err(error) => {
+                            // Legacy peers and evicted source content cannot
+                            // prove a remap. Preserve existing coordinate behavior
+                            // without repeatedly allocating unsupported leases.
+                            log::debug!("remote viewport anchor unavailable: {error:?}");
+                            anchor.retire();
+                            false
+                        }
+                    }
+                };
+                let wait_for_layout =
+                    pending && bare && !anchor.allows_current_coordinates(source_pane);
+                if let Some(mut state) = self.pane_state(pane_id) {
+                    if state.viewport.is_some() {
+                        state.remote_viewport = Some(anchor);
+                    }
+                }
+                if pending {
+                    self.update_next_frame_time(Some(
+                        Instant::now() + std::time::Duration::from_millis(16),
+                    ));
+                }
+                if wait_for_layout {
+                    return Err(crate::termwindow::NativeFramePending.into());
+                }
+            }
         }
         let local = pos.pane.downcast_ref::<mux::localpane::LocalPane>();
         let mut native_frame = if let Some(local) = local {

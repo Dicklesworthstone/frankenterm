@@ -31,6 +31,23 @@ pub(crate) fn selection_source_pane(mut pane: &dyn Pane) -> &dyn Pane {
     }
 }
 
+/// Retain the backend's actual Arc identity when a selection operation can
+/// outlive a paint callback. A decorator must not consume pending backend
+/// captures through the unsupported-pane fallback.
+pub(crate) fn selection_source_pane_arc(mut pane: &Arc<dyn Pane>) -> &Arc<dyn Pane> {
+    loop {
+        if let Some(copy) = pane.downcast_ref::<crate::overlay::copy::CopyOverlay>() {
+            pane = copy.selection_delegate();
+        } else if let Some(quick) =
+            pane.downcast_ref::<crate::overlay::quickselect::QuickSelectOverlay>()
+        {
+            pane = quick.selection_delegate();
+        } else {
+            return pane;
+        }
+    }
+}
+
 /// Result of a successful smart-selection pick. Carries the pattern
 /// kind plus the selected text so the GUI mouse handler can emit
 /// the matching `SmartSelectionA11yMessage` to the AT-tree without

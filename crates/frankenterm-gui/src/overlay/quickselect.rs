@@ -3489,6 +3489,10 @@ impl Pane for QuickSelectOverlay {
         self.delegate.get_current_seqno()
     }
 
+    fn get_render_cache_generation(&self) -> u64 {
+        self.delegate.get_render_cache_generation()
+    }
+
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,

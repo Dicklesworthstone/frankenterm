@@ -1281,11 +1281,15 @@ pub struct PaneState {
     /// scrollback.
     viewport: Option<StableRowIndex>,
     native_viewport: Option<mux::localpane::NativeViewport>,
+    remote_viewport: Option<render::pane::ViewportAnchor>,
+    last_viewport_source: Option<render::pane::ViewportSource>,
     /// Terminal sequence fence consumed by render damage discovery. This is
     /// deliberately independent from `selection.seqno`: a selection's fence
     /// must remain fixed for its lifetime, while the renderer must advance
     /// after every successful dirty query.
     render_dirty: frankenterm_gui::RenderDirtySequenceFence,
+    /// Per-view observer of local cache publication, never terminal authority.
+    last_seen_cache_generation: u64,
     selection: Selection,
     selection_frame: crate::selection::SelectionFrameState,
     mouse_selection_frame: Option<crate::selection::SelectionFrameStamp>,
@@ -6997,12 +7001,19 @@ impl TermWindow {
         // overrides this method. The split trait fallback is admissible only
         // for a stable monotonic source; a resetting or polling backend must
         // provide an atomic/delegating override.
+        let cache_generation = pane.get_render_cache_generation();
+        let cache_changed = {
+            let state = self
+                .pane_state(pane_id)
+                .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
+            cache_generation == u64::MAX || cache_generation != state.last_seen_cache_generation
+        };
         let last_observed_source_end = self
             .pane_state(pane_id)
             .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?
             .render_dirty
             .last_observed_source_end();
-        let (source_end, dirty) = frame.map_or_else(
+        let (source_end, mut dirty) = frame.map_or_else(
             || {
                 pane.get_changed_since_with_source_fence(
                     visible_range.clone(),
@@ -7011,10 +7022,18 @@ impl TermWindow {
             },
             |frame| (frame.source_sequence, frame.dirty.clone()),
         );
-        self.pane_state(pane_id)
-            .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?
-            .render_dirty
-            .advance_after_query(source_end);
+        if cache_changed {
+            dirty.add_range(visible_range.clone());
+        }
+        {
+            let mut state = self
+                .pane_state(pane_id)
+                .ok_or_else(|| anyhow!("GUI pane state admission is pending"))?;
+            state.render_dirty.advance_after_query(source_end);
+            // Commit the pre-query sample: publication racing the query must
+            // remain observable on the next notification/paint.
+            state.last_seen_cache_generation = cache_generation;
+        }
 
         // Per ft-camu6 (cont of ft-jvj78): wire PTY-write dirty
         // marks into the per-pane DirtyLineBitmap. The term layer's
@@ -10181,6 +10200,16 @@ impl TermWindow {
         position: Option<StableRowIndex>,
         dims: RenderableDimensions,
     ) {
+        self.set_viewport_with_remote_capture(pane_id, position, dims, true);
+    }
+
+    fn set_viewport_with_remote_capture(
+        &mut self,
+        pane_id: PaneId,
+        position: Option<StableRowIndex>,
+        dims: RenderableDimensions,
+        capture_remote: bool,
+    ) {
         let pos = match position {
             Some(pos) => {
                 // Drop out of scrolling mode if we're off the bottom
@@ -10199,6 +10228,34 @@ impl TermWindow {
             };
             state.native_viewport = None;
             if pos != state.viewport {
+                state.remote_viewport = pos.and_then(|row| {
+                    let pane = Mux::try_get()?.get_pane(pane_id)?;
+                    if !capture_remote
+                        || pane
+                            .downcast_ref::<frankenterm_client::pane::ClientPane>()
+                            .is_none()
+                    {
+                        return None;
+                    }
+                    let mut anchor =
+                        render::pane::ViewportAnchor::new(&*pane, row, dims).or_else(|| {
+                            // Contention must not lose this navigation's capture.
+                            // Keep an actual observed source fence, never infer a
+                            // new source from the same numeric row after resize.
+                            state
+                                .last_viewport_source
+                                .filter(|(_, _, observed)| {
+                                    mux::renderable::same_line_layout_geometry(observed, &dims)
+                                })
+                                .map(|source| {
+                                    render::pane::ViewportAnchor::from_source(source, row)
+                                })
+                        })?;
+                    // Admit capture while these coordinates still name the
+                    // pre-resize source; later paint only polls this lease.
+                    let _ = anchor.poll(&*pane);
+                    Some(anchor)
+                });
                 state.viewport = pos;
 
                 // This is a bit gross.  If we add other overlays that need this information,

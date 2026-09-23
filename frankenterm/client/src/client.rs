@@ -4171,6 +4171,13 @@ pub struct MissingTopologyFenceProtocolError {
     pub minimum_codec_version: usize,
 }
 
+#[derive(Debug, Error)]
+#[error("{diagnostic}")]
+pub(crate) struct RemoteRejectionError {
+    diagnostic: String,
+    pub(crate) response: ErrorResponse,
+}
+
 fn remote_rejection_error(
     method: &'static str,
     expected_request_ident: u64,
@@ -4189,7 +4196,8 @@ fn remote_rejection_error(
         || "none".to_string(),
         |object| format!("{}:{}", object.kind.label(), object.id),
     );
-    anyhow!(
+    RemoteRejectionError {
+        diagnostic: format!(
         "{CLI_MUX_ERROR_V1_PREFIX} request_ident={} response_request_ident={} operation={method} code={} object={} effect={} retry={}",
         expected_request_ident,
         response.request_ident,
@@ -4197,7 +4205,9 @@ fn remote_rejection_error(
         object,
         response.effect.label(),
         response.retry.label()
-    )
+        ),
+        response: response.clone(),
+    }.into()
 }
 
 struct RpcAttemptMetricGuard {
@@ -10785,6 +10795,38 @@ impl TestRpcPeer {
         Ok(())
     }
 
+    pub(crate) async fn reject_next_lines(&self, retry: MuxErrorRetry) -> anyhow::Result<()> {
+        let ReaderMessage::SendPdu {
+            binding,
+            lease,
+            promise,
+        } = self.receiver.recv().await?
+        else {
+            bail!("expected line RPC");
+        };
+        anyhow::ensure!(lease.matches(binding), "test line RPC lease mismatch");
+        let prepared = lease
+            .claim_for_reader()?
+            .context("test line RPC cancelled")?;
+        let ident = match prepared.pdu() {
+            Pdu::GetLinesAtLayout(_) => GetLinesAtLayout::IDENT,
+            Pdu::GetLines(_) => GetLines::IDENT,
+            other => bail!("unexpected test line RPC {}", other.pdu_name()),
+        };
+        let response = if retry == MuxErrorRetry::NEVER {
+            ErrorResponse::pane_not_found(ident, 753)
+        } else {
+            let mut response = ErrorResponse::backend_failure(ident);
+            response.retry = retry;
+            response
+        };
+        promise
+            .send(Ok(PendingRpcReply::pdu(Pdu::ErrorResponse(response))))
+            .await
+            .map_err(|_| anyhow!("test line RPC caller retired"))?;
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.receiver.is_empty()
@@ -11910,7 +11952,15 @@ mod tests {
     #[test]
     fn remote_rpc_error_is_finite_and_request_correlated() {
         let response = ErrorResponse::backend_failure(Ping::IDENT);
-        let error = remote_rejection_error("ping", Ping::IDENT, &response).to_string();
+        let typed = remote_rejection_error("ping", Ping::IDENT, &response);
+        assert_eq!(
+            typed
+                .downcast_ref::<RemoteRejectionError>()
+                .unwrap()
+                .response,
+            response
+        );
+        let error = typed.to_string();
         assert!(error.contains("code=backend_failure"));
         assert!(error.starts_with("FRANKENTERM_MUX_ERROR_V1 "));
         assert!(error.contains(&format!("request_ident={}", Ping::IDENT)));
@@ -11921,7 +11971,14 @@ mod tests {
         assert!(error.contains("retry=safe_after_backoff"));
         assert!(!error.contains("SECRET_REMOTE_STDERR_CANARY"));
 
-        let mismatch = remote_rejection_error("ping", ListPanes::IDENT, &response).to_string();
+        let mismatched = remote_rejection_error("ping", ListPanes::IDENT, &response);
+        assert!(mismatched.downcast_ref::<RemoteRejectionError>().is_none());
+        let mut unknown = response.clone();
+        unknown.retry = MuxErrorRetry(u8::MAX);
+        assert!(remote_rejection_error("ping", Ping::IDENT, &unknown)
+            .downcast_ref::<RemoteRejectionError>()
+            .is_none());
+        let mismatch = mismatched.to_string();
         assert!(mismatch.contains("code=unknown_future"));
         assert!(mismatch.contains(&format!("request_ident={}", ListPanes::IDENT)));
         assert!(mismatch.contains(&format!("response_request_ident={}", Ping::IDENT)));

@@ -1287,6 +1287,44 @@ mod dirty_tracking_tests {
             assert_eq!(result, Some(expected), "exact wide/combining-cell endpoint");
         }
         let source = crate::selection::SelectionAuthority::capture_source(&*pane).unwrap();
+        let (entered, held) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let owned = Arc::clone(&pane);
+        let holder = std::thread::spawn(move || {
+            owned.with_lines_mut(
+                bottom..bottom + 1,
+                &mut Hold {
+                    entered,
+                    release: wait,
+                },
+            )
+        });
+        held.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            crate::termwindow::render::pane::ViewportAnchor::new(&*pane, 0, source.2).is_none()
+        );
+        let mut viewport_anchor =
+            crate::termwindow::render::pane::ViewportAnchor::from_source(source, 0);
+        assert!(matches!(
+            viewport_anchor.poll(&*pane),
+            Err(mux::pane::PaneSelectionAnchorError::Busy)
+        ));
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let viewport_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            executor.try_tick().unwrap();
+            match viewport_anchor.poll(&*pane) {
+                Ok(Some((row, _))) => {
+                    assert_eq!(row, 0);
+                    break;
+                }
+                Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                other => panic!("real viewport capture failed: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < viewport_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let mut coordinates = CopyCoordinateAnchor {
             source,
             original: source,
@@ -1461,6 +1499,31 @@ mod dirty_tracking_tests {
         let start = mapped[1].unwrap();
         let end = mapped[0].unwrap();
         let viewport = mapped[2].unwrap();
+        let mut uncaptured_old_viewport =
+            crate::termwindow::render::pane::ViewportAnchor::from_source(source, 0);
+        assert!(matches!(
+            uncaptured_old_viewport.poll(&*pane),
+            Err(mux::pane::PaneSelectionAnchorError::SourceChanged)
+        ));
+        let viewport_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let remapped_viewport = loop {
+            executor.try_tick().unwrap();
+            match viewport_anchor.poll(&*pane) {
+                Ok(Some((row, dimensions))) => {
+                    assert_eq!(dimensions.cols, 4);
+                    break row;
+                }
+                Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                other => panic!("real viewport remap failed: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < viewport_deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(remapped_viewport, viewport.row);
+        assert_ne!(
+            remapped_viewport, 0,
+            "retaining the old numeric viewport would display different content"
+        );
         // The bounded wrap planner may leave an underfull row containing the
         // leading spaces. Cell zero and cell two need not share a visual row.
         // Prove their original content offsets through the actual hydrated
@@ -4414,6 +4477,10 @@ impl Pane for CopyOverlay {
 
     fn get_current_seqno(&self) -> SequenceNo {
         self.delegate.get_current_seqno()
+    }
+
+    fn get_render_cache_generation(&self) -> u64 {
+        self.delegate.get_render_cache_generation()
     }
 
     fn get_changed_since(

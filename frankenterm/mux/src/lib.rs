@@ -4497,6 +4497,10 @@ mod pane_registration_handle {
             self.pane.get_current_seqno()
         }
 
+        pub fn get_render_cache_generation(&self) -> u64 {
+            self.pane.get_render_cache_generation()
+        }
+
         pub fn get_changed_since(
             &self,
             range: std::ops::Range<frankenterm_term::StableRowIndex>,

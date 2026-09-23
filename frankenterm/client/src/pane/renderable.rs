@@ -160,6 +160,8 @@ fn render_line_cache_capacity_for_values(
 #[derive(Debug)]
 struct FetchIdentity {
     started_at: Instant,
+    backend_retries: AtomicUsize,
+    failed: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +175,7 @@ struct DeferredLineFetch {
     layout: LineReadLayout,
     queue_id: NonZeroU64,
     scheduler_generation: NonZeroU64,
+    not_before: Instant,
 }
 
 type FetchRetryOwner = (
@@ -321,7 +324,11 @@ impl FetchRetryCoordinator {
 
 impl FetchToken {
     fn new(started_at: Instant) -> Self {
-        Self(Arc::new(FetchIdentity { started_at }))
+        Self(Arc::new(FetchIdentity {
+            started_at,
+            backend_retries: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+        }))
     }
 
     fn started_at(&self) -> Instant {
@@ -590,6 +597,7 @@ pub struct RenderableInner {
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
+    render_cache_generation: u64,
     /// Local coordinate epoch, independent of ordinary remote content updates.
     selection_layout_generation: SequenceNo,
 
@@ -602,6 +610,7 @@ pub struct RenderableInner {
     fetch_limiter: RateLimiter,
     fetch_retry_wake: async_channel::Sender<()>,
     deferred_fetches: Vec<DeferredLineFetch>,
+    failed_fetch_authority: Option<(PaneRegistrationHandle, RpcGenerationScope, LineReadLayout)>,
 
     last_send_time: Instant,
     pub last_recv_time: Instant,
@@ -699,12 +708,14 @@ impl RenderableInner {
             fetch_limiter,
             fetch_retry_wake,
             deferred_fetches: Vec::new(),
+            failed_fetch_authority: None,
             last_send_time: now,
             last_recv_time: now,
             last_late_dirty: now,
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
+            render_cache_generation: 0,
             selection_layout_generation: SEQ_ZERO,
             implicit_hyperlink_rules: config.hyperlink_rules.clone(),
             predictions: Vec::new(),
@@ -1853,6 +1864,9 @@ impl RenderableInner {
             LineEntry::Line(line)
         };
         self.lines.put(stable_row, entry);
+        if fetch_token.is_some() {
+            self.render_cache_generation = self.render_cache_generation.saturating_add(1);
+        }
         let capacity = self.lines.cap();
         self.selection_row_sequences.resize(capacity);
         self.selection_row_sequences.put(stable_row, seqno);
@@ -1930,6 +1944,107 @@ impl RenderableInner {
         }
     }
 
+    fn refresh_failed_fetches(&mut self) {
+        let Some((registration, rpc, layout)) = &self.failed_fetch_authority else {
+            return;
+        };
+        if self
+            .mux_registration
+            .load()
+            .is_some_and(|current| current.same_registration(registration))
+            && rpc.same_generation(&self.client.client.rpc_scope())
+            && layout.seqno == self.seqno
+            && layout.dimensions == self.dimensions
+        {
+            return;
+        }
+        self.failed_fetch_authority = None;
+        let failed: Vec<_> = self
+            .lines
+            .iter()
+            .filter_map(|(row, entry)| match entry {
+                LineEntry::Fetching(token) | LineEntry::LineAndFetching(_, token)
+                    if token.0.failed.load(Ordering::Relaxed) =>
+                {
+                    Some(*row)
+                }
+                _ => None,
+            })
+            .collect();
+        for row in failed {
+            self.make_stale(row);
+        }
+    }
+
+    fn defer_failed_fetch(&mut self, error: &anyhow::Error, mut intent: DeferredLineFetch) -> bool {
+        self.retain_exact_fetch_rows(&mut intent.rows, &intent.token);
+        if intent.rows.is_empty() {
+            return false;
+        }
+        if !intent.rpc.same_generation(&self.client.client.rpc_scope())
+            || intent.layout.seqno != self.seqno
+            || !self.admit_fetched_layout(intent.layout, &intent.rows, &intent.token)
+        {
+            self.release_exact_fetch_reservations(&intent.rows, &intent.token);
+            return true;
+        }
+        let retryable = error
+            .downcast_ref::<crate::client::RemoteRejectionError>()
+            .is_some_and(|error| {
+                let response = &error.response;
+                (response.request_ident == GetLinesAtLayout::IDENT
+                    || response.request_ident == GetLines::IDENT)
+                    && response.effect == MuxErrorEffect::NOT_APPLIED
+                    && response.retry == MuxErrorRetry::SAFE_AFTER_BACKOFF
+            })
+            || error
+                .downcast_ref::<crate::client::ClientOutboundAdmissionError>()
+                .is_some_and(|error| {
+                    error.ident == GetLinesAtLayout::IDENT || error.ident == GetLines::IDENT
+                });
+        let attempt = intent.token.0.backend_retries.load(Ordering::Relaxed);
+        if self.dead
+            || self.client.is_detached()
+            || !intent.rpc.is_available()
+            || !retryable
+            || attempt >= 8
+        {
+            intent.token.0.failed.store(true, Ordering::Relaxed);
+            self.failed_fetch_authority = Some((
+                intent.registration,
+                intent.rpc,
+                LineReadLayout {
+                    seqno: self.seqno,
+                    dimensions: self.dimensions,
+                },
+            ));
+            return false;
+        }
+        self.prune_deferred_fetches();
+        if self
+            .deferred_fetches
+            .iter()
+            .any(|pending| pending.token.same_request(&intent.token))
+        {
+            return false;
+        }
+        intent
+            .token
+            .0
+            .backend_retries
+            .store(attempt + 1, Ordering::Relaxed);
+        intent.not_before = Instant::now() + Duration::from_millis((25_u64 << attempt).min(1000));
+        self.deferred_fetches.push(intent);
+        match self.fetch_retry_wake.try_send(()) {
+            Ok(()) | Err(async_channel::TrySendError::Full(())) => {}
+            Err(async_channel::TrySendError::Closed(())) => {
+                self.dead = true;
+                self.cancel_deferred_fetches();
+            }
+        }
+        false
+    }
+
     async fn run_fetch_retries(
         owner: Weak<parking_lot::Mutex<RenderableState>>,
         wake: async_channel::Receiver<()>,
@@ -1948,11 +2063,35 @@ impl RenderableInner {
                         return;
                     }
                     inner.prune_deferred_fetches();
+                    if let Some((index, _)) = inner
+                        .deferred_fetches
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, intent)| intent.not_before)
+                    {
+                        inner.deferred_fetches.swap(0, index);
+                    }
                     let Some(intent) = inner.deferred_fetches.first() else {
                         break;
                     };
-                    (intent.queue_id, intent.scheduler_generation)
+                    (
+                        (intent.queue_id, intent.scheduler_generation),
+                        intent.not_before.saturating_duration_since(Instant::now()),
+                    )
                 };
+                let (expected, remaining) = expected;
+                if !remaining.is_zero() {
+                    // A newly queued visible read may be due before this
+                    // backend retry. Re-evaluate the queue on its existing wake.
+                    let sleep = promise::spawn::sleep(remaining);
+                    let notified = wake.recv();
+                    pin_mut!(sleep);
+                    pin_mut!(notified);
+                    if matches!(select(sleep, notified).await, Either::Right((Err(_), _))) {
+                        return;
+                    }
+                    continue;
+                }
                 let reservation = match promise::spawn::try_reserve_main_thread(
                     promise::spawn::MainThreadServiceClass::Render,
                     64 * 1024,
@@ -2006,7 +2145,9 @@ impl RenderableInner {
                             return;
                         }
                         let first = &inner.deferred_fetches[0];
-                        if (first.queue_id, first.scheduler_generation) != expected {
+                        if (first.queue_id, first.scheduler_generation) != expected
+                            || first.not_before > Instant::now()
+                        {
                             return;
                         }
                         let intent = inner.deferred_fetches.remove(0);
@@ -2057,6 +2198,7 @@ impl RenderableInner {
         if to_fetch.is_empty() {
             return;
         }
+        self.refresh_failed_fetches();
         if self.dead {
             self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
             return;
@@ -2094,6 +2236,7 @@ impl RenderableInner {
                             },
                             queue_id: rejection.queue_id,
                             scheduler_generation: rejection.scheduler_generation,
+                            not_before: Instant::now(),
                         });
                     }
                     match self.fetch_retry_wake.try_send(()) {
@@ -2127,6 +2270,7 @@ impl RenderableInner {
         reservation: promise::spawn::MainThreadSpawnReservation,
         authority: Option<(PaneRegistrationHandle, RpcGenerationScope, LineReadLayout)>,
     ) {
+        self.refresh_failed_fetches();
         let Some(registration) = self.mux_registration.load() else {
             for range in to_fetch.iter() {
                 for stable_row in range.clone() {
@@ -2169,6 +2313,8 @@ impl RenderableInner {
             return;
         };
         let fenced = codec_version >= GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION;
+        let receipt = reservation.admission_receipt();
+        let scheduler = (receipt.queue_id, receipt.scheduler_generation);
 
         reservation
             .spawn_local(async move {
@@ -2182,7 +2328,7 @@ impl RenderableInner {
                         )),
                         to_fetch,
                         fetch_token,
-                        layout,
+                        (layout, scheduler),
                     );
                 }
                 let result = if fenced {
@@ -2224,7 +2370,7 @@ impl RenderableInner {
                     result,
                     to_fetch,
                     fetch_token,
-                    layout,
+                    (layout, scheduler),
                 )
             })
             .detach();
@@ -2237,8 +2383,9 @@ impl RenderableInner {
         result: anyhow::Result<HydratedLines>,
         to_fetch: RangeSet<StableRowIndex>,
         fetch_token: FetchToken,
-        layout: LineReadLayout,
+        authority: (LineReadLayout, (NonZeroU64, NonZeroU64)),
     ) -> anyhow::Result<()> {
+        let (layout, scheduler) = authority;
         let local_pane_id = registration.pane_id();
         // Fetch cleanup is intentionally allowed after this RPC generation has
         // retired: it releases only the exact reservation created by this
@@ -2281,7 +2428,29 @@ impl RenderableInner {
             },
             Err(err) => {
                 log::error!("get_lines failed: {}", err);
-                release_exact_fetch_reservations()
+                // Retain exact tokens without a repaint notification: a paint
+                // must not turn this rejected read into an immediate new RPC.
+                let refresh = registration.try_with_current(|_| {
+                    let renderable = renderable.lock();
+                    let mut inner = renderable.inner.borrow_mut();
+                    inner.defer_failed_fetch(
+                        &err,
+                        DeferredLineFetch {
+                            registration: registration.clone(),
+                            rpc: rpc.clone(),
+                            layout,
+                            rows: to_fetch,
+                            token: fetch_token,
+                            queue_id: scheduler.0,
+                            scheduler_generation: scheduler.1,
+                            not_before: Instant::now(),
+                        },
+                    )
+                });
+                if refresh == Some(true) {
+                    registration.try_with_current_output(|_| ());
+                }
+                refresh.map(|_| ())
             }
         };
         if applied.is_none() {
@@ -4064,6 +4233,7 @@ impl RenderableState {
             .inner
             .try_borrow_mut()
             .map_err(|_| SelectionReadError::Busy)?;
+        inner.refresh_failed_fetches();
         if inner.dead
             || inner.seqno < sequence
             || inner.seqno == SequenceNo::MAX
@@ -4186,6 +4356,7 @@ impl RenderableState {
 
     pub fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         let mut inner = self.inner.borrow_mut();
+        inner.refresh_failed_fetches();
         let mut result = vec![];
         let mut to_fetch = RangeSet::new();
         let now = Instant::now();
@@ -4386,6 +4557,10 @@ impl RenderableState {
         let mut inner = self.inner.borrow_mut();
         Self::poll_before_changed_query(&mut inner);
         Self::collect_changed_since(&mut inner, lines, seqno)
+    }
+
+    pub fn get_render_cache_generation(&self) -> u64 {
+        self.inner.borrow().render_cache_generation
     }
 
     /// Poll the remote source, capture its post-poll sequence fence, and scan
@@ -6461,6 +6636,77 @@ mod tests {
     }
 
     #[test]
+    fn fetched_rows_publish_paint_generation_without_advancing_source_authority() {
+        let renderable = test_renderable_state();
+        let state = renderable.lock();
+        let exact = FetchToken::new(Instant::now());
+        let successor = FetchToken::new(Instant::now());
+        let mut requested = rangeset::RangeSet::new();
+        requested.add_range(0..1);
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.seqno = 78;
+            inner.lines.put(0, LineEntry::Fetching(exact.clone()));
+        }
+        let observer_generation = state.get_render_cache_generation();
+        let (_, placeholder) = state.get_lines(0..1);
+        assert!(placeholder[0].as_str().trim().is_empty());
+        let (layout, source, _, _) = state.selection_source_snapshot().unwrap();
+        assert_eq!(source, 78);
+        {
+            let mut inner = state.inner.borrow_mut();
+            let mut line = Line::from("界e\u{301}  Z");
+            line.update_last_change_seqno(78);
+            inner.apply_fetched_lines(
+                super::HydratedLines {
+                    lines: vec![(0, line)],
+                    incomplete_rows: Default::default(),
+                },
+                &requested,
+                &exact,
+            );
+        }
+        let published = state.get_render_cache_generation();
+        assert_ne!(
+            published, observer_generation,
+            "placeholder replacement must dirty paint"
+        );
+        let mut witness = None;
+        assert!(state
+            .selection_copy_snapshot(layout, source, 0..1, &mut witness)
+            .is_ok());
+        assert_eq!(
+            state.get_render_cache_generation(),
+            published,
+            "selection readers cannot consume another observer's paint damage"
+        );
+        assert_eq!(state.get_current_seqno(), 78);
+        let (_, rows) = state.get_lines(0..1);
+        assert_eq!(rows[0].as_str().as_ref(), "界e\u{301}  Z");
+        assert!(
+            !rows[0].changed_since(78),
+            "paint publication is not new source content"
+        );
+        {
+            let mut inner = state.inner.borrow_mut();
+            inner.lines.put(0, LineEntry::Fetching(successor));
+            assert!(!inner.put_line(0, Line::from("obsolete"), Some(&exact)));
+            assert_eq!(
+                inner.render_cache_generation, published,
+                "rejected late fetch cannot publish paint damage"
+            );
+            inner.render_cache_generation = u64::MAX;
+            inner.lines.put(0, LineEntry::Fetching(exact.clone()));
+            assert!(inner.put_line(0, Line::from("current"), Some(&exact)));
+            assert_eq!(
+                inner.render_cache_generation,
+                u64::MAX,
+                "never wrap paint identity"
+            );
+        }
+    }
+
+    #[test]
     fn incomplete_fetched_images_preserve_successors_and_last_complete_rows() {
         let renderable = test_renderable_state();
         let state = renderable.lock();
@@ -6854,6 +7100,167 @@ mod tests {
     #[test]
     fn full_render_scheduler_retries_quiet_pane_fetch_without_new_output() {
         exercise_render_fetch_retry(FetchRetryChange::None);
+    }
+
+    fn exercise_backend_fetch_failure(rejection: MuxErrorRetry, exhaust: bool) {
+        let terminal = rejection != MuxErrorRetry::SAFE_AFTER_BACKOFF;
+        let scope = crate::MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(mux::Mux::new(None));
+        scope.set_mux(&mux);
+        let (client, peer) = Client::new_test_client_with_rpc_peer(
+            Some(751),
+            ClientDomainConfig::Unix(UnixDomain {
+                name: "backend-fetch-retry".into(),
+                ..UnixDomain::default()
+            }),
+        );
+        let client = Arc::new(ClientInner::new(751, client, None, None, false));
+        let pane = Arc::new(
+            ClientPane::new(
+                &client,
+                753,
+                757,
+                761,
+                wezterm_term::TerminalSize::default(),
+                "fetch",
+                false,
+            )
+            .unwrap(),
+        );
+        let registered: Arc<dyn mux::pane::Pane> = pane.clone();
+        mux.add_pane(&registered).unwrap();
+        while executor.try_tick().unwrap() {}
+        assert!(!peer.is_empty());
+        promise::spawn::block_on(peer.respond_next_unit()).unwrap();
+        while executor.try_tick().unwrap() {}
+        assert!(peer.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        {
+            let state = pane.renderable.lock();
+            let mut inner = state.inner.borrow_mut();
+            inner.dimensions.scrollback_top = 0;
+            inner.dimensions.scrollback_rows = 2;
+            inner.seqno = 1;
+            inner.lines.put(1, LineEntry::Line(Line::with_width(17, 1)));
+        }
+        let pump_until = |ready: &dyn Fn() -> bool| loop {
+            if ready() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fetch failure path stalled");
+            if !executor.try_tick().unwrap() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        pane.renderable.lock().get_lines(0..1);
+        pump_until(&|| !peer.is_empty());
+        let failures = if exhaust {
+            9
+        } else if terminal {
+            1
+        } else {
+            2
+        };
+        for attempt in 0..failures {
+            let rejected_at = Instant::now();
+            promise::spawn::block_on(peer.reject_next_lines(rejection)).unwrap();
+            pump_until(&|| {
+                let state = pane.renderable.lock();
+                let inner = state.inner.borrow();
+                inner.failed_fetch_authority.is_some() || !inner.deferred_fetches.is_empty()
+            });
+            {
+                let state = pane.renderable.lock();
+                let inner = state.inner.borrow();
+                assert!(matches!(inner.lines.peek(&0), Some(LineEntry::Fetching(_))));
+                if !terminal && attempt < 8 {
+                    assert_eq!(inner.deferred_fetches.len(), 1);
+                    assert!(
+                        inner.deferred_fetches[0].not_before
+                            >= rejected_at + Duration::from_millis(25)
+                    );
+                }
+            }
+            // Repeated visible/selection queries cannot create another request
+            // or consume the driver's retained exact-token intent.
+            for _ in 0..10 {
+                pane.renderable.lock().get_lines(0..1);
+            }
+            assert!(
+                peer.is_empty(),
+                "failure immediately redispatched from paint"
+            );
+            if !terminal && attempt < 8 {
+                pump_until(&|| !peer.is_empty());
+            }
+        }
+        if terminal || exhaust {
+            let quiet_until = Instant::now() + Duration::from_millis(120);
+            while Instant::now() < quiet_until {
+                pane.renderable.lock().get_lines(0..1);
+                while executor.try_tick().unwrap() {}
+                assert!(
+                    peer.is_empty(),
+                    "terminal/exhausted failure retried without authority refresh"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // A failed range must not poison independent reads on this quiet
+            // pane. Evict a different cached row and fetch it under the SAME
+            // authority while the original failed token remains suppressed.
+            pane.renderable.lock().inner.borrow_mut().lines.pop(&1);
+            pane.renderable.lock().get_lines(1..2);
+            pump_until(&|| !peer.is_empty());
+            promise::spawn::block_on(peer.respond_next_lines(vec![(1, Line::with_width(19, 1))]))
+                .unwrap();
+            pump_until(&|| {
+                matches!(pane.renderable.lock().inner.borrow().lines.peek(&1),
+                Some(LineEntry::Line(line)) if line.len() == 19)
+            });
+            pane.renderable.lock().get_lines(0..1);
+            while executor.try_tick().unwrap() {}
+            assert!(
+                peer.is_empty(),
+                "unrelated success restarted the failed range"
+            );
+            if terminal {
+                // Reconnection at the SAME sequence/dimensions is new authority.
+                peer.replace_ready_generation(&client.client, codec::CODEC_VERSION)
+                    .unwrap();
+            } else {
+                pane.renderable.lock().inner.borrow_mut().seqno += 1;
+            }
+            pane.renderable.lock().get_lines(0..1);
+            pump_until(&|| !peer.is_empty());
+        }
+        promise::spawn::block_on(peer.respond_next_lines(vec![(0, Line::with_width(17, 1))]))
+            .unwrap();
+        pump_until(&|| {
+            matches!(pane.renderable.lock().inner.borrow().lines.peek(&0),
+            Some(LineEntry::Line(line)) if line.len() == 17)
+        });
+        assert!(peer.is_empty());
+    }
+
+    #[test]
+    fn backend_fetch_failure_backs_off_then_publishes_without_new_output() {
+        exercise_backend_fetch_failure(MuxErrorRetry::SAFE_AFTER_BACKOFF, false);
+    }
+
+    #[test]
+    fn missing_pane_fetch_waits_for_rpc_refresh_before_retry() {
+        exercise_backend_fetch_failure(MuxErrorRetry::NEVER, false);
+    }
+
+    #[test]
+    fn backend_fetch_retry_exhaustion_requires_authority_refresh() {
+        exercise_backend_fetch_failure(MuxErrorRetry::SAFE_AFTER_BACKOFF, true);
+    }
+
+    #[test]
+    fn malformed_fetch_retry_authority_requires_rpc_refresh() {
+        exercise_backend_fetch_failure(MuxErrorRetry(u8::MAX), false);
     }
 
     #[test]

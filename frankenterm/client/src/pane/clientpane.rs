@@ -4039,7 +4039,28 @@ impl ClientPane {
     pub fn selection_source_snapshot(
         &self,
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
-        self.renderable.try_lock()?.selection_source_snapshot()
+        let rpc = self.client.client.rpc_scope();
+        let version = rpc.agreed_codec_version()?;
+        // A successor transport can be ready while its first authoritative
+        // render application is still pending. Old cached seqno/dimensions
+        // are not a source witness for that new endpoint incarnation.
+        let application = if version == LEGACY46_CODEC_VERSION {
+            None
+        } else {
+            let application = self.render_application_state.try_lock()?;
+            let generation = rpc.connection_generation()?.get();
+            let identity = rpc.render_connection_identity()?;
+            if application.applied_connection_generation != Some(generation)
+                || application.applied_connection_identity != Some(identity)
+            {
+                return None;
+            }
+            Some(application)
+        };
+        let snapshot = self.renderable.try_lock()?.selection_source_snapshot();
+        let current = rpc.same_generation(&self.client.client.rpc_scope());
+        drop(application);
+        current.then_some(snapshot).flatten()
     }
 
     /// Read a bounded authoritative selection chunk without renderer overlays.
@@ -5542,6 +5563,10 @@ impl Pane for ClientPane {
         self.renderable.lock().get_current_seqno()
     }
 
+    fn get_render_cache_generation(&self) -> u64 {
+        self.renderable.lock().get_render_cache_generation()
+    }
+
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,
@@ -6552,8 +6577,13 @@ mod tests {
 
     #[test]
     fn selection_source_snapshot_is_nonblocking_while_renderable_is_locked() {
-        let inner = test_client_inner(731);
-        let pane = test_client_pane(&inner, 733, 743);
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(731);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 733, 743);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         let before = pane.selection_source_snapshot().unwrap();
         {
             let _guard = pane.renderable.lock();
@@ -6572,23 +6602,14 @@ mod tests {
 
     #[test]
     fn remote_anchor_capture_keeps_alternate_screen_selectable_and_busy_retryable() {
-        let inner = test_client_inner(751);
-        let pane = ClientPane::new(
-            &inner,
-            753,
-            23,
-            757,
-            TerminalSize {
-                cols: 80,
-                rows: 24,
-                pixel_width: 800,
-                pixel_height: 480,
-                dpi: 96,
-            },
-            "alternate",
-            true,
-        )
-        .unwrap();
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(751);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 753, 757);
+        pane.sync_remote_listing_state(true);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         let (layout, sequence, dimensions, alternate) = pane.selection_source_snapshot().unwrap();
         assert!(alternate);
         let mut pending = None;
@@ -6660,6 +6681,84 @@ mod tests {
         pane
     }
 
+    fn apply_selection_test_snapshot(mux: &Mux, pane: &Arc<ClientPane>, inner: &ClientInner) {
+        let published: Arc<dyn Pane> = pane.clone();
+        let registration = mux.capture_pane_registration(&published).unwrap();
+        let rpc = inner.client.rpc_scope();
+        pane.prepare_render_application_bootstrap(&rpc).unwrap();
+        let mut update = test_render_application_update(
+            rpc.connection_generation().unwrap().get(),
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        update.connection_identity = rpc.render_connection_identity().unwrap();
+        update.surface.alt_screen_active = pane.is_alt_screen_active();
+        let result = settlement(promise::spawn::block_on(pane.apply_render_application(
+            &registration,
+            &rpc,
+            update.clone(),
+        )));
+        result.validate_for(&update).unwrap();
+        assert!(matches!(
+            result.outcome,
+            RenderApplicationOutcome::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn selection_source_rejects_successor_transport_until_its_snapshot_is_applied() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(891);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 893, 899);
+        assert!(pane.selection_source_snapshot().is_none());
+        apply_selection_test_snapshot(&mux, &pane, &inner);
+        let original = pane.selection_source_snapshot().unwrap();
+        {
+            let _locked = pane.render_application_state.lock();
+            assert!(pane.selection_source_snapshot().is_none());
+        }
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
+        let cached = pane.renderable.lock().selection_source_snapshot().unwrap();
+        assert_eq!(
+            cached, original,
+            "old cache must survive to exercise the alias"
+        );
+        assert!(pane.selection_source_snapshot().is_none());
+        let mut pending = None;
+        assert!(matches!(
+            pane.capture_remote_selection(
+                original.0,
+                original.1,
+                original.2,
+                [None; 3],
+                &mut pending
+            ),
+            RemoteSelectionCaptureStatus::Busy
+        ));
+        assert!(
+            pending.is_none(),
+            "old rows must not allocate a successor-owned token"
+        );
+        pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
+            .unwrap();
+        assert!(pane.selection_source_snapshot().is_none());
+        apply_selection_test_snapshot(&mux, &pane, &inner);
+        let current = pane.selection_source_snapshot().unwrap();
+        assert_eq!((current.1, current.2), (original.1, original.2));
+        assert_ne!(
+            current.0, original.0,
+            "the actual successor snapshot retires old layout authority"
+        );
+    }
+
     #[test]
     fn forwarded_selection_capture_keeps_original_request_across_resize_and_reconnect() {
         let scope = MuxTestScope::enter();
@@ -6668,6 +6767,7 @@ mod tests {
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(861);
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 863, 869);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         // Proxy layout generations and server content sequences are unrelated
         // namespaces. An idle server can retain sequence zero across many
         // local layout retirements; this must not prevent anchor capture.
@@ -6736,6 +6836,7 @@ mod tests {
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(871);
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 873, 879);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         // Only metadata is resident: successful forwarding must not require a
         // renderer fetch or substitute the blank result of ordinary get_lines.
         pane.renderable.lock().inner.borrow_mut().seqno = 7;
@@ -6815,9 +6916,8 @@ mod tests {
             let mux = Arc::new(Mux::new(None));
             scope.set_mux(&mux);
             let (inner, peer) = test_client_inner_with_rpc_peer(881);
-            let pane = test_client_pane(&inner, 883, 889);
-            let published: Arc<dyn Pane> = pane.clone();
-            mux.add_pane(&published).unwrap();
+            let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 883, 889);
+            apply_selection_test_snapshot(&mux, &pane, &inner);
             pane.renderable.lock().inner.borrow_mut().seqno = 7;
             let (_, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
             let mut state = None;
@@ -6868,6 +6968,7 @@ mod tests {
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(771);
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 773, 779);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         let baseline = executor.admission_snapshot().active_tasks;
         let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
         let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
@@ -6924,9 +7025,8 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(761);
-        let pane = test_client_pane(&inner, 763, 769);
-        let pane_for_mux: Arc<dyn Pane> = pane.clone();
-        mux.add_pane(&pane_for_mux).unwrap();
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 763, 769);
+        apply_selection_test_snapshot(&mux, &pane, &inner);
         let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
         let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
             column: Some(2),

@@ -520,6 +520,7 @@ impl super::TermWindow {
         pane: Arc<dyn Pane>,
         tx: flume::Sender<anyhow::Result<String>>,
     ) {
+        let pane = Arc::clone(crate::selection::selection_source_pane_arc(&pane));
         let desired = self
             .selection(pane.pane_id())
             .map(|selection| selection.clone());
@@ -925,6 +926,7 @@ impl super::TermWindow {
     }
 
     fn commit_selection_candidate(&self, pane: &Arc<dyn Pane>, desired: Selection) {
+        let pane = crate::selection::selection_source_pane_arc(pane);
         if (pane.downcast_ref::<mux::localpane::LocalPane>().is_none()
             && pane
                 .downcast_ref::<frankenterm_client::pane::ClientPane>()
@@ -957,6 +959,7 @@ impl super::TermWindow {
     }
 
     pub(super) fn retry_pending_native_selection(&self, pane: &Arc<dyn Pane>) {
+        let pane = crate::selection::selection_source_pane_arc(pane);
         let Some(mut pending) = self
             .pane_state(pane.pane_id())
             .and_then(|mut state| state.pending_native_selection.take())
@@ -1359,6 +1362,7 @@ impl super::TermWindow {
         copy: &mut SelectionCopy,
         window: Option<&window::Window>,
     ) -> Result<Option<String>, &'static str> {
+        let pane = crate::selection::selection_source_pane_arc(pane);
         let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
         else {
             return Ok(None);
@@ -1488,6 +1492,7 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         destination: config::keyassignment::ClipboardCopyDestination,
     ) -> bool {
+        let pane = crate::selection::selection_source_pane_arc(pane);
         let remote_authority = pane
             .downcast_ref::<frankenterm_client::pane::ClientPane>()
             .and_then(|_| SelectionAuthority::capture(&**pane));
@@ -1547,6 +1552,7 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         current: Option<SelectionAuthority>,
     ) -> bool {
+        let pane = crate::selection::selection_source_pane_arc(pane);
         let invalidated = self
             .selection(pane.pane_id())
             .is_some_and(|selection| selection.is_invalidated_by(current));
