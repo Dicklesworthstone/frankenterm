@@ -26,11 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.15`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.16`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.15` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.16` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Remote selection adds negotiated server-owned anchors for direct client-to-LocalPane connections. Capture, reflow resolution and release retain pane and connection identity; temporary observation failures defer remapping, and highlighting waits for fresh visible cache rows. Older servers retain ordinary selection without this reflow persistence. Nested forwarding and native acceptance remain pending.
 
 - Workflow input uses live watcher and captured prompt evidence before each step and send. Detection alone no longer implies a safe shell prompt, normal screen, or uninterrupted capture. Reservation checks retain unknown authority on lookup failure and reject foreign ownership before an approval can authorize input; reservation changes and dispatch share the same effect fence.
 
