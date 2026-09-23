@@ -78,6 +78,16 @@ impl ViewportAnchor {
         self
     }
 
+    pub(crate) fn begin_resize_wait(&mut self) {
+        // An initial capture can already be ready in the old geometry. Give
+        // the subsequent owner resize its own bounded remap interval.
+        self.deadline = Some(Instant::now() + std::time::Duration::from_secs(30));
+    }
+
+    fn awaiting_layout(&self) -> bool {
+        !self.unavailable && self.deadline.is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     pub(crate) fn poll(
         &mut self,
         pane: &dyn mux::pane::Pane,
@@ -513,6 +523,12 @@ impl crate::TermWindow {
             // its resized content later. Keep the old viewport anchor alive until
             // the content source actually matches the target pane geometry.
             if bare
+                && self.pane_state(pane_id).is_some_and(|state| {
+                    state
+                        .remote_viewport
+                        .as_ref()
+                        .is_some_and(ViewportAnchor::awaiting_layout)
+                })
                 && !source.is_some_and(|(_, _, dimensions)| {
                     dimensions.cols == pos.width
                         && dimensions.viewport_rows == pos.height

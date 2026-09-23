@@ -568,7 +568,7 @@ impl super::TermWindow {
             .borrow()
             .iter()
             .filter_map(|(&pane_id, state)| {
-                if state.overlay.is_some() || state.remote_viewport.is_some() {
+                if state.overlay.is_some() {
                     return None;
                 }
                 state.viewport.map(|row| (pane_id, row))
@@ -591,6 +591,12 @@ impl super::TermWindow {
             {
                 continue;
             }
+            if let Some(mut state) = self.pane_state(pane_id) {
+                if let Some(anchor) = state.remote_viewport.as_mut() {
+                    anchor.begin_resize_wait();
+                    continue;
+                }
+            }
             let dimensions = pane.get_dimensions();
             let Some(mut anchor) = super::render::pane::ViewportAnchor::new(
                 &*pane,
@@ -611,7 +617,14 @@ impl super::TermWindow {
                 continue;
             };
             // Admit the owned anchor while the old layout still names `row`.
-            let _ = anchor.poll(&*pane);
+            if matches!(
+                anchor.poll(&*pane),
+                Err(mux::pane::PaneSelectionAnchorError::SourceChanged
+                    | mux::pane::PaneSelectionAnchorError::Unsupported)
+            ) {
+                continue;
+            }
+            anchor.begin_resize_wait();
             if let Some(mut state) = self.pane_state(pane_id) {
                 if state.viewport == Some(row)
                     && state.remote_viewport.is_none()
