@@ -3842,9 +3842,9 @@ impl StorageHandle {
 
         // Retain the dispatcher only for explicitly enabled append telemetry;
         // do not replace the writer thread's ordinary event routing.
-        let writer_dispatch = tracing::enabled!(
+        let writer_dispatch = (tracing::enabled!(
             target: "frankenterm::append_transaction", tracing::Level::TRACE
-        )
+        ) || tracing::enabled!(target: "frankenterm::append_reply", tracing::Level::TRACE))
         .then(|| tracing::dispatcher::get_default(Clone::clone));
         // Spawn writer thread
         let writer_handle = thread::Builder::new()
@@ -13192,11 +13192,16 @@ fn dispatch_append_segment_group_commit_result(
                     respond,
                     ..
                 } = pending;
+                let reply_trace = AppendReplyTrace::start(pane_id, committed.segment.seq);
                 if committed.retained_tail_moved {
                     disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
                 }
                 mirror_segment_into_mmap(mmap_mirror, &committed.segment);
+                let reply_started = reply_trace.as_ref().map(|trace| trace.started.elapsed());
                 respond.respond_best_effort(Ok(committed.segment));
+                if let (Some(trace), Some(reply_started)) = (reply_trace, reply_started) {
+                    trace.finish(reply_started);
+                }
                 drop(capture_hold);
             }
         }
@@ -16335,6 +16340,66 @@ mod writer_io_scheduler_tests {
     }
 
     #[test]
+    fn append_reply_only_trace_reaches_real_writer_and_preserves_payload() {
+        use tracing::instrument::WithSubscriber;
+        let buffer = AppendTraceBuffer(Arc::new(Mutex::new(Vec::new())));
+        let output = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off,frankenterm::append_reply=trace")
+            .with_writer(move || output.clone())
+            .finish();
+        run_storage_async_test(
+            async {
+                let directory = tempfile::tempdir().expect("owned storage directory");
+                let path = directory.path().join("reply-trace.sqlite3");
+                let storage = StorageHandle::new(&path.to_string_lossy())
+                    .await
+                    .expect("open real writer");
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 71,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1,
+                        last_seen_at: 1,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("seed actual pane");
+                let stored = storage
+                    .append_segment(71, "fixture-private-payload", None)
+                    .await
+                    .expect("actual append reply");
+                assert_eq!(stored.content, "fixture-private-payload");
+                // Reply diagnostics are emitted after send; join, rather than
+                // racing the writer or sleeping, before inspecting the buffer.
+                storage.shutdown().await.expect("join writer");
+                let rows = append_trace_rows(&buffer);
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "reply-only filter must emit exactly one event"
+                );
+                let row = &rows[0];
+                assert_eq!(row["event"], "append_reply_returned");
+                assert_eq!(row["pane_id"], 71);
+                assert_eq!(row["sequence"], stored.seq);
+                assert!(row["post_backend_before_reply_ns"].as_u64().is_some());
+                assert!(row["reply_call_ns"].as_u64().is_some());
+            }
+            .with_subscriber(subscriber),
+        );
+    }
+
+    #[test]
     fn writer_batch_group_commits_consecutive_append_segments_same_pane() {
         run_storage_async_test(async {
             let backend = crate::storage_backend_trait::MockBackend::new();
@@ -18430,6 +18495,10 @@ fn dispatch_write_command_raw(
                 recorder_delivery.as_ref(),
                 segment_redactors,
             );
+            let reply_trace = result
+                .as_ref()
+                .ok()
+                .and_then(|committed| AppendReplyTrace::start(pane_id, committed.segment.seq));
             let result = result.map(|committed| {
                 if committed.retained_tail_moved {
                     disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
@@ -18437,7 +18506,11 @@ fn dispatch_write_command_raw(
                 mirror_segment_into_mmap(mmap_mirror, &committed.segment);
                 committed.segment
             });
+            let reply_started = reply_trace.as_ref().map(|trace| trace.started.elapsed());
             respond_oneshot_best_effort(respond, result);
+            if let (Some(trace), Some(reply_started)) = (reply_trace, reply_started) {
+                trace.finish(reply_started);
+            }
             drop(capture_hold);
         }
         WriteCommand::AcknowledgeRecorderDelivery {
@@ -20120,6 +20193,50 @@ struct AppendTransactionTrace {
     attempted_members: usize,
     started: Instant,
     dispatch: tracing::Dispatch,
+}
+
+// Successful append result only; a returned best-effort reply does not prove
+// that its receiver survived or consumed it. The start is AFTER the backend helper
+// returns (including its existing transaction diagnostics), before mirroring.
+// Emit only after delivering the reply, never inside its waker callback.
+struct AppendReplyTrace {
+    started: Instant,
+    dispatch: tracing::Dispatch,
+    pane_id: u64,
+    sequence: u64,
+}
+
+impl AppendReplyTrace {
+    fn start(pane_id: u64, sequence: u64) -> Option<Self> {
+        let dispatch = APPEND_TRANSACTION_DISPATCH.with(|slot| slot.borrow().clone())?;
+        if !tracing::dispatcher::with_default(
+            &dispatch,
+            || tracing::enabled!(target: "frankenterm::append_reply", tracing::Level::TRACE),
+        ) {
+            return None;
+        }
+        Some(Self {
+            started: Instant::now(),
+            dispatch,
+            pane_id,
+            sequence,
+        })
+    }
+
+    fn finish(self, reply_started: std::time::Duration) {
+        let finished = self.started.elapsed();
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            tracing::trace!(
+                target: "frankenterm::append_reply",
+                event = "append_reply_returned",
+                pane_id = self.pane_id,
+                sequence = self.sequence,
+                post_backend_before_reply_ns = u64::try_from(reply_started.as_nanos()).unwrap_or(u64::MAX),
+                reply_call_ns = u64::try_from(finished.saturating_sub(reply_started).as_nanos()).unwrap_or(u64::MAX),
+                "append reply delivery returned"
+            );
+        });
+    }
 }
 
 std::thread_local! {

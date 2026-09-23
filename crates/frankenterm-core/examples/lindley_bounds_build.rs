@@ -296,6 +296,94 @@ mod live_measurement {
         const BURST: usize = 10;
         const BURSTS_PER_PHASE: usize = 100;
 
+        #[derive(Clone, Default, Serialize, serde::Deserialize)]
+        struct ExecutorPollDiagnostics {
+            polls: u64,
+            total_poll_ns: u64,
+            maximum_poll_ns: u64,
+            wakes: u64,
+            maximum_wake_to_poll_ns: u64,
+        }
+
+        struct DiagnosticWakeState {
+            epoch: Instant,
+            wakes: std::sync::atomic::AtomicU64,
+            first_unobserved_wake: std::sync::atomic::AtomicU64,
+        }
+
+        struct DiagnosticWake {
+            state: Arc<DiagnosticWakeState>,
+            parent: std::task::Waker,
+        }
+
+        impl std::task::Wake for DiagnosticWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                use std::sync::atomic::Ordering;
+                let now = u64::try_from(self.state.epoch.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.state.wakes.fetch_add(1, Ordering::Relaxed);
+                let _ = self.state.first_unobserved_wake.compare_exchange(
+                    0,
+                    now,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                // No logging or locks in the callback; every wake is forwarded.
+                self.parent.wake_by_ref();
+            }
+        }
+
+        // Bounded summary per event, not a growing per-poll trace. Disabled
+        // measurements use the original future/waker without diagnostic clocks.
+        async fn diagnose_polls<T>(
+            enabled: bool,
+            future: impl std::future::Future<Output = Result<T, String>>,
+        ) -> Result<(T, Option<ExecutorPollDiagnostics>), String> {
+            if !enabled {
+                return future.await.map(|value| (value, None));
+            }
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let state = Arc::new(DiagnosticWakeState {
+                epoch: Instant::now(),
+                wakes: AtomicU64::new(0),
+                first_unobserved_wake: AtomicU64::new(0),
+            });
+            let mut future = std::pin::pin!(future);
+            let mut diagnostics = ExecutorPollDiagnostics::default();
+            std::future::poll_fn(|context| {
+                let started = Instant::now();
+                let wake = state.first_unobserved_wake.swap(0, Ordering::AcqRel);
+                if wake != 0 {
+                    let now = u64::try_from(state.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    diagnostics.maximum_wake_to_poll_ns = diagnostics
+                        .maximum_wake_to_poll_ns
+                        .max(now.saturating_sub(wake));
+                }
+                let waker = std::task::Waker::from(Arc::new(DiagnosticWake {
+                    state: Arc::clone(&state),
+                    parent: context.waker().clone(),
+                }));
+                let result = future
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker));
+                let duration = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                diagnostics.polls = diagnostics.polls.saturating_add(1);
+                diagnostics.total_poll_ns = diagnostics.total_poll_ns.saturating_add(duration);
+                diagnostics.maximum_poll_ns = diagnostics.maximum_poll_ns.max(duration);
+                result
+            })
+            .await
+            .map(|value| {
+                diagnostics.wakes = state.wakes.load(Ordering::Relaxed);
+                (value, Some(diagnostics))
+            })
+        }
+
         // At most BURST owned writes. Poll in insertion order: the storage
         // writer reserves its queue FIFO, including under backpressure.
         type PendingAppend<'a, T> = Option<
@@ -388,6 +476,10 @@ mod live_measurement {
             // this shares the stage epoch and is not a CPU-time measurement.
             snapshot_extraction_return_ns: u64,
             poll: FramePollDiagnostics,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            capture_executor: Option<ExecutorPollDiagnostics>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            append_executor: Option<ExecutorPollDiagnostics>,
             // Monotonic nanoseconds relative to the measurement epoch. Stage
             // boundaries include batching wait before storage admission.
             stages_ns: [[u64; 2]; 3],
@@ -506,11 +598,16 @@ mod live_measurement {
             // Numeric, content-free mux and verified append-transaction events
             // enter retained stderr. Storage carries this scoped dispatcher
             // only for append telemetry; ordinary writer logs keep their route.
+            let poll_diagnostics =
+                optional_env("FT_LINDLEY_POLL_DIAGNOSTICS")?.as_deref() == Some("1");
+            let filter = if poll_diagnostics {
+                "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace,frankenterm::append_reply=trace"
+            } else {
+                "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace"
+            };
             let subscriber = tracing_subscriber::fmt()
                 .json()
-                .with_env_filter(
-                    "off,frankenterm::mux_text_diagnostics=trace,frankenterm::append_transaction=trace",
-                )
+                .with_env_filter(filter)
                 .with_writer(std::io::stderr)
                 .finish();
             #[cfg(unix)]
@@ -644,6 +741,8 @@ mod live_measurement {
                 "transient_read_rejections": observations.iter().map(|row| u64::from(row.transient_read_rejections)).sum::<u64>(),
                 "initial_read_rejections": initial_read_rejections,
                 "diagnostic_timing": "write_ack_ns, storage_submit_ns and snapshot_extraction_return_ns share the stage epoch; snapshot_extraction_return_ns is measured immediately after capture_snapshot returns and before oracle validation, while the existing extraction stage still ends after validation; all durations are wall-clock, not CPU time; extraction-to-submit is collector scheduling wait, submit-to-completion includes storage queue and commit; poll durations and content-free mux transaction stderr include diagnostic overhead",
+                "executor_poll_diagnostics": poll_diagnostics,
+                "executor_poll_semantics": "optional per-event capture_executor/append_executor summaries; wall-clock poll occupancy includes instrumentation and OS descheduling, not CPU time; wake-to-poll measures first forwarded unobserved wake; append_reply stderr records post-backend mirror and reply-call durations, excluding preceding transaction diagnostics; no latency is subtracted",
                 "overlap_bytes": 4096,
                 "collector_scheduling": "bounded-streaming-append-polling-v1",
                 "burst_events": BURST,
@@ -685,6 +784,7 @@ mod live_measurement {
             pane_id: u64,
             arrival_rate: f64,
         ) -> Result<(LindleyTelemetryModel, Vec<Observation>, u32), String> {
+            let diagnose = optional_env("FT_LINDLEY_POLL_DIAGNOSTICS")?.as_deref() == Some("1");
             let pool = Arc::new(MuxPool::new(MuxPoolConfig {
                 mux: DirectMuxClientConfig::default().with_socket_path(socket),
                 ..MuxPoolConfig::default()
@@ -786,19 +886,26 @@ mod live_measurement {
                         ))
                     };
                     let (
-                        sequence,
-                        started,
-                        captured,
-                        extracted,
-                        hash,
-                        content,
-                        rejections,
-                        write_ack_ns,
-                        poll_diagnostics,
-                        snapshot_extraction_return_ns,
-                    ) = capture_while_appending(Box::pin(capture), &mut pending, &mut results)
-                        .await?;
-                    pending.push(Some(Box::pin(async move {
+                        (
+                            sequence,
+                            started,
+                            captured,
+                            extracted,
+                            hash,
+                            content,
+                            rejections,
+                            write_ack_ns,
+                            poll_diagnostics,
+                            snapshot_extraction_return_ns,
+                        ),
+                        capture_executor,
+                    ) = capture_while_appending(
+                        Box::pin(diagnose_polls(diagnose, capture)),
+                        &mut pending,
+                        &mut results,
+                    )
+                    .await?;
+                    let append = async move {
                         let storage_submit_ns = elapsed(epoch)?;
                         let stored = storage
                             .append_segment_with_cx(cx, pane_id, &content, None)
@@ -816,6 +923,8 @@ mod live_measurement {
                                 storage_submit_ns,
                                 snapshot_extraction_return_ns,
                                 poll: poll_diagnostics,
+                                capture_executor,
+                                append_executor: None,
                                 stages_ns: [
                                     [started, captured],
                                     [captured, extracted],
@@ -825,6 +934,12 @@ mod live_measurement {
                             },
                             content,
                         ))
+                    };
+                    pending.push(Some(Box::pin(async move {
+                        let ((mut observation, content), diagnostics) =
+                            diagnose_polls(diagnose, append).await?;
+                        observation.append_executor = diagnostics;
+                        Ok((observation, content))
                     })));
                 }
                 drain_appends(&mut pending, &mut results).await?;
@@ -1584,6 +1699,52 @@ mod live_measurement {
             use super::*;
 
             #[test]
+            fn poll_diagnostics_forward_wakes_and_preserve_disabled_path() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                struct Counter(AtomicU64);
+                impl std::task::Wake for Counter {
+                    fn wake(self: Arc<Self>) {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                    fn wake_by_ref(self: &Arc<Self>) {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                for enabled in [false, true] {
+                    let counter = Arc::new(Counter(AtomicU64::new(0)));
+                    let waker = std::task::Waker::from(Arc::clone(&counter));
+                    let mut context = std::task::Context::from_waker(&waker);
+                    let mut first = true;
+                    let future = std::future::poll_fn(|context| {
+                        if first {
+                            first = false;
+                            context.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(Ok(17_u32))
+                        }
+                    });
+                    let mut wrapped = std::pin::pin!(diagnose_polls(enabled, future));
+                    assert!(std::future::Future::poll(wrapped.as_mut(), &mut context).is_pending());
+                    assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+                    let std::task::Poll::Ready(Ok((value, diagnostics))) =
+                        std::future::Future::poll(wrapped.as_mut(), &mut context)
+                    else {
+                        panic!("forwarded wake must permit completion");
+                    };
+                    assert_eq!(value, 17);
+                    if enabled {
+                        let diagnostics = diagnostics.unwrap();
+                        assert_eq!(diagnostics.polls, 2);
+                        assert_eq!(diagnostics.wakes, 1);
+                        assert!(diagnostics.total_poll_ns >= diagnostics.maximum_poll_ns);
+                    } else {
+                        assert!(diagnostics.is_none());
+                    }
+                }
+            }
+
+            #[test]
             fn frame_poll_retries_only_typed_read_authority_and_preserves_deadline() {
                 use frankenterm_core::error::{MuxOperation, MuxRejection, WeztermError};
                 let runtime = RuntimeBuilder::current_thread()
@@ -1690,6 +1851,8 @@ mod live_measurement {
                     storage_submit_ns: start,
                     snapshot_extraction_return_ns: end,
                     poll: FramePollDiagnostics::default(),
+                    capture_executor: None,
+                    append_executor: None,
                     stages_ns: [[start, end]; 3],
                     content_sha256: String::new(),
                 }
@@ -1750,7 +1913,11 @@ mod live_measurement {
                             .map_err(|_| "capture disappeared".to_string())?;
                         Ok(row)
                     };
-                    let mut pending: Vec<PendingAppend<'_, _>> = vec![Some(Box::pin(first))];
+                    let mut pending: Vec<PendingAppend<'_, _>> = vec![Some(Box::pin(async {
+                        let (segment, diagnostics) = diagnose_polls(true, first).await?;
+                        assert!(diagnostics.unwrap().polls > 0);
+                        Ok(segment)
+                    }))];
                     let mut completed = Vec::with_capacity(BURST);
                     let next_capture = async {
                         capture_entered
@@ -1764,11 +1931,17 @@ mod live_measurement {
                     let second = frankenterm_core::runtime_async::timeout_with_cx(
                         &cx,
                         Duration::from_secs(5),
-                        capture_while_appending(next_capture, &mut pending, &mut completed),
+                        capture_while_appending(
+                            diagnose_polls(true, next_capture),
+                            &mut pending,
+                            &mut completed,
+                        ),
                     )
                     .await
                     .expect("first write must complete before capture two is released")
                     .unwrap();
+                    let (second, diagnostics) = second;
+                    assert!(diagnostics.unwrap().polls > 0);
                     for index in 1..BURST {
                         let content = if index == 1 {
                             second.to_string()
