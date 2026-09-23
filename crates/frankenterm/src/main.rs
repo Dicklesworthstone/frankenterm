@@ -117660,7 +117660,7 @@ with tarfile.open(path, "w:xz") as archive:
         );
     }
 
-    #[cfg(all(unix, target_os = "macos"))]
+    #[cfg(unix)]
     fn run_authenticated_process_family_extractor(
         installer: &Path,
         archive: &Path,
@@ -118608,6 +118608,205 @@ fi
                 "traversal archive escaped its extraction root"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn create_process_family_tar_with_members(path: &Path, members: &[(&str, &str)]) {
+        // members: (name, kind) where kind is "file" or "symlink".
+        let program = r#"
+import io
+import sys
+import tarfile
+
+path = sys.argv[1]
+pairs = sys.argv[2:]
+with tarfile.open(path, "w") as archive:
+    for name, kind in zip(pairs[0::2], pairs[1::2]):
+        member = tarfile.TarInfo(name)
+        if kind == "symlink":
+            member.type = tarfile.SYMTYPE
+            member.linkname = "ft"
+            archive.addfile(member)
+            continue
+        payload = (name + "\n").encode("ascii")
+        member.mode = 0o644 if name.endswith((".json", ".md", ".txt")) or name == "LICENSE" else 0o755
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+"#;
+        let mut command = std::process::Command::new("python3");
+        command.arg("-c").arg(program).arg(path);
+        for (name, kind) in members {
+            command.arg(name).arg(kind);
+        }
+        let output = command.output().expect("create process-family tar fixture");
+        assert!(
+            output.status.success(),
+            "failed to create process-family tar fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn private_extraction_root(fixture: &InstallerTestDir, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fixture.path().join(name);
+        std::fs::create_dir(&root).expect("create process-family extraction root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("make process-family extraction root private");
+        root
+    }
+
+    #[cfg(unix)]
+    fn extraction_inventory(root: &Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(root)
+            .expect("read process-family extraction inventory")
+            .map(|entry| {
+                entry
+                    .expect("read process-family extraction entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// GitHub issue #94: release archives carry README/LICENSE/CHANGELOG (and
+    /// ONNX notices on Linux) beside the process family. Those companions must
+    /// be accepted without ever reaching the verified package root, unknown
+    /// names must still be rejected, and a pre-process-family single-binary
+    /// archive (the v0.15.1 layout) must be reported as such rather than as a
+    /// corrupt download.
+    #[cfg(unix)]
+    #[test]
+    fn installer_process_family_archive_companions_and_legacy_layout_issue_94() {
+        let fixture = InstallerTestDir::new("create process-family companion fixture");
+        let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let manifest_name = "ft-linux-amd64.component-manifest.json";
+        let core = [
+            "ft",
+            "frankenterm-mux-server",
+            "frankenterm-pty-guardian",
+            "verify-components.sh",
+            manifest_name,
+        ];
+        let core_inventory = core
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // 1. Core family plus every allowed companion: accepted, companions not staged.
+        let mut with_docs = core.iter().map(|name| (*name, "file")).collect::<Vec<_>>();
+        with_docs.extend([
+            ("README.md", "file"),
+            ("LICENSE", "file"),
+            ("CHANGELOG.md", "file"),
+            ("onnx-sdk-NOTICES.txt", "file"),
+            ("onnx-sdk-provenance.json", "file"),
+        ]);
+        let archive = fixture.path().join("family-with-docs.tar");
+        create_process_family_tar_with_members(&archive, &with_docs);
+        let root = private_extraction_root(&fixture, "extract-docs");
+        let output =
+            run_authenticated_process_family_extractor(&installer, &archive, &root, manifest_name);
+        assert!(
+            output.status.success(),
+            "process family with companion documents was rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            extraction_inventory(&root),
+            core_inventory,
+            "companion documents must not be staged into the verified package root"
+        );
+
+        // 2. The real v0.15.1 layout: ft plus documentation only.
+        let archive = fixture.path().join("legacy-single-binary.tar");
+        create_process_family_tar_with_members(
+            &archive,
+            &[
+                ("ft", "file"),
+                ("README.md", "file"),
+                ("LICENSE", "file"),
+                ("CHANGELOG.md", "file"),
+            ],
+        );
+        let root = private_extraction_root(&fixture, "extract-legacy");
+        let output =
+            run_authenticated_process_family_extractor(&installer, &archive, &root, manifest_name);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "legacy single-binary archive must map to the dedicated status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("pre-process-family single-binary layout"),
+            "legacy rejection did not explain the layout: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(extraction_inventory(&root).is_empty());
+
+        // 3. Unknown extra names, non-regular companions, and incomplete
+        //    families remain hard rejections with nothing written.
+        let mut with_unknown = core.iter().map(|name| (*name, "file")).collect::<Vec<_>>();
+        with_unknown.push(("postinstall.sh", "file"));
+        let mut with_symlink_doc = core.iter().map(|name| (*name, "file")).collect::<Vec<_>>();
+        with_symlink_doc.push(("README.md", "symlink"));
+        let incomplete = vec![
+            ("ft", "file"),
+            ("frankenterm-mux-server", "file"),
+            ("README.md", "file"),
+        ];
+        for (index, (members, expected_error)) in [
+            (
+                with_unknown,
+                "process-family archive contains an unexpected member",
+            ),
+            (
+                with_symlink_doc,
+                "process-family archive companion document is not one bounded regular file",
+            ),
+            (
+                incomplete,
+                "process-family archive lacks its exact five-file inventory",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let archive = fixture.path().join(format!("rejected-{index}.tar"));
+            create_process_family_tar_with_members(&archive, &members);
+            let root = private_extraction_root(&fixture, &format!("extract-rejected-{index}"));
+            let output = run_authenticated_process_family_extractor(
+                &installer,
+                &archive,
+                &root,
+                manifest_name,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "case {index} was not rejected: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected_error),
+                "case {index} did not report {expected_error:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                extraction_inventory(&root).is_empty(),
+                "case {index} wrote bytes before rejection"
+            );
+        }
+
+        // 4. The main install path turns the dedicated status into an
+        //    actionable legacy-release message instead of "corrupt archive".
+        let source = std::fs::read_to_string(&installer).expect("read installer source");
+        assert!(source.contains("if [ \"$extract_status\" -eq 3 ]; then"));
+        assert!(source.contains("is a legacy single-binary release archive (ft only)"));
     }
 
     #[cfg(all(unix, target_os = "macos"))]

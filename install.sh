@@ -4060,6 +4060,33 @@ EXPECTED_FONT_FILES = {
     "pragmasevka-nf-italic.ttf",
     "pragmasevka-nf-bolditalic.ttf",
 }
+# The release packager may place documentation and third-party notice files
+# beside the process family (README/LICENSE/CHANGELOG from DSR include_files,
+# ONNX Runtime notices on Linux). They are covered by the archive checksum and
+# signature, are never executed or installed, and are never extracted into the
+# verified package root, whose inventory must still match the component
+# manifest exactly. Any other name remains a hard rejection.
+PROCESS_FAMILY_COMPANION_FILES = {
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "onnx-sdk-NOTICES.txt",
+    "onnx-sdk-provenance.json",
+}
+MAX_PROCESS_FAMILY_COMPANION_BYTES = 16 * 1024 * 1024
+# Distinct exit status for a checksum-valid archive that uses the pre-process-
+# family single-binary layout (ft plus optional documentation only), so the
+# shell caller can say what actually happened instead of "corrupt archive".
+LEGACY_SINGLE_BINARY_LAYOUT_STATUS = 3
+PROCESS_FAMILY_CORE_FILES = {
+    "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+    "verify-components.sh", manifest_name,
+}
+if archive_kind == "process-family" and (
+        manifest_name in PROCESS_FAMILY_COMPANION_FILES or
+        manifest_name in ("ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
+                          "verify-components.sh")):
+    raise SystemExit("process-family manifest name collides with another member")
 nofollow = getattr(os, "O_NOFOLLOW", 0)
 directory = getattr(os, "O_DIRECTORY", 0)
 cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -4441,11 +4468,15 @@ try:
 
         member_type = canonical_type(member)
         if archive_kind == "process-family":
-            expected = {
-                "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
-                "verify-components.sh", manifest_name,
-            }
-            if name not in expected or member_type != "file":
+            if name in PROCESS_FAMILY_CORE_FILES:
+                if member_type != "file":
+                    raise SystemExit("process-family archive contains an unexpected member")
+            elif name in PROCESS_FAMILY_COMPANION_FILES:
+                if (member_type != "file" or
+                        member.size > MAX_PROCESS_FAMILY_COMPANION_BYTES):
+                    raise SystemExit(
+                        "process-family archive companion document is not one bounded regular file")
+            else:
                 raise SystemExit("process-family archive contains an unexpected member")
         elif archive_kind == "app":
             if name == manifest_name:
@@ -4493,11 +4524,16 @@ try:
                     raise SystemExit("archive member descends through a non-directory member")
                 parent = posixpath.dirname(parent)
         if archive_kind == "process-family":
-            expected = {
-                "ft", "frankenterm-mux-server", "frankenterm-pty-guardian",
-                "verify-components.sh", manifest_name,
-            }
-            if set(state["types"]) != expected:
+            names = set(state["types"])
+            # validate_member already confined names to core + companions.
+            if not PROCESS_FAMILY_CORE_FILES.issubset(names):
+                if names & PROCESS_FAMILY_CORE_FILES == {"ft"}:
+                    sys.stderr.write(
+                        "archive uses the pre-process-family single-binary layout "
+                        "(ft without frankenterm-mux-server, frankenterm-pty-guardian, "
+                        "verify-components.sh, or a component manifest)\n")
+                    sys.stderr.flush()
+                    raise SystemExit(LEGACY_SINGLE_BINARY_LAYOUT_STATUS)
                 raise SystemExit("process-family archive lacks its exact five-file inventory")
         elif archive_kind == "app" and (state["detached"] != 1 or
               state["types"].get("FrankenTerm.app") != "directory"):
@@ -4786,6 +4822,12 @@ try:
                 expected_type = first["types"].get(member.name)
                 if expected_type != second["types"][member.name]:
                     raise SystemExit("archive metadata changed between bounded passes")
+                if (archive_kind == "process-family" and
+                        member.name in PROCESS_FAMILY_COMPANION_FILES):
+                    # Authenticated with the archive but never staged: the
+                    # package root must match the component manifest exactly.
+                    archive.members.clear()
+                    continue
                 content_digest = extract_member(archive, member, expected_type)
                 if archive_kind == "font":
                     second["file_receipts"][member.name] = content_digest
@@ -4839,6 +4881,10 @@ verify_minisign_signature() {
     if [ -z "$artifact_url" ] || \
        ! download_https_bounded "$signature_url" "$signature_file" 65536 30 2>/dev/null; then
       err "Required DSR minisign signature not found at $signature_url"
+      if [ -z "$signature_override" ] && [ -n "${VERSION:-}" ]; then
+        err "If $VERSION predates DSR-signed process-family releases, choose a signed"
+        err "release with --version vX.Y.Z or build with --from-source."
+      fi
       return 1
     fi
   fi
@@ -6568,8 +6614,25 @@ else
     exit 1
   fi
   info "Extracting $TAR"
-  if ! extract_authenticated_archive "$TMP/$TAR" "$PACKAGE_ROOT" process-family \
-      "${ASSET%.tar.xz}.component-manifest.json" "$VERIFIED_ARCHIVE_IDENTITY"; then
+  extract_status=0
+  extract_authenticated_archive "$TMP/$TAR" "$PACKAGE_ROOT" process-family \
+    "${ASSET%.tar.xz}.component-manifest.json" "$VERIFIED_ARCHIVE_IDENTITY" || \
+    extract_status=$?
+  if [ "$extract_status" -eq 3 ]; then
+    # Checksum-valid, but published before releases carried the verified
+    # CLI + mux-server + PTY-guardian process family. Installing ft alone
+    # would strand the mux/guardian authority this installer manages.
+    err "$TAR${VERSION:+ from $VERSION} is a legacy single-binary release archive (ft only)."
+    err "This installer installs only verified ft + frankenterm-mux-server + frankenterm-pty-guardian"
+    err "process families, which that release does not contain. Nothing was installed. Options:"
+    err "  * install a newer release that ships the process family:  --version vX.Y.Z"
+    err "  * build from source:                                      --from-source"
+    if [ -n "$VERSION" ]; then
+      err "  * use the installer published with that release:"
+      err "      curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/${VERSION}/install.sh | bash"
+    fi
+    exit 1
+  elif [ "$extract_status" -ne 0 ]; then
     err "Failed to extract $TAR — archive may be corrupt or truncated"
     err "If the download was interrupted, retry; otherwise file an issue at:"
     err "  https://github.com/${OWNER}/${REPO}/issues"
