@@ -237,6 +237,9 @@ fn coverage_report_matches_or_blessed() {
             "FT_REDACTOR_COVERAGE_BLESS=1: rewrote {}",
             report_path.display()
         );
+        // Remote (RCH) workers do not sync the rewritten file back; echo the
+        // blessed report between markers so it can be recovered from the log.
+        eprintln!("FT_REDACTOR_COVERAGE_BLESS_BEGIN\n{live_json}\nFT_REDACTOR_COVERAGE_BLESS_END");
         return;
     }
 
