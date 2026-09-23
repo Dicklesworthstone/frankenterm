@@ -8215,6 +8215,256 @@ mod tests {
         published
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn legacy_model_restore_refuses_without_retiring_original_child() {
+        use frankenterm_core::mux_recovery_image::{
+            CheckpointAuthority, MuxRecoveryImage, RecoveryImageGenerationMeta, RecoveryObjectRef,
+        };
+        use frankenterm_core::session_restore::{
+            WholeMuxRecoveryVerifier, WholeMuxTrustedIdentityConfig, semantic_object_id_from_str,
+        };
+        use frankenterm_core::snapshot_publication::{
+            GenerationRootPublishRequest, RecoveryObjectPayload, SnapshotPublicationStore,
+        };
+        use frankenterm_core::snapshot_representation::{
+            ObjectMetadata, RecoveryKey, RecoveryObjectKind, encode_recovery_object,
+        };
+
+        let _global_state = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let owner = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("legacy-refusal").unwrap());
+        owner.add_domain(&domain).unwrap();
+        owner.set_default_domain(&domain).unwrap();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        };
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        // The response includes the shell PID; terminal input echo cannot
+        // satisfy the post-refusal survival assertion.
+        command.args(["-c", "printf 'legacy-ready:%s\\n' \"$$\"; while IFS= read -r line; do test \"$line\" = exit && exit 0; printf 'legacy-response:%s:%s\\n' \"$$\" \"$line\"; done"]);
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair.slave.spawn_command(command).unwrap();
+        struct OwnedChildCleanup(Option<Box<dyn ChildKiller + Send + Sync>>);
+        impl Drop for OwnedChildCleanup {
+            fn drop(&mut self) {
+                if let Some(killer) = &mut self.0 {
+                    if let Err(error) = killer.kill() {
+                        eprintln!("owned legacy fixture child cleanup: {error}");
+                    }
+                }
+            }
+        }
+        let mut cleanup = OwnedChildCleanup(Some(child.clone_killer()));
+        let child_pid = child.process_id().unwrap();
+        drop(pair.slave);
+        let pane_id = alloc_pane_id().unwrap();
+        let durable = Uuid::new_v4();
+        let terminal = Terminal::new(
+            size,
+            Arc::new(config::TermConfig::new_for_pane(
+                pane_id,
+                domain.domain_id(),
+                *durable.as_bytes(),
+                String::new(),
+            )),
+            "FrankenTerm",
+            config::wezterm_version(),
+            Box::new(Vec::<u8>::new()),
+        );
+        let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
+            pane_id,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            domain.domain_id(),
+            *durable.as_bytes(),
+            String::new(),
+        ));
+        // The exact child killer also covers panic while parser tasks retain
+        // pane references; no process-name or descendant-wide signalling.
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(&pane);
+        let registration = owner.add_tab_and_active_pane(&tab).unwrap().unwrap();
+        let window = owner.new_empty_window(None, None);
+        owner.add_tab_to_window(&tab, *window).unwrap();
+        drop(window);
+        let wait_for_text = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while executor.try_tick().unwrap() {}
+                if pane
+                    .get_lines(0..24)
+                    .1
+                    .iter()
+                    .any(|line| line.as_str().contains(expected))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "missing actual child output: {expected}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait_for_text(&format!("legacy-ready:{child_pid}"));
+        assert!(pane.guardian_spawn_custody().is_none());
+        let capture_owner = Arc::clone(&owner);
+        let capture = thread::spawn(move || {
+            capture_owner.capture_pane_model_checkpoint(
+                pane_id,
+                TerminalCheckpointLimits::default(),
+                Duration::from_secs(5),
+                || false,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !capture.is_finished() {
+            while executor.try_tick().unwrap() {}
+            assert!(
+                Instant::now() < deadline,
+                "legacy parser capture did not settle"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let captured_parser = capture.join().unwrap().unwrap();
+        let topology = owner.capture_topology_coherent(Default::default()).unwrap();
+        let timestamp = topology.captured_at_epoch_ms;
+        let key = Arc::new(RecoveryKey::from_bytes([0x63; 32]).unwrap());
+        let encode = |payload: &[u8], id, kind| {
+            encode_recovery_object(
+                payload,
+                ObjectMetadata::single(id, kind, 1, None, timestamp),
+                &key,
+                None,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+        };
+        let object_id = "legacy-refusal-terminal";
+        let ciphertext = encode(
+            captured_parser.terminal_checkpoint.canonical_payload(),
+            semantic_object_id_from_str(object_id),
+            RecoveryObjectKind::TerminalCheckpoint,
+        );
+        let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let image = MuxRecoveryImage::from_mux_captured(
+            RecoveryImageGenerationMeta {
+                generation: 1,
+                predecessor_digest: None,
+                created_at_epoch_ms: timestamp,
+                ft_version: config::wezterm_version().to_owned(),
+                session_id: "legacy-refusal".into(),
+            },
+            &topology,
+            &HashMap::from([(pane_id, &captured_parser)]),
+            &HashMap::from([(
+                pane_id,
+                RecoveryObjectRef {
+                    object_id: object_id.into(),
+                    byte_length: ciphertext.len() as u64,
+                    payload_digest: digest,
+                    schema_version: 3,
+                },
+            )]),
+        )
+        .unwrap();
+        assert!(matches!(
+            image.panes[0].checkpoint.authority,
+            CheckpointAuthority::ModelOnly { .. }
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let store = SnapshotPublicationStore::open(directory.path(), Default::default()).unwrap();
+        store
+            .publish_object(&RecoveryObjectPayload {
+                object_id: object_id.into(),
+                expected_sha256: hex::encode(digest),
+                ciphertext_bytes: ciphertext,
+            })
+            .unwrap();
+        let verifier = WholeMuxRecoveryVerifier::new_production(
+            Arc::clone(&key),
+            WholeMuxTrustedIdentityConfig::new([0x64; 32]),
+        );
+        store
+            .publish_generation_root(
+                &GenerationRootPublishRequest {
+                    generation: 1,
+                    publisher_id: "legacy-refusal".into(),
+                    predecessor: None,
+                    manifest_bytes: encode(
+                        &image.to_canonical_json().unwrap(),
+                        [0x64; 32],
+                        RecoveryObjectKind::WholeMuxImage,
+                    ),
+                    created_at_ms: timestamp,
+                },
+                &verifier,
+            )
+            .unwrap();
+        let validated = store
+            .select_verified_roots(&verifier)
+            .unwrap()
+            .current
+            .unwrap();
+        let successor = Arc::new(Mux::new(None));
+        let error = restore_authenticated_topology(
+            Arc::clone(&successor),
+            validated,
+            None,
+            TerminalCheckpointLimits::default(),
+            &frankenterm_core::cx::Cx::for_testing(),
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("model-only legacy image must refuse live restore");
+        assert!(
+            error
+                .to_string()
+                .contains("live startup recovery requires guardian-backed panes"),
+            "{error:#}"
+        );
+        // No guardian endpoint/credential exists in this fixture. Refusal is
+        // before connection/Claim and must leave the successor wholly empty.
+        assert!(successor.iter_panes().is_empty());
+        assert!(successor.iter_windows().is_empty());
+        assert!(successor.iter_domains().is_empty());
+        assert!(
+            owner
+                .capture_pane_registration(&pane)
+                .unwrap()
+                .same_registration(&registration)
+        );
+        let nonce = Uuid::new_v4().to_string();
+        writeln!(pane.writer(), "{nonce}").unwrap();
+        wait_for_text(&format!("legacy-response:{child_pid}:{nonce}"));
+        assert!(!pane.is_dead());
+        writeln!(pane.writer(), "exit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.is_dead() {
+            while executor.try_tick().unwrap() {}
+            assert!(Instant::now() < deadline, "owned legacy child did not exit");
+            thread::sleep(Duration::from_millis(2));
+        }
+        cleanup.0 = None;
+    }
+
     fn assert_real_birth_image_roundtrip(
         mux: &Arc<Mux>,
         pane: &Arc<dyn mux::pane::Pane>,
