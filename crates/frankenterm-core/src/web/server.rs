@@ -411,6 +411,7 @@ mod tests {
     #[test]
     fn storage_event_tail_republishes_new_rows_but_not_history() {
         use crate::events::{Event, EventBus};
+        use crate::runtime_async::CompatRuntime as _;
         use std::sync::Arc;
         use std::time::Duration;
 
