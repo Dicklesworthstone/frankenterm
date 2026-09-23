@@ -3,7 +3,7 @@
   "overall": {
     "recall": 1.0,
     "precision": 1.0,
-    "tp": 96,
+    "tp": 105,
     "fn": 0,
     "fp": 0
   },
@@ -11,7 +11,7 @@
     "ai_provider_keyed": {
       "recall": 1.0,
       "precision": 1.0,
-      "tp": 3,
+      "tp": 5,
       "fn": 0,
       "fp": 0
     },
@@ -36,10 +36,17 @@
       "fn": 0,
       "fp": 0
     },
-    "bearer": {
+    "basic": {
       "recall": 1.0,
       "precision": 1.0,
       "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "bearer": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 4,
       "fn": 0,
       "fp": 0
     },
@@ -67,7 +74,7 @@
     "generic": {
       "recall": 1.0,
       "precision": 1.0,
-      "tp": 12,
+      "tp": 15,
       "fn": 0,
       "fp": 0
     },
@@ -203,22 +210,22 @@
     "confidence": 0.99,
     "alpha": 0.01,
     "recall_floor": 0.99,
-    "secret_pattern_classes": 32,
-    "total_classes_with_clean": 33,
-    "fano_min_mutual_information_bits": 4.913600983462542,
+    "secret_pattern_classes": 33,
+    "total_classes_with_clean": 34,
+    "fano_min_mutual_information_bits": 4.956225764160843,
     "zero_miss_positive_vectors_required_per_class": 459,
     "current_min_positive_vectors_per_class": 3,
     "current_status": "under_sampled",
     "external_corpus_status": "not_vendored_license_signoff_required",
     "follow_up_bead": "ft-tf6g3.35",
-    "classes_under_floor": 32,
-    "classes_with_corpus_exception": 32,
+    "classes_under_floor": 33,
+    "classes_with_corpus_exception": 33,
     "unexcepted_classes_under_floor": 0,
     "corpus_exception_reason": "licensed_external_corpus_unavailable"
   },
   "by_pattern_class": {
     "ai_provider_keyed_value": {
-      "observed_positive_vectors": 3,
+      "observed_positive_vectors": 5,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
@@ -227,7 +234,7 @@
         "reason": "licensed_external_corpus_unavailable",
         "tracking_bead": "ft-tf6g3.35",
         "signoff_status": "pending_operator_license_signoff",
-        "synthetic_shortfall": 456
+        "synthetic_shortfall": 454
       }
     },
     "anthropic_key": {
@@ -283,7 +290,7 @@
       }
     },
     "bearer_token": {
-      "observed_positive_vectors": 3,
+      "observed_positive_vectors": 4,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
@@ -292,7 +299,7 @@
         "reason": "licensed_external_corpus_unavailable",
         "tracking_bead": "ft-tf6g3.35",
         "signoff_status": "pending_operator_license_signoff",
-        "synthetic_shortfall": 456
+        "synthetic_shortfall": 455
       }
     },
     "database_url": {
@@ -335,7 +342,7 @@
       }
     },
     "generic_api_key": {
-      "observed_positive_vectors": 3,
+      "observed_positive_vectors": 4,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
@@ -344,7 +351,7 @@
         "reason": "licensed_external_corpus_unavailable",
         "tracking_bead": "ft-tf6g3.35",
         "signoff_status": "pending_operator_license_signoff",
-        "synthetic_shortfall": 456
+        "synthetic_shortfall": 455
       }
     },
     "generic_password": {
@@ -361,7 +368,7 @@
       }
     },
     "generic_secret": {
-      "observed_positive_vectors": 3,
+      "observed_positive_vectors": 4,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
@@ -370,11 +377,11 @@
         "reason": "licensed_external_corpus_unavailable",
         "tracking_bead": "ft-tf6g3.35",
         "signoff_status": "pending_operator_license_signoff",
-        "synthetic_shortfall": 456
+        "synthetic_shortfall": 455
       }
     },
     "generic_token": {
-      "observed_positive_vectors": 3,
+      "observed_positive_vectors": 4,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
@@ -383,7 +390,7 @@
         "reason": "licensed_external_corpus_unavailable",
         "tracking_bead": "ft-tf6g3.35",
         "signoff_status": "pending_operator_license_signoff",
-        "synthetic_shortfall": 456
+        "synthetic_shortfall": 455
       }
     },
     "github_fine_grained_pat": {
@@ -452,6 +459,19 @@
       }
     },
     "groq_key": {
+      "observed_positive_vectors": 3,
+      "required_positive_vectors": 459,
+      "confidence": 0.99,
+      "recall_floor": 0.99,
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
+    },
+    "http_basic_auth": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
@@ -634,7 +654,7 @@
       }
     }
   },
-  "vectors_total": 112,
+  "vectors_total": 122,
   "recall_floor": 0.99,
   "bead": "ft-x0666.2"
 }
