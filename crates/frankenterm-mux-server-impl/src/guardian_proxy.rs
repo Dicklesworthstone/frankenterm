@@ -3324,6 +3324,16 @@ impl GuardianPaneLeaseActor {
                 self.disposition = GuardianLeaseDisposition::Retired;
                 Ok(RecoveredPendingMutation::Generic)
             }
+            Err(GuardianMutationTransportError::Client(GuardianClientError::Rejected(
+                GuardianRejectionCode::PaneTerminal,
+            ))) if pending.kind == GenericMutation::Retire => {
+                // The child can exit after attached admission but before the
+                // retirement reaches the guardian. An authenticated terminal
+                // refusal satisfies lease cleanup without applying a mutation.
+                self.disposition = GuardianLeaseDisposition::Closed;
+                self.pending = None;
+                Ok(RecoveredPendingMutation::Generic)
+            }
             Ok(GuardianReply::EffectOutcomeIndeterminate {
                 pane_id,
                 generation,
@@ -14431,6 +14441,34 @@ mod tests {
                 FakeCall::Census,
                 FakeCall::QueryInput { .. }
             ]
+        ));
+    }
+
+    #[test]
+    fn retirement_terminal_reply_is_idempotent_without_advancing_mutation_sequence() {
+        let (staging, state) = fake_staging(
+            [FakeDirective::Reject(GuardianRejectionCode::PaneTerminal)],
+            64,
+        );
+        let actor = staging.shared_actor();
+        assert!(actor.lock().retire(identity()).is_ok());
+        assert_eq!(actor.lock().disposition, GuardianLeaseDisposition::Closed);
+        assert_eq!(actor.lock().next_sequence(), 64);
+        assert!(actor.lock().pending.is_none());
+        assert!(actor.lock().retire(identity()).is_ok());
+        assert!(matches!(
+            state.lock().calls.as_slice(),
+            [FakeCall::Retire { .. }]
+        ));
+        assert!(matches!(
+            actor.lock().resize(size(25, 80)),
+            Err(GuardianProxyError::LeaseNotAttached)
+        ));
+        assert!(matches!(
+            actor
+                .lock()
+                .retire(identity_for(id(99), identity().generation())),
+            Err(GuardianProxyError::LeaseIdentityMismatch)
         ));
     }
 

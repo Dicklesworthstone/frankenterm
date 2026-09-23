@@ -3060,9 +3060,13 @@ impl GuardianClient {
         let result = operation(self, deadline);
         let reset_read = self.stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let reset_write = self.stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+        // A peer may close a failed exchange. Darwin can then reject socket
+        // option restoration with EINVAL; that cleanup error must not replace
+        // the original transport/protocol failure. Both resets are attempted.
+        let value = result?;
         reset_read.inspect_err(|error| log_client_io_failure("reset_read_timeout", error))?;
         reset_write.inspect_err(|error| log_client_io_failure("reset_write_timeout", error))?;
-        result
+        Ok(value)
     }
 
     pub fn guarded_stop(
@@ -5462,6 +5466,38 @@ mod tests {
             ordered_boundaries.windows(2).all(|pair| pair[0] < pair[1]),
             "owned request, decoded Input, and encoded frame must die before their next blocking boundary"
         );
+    }
+
+    #[test]
+    fn census_peer_close_preserves_eof_over_timeout_restoration() {
+        let (client_stream, mut server_stream) = BlockingUnixStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        client_stream
+            .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        server_stream
+            .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let frame = read_blocking_frame(&mut server_stream).unwrap();
+            assert!(!frame.is_empty());
+            // A real peer closes after consuming the request, before replying.
+            drop(server_stream);
+        });
+        let mut client = GuardianClient {
+            stream: client_stream,
+            secret: GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap(),
+            mux_incarnation: Uuid::from_u128(0x5052),
+            guardian_incarnation: Uuid::from_u128(0x5051),
+            request_wipe_probe: None,
+        };
+        assert!(matches!(
+            client.census_snapshot(),
+            Err(GuardianClientError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof
+        ));
+        server.join().unwrap();
     }
 
     #[test]
