@@ -1199,6 +1199,18 @@ impl RenderableInner {
         self.apply_changes_to_surface_inner(delta, bonus_lines, false, false)
     }
 
+    /// The first accepted surface of a successor connection replaces cached
+    /// coordinates even when sequence numbers and dimensions happen to match.
+    /// PDU25 may omit dirty rows: this is not a complete render-application ACK.
+    pub(crate) fn apply_connection_surface(
+        &mut self,
+        delta: GetPaneRenderChangesResponse,
+        bonus_lines: Vec<(StableRowIndex, Line)>,
+        first_surface: bool,
+    ) -> bool {
+        self.apply_changes_to_surface_inner(delta, bonus_lines, first_surface, false)
+    }
+
     pub fn apply_render_application_to_surface(
         &mut self,
         delta: GetPaneRenderChangesResponse,

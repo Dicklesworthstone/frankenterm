@@ -3032,6 +3032,9 @@ pub(crate) struct ClientRenderApplicationCounters {
 struct ClientRenderApplicationState {
     active_connection_identity: Option<RenderConnectionIdentity>,
     active_connection_generation: Option<u64>,
+    // Provenance of the cached surface, independent of delivery ACK state.
+    surface_connection_identity: Option<RenderConnectionIdentity>,
+    surface_connection_generation: Option<u64>,
     applied_connection_identity: Option<RenderConnectionIdentity>,
     applied_connection_generation: Option<u64>,
     applied_state: Option<RenderStateIdentity>,
@@ -3072,6 +3075,8 @@ impl ClientRenderApplicationState {
 
         self.active_connection_identity = Some(connection_identity);
         self.active_connection_generation = Some(connection_generation);
+        self.surface_connection_identity = None;
+        self.surface_connection_generation = None;
         self.applied_connection_identity = None;
         self.applied_connection_generation = None;
         self.applied_state = None;
@@ -4041,8 +4046,8 @@ impl ClientPane {
     ) -> Option<(SequenceNo, SequenceNo, RenderableDimensions, bool)> {
         let rpc = self.client.client.rpc_scope();
         let version = rpc.agreed_codec_version()?;
-        // A successor transport can be ready while its first authoritative
-        // render application is still pending. Old cached seqno/dimensions
+        // A successor transport can be ready before its first accepted surface
+        // has arrived. Old cached seqno/dimensions
         // are not a source witness for that new endpoint incarnation.
         let application = if version == LEGACY46_CODEC_VERSION {
             None
@@ -4050,8 +4055,8 @@ impl ClientPane {
             let application = self.render_application_state.try_lock()?;
             let generation = rpc.connection_generation()?.get();
             let identity = rpc.render_connection_identity()?;
-            if application.applied_connection_generation != Some(generation)
-                || application.applied_connection_identity != Some(identity)
+            if application.surface_connection_generation != Some(generation)
+                || application.surface_connection_identity != Some(identity)
             {
                 return None;
             }
@@ -4550,11 +4555,17 @@ impl ClientPane {
                     return None;
                 }
                 let applied = {
+                    let mut application = self.render_application_state.lock();
                     let renderable = self.renderable.lock();
                     let mut inner = renderable.inner.borrow_mut();
                     let before = inner.dimensions;
                     let applied =
                         inner.apply_render_application_to_surface(surface, bonus_lines, kind);
+                    if applied {
+                        application.surface_connection_generation =
+                            Some(identity.token.connection_generation);
+                        application.surface_connection_identity = Some(connection_identity);
+                    }
                     geometry_changed =
                         applied && !same_line_layout_geometry(&before, &inner.dimensions);
                     applied
@@ -4669,6 +4680,13 @@ impl ClientPane {
                 }
                 let mouse_grabbed = delta.mouse_grabbed;
                 let alt_screen_active = delta.alt_screen_active;
+                let connection_generation = rpc.connection_generation().map(|value| value.get());
+                let connection_identity = rpc.render_connection_identity();
+                let first_surface = {
+                    let application = self.render_application_state.lock();
+                    application.surface_connection_generation != connection_generation
+                        || application.surface_connection_identity != connection_identity
+                };
                 let current_seqno = registration.try_with_current(|_| {
                     let renderable = self.renderable.lock();
                     renderable.get_current_seqno()
@@ -4676,14 +4694,16 @@ impl ClientPane {
                 let Some(current_seqno) = current_seqno else {
                     return Ok(());
                 };
-                if !should_process_unilateral_render_delta(
-                    current_seqno,
-                    delta.seqno,
-                    delta.input_serial,
-                ) {
+                if !first_surface
+                    && !should_process_unilateral_render_delta(
+                        current_seqno,
+                        delta.seqno,
+                        delta.input_serial,
+                    )
+                {
                     return Ok(());
                 }
-                let stale_dispatch_ack = current_seqno > delta.seqno;
+                let stale_dispatch_ack = !first_surface && current_seqno > delta.seqno;
 
                 let serialized_bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let (bonus_lines, incomplete_image_rows) = if stale_dispatch_ack {
@@ -4704,11 +4724,25 @@ impl ClientPane {
                         let applied = registration
                             .try_with_current_output(|_| {
                                 let applied = {
+                                    let mut application = self.render_application_state.lock();
                                     let renderable = self.renderable.lock();
                                     let mut inner = renderable.inner.borrow_mut();
                                     let before = inner.dimensions;
-                                    let applied =
-                                        inner.apply_changes_to_surface(delta, bonus_lines);
+                                    let first_surface = application.surface_connection_generation
+                                        != connection_generation
+                                        || application.surface_connection_identity
+                                            != connection_identity;
+                                    let applied = inner.apply_connection_surface(
+                                        delta,
+                                        bonus_lines,
+                                        first_surface,
+                                    );
+                                    if applied {
+                                        application.surface_connection_generation =
+                                            connection_generation;
+                                        application.surface_connection_identity =
+                                            connection_identity;
+                                    }
                                     geometry_changed = applied
                                         && !same_line_layout_geometry(&before, &inner.dimensions);
                                     if applied {
@@ -6710,6 +6744,139 @@ mod tests {
     }
 
     #[test]
+    fn selection_source_accepts_pdu25_without_render_application_acknowledgement() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(901);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 903, 909);
+        let published: Arc<dyn Pane> = pane.clone();
+        let registration = mux.capture_pane_registration(&published).unwrap();
+        let rpc = inner.client.rpc_scope();
+        assert!(pane.selection_source_snapshot().is_none());
+        let update = test_render_application_update(
+            rpc.connection_generation().unwrap().get(),
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            10,
+        );
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::GetPaneRenderChangesResponse(update.surface),
+        ))
+        .unwrap();
+        let source = pane.selection_source_snapshot().unwrap();
+        let lines = pane
+            .selection_lines(source.0, source.1, source.1, 0..1)
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].as_str(), "ready");
+        assert_eq!(
+            pane.render_application_counters(),
+            ClientRenderApplicationCounters::default()
+        );
+        assert!(pane.render_application_state.lock().applied_state.is_none());
+    }
+
+    #[test]
+    fn pdu25_successor_retires_cached_rows_even_with_identical_source_coordinates() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(911);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 913, 919);
+        let published: Arc<dyn Pane> = pane.clone();
+        let registration = mux.capture_pane_registration(&published).unwrap();
+        let old_rpc = inner.client.rpc_scope();
+        let mut surface = test_render_application_update(
+            old_rpc.connection_generation().unwrap().get(),
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            10,
+        )
+        .surface;
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &old_rpc,
+            Pdu::GetPaneRenderChangesResponse(surface.clone()),
+        ))
+        .unwrap();
+        let original = pane.selection_source_snapshot().unwrap();
+        assert!(pane
+            .selection_lines(original.0, original.1, original.1, 1..2)
+            .is_ok());
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
+        assert!(pane.selection_source_snapshot().is_none());
+        let rpc = inner.client.rpc_scope();
+        pane.prepare_render_application_bootstrap(&rpc).unwrap();
+        assert!(pane.selection_source_snapshot().is_none());
+        // PDU25 advertises dirty rows without requiring them all in bonus_lines.
+        surface.dirty_lines = std::iter::once(0..2).collect();
+        surface.bonus_lines = SerializedLines::from(vec![(
+            0,
+            Line::from_text("successor", &CellAttributes::default(), surface.seqno, None),
+        )]);
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::GetPaneRenderChangesResponse(surface.clone()),
+        ))
+        .unwrap();
+        let current = pane.selection_source_snapshot().unwrap();
+        assert_eq!((current.1, current.2), (original.1, original.2));
+        assert_ne!(current.0, original.0);
+        let lines = pane
+            .selection_lines(current.0, current.1, current.1, 0..1)
+            .unwrap();
+        assert_eq!(lines[0].as_str(), "successor");
+        assert!(
+            matches!(
+                pane.selection_lines(current.0, current.1, current.1, 1..2),
+                Err(SelectionReadError::Busy)
+            ),
+            "a missing successor row must not reuse old cached text"
+        );
+        assert_eq!(
+            pane.render_application_counters(),
+            ClientRenderApplicationCounters::default()
+        );
+
+        // A fresh server may also restart its terminal sequence below the cache.
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
+        let rpc = inner.client.rpc_scope();
+        pane.prepare_render_application_bootstrap(&rpc).unwrap();
+        surface.seqno = 1;
+        surface.bonus_lines = SerializedLines::from(vec![(
+            0,
+            Line::from_text("restart", &CellAttributes::default(), 1, None),
+        )]);
+        promise::spawn::block_on(pane.process_unilateral(
+            &registration,
+            &rpc,
+            Pdu::GetPaneRenderChangesResponse(surface),
+        ))
+        .unwrap();
+        let restarted = pane.selection_source_snapshot().unwrap();
+        assert_eq!(restarted.1, 1);
+        assert_ne!(restarted.0, current.0);
+        assert_eq!(
+            pane.render_application_counters(),
+            ClientRenderApplicationCounters::default()
+        );
+    }
+
+    #[test]
     fn selection_source_rejects_successor_transport_until_its_snapshot_is_applied() {
         let scope = MuxTestScope::enter();
         let executor = promise::spawn::SimpleExecutor::new();
@@ -6973,7 +7140,10 @@ mod tests {
         // notification. Settle that unrelated work before measuring capture
         // ownership, so cancellation cannot also drain a baseline task.
         pump_mouse_test(&executor);
-        assert!(peer.is_empty(), "snapshot setup must not leave pending RPCs");
+        assert!(
+            peer.is_empty(),
+            "snapshot setup must not leave pending RPCs"
+        );
         let baseline = executor.admission_snapshot().active_tasks;
         let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
         let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
