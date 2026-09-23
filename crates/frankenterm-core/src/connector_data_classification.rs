@@ -143,7 +143,7 @@ impl std::fmt::Display for RedactionStrategy {
 // =============================================================================
 
 /// A rule that matches fields and assigns classification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassificationRule {
     /// Rule identifier.
     pub rule_id: String,
@@ -237,7 +237,7 @@ pub struct FieldClassification {
 // =============================================================================
 
 /// Per-connector classification policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassificationPolicy {
     /// Policy identifier.
     pub policy_id: String,
@@ -593,7 +593,7 @@ impl ClassificationTelemetry {
 // =============================================================================
 
 /// Configuration for the classifier engine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassifierConfig {
     /// Maximum audit log entries to retain.
     pub max_audit_entries: usize,
@@ -699,6 +699,24 @@ impl ConnectorDataClassifier {
             classifier.register_policy(policy);
         }
         classifier
+    }
+
+    /// Replace the operator configuration and its declared policies in place.
+    ///
+    /// Used by live config reload: the new markers, salt, audit bound and
+    /// policies take effect for the next classification, while telemetry,
+    /// the audit history (trimmed to the new bound) and the tokenize counter
+    /// carry over. Policies registered programmatically after construction
+    /// are dropped; callers re-register any they still need.
+    pub fn reconfigure(&mut self, config: ClassifierConfig) {
+        self.policies.clear();
+        for policy in config.policies.clone() {
+            self.register_policy(policy);
+        }
+        while self.audit_log.len() > config.max_audit_entries {
+            self.audit_log.pop_front();
+        }
+        self.config = config;
     }
 
     /// Register a classification policy for a connector pattern.

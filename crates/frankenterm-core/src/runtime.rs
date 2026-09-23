@@ -2421,6 +2421,9 @@ fn initial_hot_reloadable_config(config: &RuntimeConfig) -> HotReloadableConfig 
         workflows_enabled: vec![],
         auto_run_allowlist: vec![],
         trauma_guard: config.trauma_guard.clone(),
+        // Replaced with the operator policy by
+        // `with_connector_inbound_bridge_config` before the runtime starts.
+        data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
     }
 }
 
@@ -4947,6 +4950,15 @@ impl ObservationRuntime {
         mut self,
         config: ConnectorInboundBridgeConfig,
     ) -> Self {
+        // Re-seed the (not yet started) hot-reload channel so
+        // `RuntimeHandle::current_config` reports the enforced classifier
+        // and reload diffs start from it. No task holds a receiver clone
+        // before `start`, so replacing the channel cannot strand one.
+        let mut hot_config = self.config_tx.borrow().clone();
+        hot_config.data_classifier = config.classifier.clone();
+        let (config_tx, config_rx) = watch::channel(hot_config);
+        self.config_tx = Arc::new(config_tx);
+        self.config_rx = config_rx;
         self.connector_inbound_bridge_config = config;
         if self.connector_inbound_bridge.is_some()
             && let Some(event_bus) = self.event_bus.as_ref()
@@ -10618,6 +10630,28 @@ fn route_connector_signal_through_bridge(
     guard.route_signal(signal)
 }
 
+/// Swap a reloaded classifier policy into the live inbound bridge. The swap
+/// happens under the bridge lock, so each routed signal is classified wholly
+/// under either the old or the new policy. Returns whether anything changed.
+fn apply_connector_classifier_reload(
+    bridge: Option<&Arc<StdMutex<ConnectorInboundBridge>>>,
+    classifier: &crate::connector_data_classification::ClassifierConfig,
+) -> bool {
+    let Some(bridge) = bridge else {
+        return false;
+    };
+    // A poisoned bridge already refuses every signal; still install the new
+    // policy so it is current if the bridge is ever rebuilt around it.
+    let mut guard = bridge
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.classifier_config() == classifier {
+        return false;
+    }
+    guard.reconfigure_classifier(classifier.clone());
+    true
+}
+
 fn connector_diagnostic_hash(value: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -12578,6 +12612,19 @@ impl RuntimeHandle {
     /// # Errors
     /// Returns an error if the config channel is closed (runtime shutting down).
     pub fn apply_config_update(&self, new_config: HotReloadableConfig) -> Result<()> {
+        // The inbound connector bridge is not a config-channel subscriber;
+        // swap its classifier here so a reloaded classification/redaction
+        // policy can never be reported as applied while the stale one keeps
+        // enforcing (ft-172av).
+        if apply_connector_classifier_reload(
+            self.connector_inbound_bridge.as_ref(),
+            &new_config.data_classifier,
+        ) {
+            tracing::info!(
+                operator_policies = new_config.data_classifier.policies.len(),
+                "Applied reloaded connector data-classifier policy"
+            );
+        }
         self.config_tx
             .send(new_config)
             .map_err(|e| runtime_backend_error("runtime.apply_config_update", e))
@@ -18943,6 +18990,106 @@ mod tests {
                 err,
                 crate::connector_inbound_bridge::ConnectorBridgeError::PrivacyRejected { .. }
             ));
+        });
+    }
+
+    /// ft-172av: a reloaded `[safety.data_classifier]` must reach the bridge
+    /// the running runtime already holds, in both directions.
+    #[test]
+    fn classifier_reload_reconfigures_the_live_inbound_bridge_ft_172av() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, ClassifierConfig, DataSensitivity,
+        };
+
+        run_async_test(async {
+            let prohibit_ssn = ClassifierConfig {
+                policies: vec![ClassificationPolicy {
+                    policy_id: "slack-pii".to_string(),
+                    connector_pattern: "slack".to_string(),
+                    rules: vec![ClassificationRule::new(
+                        "ssn-prohibited",
+                        DataSensitivity::Prohibited,
+                        vec!["ssn".to_string()],
+                    )],
+                    scan_for_secrets: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let signal = || {
+                ConnectorSignal::new(
+                    "slack",
+                    crate::connector_inbound_bridge::ConnectorSignalKind::Webhook,
+                    serde_json::json!({ "ssn": "123-45-6789", "note": "hi" }),
+                )
+            };
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_connector_inbound_bridge_config(ConnectorInboundBridgeConfig::default())
+            .with_event_bus(Arc::new(EventBus::new(16)));
+            // The same Arc `start` hands to `RuntimeHandle`.
+            let live_bridge = runtime.connector_inbound_bridge.clone();
+
+            runtime
+                .route_connector_signal(&signal())
+                .expect("the built-in default policy routes a Restricted field");
+
+            assert!(apply_connector_classifier_reload(
+                live_bridge.as_ref(),
+                &prohibit_ssn
+            ));
+            let err = runtime
+                .route_connector_signal(&signal())
+                .expect_err("the reloaded prohibited-field policy must reject ingress");
+            assert!(matches!(
+                err,
+                crate::connector_inbound_bridge::ConnectorBridgeError::PrivacyRejected { .. }
+            ));
+            assert!(
+                !apply_connector_classifier_reload(live_bridge.as_ref(), &prohibit_ssn),
+                "re-applying the enforced policy is a no-op"
+            );
+
+            assert!(apply_connector_classifier_reload(
+                live_bridge.as_ref(),
+                &ClassifierConfig::default()
+            ));
+            runtime
+                .route_connector_signal(&signal())
+                .expect("reloading the default policy lifts the prohibition");
+            assert!(!apply_connector_classifier_reload(
+                None,
+                &ClassifierConfig::default()
+            ));
+        });
+    }
+
+    #[test]
+    fn hot_reload_channel_reports_the_enforced_classifier_ft_172av() {
+        use crate::connector_data_classification::ClassifierConfig;
+
+        run_async_test(async {
+            let operator = ClassifierConfig {
+                redaction_marker: "[OPERATOR]".to_string(),
+                ..Default::default()
+            };
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_connector_inbound_bridge_config(ConnectorInboundBridgeConfig {
+                classifier: operator.clone(),
+                ..Default::default()
+            });
+            assert_eq!(runtime.config_tx.borrow().data_classifier, operator);
         });
     }
 

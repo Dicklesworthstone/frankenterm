@@ -21,7 +21,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::connector_data_classification::{
-    ClassificationAuditEntry, ClassificationPolicy, ClassificationTelemetry,
+    ClassificationAuditEntry, ClassificationPolicy, ClassificationTelemetry, ClassifierConfig,
     ConnectorDataClassifier, IngestionDecision, RedactedEvent,
 };
 use crate::connector_event_model;
@@ -498,6 +498,22 @@ impl ConnectorInboundBridge {
             telemetry: ConnectorBridgeTelemetry::default(),
             classifier,
         }
+    }
+
+    /// Apply a reloaded operator classifier configuration to this live
+    /// bridge (ft-172av). Dedup state and bridge telemetry are preserved; the
+    /// built-in default wildcard stays registered last as the fallback.
+    pub fn reconfigure_classifier(&mut self, classifier: ClassifierConfig) {
+        self.classifier.reconfigure(classifier.clone());
+        self.classifier
+            .register_policy(ClassificationPolicy::default());
+        self.config.classifier = classifier;
+    }
+
+    /// Operator classifier configuration currently enforced on ingress.
+    #[must_use]
+    pub fn classifier_config(&self) -> &ClassifierConfig {
+        &self.config.classifier
     }
 
     /// Register an explicit classification policy for connector ingress.

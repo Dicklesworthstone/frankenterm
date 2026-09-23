@@ -5079,6 +5079,10 @@ pub struct HotReloadableConfig {
     // Safety
     /// Trauma guard tuning.
     pub trauma_guard: TraumaGuardConfig,
+    /// Connector ingress classification and redaction policy
+    /// (`[safety.data_classifier]`). Applied to the live inbound bridge by
+    /// `RuntimeHandle::apply_config_update` (ft-172av).
+    pub data_classifier: crate::connector_data_classification::ClassifierConfig,
 }
 
 impl HotReloadableConfig {
@@ -5110,6 +5114,7 @@ impl HotReloadableConfig {
             workflows_enabled: config.workflows.enabled.clone(),
             auto_run_allowlist: config.workflows.auto_run_allowlist.clone(),
             trauma_guard: config.safety.trauma_guard.clone(),
+            data_classifier: config.safety.data_classifier.clone(),
         })
     }
 }
@@ -5460,6 +5465,22 @@ impl Config {
                 name: "safety.trauma_guard.window_size".to_string(),
                 old_value: self.safety.trauma_guard.window_size.to_string(),
                 new_value: new_config.safety.trauma_guard.window_size.to_string(),
+            });
+        }
+
+        // The classifier carries a hash salt, so the change report names the
+        // section and policy counts but never echoes its values.
+        if self.safety.data_classifier != new_config.safety.data_classifier {
+            changes.push(HotReloadChange {
+                name: "safety.data_classifier".to_string(),
+                old_value: format!(
+                    "{} operator policies (settings redacted)",
+                    self.safety.data_classifier.policies.len()
+                ),
+                new_value: format!(
+                    "{} operator policies (settings redacted)",
+                    new_config.safety.data_classifier.policies.len()
+                ),
             });
         }
 
@@ -7490,6 +7511,44 @@ enable_kitty_graphics = true
             diff.changes
                 .iter()
                 .any(|change| change.name == "kitty_graphics.enable_kitty_graphics")
+        );
+    }
+
+    /// ft-172av: a classifier-only edit used to be reported as "no
+    /// configuration changes detected" and never reached the live bridge.
+    #[test]
+    fn hot_reload_detects_classifier_only_change_without_echoing_settings() {
+        let old_config = Config::default();
+        let mut new_config = Config::default();
+        new_config.safety.data_classifier.hash_salt = "operator-secret-salt".to_string();
+        new_config
+            .safety
+            .data_classifier
+            .policies
+            .push(crate::connector_data_classification::ClassificationPolicy::default());
+
+        let diff = old_config.diff_for_hot_reload(&new_config);
+
+        assert!(diff.allowed);
+        let change = diff
+            .changes
+            .iter()
+            .find(|change| change.name == "safety.data_classifier")
+            .expect("a classifier-only edit is a hot-reload change");
+        assert_eq!(change.old_value, "0 operator policies (settings redacted)");
+        assert_eq!(change.new_value, "1 operator policies (settings redacted)");
+        assert!(!diff.to_string().contains("operator-secret-salt"));
+        assert_eq!(
+            HotReloadableConfig::from_config(&new_config)
+                .unwrap()
+                .data_classifier,
+            new_config.safety.data_classifier
+        );
+        assert!(
+            Config::default()
+                .diff_for_hot_reload(&Config::default())
+                .changes
+                .is_empty()
         );
     }
 
