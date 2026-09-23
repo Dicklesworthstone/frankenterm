@@ -183,7 +183,7 @@ enum ColdSelectionRequest {
         dimensions: RenderableDimensions,
         points: SelectionPoints,
     },
-    Resolve(frankenterm_term::screen::ScreenSelectionAnchor),
+    Resolve(frankenterm_term::screen::ScreenSelectionAnchorWeak),
 }
 
 #[derive(Clone)]
@@ -4828,7 +4828,7 @@ impl LocalPane {
             .flatten()?;
         let dimensions = terminal_try_get_dimensions(&mut term)?;
         let sequence = term.current_seqno();
-        let request = ColdSelectionRequest::Resolve(anchor.clone());
+        let request = ColdSelectionRequest::Resolve(anchor.downgrade());
         match self.cold_selection_ready(&request, floor, sequence, dimensions, &term) {
             Some(ColdSelectionValue::Resolved(points)) => {
                 return Some((floor, sequence, dimensions, points))
@@ -4896,7 +4896,8 @@ impl LocalPane {
         term: &Terminal,
     ) -> Option<ColdSelectionValue> {
         let mut slot = self.cold_selection.try_lock()?;
-        let work = slot.iter_mut().find(|work| work.request == *request)?;
+        let index = slot.iter().position(|work| work.request == *request)?;
+        let work = &mut slot[index];
         work.renewed = Instant::now();
         let ready = work.ready.as_ref()?;
         if work.request != *request
@@ -4911,9 +4912,9 @@ impl LocalPane {
             return (Instant::now() < *retry_at).then_some(ColdSelectionValue::Busy);
         }
         let anchor = match (&ready.value, request) {
-            (ColdSelectionValue::Captured(Ok(Some(anchor))), _) => Some(anchor),
+            (ColdSelectionValue::Captured(Ok(Some(anchor))), _) => Some(anchor.clone()),
             (ColdSelectionValue::Resolved(Some(_)), ColdSelectionRequest::Resolve(anchor)) => {
-                Some(anchor)
+                anchor.upgrade()
             }
             _ => None,
         };
@@ -4922,8 +4923,14 @@ impl LocalPane {
             // sequence. Revalidate even an exact-sequence cache hit. Conversely,
             // unrelated output alone must not force another payload hydration.
             return Some(
-                match term.screen().selection_anchor_read_ranges(anchor, sequence) {
-                    Ok(Some(_)) => ready.value.clone(),
+                match term.screen().selection_anchor_read_ranges(&anchor, sequence) {
+                    Ok(Some(_)) => {
+                        let value = ready.value.clone();
+                        if matches!(value, ColdSelectionValue::Captured(Ok(Some(_)))) {
+                            slot.remove(index);
+                        }
+                        value
+                    }
                     Err(_) => ColdSelectionValue::Busy,
                     Ok(None) => match request {
                         ColdSelectionRequest::Capture { .. } => ColdSelectionValue::Captured(Err(
@@ -4934,7 +4941,11 @@ impl LocalPane {
                 },
             );
         }
-        (ready.sequence == sequence).then(|| ready.value.clone())
+        let value = (ready.sequence == sequence).then(|| ready.value.clone());
+        if matches!(value, Some(ColdSelectionValue::Captured(Ok(Some(_))))) {
+            slot.remove(index);
+        }
+        value
     }
 
     fn request_cold_selection(
@@ -5164,9 +5175,12 @@ impl LocalPane {
                                     ColdSelectionValue::Captured(Ok(anchor))
                                 }
                                 ColdSelectionRequest::Resolve(anchor) => {
+                                    let Some(anchor) = anchor.upgrade() else {
+                                        return true;
+                                    };
                                     let Ok(points) =
                                         term.screen().resolve_selection_anchor_with_reads(
-                                            anchor, sequence, &refs,
+                                            &anchor, sequence, &refs,
                                         )
                                     else {
                                         return false;
@@ -5174,7 +5188,7 @@ impl LocalPane {
                                     if points.is_none() {
                                         match term
                                             .screen()
-                                            .selection_anchor_read_ranges(anchor, sequence)
+                                            .selection_anchor_read_ranges(&anchor, sequence)
                                         {
                                             Ok(None) => {}
                                             // A bounded payload fallback can be
@@ -11854,23 +11868,18 @@ mod tests {
         }
         let selection_anchor = selection_token.unwrap();
         let viewport_token = viewport_token.unwrap();
-        assert!(matches!(
-            pane.cold_selection
-                .lock()
-                .first()
-                .unwrap()
-                .ready
-                .as_ref()
-                .unwrap()
-                .value,
-            ColdSelectionValue::Captured(Ok(Some(_)))
-        ));
+        assert!(pane.cold_selection.lock().iter().all(|work| {
+            !matches!(
+                work.ready.as_ref().map(|ready| &ready.value),
+                Some(ColdSelectionValue::Captured(Ok(Some(_))))
+            )
+        }));
         // A superseded completion may only retire its own generation. This
         // exercises the production RAII guard used by canceled read workers.
         let old_cancelled = Arc::new(AtomicBool::new(true));
         let successor_cancelled = Arc::new(AtomicBool::new(false));
         let successor = Arc::new(Mutex::new(vec![ColdSelectionWork {
-            request: ColdSelectionRequest::Resolve(selection_anchor.clone()),
+            request: ColdSelectionRequest::Resolve(selection_anchor.downgrade()),
             cancelled: Arc::clone(&successor_cancelled),
             ready: None,
             renewed: Instant::now(),
@@ -12090,6 +12099,12 @@ mod tests {
                 assert!(viewport.cold_anchor.is_some());
             }
         }
+        let selection_weak = selection_anchor.downgrade();
+        let viewport_weak = viewport_token.downgrade();
+        drop(selection_anchor);
+        drop(viewport_token);
+        assert!(selection_weak.upgrade().is_none());
+        assert!(viewport_weak.upgrade().is_none());
         cold_ragged_paragraph_selection_endpoints(&executor, false);
         cold_ragged_paragraph_selection_endpoints(&executor, true);
     }

@@ -147,6 +147,30 @@ pub struct SelectionAnchorCoordinate {
 #[derive(Debug, Clone)]
 pub struct ScreenSelectionAnchor(Arc<()>);
 
+/// Non-owning identity for work that may outlive the caller's selection.
+#[derive(Debug, Clone)]
+pub struct ScreenSelectionAnchorWeak(Weak<()>);
+
+impl ScreenSelectionAnchor {
+    pub fn downgrade(&self) -> ScreenSelectionAnchorWeak {
+        ScreenSelectionAnchorWeak(Arc::downgrade(&self.0))
+    }
+}
+
+impl ScreenSelectionAnchorWeak {
+    pub fn upgrade(&self) -> Option<ScreenSelectionAnchor> {
+        self.0.upgrade().map(ScreenSelectionAnchor)
+    }
+}
+
+impl PartialEq for ScreenSelectionAnchorWeak {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScreenSelectionAnchorWeak {}
+
 impl PartialEq for ScreenSelectionAnchor {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
