@@ -6931,7 +6931,9 @@ mod tests {
         connections: usize,
         mut handle: impl FnMut(usize, Pdu) -> (Vec<Pdu>, Option<Pdu>, Vec<Pdu>) + Send + 'static,
     ) -> (tempfile::TempDir, PathBuf, task::JoinHandle<()>) {
-        let dir = tempfile::tempdir().expect("text tempdir");
+        // Unix socket paths have a small platform limit; RCH's nested TMPDIR
+        // can exceed it. Keep a securely created private fixture under /tmp.
+        let dir = tempfile::tempdir_in("/tmp").expect("short text socket tempdir");
         let path = dir.path().join("text.sock");
         let listener = compat_unix::bind(&path).await.expect("bind text socket");
         let server = task::spawn(async move {
@@ -7206,6 +7208,93 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn buffered_unilateral_response_yields_to_progress_and_cancellation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ResponseWake(std::sync::atomic::AtomicUsize);
+        impl Wake for ResponseWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        run_async_test(async {
+            for cancel in [false, true] {
+                let cx = crate::cx::for_testing();
+                let (_dir, path, server) = text_read_server(1, |_, _| None).await;
+                let mut client = DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(path))
+                    .await
+                    .unwrap();
+                let serial = client
+                    .send_request_only(Pdu::ListPanes(ListPanes {}))
+                    .await
+                    .unwrap();
+                // No socket readiness, timer, or scheduler luck is needed:
+                // every sideband and the final correlated frame is resident.
+                let mut bytes = Vec::new();
+                for pane_id in 0..96 {
+                    Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
+                        .encode(&mut bytes, 0)
+                        .unwrap();
+                }
+                Pdu::UnitResponse(UnitResponse {})
+                    .encode(&mut bytes, serial)
+                    .unwrap();
+                client.read_buf.extend_from_slice(&bytes);
+                let wake = Arc::new(ResponseWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut context = Context::from_waker(&waker);
+                let progressed = std::sync::atomic::AtomicBool::new(false);
+                {
+                    let mut response = std::pin::pin!(client.await_response_with_cx(&cx, serial));
+                    assert!(
+                        response.as_mut().poll(&mut context).is_pending(),
+                        "resident unsolicited frames must not monopolize one poll"
+                    );
+                    assert!(wake.0.load(Ordering::Relaxed) > 0);
+                    // A separate ready task gets the next cooperative turn.
+                    let mut witness = std::pin::pin!(async {
+                        progressed.store(true, Ordering::Relaxed);
+                        if cancel {
+                            cx.cancel_with(crate::outcome::CancelKind::User, None);
+                        }
+                    });
+                    assert!(witness.as_mut().poll(&mut context).is_ready());
+                    let mut completed = None;
+                    for _ in 0..8 {
+                        if let Poll::Ready(result) = response.as_mut().poll(&mut context) {
+                            completed = Some(result);
+                            break;
+                        }
+                    }
+                    let result = completed.expect("bounded buffered response polls");
+                    if cancel {
+                        assert_cancelled_mux_error(&result.unwrap_err());
+                    } else {
+                        assert!(matches!(result.unwrap(), Pdu::UnitResponse(_)));
+                    }
+                }
+                assert!(progressed.load(Ordering::Relaxed));
+                assert!(client.outstanding_requests.is_empty());
+                assert!(client.pending_responses.is_empty());
+                assert_eq!(client.pending_response_bytes, 0);
+                assert!(client.pending_render_changes.is_empty());
+                assert_eq!(client.connection_poisoned, cancel);
+                assert_eq!(client.poison_transition_count, usize::from(cancel));
+                if !cancel {
+                    assert!(client.read_buf.is_empty(), "every frame consumed exactly once");
+                }
+                drop(client);
+                timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            }
         });
     }
 
