@@ -3693,6 +3693,9 @@ impl TermWindow {
     /// refuses to replace GPU buffers.
     fn begin_quad_resize_gesture(&mut self) {
         if !self.quad_buffer_in_resize_gesture {
+            if let Some(state) = self.render_state.as_mut() {
+                state.note_quad_activity(Instant::now());
+            }
             self.quad_buffer_policy.begin_gesture();
             self.quad_buffer_in_resize_gesture = true;
         }
@@ -3705,7 +3708,11 @@ impl TermWindow {
     /// idle tick once the configured idle threshold has elapsed.
     fn end_quad_resize_gesture(&mut self) {
         if self.quad_buffer_in_resize_gesture {
-            self.quad_buffer_policy.end_gesture(Instant::now());
+            let now = Instant::now();
+            if let Some(state) = self.render_state.as_mut() {
+                state.note_quad_activity(now);
+            }
+            self.quad_buffer_policy.end_gesture(now);
             self.quad_buffer_in_resize_gesture = false;
         }
     }
