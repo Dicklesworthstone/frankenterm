@@ -2725,8 +2725,21 @@ mod tests {
         assert!(!same_selection_text_intent(&unanchored, &changed_capture));
         request.adopt_acquired_anchor(&selected).unwrap();
         let local = pane.downcast_ref::<mux::localpane::LocalPane>().unwrap();
-        let (floor, sequence, dimensions, points) =
-            local.selection_anchor_snapshot(&anchor).unwrap();
+        // resize() admits an asynchronous worker; its return is not a
+        // committed layout receipt. Resolve the original token only after
+        // the requested geometry is observable, under the request's budget.
+        let (floor, sequence, dimensions, points) = loop {
+            assert!(
+                std::time::Instant::now() < request.deadline,
+                "the admitted resize did not commit before the read deadline"
+            );
+            if let Some(snapshot) = local.selection_anchor_snapshot(&anchor) {
+                if snapshot.2.cols == 8 {
+                    break snapshot;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         let authority =
             SelectionAuthority::from_native_snapshot(&*pane, floor, dimensions).unwrap();
         let mut remapped = selected.clone();
@@ -3231,7 +3244,18 @@ mod tests {
             let ready = received.unwrap();
             let plans = ready.plans.as_ref().unwrap().as_ref().unwrap();
             assert_eq!(plans.len(), 1);
-            assert!(terminal.lock().screen().validates_line_read(&plans[0]));
+            {
+                let mut terminal = terminal.lock();
+                assert!(terminal.screen().validates_line_read(&plans[0]));
+                // A displayed native selection starts from a published cold
+                // layout. The raw reader above otherwise leaves the first
+                // mapping unpublished, so the Lua stage would legitimately
+                // invalidate its own frozen, pre-publication authority.
+                assert!(terminal.screen().line_read_preserves_coordinates(&plans[0]));
+                terminal
+                    .screen_mut()
+                    .install_line_read_layout(&plans[0], sequence);
+            }
             let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
             let mut work = 65_536;
             let (first, rows) = plans[0]
@@ -3252,6 +3276,10 @@ mod tests {
         }
         assert_eq!(chunks, 17);
         assert_eq!(copy.finish(sequence).unwrap(), Some(expected.clone()));
+        assert!(
+            terminal.lock().screen().in_memory_scrollback_rows() < 8,
+            "publishing cold geometry must not materialize the selected history"
+        );
 
         // Exercise the production Lua request accumulator against the same
         // encrypted cold store, not the render cache or a canned text result.

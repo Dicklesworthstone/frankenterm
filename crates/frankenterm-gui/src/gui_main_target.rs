@@ -1,5 +1,8 @@
 // Don't create a new standard console window when launched from the Windows GUI.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
+// Bounded selection-copy transfers nest the channel and retained pane types.
+// Let rustc complete their Send/Sync proofs without suppressing the lint.
+#![recursion_limit = "256"]
 // Keep this in sync with Cargo.toml: the vendored GUI crate is not yet a
 // pedantic-clean primary lint target.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]

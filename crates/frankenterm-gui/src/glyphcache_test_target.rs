@@ -3,6 +3,8 @@
 // be linked or executed by this target. That fence does not make every included
 // test noninteractive: proof commands must still select only exact test bodies
 // audited not to initialize the frontend, event loop, or an OS window.
+// Match the production root's trait-proof budget for selection-copy transfers.
+#![recursion_limit = "256"]
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 // The included production graph is intentionally much larger than the
 // glyph-cache test surface. Keep dead-code suppression scoped to this opt-in

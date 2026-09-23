@@ -3185,6 +3185,18 @@ impl WeztermClient {
                     MuxOperation::ReportRenderApplicationResult
                 )
                 | ("get_lines", MuxOperation::ReadPaneText)
+                | (
+                    "capture_selection_anchor",
+                    MuxOperation::CaptureSelectionAnchor
+                )
+                | (
+                    "resolve_selection_anchor",
+                    MuxOperation::ResolveSelectionAnchor
+                )
+                | (
+                    "release_selection_anchor",
+                    MuxOperation::ReleaseSelectionAnchor
+                )
                 | ("get_dimensions", MuxOperation::ReadPaneRenderableDimensions)
                 | ("get_semantic_zones", MuxOperation::ReadSemanticZones)
                 | ("write_to_pane" | "send_paste", MuxOperation::SendText)
@@ -3504,6 +3516,9 @@ impl WeztermClient {
                 MuxOperation::ReportRenderApplicationResult
             }
             Some("GetLines" | "GetLinesAtLayout") => MuxOperation::ReadPaneText,
+            Some("CaptureSelectionAnchorV1") => MuxOperation::CaptureSelectionAnchor,
+            Some("ResolveSelectionAnchorV1") => MuxOperation::ResolveSelectionAnchor,
+            Some("ReleaseSelectionAnchorV1") => MuxOperation::ReleaseSelectionAnchor,
             Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
             Some("WriteToPane" | "SendPaste" | "SendPasteTracedV1" | "ReliablePaneWriteV1") => {
@@ -7786,6 +7801,77 @@ mod tests {
             ),
             MuxOperation::ReadPaneText,
         );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn selection_anchor_rejections_preserve_operation_effect_retry_and_object_authority() {
+        let operations = [
+            (
+                <codec::CaptureSelectionAnchorV1 as codec::PduWireIdent>::IDENT,
+                MuxOperation::CaptureSelectionAnchor,
+                "capture_selection_anchor",
+            ),
+            (
+                <codec::ResolveSelectionAnchorV1 as codec::PduWireIdent>::IDENT,
+                MuxOperation::ResolveSelectionAnchor,
+                "resolve_selection_anchor",
+            ),
+            (
+                <codec::ReleaseSelectionAnchorV1 as codec::PduWireIdent>::IDENT,
+                MuxOperation::ReleaseSelectionAnchor,
+                "release_selection_anchor",
+            ),
+        ];
+        let pane = Some(MuxObjectIdentity {
+            kind: MuxObjectKind::Pane,
+            id: 77,
+        });
+        for (ident, operation, method) in operations {
+            assert_ne!(operation, MuxOperation::ReadPaneText);
+            assert_eq!(operation.label(), method);
+            assert_eq!(MuxOperation::from_cli_operation(method), operation);
+            assert_eq!(serde_json::to_value(operation).unwrap(), method);
+            let cases = [
+                (
+                    codec::ErrorResponse::pane_not_found(ident, 77),
+                    MuxRejection::pane_not_found(operation, 77),
+                ),
+                (
+                    codec::ErrorResponse::deadline_exceeded(ident),
+                    MuxRejection::deadline_exceeded(operation),
+                ),
+                (
+                    codec::ErrorResponse::indeterminate_mutation(
+                        ident,
+                        Some(codec::MuxErrorObject {
+                            kind: codec::MuxErrorObjectKind::PANE,
+                            id: 77,
+                        }),
+                    ),
+                    MuxRejection::indeterminate(operation, pane),
+                ),
+            ];
+            for (response, expected) in cases {
+                response.validate().expect("canonical selection rejection");
+                let direct = WeztermClient::mux_rejection_from_wire(&response);
+                assert_eq!(direct, expected, "{method}: {}", response.code.label());
+                assert!(direct.has_consistent_authority());
+                let object = response.object.map_or_else(
+                    || "none".to_string(),
+                    |object| format!("{}:{}", object.kind.label(), object.id),
+                );
+                let cli = WeztermClient::parse_cli_mux_rejection(
+                    &format!(
+                        "FRANKENTERM_MUX_ERROR_V1 request_ident={ident} response_request_ident={ident} operation={method} code={} object={object} effect={} retry={}",
+                        response.code.label(), response.effect.label(), response.retry.label(),
+                    ),
+                    CliEffect::Mutation { operation, object: pane },
+                )
+                .expect("selection rejection retains CLI authority");
+                assert_eq!(cli, expected);
+            }
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]

@@ -1176,6 +1176,14 @@ mod dirty_tracking_tests {
             }
         }
         let _child = ChildGuard(Arc::clone(&pane));
+        // Cold anchor capture/resolve publishes through the exact live mux
+        // registration. An unregistered LocalPane cannot admit that work,
+        // even though the direct owned content-navigation read can complete.
+        // Keep a real private owner alive without replacing the global mux or
+        // the shared GUI executor used by other tests.
+        let owner = Arc::new(mux::Mux::new(None));
+        owner.add_pane(&pane).unwrap();
+        assert!(owner.capture_pane_registration(&pane).is_some());
         // Check the cold bytes with the synchronous oracle. This does not
         // publish an owned layout: the first action must handle that itself.
         let (top, rows) = pane.get_lines(0..1);
