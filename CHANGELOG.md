@@ -26,13 +26,19 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.16`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.17`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.16` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.17` carries forward the release-candidate fixes below and adds selection, overlay and guardian corrections. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
 
-- Remote selection adds negotiated server-owned anchors for direct client-to-LocalPane connections. Capture, reflow resolution and release retain pane and connection identity; temporary observation failures defer remapping, and highlighting waits for fresh visible cache rows. Older servers retain ordinary selection without this reflow persistence. Nested forwarding and native acceptance remain pending.
+- Remote selection adds negotiated server-owned anchors. Intermediate remote panes forward capture, resolution and layout-fenced copying to the terminal owner, retaining the original request across delayed replies and resize. Pending anchors share the existing capacity limit; release, expiry and disconnect retire their downstream work. Copying uncached history validates exact rows and connection identity before publication. Older servers retain ordinary selection without this reflow persistence. Nested forwarding tests and native acceptance remain pending.
+
+- Copy mode retains selection and navigation anchors during resize instead of clearing them through an empty search restart. Coordinates are remapped before navigation resumes; stale cursors stay hidden while authority is pending.
+- Lua selection getters await bounded anchor remapping and cold-row reads instead of returning empty text while layout work is pending. Timeout, cancellation, changed selection and pane replacement retire the request and its retained payload.
+- Selection painting through copy-mode and quick-select overlays uses the underlying pane's authority. Remote highlights wait for fresh selected rows instead of bypassing the layout fence through an overlay.
+- Guardian transport preserves the original EOF or protocol error if restoring socket timeouts also fails. An authenticated terminal-state reply completes repeated lease retirement without advancing the mutation sequence or permitting further input.
+- The diagnostic delay model jointly calibrates stage and aggregate curves before choosing between their bounds. Its statistical assumptions and independent individual-event checks remain explicit; it is not a deterministic future bound or native performance qualification.
 
 - Workflow input uses live watcher and captured prompt evidence before each step and send. Detection alone no longer implies a safe shell prompt, normal screen, or uninterrupted capture. Reservation checks retain unknown authority on lookup failure and reject foreign ownership before an approval can authorize input; reservation changes and dispatch share the same effect fence.
 
