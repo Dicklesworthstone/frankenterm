@@ -100,7 +100,9 @@ impl ViewportAnchor {
             }
             let points = [
                 Some(wezterm_term::screen::SelectionAnchorCoordinate {
-                    column: None,
+                    // Slot zero is an origin cell; None is only valid for
+                    // selection boundary slots and would refuse this anchor.
+                    column: Some(0),
                     row: self.row,
                 }),
                 None,

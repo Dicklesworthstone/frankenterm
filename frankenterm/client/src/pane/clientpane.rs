@@ -6969,6 +6969,11 @@ mod tests {
         let (inner, peer) = test_client_inner_with_rpc_peer(771);
         let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 773, 779);
         apply_selection_test_snapshot(&mux, &pane, &inner);
+        // Applying the bootstrap snapshot queues its geometry/output
+        // notification. Settle that unrelated work before measuring capture
+        // ownership, so cancellation cannot also drain a baseline task.
+        pump_mouse_test(&executor);
+        assert!(peer.is_empty(), "snapshot setup must not leave pending RPCs");
         let baseline = executor.admission_snapshot().active_tasks;
         let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
         let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
