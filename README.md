@@ -373,7 +373,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
 | Distributed mode | **Supported behind `--features distributed`** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
-| MCP server | **Supported behind `--features mcp`** | stdio + tool surface mirroring Robot Mode |
+| MCP server | **Supported behind `--features mcp`** | stdio tool surface; per-family Robot parity is scoped in [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) |
 | Semantic search | **Supported behind `--features semantic-search`** | fastembed-backed embeddings + FrankenSearch hybrid mode |
 | Browser auth tooling | **Feature-gated** | `ft auth` is real, but only in builds that include the browser feature and a usable browser stack |
 | GUI (FrankenTerm.app) | **Supported on macOS** | Native macOS bundle; live render-state plumbing, BSU/ESU sync-output, classified drag handlers, command-palette domain labels |
@@ -1419,7 +1419,7 @@ cargo build --profile release-interactive --features mcp
 ft mcp serve                                # MCP server over stdio
 ```
 
-MCP mirrors Robot Mode. See [`docs/mcp-api-spec.md`](docs/mcp-api-spec.md) for the tool list and [`docs/json-schema/`](docs/json-schema/) for response schemas.
+MCP covers a subset of Robot Mode (plus MCP-only mission lifecycle and steer-plan tools); [`docs/robot-contracts/mcp-robot-surface-matrix.md`](docs/robot-contracts/mcp-robot-surface-matrix.md) lists which families are mirrored, partial, or robot-only. See [`docs/mcp-api-spec.md`](docs/mcp-api-spec.md) for the tool list and [`docs/json-schema/`](docs/json-schema/) for response schemas.
 
 ---
 

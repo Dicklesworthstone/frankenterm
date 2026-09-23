@@ -300,3 +300,7 @@ supports rule conditions plus optional claim leasing while the CLI additionally
 supports storage-derived quiescence. Every MCP error still maps to a stable code
 from the catalog above; callers must follow the per-tool parameter and response
 notes rather than assuming 1:1 command-line equivalence.
+
+The per-family scope (mirrored, partial, robot-only, MCP-only) is the
+conformance-enforced table in
+[`robot-contracts/mcp-robot-surface-matrix.md`](robot-contracts/mcp-robot-surface-matrix.md).
