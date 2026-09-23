@@ -80,8 +80,11 @@
 //! `frozen_path` and `frozen_sha256`. External DSR receipts must authenticate
 //! both source identities; these declarations and hashes only bind inputs.
 //! Conditional on an independent pilot and exchangeable whole-workload blocks,
-//! the joint calibration supports at least 95% next-block service conformity,
-//! marginal over calibration and validation blocks. It is not a deterministic
+//! the joint calibration supports at least 95% next-block service conformity
+//! simultaneously for the three stages and a capture-to-storage aggregate
+//! curve, marginal over calibration and validation blocks. The reported delay
+//! is the minimum of the serial and aggregate bounds; validation still requires
+//! every stage and aggregate curve to hold. It is not a deterministic
 //! future bound, a confidence interval, or release qualification. Collection
 //! order, disjoint execution and absence of outcome-dependent retries require
 //! external campaign evidence; the analyzer cannot infer them from timestamps.
@@ -280,6 +283,9 @@ mod live_measurement {
         use frankenterm_core::cx::Cx;
         use frankenterm_core::ingest::{CapturedSegmentKind, PaneCursor};
         use frankenterm_core::latency_stages::{LatencyStage, LindleyStageTelemetry};
+        use frankenterm_core::network_calculus_bound::{
+            EmpiricalComparison, ServiceCurve, delay_bound,
+        };
         use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, sleep_with_cx};
         use frankenterm_core::storage::{PaneRecord, StorageHandle};
         use frankenterm_core::vendored::{DirectMuxClientConfig, MuxPool, MuxPoolConfig};
@@ -857,8 +863,40 @@ mod live_measurement {
 
         const NEXT_BLOCK_ROWS: usize = BURST * BURSTS_PER_PHASE;
         const NEXT_BLOCK_CALIBRATION_BLOCKS: usize = 19;
-        const NEXT_BLOCK_SCHEMA: &str = "frankenterm.lindley-next-block-frozen.v1";
-        const NEXT_BLOCK_METHOD: &str = "pilot-rates-joint-max-latency-adjustment-v1";
+        const NEXT_BLOCK_SCHEMA: &str = "frankenterm.lindley-next-block-frozen.v2";
+        const NEXT_BLOCK_METHOD: &str = "pilot-rates-four-curve-joint-max-latency-adjustment-v2";
+
+        #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AggregateService {
+            service_rate_events_per_ms: f64,
+            latency_ms: f64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PredictiveModel {
+            pipeline: LindleyTelemetryModel,
+            // Capture-start arrivals to storage-complete departures. This is
+            // an additional service curve, not a replacement for stage gates.
+            aggregate: AggregateService,
+        }
+
+        impl PredictiveModel {
+            fn bounds(&self) -> Result<(f64, f64, f64), String> {
+                let (arrival, stages) = self.pipeline.to_network_calculus_inputs()?;
+                let serial =
+                    pipeline_delay_bound(arrival, &stages).ok_or("invalid serial delay bound")?;
+                let curve = ServiceCurve::try_new(
+                    self.aggregate.service_rate_events_per_ms,
+                    self.aggregate.latency_ms,
+                )
+                .ok_or("invalid aggregate service curve")?;
+                let aggregate =
+                    delay_bound(arrival, curve).ok_or("invalid aggregate delay bound")?;
+                Ok((serial, aggregate, serial.min(aggregate)))
+            }
+        }
 
         #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -894,7 +932,7 @@ mod live_measurement {
             training_manifest_sha256: String,
             training_blocks: Vec<CampaignBlockReference>,
             training_trace_sha256: Vec<String>,
-            model: LindleyTelemetryModel,
+            model: PredictiveModel,
             release_ready: bool,
             assumptions: String,
         }
@@ -1045,7 +1083,7 @@ mod live_measurement {
         fn predictive_model(
             pilot: &[Observation],
             blocks: &[Vec<Observation>],
-        ) -> Result<LindleyTelemetryModel, String> {
+        ) -> Result<PredictiveModel, String> {
             if blocks.len() != NEXT_BLOCK_CALIBRATION_BLOCKS
                 || pilot.len() != NEXT_BLOCK_ROWS
                 || !arrival_conforms(pilot, 0.1)
@@ -1053,8 +1091,20 @@ mod live_measurement {
                 return Err("expected one valid pilot and 19 calibration blocks".into());
             }
             let mut model = calibrate(pilot, 0.1)?;
+            let aggregate_rate = model
+                .stages
+                .iter()
+                .map(|stage| stage.service_rate_events_per_ms)
+                .fold(f64::INFINITY, f64::min);
+            let (arrivals, departures) = aggregate_trace(pilot);
+            let mut aggregate = AggregateService {
+                service_rate_events_per_ms: aggregate_rate,
+                latency_ms: fit_service_latency(&arrivals, &departures, aggregate_rate),
+            };
             // Freeze pilot rates. Each independent block supplies one score:
-            // its largest nonnegative excess latency over all three stages.
+            // its largest nonnegative excess latency over all three stages
+            // AND the aggregate curve. A separate aggregate quantile would
+            // not preserve the simultaneous coverage of all four curves.
             // The maximum of 19 scores is the 95% split-conformal quantile for
             // one next exchangeable block, conditional on the pilot. This is
             // marginal coverage, not coverage conditional on observed scores.
@@ -1084,21 +1134,56 @@ mod live_measurement {
                         ) - stage.p99_latency_ms,
                     );
                 }
+                let (arrivals, departures) = aggregate_trace(block);
+                adjustment = adjustment.max(
+                    fit_service_latency(&arrivals, &departures, aggregate_rate)
+                        - aggregate.latency_ms,
+                );
             }
             for stage in &mut model.stages {
                 stage.p99_latency_ms += adjustment;
             }
+            aggregate.latency_ms += adjustment;
             model.to_network_calculus_inputs()?;
             if blocks.iter().any(|block| {
-                model
-                    .stages
-                    .iter()
-                    .enumerate()
-                    .any(|(index, stage)| !service_conforms(block, index, stage))
+                !aggregate_conforms(block, &aggregate)
+                    || model
+                        .stages
+                        .iter()
+                        .enumerate()
+                        .any(|(index, stage)| !service_conforms(block, index, stage))
             }) {
                 return Err("independent calibration conformance failed".into());
             }
-            Ok(model)
+            let prediction = PredictiveModel {
+                pipeline: model,
+                aggregate,
+            };
+            prediction.bounds()?;
+            Ok(prediction)
+        }
+
+        fn aggregate_trace(rows: &[Observation]) -> (Vec<u64>, Vec<u64>) {
+            let mut arrivals: Vec<_> = rows.iter().map(|row| row.stages_ns[0][0]).collect();
+            let mut departures: Vec<_> = rows.iter().map(|row| row.stages_ns[2][1]).collect();
+            arrivals.sort_unstable();
+            departures.sort_unstable();
+            (arrivals, departures)
+        }
+
+        fn aggregate_conforms(rows: &[Observation], model: &AggregateService) -> bool {
+            let (arrivals, departures) = aggregate_trace(rows);
+            departures.iter().all(|departure| {
+                let time = departure.saturating_sub(1);
+                let (completed, lower) = service_cut_parameters(
+                    &arrivals,
+                    &departures,
+                    time,
+                    model.service_rate_events_per_ms,
+                    model.latency_ms,
+                );
+                lower <= completed as f64 + 1e-9
+            })
         }
 
         fn verify_frozen_model(
@@ -1186,7 +1271,7 @@ mod live_measurement {
                     training_blocks: manifest.blocks,
                     training_trace_sha256: trace_hashes,
                     release_ready: false,
-                    assumptions: "Conditional on an independent pilot and exchangeable whole-workload calibration/validation blocks, at least 95% next-block service conformity marginal over those blocks; no outcome-dependent selection/retries. Not a deterministic future bound, confidence interval, or release qualification.".into(),
+                    assumptions: "Conditional on an independent pilot and exchangeable whole-workload calibration/validation blocks, at least 95% simultaneous next-block conformity of all three stage curves and the aggregate curve, marginal over those blocks; no outcome-dependent selection/retries. Both network-calculus horizontal-deviation bounds hold on that joint event, so their minimum is valid. Individual-event maximum delay is checked separately, not inferred from completion ordering. Not a deterministic future bound, confidence interval, or release qualification.".into(),
                 };
                 println!(
                     "{}",
@@ -1196,50 +1281,86 @@ mod live_measurement {
             }
             let (frozen, frozen_hash) = load_frozen_model(&manifest)?;
             verify_frozen_model(&frozen, &manifest, &trace_hashes)?;
-            let (arrival, stages) = frozen.model.to_network_calculus_inputs()?;
+            let (arrival, stages) = frozen.model.pipeline.to_network_calculus_inputs()?;
             let rows = &blocks[0];
             let mut delays: Vec<_> = rows
                 .iter()
                 .map(|row| (row.stages_ns[2][1] - row.stages_ns[0][0]) as f64 / 1e6)
                 .collect();
             delays.sort_by(f64::total_cmp);
-            let bound = pipeline_delay_bound(arrival, &stages);
-            let artifact = LindleyBoundsArtifact {
+            let (serial_bound, aggregate_bound, bound) = frozen.model.bounds()?;
+            let empirical_p99_ms = delays[(99 * delays.len()).div_ceil(100) - 1];
+            let serial_artifact = LindleyBoundsArtifact {
                 release_version: manifest.measurement_identity.release_version.clone(),
                 arrival,
                 stages,
-                analytical_bound_ms: bound.unwrap_or(f64::INFINITY),
-                empirical_p99_ms: delays[(99 * delays.len()).div_ceil(100) - 1],
+                analytical_bound_ms: serial_bound,
+                empirical_p99_ms,
+            };
+            let comparison = EmpiricalComparison {
+                analytical_bound_ms: bound,
+                empirical_p99_ms,
             };
             let service: Vec<_> = frozen
                 .model
+                .pipeline
                 .stages
                 .iter()
                 .enumerate()
                 .map(|(index, stage)| service_conforms(rows, index, stage))
                 .collect();
             let maximum = *delays.last().ok_or("missing validation rows")?;
-            let delay_holds = bound.is_some_and(|value| maximum <= value);
+            let aggregate_holds = aggregate_conforms(rows, &frozen.model.aggregate);
+            let delay_holds = maximum <= bound;
             let arrival_holds = arrival_conforms(rows, 0.1);
             let accepted = delay_holds
                 && arrival_holds
                 && service.iter().all(|value| *value)
-                && artifact.comparison().within_tolerance();
+                && aggregate_holds
+                && comparison.within_tolerance();
+            // This is deliberately not a serial LindleyBoundsArtifact: the
+            // selected minimum requires both model authorities. Retain the
+            // original serial artifact with its own truthful analytical bound.
+            let artifact_json = serde_json::json!({
+                "schema": "frankenterm.lindley-joint-service-bounds.v2",
+                "release_version": manifest.measurement_identity.release_version,
+                "method": NEXT_BLOCK_METHOD,
+                "serial_model": serde_json::from_str::<serde_json::Value>(
+                    &serial_artifact.render_attestation_json()
+                ).map_err(|error| error.to_string())?,
+                "aggregate_model": {
+                    "arrival_burst_events": frozen.model.pipeline.arrival_burst_events,
+                    "arrival_rate_events_per_ms": frozen.model.pipeline.arrival_rate_events_per_ms,
+                    "service_curve": frozen.model.aggregate,
+                    "analytical_bound_ms": aggregate_bound,
+                },
+                "selection": "minimum-of-jointly-calibrated-serial-and-aggregate",
+                "selected_bound_ms": bound,
+                "empirical_p99_ms": empirical_p99_ms,
+                "deviation_pct": comparison.deviation_pct(),
+                "within_tolerance": comparison.within_tolerance(),
+                "release_ready": false,
+            });
             println!(
                 "{}",
                 serde_json::json!({
-                "schema": "frankenterm.lindley-next-block-validation.v1",
+                "schema": "frankenterm.lindley-next-block-validation.v2",
                 "measurement_identity": manifest.measurement_identity,
                 "analyzer_source_revision": manifest.analyzer_source_revision,
                 "accepted": accepted,
                 "frozen_sha256": frozen_hash,
                 "validation_manifest_sha256": manifest_hash,
-                "artifact": serde_json::from_str::<serde_json::Value>(&artifact.render_attestation_json()).map_err(|error| error.to_string())?,
+                "artifact": artifact_json,
                 "arrival_envelope_holds": arrival_holds,
                 "service_curves_hold": service,
+                "aggregate_service_curve": frozen.model.aggregate,
+                "aggregate_service_curve_holds": aggregate_holds,
+                "serial_bound_ms": serial_bound,
+                "aggregate_bound_ms": aggregate_bound,
+                "bound_selection": "minimum-of-jointly-calibrated-serial-and-aggregate",
                 "maximum_delay_bound_holds": delay_holds,
                 "maximum_delay_ms": maximum,
-                "service_violations": (0..3).map(|index| service_violation_diagnostics(rows, index, &frozen.model.stages[index])).collect::<Vec<_>>(),
+                "service_violations": (0..3).map(|index| service_violation_diagnostics(rows, index, &frozen.model.pipeline.stages[index])).collect::<Vec<_>>(),
                 "release_ready": false,
                 "conditional_assumptions": frozen.assumptions,
                 })
@@ -1376,14 +1497,30 @@ mod live_measurement {
             time: u64,
             model: &LindleyStageTelemetry,
         ) -> (usize, f64) {
+            service_cut_parameters(
+                arrivals,
+                departures,
+                time,
+                model.service_rate_events_per_ms,
+                model.p99_latency_ms,
+            )
+        }
+
+        fn service_cut_parameters(
+            arrivals: &[u64],
+            departures: &[u64],
+            time: u64,
+            rate: f64,
+            latency: f64,
+        ) -> (usize, f64) {
             let completed = departures.partition_point(|value| *value <= time);
             let lower = arrivals
                 .iter()
                 .enumerate()
                 .take_while(|(_, start)| **start <= time)
                 .map(|(count, start)| {
-                    model.service_rate_events_per_ms.mul_add(
-                        (((time - start) as f64 / 1e6) - model.p99_latency_ms).max(0.0),
+                    rate.mul_add(
+                        (((time - start) as f64 / 1e6) - latency).max(0.0),
                         count as f64,
                     )
                 })
@@ -1845,7 +1982,7 @@ mod live_measurement {
                 let mut training = vec![block(2_000_000); 19];
                 training[18] = block(3_000_000);
                 let frozen = predictive_model(&pilot, &training).unwrap();
-                for (index, stage) in frozen.stages.iter().enumerate() {
+                for (index, stage) in frozen.pipeline.stages.iter().enumerate() {
                     assert_eq!(
                         stage.service_rate_events_per_ms,
                         base.stages[index].service_rate_events_per_ms
@@ -1866,6 +2003,96 @@ mod live_measurement {
                 assert!(predictive_model(&excess_burst, &training).is_err());
                 training[0] = excess_burst;
                 assert!(predictive_model(&pilot, &training).is_err());
+            }
+
+            fn sequential_block(durations: impl Fn(u32) -> [u64; 3]) -> Vec<Observation> {
+                (0..1000)
+                    .map(|sequence| {
+                        let start = u64::from(sequence) * 100_000_000;
+                        let [capture, extraction, storage] = durations(sequence);
+                        let captured = start + capture;
+                        let extracted = captured + extraction;
+                        let completed = extracted + storage;
+                        let mut observation = row(sequence, start, completed);
+                        observation.stages_ns = [
+                            [start, captured],
+                            [captured, extracted],
+                            [extracted, completed],
+                        ];
+                        observation
+                    })
+                    .collect()
+            }
+
+            #[test]
+            fn next_block_aggregate_excess_participates_in_joint_calibration() {
+                let pilot = sequential_block(|_| [1_000_000; 3]);
+                let training_block = sequential_block(|_| [2_000_000; 3]);
+                let base = calibrate(&pilot, 0.1).unwrap();
+                let fitted = predictive_model(&pilot, &vec![training_block.clone(); 19]).unwrap();
+                // Each stage grows by 1ms, but end-to-end latency grows by
+                // 3ms. Omitting the fourth score would underfit its curve.
+                for (index, stage) in fitted.pipeline.stages.iter().enumerate() {
+                    assert!(
+                        (stage.p99_latency_ms - base.stages[index].p99_latency_ms - 3.0).abs()
+                            < 1e-6
+                    );
+                    assert!(service_conforms(&training_block, index, stage));
+                }
+                assert!(aggregate_conforms(&training_block, &fitted.aggregate));
+                let unseen = sequential_block(|_| [2_500_000; 3]);
+                assert!(
+                    fitted
+                        .pipeline
+                        .stages
+                        .iter()
+                        .enumerate()
+                        .all(|(index, stage)| service_conforms(&unseen, index, stage))
+                );
+                assert!(!aggregate_conforms(&unseen, &fitted.aggregate));
+                let (serial, aggregate, selected) = fitted.bounds().unwrap();
+                assert!((serial - aggregate - 6.0).abs() < 1e-5);
+                assert_eq!(selected, aggregate);
+            }
+
+            #[test]
+            fn next_block_aggregate_avoids_summing_disjoint_peaks_without_bypassing_stages() {
+                let pilot = sequential_block(|sequence| {
+                    let mut durations = [1_000_000; 3];
+                    durations[sequence as usize % 3] = 3_000_000;
+                    durations
+                });
+                let fitted = predictive_model(&pilot, &vec![pilot.clone(); 19]).unwrap();
+                let (serial, aggregate, selected) = fitted.bounds().unwrap();
+                // Every event takes 5ms; serial composition pays three 3ms
+                // peaks that belong to different events. Both remain bounds.
+                assert!((serial - 9.0).abs() < 1e-4);
+                assert!((aggregate - 5.0).abs() < 1e-4);
+                assert_eq!(selected, aggregate);
+                assert!(aggregate_conforms(&pilot, &fitted.aggregate));
+                assert!(
+                    fitted
+                        .pipeline
+                        .stages
+                        .iter()
+                        .enumerate()
+                        .all(|(index, stage)| service_conforms(&pilot, index, stage))
+                );
+                let redistributed = sequential_block(|_| [4_000_000, 0, 0]);
+                // A valid aggregate is insufficient: a changed internal
+                // bottleneck still fails the original capture-stage gate.
+                assert!(aggregate_conforms(&redistributed, &fitted.aggregate));
+                assert!(!service_conforms(
+                    &redistributed,
+                    0,
+                    &fitted.pipeline.stages[0]
+                ));
+                let mut invalid = fitted.clone();
+                invalid.aggregate.service_rate_events_per_ms =
+                    invalid.pipeline.arrival_rate_events_per_ms;
+                assert!(invalid.bounds().is_err());
+                invalid.aggregate.latency_ms = f64::NAN;
+                assert!(invalid.bounds().is_err());
             }
 
             fn next_block_identity() -> MeasurementIdentity {
@@ -1982,11 +2209,17 @@ mod live_measurement {
                     frozen_sha256: None,
                 };
                 verify_frozen_model(&frozen, &manifest, &validation_hashes).unwrap();
+                frozen.schema = "frankenterm.lindley-next-block-frozen.v1".into();
+                assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
+                frozen.schema = NEXT_BLOCK_SCHEMA.into();
                 assert!(verify_frozen_model(&frozen, &manifest, &training_hashes[..1]).is_err());
                 manifest.analyzer_source_revision = identity.source_revision.clone();
                 assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
                 manifest.analyzer_source_revision = analyzer.into();
-                frozen.model.stages[0].p99_latency_ms += 1.0;
+                frozen.model.aggregate.latency_ms += 1.0;
+                assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
+                frozen.model = predictive_model(&training[0], &training[1..]).unwrap();
+                frozen.model.pipeline.stages[0].p99_latency_ms += 1.0;
                 assert!(verify_frozen_model(&frozen, &manifest, &validation_hashes).is_err());
                 assert!(load_campaign_blocks(&references[..19], &identity, 20).is_err());
                 let mut duplicate = references[..20].to_vec();
