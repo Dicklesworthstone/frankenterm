@@ -84,5 +84,5 @@ MCP policy column: `mutation gate` means the tool calls
 
 Robot Mode has no mission lifecycle mutation (`pause`/`resume`/`abort`) even
 though MCP and the human CLI do. This is a gap, not a design decision, and is
-tracked separately; until it closes, Robot callers must use the human
+tracked in `ft-oi92j`; until it closes, Robot callers must use the human
 `ft mission` commands.
