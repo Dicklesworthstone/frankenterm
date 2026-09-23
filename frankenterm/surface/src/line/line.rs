@@ -2111,6 +2111,9 @@ pub const KP_BADNESS_INF: u64 = u64::MAX / 4;
 /// Terminal defaults for bounded monospace Knuth-Plass scoring.
 pub const KP_DEFAULT_LOOKAHEAD_LIMIT: usize = 64;
 pub const KP_DEFAULT_MAX_DP_STATES: usize = 8_192;
+// Bound the number of token positions scanned even when almost every candidate
+// endpoint is an illegal word break. Longer logical lines retain greedy wrap.
+const KP_MAX_DP_TOKENS: usize = 1_024;
 
 /// Scoring and complexity contract for bounded Knuth-Plass line breaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2197,7 +2200,8 @@ impl MonospaceKpCostModel {
             .saturating_add(tail)
     }
 
-    /// Whether the DP engine should fall back to deterministic greedy wrapping.
+    /// Whether the full token-pair upper bound exceeds the state budget.
+    /// Width and word boundaries can make the actual planner cheaper.
     pub const fn should_fallback(self, token_count: usize) -> bool {
         self.estimated_dp_states(token_count) > self.max_dp_states
     }
@@ -2456,11 +2460,16 @@ impl LineWrapGeometry {
             .max(n.checked_add(1)?.checked_mul(3)?)
             .max(4)
             .checked_add(scratch.capacity())?;
-        // Vec push growth rounds up geometrically. Twice n (at least eight)
-        // bounds each offset vector, including a cloned candidate's next push.
+        // Vec push growth rounds up geometrically. The planner keeps one
+        // predecessor per endpoint, rather than a copied path at every state.
         let offsets = n.checked_add(1)?.checked_mul(2)?.max(8);
-        let dp = cols != 0 && !cost_model.should_fallback(n);
-        let offset_vectors = if dp { n.checked_add(8)? } else { 8 };
+        let dp = cols != 0
+            && n <= KP_MAX_DP_TOKENS
+            && cost_model.max_dp_states > 0
+            && cost_model.lookahead_limit > 0;
+        // Greedy baseline, scored candidate, final plan, and two temporary
+        // paths for a rare exact scalar tie; eight vectors is conservative.
+        let offset_vectors = 8;
         let mut bytes = prefix
             .checked_mul(core::mem::size_of::<u128>())?
             .checked_add(
@@ -2471,7 +2480,7 @@ impl LineWrapGeometry {
         if dp {
             bytes = bytes.checked_add(
                 n.checked_add(1)?
-                    .checked_mul(core::mem::size_of::<Option<MonospaceBreakCandidate>>())?,
+                    .checked_mul(core::mem::size_of::<Option<MonospaceDpState>>())?,
             )?;
         }
         Some(bytes)
@@ -3433,8 +3442,57 @@ fn fallback_wrap_plan(
     }
 }
 
+#[derive(Clone, Copy)]
+struct MonospaceDpState {
+    total_cost: u64,
+    forced_breaks: usize,
+    max_line_badness: u64,
+    line_count: usize,
+    predecessor: usize,
+}
+
+fn dp_break_offsets(best: &[Option<MonospaceDpState>], mut end: usize) -> Option<Vec<usize>> {
+    let mut offsets = Vec::new();
+    while end > 0 {
+        offsets.push(end);
+        let predecessor = best.get(end)?.as_ref()?.predecessor;
+        if predecessor >= end {
+            return None;
+        }
+        end = predecessor;
+    }
+    offsets.reverse();
+    Some(offsets)
+}
+
+fn dp_candidate_better(
+    candidate: MonospaceDpState,
+    existing: MonospaceDpState,
+    end: usize,
+    best: &[Option<MonospaceDpState>],
+) -> bool {
+    let scalar = candidate
+        .total_cost
+        .cmp(&existing.total_cost)
+        .then(candidate.forced_breaks.cmp(&existing.forced_breaks))
+        .then(candidate.max_line_badness.cmp(&existing.max_line_badness))
+        .then(candidate.line_count.cmp(&existing.line_count));
+    if scalar != Ordering::Equal {
+        return scalar == Ordering::Less;
+    }
+    let Some(mut candidate_offsets) = dp_break_offsets(best, candidate.predecessor) else {
+        return false;
+    };
+    candidate_offsets.push(end);
+    let Some(mut existing_offsets) = dp_break_offsets(best, existing.predecessor) else {
+        return true;
+    };
+    existing_offsets.push(end);
+    candidate_offsets < existing_offsets
+}
+
 /// Compute a bounded DP wrap plan and deterministically fall back to greedy wrapping
-/// when the configured state budget would be exceeded.
+/// when the configured viable-transition or token-scan budget would be exceeded.
 #[cfg(test)]
 pub(crate) fn bounded_monospace_wrap_plan(
     tokens: &[Cell],
@@ -3462,34 +3520,38 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
     }
 
     let estimated_states = model.estimated_dp_states(token_count);
-    if width == 0 || model.should_fallback(token_count) {
+    if width == 0
+        || token_count > KP_MAX_DP_TOKENS
+        || model.max_dp_states == 0
+        || model.lookahead_limit == 0
+    {
         return fallback_wrap_plan(token_count, width, estimated_states, 0, width_prefix);
     }
 
     let mut evaluated_states = 0usize;
-    let mut best: Vec<Option<MonospaceBreakCandidate>> = vec![None; token_count + 1];
-    best[0] = Some(MonospaceBreakCandidate {
+    let mut best: Vec<Option<MonospaceDpState>> = vec![None; token_count + 1];
+    best[0] = Some(MonospaceDpState {
         total_cost: 0,
         forced_breaks: 0,
         max_line_badness: 0,
         line_count: 0,
-        break_offsets: vec![],
+        predecessor: 0,
     });
     // A bounded lookahead can omit feasible edges, including a full row
     // wider than lookahead_limit tokens. Keep greedy as a complete feasible
     // incumbent: searching fewer edges must never make the selected layout
     // worse. The normal candidate comparator retains all tie-break rules.
     let greedy_breaks = greedy_break_offsets_from_width_prefix(token_count, width, width_prefix);
-    best[token_count] = Some(evaluate_break_offsets_with_width_prefix(
+    let greedy = evaluate_break_offsets_with_width_prefix(
         token_count,
         &greedy_breaks,
         width,
         model,
         width_prefix,
-    ));
+    );
 
     for start in 0..token_count {
-        let Some(prefix) = best[start].clone() else {
+        let Some(prefix) = best[start] else {
             continue;
         };
 
@@ -3503,6 +3565,12 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
         #[allow(clippy::needless_range_loop)]
         for end in (start + 1)..=max_end {
             let line_width = width_prefix.width_between(start, end);
+            if line_width > width && end > start + 1 {
+                break;
+            }
+            if !width_prefix.allowed_word_break(start, end, width) {
+                continue;
+            }
             evaluated_states = evaluated_states.saturating_add(1);
             if evaluated_states > model.max_dp_states {
                 return fallback_wrap_plan(
@@ -3512,12 +3580,6 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
                     evaluated_states,
                     width_prefix,
                 );
-            }
-            if line_width > width && end > start + 1 {
-                break;
-            }
-            if !width_prefix.allowed_word_break(start, end, width) {
-                continue;
             }
 
             let is_last_line = end == token_count;
@@ -3545,19 +3607,17 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
                 )
             };
 
-            let mut break_offsets = prefix.break_offsets.clone();
-            break_offsets.push(end);
-            let candidate = MonospaceBreakCandidate {
+            let candidate = MonospaceDpState {
                 total_cost: prefix.total_cost.saturating_add(line_cost),
                 forced_breaks: prefix.forced_breaks.saturating_add(forced_break_inc),
                 max_line_badness: prefix.max_line_badness.max(line_cost),
                 line_count: prefix.line_count + 1,
-                break_offsets,
+                predecessor: start,
             };
 
-            match &best[end] {
+            match best[end] {
                 Some(existing) => {
-                    if compare_monospace_break_candidates(&candidate, existing) == Ordering::Less {
+                    if dp_candidate_better(candidate, existing, end, &best) {
                         best[end] = Some(candidate);
                     }
                 }
@@ -3570,20 +3630,32 @@ fn bounded_monospace_wrap_plan_with_width_prefix(
         }
     }
 
-    match best[token_count].take() {
-        Some(candidate) => MonospaceWrapPlan {
-            mode: MonospaceWrapMode::Dp,
-            break_offsets: candidate.break_offsets,
-            estimated_states,
-            evaluated_states,
-        },
-        None => fallback_wrap_plan(
-            token_count,
-            width,
-            estimated_states,
-            evaluated_states,
-            width_prefix,
-        ),
+    if let Some((state, break_offsets)) = best[token_count]
+        .and_then(|state| dp_break_offsets(&best, token_count).map(|offsets| (state, offsets)))
+    {
+        let candidate = MonospaceBreakCandidate {
+            total_cost: state.total_cost,
+            forced_breaks: state.forced_breaks,
+            max_line_badness: state.max_line_badness,
+            line_count: state.line_count,
+            break_offsets,
+        };
+        if compare_monospace_break_candidates(&candidate, &greedy) == Ordering::Less {
+            return MonospaceWrapPlan {
+                mode: MonospaceWrapMode::Dp,
+                break_offsets: candidate.break_offsets,
+                estimated_states,
+                evaluated_states,
+            };
+        }
+    }
+    // The DP search may not reach a complete row past its lookahead. The
+    // feasible greedy incumbent still counts as a completed bounded search.
+    MonospaceWrapPlan {
+        mode: MonospaceWrapMode::Dp,
+        break_offsets: greedy.break_offsets,
+        estimated_states,
+        evaluated_states,
     }
 }
 
@@ -5832,17 +5904,52 @@ mod tests {
     }
 
     #[test]
-    fn bounded_wrap_plan_falls_back_when_estimated_budget_exceeds_limit() {
+    fn bounded_wrap_plan_falls_back_when_viable_budget_exceeds_limit() {
         let mut model = MonospaceKpCostModel::terminal_default();
         model.max_dp_states = 8;
         let tokens = cells_from_text("abcdefghijklmnop");
         let plan = bounded_monospace_wrap_plan(&tokens, 4, model);
 
         assert_eq!(plan.mode, MonospaceWrapMode::Fallback);
-        assert_eq!(plan.evaluated_states, 0);
+        assert_eq!(plan.evaluated_states, model.max_dp_states + 1);
         assert_eq!(
             plan.break_offsets,
             greedy_break_offsets_from_tokens(&tokens, 4)
+        );
+    }
+
+    #[test]
+    fn long_unicode_logical_line_uses_bounded_word_aware_dp() {
+        let text = format!(
+            "{}tail",
+            "aaaa bbbb cccc dddddddd eeeeeeee 界 e\u{301} 🚀 ".repeat(16)
+        );
+        let model = MonospaceKpCostModel::terminal_default();
+        let line: Line = text.as_str().into();
+        let report = line.wrap_with_report(14, SEQ_ZERO, model);
+        let reconstructed: String = report
+            .lines
+            .iter()
+            .map(|row| row.as_str().into_owned())
+            .collect();
+        assert_eq!(reconstructed, text);
+        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Dp);
+        assert!(report.scorecard.estimated_states > model.max_dp_states);
+        assert!(report.scorecard.evaluated_states <= model.max_dp_states);
+        assert!(report.scorecard.selected_total_cost < report.scorecard.greedy_total_cost);
+        assert_eq!(report.scorecard.selected_forced_breaks, 0);
+    }
+
+    #[test]
+    fn long_opaque_token_retains_bounded_greedy_fallback() {
+        let text = "x".repeat(KP_MAX_DP_TOKENS + 1);
+        let line: Line = text.as_str().into();
+        let report = line.wrap_with_report(80, SEQ_ZERO, MonospaceKpCostModel::terminal_default());
+        assert_eq!(report.scorecard.mode, MonospaceWrapMode::Fallback);
+        assert_eq!(report.scorecard.evaluated_states, 0);
+        assert_eq!(
+            report.lines.iter().map(Line::len).sum::<usize>(),
+            text.len()
         );
     }
 
