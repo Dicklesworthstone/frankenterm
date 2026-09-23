@@ -2350,9 +2350,14 @@ impl LineWrapGeometry {
             if width > 2 || result.widths.len() == result.widths.capacity() {
                 return None;
             }
-            result
-                .widths
-                .push(width as u8 | if cell.str() == " " { 0x80 } else { 0 });
+            result.widths.push(
+                width as u8
+                    | if is_wrap_separator(cell.str()) {
+                        0x80
+                    } else {
+                        0
+                    },
+            );
             // Preserve the source borrow beyond this temporary CellRef so the
             // next token can certify its boundary against the previous one.
             let text = match cell {
@@ -3172,6 +3177,13 @@ fn memoized_wrap_point_cache_key_hits_for_test(
         .hits_for_key(key)
 }
 
+// Only these standalone graphemes are separators for this narrow terminal
+// policy. Do not collapse bytes or classify controls, nonbreaking spaces,
+// joiners, or a space decorated with combining marks as interchangeable glue.
+fn is_wrap_separator(grapheme: &str) -> bool {
+    matches!(grapheme, " " | "\u{2003}")
+}
+
 /// Reusable prefix-width storage for resize-time line wrapping.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LineWrapWidthPrefixScratch {
@@ -3209,7 +3221,11 @@ impl LineWrapWidthPrefixScratch {
     }
 
     fn rebuild(&mut self, tokens: &[Cell]) {
-        self.rebuild_metadata(tokens.iter().map(|cell| (cell.width(), cell.str() == " ")));
+        self.rebuild_metadata(
+            tokens
+                .iter()
+                .map(|cell| (cell.width(), is_wrap_separator(cell.str()))),
+        );
     }
 
     fn rebuild_metadata(&mut self, widths: impl ExactSizeIterator<Item = (usize, bool)>) {
@@ -3336,7 +3352,7 @@ fn compute_wrap_geometry_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16]
             cell.compute_shape_hash(&mut hasher);
         }
         cell.width().hash(&mut hasher);
-        (cell.str() == " ").hash(&mut hasher);
+        is_wrap_separator(cell.str()).hash(&mut hasher);
     }
     hasher.finish128().as_bytes()
 }
@@ -3743,6 +3759,108 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use frankenterm_cell::{Cell, CellAttributes, SemanticType};
+
+    #[test]
+    fn em_space_wrap_preserves_words_bytes_and_geometry() {
+        for fallback in [false, true] {
+            let mut model = MonospaceKpCostModel::terminal_default();
+            if fallback {
+                model.max_dp_states = 0;
+            }
+            for separator in [" ", "\u{2003}"] {
+                let text = format!("aa{separator}bbbb");
+                let line = Line::from_text(&text, &CellAttributes::default(), 7, None);
+                let geometry = LineWrapGeometry::capture(&line, 4096).unwrap();
+                let report = line.wrap_with_report(6, 7, model);
+                let rows: Vec<String> = report
+                    .lines
+                    .iter()
+                    .map(|row| row.as_str().into_owned())
+                    .collect();
+                assert_eq!(rows, [format!("aa{separator}"), "bbbb".to_owned()]);
+                assert_eq!(rows.concat(), text);
+                assert_eq!(
+                    geometry.row_count(6, model, &mut LineWrapWidthPrefixScratch::default()),
+                    rows.len()
+                );
+                assert_eq!(
+                    report.scorecard.mode,
+                    if fallback {
+                        MonospaceWrapMode::Fallback
+                    } else {
+                        MonospaceWrapMode::Dp
+                    }
+                );
+            }
+            for separator in ["\u{a0}", "\u{202f}", "\u{2007}"] {
+                let text = format!("x aa{separator}bb");
+                let line = Line::from_text(&text, &CellAttributes::default(), 7, None);
+                let geometry = LineWrapGeometry::capture(&line, 4096).unwrap();
+                let report = line.wrap_with_report(5, 7, model);
+                let rows: Vec<String> = report
+                    .lines
+                    .iter()
+                    .map(|row| row.as_str().into_owned())
+                    .collect();
+                assert_eq!(rows, ["x ".to_owned(), format!("aa{separator}bb")]);
+                assert_eq!(rows.concat(), text);
+                assert_eq!(
+                    geometry.row_count(5, model, &mut LineWrapWidthPrefixScratch::default()),
+                    rows.len()
+                );
+            }
+        }
+        for nonseparator in [
+            "",
+            "\t",
+            "\n",
+            "\r",
+            "\u{200b}",
+            "\u{2060}",
+            " \u{301}",
+            "\u{2003}\u{301}",
+        ] {
+            assert!(!is_wrap_separator(nonseparator), "{nonseparator:?}");
+        }
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn em_space_wrap_cache_separates_equal_width_nonseparators() {
+        let _guard = memoized_wrap_point_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        memoized_wrap_point_cache_clear_for_test();
+        for fallback in [false, true] {
+            let mut model = MonospaceKpCostModel::terminal_default();
+            if fallback {
+                model.max_dp_states = 0;
+            }
+            let breaking = Line::from_text("aa\u{2003}bbbb", &CellAttributes::default(), 7, None);
+            let breaking_key = memoized_wrap_point_cache_key_for_test(&breaking, 6, model).unwrap();
+            let report = breaking.clone().wrap_with_report(6, 7, model);
+            assert_eq!(report.lines[1].as_str(), "bbbb");
+            assert!(memoized_wrap_point_cache_entry_for_test(&breaking, 6, model).is_some());
+            for separator in ["X", "\u{a0}", "\u{202f}", "\u{2007}"] {
+                let text = format!("aa{separator}bbbb");
+                let other = Line::from_text(&text, &CellAttributes::default(), 7, None);
+                let other_key = memoized_wrap_point_cache_key_for_test(&other, 6, model).unwrap();
+                assert_ne!(breaking_key, other_key);
+                let report = other.wrap_with_report(6, 7, model);
+                let rows: Vec<String> = report
+                    .lines
+                    .iter()
+                    .map(|row| row.as_str().into_owned())
+                    .collect();
+                // This indivisible seven-column run exceeds the six-column
+                // grid. Emergency splitting must not borrow the EM SPACE plan.
+                assert_eq!(rows, [format!("aa{separator}bbb"), "b".to_owned()]);
+                assert_eq!(rows.concat(), text);
+            }
+            let report = breaking.wrap_with_report(6, 7, model);
+            assert_eq!(report.lines[1].as_str(), "bbbb");
+        }
+    }
 
     #[test]
     fn visible_text_bytes_matches_cell_accounting_across_storage_and_edits() {
