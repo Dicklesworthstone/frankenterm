@@ -26,11 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.17`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.18`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.17` carries forward the release-candidate fixes below and adds selection, overlay and guardian corrections. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+Version `0.15.18` carries forward the release-candidate fixes below and adds selection, overlay and guardian corrections. Publication and new native artifact qualification remain pending; diagnostic models do not establish release acceptance or measured performance gains.
+
+- Selection-anchor failures retain their capture, resolve or release operation identity, affected pane, mutation outcome and retry policy across wire and CLI error handling. Known requests no longer degrade to an unknown-operation error.
 
 - Remote selection adds negotiated server-owned anchors. Intermediate remote panes forward capture, resolution and layout-fenced copying to the terminal owner, retaining the original request across delayed replies and resize. Pending anchors share the existing capacity limit; release, expiry and disconnect retire their downstream work. Copying uncached history validates exact rows and connection identity before publication. Older servers retain ordinary selection without this reflow persistence. Nested forwarding tests and native acceptance remain pending.
 
