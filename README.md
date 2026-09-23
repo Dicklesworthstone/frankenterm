@@ -904,7 +904,7 @@ curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz
 curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
 ```
 
-- `/stream/events` streams live `EventBus` traffic as `text/event-stream`.
+- `/stream/events` streams live `EventBus` traffic as `text/event-stream`. A standalone `ft web` runs no capture pipeline, so it tails detections a watcher persists to the same database (every 250 ms; `FT_WEB_STORAGE_TAIL=0` turns the tail off). `ft watch --web [--web-port N]` serves the same API from inside the watcher on its live bus, so events arrive at publish time. A client that falls behind receives a `lag` frame with the missed count instead of a silent gap.
 - `/stream/deltas` streams redacted pane output deltas and gap markers from storage.
 - `max_hz` bounds fan-out rate; `pane_id` narrows to one pane; `channel` accepts `all`, `deltas`, `detections`, or `signals`.
 
@@ -1068,7 +1068,9 @@ curl -N http://127.0.0.1:8000/stream/events
 curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
 ```
 
-Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, and redact secret material before emission.
+Streaming query parameters: `pane_id` filters to one pane; `max_hz` caps delivery rate for backpressure control; `/stream/events` also accepts `channel=all|deltas|detections|signals`. Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, emit `lag` frames when a slow client misses events, and redact secret material before emission.
+
+`/stream/events` has two event sources. Standalone `ft web` tails detections that a watcher persists to the same database (250 ms poll; `FT_WEB_STORAGE_TAIL=0` disables it). `ft watch --web [--web-port N]` runs the API inside the watcher and streams its live event bus directly, with no polling delay.
 
 `ft web` runs no capture pipeline of its own. `/stream/events` is fed by a storage tail: the server follows newly persisted `events` rows written by the watcher (another process) and republishes them on its in-process bus, so a detection reaches SSE clients within one poll interval (250 ms) after `ft watch` stores it. The tail starts after the newest existing row, so a restart never replays history. Embedders that publish to the same bus in-process can disable it with `WebServerConfig::with_storage_event_tail(false)`.
 
