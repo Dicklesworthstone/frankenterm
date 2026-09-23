@@ -385,6 +385,108 @@ mod tests {
         }
     }
 
+    fn stored_detection(pane_id: u64, rule_id: &str) -> crate::storage::StoredEvent {
+        crate::storage::StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: rule_id.to_string(),
+            agent_type: "codex".to_string(),
+            event_type: "usage_limit".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.95,
+            extracted: None,
+            matched_text: Some("Usage limit reached".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: None,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    /// ft-zeo5o: a detection persisted by another process (here: written
+    /// straight to storage) must reach the web server's bus, while history
+    /// that predates the tail is never replayed.
+    #[test]
+    fn storage_event_tail_republishes_new_rows_but_not_history() {
+        use crate::events::{Event, EventBus};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tail.db");
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 7,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
+            let history_id = storage
+                .record_event(stored_detection(7, "codex.usage.history"))
+                .await
+                .unwrap();
+
+            let bus = Arc::new(EventBus::new(16));
+            let mut subscriber = bus.subscribe();
+            let cx = crate::cx::for_testing();
+            let tail = super::spawn_storage_event_tail(
+                &cx,
+                storage.clone(),
+                Arc::clone(&bus),
+                Duration::from_millis(20),
+                8,
+            )
+            .await;
+
+            let live_id = storage
+                .record_event(stored_detection(7, "codex.usage.reached"))
+                .await
+                .unwrap();
+            assert!(live_id > history_id);
+
+            let event = crate::runtime_async::timeout(Duration::from_secs(10), subscriber.recv())
+                .await
+                .expect("the tail must republish a newly persisted row")
+                .expect("bus delivers the event");
+            match event {
+                Event::PatternDetected {
+                    pane_id, event_id, ..
+                } => {
+                    assert_eq!(pane_id, 7);
+                    assert_eq!(
+                        event_id,
+                        Some(live_id),
+                        "history (id {history_id}) must never be replayed"
+                    );
+                }
+                other => panic!("expected PatternDetected, got {other:?}"),
+            }
+
+            let _ = tail.into_task().await;
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     #[test]
     fn validate_bind_config_allows_localhost() {
         let config = WebServerConfig::default();
