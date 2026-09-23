@@ -3640,7 +3640,7 @@ mod tests {
 
         let mut assigned_cycles = 0;
         let mut storm_fired = false;
-        for cycle in 1..=20_u64 {
+        for cycle in 1..=20_i64 {
             let decision = ml.evaluate(
                 cycle * 1000,
                 MissionTrigger::CadenceTick,
