@@ -895,34 +895,80 @@ impl super::TermWindow {
 
     fn capture_native_selection(
         pane: &Arc<dyn Pane>,
-        local: &mux::localpane::LocalPane,
-        desired: &Selection,
+        pending: &mut crate::selection::PendingNativeSelection,
     ) -> crate::selection::NativeSelectionCapture {
-        use crate::selection::NativeSelectionCapture;
-        let Some((authority, _, dimensions)) = SelectionAuthority::capture_source(&**pane) else {
-            return NativeSelectionCapture::Busy;
-        };
-        if desired.authority != Some(authority) {
-            return NativeSelectionCapture::Invalidated;
+        use crate::selection::{NativeSelectionCapture, PendingLocalSelectionCapture};
+        use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
+
+        if pending.local_capture.is_none() {
+            let Some((authority, _, dimensions)) = SelectionAuthority::capture_source(&**pane)
+            else {
+                return NativeSelectionCapture::Busy;
+            };
+            if pending.desired.authority != Some(authority) {
+                return NativeSelectionCapture::Invalidated;
+            }
+            pending.local_capture = Some(PendingLocalSelectionCapture {
+                dimensions,
+                state: None,
+            });
         }
-        let captured = local.capture_selection_anchor(
-            authority.layout_floor(),
-            desired.seqno,
-            dimensions,
-            desired.native_points(),
+        let capture = pending.local_capture.as_mut().unwrap();
+        let result = pane.capture_selection_anchor_capability(
+            pending.desired.seqno,
+            capture.dimensions,
+            pending.desired.native_points(),
+            &mut capture.state,
         );
-        if matches!(captured, Ok(None)) {
-            log::debug!(
-                target: "frankenterm_gui::selection_anchor",
-                "capture_unremappable pane={} floor={} sequence={} cols={} points={:?}",
-                pane.pane_id(),
-                authority.layout_floor(),
-                desired.seqno,
-                dimensions.cols,
-                desired.native_points()
-            );
+        match result {
+            Ok(Status::Pending) => {
+                if capture.state.is_none() {
+                    pending.local_capture = None;
+                }
+                NativeSelectionCapture::Busy
+            }
+            Ok(Status::Captured) => {
+                let token = pending
+                    .local_capture
+                    .take()
+                    .and_then(|capture| capture.state)
+                    .and_then(|state| {
+                        state
+                            .downcast::<wezterm_term::screen::ScreenSelectionAnchor>()
+                            .ok()
+                    });
+                match token {
+                    Some(token) => NativeSelectionCapture::Ready(*token),
+                    None => NativeSelectionCapture::Invalidated,
+                }
+            }
+            Err(Error::Busy) => {
+                // No admitted owner means the next attempt must revalidate
+                // the original pane authority, not reuse stale dimensions.
+                if capture.state.is_none() {
+                    pending.local_capture = None;
+                }
+                NativeSelectionCapture::Busy
+            }
+            Err(error) => {
+                if error == Error::Unsupported {
+                    log::debug!(
+                        target: "frankenterm_gui::selection_anchor",
+                        "capture_unremappable pane={} sequence={} cols={} points={:?}",
+                        pane.pane_id(),
+                        pending.desired.seqno,
+                        capture.dimensions.cols,
+                        pending.desired.native_points()
+                    );
+                }
+                pending.local_capture = None;
+                match error {
+                    Error::Unsupported => NativeSelectionCapture::Unremappable,
+                    Error::SourceChanged => NativeSelectionCapture::Invalidated,
+                    Error::Busy => unreachable!(),
+                }
+            }
         }
-        captured.into()
     }
 
     fn commit_selection_candidate(&self, pane: &Arc<dyn Pane>, desired: Selection) {
@@ -1032,8 +1078,8 @@ impl super::TermWindow {
             }
         }
         let local = pane.downcast_ref::<mux::localpane::LocalPane>();
-        let capture = if let Some(local) = local {
-            Self::capture_native_selection(pane, local, &pending.desired)
+        let capture = if local.is_some() {
+            Self::capture_native_selection(pane, &mut pending)
         } else if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
             use crate::selection::NativeSelectionCapture;
             if let Some(token) = pending.desired.remote_anchor() {
@@ -3047,7 +3093,6 @@ mod tests {
             }
         }
         let _child = RetireChild(Arc::clone(&pane));
-        let local = pane.downcast_ref::<mux::localpane::LocalPane>().unwrap();
         let (authority, sequence, dimensions) = SelectionAuthority::capture_source(&*pane).unwrap();
         let mut desired = Selection::default();
         desired.seqno = sequence;
@@ -3056,15 +3101,12 @@ mod tests {
             start: SelectionCoordinate::x_y(0, 0),
             end: SelectionCoordinate::x_y(14, 1),
         });
-        let token = local
-            .capture_selection_anchor(
-                authority.layout_floor(),
-                sequence,
-                dimensions,
-                desired.native_points(),
-            )
-            .unwrap()
-            .unwrap();
+        let mut pending = crate::selection::PendingNativeSelection::new(desired.clone());
+        let token = match TermWindow::capture_native_selection(&pane, &mut pending) {
+            crate::selection::NativeSelectionCapture::Ready(token) => token,
+            _ => panic!("the resident fixture must capture a native selection"),
+        };
+        assert!(pending.local_capture.is_none());
         desired.remember_native_anchor(token);
         let mut copy = SelectionCopy::new(&desired, sequence).unwrap();
 

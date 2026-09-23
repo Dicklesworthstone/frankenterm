@@ -116,10 +116,27 @@ pub(crate) struct PendingNativeSelection {
     pub paint_retries_remaining: u8,
     pub committed: bool,
     pub text_copy: Option<crate::termwindow::SelectionCopy>,
+    /// Owns one native cold capture until it resolves or this gesture is
+    /// superseded. Dropping the opaque state cancels only this request.
+    pub local_capture: Option<PendingLocalSelectionCapture>,
     pub remote_capture: Option<frankenterm_client::pane::RemoteSelectionCapture>,
     pub remote_motion: Option<PendingRemoteSelectionMotion>,
     pub replay_scheduled: bool,
     pub identity: Arc<()>,
+}
+
+pub(crate) struct PendingLocalSelectionCapture {
+    pub dimensions: mux::renderable::RenderableDimensions,
+    pub state: Option<mux::pane::PaneSelectionAnchor>,
+}
+
+impl std::fmt::Debug for PendingLocalSelectionCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLocalSelectionCapture")
+            .field("dimensions", &self.dimensions)
+            .field("owns_backend_request", &self.state.is_some())
+            .finish()
+    }
 }
 
 /// One coalesced endpoint while a remote anchor RPC owns the original gesture.
@@ -214,6 +231,7 @@ impl PendingNativeSelection {
             paint_retries_remaining: 3,
             committed: false,
             text_copy: None,
+            local_capture: None,
             remote_capture: None,
             remote_motion: None,
             replay_scheduled: false,
