@@ -675,18 +675,9 @@ impl crate::TermWindow {
             let sel = self
                 .selection(pos.pane.pane_id())
                 .ok_or_else(|| anyhow::anyhow!("GUI pane state admission is pending"))?;
-            // Copy/search overlays deliberately keep the delegate pane's
-            // selection authority, matching the dirty-invalidation exemption.
-            let delegate_overlay = pos
-                .pane
-                .downcast_ref::<crate::overlay::copy::CopyOverlay>()
-                .is_some()
-                || pos
-                    .pane
-                    .downcast_ref::<crate::overlay::quickselect::QuickSelectOverlay>()
-                    .is_some();
-            let remote_pixels_ready = pos
-                .pane
+            // Decorations must obey the underlying terminal's layout and
+            // row-revision fences just like an undecorated pane.
+            let remote_pixels_ready = crate::selection::selection_source_pane(&*pos.pane)
                 .downcast_ref::<frankenterm_client::pane::ClientPane>()
                 .is_none_or(|client| {
                     let Some(range) = sel.range else {
@@ -713,10 +704,7 @@ impl crate::TermWindow {
                 });
             (
                 (remote_pixels_ready
-                    && (delegate_overlay
-                        || sel.is_authorized_by(
-                            selection_frame_before.map(|frame| frame.authority),
-                        )))
+                    && sel.is_authorized_by(selection_frame_before.map(|frame| frame.authority)))
                 .then_some(sel.range)
                 .flatten(),
                 sel.rectangular,

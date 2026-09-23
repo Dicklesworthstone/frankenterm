@@ -7034,7 +7034,8 @@ const SELECTION_OPERATION_WINDOW: u64 = 4096;
 struct RemoteSelectionAnchor {
     request: codec::CaptureSelectionAnchorV1,
     registration: PaneRegistrationHandle,
-    token: wezterm_term::screen::ScreenSelectionAnchor,
+    token: Option<mux::pane::PaneSelectionAnchor>,
+    captured: bool,
     renewed: Instant,
 }
 
@@ -7082,33 +7083,35 @@ impl RemoteSelectionAnchors {
         self.reap(now);
         let id = request.operation_id;
         if let Some(entry) = self.active.get(&id) {
-            return if entry.request == request
-                && entry.registration.wire_identity() == registration.wire_identity()
+            if entry.request != request
+                || entry.registration.wire_identity() != registration.wire_identity()
             {
-                Outcome::Captured
-            } else {
-                Outcome::SourceChanged
-            };
-        }
-        if id == 0
-            || id <= self.high_water.saturating_sub(SELECTION_OPERATION_WINDOW)
-            || self.retired.contains(&id)
-        {
-            return Outcome::SourceChanged;
-        }
-        if self.active.len() >= MAX_REMOTE_SELECTION_ANCHORS {
-            return Outcome::Capacity;
-        }
-        let (floor, dimensions) = match pane.get_line_layout() {
-            Ok(Some(layout)) => layout,
-            Ok(None) => return Outcome::Unsupported,
-            Err(_) => return Outcome::Busy,
-        };
-        if floor > request.layout.seqno
-            || request.layout.seqno > pane.get_current_seqno()
-            || !mux::renderable::same_line_layout_geometry(&dimensions, &request.layout.dimensions)
-        {
-            return Outcome::SourceChanged;
+                return Outcome::SourceChanged;
+            }
+            if entry.captured {
+                return Outcome::Captured;
+            }
+        } else {
+            if id == 0
+                || id <= self.high_water.saturating_sub(SELECTION_OPERATION_WINDOW)
+                || self.retired.contains(&id)
+            {
+                return Outcome::SourceChanged;
+            }
+            if self.active.len() >= MAX_REMOTE_SELECTION_ANCHORS {
+                return Outcome::Capacity;
+            }
+            self.retire(id);
+            self.active.insert(
+                id,
+                RemoteSelectionAnchor {
+                    request: request.clone(),
+                    registration: registration.clone(),
+                    token: None,
+                    captured: false,
+                    renewed: now,
+                },
+            );
         }
         let points = request.points.map(|point| {
             point.map(|point| wezterm_term::screen::SelectionAnchorCoordinate {
@@ -7116,23 +7119,28 @@ impl RemoteSelectionAnchors {
                 row: point.row,
             })
         });
-        match pane.capture_selection_anchor(floor, request.layout.seqno, dimensions, points) {
-            None | Some(Ok(None)) => Outcome::Unsupported,
-            Some(Err(mux::localpane::SelectionAnchorCaptureError::Busy)) => Outcome::Busy,
-            Some(Err(mux::localpane::SelectionAnchorCaptureError::SourceChanged)) => {
+        let Some(entry) = self.active.get_mut(&id) else {
+            return Outcome::SourceChanged;
+        };
+        use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
+        match pane.capture_selection_anchor_capability(
+            request.layout.seqno,
+            request.layout.dimensions,
+            points,
+            &mut entry.token,
+        ) {
+            Ok(Status::Pending) | Err(Error::Busy) => Outcome::Busy,
+            Err(Error::Unsupported) => {
+                self.active.remove(&id);
+                Outcome::Unsupported
+            }
+            Err(Error::SourceChanged) => {
+                self.active.remove(&id);
                 Outcome::SourceChanged
             }
-            Some(Ok(Some(token))) => {
-                self.retire(id);
-                self.active.insert(
-                    id,
-                    RemoteSelectionAnchor {
-                        request,
-                        registration: registration.clone(),
-                        token,
-                        renewed: now,
-                    },
-                );
+            Ok(Status::Captured) => {
+                entry.captured = true;
+                entry.renewed = now;
                 Outcome::Captured
             }
         }
@@ -7155,13 +7163,17 @@ impl RemoteSelectionAnchors {
         {
             return Outcome::SourceChanged;
         }
-        match pane.selection_anchor_snapshot(&entry.token) {
-            None => Outcome::Unsupported,
-            Some(None) => {
+        let Some(token) = entry.token.as_ref().filter(|_| entry.captured) else {
+            return Outcome::Busy;
+        };
+        use mux::pane::PaneSelectionAnchorError as Error;
+        match pane.selection_anchor_capability_snapshot(token) {
+            Err(Error::Unsupported) => Outcome::Unsupported,
+            Ok(None) | Err(Error::Busy) => {
                 entry.renewed = now;
                 Outcome::Busy
             }
-            Some(Some((layout_floor, sequence, dimensions, Some(points)))) => {
+            Ok(Some((layout_floor, sequence, dimensions, Some(points)))) => {
                 entry.renewed = now;
                 Outcome::Snapshot {
                     layout_floor,
@@ -7175,7 +7187,7 @@ impl RemoteSelectionAnchors {
                     }),
                 }
             }
-            Some(Some((_, _, _, None))) => {
+            Ok(Some((_, _, _, None))) | Err(Error::SourceChanged) => {
                 self.active.remove(&request.operation_id);
                 Outcome::SourceChanged
             }
@@ -8376,6 +8388,15 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
+                let resize_profile_started =
+                    log::log_enabled!(target: "mux::resize_profile", log::Level::Debug)
+                        .then(Instant::now);
+                if resize_profile_started.is_some() {
+                    log::debug!(target: "mux::resize_profile",
+                        "resize_server_received serial={} pane_id={} tab_id={} target={}x{} pixels={}x{} dpi={}",
+                        serial, pane_id, containing_tab_id, size.cols, size.rows,
+                        size.pixel_width, size.pixel_height, size.dpi);
+                }
                 let Some(pane_authority) =
                     capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
@@ -8384,13 +8405,25 @@ impl SessionHandler {
                 schedule_main_thread_rpc(
                     MainThreadServiceClass::Topology,
                     MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
-                    |send_response| async move {
+                    move |send_response| async move {
+                        if let Some(started) = resize_profile_started {
+                            log::debug!(target: "mux::resize_profile",
+                                "resize_server_dispatch serial={} pane_id={} target={}x{} dispatch_wait_us={}",
+                                serial, pane_id, size.cols, size.rows, started.elapsed().as_micros());
+                        }
                         catch(
                             move || {
-                                pane_authority.try_with_pane(|pane| {
+                                let result = pane_authority.try_with_pane(|pane| {
                                     pane.resize_in_tab(containing_tab_id, size)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
-                                })
+                                });
+                                if let Some(started) = resize_profile_started {
+                                    log::debug!(target: "mux::resize_profile",
+                                        "resize_server_reply serial={} pane_id={} target={}x{} elapsed_us={} outcome={} completion_scope=enqueue_ack_not_reflow",
+                                        serial, pane_id, size.cols, size.rows, started.elapsed().as_micros(),
+                                        if result.is_ok() { "queued_ack" } else { "rejected" });
+                                }
+                                result
                             },
                             send_response,
                         );
@@ -9342,6 +9375,76 @@ impl SessionHandler {
                             send_response(Err(anyhow!("cold read worker capacity exhausted")));
                             return;
                         };
+                        if let Some(layout) = layout {
+                            use mux::pane::PaneSelectionAnchorError as Error;
+                            let mut state = None;
+                            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                            loop {
+                                let read = recover_line_read_callback(|| {
+                                    with_current_pane(&authority, &registration, |pane| {
+                                        Ok(pane.read_lines_at_layout_capability(
+                                            layout.seqno,
+                                            layout.dimensions,
+                                            &lines,
+                                            &mut state,
+                                        ))
+                                    })
+                                });
+                                match read {
+                                    Ok(Err(Error::Unsupported)) if state.is_none() => break,
+                                    Ok(Ok(Some(rows))) => {
+                                        let Some(state) = state.as_ref() else {
+                                            send_response(Err(anyhow!(
+                                                "missing forwarded read witness"
+                                            )));
+                                            return;
+                                        };
+                                        let mut payload = Some(rows.into());
+                                        let mut attempted = false;
+                                        let published = recover_line_read_callback(|| {
+                                            with_current_pane(&authority, &registration, |pane| {
+                                                Ok(pane.publish_lines_at_layout_capability(state, &mut || {
+                                                if let Some(lines) = payload.take() {
+                                                    attempted = true;
+                                                    send_response(Ok(Pdu::GetLinesAtLayoutResponse(
+                                                        codec::GetLinesAtLayoutResponse { pane_id, layout, lines },
+                                                    )));
+                                                }
+                                                }))
+                                            })
+                                        });
+                                        if let Some(timing) = &mut timing {
+                                            timing.outcome = if attempted {
+                                                "success"
+                                            } else {
+                                                "source_changed"
+                                            };
+                                        }
+                                        if !attempted {
+                                            send_response(Err(anyhow!(
+                                                "forwarded line publication refused: {published:?}"
+                                            )));
+                                        }
+                                        return;
+                                    }
+                                    Ok(Ok(None) | Err(Error::Busy))
+                                        if Instant::now() < deadline =>
+                                    {
+                                        promise::spawn::sleep(std::time::Duration::from_millis(10))
+                                            .await;
+                                    }
+                                    other => {
+                                        if let Some(timing) = &mut timing {
+                                            timing.outcome = "forwarded_read_refused";
+                                        }
+                                        send_response(Err(anyhow!(
+                                            "forwarded line read refused: {other:?}"
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let _cancel = CancelLineReadOnDrop(Arc::clone(&cancelled));
                         let cancellation = SessionLineReadCancellation {
@@ -10626,6 +10729,117 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn remote_selection_anchor_pending_capacity_release_and_expiry_under_real_contention() {
+        use codec::SelectionAnchorCaptureOutcomeV1 as Outcome;
+        struct HoldTerminal {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl mux::pane::WithPaneLines for HoldTerminal {
+            fn with_lines_mut(&mut self, _: StableRowIndex, _: &mut [&mut Line]) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release actual terminal contention");
+            }
+        }
+        let owner = Arc::new(Mux::new(None));
+        let (pane, _child_guard) = real_selection_pane(987);
+        owner.add_pane(&pane).unwrap();
+        let registration = owner.capture_pane_registration(&pane).unwrap();
+        let (_, dimensions) = pane.get_line_layout().unwrap().unwrap();
+        let base = codec::CaptureSelectionAnchorV1 {
+            pane_id: 987,
+            operation_id: 1,
+            layout: codec::LineReadLayout {
+                seqno: pane.get_current_seqno(),
+                dimensions,
+            },
+            points: [
+                Some(codec::SelectionAnchorPointV1 {
+                    column: Some(2),
+                    row: 0,
+                }),
+                None,
+                None,
+            ],
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_pane = Arc::clone(&pane);
+        let holding = std::thread::spawn(move || {
+            held_pane.with_lines_mut(
+                0..1,
+                &mut HoldTerminal {
+                    entered: entered_tx,
+                    release: release_rx,
+                },
+            );
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let now = Instant::now();
+        let mut anchors = RemoteSelectionAnchors::default();
+        registration
+            .try_with_current(|current| {
+                for id in 1..=16 {
+                    let mut request = base.clone();
+                    request.operation_id = id;
+                    assert_eq!(
+                        anchors.capture(request, &registration, &current, now),
+                        Outcome::Busy
+                    );
+                }
+                assert_eq!(anchors.active.len(), MAX_REMOTE_SELECTION_ANCHORS);
+                assert!(anchors.active.values().all(|entry| !entry.captured));
+                let mut excess = base.clone();
+                excess.operation_id = 17;
+                assert_eq!(
+                    anchors.capture(excess, &registration, &current, now),
+                    Outcome::Capacity
+                );
+                assert!(anchors.release(&codec::ReleaseSelectionAnchorV1 {
+                    pane_id: 987,
+                    operation_id: 1
+                }));
+                assert_eq!(
+                    anchors.capture(base.clone(), &registration, &current, now),
+                    Outcome::SourceChanged
+                );
+                let almost_expired =
+                    now + std::time::Duration::from_secs(codec::SELECTION_ANCHOR_LIFETIME_SECS - 1);
+                let mut retry = base.clone();
+                retry.operation_id = 2;
+                assert_eq!(
+                    anchors.capture(retry, &registration, &current, almost_expired),
+                    Outcome::Busy
+                );
+                anchors.reap(
+                    now + std::time::Duration::from_secs(codec::SELECTION_ANCHOR_LIFETIME_SECS),
+                );
+                assert!(
+                    anchors.active.is_empty(),
+                    "pending Busy retries must not renew abandoned leases"
+                );
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+        holding.join().unwrap();
+        let mut fresh = base;
+        fresh.operation_id = 18;
+        registration
+            .try_with_current(|current| {
+                assert_eq!(
+                    anchors.capture(fresh, &registration, &current, now),
+                    Outcome::Captured
+                );
+            })
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_selection_anchor_capacity_out_of_order_expiry_and_cancellation() {
         use codec::SelectionAnchorCaptureOutcomeV1 as Outcome;
         let owner = Arc::new(Mux::new(None));
@@ -10705,6 +10919,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_selection_anchor_capture_tolerates_unrelated_scrollback_growth() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        // Actions require a live scheduler; another test's dropped executor
+        // leaves a retired binding installed and must not supply our authority.
+        let _executor = SimpleExecutor::new();
         let owner = Arc::new(Mux::new(None));
         let (pane, _child_guard) = real_selection_pane(984);
         owner.add_pane(&pane).unwrap();
@@ -10753,6 +10971,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_selection_anchor_current_alt_screen_is_unremappable_not_stale() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _executor = SimpleExecutor::new();
         let owner = Arc::new(Mux::new(None));
         let (pane, _child_guard) = real_selection_pane(985);
         owner.add_pane(&pane).unwrap();
@@ -10798,6 +11018,8 @@ mod tests {
         use codec::{
             SelectionAnchorCaptureOutcomeV1 as Capture, SelectionAnchorResolveOutcomeV1 as Resolve,
         };
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let _executor = SimpleExecutor::new();
         let owner = Arc::new(Mux::new(None));
         let (pane, _child_guard) = real_selection_pane(983);
         owner.add_pane(&pane).unwrap();

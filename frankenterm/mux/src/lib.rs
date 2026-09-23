@@ -4345,17 +4345,6 @@ mod pane_registration_handle {
         }
     }
 
-    pub type LocalSelectionAnchorCapture = Result<
-        Option<frankenterm_term::screen::ScreenSelectionAnchor>,
-        crate::localpane::SelectionAnchorCaptureError,
-    >;
-    pub type LocalSelectionAnchorSnapshot = (
-        termwiz::surface::SequenceNo,
-        termwiz::surface::SequenceNo,
-        crate::renderable::RenderableDimensions,
-        Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
-    );
-
     /// Restricted view of one exact live pane registration.
     ///
     /// The underlying mux and pane references are intentionally private.  In
@@ -4460,27 +4449,48 @@ mod pane_registration_handle {
             self.pane.get_current_working_dir(policy)
         }
 
-        /// Only the terminal owner can mint an anchor. Nested remote panes
-        /// deliberately have no local token authority.
-        pub fn capture_selection_anchor(
+        pub fn capture_selection_anchor_capability(
             &self,
-            floor: termwiz::surface::SequenceNo,
             sequence: termwiz::surface::SequenceNo,
             dimensions: crate::renderable::RenderableDimensions,
             points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
-        ) -> Option<LocalSelectionAnchorCapture> {
+            state: &mut Option<crate::pane::PaneSelectionAnchor>,
+        ) -> Result<crate::pane::PaneSelectionAnchorStatus, crate::pane::PaneSelectionAnchorError>
+        {
             self.pane
-                .downcast_ref::<crate::localpane::LocalPane>()
-                .map(|pane| pane.capture_selection_anchor(floor, sequence, dimensions, points))
+                .capture_selection_anchor_capability(sequence, dimensions, points, state)
         }
 
-        pub fn selection_anchor_snapshot(
+        pub fn selection_anchor_capability_snapshot(
             &self,
-            anchor: &frankenterm_term::screen::ScreenSelectionAnchor,
-        ) -> Option<Option<LocalSelectionAnchorSnapshot>> {
+            state: &crate::pane::PaneSelectionAnchor,
+        ) -> Result<
+            Option<crate::pane::PaneSelectionAnchorSnapshot>,
+            crate::pane::PaneSelectionAnchorError,
+        > {
+            self.pane.selection_anchor_capability_snapshot(state)
+        }
+
+        pub fn read_lines_at_layout_capability(
+            &self,
+            sequence: termwiz::surface::SequenceNo,
+            dimensions: crate::renderable::RenderableDimensions,
+            ranges: &[std::ops::Range<frankenterm_term::StableRowIndex>],
+            state: &mut Option<crate::pane::PaneLayoutRead>,
+        ) -> Result<
+            Option<Vec<(frankenterm_term::StableRowIndex, termwiz::surface::Line)>>,
+            crate::pane::PaneSelectionAnchorError,
+        > {
             self.pane
-                .downcast_ref::<crate::localpane::LocalPane>()
-                .map(|pane| pane.selection_anchor_snapshot(anchor))
+                .read_lines_at_layout_capability(sequence, dimensions, ranges, state)
+        }
+
+        pub fn publish_lines_at_layout_capability(
+            &self,
+            state: &crate::pane::PaneLayoutRead,
+            publish: &mut dyn FnMut(),
+        ) -> Result<bool, crate::pane::PaneSelectionAnchorError> {
+            self.pane.publish_lines_at_layout_capability(state, publish)
         }
 
         pub fn get_current_seqno(&self) -> termwiz::surface::SequenceNo {

@@ -1547,6 +1547,51 @@ fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
 
 #[async_trait(?Send)]
 impl Pane for LocalPane {
+    fn capture_selection_anchor_capability(
+        &self,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
+        state: &mut Option<crate::pane::PaneSelectionAnchor>,
+    ) -> Result<crate::pane::PaneSelectionAnchorStatus, crate::pane::PaneSelectionAnchorError> {
+        use crate::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
+        if state.is_some() {
+            return Err(Error::SourceChanged);
+        }
+        let (floor, current_dimensions) = self
+            .get_line_layout()
+            .map_err(|_| Error::Busy)?
+            .ok_or(Error::Unsupported)?;
+        if floor > sequence
+            || sequence > self.get_current_seqno()
+            || !crate::renderable::same_line_layout_geometry(&dimensions, &current_dimensions)
+        {
+            return Err(Error::SourceChanged);
+        }
+        match self.capture_selection_anchor(floor, sequence, current_dimensions, points) {
+            Ok(Some(token)) => {
+                *state = Some(Box::new(token));
+                Ok(Status::Captured)
+            }
+            Ok(None) => Err(Error::Unsupported),
+            Err(SelectionAnchorCaptureError::Busy) => Err(Error::Busy),
+            Err(SelectionAnchorCaptureError::SourceChanged) => Err(Error::SourceChanged),
+        }
+    }
+
+    fn selection_anchor_capability_snapshot(
+        &self,
+        state: &crate::pane::PaneSelectionAnchor,
+    ) -> Result<
+        Option<crate::pane::PaneSelectionAnchorSnapshot>,
+        crate::pane::PaneSelectionAnchorError,
+    > {
+        let token = state
+            .downcast_ref::<frankenterm_term::screen::ScreenSelectionAnchor>()
+            .ok_or(crate::pane::PaneSelectionAnchorError::SourceChanged)?;
+        Ok(self.selection_anchor_snapshot(token))
+    }
+
     fn guardian_spawn_custody(
         &self,
     ) -> Option<crate::guardian_checkpoint::GuardianSpawnCaptureProvenanceV1> {

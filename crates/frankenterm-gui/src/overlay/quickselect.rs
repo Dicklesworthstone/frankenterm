@@ -3020,6 +3020,10 @@ struct QuickSelectRenderable {
 }
 
 impl QuickSelectOverlay {
+    pub(crate) fn selection_delegate(&self) -> &Arc<dyn Pane> {
+        &self.delegate
+    }
+
     pub fn with_pane(
         term_window: &TermWindow,
         pane: &Arc<dyn Pane>,

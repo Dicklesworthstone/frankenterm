@@ -36,6 +36,164 @@ pub(crate) struct SelectionCopy {
 #[derive(Debug)]
 struct SelectionCopyDeadline(futures::future::AbortHandle);
 
+/// One Lua read owns its original pane and selection, independently of any
+/// clipboard request. Pending remaps/hydration are never successful empty text.
+struct SelectionTextRequest {
+    pane: Arc<dyn Pane>,
+    pending: crate::selection::PendingNativeSelection,
+    deadline: std::time::Instant,
+}
+
+/// The async reader owns revocation even while a native notification is queued.
+/// A timed-out notification retains only the empty cell, never pane/history data.
+struct SelectionTextTransfer(Arc<std::sync::Mutex<Option<SelectionTextRequest>>>);
+
+impl SelectionTextTransfer {
+    fn new(request: SelectionTextRequest) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(request))))
+    }
+
+    fn take(cell: &std::sync::Mutex<Option<SelectionTextRequest>>) -> Option<SelectionTextRequest> {
+        cell.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+impl Drop for SelectionTextTransfer {
+    fn drop(&mut self) {
+        // Drop heavy reads after releasing the cell lock.
+        let request = Self::take(&self.0);
+        drop(request);
+    }
+}
+
+fn same_selection_text_intent(expected: &Selection, current: &Selection) -> bool {
+    // An admitted capture can acquire its first anchor after this request.
+    // Accept that transition only for the identical original frame and span;
+    // after acquisition every retry is pinned to the exact anchor token.
+    if expected.native_anchor().is_none() && expected.remote_anchor().is_none() {
+        return expected.origin == current.origin
+            && expected.range == current.range
+            && expected.seqno == current.seqno
+            && expected.authority == current.authority
+            && expected.rectangular == current.rectangular;
+    }
+    match (expected.native_anchor(), current.native_anchor()) {
+        (Some(expected), Some(current)) => expected == current,
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => match (expected.remote_anchor(), current.remote_anchor()) {
+            (Some(expected), Some(current)) => expected == current,
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => expected == current,
+        },
+    }
+}
+
+impl SelectionTextRequest {
+    fn adopt_acquired_anchor(&mut self, current: &Selection) -> anyhow::Result<()> {
+        if self.pending.desired.native_anchor().is_none()
+            && self.pending.desired.remote_anchor().is_none()
+            && (current.native_anchor().is_some() || current.remote_anchor().is_some())
+        {
+            anyhow::ensure!(
+                same_selection_text_intent(&self.pending.desired, current),
+                "The selection changed before its anchor arrived."
+            );
+            self.pending.desired = current.clone();
+        }
+        Ok(())
+    }
+
+    fn validate_source(
+        &self,
+        current_pane: Option<&Arc<dyn Pane>>,
+        current: &Selection,
+        now: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            now < self.deadline,
+            "The selected text did not arrive before the read deadline."
+        );
+        anyhow::ensure!(
+            current_pane.is_some_and(|pane| Arc::ptr_eq(pane, &self.pane)),
+            "The pane was replaced while reading its selection."
+        );
+        anyhow::ensure!(
+            same_selection_text_intent(&self.pending.desired, current),
+            "The selection changed while reading."
+        );
+        Ok(())
+    }
+
+    fn advance(&mut self, tw: &super::TermWindow) -> anyhow::Result<Option<String>> {
+        let current_pane = mux::Mux::try_get().and_then(|mux| mux.get_pane(self.pane.pane_id()));
+        anyhow::ensure!(
+            current_pane
+                .as_ref()
+                .is_some_and(|pane| Arc::ptr_eq(pane, &self.pane)),
+            "The pane was replaced while reading its selection."
+        );
+        anyhow::ensure!(
+            std::time::Instant::now() < self.deadline,
+            "The selected text did not arrive before the read deadline."
+        );
+        tw.retry_pending_native_selection(&self.pane);
+        if let Some(current) = tw.selection(self.pane.pane_id()) {
+            self.adopt_acquired_anchor(&current)?;
+        }
+        let authorized = tw.selection_authority_is_current(&self.pane);
+        let current = tw
+            .selection(self.pane.pane_id())
+            .map(|selection| selection.clone())
+            .ok_or_else(|| anyhow::anyhow!("The selection was removed while reading."))?;
+        self.advance_observed(
+            current_pane.as_ref(),
+            current,
+            authorized,
+            tw.window.as_ref(),
+        )
+    }
+
+    fn advance_observed(
+        &mut self,
+        current_pane: Option<&Arc<dyn Pane>>,
+        current: Selection,
+        authorized: bool,
+        window: Option<&window::Window>,
+    ) -> anyhow::Result<Option<String>> {
+        self.validate_source(current_pane, &current, std::time::Instant::now())?;
+        if !authorized {
+            return Ok(None);
+        }
+        // Reflow may move the same owned anchor while chunks are outstanding.
+        // Restart only the text accumulator, under the original deadline.
+        if self.pending.desired.authority != current.authority
+            || self.pending.desired.range != current.range
+            || self.pending.desired.seqno != current.seqno
+        {
+            self.pending.text_copy = None;
+        }
+        self.pending.desired = current;
+        if self.pending.text_copy.is_none() {
+            let Some((_, sequence, _)) = SelectionAuthority::capture_source(&*self.pane) else {
+                return Ok(None);
+            };
+            let mut copy = SelectionCopy::new(&self.pending.desired, sequence)
+                .ok_or_else(|| anyhow::anyhow!("The selection range is unavailable."))?;
+            copy.deadline = self.deadline;
+            self.pending.text_copy = Some(copy);
+        }
+        super::TermWindow::advance_selection_copy_text(
+            &self.pane,
+            &self.pending.desired,
+            self.pending.text_copy.as_mut().unwrap(),
+            window,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+}
+
 impl Drop for SelectionCopyDeadline {
     fn drop(&mut self) {
         self.0.abort();
@@ -357,6 +515,107 @@ fn announce_pick_if_smart(pick: Option<SmartSelectionPick>) {
 }
 
 impl super::TermWindow {
+    pub(super) fn request_selection_text(
+        &self,
+        pane: Arc<dyn Pane>,
+        tx: flume::Sender<anyhow::Result<String>>,
+    ) {
+        let desired = self
+            .selection(pane.pane_id())
+            .map(|selection| selection.clone());
+        let Some(desired) = desired.filter(|selection| selection.range.is_some()) else {
+            let pending = self.pane_state(pane.pane_id()).is_some_and(|state| {
+                state.pending_selection_start.is_some() || state.pending_native_selection.is_some()
+            });
+            let result = if pending {
+                Err(anyhow::anyhow!(
+                    "The selection gesture has not settled yet."
+                ))
+            } else {
+                Ok(String::new())
+            };
+            let _ = tx.try_send(result);
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            let _ = tx.try_send(Err(anyhow::anyhow!("The selection window closed.")));
+            return;
+        };
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            _ => {
+                let _ = tx.try_send(Err(anyhow::anyhow!("The selection reader is busy.")));
+                return;
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut request = SelectionTextRequest {
+            pane,
+            pending: crate::selection::PendingNativeSelection::new(desired),
+            deadline,
+        };
+        reservation
+            .spawn_local(async move {
+                let result = loop {
+                    if tx.is_disconnected() {
+                        return;
+                    }
+                    let (reply, rx) = flume::bounded(1);
+                    // Window notifications require Sync; the request owns a
+                    // single-consumer hydration receiver. Transfer it exclusively,
+                    // without holding a lock while advancing or invoking callbacks.
+                    let transfer = SelectionTextTransfer::new(request);
+                    let queued = Arc::clone(&transfer.0);
+                    window.notify(super::TermWindowNotif::Apply(Box::new(move |tw| {
+                        let Some(mut request) = SelectionTextTransfer::take(&queued) else {
+                            return;
+                        };
+                        let result = request.advance(tw);
+                        let _ = reply.try_send((request, result));
+                    })));
+                    let wait = Box::pin(rx.recv_async());
+                    let timeout = Box::pin(async {
+                        loop {
+                            if tx.is_disconnected() {
+                                break "The selection reader was cancelled.";
+                            }
+                            let remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                break "The selected text did not arrive before the read deadline.";
+                            }
+                            promise::spawn::sleep(
+                                remaining.min(std::time::Duration::from_millis(25)),
+                            )
+                            .await;
+                        }
+                    });
+                    match futures::future::select(wait, timeout).await {
+                        futures::future::Either::Left((Ok((next, outcome)), _)) => {
+                            request = next;
+                            match outcome {
+                                Ok(Some(text)) => break Ok(text),
+                                Err(error) => break Err(error),
+                                Ok(None) => {}
+                            }
+                        }
+                        futures::future::Either::Left((Err(_), _)) => {
+                            break Err(anyhow::anyhow!("The selection window closed."));
+                        }
+                        futures::future::Either::Right((reason, _)) => {
+                            break Err(anyhow::anyhow!(reason));
+                        }
+                    }
+                    promise::spawn::sleep(std::time::Duration::from_millis(25)).await;
+                };
+                let _ = tx.try_send(result);
+            })
+            .detach();
+    }
+
     /// Clipboard ownership must expire even when a hidden or failed surface
     /// never presents another frame. One cancellable wake belongs to each copy.
     fn arm_selection_copy_deadline(
@@ -993,17 +1252,17 @@ impl super::TermWindow {
     }
 
     fn advance_local_selection_read(
-        &self,
         pane: &Arc<dyn Pane>,
         copy: &mut SelectionCopy,
         sequence: termwiz::surface::SequenceNo,
         dimensions: mux::renderable::RenderableDimensions,
         end: StableRowIndex,
+        window: Option<&window::Window>,
     ) -> Result<Option<Vec<Line>>, &'static str> {
         copy.local = true;
         let requested = copy.next_row..end;
         if copy.local_read.is_none() {
-            let window = self.window.clone();
+            let window = window.cloned();
             copy.local_read = LocalSelectionRead::start(
                 || pane.capture_line_read(requested.clone(), &mut Default::default()),
                 copy.deadline,
@@ -1068,8 +1327,7 @@ impl super::TermWindow {
         pane: &Arc<dyn Pane>,
         pending: &mut crate::selection::PendingNativeSelection,
     ) -> Result<Option<String>, &'static str> {
-        let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
-        else {
+        let Some((authority, sequence, _)) = SelectionAuthority::capture_source(&**pane) else {
             return Ok(None);
         };
         if pending.desired.authority != Some(authority) {
@@ -1092,25 +1350,34 @@ impl super::TermWindow {
             pending.text_copy = Some(copy);
         }
         let copy = pending.text_copy.as_mut().unwrap();
+        Self::advance_selection_copy_text(pane, &pending.desired, copy, self.window.as_ref())
+    }
+
+    fn advance_selection_copy_text(
+        pane: &Arc<dyn Pane>,
+        desired: &Selection,
+        copy: &mut SelectionCopy,
+        window: Option<&window::Window>,
+    ) -> Result<Option<String>, &'static str> {
+        let Some((authority, sequence, dimensions)) = SelectionAuthority::capture_source(&**pane)
+        else {
+            return Ok(None);
+        };
+        if desired.authority != Some(authority) {
+            return Ok(None);
+        }
         if let Some(client) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() {
             let previous_row = copy.next_row;
-            let result =
-                copy.advance_remote(client, authority.layout_floor(), pending.desired.seqno);
+            let result = copy.advance_remote(client, authority.layout_floor(), desired.seqno);
             if matches!(result, Ok(None)) && copy.next_row != previous_row {
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = window {
                     window.invalidate();
                 }
             }
             return result;
         }
-        let Some((sequence, dimensions)) = Self::refresh_local_copy_source(
-            pane,
-            &pending.desired,
-            copy,
-            authority,
-            sequence,
-            dimensions,
-        )?
+        let Some((sequence, dimensions)) =
+            Self::refresh_local_copy_source(pane, desired, copy, authority, sequence, dimensions)?
         else {
             return Ok(None);
         };
@@ -1122,7 +1389,7 @@ impl super::TermWindow {
                 .unwrap_or(copy.end_row)
                 .min(copy.end_row);
             let Some(rows) =
-                self.advance_local_selection_read(pane, copy, sequence, dimensions, end)?
+                Self::advance_local_selection_read(pane, copy, sequence, dimensions, end, window)?
             else {
                 return Ok(None);
             };
@@ -1130,7 +1397,7 @@ impl super::TermWindow {
         }
         if copy.next_row < copy.end_row {
             // Actual bounded progress, not an idle retry: one chunk per frame.
-            if let Some(window) = self.window.as_ref() {
+            if let Some(window) = window {
                 window.invalidate();
             }
             return Ok(None);
@@ -1140,7 +1407,7 @@ impl super::TermWindow {
             Some((current, current_sequence, current_dimensions)) if current == authority => {
                 let Some((current_sequence, _)) = Self::refresh_local_copy_source(
                     pane,
-                    &pending.desired,
+                    desired,
                     copy,
                     current,
                     current_sequence,
@@ -2364,6 +2631,175 @@ mod tests {
     use termwiz::cell::{CellAttributes, unicode_column_width};
     use termwiz::surface::SEQ_ZERO;
 
+    #[cfg(unix)]
+    #[test]
+    fn lua_selection_request_preserves_anchor_across_reflow_and_rejects_retirement() {
+        #[derive(Debug)]
+        struct ReadConfig;
+        impl wezterm_term::TerminalConfiguration for ReadConfig {
+            fn color_palette(&self) -> wezterm_term::color::ColorPalette {
+                Default::default()
+            }
+        }
+        let mut terminal = wezterm_term::Terminal::new(
+            wezterm_term::TerminalSize {
+                rows: 3,
+                cols: 40,
+                dpi: 96,
+                pixel_width: 320,
+                pixel_height: 48,
+            },
+            Arc::new(ReadConfig),
+            "lua-selection-test",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes(b"OWNED_BRIDGE_A");
+        let mut selected = Selection::default();
+        selected.seqno = terminal.current_seqno();
+        selected.range = Some(SelectionRange {
+            start: SelectionCoordinate::x_y(0, 0),
+            end: SelectionCoordinate::x_y(13, 0),
+        });
+        let anchor = terminal
+            .screen_mut()
+            .capture_selection_anchor(selected.seqno, selected.native_points())
+            .unwrap();
+        let unanchored = selected.clone();
+        selected.remember_native_anchor(anchor.clone());
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_409,
+            terminal,
+            child,
+            pair.master,
+            writer,
+            998_409,
+            [0x39; 16],
+            "Lua selection".into(),
+        ));
+        struct Retire(Arc<dyn Pane>);
+        impl Drop for Retire {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _retire = Retire(Arc::clone(&pane));
+        let now = std::time::Instant::now();
+        let mut request = SelectionTextRequest {
+            pane: Arc::clone(&pane),
+            pending: crate::selection::PendingNativeSelection::new(unanchored.clone()),
+            deadline: now + std::time::Duration::from_secs(30),
+        };
+        assert!(
+            request
+                .validate_source(Some(&pane), &unanchored, now)
+                .is_ok()
+        );
+        assert!(
+            request
+                .advance_observed(Some(&pane), unanchored.clone(), false, None)
+                .unwrap()
+                .is_none(),
+            "an unresolved layout must remain pending, never become empty text"
+        );
+        pane.resize(wezterm_term::TerminalSize {
+            rows: 3,
+            cols: 8,
+            dpi: 96,
+            pixel_width: 64,
+            pixel_height: 48,
+        })
+        .unwrap();
+        // The original capture acknowledgment arrives after resize but still
+        // names the admitted pre-resize frame. Pin it before synchronizing.
+        let mut changed_capture = selected.clone();
+        changed_capture.range.as_mut().unwrap().end.x = SelectionX::Cell(0);
+        assert!(!same_selection_text_intent(&unanchored, &changed_capture));
+        request.adopt_acquired_anchor(&selected).unwrap();
+        let local = pane.downcast_ref::<mux::localpane::LocalPane>().unwrap();
+        let (floor, sequence, dimensions, points) =
+            local.selection_anchor_snapshot(&anchor).unwrap();
+        let authority =
+            SelectionAuthority::from_native_snapshot(&*pane, floor, dimensions).unwrap();
+        let mut remapped = selected.clone();
+        remapped.rebase_native_anchor(points.unwrap(), authority, sequence);
+        assert_ne!(
+            remapped.range, selected.range,
+            "real reflow must move coordinates"
+        );
+        assert!(request.validate_source(Some(&pane), &remapped, now).is_ok());
+        let mut navigated = remapped.clone();
+        navigated.range.as_mut().unwrap().end.x = SelectionX::Cell(0);
+        assert!(
+            request
+                .validate_source(Some(&pane), &navigated, now)
+                .is_err(),
+            "changing an endpoint invalidates the old anchor projection"
+        );
+        let text = loop {
+            match request
+                .advance_observed(Some(&pane), remapped.clone(), true, None)
+                .unwrap()
+            {
+                Some(text) => break text,
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        };
+        assert_eq!(text, "OWNED_BRIDGE_A");
+        assert!(request.validate_source(None, &remapped, now).is_err());
+        assert!(
+            request
+                .validate_source(Some(&pane), &remapped, request.deadline)
+                .is_err()
+        );
+        remapped.clear();
+        assert!(
+            request
+                .validate_source(Some(&pane), &remapped, now)
+                .is_err()
+        );
+
+        // A queued native notification may outlive both timeout and its caller.
+        // Revoking it must retire retained history once, before callback delivery.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (_sender, receiver) = sync_channel(1);
+        let (retire, retired) = sync_channel(1);
+        let mut copy = SelectionCopy::new(&selected, selected.seqno).unwrap();
+        copy.text = "x".repeat(1024 * 1024);
+        copy.local_read = Some(LocalSelectionRead {
+            receiver,
+            ready: Some(LocalSelectionReadReady {
+                plans: Some(Ok(Vec::new())),
+                retire,
+            }),
+            cancelled: Arc::clone(&cancelled),
+        });
+        request.pending.text_copy = Some(copy);
+        let retained = Arc::strong_count(&pane);
+        let transfer = SelectionTextTransfer::new(request);
+        let queued = Arc::clone(&transfer.0);
+        drop(transfer); // timeout/caller cancellation, while the callback is queued
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&pane), retained - 1);
+        assert!(retired.try_recv().unwrap().is_ok());
+        assert!(
+            retired.try_recv().is_err(),
+            "history retirement must occur exactly once"
+        );
+        assert!(
+            SelectionTextTransfer::take(&queued).is_none(),
+            "late callback cannot restart the revoked read"
+        );
+    }
+
     #[test]
     fn local_selection_read_retires_busy_and_cancelled_workers_and_preserves_source_fence() {
         #[derive(Debug)]
@@ -2815,7 +3251,60 @@ mod tests {
             drop(read);
         }
         assert_eq!(chunks, 17);
-        assert_eq!(copy.finish(sequence).unwrap(), Some(expected));
+        assert_eq!(copy.finish(sequence).unwrap(), Some(expected.clone()));
+
+        // Exercise the production Lua request accumulator against the same
+        // encrypted cold store, not the render cache or a canned text result.
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(mux::localpane::LocalPane::new(
+            998_410,
+            terminal.into_inner(),
+            child,
+            pair.master,
+            writer,
+            998_410,
+            [0x40; 16],
+            "cold Lua selection".into(),
+        ));
+        struct Retire(Arc<dyn Pane>);
+        impl Drop for Retire {
+            fn drop(&mut self) {
+                self.0.kill();
+            }
+        }
+        let _retire = Retire(Arc::clone(&pane));
+        let (authority, sequence, _) = SelectionAuthority::capture_source(&*pane).unwrap();
+        selection.authority = Some(authority);
+        selection.seqno = sequence;
+        let mut request = SelectionTextRequest {
+            pane: Arc::clone(&pane),
+            pending: crate::selection::PendingNativeSelection::new(selection.clone()),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        };
+        assert!(
+            request
+                .advance_observed(Some(&pane), selection.clone(), true, None)
+                .unwrap()
+                .is_none(),
+            "initial cold hydration is pending, not successful empty text"
+        );
+        let text = loop {
+            match request
+                .advance_observed(Some(&pane), selection.clone(), true, None)
+                .unwrap()
+            {
+                Some(text) => break text,
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        };
+        assert_eq!(text, expected);
     }
 
     #[test]
@@ -3397,6 +3886,24 @@ mod tests {
 
     #[test]
     fn word_line_selection_read_local_pane_async_resolution_and_fences() {
+        fn await_admission(
+            deadline: std::time::Instant,
+            mut start: impl FnMut() -> Result<Option<WordLineSelectionRead>, &'static str>,
+        ) -> WordLineSelectionRead {
+            loop {
+                if let Some(read) = start().expect("start must succeed") {
+                    return read;
+                }
+                // The four permits are shared with parallel tests, including
+                // one that deliberately occupies all four. Retry only Busy;
+                // retain the original deadline so a leak still fails.
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "word/line read admission did not recover before its original deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         #[derive(Debug)]
         struct TestConfig;
         impl wezterm_term::TerminalConfiguration for TestConfig {
@@ -3451,20 +3958,21 @@ mod tests {
 
         // 1. Word mode async start and resolution: URL smart match
         let (woke, wake) = sync_channel(1);
-        let mut read = WordLineSelectionRead::start(
-            &pane,
-            authority,
-            sequence,
-            SelectionMode::Word,
-            SelectionCoordinate::x_y(10, 0), // within https://...
-            None,
-            deadline,
-            move || {
-                let _ = woke.send(());
-            },
-        )
-        .expect("start must succeed")
-        .expect("permit must be acquired");
+        let mut read = await_admission(deadline, || {
+            let woke = woke.clone();
+            WordLineSelectionRead::start(
+                &pane,
+                authority,
+                sequence,
+                SelectionMode::Word,
+                SelectionCoordinate::x_y(10, 0), // within https://...
+                None,
+                deadline,
+                move || {
+                    let _ = woke.send(());
+                },
+            )
+        });
 
         wake.recv_timeout(std::time::Duration::from_secs(5))
             .expect("wake must trigger");
@@ -3487,20 +3995,21 @@ mod tests {
 
         // 2. Line mode async start and resolution: triple click
         let (woke_line, wake_line) = sync_channel(1);
-        let mut read_line = WordLineSelectionRead::start(
-            &pane,
-            authority,
-            sequence,
-            SelectionMode::Line,
-            SelectionCoordinate::x_y(2, 1),
-            None,
-            deadline,
-            move || {
-                let _ = woke_line.send(());
-            },
-        )
-        .expect("start must succeed")
-        .expect("permit must be acquired");
+        let mut read_line = await_admission(deadline, || {
+            let woke_line = woke_line.clone();
+            WordLineSelectionRead::start(
+                &pane,
+                authority,
+                sequence,
+                SelectionMode::Line,
+                SelectionCoordinate::x_y(2, 1),
+                None,
+                deadline,
+                move || {
+                    let _ = woke_line.send(());
+                },
+            )
+        });
 
         wake_line
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -3518,20 +4027,21 @@ mod tests {
 
         // 3. Independent endpoint contexts: start at row 0, retained end at row 2
         let (woke_ext, wake_ext) = sync_channel(1);
-        let mut read_ext = WordLineSelectionRead::start(
-            &pane,
-            authority,
-            sequence,
-            SelectionMode::Word,
-            SelectionCoordinate::x_y(1, 0),       // "hello"
-            Some(SelectionCoordinate::x_y(2, 2)), // "third"
-            deadline,
-            move || {
-                let _ = woke_ext.send(());
-            },
-        )
-        .expect("start must succeed")
-        .expect("permit must be acquired");
+        let mut read_ext = await_admission(deadline, || {
+            let woke_ext = woke_ext.clone();
+            WordLineSelectionRead::start(
+                &pane,
+                authority,
+                sequence,
+                SelectionMode::Word,
+                SelectionCoordinate::x_y(1, 0),       // "hello"
+                Some(SelectionCoordinate::x_y(2, 2)), // "third"
+                deadline,
+                move || {
+                    let _ = woke_ext.send(());
+                },
+            )
+        });
 
         wake_ext
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -3550,20 +4060,21 @@ mod tests {
 
         // 4. Source sequence fence & causal publication Busy retention:
         let (woke_fence, wake_fence) = sync_channel(1);
-        let mut read_fence = WordLineSelectionRead::start(
-            &pane,
-            authority,
-            sequence,
-            SelectionMode::Word,
-            SelectionCoordinate::x_y(0, 0),
-            None,
-            deadline,
-            move || {
-                let _ = woke_fence.send(());
-            },
-        )
-        .expect("start must succeed")
-        .expect("permit must be acquired");
+        let mut read_fence = await_admission(deadline, || {
+            let woke_fence = woke_fence.clone();
+            WordLineSelectionRead::start(
+                &pane,
+                authority,
+                sequence,
+                SelectionMode::Word,
+                SelectionCoordinate::x_y(0, 0),
+                None,
+                deadline,
+                move || {
+                    let _ = woke_fence.send(());
+                },
+            )
+        });
 
         wake_fence
             .recv_timeout(std::time::Duration::from_secs(5))

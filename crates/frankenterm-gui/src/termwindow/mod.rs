@@ -1033,7 +1033,7 @@ pub enum TermWindowNotif {
     GetDimensions(Sender<(Dimensions, WindowState)>),
     GetSelectionForPane {
         pane_id: PaneId,
-        tx: Sender<String>,
+        tx: Sender<anyhow::Result<String>>,
     },
     GetEffectiveConfig(Sender<ConfigHandle>),
     FinishWindowEvent {
@@ -5767,13 +5767,12 @@ impl TermWindow {
                 }
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
-                let pane = Mux::try_get()
-                    .and_then(|mux| mux.get_pane(pane_id))
-                    .ok_or_else(|| anyhow!("pane id {} is not valid", pane_id))?;
+                let Some(pane) = Mux::try_get().and_then(|mux| mux.get_pane(pane_id)) else {
+                    let _ = tx.try_send(Err(anyhow!("pane id {} is not valid", pane_id)));
+                    return Ok(());
+                };
 
-                tx.try_send(self.selection_text(&pane))
-                    .map_err(chan_err)
-                    .context("send GetSelectionForPane response")?;
+                self.request_selection_text(pane, tx);
             }
             TermWindowNotif::Apply(func) => {
                 func(self);

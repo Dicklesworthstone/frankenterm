@@ -16,8 +16,9 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use mux::domain::DomainId;
 use mux::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, PaneLayoutRead,
+    PaneSelectionAnchor, PaneSelectionAnchorError, PaneSelectionAnchorSnapshot,
+    PaneSelectionAnchorStatus, Pattern, SearchResult, WithPaneLines,
 };
 use mux::renderable::{same_line_layout_geometry, RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -231,6 +232,28 @@ pub struct RemoteSelectionCapture {
     started: Instant,
 }
 
+/// An outer read owns the downstream request and its exact cache witness.
+/// Dropping it cancels unfinished RPC work; no renderer placeholder is a reply.
+struct ForwardedLayoutRead {
+    request: GetLinesAtLayout,
+    registration: PaneRegistrationHandle,
+    rpc: RpcGenerationScope,
+    layout: SequenceNo,
+    rows: Range<StableRowIndex>,
+    witness: Option<super::SelectionReadWitness>,
+    pending: Option<SelectionRpcResult<Vec<(StableRowIndex, Line)>>>,
+    completed: bool,
+}
+
+fn forwarded_selection_error(error: SelectionReadError) -> PaneSelectionAnchorError {
+    match error {
+        SelectionReadError::Busy => PaneSelectionAnchorError::Busy,
+        SelectionReadError::SourceChanged
+        | SelectionReadError::InvalidRange
+        | SelectionReadError::TooLarge => PaneSelectionAnchorError::SourceChanged,
+    }
+}
+
 impl std::fmt::Debug for RemoteSelectionCapture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteSelectionCapture")
@@ -412,6 +435,39 @@ enum DispatchResizeOutcome {
     Admitted,
     ImmediateCompletion,
     RetryableFull,
+}
+
+// Diagnostic timing starts at the actual first effect poll, including the
+// retry driver. A missing terminal record is incomplete evidence, never zero
+// latency. UnitResponse confirms enqueueing, not reflow or presentation.
+async fn profile_resize_rpc<F>(
+    request: F,
+    local_pane_id: PaneId,
+    remote_pane_id: PaneId,
+    attempt: u64,
+    size: TerminalSize,
+    phase: &'static str,
+) -> anyhow::Result<UnitResponse>
+where
+    F: Future<Output = anyhow::Result<UnitResponse>>,
+{
+    let started =
+        log::log_enabled!(target: "mux::resize_profile", log::Level::Debug).then(Instant::now);
+    if started.is_some() {
+        log::debug!(target: "mux::resize_profile",
+            "resize_client_begin local_pane_id={} remote_pane_id={} attempt={} target={}x{} pixels={}x{} dpi={} phase={}",
+            local_pane_id, remote_pane_id, attempt, size.cols, size.rows,
+            size.pixel_width, size.pixel_height, size.dpi, phase);
+    }
+    let result = request.await;
+    if let Some(started) = started {
+        log::debug!(target: "mux::resize_profile",
+            "resize_client_reply local_pane_id={} remote_pane_id={} attempt={} target={}x{} phase={} elapsed_us={} outcome={} completion_scope=enqueue_ack_not_reflow",
+            local_pane_id, remote_pane_id, attempt, size.cols, size.rows, phase,
+            started.elapsed().as_micros(),
+            if result.is_ok() { "queued_ack" } else { "failed_or_unknown" });
+    }
+    result
 }
 
 fn dispatch_resize_rpc<F>(
@@ -662,6 +718,14 @@ impl ClientResizeCoordinator {
                                 pane_id: intent.remote_pane_id,
                                 size: intent.size,
                             });
+                            let request = profile_resize_rpc(
+                                request,
+                                intent.pane_id,
+                                intent.remote_pane_id,
+                                intent.attempt,
+                                intent.size,
+                                "retry",
+                            );
 
                             match admit_interactive_rpc_now(request) {
                                 Ok(Some(fut)) => Ok(RetriedAdmissionOutcome::Admitted(fut)),
@@ -3628,6 +3692,15 @@ fn validate_render_application_resources(
 }
 
 impl ClientPane {
+    fn owns_forwarded_read(&self, read: &ForwardedLayoutRead) -> bool {
+        read.request.pane_id == self.remote_pane_id
+            && read.rpc.same_generation(&self.client.client.rpc_scope())
+            && self.mux_registration.load().is_some_and(|registration| {
+                registration.wire_identity() == read.registration.wire_identity()
+                    && registration.try_with_current(|_| ()).is_some()
+            })
+    }
+
     fn owns_remote_selection(&self, token: &RemoteSelectionAnchor) -> bool {
         !token.0.invalid.load(Ordering::Acquire)
             && token.0.remote_pane_id == self.remote_pane_id
@@ -4962,6 +5035,14 @@ impl ClientPane {
             pane_id: self.remote_pane_id,
             size,
         });
+        let request = profile_resize_rpc(
+            request,
+            self.local_pane_id,
+            self.remote_pane_id,
+            attempt,
+            size,
+            "initial",
+        );
         match dispatch_resize_rpc(request, delivery)? {
             DispatchResizeOutcome::Admitted | DispatchResizeOutcome::ImmediateCompletion => {
                 let state = self.resize_delivery.lock();
@@ -4981,6 +5062,9 @@ impl ClientPane {
                 }
             }
             DispatchResizeOutcome::RetryableFull => {
+                log::debug!(target: "mux::resize_profile",
+                    "resize_client_deferred local_pane_id={} remote_pane_id={} attempt={} target={}x{} reason=scheduler_capacity",
+                    self.local_pane_id, self.remote_pane_id, attempt, size.cols, size.rows);
                 let mut delivery = ResizeDelivery {
                     state: Arc::clone(&self.resize_delivery),
                     attempt,
@@ -5054,6 +5138,264 @@ impl ClientPane {
 
 #[async_trait(?Send)]
 impl Pane for ClientPane {
+    fn capture_selection_anchor_capability(
+        &self,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        points: SelectionPoints,
+        state: &mut Option<PaneSelectionAnchor>,
+    ) -> Result<PaneSelectionAnchorStatus, PaneSelectionAnchorError> {
+        let status = if let Some(state) = state {
+            let capture = state
+                .downcast_mut::<RemoteSelectionCapture>()
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            if capture.request.layout.seqno != sequence
+                || !same_line_layout_geometry(&capture.request.layout.dimensions, &dimensions)
+                || capture.request.points
+                    != points.map(|point| {
+                        point.map(|point| SelectionAnchorPointV1 {
+                            column: point.column,
+                            row: point.row,
+                        })
+                    })
+            {
+                return Err(PaneSelectionAnchorError::SourceChanged);
+            }
+            // A delayed capture reply belongs to its original coordinates,
+            // even when this proxy resized while the request was in flight.
+            self.poll_remote_selection_capture(capture)
+        } else {
+            let (layout, current, current_dimensions, _) = self
+                .selection_source_snapshot()
+                .ok_or(PaneSelectionAnchorError::Busy)?;
+            if sequence > current || !same_line_layout_geometry(&dimensions, &current_dimensions) {
+                return Err(PaneSelectionAnchorError::SourceChanged);
+            }
+            let mut capture = None;
+            let status = self.capture_remote_selection(
+                layout,
+                sequence,
+                current_dimensions,
+                points,
+                &mut capture,
+            );
+            if let Some(capture) = capture {
+                *state = Some(Box::new(capture));
+            }
+            status
+        };
+        match status {
+            RemoteSelectionCaptureStatus::Ready(_) => Ok(PaneSelectionAnchorStatus::Captured),
+            RemoteSelectionCaptureStatus::Busy => Ok(PaneSelectionAnchorStatus::Pending),
+            RemoteSelectionCaptureStatus::Invalidated => {
+                Err(PaneSelectionAnchorError::SourceChanged)
+            }
+            RemoteSelectionCaptureStatus::Unremappable => {
+                Err(PaneSelectionAnchorError::Unsupported)
+            }
+        }
+    }
+
+    fn selection_anchor_capability_snapshot(
+        &self,
+        state: &PaneSelectionAnchor,
+    ) -> Result<Option<PaneSelectionAnchorSnapshot>, PaneSelectionAnchorError> {
+        let capture = state
+            .downcast_ref::<RemoteSelectionCapture>()
+            .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+        if !capture.captured {
+            return Ok(None);
+        }
+        self.remote_selection_anchor_snapshot(&capture.token)
+            .map(|snapshot| {
+                snapshot.map(|(_local_generation, sequence, dimensions, points)| {
+                    // The local cache generation is not a terminal sequence.
+                    // This conservatively admits only the proven snapshot's
+                    // sequence, in the downstream terminal's wire namespace.
+                    (sequence, sequence, dimensions, points)
+                })
+            })
+            .map_err(forwarded_selection_error)
+    }
+
+    fn read_lines_at_layout_capability(
+        &self,
+        sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        ranges: &[Range<StableRowIndex>],
+        state: &mut Option<PaneLayoutRead>,
+    ) -> Result<Option<Vec<(StableRowIndex, Line)>>, PaneSelectionAnchorError> {
+        if state.is_none() {
+            let rpc = self.client.client.rpc_scope();
+            match rpc.agreed_codec_version() {
+                Some(version) if version >= GET_LINES_AT_LAYOUT_MIN_CODEC_VERSION => {}
+                Some(_) => return Err(PaneSelectionAnchorError::Unsupported),
+                None => return Err(PaneSelectionAnchorError::Busy),
+            }
+            let mut count = 0usize;
+            let mut previous_end = None;
+            for range in ranges {
+                let rows = range
+                    .end
+                    .checked_sub(range.start)
+                    .and_then(|rows| usize::try_from(rows).ok())
+                    .filter(|rows| *rows > 0)
+                    .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+                if previous_end.is_some_and(|end| end > range.start) {
+                    return Err(PaneSelectionAnchorError::SourceChanged);
+                }
+                previous_end = Some(range.end);
+                count = count
+                    .checked_add(rows)
+                    .filter(|count| *count <= wezterm_term::screen::ScreenLineRead::MAX_ROWS)
+                    .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            }
+            let rows = ranges
+                .first()
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?
+                .start
+                ..ranges
+                    .last()
+                    .ok_or(PaneSelectionAnchorError::SourceChanged)?
+                    .end;
+            let cache = self
+                .renderable
+                .try_lock()
+                .ok_or(PaneSelectionAnchorError::Busy)?;
+            let (layout, current, current_dimensions, _) = cache
+                .selection_source_snapshot()
+                .ok_or(PaneSelectionAnchorError::Busy)?;
+            if sequence > current || !same_line_layout_geometry(&dimensions, &current_dimensions) {
+                return Err(PaneSelectionAnchorError::SourceChanged);
+            }
+            let mut witness = None;
+            cache
+                .selection_copy_snapshot(layout, sequence, rows.clone(), &mut witness)
+                .map_err(forwarded_selection_error)?;
+            drop(cache);
+            let registration = self
+                .mux_registration
+                .load()
+                .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+            let request = GetLinesAtLayout {
+                pane_id: self.remote_pane_id,
+                layout: LineReadLayout {
+                    seqno: sequence,
+                    dimensions,
+                },
+                lines: ranges.to_vec(),
+            };
+            let sent = request.clone();
+            let rpc_request = rpc.clone();
+            let pending = start_selection_rpc(
+                async move {
+                    let response = rpc_request.get_lines_at_layout(sent.clone()).await?;
+                    anyhow::ensure!(
+                        response.pane_id == sent.pane_id && response.layout == sent.layout,
+                        "forwarded line reply identity changed"
+                    );
+                    let (lines, incomplete) =
+                        hydrate_lines(&rpc_request, sent.pane_id, response.lines)
+                            .await?
+                            .into_parts();
+                    anyhow::ensure!(
+                        incomplete.is_empty() && lines.len() == count,
+                        "forwarded line reply is incomplete"
+                    );
+                    let mut expected = sent.lines.iter().flat_map(|range| range.clone());
+                    let mut bytes = wezterm_term::screen::ScreenLineRead::MAX_PAYLOAD_BYTES;
+                    let mut work = 65_536;
+                    let mut bounded = Vec::with_capacity(lines.len());
+                    for (row, line) in lines {
+                        anyhow::ensure!(
+                            expected.next() == Some(row)
+                                && line.current_seqno() != 0
+                                && line.current_seqno() <= sent.layout.seqno,
+                            "forwarded line reply row authority changed"
+                        );
+                        let line = line
+                            .try_clone_for_snapshot(&mut bytes, &mut work)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("forwarded line reply payload budget")
+                            })?;
+                        bounded.push((row, line));
+                    }
+                    Ok(bounded)
+                },
+                registration.clone(),
+            )
+            .map_err(|_| PaneSelectionAnchorError::Busy)?;
+            *state = Some(Box::new(ForwardedLayoutRead {
+                request,
+                registration,
+                rpc,
+                layout,
+                rows,
+                witness,
+                pending: Some(pending),
+                completed: false,
+            }));
+            return Ok(None);
+        }
+        let read = state
+            .as_mut()
+            .unwrap()
+            .downcast_mut::<ForwardedLayoutRead>()
+            .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+        if read.request.layout
+            != (LineReadLayout {
+                seqno: sequence,
+                dimensions,
+            })
+            || read.request.lines != ranges
+            || !self.owns_forwarded_read(read)
+            || read.completed
+        {
+            return Err(PaneSelectionAnchorError::SourceChanged);
+        }
+        let Some(result) = read.pending.as_ref().and_then(SelectionRpcResult::take) else {
+            return Ok(None);
+        };
+        read.pending = None;
+        let lines = result.map_err(|error| {
+            log::debug!("forwarded layout read refused: {error:#}");
+            PaneSelectionAnchorError::SourceChanged
+        })?;
+        read.completed = true;
+        Ok(Some(lines))
+    }
+
+    fn publish_lines_at_layout_capability(
+        &self,
+        state: &PaneLayoutRead,
+        publish: &mut dyn FnMut(),
+    ) -> Result<bool, PaneSelectionAnchorError> {
+        let read = state
+            .downcast_ref::<ForwardedLayoutRead>()
+            .ok_or(PaneSelectionAnchorError::SourceChanged)?;
+        if !read.completed || !self.owns_forwarded_read(read) {
+            return Err(PaneSelectionAnchorError::SourceChanged);
+        }
+        read.rpc
+            .commit_sync(RpcConsumerKind::FetchedLines, || {
+                let cache = self
+                    .renderable
+                    .try_lock()
+                    .ok_or(PaneSelectionAnchorError::Busy)?;
+                cache
+                    .publish_forwarded_read(
+                        read.layout,
+                        read.request.layout.seqno,
+                        read.request.layout.dimensions,
+                        &read.rows,
+                        read.witness.as_ref(),
+                        publish,
+                    )
+                    .map_err(forwarded_selection_error)
+            })
+            .map_err(|_| PaneSelectionAnchorError::SourceChanged)?
+    }
+
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
     }
@@ -6316,6 +6658,191 @@ mod tests {
         pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
             .expect("test pane should prepare its committed render connection");
         pane
+    }
+
+    #[test]
+    fn forwarded_selection_capture_keeps_original_request_across_resize_and_reconnect() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(861);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 863, 869);
+        // Proxy layout generations and server content sequences are unrelated
+        // namespaces. An idle server can retain sequence zero across many
+        // local layout retirements; this must not prevent anchor capture.
+        pane.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .retire_selection_layout();
+        let (layout, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
+        assert!(layout > sequence, "exercise divergent counter namespaces");
+        let points = [Some(wezterm_term::screen::SelectionAnchorCoordinate {
+            column: Some(2),
+            row: 0,
+        }); 3];
+        let mut state = None;
+        assert!(matches!(
+            pane.capture_selection_anchor_capability(sequence, dimensions, points, &mut state),
+            Ok(PaneSelectionAnchorStatus::Pending)
+        ));
+        {
+            let cache = pane.renderable.lock();
+            let mut cache = cache.inner.borrow_mut();
+            cache.retire_selection_layout();
+            cache.dimensions.cols = 40;
+        }
+        let sent = promise::spawn::block_on(
+            peer.respond_next_selection_capture(SelectionAnchorCaptureOutcomeV1::Captured),
+        )
+        .unwrap();
+        assert_eq!(
+            sent.layout,
+            LineReadLayout {
+                seqno: sequence,
+                dimensions
+            }
+        );
+        let mut ready = false;
+        for _ in 0..64 {
+            match pane
+                .capture_selection_anchor_capability(sequence, dimensions, points, &mut state)
+                .unwrap()
+            {
+                PaneSelectionAnchorStatus::Captured => {
+                    ready = true;
+                    break;
+                }
+                PaneSelectionAnchorStatus::Pending => {
+                    assert!(executor.try_tick().unwrap());
+                }
+            }
+        }
+        assert!(ready, "forwarded delayed capture must settle");
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
+        assert!(matches!(
+            pane.selection_anchor_capability_snapshot(state.as_ref().unwrap()),
+            Err(PaneSelectionAnchorError::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn forwarded_layout_read_returns_uncached_unicode_and_rejects_retired_authority() {
+        let scope = MuxTestScope::enter();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let (inner, peer) = test_client_inner_with_rpc_peer(871);
+        let pane = register_resize_test_pane(&mux, &executor, &inner, &peer, 873, 879);
+        // Only metadata is resident: successful forwarding must not require a
+        // renderer fetch or substitute the blank result of ordinary get_lines.
+        pane.renderable.lock().inner.borrow_mut().seqno = 7;
+        let (_, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
+        let mut state = None;
+        assert!(pane
+            .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+            .unwrap()
+            .is_none());
+        promise::spawn::block_on(peer.respond_next_lines(vec![(
+            0,
+            Line::from_text(
+                "界 e\u{301} exact",
+                &termwiz::cell::CellAttributes::default(),
+                7,
+                None,
+            ),
+        )]))
+        .unwrap();
+        let mut payload = None;
+        for _ in 0..64 {
+            payload = pane
+                .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+                .unwrap();
+            if payload.is_some() {
+                break;
+            }
+            assert!(executor.try_tick().unwrap());
+        }
+        let payload = payload.expect("bounded reply delivery");
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].0, 0);
+        assert_eq!(payload[0].1.as_str(), "界 e\u{301} exact");
+        let mut emitted = 0;
+        assert!(pane
+            .publish_lines_at_layout_capability(state.as_ref().unwrap(), &mut || emitted += 1)
+            .unwrap());
+        assert_eq!(emitted, 1);
+        peer.replace_ready_generation(&inner.client, CODEC_VERSION)
+            .unwrap();
+        assert!(matches!(
+            pane.publish_lines_at_layout_capability(state.as_ref().unwrap(), &mut || emitted += 1),
+            Err(PaneSelectionAnchorError::SourceChanged)
+        ));
+        assert_eq!(
+            emitted, 1,
+            "retired connection must not publish retained bytes"
+        );
+    }
+
+    #[test]
+    fn forwarded_layout_read_rejects_missing_rows_and_newer_content() {
+        for reply in [
+            Vec::new(),
+            vec![(
+                0,
+                Line::from_text(
+                    "changed after selection",
+                    &termwiz::cell::CellAttributes::default(),
+                    8,
+                    None,
+                ),
+            )],
+        ] {
+            let scope = MuxTestScope::enter();
+            let executor = promise::spawn::SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            scope.set_mux(&mux);
+            let (inner, peer) = test_client_inner_with_rpc_peer(881);
+            let pane = test_client_pane(&inner, 883, 889);
+            let published: Arc<dyn Pane> = pane.clone();
+            mux.add_pane(&published).unwrap();
+            pane.renderable.lock().inner.borrow_mut().seqno = 7;
+            let (_, sequence, dimensions, _) = pane.selection_source_snapshot().unwrap();
+            let mut state = None;
+            assert!(pane
+                .read_lines_at_layout_capability(sequence, dimensions, &[0..1], &mut state)
+                .unwrap()
+                .is_none());
+            promise::spawn::block_on(peer.respond_next_lines(reply)).unwrap();
+            let mut refused = false;
+            for _ in 0..64 {
+                match pane.read_lines_at_layout_capability(
+                    sequence,
+                    dimensions,
+                    &[0..1],
+                    &mut state,
+                ) {
+                    Err(PaneSelectionAnchorError::SourceChanged) => {
+                        refused = true;
+                        break;
+                    }
+                    Ok(None) => {
+                        assert!(executor.try_tick().unwrap());
+                    }
+                    other => panic!("invalid line reply was not refused: {:?}", other),
+                }
+            }
+            assert!(refused);
+            let mut emitted = false;
+            assert!(matches!(
+                pane.publish_lines_at_layout_capability(state.as_ref().unwrap(), &mut || emitted =
+                    true),
+                Err(PaneSelectionAnchorError::SourceChanged)
+            ));
+            assert!(!emitted);
+        }
     }
 
     #[test]

@@ -34,6 +34,30 @@ pub(crate) fn reserve_recovered_pane_ids(maximum: usize) -> anyhow::Result<()> {
 }
 pub type PaneId = usize;
 
+/// Backend-owned state. Only the originating pane may interpret this capability.
+pub type PaneSelectionAnchor = Box<dyn std::any::Any + Send + Sync>;
+pub type PaneLayoutRead = Box<dyn std::any::Any + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneSelectionAnchorError {
+    Busy,
+    SourceChanged,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneSelectionAnchorStatus {
+    Pending,
+    Captured,
+}
+
+pub type PaneSelectionAnchorSnapshot = (
+    SequenceNo,
+    SequenceNo,
+    RenderableDimensions,
+    Option<[Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3]>,
+);
+
 /// Refusal before applying any action in the returned batch.
 ///
 /// Readers may retry temporary saturation after releasing all model locks.
@@ -105,18 +129,20 @@ impl LineReadPool {
         // workers; no task or source rows have entered the pool yet.
         for _ in 0..MAX_LINE_READ_WORKERS {
             let receiver = Arc::clone(&receiver);
-            spawn(Box::new(move || loop {
-                let task = { receiver.lock().recv() };
-                let Ok(task) = task else {
-                    break;
-                };
-                // Never hold the receiver lock while hydrating, completing,
-                // or waiting for publication retirement. All four admitted
-                // reads must be able to progress independently.
-                let _ = frankenterm_sigpipe::catch_recoverable(
-                    frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
-                    std::panic::AssertUnwindSafe(task),
-                );
+            spawn(Box::new(move || {
+                loop {
+                    let task = { receiver.lock().recv() };
+                    let Ok(task) = task else {
+                        break;
+                    };
+                    // Never hold the receiver lock while hydrating, completing,
+                    // or waiting for publication retirement. All four admitted
+                    // reads must be able to progress independently.
+                    let _ = frankenterm_sigpipe::catch_recoverable(
+                        frankenterm_sigpipe::RecoverablePanicSite::MuxPaneCallback,
+                        std::panic::AssertUnwindSafe(task),
+                    );
+                }
             }))?;
         }
         Ok(Self { sender })
@@ -856,6 +882,45 @@ pub trait Pane: Downcast + Send + Sync {
         frankenterm_term::screen::ColdReadMetadataBusy,
     > {
         Ok(None)
+    }
+
+    /// Capture points in the selected terminal sequence and geometry. Each
+    /// backend derives its own layout authority; a proxy's local layout
+    /// generation is not a terminal sequence and must not cross this boundary.
+    fn capture_selection_anchor_capability(
+        &self,
+        _sequence: SequenceNo,
+        _dimensions: RenderableDimensions,
+        _points: [Option<frankenterm_term::screen::SelectionAnchorCoordinate>; 3],
+        _state: &mut Option<PaneSelectionAnchor>,
+    ) -> Result<PaneSelectionAnchorStatus, PaneSelectionAnchorError> {
+        Err(PaneSelectionAnchorError::Unsupported)
+    }
+
+    fn selection_anchor_capability_snapshot(
+        &self,
+        _state: &PaneSelectionAnchor,
+    ) -> Result<Option<PaneSelectionAnchorSnapshot>, PaneSelectionAnchorError> {
+        Err(PaneSelectionAnchorError::Unsupported)
+    }
+
+    fn read_lines_at_layout_capability(
+        &self,
+        _sequence: SequenceNo,
+        _dimensions: RenderableDimensions,
+        _ranges: &[Range<StableRowIndex>],
+        _state: &mut Option<PaneLayoutRead>,
+    ) -> Result<Option<Vec<(StableRowIndex, Line)>>, PaneSelectionAnchorError> {
+        Err(PaneSelectionAnchorError::Unsupported)
+    }
+
+    /// Publish only while the retained backend read witness remains current.
+    fn publish_lines_at_layout_capability(
+        &self,
+        _state: &PaneLayoutRead,
+        _publish: &mut dyn FnMut(),
+    ) -> Result<bool, PaneSelectionAnchorError> {
+        Err(PaneSelectionAnchorError::Unsupported)
     }
 
     fn publish_line_reads_at_layout(

@@ -15,6 +15,22 @@ use wezterm_term::screen::ScreenLineRead;
 use wezterm_term::unicode_column_width;
 use wezterm_term::{SemanticZone, StableRowIndex};
 
+/// Overlays decorate rows but do not own their terminal layout or revisions.
+/// Resolve the actual source before authorizing coordinates or cached pixels.
+pub(crate) fn selection_source_pane(mut pane: &dyn Pane) -> &dyn Pane {
+    loop {
+        if let Some(copy) = pane.downcast_ref::<crate::overlay::copy::CopyOverlay>() {
+            pane = copy.selection_delegate().as_ref();
+        } else if let Some(quick) =
+            pane.downcast_ref::<crate::overlay::quickselect::QuickSelectOverlay>()
+        {
+            pane = quick.selection_delegate().as_ref();
+        } else {
+            return pane;
+        }
+    }
+}
+
 /// Result of a successful smart-selection pick. Carries the pattern
 /// kind plus the selected text so the GUI mouse handler can emit
 /// the matching `SmartSelectionA11yMessage` to the AT-tree without
@@ -334,6 +350,7 @@ impl SelectionAuthority {
     pub fn capture_source(
         pane: &dyn Pane,
     ) -> Option<(Self, SequenceNo, mux::renderable::RenderableDimensions)> {
+        let pane = selection_source_pane(pane);
         // Native layout capture is atomic and nonblocking. Busy must never
         // fall back to a fabricated stamp from separately sampled metadata.
         let (sequence, source_sequence, dims, alternate) = if let Some(local) =

@@ -3754,6 +3754,46 @@ pub(crate) async fn hydrate_render_application_lines(
 }
 
 impl RenderableState {
+    /// The outer server sends only while the exact downstream read witness is
+    /// current. Keep the cache borrow across publication so a queued render
+    /// update cannot invalidate the rows between this check and the response.
+    pub(crate) fn publish_forwarded_read(
+        &self,
+        layout: SequenceNo,
+        selected_sequence: SequenceNo,
+        dimensions: RenderableDimensions,
+        rows: &Range<StableRowIndex>,
+        witness: Option<&SelectionReadWitness>,
+        publish: &mut dyn FnMut(),
+    ) -> Result<bool, super::SelectionReadError> {
+        use super::SelectionReadError;
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| SelectionReadError::Busy)?;
+        let issued = &witness.ok_or(SelectionReadError::SourceChanged)?.0;
+        let end = StableRowIndex::try_from(inner.dimensions.scrollback_rows)
+            .ok()
+            .and_then(|count| inner.dimensions.scrollback_top.checked_add(count));
+        if inner.dead
+            || inner.seqno == SequenceNo::MAX
+            || inner.seqno < selected_sequence
+            || inner.selection_layout_generation != layout
+            || !Weak::ptr_eq(&issued.owner, &inner.renderable)
+            || issued.layout != layout
+            || issued.selected_sequence != selected_sequence
+            || issued.rows != *rows
+            || issued.invalid.load(Ordering::Relaxed)
+            || !mux::renderable::same_line_layout_geometry(&dimensions, &inner.dimensions)
+            || rows.start < inner.dimensions.scrollback_top
+            || end.is_none_or(|end| rows.end > end)
+        {
+            return Err(SelectionReadError::SourceChanged);
+        }
+        publish();
+        Ok(true)
+    }
+
     pub(crate) fn selection_copy_snapshot(
         &self,
         layout: SequenceNo,
@@ -4455,7 +4495,7 @@ mod tests {
     use crate::client::Client;
     use crate::client::TEST_RENDER_CONNECTION_IDENTITY;
     use crate::domain::{ClientDomainConfig, ClientInner};
-    use crate::pane::ClientPane;
+    use crate::pane::{ClientPane, SelectionReadError};
     use codec::{
         GetImageCell, InputSerial, RenderConnectionIdentity, TopologyStreamId,
         MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES, MAX_IMAGE_HYDRATION_DECODED_BYTES,
@@ -4559,6 +4599,88 @@ mod tests {
 
     fn test_renderable_state() -> Arc<parking_lot::Mutex<super::RenderableState>> {
         test_renderable_state_with_echo_threshold(None)
+    }
+
+    #[test]
+    fn forwarded_read_publication_fences_uncached_mutation_resize_and_pruning() {
+        for change in ["selected", "resize", "prune"] {
+            let renderable = test_renderable_state();
+            let state = renderable.lock();
+            state.inner.borrow_mut().seqno = 7;
+            let (layout, sequence, dimensions, alternate) =
+                state.selection_source_snapshot().unwrap();
+            let mut witness = None;
+            state
+                .selection_copy_snapshot(layout, sequence, 0..1, &mut witness)
+                .unwrap();
+            assert!(state.inner.borrow().lines.peek(&0).is_none());
+            let mut published = 0;
+            assert!(state
+                .publish_forwarded_read(
+                    layout,
+                    sequence,
+                    dimensions,
+                    &(0..1),
+                    witness.as_ref(),
+                    &mut || published += 1
+                )
+                .unwrap());
+            let mut delta = codec::GetPaneRenderChangesResponse {
+                pane_id: 743,
+                mouse_grabbed: false,
+                alt_screen_active: alternate,
+                cursor_position: mux::renderable::StableCursorPosition::default(),
+                dimensions,
+                tiered_scrollback_status: None,
+                dirty_lines: std::iter::once(10..11).collect(),
+                title: "forwarded-read".to_string(),
+                working_dir: None,
+                bonus_lines: codec::SerializedLines::from(Vec::new()),
+                input_serial: None,
+                seqno: 8,
+            };
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_changes_to_surface(delta.clone(), Vec::new()));
+            assert!(state
+                .publish_forwarded_read(
+                    layout,
+                    sequence,
+                    dimensions,
+                    &(0..1),
+                    witness.as_ref(),
+                    &mut || published += 1
+                )
+                .unwrap());
+            assert_eq!(published, 2, "unrelated output must not prevent forwarding");
+            delta.seqno = 9;
+            match change {
+                "selected" => delta.dirty_lines = std::iter::once(0..1).collect(),
+                "resize" => delta.dimensions.cols = 40,
+                "prune" => delta.dimensions.scrollback_top = 1,
+                _ => unreachable!(),
+            }
+            assert!(state
+                .inner
+                .borrow_mut()
+                .apply_changes_to_surface(delta, Vec::new()));
+            assert!(matches!(
+                state.publish_forwarded_read(
+                    layout,
+                    sequence,
+                    dimensions,
+                    &(0..1),
+                    witness.as_ref(),
+                    &mut || published += 1
+                ),
+                Err(SelectionReadError::SourceChanged)
+            ));
+            assert_eq!(
+                published, 2,
+                "invalidated forwarding must not invoke publication"
+            );
+        }
     }
 
     #[test]

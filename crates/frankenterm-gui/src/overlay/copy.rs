@@ -19,7 +19,7 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use promise::spawn::sleep;
 use rangeset::RangeSet;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +77,105 @@ pub struct CopyOverlay {
     delegate: Arc<dyn Pane>,
     render: Arc<Mutex<CopyRenderable>>,
     writer: Mutex<SearchOverlayPatternWriter>,
+}
+
+type CopyCoordinateSource = (
+    crate::selection::SelectionAuthority,
+    SequenceNo,
+    RenderableDimensions,
+);
+
+/// Cursor, selection start and viewport are one coordinate transaction. The
+/// token belongs to the terminal backend, never to numeric row arithmetic.
+struct CopyCoordinateAnchor {
+    source: CopyCoordinateSource,
+    original: CopyCoordinateSource,
+    points: [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+    state: Option<mux::pane::PaneSelectionAnchor>,
+    captured: bool,
+    deadline: std::time::Instant,
+}
+
+impl CopyCoordinateAnchor {
+    fn allows_navigation(&self, current: Option<crate::selection::SelectionAuthority>) -> bool {
+        current == Some(self.source.0)
+    }
+
+    fn failure_invalidates(
+        &self,
+        error: mux::pane::PaneSelectionAnchorError,
+        current: Option<crate::selection::SelectionAuthority>,
+    ) -> bool {
+        error != mux::pane::PaneSelectionAnchorError::Unsupported
+            || !self.allows_navigation(current)
+    }
+
+    fn poll(
+        &mut self,
+        pane: &dyn Pane,
+    ) -> Result<
+        Option<(
+            [Option<wezterm_term::screen::SelectionAnchorCoordinate>; 3],
+            CopyCoordinateSource,
+        )>,
+        mux::pane::PaneSelectionAnchorError,
+    > {
+        use mux::pane::{PaneSelectionAnchorError as Error, PaneSelectionAnchorStatus as Status};
+        if std::time::Instant::now() >= self.deadline {
+            return Err(Error::SourceChanged);
+        }
+        if !self.captured {
+            match pane.capture_selection_anchor_capability(
+                self.original.1,
+                self.original.2,
+                self.points,
+                &mut self.state,
+            )? {
+                Status::Pending => return Ok(None),
+                Status::Captured => self.captured = true,
+            }
+        }
+        let Some((_, sequence, dimensions, points)) = pane.selection_anchor_capability_snapshot(
+            self.state.as_ref().ok_or(Error::SourceChanged)?,
+        )?
+        else {
+            return Ok(None);
+        };
+        let points = points.ok_or(Error::SourceChanged)?;
+        let source =
+            crate::selection::SelectionAuthority::capture_source(pane).ok_or(Error::Busy)?;
+        if source.1 != sequence || source.2 != dimensions {
+            return Ok(None);
+        }
+        Ok(Some((points, source)))
+    }
+}
+
+fn copy_resize_restarts_search(resized: bool, pattern_empty: bool) -> bool {
+    resized && !pattern_empty
+}
+
+struct CopyCoordinateDriverGuard(Arc<AtomicBool>);
+
+impl Drop for CopyCoordinateDriverGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn coordinate_reply_before_deadline(
+    reply: oneshot::Receiver<bool>,
+    deadline: std::time::Instant,
+) -> bool {
+    if std::time::Instant::now() >= deadline {
+        return false;
+    }
+    let timeout = sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+    futures::pin_mut!(reply, timeout);
+    matches!(
+        futures::future::select(reply, timeout).await,
+        futures::future::Either::Left((Ok(true), _))
+    )
 }
 
 fn close_copy_overlay_if_current(
@@ -440,6 +539,13 @@ struct CopyRenderable {
     content_navigation: Option<ContentNavigation>,
     content_action: Arc<()>,
     content_viewport_publication: Arc<ContentViewportPublication>,
+    coordinate_anchor: Option<CopyCoordinateAnchor>,
+    coordinate_driver: Option<promise::spawn::MainThreadSpawnedTask<()>>,
+    coordinate_action: Arc<()>,
+    deferred_navigation: VecDeque<KeyAssignment>,
+    coordinates_invalid: bool,
+    coordinate_driver_running: Arc<AtomicBool>,
+    coordinate_remap_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1131,6 +1237,48 @@ mod dirty_tracking_tests {
             }
             assert_eq!(result, Some(expected), "exact wide/combining-cell endpoint");
         }
+        let source = crate::selection::SelectionAuthority::capture_source(&*pane).unwrap();
+        let mut coordinates = CopyCoordinateAnchor {
+            source,
+            original: source,
+            points: [
+                Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                    column: Some(7),
+                    row: 0,
+                }),
+                Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                    column: Some(2),
+                    row: 0,
+                }),
+                Some(wezterm_term::screen::SelectionAnchorCoordinate {
+                    column: Some(0),
+                    row: 0,
+                }),
+            ],
+            state: None,
+            captured: false,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+        };
+        // Unsupported peers still permit ordinary navigation in the exact
+        // original frame: token presence is not fabricated as a prerequisite.
+        assert!(coordinates.allows_navigation(Some(source.0)));
+        assert!(
+            !coordinates.failure_invalidates(
+                mux::pane::PaneSelectionAnchorError::Unsupported,
+                Some(source.0)
+            ),
+            "legacy unsupported capture preserves same-layout navigation"
+        );
+        loop {
+            match coordinates.poll(&*pane) {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                other => panic!("real cold coordinate capture failed: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < coordinates.deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(coordinates.captured);
         for stale in ["cursor", "selection", "close", "source", "geometry"] {
             let mut action = ContentNavigation::new((0, 0), None, SelectionMode::Cell, true);
             while action.receiver.is_none() {
@@ -1214,6 +1362,117 @@ mod dirty_tracking_tests {
             );
             assert!(!published, "stale {stale} must not move the cursor");
         }
+        pane.resize(TerminalSize {
+            rows: 3,
+            cols: 4,
+            dpi: 96,
+            pixel_width: 32,
+            pixel_height: 48,
+        })
+        .unwrap();
+        coordinates.deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = crate::selection::SelectionAuthority::capture_source(&*pane);
+            if current.is_some_and(|(_, _, dims)| dims.cols == 4) {
+                break;
+            }
+            assert!(std::time::Instant::now() < coordinates.deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !coordinates.allows_navigation(crate::selection::SelectionAuthority::capture(&*pane)),
+            "even an unsupported anchor must not authorize old coordinates after resize"
+        );
+        assert!(
+            coordinates.failure_invalidates(
+                mux::pane::PaneSelectionAnchorError::Unsupported,
+                crate::selection::SelectionAuthority::capture(&*pane)
+            ),
+            "legacy unsupported capture refuses changed-layout coordinates"
+        );
+        let mapped = loop {
+            match coordinates.poll(&*pane) {
+                Ok(Some((points, _))) => break points,
+                Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy) => {}
+                other => panic!("real cold coordinate resolution failed: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < coordinates.deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let start = mapped[1].unwrap();
+        let end = mapped[0].unwrap();
+        let viewport = mapped[2].unwrap();
+        assert_eq!(
+            viewport.row, start.row,
+            "top-prefix viewport follows the same logical content"
+        );
+        assert!(
+            end.row > start.row,
+            "four-column resize must really reflow the selected prefix"
+        );
+        let requested = start.row..end.row + 1;
+        let read = pane
+            .capture_line_read(requested.clone(), &mut Default::default())
+            .expect("native cold read capability")
+            .expect("capture remapped cold rows")
+            .hydrate(|| false)
+            .expect("hydrate remapped cold rows");
+        let (first, rows) = read
+            .try_clone_viewport_for_snapshot(requested, &mut (32 * 1024 * 1024), &mut 65_536)
+            .expect("complete bounded remapped cold rows");
+        assert_eq!(first, start.row);
+        let mut selected = String::new();
+        for (offset, line) in rows.iter().enumerate() {
+            let row = first + offset as isize;
+            let left = if row == start.row {
+                start.column.unwrap()
+            } else {
+                0
+            };
+            let right = if row == end.row {
+                end.column.unwrap() + 1
+            } else {
+                4
+            };
+            selected.push_str(&line.columns_as_str(left..right));
+        }
+        assert_eq!(
+            selected, "界e\u{301}  Z",
+            "actual cold reflow retains exact original selected bytes"
+        );
+    }
+
+    #[test]
+    fn non_search_copy_resize_does_not_restart_selection_clearing_search() {
+        assert!(!copy_resize_restarts_search(true, true));
+        assert!(copy_resize_restarts_search(true, false));
+        assert!(!copy_resize_restarts_search(false, false));
+    }
+
+    #[test]
+    fn coordinate_driver_deadline_rejects_late_reply_and_releases_running_owner() {
+        use futures::FutureExt;
+        let running = Arc::new(AtomicBool::new(true));
+        let guard = CopyCoordinateDriverGuard(Arc::clone(&running));
+        let (send, recv) = oneshot::channel();
+        send.send(true).unwrap();
+        assert_eq!(
+            coordinate_reply_before_deadline(recv, std::time::Instant::now()).now_or_never(),
+            Some(false),
+            "an already queued reply cannot authorize an expired action"
+        );
+        drop(guard);
+        assert!(!running.load(Ordering::Acquire));
+        let (send, recv) = oneshot::channel();
+        send.send(true).unwrap();
+        assert_eq!(
+            coordinate_reply_before_deadline(
+                recv,
+                std::time::Instant::now() + Duration::from_secs(5)
+            )
+            .now_or_never(),
+            Some(true)
+        );
     }
 
     fn make_dirty_ranges(
@@ -1604,6 +1863,10 @@ pub struct CopyModeParams {
 }
 
 impl CopyOverlay {
+    pub(crate) fn selection_delegate(&self) -> &Arc<dyn Pane> {
+        &self.delegate
+    }
+
     pub fn with_pane(
         term_window: &TermWindow,
         pane: &Arc<dyn Pane>,
@@ -1676,11 +1939,19 @@ impl CopyOverlay {
             content_navigation: None,
             content_action: Arc::new(()),
             content_viewport_publication: Arc::new(ContentViewportPublication::default()),
+            coordinate_anchor: None,
+            coordinate_driver: None,
+            coordinate_action: Arc::new(()),
+            deferred_navigation: VecDeque::new(),
+            coordinates_invalid: false,
+            coordinate_driver_running: Arc::new(AtomicBool::new(false)),
+            coordinate_remap_deadline: None,
         };
 
         let search_row = render.compute_search_row();
         render.dirty_results.add(search_row);
         render.update_search();
+        render.refresh_coordinate_anchor();
 
         let shared_render = Arc::new(Mutex::new(render));
         let writer = SearchOverlayPatternWriter {
@@ -1730,6 +2001,9 @@ impl CopyOverlay {
             } else {
                 render.mark_search_ui_dirty();
             }
+            if render.coordinates_current() {
+                render.refresh_coordinate_anchor();
+            }
         }
     }
 }
@@ -1752,6 +2026,236 @@ impl Drop for CopyRenderable {
 }
 
 impl CopyRenderable {
+    fn coordinates_current(&self) -> bool {
+        let Some((authority, _, dimensions)) =
+            crate::selection::SelectionAuthority::capture_source(&*self.delegate)
+        else {
+            return false;
+        };
+        let Some(end) =
+            checked_stable_row_end(dimensions.scrollback_top, dimensions.scrollback_rows)
+        else {
+            return false;
+        };
+        !self.coordinates_invalid
+            && [
+                Some(self.cursor.y),
+                self.start.map(|start| start.y),
+                self.viewport,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|row| row >= dimensions.scrollback_top && row < end)
+            && self
+                .coordinate_anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.allows_navigation(Some(authority)))
+    }
+
+    fn refresh_coordinate_anchor(&mut self) {
+        use wezterm_term::screen::SelectionAnchorCoordinate as Point;
+        let source = crate::selection::SelectionAuthority::capture_source(&*self.delegate)
+            .or_else(|| self.coordinate_anchor.as_ref().map(|anchor| anchor.source));
+        self.coordinate_driver.take();
+        self.coordinate_driver_running = Arc::new(AtomicBool::new(false));
+        self.coordinate_remap_deadline = None;
+        self.coordinate_action = Arc::new(());
+        self.coordinate_anchor.take();
+        let Some(source) = source else {
+            self.coordinates_invalid = true;
+            log::warn!("copy navigation has no current coordinate authority");
+            return;
+        };
+        let points = [
+            Some(Point {
+                column: Some(self.cursor.x),
+                row: self.cursor.y,
+            }),
+            self.start.map(|start| Point {
+                column: match start.x {
+                    SelectionX::Cell(x) => Some(x),
+                    SelectionX::BeforeZero => None,
+                },
+                row: start.y,
+            }),
+            self.viewport.map(|row| Point {
+                column: Some(0),
+                row,
+            }),
+        ];
+        let mut anchor = CopyCoordinateAnchor {
+            source,
+            original: source,
+            points,
+            state: None,
+            captured: false,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+        };
+        // First poll orders the capture before a subsequent resize request.
+        let initial = anchor.poll(&*self.delegate);
+        self.coordinate_anchor = Some(anchor);
+        self.coordinates_invalid = false;
+        if !matches!(initial, Ok(Some(_))) {
+            self.schedule_coordinate_driver();
+        }
+    }
+
+    fn schedule_coordinate_driver(&mut self) {
+        if self.coordinate_driver_running.load(Ordering::Acquire) || self.coordinates_invalid {
+            return;
+        }
+        let deadline = *self
+            .coordinate_remap_deadline
+            .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+        if std::time::Instant::now() >= deadline {
+            self.coordinates_invalid = true;
+            self.start = None;
+            self.deferred_navigation.clear();
+            self.clear_selection();
+            log::warn!("copy coordinate remap deadline expired; navigation refused");
+            return;
+        }
+        let Some(anchor) = self.coordinate_anchor.as_mut() else {
+            return;
+        };
+        anchor.deadline = deadline;
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4096,
+            "copy coordinate remap",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                log::warn!("{error:#}; copy coordinate remap not admitted");
+                return;
+            }
+        };
+        let window = self.window.clone();
+        let pane_id = self.delegate.pane_id();
+        let instance = Arc::clone(&self.instance_token);
+        let action = Arc::clone(&self.coordinate_action);
+        self.coordinate_driver_running = Arc::new(AtomicBool::new(true));
+        let running = CopyCoordinateDriverGuard(Arc::clone(&self.coordinate_driver_running));
+        self.coordinate_driver = Some(reservation.spawn_local(async move {
+            let _running = running;
+            loop {
+                let (send, recv) = oneshot::channel();
+                let instance = Arc::clone(&instance);
+                let action = Arc::clone(&action);
+                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                    let overlay = tw.pane_state(pane_id).and_then(|state| {
+                        state
+                            .overlay
+                            .as_ref()
+                            .map(|overlay| Arc::clone(&overlay.pane))
+                    });
+                    let Some(overlay) = overlay else {
+                        return;
+                    };
+                    let Some(copy) = overlay.downcast_ref::<CopyOverlay>() else {
+                        return;
+                    };
+                    let mut publication = None;
+                    let (retry, queued) = {
+                        let mut r = copy.render.lock();
+                        if !Arc::ptr_eq(&r.instance_token, &instance)
+                            || !Arc::ptr_eq(&r.coordinate_action, &action)
+                        {
+                            return;
+                        }
+                        let pane = Arc::clone(&r.delegate);
+                        let result = r
+                            .coordinate_anchor
+                            .as_mut()
+                            .map(|anchor| anchor.poll(&*pane));
+                        match result {
+                            Some(Ok(Some((points, source)))) => {
+                                let remapped = r
+                                    .coordinate_anchor
+                                    .as_ref()
+                                    .is_some_and(|anchor| anchor.source.0 != source.0);
+                                let Some(cursor) = points[0].and_then(|point| {
+                                    point.column.map(|column| (column, point.row))
+                                }) else {
+                                    let _ = send.send(false);
+                                    return;
+                                };
+                                r.cursor.x = cursor.0;
+                                r.cursor.y = cursor.1;
+                                r.start = points[1].map(|point| SelectionCoordinate {
+                                    x: point
+                                        .column
+                                        .map_or(SelectionX::BeforeZero, SelectionX::Cell),
+                                    y: point.row,
+                                });
+                                r.viewport = points[2].map(|point| point.row);
+                                r.coordinate_anchor.as_mut().unwrap().source = source;
+                                r.coordinates_invalid = false;
+                                r.coordinate_driver_running.store(false, Ordering::Release);
+                                r.coordinate_remap_deadline = None;
+                                if remapped {
+                                    publication = Some((
+                                        source,
+                                        r.viewport,
+                                        Arc::clone(&r.content_viewport_publication),
+                                        pane,
+                                    ));
+                                }
+                                (false, r.deferred_navigation.drain(..).collect::<Vec<_>>())
+                            }
+                            Some(Ok(None) | Err(mux::pane::PaneSelectionAnchorError::Busy)) => {
+                                (true, Vec::new())
+                            }
+                            failed => {
+                                r.coordinate_driver_running.store(false, Ordering::Release);
+                                let current = crate::selection::SelectionAuthority::capture(&*pane);
+                                let invalid = match (failed, r.coordinate_anchor.as_ref()) {
+                                    (Some(Err(error)), Some(anchor)) => {
+                                        anchor.failure_invalidates(error, current)
+                                    }
+                                    _ => true,
+                                };
+                                if invalid {
+                                    r.coordinates_invalid = true;
+                                    r.start = None;
+                                    r.clear_selection();
+                                    r.deferred_navigation.clear();
+                                    log::warn!(
+                                        "copy coordinates could not be remapped; navigation refused"
+                                    );
+                                }
+                                (false, Vec::new())
+                            }
+                        }
+                    };
+                    if let Some((source, viewport, guard, pane)) = publication {
+                        if crate::selection::SelectionAuthority::capture_source(&*pane)
+                            == Some(source)
+                        {
+                            // The GUI selection retains its own original token.
+                            // Do not replace that intent with a freshly captured
+                            // range derived from this independent viewport token.
+                            tw.selection_authority_is_current(&pane);
+                            guard.with_dimensions(source.2, || {
+                                tw.set_viewport(pane_id, viewport, source.2)
+                            });
+                        } else {
+                            copy.render.lock().schedule_coordinate_driver();
+                        }
+                    }
+                    for assignment in queued {
+                        copy.perform_assignment(&assignment);
+                    }
+                    let _ = send.send(retry);
+                })));
+                if !coordinate_reply_before_deadline(recv, deadline).await {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        }));
+    }
+
     fn compute_search_row(&self) -> StableRowIndex {
         compute_search_row_from_viewport(self.viewport, self.delegate.get_dimensions())
     }
@@ -1811,8 +2315,11 @@ impl CopyRenderable {
                 .get_changed_since_with_source_fence(lines, self.last_result_seqno);
             source_end < self.last_result_seqno || dirty.iter().next().is_some()
         };
-        if resized || source_changed {
+        if copy_resize_restarts_search(resized, self.get_pattern().is_empty()) || source_changed {
             self.restart_search(true, 0);
+        }
+        if resized || !self.coordinates_current() {
+            self.schedule_coordinate_driver();
         }
     }
 
@@ -2460,6 +2967,7 @@ impl CopyRenderable {
             self.adjust_viewport_for_cursor_position();
             self.window.invalidate();
         }
+        self.refresh_coordinate_anchor();
     }
 
     fn adjust_selection(&self, start: SelectionCoordinate, range: SelectionRange) {
@@ -2836,7 +3344,11 @@ impl CopyRenderable {
                             match effect(tw) {
                                 Ok(false) => true,
                                 outcome => {
-                                    render.lock().content_navigation.take();
+                                    let mut render = render.lock();
+                                    render.content_navigation.take();
+                                    if matches!(outcome, Ok(true)) {
+                                        render.refresh_coordinate_anchor();
+                                    }
                                     if let Err(reason) = outcome {
                                         log::warn!("{reason}");
                                     }
@@ -3680,6 +4192,23 @@ impl Pane for CopyOverlay {
     fn perform_assignment(&self, assignment: &KeyAssignment) -> PerformAssignmentResult {
         use CopyModeAssignment::*;
         let mut render = self.render.lock();
+        if matches!(assignment, KeyAssignment::CopyMode(_))
+            && !matches!(
+                assignment,
+                KeyAssignment::CopyMode(CopyModeAssignment::Close)
+            )
+            && !render.coordinates_current()
+        {
+            if render.coordinates_invalid || render.deferred_navigation.len() >= 16 {
+                log::warn!(
+                    "copy navigation refused: coordinate authority unavailable or pending queue full"
+                );
+            } else {
+                render.deferred_navigation.push_back(assignment.clone());
+                render.schedule_coordinate_driver();
+            }
+            return PerformAssignmentResult::Handled;
+        }
         render.content_navigation.take();
         render.content_action = Arc::new(());
         if render.pending_jump.is_some() {
@@ -3798,7 +4327,11 @@ impl Pane for CopyOverlay {
                 visibility: termwiz::surface::CursorVisibility::Visible,
             }
         } else {
-            renderer.cursor
+            let mut cursor = renderer.cursor;
+            if !renderer.coordinates_current() {
+                cursor.visibility = CursorVisibility::Hidden;
+            }
+            cursor
         }
     }
 

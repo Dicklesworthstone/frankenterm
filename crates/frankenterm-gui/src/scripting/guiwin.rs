@@ -166,6 +166,7 @@ impl UserData for GuiWin {
                     .recv_async()
                     .await
                     .map_err(|e| anyhow::anyhow!("{:#}", e))
+                    .map_err(luaerr)?
                     .map_err(luaerr)?;
 
                 Ok(text)
