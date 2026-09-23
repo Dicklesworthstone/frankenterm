@@ -7,6 +7,8 @@
 
 #![cfg(unix)]
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -44,8 +46,6 @@ fn hermetic_command(root: &Path) -> Command {
 
 /// Every unix socket created anywhere under the hermetic root.
 fn sockets_under(root: &Path) -> Vec<PathBuf> {
-    use std::os::unix::fs::FileTypeExt as _;
-
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
