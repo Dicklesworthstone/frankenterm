@@ -26,11 +26,13 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- `0.15.14`; development on `main` since the local `0.15.2` build
+## [Unreleased] -- `0.15.15`; development on `main` since the local `0.15.2` build
 
 Compare against the latest public release: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-Version `0.15.14` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+Version `0.15.15` carries forward the release-candidate fixes below. Publication and final native artifact qualification remain pending.
+
+- Workflow input uses live watcher and captured prompt evidence before each step and send. Detection alone no longer implies a safe shell prompt, normal screen, or uninterrupted capture. Reservation checks retain unknown authority on lookup failure and reject foreign ownership before an approval can authorize input; reservation changes and dispatch share the same effect fence.
 
 - Retention cleanup records a durable attempt before deleting session data. An interrupted or malformed attempt blocks subsequent cleanup until explicit operator acknowledgement. Real subprocess interruption tests cover admission, age/count/size deletion, orphan cleanup, and interruption before completion publication; this does not establish recovery of running processes after power loss.
 
