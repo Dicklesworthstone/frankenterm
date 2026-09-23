@@ -2469,7 +2469,7 @@ impl LineWrapGeometry {
             && cost_model.lookahead_limit > 0;
         // Greedy baseline, scored candidate, final plan, and two temporary
         // paths for a rare exact scalar tie; eight vectors is conservative.
-        let offset_vectors = 8;
+        let offset_vectors: usize = 8;
         let mut bytes = prefix
             .checked_mul(core::mem::size_of::<u128>())?
             .checked_add(
