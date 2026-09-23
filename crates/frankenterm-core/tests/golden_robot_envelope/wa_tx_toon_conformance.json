@@ -311,40 +311,26 @@
         "prepare_report": {
           "gate_inputs": [
             {
-              "approval_reason_code": "policy.alt_screen_unknown",
-              "approval_satisfied": false,
+              "approval_satisfied": true,
               "liveness_reason_code": "tx.prepare.target_missing:11",
               "pane_id": 11,
-              "policy_passed": true,
+              "policy_passed": false,
+              "policy_reason_code": "policy.reservation_unknown",
               "precondition_reason_code": "tx.prepare.precondition.prompt_active.target_missing:11",
               "preconditions_satisfied": false,
-              "required_approval": {
-                "action_fingerprint": "sha256:aa8acb0c783dd549d4804088710dbca52ed2151cef57ea5d51c0b6474eff6d2a",
-                "action_kind": "send_text",
-                "pane_id": 11,
-                "reason_code": "policy.alt_screen_unknown",
-                "workspace_id": "<workspace_id>"
-              },
               "reservation_available": false,
               "reservation_reason_code": "tx.prepare.reservation_unknown:11",
               "step_id": "tx-step:1",
               "target_liveness": false
             },
             {
-              "approval_reason_code": "policy.alt_screen_unknown",
-              "approval_satisfied": false,
+              "approval_satisfied": true,
               "liveness_reason_code": "tx.prepare.target_missing:12",
               "pane_id": 12,
-              "policy_passed": true,
+              "policy_passed": false,
+              "policy_reason_code": "policy.reservation_unknown",
               "precondition_reason_code": "tx.prepare.precondition.prompt_active.target_missing:11",
               "preconditions_satisfied": false,
-              "required_approval": {
-                "action_fingerprint": "sha256:3a9e13f15f68ee70e29e76f06c521d1d48601472e566987bf1ba2b6627ad310a",
-                "action_kind": "send_text",
-                "pane_id": 12,
-                "reason_code": "policy.alt_screen_unknown",
-                "workspace_id": "<workspace_id>"
-              },
               "reservation_available": false,
               "reservation_reason_code": "tx.prepare.reservation_unknown:12",
               "step_id": "tx-step:2",
@@ -370,40 +356,26 @@
         "prepare_report": {
           "gate_inputs": [
             {
-              "approval_reason_code": "policy.alt_screen_unknown",
-              "approval_satisfied": false,
+              "approval_satisfied": true,
               "liveness_reason_code": "tx.prepare.target_missing:11",
               "pane_id": 11,
-              "policy_passed": true,
+              "policy_passed": false,
+              "policy_reason_code": "policy.reservation_unknown",
               "precondition_reason_code": "tx.prepare.precondition.prompt_active.target_missing:11",
               "preconditions_satisfied": false,
-              "required_approval": {
-                "action_fingerprint": "sha256:aa8acb0c783dd549d4804088710dbca52ed2151cef57ea5d51c0b6474eff6d2a",
-                "action_kind": "send_text",
-                "pane_id": 11,
-                "reason_code": "policy.alt_screen_unknown",
-                "workspace_id": "<workspace_id>"
-              },
               "reservation_available": false,
               "reservation_reason_code": "tx.prepare.reservation_unknown:11",
               "step_id": "tx-step:1",
               "target_liveness": false
             },
             {
-              "approval_reason_code": "policy.alt_screen_unknown",
-              "approval_satisfied": false,
+              "approval_satisfied": true,
               "liveness_reason_code": "tx.prepare.target_missing:12",
               "pane_id": 12,
-              "policy_passed": true,
+              "policy_passed": false,
+              "policy_reason_code": "policy.reservation_unknown",
               "precondition_reason_code": "tx.prepare.precondition.prompt_active.target_missing:11",
               "preconditions_satisfied": false,
-              "required_approval": {
-                "action_fingerprint": "sha256:3a9e13f15f68ee70e29e76f06c521d1d48601472e566987bf1ba2b6627ad310a",
-                "action_kind": "send_text",
-                "pane_id": 12,
-                "reason_code": "policy.alt_screen_unknown",
-                "workspace_id": "<workspace_id>"
-              },
               "reservation_available": false,
               "reservation_reason_code": "tx.prepare.reservation_unknown:12",
               "step_id": "tx-step:2",

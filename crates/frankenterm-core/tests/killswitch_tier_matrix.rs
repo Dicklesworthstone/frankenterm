@@ -29,7 +29,9 @@
 
 use std::path::PathBuf;
 
-use frankenterm_core::policy::{ActionKind, ActorKind, PolicyEngine, PolicyInput};
+use frankenterm_core::policy::{
+    ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput,
+};
 use frankenterm_core::policy_quarantine::KillSwitchLevel;
 use serde_json::{Value, json};
 
@@ -123,7 +125,12 @@ fn evaluate(tier: KillSwitchLevel, action: ActionKind, pane: Option<u64>) -> Cel
     let mut engine = engine_at(tier);
     let mut input = PolicyInput::new(action, ActorKind::Robot);
     if let Some(p) = pane {
-        input = input.with_pane(p);
+        // This matrix isolates kill-switch tiers with explicitly known-free
+        // fixture panes; unknown live reservation authority must still deny.
+        input = input.with_pane(p).with_capabilities(PaneCapabilities {
+            is_reserved: Some(false),
+            ..PaneCapabilities::default()
+        });
     }
     let decision = engine.authorize(&input);
     let rule_id = decision.rule_id().map(str::to_string);
@@ -270,6 +277,22 @@ fn every_action_kind_is_in_the_matrix() {
         declared_sorted, names,
         "ACTIONS in this test must list every ActionKind variant"
     );
+}
+
+#[test]
+fn disarmed_matrix_does_not_assume_unknown_reservations_are_free() {
+    let mut engine = engine_at(KillSwitchLevel::Disarmed);
+    let decision =
+        engine.authorize(&PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(1));
+    assert!(decision.is_denied());
+    assert_eq!(decision.rule_id(), Some("policy.reservation_unknown"));
+    let known_free = evaluate(KillSwitchLevel::Disarmed, ActionKind::SendText, Some(1));
+    assert_eq!(known_free.decision, "approval");
+    assert_eq!(
+        known_free.rule_id.as_deref(),
+        Some("policy.alt_screen_unknown")
+    );
+    assert!(!known_free.kill_switch_denied);
 }
 
 #[test]

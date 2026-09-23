@@ -13949,7 +13949,10 @@ mod tests {
     "outcome_complete_restore_attempts": 0,
     "reconciliation_required_restore_attempts": 0,
     "orphaned_restore_intents": 0,
-    "total_data_bytes": 2560
+    "total_data_bytes": 2560,
+    "cleanup_attempt": {
+      "state": "none"
+    }
   }
 }"#;
 

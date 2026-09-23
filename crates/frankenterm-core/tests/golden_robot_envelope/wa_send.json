@@ -175,6 +175,12 @@
               {
                 "decision": null,
                 "matched": false,
+                "reason": "no reservation conflict",
+                "rule_id": "policy.pane_reserved"
+              },
+              {
+                "decision": null,
+                "matched": false,
                 "reason": null,
                 "rule_id": "policy.rate_limit"
               },

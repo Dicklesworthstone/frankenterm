@@ -577,6 +577,12 @@ fn assert_response_outcome(harness: &TestHarness, tool_name: &str, envelope: &Va
             for gate in gates {
                 assert_eq!(gate["target_liveness"], false);
                 assert_eq!(gate["preconditions_satisfied"], false);
+                // A missing pane cannot establish reservation authority. This
+                // is a hard denial, never an approvable shell-state warning.
+                assert_eq!(gate["policy_passed"], false);
+                assert_eq!(gate["policy_reason_code"], "policy.reservation_unknown");
+                assert!(gate.get("required_approval").is_none());
+                assert!(gate.get("approval_reason_code").is_none());
             }
             assert!(envelope["data"].get("commit_report").is_none());
             assert_persisted_prepare_denial(harness);
