@@ -17,9 +17,11 @@ use frankenterm_font::FontConfiguration;
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingVertex, visit_expanded_glyph_quad_soa_vertices,
 };
+use futures::FutureExt;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;
@@ -377,14 +379,16 @@ impl std::ops::Deref for WebGpuIndexBuffer {
 
 impl WebGpuIndexBuffer {
     pub fn new(indices: &[u32], state: &WebGpuState) -> Self {
+        Self::with_device(indices, &state.device)
+    }
+
+    fn with_device(indices: &[u32], device: &wgpu::Device) -> Self {
         Self {
-            buf: state
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Index Buffer"),
-                    usage: wgpu::BufferUsages::INDEX,
-                    contents: bytemuck::cast_slice(indices),
-                }),
+            buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                usage: wgpu::BufferUsages::INDEX,
+                contents: bytemuck::cast_slice(indices),
+            }),
         }
     }
 }
@@ -523,6 +527,28 @@ unsafe impl<'a, T: ?Sized + ::window::glium::buffer::Content + 'static> ExtendSt
 }
 
 impl TripleVertexBuffer {
+    fn new_webgpu(num_quads: usize, device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self {
+            index: RefCell::new(0),
+            bufs: RefCell::new(std::array::from_fn(|_| {
+                VertexBuffer::WebGpu(WebGpuVertexBuffer::new(
+                    num_quads * VERTICES_PER_CELL,
+                    device,
+                    queue,
+                ))
+            })),
+            glyph_quad_instances: RefCell::new(std::array::from_fn(|_| {
+                WebGpuGlyphQuadSoaStaging::default()
+            })),
+            indices: IndexBuffer::WebGpu(WebGpuIndexBuffer::with_device(
+                &build_quad_indices(num_quads),
+                device,
+            )),
+            capacity: num_quads,
+            next_quad: RefCell::new(0),
+        }
+    }
+
     pub fn clear_quad_allocation(&self) {
         *self.next_quad.borrow_mut() = 0;
         for buffer in self.bufs.borrow_mut().iter_mut() {
@@ -617,7 +643,8 @@ impl TripleVertexBuffer {
 }
 
 pub struct RenderLayer {
-    pub vb: RefCell<[TripleVertexBuffer; 3]>,
+    pub vb: Rc<RefCell<[TripleVertexBuffer; 3]>>,
+    shrink_usage: RefCell<[Option<QuadShrinkUsage>; 3]>,
     context: RenderContext,
     zindex: i8,
 }
@@ -632,7 +659,8 @@ impl RenderLayer {
 
         Ok(Self {
             context: context.clone(),
-            vb: RefCell::new(vb),
+            vb: Rc::new(RefCell::new(vb)),
+            shrink_usage: RefCell::new([None; 3]),
             zindex,
         })
     }
@@ -680,6 +708,13 @@ impl RenderLayer {
         context: &RenderContext,
         num_quads: usize,
     ) -> anyhow::Result<TripleVertexBuffer> {
+        if let RenderContext::WebGpu(state) = context {
+            return Ok(TripleVertexBuffer::new_webgpu(
+                num_quads,
+                &state.device,
+                &state.queue,
+            ));
+        }
         let verts = context.allocate_vertex_buffer_initializer(num_quads);
         log::trace!(
             "compute_vertices num_quads={}, allocated {} bytes",
@@ -734,6 +769,111 @@ pub struct RenderState {
     pub util_sprites: UtilSprites,
     pub glyph_prog: Option<glium::Program>,
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
+    quad_last_activity: Instant,
+    pending_quad_shrink: Option<PendingQuadShrink>,
+}
+
+const QUAD_SHRINK_IDLE: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct QuadShrinkUsage {
+    target: usize,
+    since: Instant,
+}
+
+impl QuadShrinkUsage {
+    fn observe(previous: Option<Self>, used: usize, now: Instant, submitted: bool) -> Option<Self> {
+        if !submitted {
+            return None;
+        }
+        let target = quad_shrink_target(used);
+        Some(match previous {
+            Some(prior) if prior.target == target => prior,
+            _ => Self { target, since: now },
+        })
+    }
+
+    fn eligible(self, capacity: usize, now: Instant) -> bool {
+        now.saturating_duration_since(self.since) >= QUAD_SHRINK_IDLE && self.target <= capacity / 2
+    }
+}
+
+fn quad_shrink_target(used: usize) -> usize {
+    used.checked_mul(2)
+        .map(|size| size.max(128).div_ceil(QUAD_CAPACITY_GROWTH_GRANULARITY))
+        .and_then(|buckets| buckets.checked_mul(QUAD_CAPACITY_GROWTH_GRANULARITY))
+        .unwrap_or(usize::MAX)
+}
+
+struct PreparedQuadShrink {
+    owner: Rc<RefCell<[TripleVertexBuffer; 3]>>,
+    index: usize,
+    previous_capacity: usize,
+    replacement: TripleVertexBuffer,
+}
+
+struct PendingQuadShrink {
+    activity: Instant,
+    started: Instant,
+    prepared: Option<anyhow::Result<Vec<PreparedQuadShrink>>>,
+    ready: futures::future::LocalBoxFuture<'static, anyhow::Result<()>>,
+}
+
+fn finish_quad_shrink_allocation(
+    scopes: Vec<wgpu::ErrorScopeGuard>,
+) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+    // Pop synchronously in stack order; completion never escapes its scope.
+    let errors: Vec<_> = scopes
+        .into_iter()
+        .rev()
+        .map(|scope| scope.pop().boxed_local())
+        .collect();
+    async move {
+        let errors = futures::future::join_all(errors).await;
+        if let Some(error) = errors.into_iter().flatten().next() {
+            anyhow::bail!("quad shrink allocation rejected: {error}");
+        }
+        Ok(())
+    }
+    .boxed_local()
+}
+
+impl PendingQuadShrink {
+    fn cancel_if_stale(&mut self, now: Instant, activity: Instant, resizing: bool) {
+        if resizing
+            || activity != self.activity
+            || now.saturating_duration_since(self.started) > Duration::from_secs(5)
+        {
+            // Drop all replacement resources now, retaining only the single
+            // scope completion future until it resolves (or its window dies).
+            self.prepared.take();
+        }
+    }
+}
+
+/// Publish only after every allocation and backend error scope has succeeded.
+/// No borrowed/mapped frame state may exist at this frame-boundary seam.
+fn commit_quad_shrink(prepared: Vec<PreparedQuadShrink>) -> anyhow::Result<u64> {
+    for item in &prepared {
+        let owner = item.owner.try_borrow()?;
+        anyhow::ensure!(
+            owner[item.index].capacity == item.previous_capacity,
+            "quad capacity changed during shrink preparation"
+        );
+        anyhow::ensure!(
+            item.replacement.capacity < item.previous_capacity,
+            "quad shrink did not reduce allocation"
+        );
+    }
+    // Preflight every mutable borrow before the first mutation.
+    for item in &prepared {
+        drop(item.owner.try_borrow_mut()?);
+    }
+    let count = prepared.len() as u64;
+    for item in prepared {
+        item.owner.borrow_mut()[item.index] = item.replacement;
+    }
+    Ok(count)
 }
 
 /// Live aggregate of the quad vertex-buffer allocation owned by `RenderState`.
@@ -751,6 +891,153 @@ pub struct QuadAllocationChange {
 }
 
 impl RenderState {
+    pub(crate) fn note_quad_activity(&mut self, now: Instant) {
+        self.quad_last_activity = now;
+        if let Some(pending) = self.pending_quad_shrink.as_mut() {
+            pending.prepared.take();
+        }
+    }
+
+    /// Failed/partial paint passes are never a usage baseline for reclamation.
+    pub(crate) fn observe_quad_frame(&mut self, now: Instant, submitted: bool) {
+        for layer in self.layers.borrow().iter() {
+            let buffers = layer.vb.borrow();
+            let mut usage = layer.shrink_usage.borrow_mut();
+            for (index, buffer) in buffers.iter().enumerate() {
+                usage[index] = QuadShrinkUsage::observe(
+                    usage[index],
+                    *buffer.next_quad.borrow(),
+                    now,
+                    submitted,
+                );
+            }
+        }
+    }
+
+    fn quad_shrink_candidates(&self, now: Instant) -> Vec<(Rc<RenderLayer>, usize, usize)> {
+        if now.saturating_duration_since(self.quad_last_activity) < QUAD_SHRINK_IDLE {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for layer in self.layers.borrow().iter() {
+            let buffers = layer.vb.borrow();
+            for (index, observed) in layer.shrink_usage.borrow().iter().enumerate() {
+                if let Some(observed) = observed {
+                    // Headroom plus 2:1 hysteresis prevents resizing on a
+                    // cursor blink or small alternating geometry changes.
+                    if observed.eligible(buffers[index].capacity, now) {
+                        candidates.push((Rc::clone(layer), index, observed.target));
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    pub(crate) fn quad_shrink_needs_paint(&mut self, now: Instant, resizing: bool) -> bool {
+        if let Some(pending) = self.pending_quad_shrink.as_mut() {
+            pending.cancel_if_stale(now, self.quad_last_activity, resizing);
+            if pending.prepared.is_none() {
+                if let Some(result) = pending.ready.as_mut().now_or_never() {
+                    if let Err(error) = result {
+                        log::warn!("cancelled quad shrink allocation rejected: {error:#}");
+                    }
+                    self.pending_quad_shrink.take();
+                    self.quad_last_activity = now;
+                }
+                return false;
+            }
+        }
+        !resizing
+            && (self.pending_quad_shrink.is_some() || !self.quad_shrink_candidates(now).is_empty())
+    }
+
+    /// Run before paint acquires any mapped/borrowed layer storage. All new
+    /// resources are checked before any old resources are replaced. Queued GPU
+    /// commands retain their own references to the previous buffers.
+    pub(crate) fn shrink_idle_quads(
+        &mut self,
+        now: Instant,
+        resizing: bool,
+    ) -> anyhow::Result<u64> {
+        if resizing {
+            self.note_quad_activity(now);
+            return Ok(0);
+        }
+        if self.pending_quad_shrink.is_none() {
+            let candidates = self.quad_shrink_candidates(now);
+            if candidates.is_empty() {
+                return Ok(0);
+            }
+            let scopes = match &self.context {
+                RenderContext::WebGpu(state) => vec![
+                    state
+                        .device
+                        .push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+                    state.device.push_error_scope(wgpu::ErrorFilter::Internal),
+                    state.device.push_error_scope(wgpu::ErrorFilter::Validation),
+                ],
+                RenderContext::Glium(_) => Vec::new(),
+            };
+            let prepared = candidates
+                .into_iter()
+                .map(|(layer, index, target)| {
+                    let previous_capacity = layer.vb.borrow()[index].capacity;
+                    Ok(PreparedQuadShrink {
+                        replacement: RenderLayer::compute_vertices(&layer.context, target)?,
+                        owner: Rc::clone(&layer.vb),
+                        index,
+                        previous_capacity,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>();
+            // Pop synchronously in stack order. Retain every completion future
+            // even if another scope reports an error; never await on the GUI.
+            self.pending_quad_shrink = Some(PendingQuadShrink {
+                activity: self.quad_last_activity,
+                started: now,
+                prepared: Some(prepared),
+                ready: finish_quad_shrink_allocation(scopes),
+            });
+        }
+        let pending = self.pending_quad_shrink.as_mut().unwrap();
+        pending.cancel_if_stale(now, self.quad_last_activity, resizing);
+        let Some(result) = pending.ready.as_mut().now_or_never() else {
+            // One retained batch, polled by the existing periodic status tick.
+            // No repeated allocations or synchronous GPU completion wait.
+            return Ok(0);
+        };
+        let mut pending = self.pending_quad_shrink.take().unwrap();
+        // Back off after failure/cancellation as well as successful shrink.
+        let candidates = self.quad_shrink_candidates(now);
+        let current = pending.activity == self.quad_last_activity
+            && now.saturating_duration_since(pending.started) <= Duration::from_secs(5);
+        self.quad_last_activity = now;
+        result?;
+        let Some(prepared) = pending.prepared.take() else {
+            return Ok(0);
+        };
+        let prepared = prepared?;
+        if !current
+            || prepared.iter().any(|item| {
+                !candidates.iter().any(|(layer, index, target)| {
+                    Rc::ptr_eq(&layer.vb, &item.owner)
+                        && *index == item.index
+                        && *target == item.replacement.capacity
+                })
+            })
+        {
+            return Ok(0);
+        }
+        let capacity_before = self.quad_allocation_snapshot().capacity;
+        let count = commit_quad_shrink(prepared)?;
+        let capacity_after = self.quad_allocation_snapshot().capacity;
+        log::debug!(
+            "idle quad allocation reduced: capacity_quads={capacity_before}->{capacity_after} replaced_quad_sets={count}; queued GPU references may still be live"
+        );
+        Ok(count)
+    }
+
     pub fn new(
         context: RenderContext,
         fonts: &Rc<FontConfiguration>,
@@ -777,6 +1064,8 @@ impl RenderState {
                         util_sprites,
                         glyph_prog,
                         layers: RefCell::new(vec![main_layer]),
+                        quad_last_activity: Instant::now(),
+                        pending_quad_shrink: None,
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -986,6 +1275,233 @@ mod tests {
         round_quad_capacity, texture_atlas_footprint_bytes,
     };
     use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT, VERTICES_PER_CELL};
+
+    #[test]
+    fn idle_quad_shrink_requires_stable_successful_geometry() {
+        use super::{QuadShrinkUsage, quad_shrink_target};
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let small = QuadShrinkUsage::observe(None, 10, start, true).unwrap();
+        assert!(!small.eligible(1024, start + Duration::from_millis(999)));
+        assert!(small.eligible(1024, start + Duration::from_secs(1)));
+        assert!(!small.eligible(128, start + Duration::from_secs(60)));
+        let failed =
+            QuadShrinkUsage::observe(Some(small), 0, start + Duration::from_secs(1), false);
+        assert!(
+            failed.is_none(),
+            "partial cleared geometry is not a shrink baseline"
+        );
+        let recovered =
+            QuadShrinkUsage::observe(failed, 10, start + Duration::from_secs(2), true).unwrap();
+        assert!(!recovered.eligible(1024, start + Duration::from_secs(2)));
+        let larger =
+            QuadShrinkUsage::observe(Some(small), 400, start + Duration::from_secs(2), true)
+                .unwrap();
+        assert!(!larger.eligible(1024, start + Duration::from_secs(60)));
+        assert_eq!(quad_shrink_target(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    #[ignore = "requires a real WebGPU adapter; run explicitly for idle-shrink qualification"]
+    fn webgpu_idle_shrink_reduces_owned_buffers_and_preserves_queued_geometry() {
+        use super::*;
+        use std::sync::mpsc;
+
+        let (device, queue) = futures::executor::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .expect("idle-shrink qualification requires an actual adapter");
+            eprintln!("idle-shrink adapter: {:?}", adapter.get_info());
+            adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .unwrap()
+        });
+        let owner = Rc::new(RefCell::new(std::array::from_fn(|_| {
+            TripleVertexBuffer::new_webgpu(1024, &device, &queue)
+        })));
+        let owned_bytes = || {
+            owner
+                .borrow()
+                .iter()
+                .map(|buffer| {
+                    buffer.indices.webgpu().buf.size()
+                        + buffer
+                            .bufs
+                            .borrow()
+                            .iter()
+                            .map(|vertex| vertex.webgpu().buf.size())
+                            .sum::<u64>()
+                })
+                .sum::<u64>()
+        };
+        let before_bytes = owned_bytes();
+        let mut original_ids = Some(
+            owner
+                .borrow()
+                .iter()
+                .map(|buffer| buffer.bufs.borrow()[0].webgpu().buf.clone())
+                .collect::<Vec<_>>(),
+        );
+        let prepare = || {
+            (0..3)
+                .map(|index| PreparedQuadShrink {
+                    owner: Rc::clone(&owner),
+                    index,
+                    previous_capacity: 1024,
+                    replacement: TripleVertexBuffer::new_webgpu(128, &device, &queue),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Real backend validation refusal must leave the entire old batch intact.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let invalid = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deliberately invalid shrink allocation control"),
+            size: device.limits().max_buffer_size + 4,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let failed_preparation = prepare();
+        let rejected = futures::executor::block_on(finish_quad_shrink_allocation(vec![scope]));
+        assert!(
+            rejected.is_err(),
+            "actual backend allocation validation must reject the batch"
+        );
+        drop(failed_preparation);
+        drop(invalid);
+        assert_eq!(owned_bytes(), before_bytes);
+
+        let started = Instant::now();
+        for (now, activity, resizing) in [
+            (started, started, true),
+            (
+                started + Duration::from_millis(1),
+                started + Duration::from_millis(1),
+                false,
+            ),
+            (started + Duration::from_secs(6), started, false),
+        ] {
+            let mut pending = PendingQuadShrink {
+                activity: started,
+                started,
+                prepared: Some(Ok(prepare())),
+                ready: finish_quad_shrink_allocation(Vec::new()),
+            };
+            pending.cancel_if_stale(now, activity, resizing);
+            assert!(
+                pending.prepared.is_none(),
+                "interaction/deadline must release replacement resources"
+            );
+            futures::executor::block_on(pending.ready).unwrap();
+            assert_eq!(owned_bytes(), before_bytes);
+        }
+        for (index, original) in original_ids.as_ref().unwrap().iter().enumerate() {
+            assert_eq!(
+                &owner.borrow()[index].bufs.borrow()[0].webgpu().buf,
+                original
+            );
+        }
+
+        // A still-borrowed owner cannot partially commit a prepared batch.
+        let retained_mapping = owner.borrow();
+        assert!(commit_quad_shrink(prepare()).is_err());
+        drop(retained_mapping);
+        assert_eq!(owned_bytes(), before_bytes);
+
+        let expected: Vec<_> = (0..8)
+            .map(|index| Vertex {
+                position: [index as f32, 7.0],
+                fg_color: [0.25, 0.5, 0.75, 1.0],
+                ..Vertex::default()
+            })
+            .collect();
+        let expected_bytes = bytemuck::cast_slice::<_, u8>(&expected).to_vec();
+        let mut readbacks = Vec::new();
+        // Submit the old frame before replacing its owners. No GPU completion
+        // wait separates old submission, replacement, and new submission.
+        for phase in 0..2 {
+            if phase == 1 {
+                let scopes = vec![
+                    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+                    device.push_error_scope(wgpu::ErrorFilter::Internal),
+                    device.push_error_scope(wgpu::ErrorFilter::Validation),
+                ];
+                let prepared = prepare();
+                futures::executor::block_on(finish_quad_shrink_allocation(scopes)).unwrap();
+                assert_eq!(commit_quad_shrink(prepared).unwrap(), 3);
+                assert_eq!(owned_bytes(), before_bytes / 8);
+                for (index, original) in original_ids.take().unwrap().iter().enumerate() {
+                    assert_ne!(
+                        &owner.borrow()[index].bufs.borrow()[0].webgpu().buf,
+                        original
+                    );
+                }
+            }
+            for buffer in owner.borrow().iter() {
+                buffer.clear_quad_allocation();
+                for quad in expected.chunks_exact(VERTICES_PER_CELL) {
+                    buffer.map().extend_with(quad);
+                }
+                let vertex_count = buffer.vertex_index_count().0;
+                assert_eq!(vertex_count, expected.len());
+                let uploaded = buffer.current_vb_mut().webgpu().upload(vertex_count);
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("idle-shrink queued geometry readback"),
+                    size: expected_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                encoder.copy_buffer_to_buffer(
+                    &uploaded,
+                    0,
+                    &readback,
+                    0,
+                    expected_bytes.len() as u64,
+                );
+                queue.submit([encoder.finish()]);
+                readbacks.push(readback);
+                buffer.next_index();
+            }
+        }
+        assert!(
+            original_ids.is_none(),
+            "old owner handles must drop before waiting for GPU work"
+        );
+        for readback in readbacks {
+            let slice = readback.slice(..);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap()
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                device.poll(wgpu::PollType::Poll).unwrap();
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                    other => panic!("queued shrink readback did not complete: {other:?}"),
+                }
+            }
+            let bytes = slice.get_mapped_range().unwrap();
+            assert_eq!(&*bytes, expected_bytes.as_slice());
+            drop(bytes);
+            readback.unmap();
+        }
+    }
 
     #[test]
     #[ignore = "requires a real WebGPU adapter; run explicitly for vertex-buffer qualification"]

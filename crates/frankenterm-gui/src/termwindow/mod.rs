@@ -2336,8 +2336,8 @@ pub struct TermWindow {
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
-    /// The policy tracks gesture state so the underlying GPU buffer
-    /// (continuation bead) doesn't reallocate during a resize drag.
+    /// The policy tracks gesture state while RenderState owns actual GPU
+    /// allocation. Required growth remains permitted during a resize drag.
     /// `begin_quad_resize_gesture()` is called when the OS reports
     /// `live_resizing=true`; `end_quad_resize_gesture()` is called
     /// on the first non-live resize event after a sequence of live
@@ -2345,11 +2345,9 @@ pub struct TermWindow {
     /// status-update timer to release excess capacity once the
     /// gesture has ended and the idle threshold has elapsed.
     ///
-    /// The policy observes the live `RenderState` quad allocation
-    /// without claiming ownership of GPU memory. A future quad-writer
-    /// continuation can still move the actual staging data into this
-    /// policy; today the telemetry is live allocation-backed while
-    /// shrink remains observational.
+    /// This policy observes live allocation telemetry. RenderState admits idle
+    /// shrink from successful per-sublayer usage and commits replacements at a
+    /// paint boundary, preserving queued GPU references and mapped lifetimes.
     quad_buffer_policy: render::elastic_buffer::ElasticBuffer<()>,
     /// Whether `quad_buffer_policy` currently believes a live
     /// resize is in progress. The OS-side `live_resizing` boolean
@@ -3691,9 +3689,8 @@ impl TermWindow {
     /// Notify the quad-buffer policy that a live resize gesture has
     /// started (ft-kciew). Idempotent on an active gesture so it's
     /// safe to call from every `resize()` event with
-    /// `live_resizing=true`. While the gesture is active,
-    /// `tick_quad_buffer_shrink()` is a no-op and any continuation
-    /// bead's GPU buffer wrap will refuse to shrink.
+    /// `live_resizing=true`. While the gesture is active, owner-level shrink
+    /// refuses to replace GPU buffers.
     fn begin_quad_resize_gesture(&mut self) {
         if !self.quad_buffer_in_resize_gesture {
             self.quad_buffer_policy.begin_gesture();
@@ -3713,23 +3710,28 @@ impl TermWindow {
         }
     }
 
-    /// Driven by the periodic status-update timer. The current
-    /// integration preserves resize-gesture gating and live
-    /// allocation telemetry, but does not shrink the GPU-owned
-    /// `RenderState` buffers until the quad-writer continuation
-    /// moves live reallocation into the policy.
+    /// Request an idle repaint; GPU replacements happen only at its beginning,
+    /// before mapped geometry exists, never inside this timer callback.
     fn tick_quad_buffer_shrink(&mut self) {
-        if let Some(result) = self.quad_buffer_policy.try_shrink_if_idle(Instant::now()) {
-            log::trace!(
-                "quad buffer policy shrunk: capacity {} → {} (used_at_shrink={})",
-                result.capacity_before,
-                result.capacity_after,
-                result.used_at_shrink,
-            );
+        if self.render_state.as_mut().is_some_and(|state| {
+            state.quad_shrink_needs_paint(Instant::now(), self.quad_buffer_in_resize_gesture)
+        }) {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
         }
     }
 
     fn record_idle_event(&mut self, event: idle_detector::IdleEvent) {
+        // A repaint requested by the shrink timer is not fresh interaction.
+        if !matches!(
+            event,
+            idle_detector::IdleEvent::OsPaintRequest | idle_detector::IdleEvent::AnimationTick
+        ) {
+            if let Some(state) = self.render_state.as_mut() {
+                state.note_quad_activity(Instant::now());
+            }
+        }
         let report = self.idle_detector.record_event(event, Instant::now());
         if report.is_wake() {
             log::trace!(

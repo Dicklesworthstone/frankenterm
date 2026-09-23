@@ -58,6 +58,22 @@ impl crate::TermWindow {
 
         let start = Instant::now();
 
+        // This is before paint_pass clears counters or takes self-referential
+        // mapped layer borrows. Every accepted replacement is rebuilt below.
+        let shrink = self
+            .render_state
+            .as_mut()
+            .map(|state| state.shrink_idle_quads(start, self.quad_buffer_in_resize_gesture));
+        match shrink {
+            Some(Ok(count)) if count > 0 => {
+                self.record_quad_buffer_allocation_snapshot(count);
+                self.invalidate_fancy_tab_bar();
+                self.invalidate_modal();
+            }
+            Some(Err(error)) => log::warn!("idle quad shrink refused: {error:#}"),
+            _ => {}
+        }
+
         {
             let diff = start.duration_since(self.last_fps_check_time);
             if diff > Duration::from_secs(1) {
@@ -82,7 +98,7 @@ impl crate::TermWindow {
                             // *growth* while a resize gesture was active. That was
                             // incorrect because geometry had already outgrown the
                             // buffer. Always grow on demand; idle shrinking remains
-                            // separately gated in elastic_buffer.rs.
+                            // separately gated by RenderState at the frame boundary.
                             match render_state.allocate_more_quads() {
                                 Ok(change) => {
                                     let snapshot = render_state.quad_allocation_snapshot();
@@ -214,6 +230,9 @@ impl crate::TermWindow {
         metrics::histogram!("gui.paint.impl").record(self.last_frame_duration);
         metrics::histogram!("gui.paint.impl.rate").record(1.);
 
+        if let Some(state) = self.render_state.as_mut() {
+            state.observe_quad_frame(Instant::now(), present_result.is_ok());
+        }
         present_result.map(|(damage_generation, submission_mach_ns)| PaintOutcome {
             damage_generation,
             submission_mach_ns,
